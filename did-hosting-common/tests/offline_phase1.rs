@@ -71,9 +71,8 @@ async fn phase1_writes_request_and_seed_round_trips_via_plaintext_store() {
     let request_path = dir.path().join("bootstrap-request.json");
     let config_path = dir.path().join("config.toml");
 
-    // The plaintext store reads/writes through config.toml. Seed an
-    // empty config so phase 1's `set_bootstrap_seed` has a file to
-    // append to without create_dir_all surprises.
+    // The plaintext store keeps its file beside config.toml; an empty
+    // config stands in for the one setup writes.
     std::fs::write(&config_path, "").expect("seed empty config");
 
     let recipe = offline_prepare_recipe(request_path.clone(), config_path.clone());
@@ -159,28 +158,15 @@ async fn phase1_writes_request_and_seed_round_trips_via_plaintext_store() {
     let _ = store2.clear_bootstrap_seed().await;
 }
 
-/// Helper: per-test-invocation SecretsConfig with a unique `keyring_service`
-/// scope.
-///
-/// Why unique-per-invocation: with the `keyring` feature compiled in (the
-/// default on dev hosts), `create_secret_store` always returns the keyring
-/// backend regardless of `SecretsConfig` shape. The OS keyring is process-
-/// global, so two `#[tokio::test]` cases sharing a fixed scope name see
-/// each other's entries — phase 1 writes a seed, phase 2 expects no seed,
-/// and parallel execution leaks state between them.
-///
-/// UUID per invocation also handles re-runs cleanly: a previous crashed
-/// run leaves stale keyring entries under its own UUID, and the next
-/// run gets a fresh scope.
-///
-/// The caller is responsible for `clear_bootstrap_seed()` at end-of-test
-/// to leave the keyring tidy. Tests that don't write a seed can skip the
-/// cleanup (clearing an absent entry is a no-op).
+/// Helper: the plaintext backend, confirmed — CI has no keyring. Each test
+/// uses its own temp dir, so the plaintext files never collide; the unique
+/// `keyring_service` keeps that true even if the backend ever changes.
 fn secrets_for_test(scope: &str) -> SecretsConfig {
     SecretsConfig {
         // Explicitly select plaintext: this is the offline-prepare path, which
         // must not touch the OS keyring (CI Linux has no Secret Service).
-        plaintext_mode: true,
+        backend: Some(did_hosting_common::server::secret_store::SecretBackend::Plaintext),
+        confirm_plaintext: true,
         keyring_service: format!("did-hosting-test-{}-{}", scope, uuid::Uuid::new_v4()),
         ..SecretsConfig::default()
     }

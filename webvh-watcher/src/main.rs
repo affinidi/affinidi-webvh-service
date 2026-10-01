@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use webvh_watcher::config::AppConfig;
-use webvh_watcher::{health, server, setup, store};
+use webvh_watcher::{health, secret_store, server, setup, store};
 
 #[derive(Parser)]
 #[command(
@@ -20,15 +20,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run interactive setup wizard to generate config.toml.
+    /// Provision the watcher's DID from a VTA context and write config.toml.
     ///
-    /// For non-interactive / scripted setup, pass `--from <recipe.toml>`.
-    /// The watcher has no VTA / no secrets, so the recipe only needs
-    /// `[deployment]`, `[output]`, `[server]`, and `[watcher]`.
+    /// Interactive by default (online VTA). For scripted setup, pass
+    /// `--from <recipe.toml>`; an online recipe also needs
+    /// `--setup-key-file`, minted first with `--setup-key-out`.
     Setup {
         /// Path to a declarative setup recipe TOML. Skips every prompt.
         #[arg(long, value_name = "FILE")]
         from: Option<PathBuf>,
+        /// Mint an ephemeral setup did:key, persist it to <path>, print the
+        /// `pnm contexts create` command, and exit.
+        #[arg(long, conflicts_with = "setup_key_file")]
+        setup_key_out: Option<PathBuf>,
+        /// Reuse the setup did:key persisted by `--setup-key-out`.
+        #[arg(long)]
+        setup_key_file: Option<PathBuf>,
+        /// Context id for `--setup-key-out`'s PNM command.
+        #[arg(long, default_value = "webvh", requires = "setup_key_out")]
+        context: String,
         /// Allow overwriting an existing config.toml. The previous file
         /// is moved to config.toml.bak.
         #[arg(long)]
@@ -47,12 +57,17 @@ async fn main() {
     match cli.command {
         Some(Command::Setup {
             from,
+            setup_key_out,
+            setup_key_file,
+            context,
             force_reprovision,
         }) => {
-            let result = if let Some(path) = from {
-                setup::run_from_recipe(&path, force_reprovision).await
+            let result = if let Some(path) = setup_key_out {
+                setup::run_setup_phase1(&path, &context).await
+            } else if let Some(path) = from {
+                setup::run_from_recipe(&path, setup_key_file, force_reprovision).await
             } else {
-                setup::run_wizard(cli.config).await
+                setup::run_wizard(cli.config, setup_key_file).await
             };
             if let Err(e) = result {
                 eprintln!("Setup error: {e}");
@@ -83,11 +98,29 @@ async fn run_watcher(config_path: Option<PathBuf>) {
 
     did_hosting_common::server::config::init_tracing(&config.log);
 
-    let store = store::Store::open(&config.store)
+    let store = store::Store::open_with(&config.store, &config.fjall)
         .await
         .expect("failed to open store");
 
-    if let Err(e) = server::run(config, store).await {
+    let secrets = match secret_store::create_secret_store(&config) {
+        Ok(backend) => match backend.get().await {
+            Ok(Some(secrets)) => secrets,
+            Ok(None) => {
+                eprintln!("Error: no secrets found — run `webvh-watcher setup` first");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error: failed to read secrets: {e}");
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            eprintln!("Error: secret store: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = server::run(config, store, secrets).await {
         tracing::error!("watcher error: {e}");
         std::process::exit(1);
     }

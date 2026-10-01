@@ -4,8 +4,8 @@ use crate::store::{RawKvPair, Store};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use did_hosting_common::server::store::{
-    KS_ACL, KS_ASSIGNMENTS, KS_DIDS, KS_DOMAINS, KS_META, KS_PENDING_PURGES, KS_REGISTRY,
-    KS_SESSIONS, KS_STATS, KS_TIMESERIES, KS_WITNESSES,
+    KS_ASSIGNMENTS, KS_DIDS, KS_DOMAINS, KS_META, KS_PENDING_PURGES, KS_REGISTRY, KS_STATS,
+    KS_TIMESERIES, KS_WITNESSES,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -14,15 +14,16 @@ use std::path::PathBuf;
 ///
 /// - **v1**: original shape — `{ dids, acl, stats, sessions }`.
 ///   Restored as a no-op for any keyspace introduced after.
-/// - **v2** (current, T54): adds `{ domains, assignments,
-///   pending_purges, registry, timeseries, meta, witnesses }` —
-///   every keyspace introduced by the multi-domain rollout
-///   (T18/T27/T28/T29/T30) plus the previously-undumped
+/// - **v2**: adds `{ domains, assignments, pending_purges, registry,
+///   timeseries, meta, witnesses }` — every keyspace introduced by the
+///   multi-domain rollout (T18/T27/T28/T29/T30) plus the previously-undumped
 ///   bookkeeping keyspaces (registry, timeseries, meta, witnesses).
-const BACKUP_VERSION: u32 = 2;
-
-/// Durable session key prefixes to include in backups.
-const DURABLE_SESSION_PREFIXES: &[&str] = &["pk_user:", "pk_cred:", "pk_did:", "enroll:"];
+/// - **v3** (current): drops `acl` and `sessions` — the edge's own auth and
+///   ACL were deleted (its only authority is `control_did`, checked on each
+///   Trust Task's proof), so both keyspaces are permanently empty on this
+///   binary and never worth a backup entry. Restoring an older backup still
+///   works; its `acl`/`sessions` data, if any, is simply not restored.
+const BACKUP_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct Backup {
@@ -36,9 +37,7 @@ struct Backup {
 #[derive(Serialize, Deserialize)]
 struct BackupKeyspaces {
     dids: Vec<KvEntry>,
-    acl: Vec<KvEntry>,
     stats: Vec<KvEntry>,
-    sessions: Vec<KvEntry>,
     // ---- T54: new keyspaces (v2 backup) ----
     //
     // `#[serde(default)]` keeps v1 backups loadable: a missing key
@@ -88,9 +87,7 @@ pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<
     let store = Store::open(&config.store).await?;
 
     let dids_ks = store.keyspace(KS_DIDS)?;
-    let acl_ks = store.keyspace(KS_ACL)?;
     let stats_ks = store.keyspace(KS_STATS)?;
-    let sessions_ks = store.keyspace(KS_SESSIONS)?;
     let domains_ks = store.keyspace(KS_DOMAINS)?;
     let assignments_ks = store.keyspace(KS_ASSIGNMENTS)?;
     let pending_purges_ks = store.keyspace(KS_PENDING_PURGES)?;
@@ -100,7 +97,6 @@ pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<
     let witnesses_ks = store.keyspace(KS_WITNESSES)?;
 
     let dids = encode_pairs(dids_ks.iter_all().await?);
-    let acl = encode_pairs(acl_ks.iter_all().await?);
     let stats = encode_pairs(stats_ks.iter_all().await?);
     let domains = encode_pairs(domains_ks.iter_all().await?);
     let assignments = encode_pairs(assignments_ks.iter_all().await?);
@@ -110,19 +106,6 @@ pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<
     let meta = encode_pairs(meta_ks.iter_all().await?);
     let witnesses = encode_pairs(witnesses_ks.iter_all().await?);
 
-    // Filter sessions to only include durable prefixes
-    let all_sessions = sessions_ks.iter_all().await?;
-    let durable_sessions: Vec<RawKvPair> = all_sessions
-        .into_iter()
-        .filter(|(key, _)| {
-            let key_str = String::from_utf8_lossy(key);
-            DURABLE_SESSION_PREFIXES
-                .iter()
-                .any(|prefix| key_str.starts_with(prefix))
-        })
-        .collect();
-    let sessions = encode_pairs(durable_sessions);
-
     let backup = Backup {
         version: BACKUP_VERSION,
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -130,9 +113,7 @@ pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<
         config: config_json,
         keyspaces: BackupKeyspaces {
             dids,
-            acl,
             stats,
-            sessions,
             domains,
             assignments,
             pending_purges,
@@ -152,9 +133,7 @@ pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<
     }
 
     let total = backup.keyspaces.dids.len()
-        + backup.keyspaces.acl.len()
         + backup.keyspaces.stats.len()
-        + backup.keyspaces.sessions.len()
         + backup.keyspaces.domains.len()
         + backup.keyspaces.assignments.len()
         + backup.keyspaces.pending_purges.len()
@@ -167,12 +146,7 @@ pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<
     eprintln!("  Backup complete!");
     eprintln!();
     eprintln!("  dids:           {} entries", backup.keyspaces.dids.len());
-    eprintln!("  acl:            {} entries", backup.keyspaces.acl.len());
     eprintln!("  stats:          {} entries", backup.keyspaces.stats.len());
-    eprintln!(
-        "  sessions:       {} entries",
-        backup.keyspaces.sessions.len()
-    );
     eprintln!(
         "  domains:        {} entries",
         backup.keyspaces.domains.len()
@@ -232,7 +206,10 @@ pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<
         eprintln!(
             "  Note: restoring v{} backup with v{BACKUP_VERSION} binary. \
              Missing keyspaces ({{domains, assignments, ...}}) will be \
-             populated by first-boot seed on next daemon startup.",
+             populated by first-boot seed on next daemon startup, and any \
+             `acl`/`sessions` data in the backup is not restored — this \
+             binary has no use for either (the edge's own auth and ACL were \
+             deleted; its only authority is `control_did`).",
             backup.version
         );
     }
@@ -265,9 +242,7 @@ pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<
     let store = Store::open(&config.store).await?;
 
     let dids_ks = store.keyspace(KS_DIDS)?;
-    let acl_ks = store.keyspace(KS_ACL)?;
     let stats_ks = store.keyspace(KS_STATS)?;
-    let sessions_ks = store.keyspace(KS_SESSIONS)?;
     let domains_ks = store.keyspace(KS_DOMAINS)?;
     let assignments_ks = store.keyspace(KS_ASSIGNMENTS)?;
     let pending_purges_ks = store.keyspace(KS_PENDING_PURGES)?;
@@ -277,9 +252,7 @@ pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<
     let witnesses_ks = store.keyspace(KS_WITNESSES)?;
 
     let dids_count = restore_keyspace(&store, &dids_ks, &backup.keyspaces.dids).await?;
-    let acl_count = restore_keyspace(&store, &acl_ks, &backup.keyspaces.acl).await?;
     let stats_count = restore_keyspace(&store, &stats_ks, &backup.keyspaces.stats).await?;
-    let sessions_count = restore_keyspace(&store, &sessions_ks, &backup.keyspaces.sessions).await?;
     let domains_count = restore_keyspace(&store, &domains_ks, &backup.keyspaces.domains).await?;
     let assignments_count =
         restore_keyspace(&store, &assignments_ks, &backup.keyspaces.assignments).await?;
@@ -293,9 +266,7 @@ pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<
         restore_keyspace(&store, &witnesses_ks, &backup.keyspaces.witnesses).await?;
 
     let total = dids_count
-        + acl_count
         + stats_count
-        + sessions_count
         + domains_count
         + assignments_count
         + pending_purges_count
@@ -308,9 +279,7 @@ pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<
     eprintln!("  Restore complete!");
     eprintln!();
     eprintln!("  dids:           {dids_count} entries");
-    eprintln!("  acl:            {acl_count} entries");
     eprintln!("  stats:          {stats_count} entries");
-    eprintln!("  sessions:       {sessions_count} entries");
     eprintln!("  domains:        {domains_count} entries");
     eprintln!("  assignments:    {assignments_count} entries");
     eprintln!("  pending_purges: {pending_purges_count} entries");
@@ -396,11 +365,11 @@ mod tests {
         assert!(parsed.keyspaces.witnesses.is_empty());
     }
 
-    /// A v2 backup with non-empty `domains` / `assignments` /
-    /// `pending_purges` round-trips through serde without losing
-    /// the new-keyspace data.
+    /// A current-version backup with non-empty `domains` / `assignments` /
+    /// `pending_purges` round-trips through serde without losing the
+    /// new-keyspace data, and carries no `acl`/`sessions` fields at all.
     #[test]
-    fn v2_backup_round_trips_every_keyspace() {
+    fn current_backup_round_trips_every_keyspace() {
         let k = BASE64.encode(b"key1");
         let v = BASE64.encode(b"val1");
         let entry = vec![KvEntry {
@@ -415,9 +384,7 @@ mod tests {
             config: "{}".into(),
             keyspaces: BackupKeyspaces {
                 dids: entry.clone(),
-                acl: entry.clone(),
                 stats: entry.clone(),
-                sessions: entry.clone(),
                 domains: entry.clone(),
                 assignments: entry.clone(),
                 pending_purges: entry.clone(),

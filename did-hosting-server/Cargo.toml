@@ -26,7 +26,7 @@ method-web = ["did-hosting-common/method-web"]
 # did:webs DIDs should not carry. Registers `/{*mnemonic}/keri.cesr` and
 # claims `/{*mnemonic}/did.json` for did:webs records only.
 method-webs = ["did-hosting-common/method-webs"]
-aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "did-hosting-common/aws-secrets"]
+aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "dep:aws-smithy-types", "did-hosting-common/aws-secrets"]
 gcp-secrets = [
   "dep:google-cloud-secretmanager-v1",
   "dep:google-cloud-auth",
@@ -44,8 +44,8 @@ vault-secrets = ["did-hosting-common/vault-secrets"]
 k8s-secrets = ["did-hosting-common/k8s-secrets"]
 store-fjall = ["dep:fjall", "did-hosting-common/store-fjall"]
 store-redis = ["dep:redis", "did-hosting-common/store-redis"]
-store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "did-hosting-common/store-dynamodb"]
-store-dynamodb-single = ["dep:aws-sdk-dynamodb", "dep:aws-config", "did-hosting-common/store-dynamodb-single"]
+store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "dep:aws-smithy-types", "did-hosting-common/store-dynamodb"]
+store-dynamodb-single = ["dep:aws-sdk-dynamodb", "dep:aws-config", "dep:aws-smithy-types", "did-hosting-common/store-dynamodb-single"]
 store-firestore = ["dep:firestore", "dep:futures", "did-hosting-common/store-firestore"]
 store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures", "did-hosting-common/store-cosmosdb"]
 # Generate an OpenAPI 3.1 spec for the HTTP upload/resolve API (issue #47).
@@ -65,7 +65,7 @@ path = "src/main.rs"
 did-hosting-common = { version = "0.8", path = "../did-hosting-common", features = ["server-core", "setup-wizard"] }
 # OpenAPI spec generation (behind the off-by-default `openapi` feature).
 utoipa = { version = "5", optional = true }
-vti-common = { version = "0.18", default-features = false }
+vti-common = { version = "0.31", default-features = false }
 async-trait = "0.1"
 affinidi-tdk = { workspace = true }
 # Trust Tasks: the server consumes infrastructure trust tasks (health ping,
@@ -75,11 +75,14 @@ affinidi-tdk = { workspace = true }
 trust-tasks-rs = { workspace = true }
 trust-tasks-didcomm = { workspace = true }
 affinidi-messaging-didcomm-service = { workspace = true }
+# TSP control-message type for `ServerTspHandler::handle_control`'s signature;
+# the accept policy itself lives in `did_hosting_common::server::tsp_relationship`.
+affinidi-tsp = { workspace = true }
 affinidi-tdk-common = { workspace = true }
 affinidi-messaging-didcomm = { workspace = true }
 affinidi-secrets-resolver = { workspace = true }
 tokio-util = { workspace = true }
-affinidi-did-resolver-cache-sdk = "0.8"
+affinidi-did-resolver-cache-sdk = "0.8.38"
 axum = "0.8"
 axum-extra = { workspace = true }
 base64 = { workspace = true }
@@ -88,6 +91,7 @@ chrono = { workspace = true }
 clap = { workspace = true }
 dialoguer = { workspace = true }
 didwebvh-rs = { workspace = true }
+url = { workspace = true }
 ed25519-dalek = { workspace = true }
 fjall = { workspace = true, optional = true }
 hex = "0.4"
@@ -110,6 +114,12 @@ aws-sdk-secretsmanager = { version = "1", optional = true }
 aws-config = { version = "1", features = [
   "behavior-version-latest",
 ], optional = true }
+
+# Not called from this crate — a resolver bound, explained in the workspace
+# manifest. Named here because a `[workspace.dependencies]` entry constrains
+# nothing on its own: only a crate that declares the dependency contributes its
+# version requirement, and this is a subtree that pulls `aws-config`.
+aws-smithy-types = { workspace = true, optional = true }
 google-cloud-secretmanager-v1 = { version = "1", optional = true }
 google-cloud-auth = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
@@ -126,7 +136,18 @@ azure_identity = { version = "1.0", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# `tests/edge_trust_tasks.rs` checks every reply against the schema its type
+# names.
+trust-tasks-rs = { workspace = true, features = ["validate"] }
 anyhow.workspace = true
+# `tests/control_plane_ops.rs` signs control-plane documents with `did:key`
+# signers and verifies them with the crate's local `DidKeyResolver`, so the
+# proof checks run without DID-resolution I/O. It also asserts the claimed-
+# issuer pre-check never reaches the resolver for a document that does not
+# even claim to be the control plane, via a resolver double from
+# `trust-tasks-proof`'s `ProofPurposeResolver` that panics if called.
+affinidi-data-integrity = { workspace = true }
+trust-tasks-proof = { workspace = true }
 # `tests/webs_resolve.rs` re-derives the DID document from the served
 # artifacts with the method crate directly, so the assertion is against
 # an independent implementation rather than against the same code path

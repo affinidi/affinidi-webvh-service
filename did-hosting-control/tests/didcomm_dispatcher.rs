@@ -54,6 +54,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         server: ServerConfig::default(),
         log: LogConfig::default(),
         store: store_config.clone(),
+        fjall: Default::default(),
         auth: AuthConfig::default(),
         secrets: SecretsConfig::default(),
         vta: VtaConfig::default(),
@@ -90,8 +91,12 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
             did_hosting_control::pending_challenges::PendingChallengeTracker::new(),
         ),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
-        pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),
+        large_document_budget: Arc::new(
+            did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
+        ),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
+        cache_invalidate: None,
     };
 
     (state, dir)

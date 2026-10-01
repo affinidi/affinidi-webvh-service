@@ -12,9 +12,8 @@ import { AffinidiLogo } from "../components/AffinidiLogo";
 import { AgentNameChips } from "../components/AgentNameChips";
 import {
   api,
-  clearSessionPrincipalDid,
   setAuthMethod,
-  setSessionPrincipalDid,
+  setRefreshToken,
 } from "../lib/api";
 import { getPasskeyCredential } from "../lib/passkey";
 import { colors, fonts, radii, spacing } from "../lib/theme";
@@ -70,12 +69,10 @@ export default function Login() {
   // Fetch the server's own DID so the operator can see it on the
   // login page — they need it when granting wallet access (the DID
   // is what the wallet pins a did-self-issued vault entry to). The
-  // /api/server-info endpoint is unauthenticated and cached at the
-  // api-client layer; mounting the login page is cheap. `null` is
-  // a legitimate response when the operator hasn't configured a
-  // server_did yet; we skip rendering the row in that case rather
-  // than showing "(unset)" — operators who haven't configured it
-  // don't need a Copy button.
+  // `server/info` Trust Task is the one public read, and is cached at the
+  // api-client layer; mounting the login page is cheap. The row stays
+  // hidden until the read succeeds (a control plane with no DID cannot
+  // answer it).
   const [serverDid, setServerDid] = useState<string | null>(null);
   // The server's own agent names, if it serves any. Same request as the DID —
   // no extra round-trip — and rendered beneath it, because a name is an alias
@@ -88,8 +85,8 @@ export default function Login() {
       try {
         const info = await api.serverInfo();
         if (!cancelled) {
-          setServerDid(info.server_did);
-          setServerNames(info.server_names ?? []);
+          setServerDid(info.serviceDid);
+          setServerNames(info.serviceNames);
         }
       } catch {
         // Best-effort. The login page works without the DID row.
@@ -111,11 +108,15 @@ export default function Login() {
     setPasskeyLoading(true);
     setPasskeyError(null);
     try {
-      const { auth_id, options } = await api.passkeyLoginStart();
-      const credential = await getPasskeyCredential(options);
-      const result = await api.passkeyLoginFinish(auth_id, credential);
+      const { authId, options } = await api.passkeyLoginStart();
+      const credential = await getPasskeyCredential({ publicKey: options });
+      const result = await api.passkeyLoginFinish(authId, credential);
       setAuthMethod("passkey");
-      login(result.access_token);
+      // Keep the renewal credential. Every login path hands one back and
+      // all three used to drop it, which is why a session could not be
+      // renewed and died on a fixed timer.
+      setRefreshToken(result.refreshToken);
+      login(result.accessToken);
       router.replace("/");
     } catch (err: any) {
       setPasskeyError(
@@ -127,19 +128,16 @@ export default function Login() {
   };
 
   // The wallet's `login()` returns the SAME server-issued JWT shape the
-  // passkey path produces (both come out of did-hosting-control's
-  // `/api/auth/`), so we route into `useAuth().login(...)` identically.
-  // Passkey login stays as-is — this is additive.
+  // passkey path produces, so we route into `useAuth().login(...)`
+  // identically. Like the passkey path, it binds this browser's session key,
+  // which signs the session's calls from here on (`wallet-login.ts`).
   const handleWalletLogin = async () => {
     setWalletLoading(true);
     setWalletError(null);
     try {
       const result = await loginWithWallet();
       setAuthMethod("wallet");
-      // Holder login — session DID is the wallet's holder DID. Trust-task
-      // signing should NOT route via vault/sign-trust-task; clear any
-      // stale principal-DID hint from a previous proxy-login session.
-      clearSessionPrincipalDid();
+      setRefreshToken(result.refreshToken || null);
       login(result.accessToken);
       router.replace("/");
     } catch (err: any) {
@@ -206,15 +204,10 @@ export default function Login() {
     try {
       const outcome = await loginWithWalletProxy(entry);
       setAuthMethod("wallet");
-      // Proxy login — session is authenticated as the entry's
-      // principalDid (the SIOP id_token's iss/sub). Subsequent
-      // trust-task signing MUST sign as this DID, not the wallet's
-      // holder; record it so api.ts's signTrustTask path threads
-      // `asDid` through to the wallet's vault/sign-trust-task call.
-      // `principalDid` is optional on ProxyVaultEntry for forward-compat,
-      // but `listProxyCandidates` already filters out entries without
-      // one — only entries that round-trip with a DID reach this path.
-      setSessionPrincipalDid(entry.principalDid!);
+      // The session is the entry's principal DID (the id_token's iss/sub),
+      // and it is bound to the session key the login generated, which
+      // signs as that principal from here on (`trust-task.ts`).
+      setRefreshToken(outcome.result.refreshToken || null);
       login(outcome.result.accessToken);
       // When the operator has enabled the flow visualization, stash
       // it and let the modal hold the redirect. Otherwise (the

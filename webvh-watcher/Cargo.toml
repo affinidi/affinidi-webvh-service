@@ -14,7 +14,13 @@ rust-version.workspace = true
 build = "build.rs"
 
 [features]
-default = ["store-fjall"]
+default = ["keyring", "store-fjall"]
+keyring = ["did-hosting-common/keyring"]
+aws-secrets = ["did-hosting-common/aws-secrets"]
+gcp-secrets = ["did-hosting-common/gcp-secrets"]
+azure-secrets = ["did-hosting-common/azure-secrets"]
+vault-secrets = ["did-hosting-common/vault-secrets"]
+k8s-secrets = ["did-hosting-common/k8s-secrets"]
 store-fjall = ["did-hosting-common/store-fjall"]
 store-redis = ["did-hosting-common/store-redis"]
 store-dynamodb = ["did-hosting-common/store-dynamodb"]
@@ -31,7 +37,19 @@ name = "webvh-watcher"
 path = "src/main.rs"
 
 [dependencies]
-did-hosting-common = { version = "0.8", path = "../did-hosting-common", features = ["server-core"] }
+did-hosting-common = { version = "0.8", path = "../did-hosting-common", features = ["server-core", "setup-wizard"] }
+affinidi-did-resolver-cache-sdk = { workspace = true }
+affinidi-messaging-didcomm = { workspace = true }
+affinidi-messaging-didcomm-service = { workspace = true }
+affinidi-tdk = { workspace = true }
+affinidi-tsp = { workspace = true }
+async-trait = "0.1"
+chrono = { workspace = true }
+tokio-util = { workspace = true }
+trust-tasks-rs = { workspace = true }
+trust-tasks-didcomm = { workspace = true }
+uuid = { workspace = true }
+vta-sdk = { workspace = true }
 axum = "0.8"
 axum-extra = { workspace = true }
 clap = { workspace = true }
@@ -41,6 +59,15 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = "1.0"
-tower-http = { version = "0.7", features = ["trace", "limit"] }
+tower-http = { version = "0.7", features = ["trace"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+affinidi-data-integrity = "0.7"
+affinidi-secrets-resolver = { workspace = true }
+didwebvh-rs = { workspace = true }
+http-body-util = "0.1"
+tempfile = "3"
+trust-tasks-proof = { workspace = true }
+trust-tasks-rs = { workspace = true, features = ["validate"] }

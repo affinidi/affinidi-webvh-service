@@ -12,6 +12,7 @@
 pub mod acl;
 pub mod auth;
 pub mod config;
+pub(crate) mod control_tasks;
 pub mod did_ops;
 pub mod error;
 #[cfg(feature = "ui")]
@@ -26,6 +27,8 @@ pub mod purge_sweep;
 pub mod rate_limit;
 pub mod registry;
 pub mod replay;
+#[cfg(test)]
+mod replication_e2e;
 pub mod routes;
 pub mod secret_store;
 pub mod server;
@@ -37,6 +40,7 @@ pub mod store;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod trust_tasks_auth;
-pub mod trust_tasks_did;
 pub mod trust_tasks_infra;
 pub mod tsp;
+#[cfg(test)]
+mod watcher_e2e;

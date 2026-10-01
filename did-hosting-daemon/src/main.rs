@@ -26,7 +26,7 @@ use did_hosting_common::server::store::{KeyspaceHandle, Store};
 
 use config::DaemonConfig;
 use did_hosting_common::server::store::{
-    KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES, KS_WITNESSES,
+    KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
 };
 
 #[derive(Parser)]
@@ -156,6 +156,39 @@ enum Command {
     },
     /// List the service's own identity generations (key material still honoured).
     IdentityList,
+    /// List this service's established TSP relationships (offline; stop the
+    /// service first).
+    ///
+    /// Each endpoint keeps its own half of every relationship; the mediator holds
+    /// none, so resetting a peer pairing means clearing both ends.
+    TspRelationshipList,
+    /// Reset our half of a TSP relationship to `None`, so the next send to the
+    /// peer re-invites (offline). Keeps the cached peer capability.
+    TspRelationshipReset {
+        /// The peer's DID (its TSP VID).
+        #[arg(long)]
+        peer: String,
+        /// This service's VID for the pair. Needed only for a half-formed
+        /// relationship, which `tsp-relationship-list` cannot show.
+        #[arg(long)]
+        our: Option<String>,
+    },
+    /// Delete TSP relationship records outright (offline).
+    TspRelationshipDelete {
+        /// The peer's DID (its TSP VID).
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        peer: Option<String>,
+        /// This service's VID for the pair. Needed only for a half-formed
+        /// relationship, which `tsp-relationship-list` cannot show.
+        #[arg(long, requires = "peer", conflicts_with = "all")]
+        our: Option<String>,
+        /// Delete every record, established or half-formed.
+        #[arg(long)]
+        all: bool,
+        /// Confirm `--all`. Without it, only reports what would be deleted.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Rotate the service's own key-agreement key.
     ///
     /// Publishes a new DID log entry installing a fresh key-agreement key on a
@@ -221,7 +254,7 @@ enum Command {
         /// Role (admin or owner)
         #[arg(long, default_value = "owner")]
         role: String,
-        /// Override enrollment TTL (in hours)
+        /// Invite lifetime in hours (default: `auth.passkey_enrollment_ttl`)
         #[arg(long)]
         ttl_hours: Option<u64>,
     },
@@ -237,11 +270,17 @@ enum Command {
         #[arg(long)]
         did_witness: Option<PathBuf>,
         /// Witness service URL for requesting a proof
-        #[arg(long)]
+        #[arg(long, requires = "witness_did")]
         witness_url: Option<String>,
         /// Witness ID to use when requesting a proof
         #[arg(long)]
         witness_id: Option<String>,
+        /// The witness server's own DID (its `server_did`), required with
+        /// --witness-url. The sign-in is addressed to it, and the witness
+        /// server refuses one addressed elsewhere. This is not --witness-id,
+        /// which names one of the witnesses that server hosts.
+        #[arg(long)]
+        witness_did: Option<String>,
     },
     /// Recreate a DID at a given path
     RecreateDid {
@@ -439,6 +478,29 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Command::TspRelationshipList) => {
+            if let Err(e) = run_tsp_relationship_list(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::TspRelationshipReset { peer, our }) => {
+            if let Err(e) = run_tsp_relationship_reset(cli.config, peer, our).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::TspRelationshipDelete {
+            peer,
+            our,
+            all,
+            yes,
+        }) => {
+            if let Err(e) = run_tsp_relationship_delete(cli.config, peer, our, all, yes).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
         Some(Command::IdentityList) => {
             if let Err(e) = run_identity_list(cli.config).await {
                 eprintln!("Error: {e}");
@@ -473,6 +535,7 @@ async fn main() {
             did_witness,
             witness_url,
             witness_id,
+            witness_did,
         }) => {
             if let Err(e) = run_bootstrap_did(
                 cli.config,
@@ -481,6 +544,7 @@ async fn main() {
                 did_witness,
                 witness_url,
                 witness_id,
+                witness_did,
             )
             .await
             {
@@ -634,12 +698,14 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // ── Open stores ───────────────────────────────────────────────────
     // fjall locks the directory, so server/watcher/control share one handle.
-    let main_store = Store::open(&config.store).await.unwrap_or_else(|e| {
-        error!("failed to open main store: {e}");
-        std::process::exit(1);
-    });
+    let main_store = Store::open_with(&config.store, &config.fjall)
+        .await
+        .unwrap_or_else(|e| {
+            error!("failed to open main store: {e}");
+            std::process::exit(1);
+        });
 
-    let witness_store = Store::open(&config.witness_store)
+    let witness_store = Store::open_with(&config.witness_store, &config.fjall)
         .await
         .unwrap_or_else(|e| {
             error!("failed to open witness store: {e}");
@@ -692,7 +758,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     // a freshly-deployed daemon — even with no control plane
     // reachable — has the same effective assignments and will host
     // its bootstrap_domains immediately. Once the control plane sends
-    // `MSG_DOMAIN_ASSIGN` the keyspace is the same; subsequent boots
+    // `replica/domain/assign` the keyspace is the same; subsequent boots
     // short-circuit at tier 0.
     let assignment_now = did_hosting_common::server::auth::session::now_epoch();
     match did_hosting_common::server::assignment_seed::seed_assignments_first_boot(
@@ -860,16 +926,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // 2a. Server — public DID-serving routes only (.well-known)
     if config.enable.server {
-        match build_server(
-            &config,
-            &secrets,
-            &main_store,
-            &stats_collector,
-            &http_client,
-            identity.clone(),
-        )
-        .await
-        {
+        match build_server(&config, &main_store, &stats_collector, identity.clone()).await {
             Ok((router, state)) => {
                 combined = combined.merge(router);
                 server_state = Some(state);
@@ -884,7 +941,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // 2b. Witness (nested at /witness)
     if config.enable.witness {
-        match build_witness(&config, &secrets, &witness_store, identity.clone()).await {
+        match build_witness(&config, &witness_store, identity.clone()).await {
             Ok(router) => {
                 combined = combined.nest("/witness", router);
                 enabled_services.push("witness (/witness)");
@@ -920,6 +977,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             &stats_collector,
             &http_client,
             identity.clone(),
+            server_state.as_ref().map(|s| s.did_cache.clone()),
         )
         .await
         {
@@ -1287,57 +1345,21 @@ type ServiceResult = Result<Router, AppError>;
 /// control plane, which is merged at root.
 async fn build_server(
     config: &DaemonConfig,
-    secrets: &ServerSecrets,
     store: &Store,
     stats_collector: &Arc<StatsCollector>,
-    http_client: &reqwest::Client,
     identity: Option<Arc<ServiceIdentity>>,
 ) -> Result<(Router, did_hosting_server::server::AppState), AppError> {
     use did_hosting_server::server::AppState;
 
     let server_config = config.server_config();
 
-    let sessions_ks = store.keyspace(KS_SESSIONS)?;
-    let acl_ks = store.keyspace(KS_ACL)?;
-    let dids_ks = store.keyspace(KS_DIDS)?;
-    let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
-    let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
-    let jwt_keys = init::init_jwt_keys(secrets);
-    let signing_key_bytes = init::decode_multibase_ed25519_key(&secrets.signing_key).ok();
-
-    let (parsed_cidrs, bad_cidrs) = did_hosting_common::server::domain::parse_trusted_cidrs(
-        &server_config.server.trusted_proxy_cidrs,
-    );
-    if !bad_cidrs.is_empty() {
-        warn!(
-            bad_cidrs = ?bad_cidrs,
-            "server.trusted_proxy_cidrs contains unparseable entries; ignoring them"
-        );
-    }
-
-    let state = AppState {
-        store: store.clone(),
-        sessions_ks,
-        acl_ks,
-        dids_ks,
-        config: Arc::new(server_config),
-        did_resolver,
-        secrets_resolver,
-        identity,
-        // The daemon's embedded server does not run its own DIDComm listener —
-        // the control plane's handles the full protocol on the authoritative
-        // store (CLAUDE.md, "What the daemon intentionally does NOT mirror").
-        // The slot exists for parity with the standalone server's AppState.
-        didcomm_service: Arc::new(std::sync::OnceLock::new()),
-        jwt_keys,
-        signing_key_bytes,
-        http_client: http_client.clone(),
-        stats_collector: Some(stats_collector.clone()),
-        did_cache: Arc::new(did_hosting_server::cache::ContentCache::new(
-            Duration::from_secs(300),
-        )),
-        trusted_proxy_cidrs: Arc::new(parsed_cidrs),
-    };
+    // The daemon's embedded server does not run its own messaging listener —
+    // the control plane's handles the full protocol on the authoritative store
+    // (CLAUDE.md, "What the daemon intentionally does NOT mirror") — so its
+    // `didcomm_service` slot stays empty. It reads the one shared store the
+    // control plane writes, so there is nothing to replicate to it.
+    let mut state = AppState::new(store.clone(), server_config)?.with_identity(identity);
+    state.stats_collector = Some(stats_collector.clone());
 
     let router = did_hosting_server::routes::router_public_only().with_state(state.clone());
     info!("server service initialized (public-only, daemon mode)");
@@ -1347,40 +1369,23 @@ async fn build_server(
 
 async fn build_witness(
     config: &DaemonConfig,
-    secrets: &ServerSecrets,
     store: &Store,
     identity: Option<Arc<ServiceIdentity>>,
 ) -> ServiceResult {
     use webvh_witness::server::AppState;
     use webvh_witness::signing::LocalSigner;
 
-    let witness_config = config.witness_config();
-
-    let sessions_ks = store.keyspace(KS_SESSIONS)?;
-    let acl_ks = store.keyspace(KS_ACL)?;
-    let witnesses_ks = store.keyspace(KS_WITNESSES)?;
-
-    let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
-    let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
-    let jwt_keys = init::init_jwt_keys(secrets);
-
-    let state = AppState {
-        store: store.clone(),
-        sessions_ks,
-        acl_ks,
-        witnesses_ks,
-        config: Arc::new(witness_config),
-        did_resolver,
-        secrets_resolver,
+    // The daemon's embedded witness runs no messaging listener of its own —
+    // the control plane's carries the mediator connection — so its Trust Task
+    // listener is the HTTPS binding, `POST /witness/api/trust-tasks`, under the
+    // daemon's DID. Its `didcomm_service` slot stays empty, which is what makes
+    // the witness's rotation path an inert no-op here.
+    let state = AppState::new(
+        store.clone(),
+        config.witness_config(),
         identity,
-        // The daemon's embedded witness runs no DIDComm listener of its own —
-        // the control plane's listener carries the whole protocol. The slot
-        // exists for parity with the standalone witness's AppState, and leaving
-        // it empty is what makes the witness's rotation path an inert no-op here.
-        didcomm_service: Arc::new(std::sync::OnceLock::new()),
-        jwt_keys,
-        signer: Arc::new(LocalSigner),
-    };
+        Arc::new(LocalSigner),
+    )?;
 
     let router = webvh_witness::routes::router().with_state(state);
     info!("witness service initialized");
@@ -1391,19 +1396,27 @@ async fn build_witness(
 async fn build_watcher(config: &DaemonConfig, store: &Store) -> ServiceResult {
     use webvh_watcher::server::AppState;
 
-    let watcher_config = config.watcher_config();
-    let dids_ks = store.keyspace(KS_DIDS)?;
-
-    let state = AppState {
-        store: store.clone(),
-        dids_ks,
-        config: Arc::new(watcher_config),
-    };
-
-    let router = webvh_watcher::routes::router().with_state(state);
-    info!("watcher service initialized");
+    // Resolution only. The embedded watcher reads the daemon's one store, and
+    // it has no DID of its own, so it runs no Trust Task listener: nothing is
+    // ever synced into it. A watcher that mirrors control planes is a
+    // standalone `webvh-watcher` with its own DID.
+    let state = AppState::new(store.clone(), config.watcher_config(), None)?;
+    let router = webvh_watcher::routes::router_public_only().with_state(state);
+    info!("watcher service initialized (resolution only, daemon mode)");
 
     Ok(router)
+}
+
+/// The control plane's Trust Task proof verifier, built exactly as the
+/// standalone control plane builds it (the shared
+/// [`did_hosting_common::server::trust_tasks::build_verifier`]): a deactivated
+/// `did:webvh` signer is refused, an unreachable signer is retryable, and a
+/// proof failing against a cached DID document is retried once, rate-limited,
+/// against a fresh one.
+fn control_verifier(
+    did_resolver: Option<&affinidi_did_resolver_cache_sdk::DIDCacheClient>,
+) -> Option<Arc<did_hosting_common::server::trust_tasks::TransportBoundVerifier>> {
+    did_hosting_common::server::trust_tasks::build_verifier(did_resolver)
 }
 
 async fn build_control(
@@ -1413,10 +1426,26 @@ async fn build_control(
     stats_collector: &Arc<StatsCollector>,
     http_client: &reqwest::Client,
     identity: Option<Arc<ServiceIdentity>>,
+    did_cache: Option<Arc<did_hosting_server::cache::ContentCache>>,
 ) -> Result<(Router, did_hosting_control::server::AppState), AppError> {
-    use did_hosting_control::server::AppState;
+    use did_hosting_control::server::{AppState, CacheInvalidateFn};
+
+    // Lets the control plane's own mutations (register, publish, disable,
+    // rollback, delete) evict the embedded server's resolved-content cache
+    // in the same process — there is no sync round-trip to do it the way a
+    // standalone edge does on receipt of `webvh/sync/*`. `None` when the
+    // server component isn't enabled in this deployment: nothing serves
+    // resolution, so nothing to invalidate.
+    let cache_invalidate: Option<Arc<CacheInvalidateFn>> = did_cache
+        .map(|cache| Arc::new(move |key: &str| cache.invalidate(key)) as Arc<CacheInvalidateFn>);
 
     let control_config = config.control_config();
+
+    // No unsigned mode: a control plane that cannot sign refuses to start.
+    did_hosting_control::signing::require_signing_identity(
+        identity.as_deref(),
+        control_config.server_did.as_deref(),
+    )?;
 
     // Opened here rather than threaded in: `keyspace()` is idempotent and
     // cheap, and passing them as arguments pushed this past clippy's
@@ -1447,20 +1476,14 @@ async fn build_control(
         }
     });
 
-    // Trust Tasks verifier — share the configured DID cache so
-    // `did:web` / `did:webvh` proof verifications hit the same cache
-    // the DIDComm path populates. Mirrors `did_hosting_control::server::build`
-    // for daemon-mode parity (see CLAUDE.md §What the daemon mirrors).
-    let trust_tasks_verifier = did_resolver.clone().map(|client| {
-        let resolver = Arc::new(trust_tasks_proof::affinidi::CachedDidResolver::new(
-            Arc::new(client),
-        ));
-        Arc::new(
-            did_hosting_common::server::trust_tasks::TransportBoundVerifier::with_resolver(
-                resolver,
-            ),
-        )
-    });
+    // Trust Tasks verifier — the control plane's, built by the same shared
+    // constructor (see CLAUDE.md §What the daemon mirrors).
+    let trust_tasks_verifier = control_verifier(did_resolver.as_ref());
+
+    let pending_challenges =
+        did_hosting_control::pending_challenges::PendingChallengeTracker::for_auth_config(
+            &control_config.auth,
+        );
 
     let state = AppState {
         store: store.clone(),
@@ -1484,13 +1507,22 @@ async fn build_control(
         replay_cache: Arc::new(did_hosting_control::replay::ReplayCache::new()),
         path_locks: did_hosting_control::path_locks::PathLocks::new(),
         acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
-        pending_challenges: Arc::new(
-            did_hosting_control::pending_challenges::PendingChallengeTracker::new(),
-        ),
-        pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        pending_challenges: Arc::new(pending_challenges),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
+        redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),
+        cache_invalidate,
+        large_document_budget: Arc::new(
+            did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
+        ),
     };
+
+    // Reload challenges issued before a restart, so the caps hold across it.
+    // Mirrors `did_hosting_control::server` (startup initialisation parity).
+    state
+        .pending_challenges
+        .seed_from_sessions_or_warn(&state.sessions_ks)
+        .await;
 
     // Seed registry from static config
     did_hosting_control::server::seed_registry(&state).await;
@@ -1642,8 +1674,6 @@ async fn run_invite(
     role: String,
     ttl_hours: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use did_hosting_common::server::passkey::routes::create_enrollment_invite;
-
     let config = DaemonConfig::load(config_path)?;
     let control_config = config.control_config();
 
@@ -1660,23 +1690,14 @@ async fn run_invite(
     let store = Store::open(&control_config.store).await?;
     let sessions_ks = store.keyspace(KS_SESSIONS)?;
 
-    let resp =
-        create_enrollment_invite(&sessions_ks, base_url, enrollment_ttl, &did, &role).await?;
-
-    eprintln!();
-    eprintln!("  Enrollment invite created!");
-    eprintln!();
-    eprintln!("  DID:     {did}");
-    eprintln!("  Role:    {role}");
-    let ttl_hours_display = enrollment_ttl / 3600;
-    eprintln!(
-        "  Expires: in {ttl_hours_display}h (epoch {})",
-        resp.expires_at
-    );
-    eprintln!();
-    eprintln!("  Enrollment URL:");
-    eprintln!("  {}", resp.enrollment_url);
-    eprintln!();
+    did_hosting_common::server::passkey::run_cli_invite(
+        &sessions_ks,
+        base_url,
+        enrollment_ttl,
+        &did,
+        &role,
+    )
+    .await?;
 
     Ok(())
 }
@@ -1688,6 +1709,7 @@ async fn run_bootstrap_did(
     did_witness: Option<PathBuf>,
     witness_url: Option<String>,
     witness_id: Option<String>,
+    witness_did: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use affinidi_tdk::secrets_resolver::secrets::Secret;
     use did_hosting_server::bootstrap;
@@ -1769,44 +1791,25 @@ async fn run_bootstrap_did(
         .await?;
 
         // Optional: request witness proof
-        if let (Some(w_url), Some(w_id)) = (witness_url, witness_id) {
-            use did_hosting_common::WitnessClient;
-
+        if let (Some(w_url), Some(w_id), Some(w_did)) = (witness_url, witness_id, witness_did) {
             eprintln!("  Requesting witness proof...");
-            let mut witness_client = WitnessClient::new(&w_url);
-            if let Err(e) = witness_client
-                .authenticate(&result.did_id, &signing_secret)
+            eprintln!("  NOTE: the DID must already be served (by a running server) for the");
+            eprintln!("  witness to resolve it and verify the request.");
+            match bootstrap::request_witness_proof(&w_url, &w_did, &w_id, &result, &signing_secret)
                 .await
             {
-                eprintln!("  Warning: witness authentication failed: {e}");
-            } else {
-                let version_id = result
-                    .jsonl
-                    .lines()
-                    .last()
-                    .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                    .and_then(|v| {
-                        v.get("versionId")
-                            .and_then(|id| id.as_str())
-                            .map(String::from)
-                    });
-
-                if let Some(vid) = version_id {
-                    match witness_client.request_proof(&w_id, &vid).await {
-                        Ok(proof) => {
-                            let proof_json = serde_json::to_string(&proof)?;
-                            dids_ks
-                                .insert_raw(
-                                    did_hosting_server::did_ops::content_witness_key(&mnemonic),
-                                    proof_json.into_bytes(),
-                                )
-                                .await?;
-                            eprintln!("  Witness proof stored.");
-                        }
-                        Err(e) => {
-                            eprintln!("  Warning: witness proof request failed: {e}");
-                        }
-                    }
+                Ok(witness_file) => {
+                    dids_ks
+                        .insert_raw(
+                            did_hosting_server::did_ops::content_witness_key(&mnemonic),
+                            witness_file.into_bytes(),
+                        )
+                        .await?;
+                    eprintln!("  Witness proof stored.");
+                }
+                Err(e) => {
+                    eprintln!("  Warning: witness proof request failed: {e}");
+                    eprintln!("  The DID was created but has no witness proof.");
                 }
             }
         }
@@ -2358,6 +2361,39 @@ async fn run_remove_did(
 }
 
 /// `identity-list` — show which key material this service still honours.
+async fn run_tsp_relationship_list(
+    config_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = DaemonConfig::load(config_path)?;
+    did_hosting_common::server::cli_tsp::run_list(&config.store).await
+}
+
+async fn run_tsp_relationship_reset(
+    config_path: Option<PathBuf>,
+    peer: String,
+    our: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use did_hosting_common::server::cli_tsp::{Target, run_reset};
+    let config = DaemonConfig::load(config_path)?;
+    run_reset(&config.store, Target::Peer { peer, our }).await
+}
+
+async fn run_tsp_relationship_delete(
+    config_path: Option<PathBuf>,
+    peer: Option<String>,
+    our: Option<String>,
+    all: bool,
+    yes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use did_hosting_common::server::cli_tsp::{Target, run_delete};
+    let config = DaemonConfig::load(config_path)?;
+    let target = match peer {
+        Some(peer) if !all => Target::Peer { peer, our },
+        _ => Target::All,
+    };
+    run_delete(&config.store, target, yes).await
+}
+
 async fn run_identity_list(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let config = DaemonConfig::load(config_path)?;
     did_hosting_common::server::cli_identity::run_list_generations(&config.store).await
@@ -2472,4 +2508,215 @@ async fn run_identity_rotate_keys(
     eprintln!();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod verifier_tests {
+    //! The daemon's control-plane verifier behaves like the standalone control
+    //! plane's: status, rotation and reachability of the signer's DID.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use affinidi_did_resolver_cache_sdk::{
+        AsyncResolver, DIDCacheClient, MethodName, Resolution, ResolverError,
+        config::DIDCacheConfigBuilder,
+    };
+    use affinidi_tdk::did_common::{DID, Document};
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+    use did_hosting_common::server::trust_tasks::{
+        BoundError, TransportBoundVerifier, send::build_request, sign_document, verify_sender_bound,
+    };
+    use serde_json::{Value, json};
+    use trust_tasks_rs::{RejectReason, TrustTask};
+
+    use super::control_verifier;
+
+    const TYPE: &str = "https://trusttasks.org/spec/webvh/sync/delete/0.1";
+    const ME: &str = "did:example:daemon";
+
+    async fn cache() -> DIDCacheClient {
+        DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .unwrap()
+    }
+
+    fn verifier(client: &DIDCacheClient) -> Arc<TransportBoundVerifier> {
+        control_verifier(Some(client)).expect("a resolver is configured")
+    }
+
+    fn key(seed: u8, did: &str) -> Secret {
+        let mut secret = Secret::generate_ed25519(None, Some(&[seed; 32]));
+        secret.id = format!("{did}#key-1");
+        secret
+    }
+
+    fn document(did: &str, signer: &Secret) -> Document {
+        serde_json::from_value(json!({
+            "id": did,
+            "verificationMethod": [{
+                "id": format!("{did}#key-1"),
+                "type": "Multikey",
+                "controller": did,
+                "publicKeyMultibase": signer.get_public_keymultibase().unwrap(),
+            }],
+            "authentication": [format!("{did}#key-1")],
+        }))
+        .unwrap()
+    }
+
+    async fn signed(did: &str, signer: &Secret) -> TrustTask<Value> {
+        let doc = build_request(TYPE, did, ME, json!({ "mnemonic": "alice" })).unwrap();
+        sign_document(&doc, signer).await.unwrap()
+    }
+
+    async fn check(
+        doc: &TrustTask<Value>,
+        did: &str,
+        verifier: &TransportBoundVerifier,
+    ) -> Result<String, BoundError> {
+        verify_sender_bound(doc, Some(did), Some(did), ME, verifier).await
+    }
+
+    /// A deactivated `did:webvh` signer is refused even though its last
+    /// document, still served from cache, lists the key; the same document
+    /// from a live DID verifies. The refusal is final: it spends no forced
+    /// re-resolution (which would evict the recorded verdict and the cached
+    /// document, and fail here as unreachable).
+    #[tokio::test]
+    async fn a_deactivated_webvh_signer_is_refused() {
+        let mut client = cache().await;
+        let live = "did:webvh:QmLive:live.example";
+        let dead = "did:webvh:QmDead:dead.example";
+        let (live_key, dead_key) = (key(1, live), key(2, dead));
+        client
+            .add_did_document(live, document(live, &live_key))
+            .await;
+        client
+            .add_did_document(dead, document(dead, &dead_key))
+            .await;
+        let v = verifier(&client);
+        v.record_deactivation_verdict(live, false);
+        v.record_deactivation_verdict(dead, true);
+
+        check(&signed(live, &live_key).await, live, &v)
+            .await
+            .expect("a live signer verifies");
+        let err = check(&signed(dead, &dead_key).await, dead, &v)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("deactivated"), "{err}");
+        assert!(!err.is_transient(), "{err:?}");
+        assert!(
+            matches!(err.reject_reason(), RejectReason::ProofInvalid { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// Serves `did:web` documents listing whichever key `keys` holds, and
+    /// counts resolutions.
+    struct RotatingResolver {
+        keys: Arc<std::sync::Mutex<Secret>>,
+        resolutions: Arc<AtomicUsize>,
+    }
+
+    impl AsyncResolver for RotatingResolver {
+        fn name(&self) -> &str {
+            "RotatingResolver"
+        }
+
+        fn resolve<'a>(
+            &'a self,
+            did: &'a DID,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Resolution> + Send + 'a>> {
+            self.resolutions.fetch_add(1, Ordering::SeqCst);
+            let current = self.keys.lock().unwrap().clone();
+            let did = did.to_string();
+            Box::pin(async move { Some(Ok(document(&did, &current))) })
+        }
+    }
+
+    /// A signer that rotated its key after its document was cached verifies
+    /// after exactly one fresh resolution.
+    #[tokio::test]
+    async fn a_rotated_key_verifies_after_one_refresh() {
+        let did = "did:web:rotated.example";
+        let (old_key, new_key) = (key(3, did), key(4, did));
+        let keys = Arc::new(std::sync::Mutex::new(old_key));
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let mut client = cache().await;
+        client.set_resolver(
+            MethodName::Web,
+            Box::new(RotatingResolver {
+                keys: keys.clone(),
+                resolutions: resolutions.clone(),
+            }),
+        );
+        // The pre-rotation document is cached.
+        client.resolve(did).await.unwrap();
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+        let v = verifier(&client);
+
+        *keys.lock().unwrap() = new_key.clone();
+        let proven = check(&signed(did, &new_key).await, did, &v)
+            .await
+            .expect("verifies after one refresh");
+        assert_eq!(proven, did);
+        assert_eq!(resolutions.load(Ordering::SeqCst), 2, "exactly one refresh");
+    }
+
+    /// A signer whose DID cannot be resolved is `unavailable` — retryable —
+    /// not a bad proof.
+    #[tokio::test]
+    async fn an_unreachable_signer_is_unavailable() {
+        struct Unreachable;
+        impl AsyncResolver for Unreachable {
+            fn name(&self) -> &str {
+                "Unreachable"
+            }
+            fn resolve<'a>(
+                &'a self,
+                _did: &'a DID,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Resolution> + Send + 'a>>
+            {
+                Box::pin(async {
+                    Some(Err(ResolverError::ResolutionFailed(
+                        "connection refused".to_string(),
+                    )))
+                })
+            }
+        }
+
+        let did = "did:web:unreachable.example";
+        let signer = key(5, did);
+        let mut client = cache().await;
+        client.set_resolver(MethodName::Web, Box::new(Unreachable));
+        let err = check(&signed(did, &signer).await, did, &verifier(&client))
+            .await
+            .unwrap_err();
+        assert!(err.is_transient(), "{err:?}");
+        assert!(
+            matches!(err.reject_reason(), RejectReason::Unavailable { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// The `did:webvh` flavour: a document served from cache whose DID log
+    /// cannot be read leaves deactivation unestablished, which is retryable.
+    #[tokio::test]
+    async fn a_webvh_signer_with_an_unreadable_log_is_unavailable() {
+        // `.invalid` never resolves (RFC 6761).
+        let did = "did:webvh:QmGone:gone.invalid";
+        let signer = key(6, did);
+        let mut client = cache().await;
+        client.add_did_document(did, document(did, &signer)).await;
+        let err = check(&signed(did, &signer).await, did, &verifier(&client))
+            .await
+            .unwrap_err();
+        assert!(err.is_transient(), "{err:?}");
+        assert!(
+            matches!(err.reject_reason(), RejectReason::Unavailable { .. }),
+            "{err:?}"
+        );
+    }
 }

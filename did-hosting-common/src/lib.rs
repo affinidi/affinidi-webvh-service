@@ -1,26 +1,24 @@
-mod client;
-mod control_client;
-pub mod did;
 #[cfg(feature = "server-core")]
-pub mod did_hosting_tasks;
+mod client;
+pub mod did;
 pub mod did_ops;
 pub mod didcomm_types;
 mod error;
+#[cfg(feature = "server-core")]
+mod http;
 pub mod method;
 mod types;
-mod watcher_client;
+#[cfg(feature = "server-core")]
 mod witness_client;
 
 #[cfg(feature = "server-core")]
 pub mod server;
 
-pub use client::WebVHClient;
-pub use control_client::{
-    ControlClient, DidSyncEntry, DidSyncUpdate, RegisterServiceRequest, RegisterServiceResponse,
-};
+#[cfg(feature = "server-core")]
+pub use client::{DidSummary, WebVHClient};
 pub use error::{Result, WebVHError};
 pub use types::*;
-pub use watcher_client::WatcherClient;
+#[cfg(feature = "server-core")]
 pub use witness_client::WitnessClient;
 
 // Re-export Secret so SDK users don't need affinidi-tdk directly.

@@ -138,6 +138,21 @@ impl KeyspaceOps for RedisKeyspace {
         })
     }
 
+    fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
+        Box::pin(async move {
+            // Redis `INCR` is a single atomic command — cross-replica safe
+            // by construction, the same guarantee `take_raw_atomic`'s
+            // `GETDEL` gives.
+            let fk = self.full_key(&key);
+            let mut conn = self.conn.clone();
+            let next: u64 = conn
+                .incr(fk, 1i64)
+                .await
+                .map_err(|e| AppError::Store(format!("redis INCR: {e}")))?;
+            Ok(next)
+        })
+    }
+
     fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
         Box::pin(async move {
             let mut pattern = self.full_key(&prefix);

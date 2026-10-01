@@ -23,6 +23,18 @@ use super::error::AppError;
 /// fresh enough to accept is still tracked for replay detection.
 pub const FRESHNESS_WINDOW_SECS: u64 = 300;
 
+/// How far into the future a signed message or document's timestamp may sit
+/// and still be accepted, absorbing ordinary clock skew between peers.
+pub const FUTURE_SKEW_SECS: u64 = 60;
+
+/// How long a replay cache must remember an accepted `(sender, id)` pair.
+///
+/// Not just [`FRESHNESS_WINDOW_SECS`]: a message stamped at the edge of the
+/// future tolerance stays inside the freshness window for
+/// `FRESHNESS_WINDOW_SECS + FUTURE_SKEW_SECS` after it was first accepted, so
+/// a cache that forgot it sooner would accept it a second time.
+pub const REPLAY_WINDOW_SECS: u64 = FRESHNESS_WINDOW_SECS + FUTURE_SKEW_SECS;
+
 /// Extract the signer's key ID from a JWS protected header without verifying the signature.
 ///
 /// Rejects multi-signature JWS envelopes outright — the threat model assumes a
@@ -79,6 +91,29 @@ async fn resolve_verifying_key(
         .await
         .map_err(|e| AppError::Authentication(format!("failed to resolve DID {base_did}: {e}")))?;
 
+    // Signing in is authentication, so the key must be one the DID lists under
+    // `authentication` — not merely any key in its document (an
+    // `assertionMethod` key is for attestations, a `keyAgreement` key for
+    // encryption).
+    let fragment = kid.find('#').map(|i| &kid[i..]);
+    let refers = |id: &str| id == kid || fragment.is_some_and(|f| id == f);
+    let listed = resolved.doc.authentication.iter().any(|r| {
+        match r {
+        affinidi_tdk::did_common::verification_method::VerificationRelationship::Reference(id) => {
+            refers(id)
+        }
+        affinidi_tdk::did_common::verification_method::VerificationRelationship::VerificationMethod(
+            m,
+        ) => refers(m.id.as_str()),
+        _ => false,
+    }
+    });
+    if !listed {
+        return Err(AppError::Authentication(format!(
+            "verification method {kid} is not an authentication key of {base_did}"
+        )));
+    }
+
     let vm = resolved.doc.get_verification_method(kid).ok_or_else(|| {
         AppError::Authentication(format!(
             "verification method {kid} not found in DID document"
@@ -109,6 +144,36 @@ async fn resolve_verifying_key(
         .map_err(|_| AppError::Authentication("public key must be 32 bytes".into()))
 }
 
+/// Refuse a signed sign-in message not addressed to this service
+/// (affinidi-webvh-service#207; the rule is SPEC §7.2 item 5, as in VTI #1638).
+///
+/// A JWS-signed message is readable and forwardable by anyone holding it — the
+/// signature proves who wrote it, not who it was for. Without this check a
+/// service the holder signed in to could relay the message to this one and be
+/// issued a session as the holder. So the message must name exactly one
+/// recipient, and it must be this service's own DID, by exact string equality.
+///
+/// Call it on every sign-in path that accepts a signed (not encrypted)
+/// envelope, before the canonical handler runs.
+pub fn require_addressed_to(msg: &Message, own_did: Option<&str>) -> Result<(), AppError> {
+    let own = own_did.ok_or_else(|| {
+        AppError::Config(
+            "server_did not configured; a signed sign-in cannot be addressed to this service"
+                .into(),
+        )
+    })?;
+    match msg.to.as_deref() {
+        None | Some([]) => Err(AppError::Validation(
+            "malformedRequest: a signed sign-in message must name this service in `to`".into(),
+        )),
+        Some([one]) if one == own => Ok(()),
+        Some(to) => Err(AppError::Authentication(format!(
+            "wrongRecipient: this message is addressed to {}, not to this service ({own})",
+            to.join(", ")
+        ))),
+    }
+}
+
 /// Unpack a DIDComm signed (JWS) message and verify the JWS signer matches `msg.from`.
 ///
 /// Resolves the signer's public key from the JWS protected-header `kid`, verifies
@@ -132,7 +197,11 @@ pub async fn unpack_signed(
     let kid = extract_signer_kid(input)?;
     let verifying_key = resolve_verifying_key(did_resolver, &kid).await?;
 
-    let result = unpack::unpack(input, None, None, None, Some(&verifying_key))
+    // Verify under the resolved key *as the key of `kid`*: the reported
+    // `signer_kid` is then the key id the signature was checked against.
+    let verify_key = affinidi_tdk::didcomm::jws::verify::VerifyKey::Ed25519(verifying_key);
+    let signer = affinidi_tdk::didcomm::SignerKey::new(&kid, &verify_key);
+    let result = unpack::unpack_bound(input, None, None, None, Some(signer))
         .map_err(|e| AppError::Authentication(format!("failed to unpack message: {e}")))?;
 
     let (message, signer_kid) = match result {
@@ -179,21 +248,34 @@ pub async fn unpack_signed(
         ));
     }
 
-    if let Some(created_time) = message.created_time {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if now.saturating_sub(created_time) > FRESHNESS_WINDOW_SECS {
-            return Err(AppError::Authentication(
-                "message too old (created_time exceeds 5-minute window)".into(),
-            ));
-        }
-        if created_time > now + 60 {
-            return Err(AppError::Authentication(
-                "message created_time is in the future".into(),
-            ));
-        }
+    // `created_time` is REQUIRED, not optional. Freshness and the DIDComm
+    // replay cache are a matched pair (the cache TTL equals the freshness
+    // window and prunes entries past it), so a signed envelope with no
+    // `created_time` would never become "stale" and could be replayed to
+    // re-trigger a state-changing DID op once its replay-cache entry aged out.
+    // `created_time` is inside the JWS-signed payload, so an attacker can't add
+    // or strip it — every compliant sender sets it (this service's own clients,
+    // and the VTA's webvh client, all do), so treating its absence as a
+    // rejection closes the gap without refusing any real client.
+    let created_time = message.created_time.ok_or_else(|| {
+        AppError::Authentication(
+            "signed message is missing `created_time` (required for freshness/replay protection)"
+                .into(),
+        )
+    })?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now.saturating_sub(created_time) > FRESHNESS_WINDOW_SECS {
+        return Err(AppError::Authentication(
+            "message too old (created_time exceeds 5-minute window)".into(),
+        ));
+    }
+    if created_time > now + FUTURE_SKEW_SECS {
+        return Err(AppError::Authentication(
+            "message created_time is in the future".into(),
+        ));
     }
 
     Ok((message, signer_base))
@@ -394,6 +476,44 @@ fn extract_signer_kid_compact(header_b64: &str) -> Result<String, AppError> {
     header
         .kid
         .ok_or_else(|| AppError::Authentication("id_token header missing kid".into()))
+}
+
+#[cfg(test)]
+mod addressed_to_tests {
+    use super::require_addressed_to;
+    use affinidi_tdk::didcomm::Message;
+    use serde_json::json;
+
+    fn msg(to: Option<Vec<&str>>) -> Message {
+        let mut m = Message::build("id-1".to_string(), "t".to_string(), json!({})).finalize();
+        m.to = to.map(|v| v.into_iter().map(String::from).collect());
+        m
+    }
+
+    /// affinidi-webvh-service#207: only a message addressed to this service,
+    /// and to it alone, signs in here.
+    #[test]
+    fn a_signed_sign_in_must_be_addressed_to_this_service_alone() {
+        let own = Some("did:web:svc.example");
+        assert!(require_addressed_to(&msg(Some(vec!["did:web:svc.example"])), own).is_ok());
+        // Another service — the relay.
+        assert!(require_addressed_to(&msg(Some(vec!["did:web:other.example"])), own).is_err());
+        // Several recipients: valid at each, so not bound to this one.
+        assert!(
+            require_addressed_to(
+                &msg(Some(vec!["did:web:svc.example", "did:web:other.example"])),
+                own
+            )
+            .is_err()
+        );
+        // None.
+        assert!(require_addressed_to(&msg(None), own).is_err());
+        assert!(require_addressed_to(&msg(Some(vec![])), own).is_err());
+        // Exact equality, no normalisation.
+        assert!(require_addressed_to(&msg(Some(vec!["did:web:svc.example "])), own).is_err());
+        // A service with no DID cannot be addressed.
+        assert!(require_addressed_to(&msg(Some(vec!["did:web:svc.example"])), None).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -618,5 +738,47 @@ mod tests {
         .await
         .expect("did:key resolver");
         assert!(verify_siop_id_token(&token, &resolver).await.is_err());
+    }
+
+    /// A signed sign-in or refresh must use a key the DID lists under
+    /// `authentication`; an `assertionMethod`-only key is refused.
+    #[tokio::test]
+    async fn sign_in_keys_must_be_authentication_keys() {
+        use affinidi_secrets_resolver::secrets::Secret;
+        let secret = Secret::generate_ed25519(None, Some(&[4u8; 32]));
+        let pk = secret.get_public_keymultibase().unwrap();
+        let mut resolver = DIDCacheClient::new(
+            affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default().build(),
+        )
+        .await
+        .unwrap();
+        for (did, rel) in [
+            ("did:web:auth.example", "authentication"),
+            ("did:web:assert.example", "assertionMethod"),
+        ] {
+            let doc: affinidi_tdk::did_common::Document =
+                serde_json::from_value(serde_json::json!({
+                    "id": did,
+                    "verificationMethod": [{
+                        "id": format!("{did}#key-1"),
+                        "type": "Multikey",
+                        "controller": did,
+                        "publicKeyMultibase": pk,
+                    }],
+                    rel: [format!("{did}#key-1")],
+                }))
+                .unwrap();
+            resolver.add_did_document(did, doc).await;
+        }
+        resolve_verifying_key(&resolver, "did:web:auth.example#key-1")
+            .await
+            .expect("authentication key accepted");
+        let err = resolve_verifying_key(&resolver, "did:web:assert.example#key-1")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not an authentication key"),
+            "{err}"
+        );
     }
 }

@@ -79,6 +79,39 @@ enum Command {
     ListAcl,
     /// List the service's own identity generations (key material still honoured).
     IdentityList,
+    /// List this service's established TSP relationships (offline; stop the
+    /// service first).
+    ///
+    /// Each endpoint keeps its own half of every relationship; the mediator holds
+    /// none, so resetting a peer pairing means clearing both ends.
+    TspRelationshipList,
+    /// Reset our half of a TSP relationship to `None`, so the next send to the
+    /// peer re-invites (offline). Keeps the cached peer capability.
+    TspRelationshipReset {
+        /// The peer's DID (its TSP VID).
+        #[arg(long)]
+        peer: String,
+        /// This service's VID for the pair. Needed only for a half-formed
+        /// relationship, which `tsp-relationship-list` cannot show.
+        #[arg(long)]
+        our: Option<String>,
+    },
+    /// Delete TSP relationship records outright (offline).
+    TspRelationshipDelete {
+        /// The peer's DID (its TSP VID).
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        peer: Option<String>,
+        /// This service's VID for the pair. Needed only for a half-formed
+        /// relationship, which `tsp-relationship-list` cannot show.
+        #[arg(long, requires = "peer", conflicts_with = "all")]
+        our: Option<String>,
+        /// Delete every record, established or half-formed.
+        #[arg(long)]
+        all: bool,
+        /// Confirm `--all`. Without it, only reports what would be deleted.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Rotate the service's own key-agreement key.
     ///
     /// Publishes a new DID log entry installing a fresh key-agreement key on a
@@ -138,7 +171,7 @@ enum Command {
         /// Role (admin or owner)
         #[arg(long, default_value = "owner")]
         role: String,
-        /// Override enrollment TTL (in hours)
+        /// Invite lifetime in hours (default: `auth.passkey_enrollment_ttl`)
         #[arg(long)]
         ttl_hours: Option<u64>,
     },
@@ -361,6 +394,29 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Command::TspRelationshipList) => {
+            if let Err(e) = run_tsp_relationship_list(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::TspRelationshipReset { peer, our }) => {
+            if let Err(e) = run_tsp_relationship_reset(cli.config, peer, our).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::TspRelationshipDelete {
+            peer,
+            our,
+            all,
+            yes,
+        }) => {
+            if let Err(e) = run_tsp_relationship_delete(cli.config, peer, our, all, yes).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
         Some(Command::IdentityList) => {
             if let Err(e) = run_identity_list(cli.config).await {
                 eprintln!("Error: {e}");
@@ -545,7 +601,7 @@ async fn run_control(config_path: Option<PathBuf>) {
         }
     };
 
-    let store = store::Store::open(&config.store)
+    let store = store::Store::open_with(&config.store, &config.fjall)
         .await
         .expect("failed to open store");
 
@@ -592,8 +648,6 @@ async fn run_invite(
     role: String,
     ttl_hours: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use did_hosting_common::server::passkey::routes::create_enrollment_invite;
-
     let config = AppConfig::load(config_path)?;
 
     let base_url = config
@@ -609,20 +663,14 @@ async fn run_invite(
     let store = store::Store::open(&config.store).await?;
     let sessions_ks = store.keyspace(KS_SESSIONS)?;
 
-    let resp =
-        create_enrollment_invite(&sessions_ks, base_url, enrollment_ttl, &did, &role).await?;
-
-    eprintln!();
-    eprintln!("  Enrollment invite created!");
-    eprintln!();
-    eprintln!("  DID:     {did}");
-    eprintln!("  Role:    {role}");
-    let ttl_hours = enrollment_ttl / 3600;
-    eprintln!("  Expires: in {ttl_hours}h (epoch {})", resp.expires_at);
-    eprintln!();
-    eprintln!("  Enrollment URL:");
-    eprintln!("  {}", resp.enrollment_url);
-    eprintln!();
+    did_hosting_common::server::passkey::run_cli_invite(
+        &sessions_ks,
+        base_url,
+        enrollment_ttl,
+        &did,
+        &role,
+    )
+    .await?;
 
     Ok(())
 }
@@ -827,6 +875,39 @@ fn print_banner() {
 }
 
 /// `identity-list` — show which key material this service still honours.
+async fn run_tsp_relationship_list(
+    config_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    did_hosting_common::server::cli_tsp::run_list(&config.store).await
+}
+
+async fn run_tsp_relationship_reset(
+    config_path: Option<PathBuf>,
+    peer: String,
+    our: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use did_hosting_common::server::cli_tsp::{Target, run_reset};
+    let config = AppConfig::load(config_path)?;
+    run_reset(&config.store, Target::Peer { peer, our }).await
+}
+
+async fn run_tsp_relationship_delete(
+    config_path: Option<PathBuf>,
+    peer: Option<String>,
+    our: Option<String>,
+    all: bool,
+    yes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use did_hosting_common::server::cli_tsp::{Target, run_delete};
+    let config = AppConfig::load(config_path)?;
+    let target = match peer {
+        Some(peer) if !all => Target::Peer { peer, our },
+        _ => Target::All,
+    };
+    run_delete(&config.store, target, yes).await
+}
+
 async fn run_identity_list(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load(config_path)?;
     did_hosting_common::server::cli_identity::run_list_generations(&config.store).await

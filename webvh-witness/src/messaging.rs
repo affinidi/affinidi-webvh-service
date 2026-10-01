@@ -3,40 +3,26 @@
 //! Uses the `affinidi-messaging-didcomm-service` framework for mediator
 //! connection management, message dispatch, and response packing/sending.
 //!
-//! **This listener serves no witness protocol.** It once routed `authenticate`,
-//! `witness/proof-request` and `witness/list-request` — a second implementation
-//! of operations the REST API already serves and which `witness_client`, the
-//! only client of this service in the estate, has always used over HTTP
-//! (`/api/auth/*`, `POST /api/proof/{witness_id}`, `GET /api/witnesses`).
-//! Nothing ever spoke the DIDComm forms, so they are gone rather than kept as
-//! a parallel surface to keep in step.
-//!
-//! What remains is the mediator presence the service does depend on: trust-ping
-//! and message-pickup status, and a listener for `identity_rotation` to drain a
-//! superseded generation through. Adding a witness operation here again should
-//! mean deciding it belongs on DIDComm, not restoring a mirror of the REST API.
+//! Every witness operation arrives as a signed Trust Task document inside the
+//! framework's DIDComm trust-task envelope, and is handed to
+//! [`crate::trust_tasks::dispatch_inbound_document`] — the same dispatch the
+//! TSP handler and `POST /api/trust-tasks` use. There are no bare-message
+//! routes. What else remains is the mediator presence the service depends on:
+//! trust-ping and message-pickup status.
 
 use affinidi_messaging_didcomm::Message;
 use affinidi_messaging_didcomm_service::{
-    DIDCommResponse, DIDCommServiceError, HandlerContext, MESSAGE_PICKUP_STATUS_TYPE,
+    DIDCommResponse, DIDCommServiceError, Extension, HandlerContext, MESSAGE_PICKUP_STATUS_TYPE,
     MessagePolicy, RequestLogging, Router, TRUST_PING_TYPE, handler_fn, ignore_handler,
     trust_ping_handler,
 };
-use serde_json::json;
+use serde_json::Value;
 use tracing::warn;
 
 use did_hosting_common::server::problem_report::log_problem_report;
 
 use crate::server::AppState;
-
-/// Emitted by the fallback for a message type this listener does not serve.
-///
-/// The only witness-specific type left. `authenticate`, `witness/proof-request`
-/// and `witness/list-request` are gone: they were a second implementation of
-/// operations the REST API already serves and `witness_client` already uses
-/// (`/api/auth/*`, `POST /api/proof/{witness_id}`, `GET /api/witnesses`), and
-/// nothing in the estate ever spoke the DIDComm forms.
-const MSG_WITNESS_PROBLEM_REPORT: &str = "https://affinidi.com/webvh/1.0/witness/problem-report";
+use crate::trust_tasks::{Via, dispatch_inbound_document};
 
 /// Build the DIDComm router for the witness service.
 pub fn build_witness_router(state: AppState) -> Result<Router, DIDCommServiceError> {
@@ -44,6 +30,10 @@ pub fn build_witness_router(state: AppState) -> Result<Router, DIDCommServiceErr
         .extension(state)
         .route(TRUST_PING_TYPE, handler_fn(trust_ping_handler))?
         .route(MESSAGE_PICKUP_STATUS_TYPE, handler_fn(ignore_handler))?
+        .route(
+            trust_tasks_didcomm::ENVELOPE_TYPE,
+            handler_fn(handle_trust_tasks_envelope),
+        )?
         .fallback(handler_fn(handle_fallback))
         .layer(
             MessagePolicy::new()
@@ -53,36 +43,61 @@ pub fn build_witness_router(state: AppState) -> Result<Router, DIDCommServiceErr
         .layer(RequestLogging))
 }
 
-// ---------------------------------------------------------------------------
-// Handlers
-// ---------------------------------------------------------------------------
+/// Inbound trust-task document carried in a DIDComm envelope. The reply is
+/// returned, so the framework routes it back over the same connection.
+async fn handle_trust_tasks_envelope(
+    ctx: HandlerContext,
+    message: Message,
+    Extension(state): Extension<AppState>,
+) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
+    let Some((typ, body)) =
+        run_trust_tasks_envelope(&state, ctx.sender_did.as_deref(), &message).await
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        DIDCommResponse::new(typ, body).thid(message.id.clone()),
+    ))
+}
+
+/// The DIDComm envelope entry point, without the messaging framework around
+/// it: read the Trust Task document the envelope carries, dispatch it, and
+/// return the reply envelope's type and body. `None` when there is nothing to
+/// answer. `sender` is a routing hint that must agree with the proof.
+pub async fn run_trust_tasks_envelope(
+    state: &AppState,
+    sender: Option<&str>,
+    message: &Message,
+) -> Option<(String, Value)> {
+    let doc: trust_tasks_rs::TrustTask<Value> = match serde_json::from_value(message.body.clone()) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(
+                sender,
+                error = %e,
+                "trust-tasks envelope: inner body is not a Trust Task document"
+            );
+            return None;
+        }
+    };
+    let reply = dispatch_inbound_document(state, Via::Didcomm, sender, doc).await?;
+    Some((trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), reply))
+}
 
 async fn handle_fallback(
     ctx: HandlerContext,
     message: Message,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
     let sender = ctx.sender_did.as_deref();
-
-    // Inbound problem-reports describe failures on the remote side; log
-    // them with full context and don't echo another problem-report back
-    // (that would create a ping-pong loop).
+    // Inbound problem-reports describe failures on the remote side; log them
+    // and never answer (that would create a ping-pong loop).
     if log_problem_report("witness", sender, &message) {
         return Ok(None);
     }
-
     warn!(
         sender = sender.unwrap_or("unknown"),
         msg_type = %message.typ,
-        "unknown DIDComm message type"
+        "unknown DIDComm message type — ignoring"
     );
-    Ok(Some(
-        DIDCommResponse::new(
-            MSG_WITNESS_PROBLEM_REPORT,
-            json!({
-                "code": "e.p.witness.unknown-type",
-                "comment": format!("unknown message type: {}", message.typ),
-            }),
-        )
-        .thid(message.id.clone()),
-    ))
+    Ok(None)
 }

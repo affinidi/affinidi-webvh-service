@@ -31,6 +31,16 @@ pub const KS_ACL: &str = "acl";
 /// refresh-token index. Holds the JWT challenge-response flow's state.
 pub const KS_SESSIONS: &str = "sessions";
 
+/// `pk_user:<uuid>`, `pk_did:<did>`, `pk_cred:<cred_id_hex>` — **step-up-only**
+/// passkeys (`auth/passkey/enroll/invite/0.2` `purpose: stepUp`), in the same
+/// layout [`KS_SESSIONS`] holds login passkeys in.
+///
+/// A separate keyspace so the separation holds by construction: the passkey
+/// login ceremony reads [`KS_SESSIONS`] and nothing else, so a step-up
+/// credential can never be offered at, or accepted by, a login — and a login
+/// credential is never found where a step-up credential is looked for.
+pub const KS_PASSKEY_STEP_UP: &str = "passkey_step_up";
+
 /// `stats:<mnemonic>` — per-DID resolve/update counters and totals.
 pub const KS_STATS: &str = "stats";
 
@@ -99,3 +109,12 @@ pub const KS_IDENTITY: &str = "identity";
 /// flight work. Receivers must remain idempotent because the
 /// delivery guarantee is at-least-once.
 pub const KS_OUTBOUND_QUEUE: &str = "outbox";
+
+/// `tsp-rel/v1/<facet><len(our_vid)><our_vid><their_vid>` — durable TSP
+/// relationship state (Rev 3 §7.2.2), the byte backend behind
+/// [`crate::server::tsp_relationship_store`]. Keyed and encoded entirely by the
+/// SDK's `PersistentRelationshipStore`; this crate only supplies the raw
+/// get/put/delete over the keyspace. Persisting it is what stops a restarted
+/// node from forgetting every peer and silently dropping their application
+/// traffic until a re-handshake.
+pub const KS_TSP_RELATIONSHIPS: &str = "tsp_relationships";

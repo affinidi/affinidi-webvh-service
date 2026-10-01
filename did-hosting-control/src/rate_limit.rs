@@ -64,6 +64,9 @@ pub const WINDOW_SECS: u64 = 60;
 /// a CDN or deploy a real DDoS mitigation.
 pub const MAX_TRACKED_IPS: usize = 10_000;
 
+/// The `limiter` this refusal names in its 429 body.
+pub const LIMITER_NAME: &str = "auth-challenge-per-ip";
+
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
     /// Number of consume attempts in the current window.
@@ -110,9 +113,16 @@ impl IpRateLimiter {
         }
 
         if entry.count >= MAX_PER_WINDOW {
-            return Err(AppError::Validation(format!(
-                "IP rate limit exceeded ({MAX_PER_WINDOW} requests per {WINDOW_SECS}s); try again later",
-            )));
+            // The window resets lazily at `window_start + WINDOW_SECS`, so the
+            // time left in it is exactly when the next attempt can succeed.
+            let retry_after_secs = (entry.window_start + WINDOW_SECS).saturating_sub(now);
+            return Err(AppError::RateLimited {
+                limiter: LIMITER_NAME,
+                message: format!(
+                    "IP rate limit exceeded ({MAX_PER_WINDOW} requests per {WINDOW_SECS}s); try again later",
+                ),
+                retry_after_secs,
+            });
         }
         entry.count += 1;
         Ok(())
@@ -122,6 +132,76 @@ impl IpRateLimiter {
     pub fn count(&self, ip: IpAddr) -> u64 {
         let buckets = self.buckets.lock().unwrap();
         buckets.get(&ip).map(|b| b.count).unwrap_or(0)
+    }
+}
+
+/// Redemption attempts one source may make per [`WINDOW_SECS`]: an invite's
+/// claim code is Argon2-hashed on every attempt, so this bounds both guessing
+/// across invites and the hashing a single source can make the service do.
+pub const REDEEM_MAX_PER_WINDOW: u64 = 10;
+
+/// The `limiter` a refused redemption names.
+pub const REDEEM_LIMITER_NAME: &str = "passkey-redeem-per-source";
+
+/// Per-source limiter for `auth/passkey/enroll/redeem/start`
+/// (Conformance item 2: "Rate-limit this task per source as well").
+///
+/// A source is what the transport can vouch for: the client IP on HTTPS
+/// (`ip:…`), the authenticated sender on TSP and DIDComm (`vid:…`). The
+/// per-invite wrong-code limit is the real guard on a claim code (and, unlike
+/// this limiter, holds across replicas — its counter lives in the shared
+/// store behind an atomic increment; see
+/// `did_hosting_common::server::passkey::invite`). This one keeps a single
+/// source from spraying invites or burning CPU.
+///
+/// **Per-process, by design.** Unlike the wrong-code counter, this limiter's
+/// buckets are an in-memory `HashMap` — nothing here is shared across
+/// replicas. A source spread across N replicas behind a load balancer gets
+/// effectively `N * REDEEM_MAX_PER_WINDOW` attempts per window, not
+/// `REDEEM_MAX_PER_WINDOW`. That's an accepted tradeoff: this limiter sheds
+/// load and guessing pressure, it isn't the security boundary (the per-invite
+/// wrong-code lockout is), so making it cross-replica would trade a store
+/// round trip on every redemption attempt for a guarantee this limiter
+/// doesn't need to make.
+#[derive(Debug, Default)]
+pub struct SourceRateLimiter {
+    buckets: Mutex<HashMap<String, Bucket>>,
+}
+
+impl SourceRateLimiter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Consume one attempt for `source`, or refuse once it has made
+    /// [`REDEEM_MAX_PER_WINDOW`] in the current window.
+    pub fn try_consume(&self, source: &str, now: u64) -> Result<(), AppError> {
+        let mut buckets = self
+            .buckets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if buckets.len() >= MAX_TRACKED_IPS {
+            buckets.clear();
+        }
+        let entry = buckets.entry(source.to_string()).or_insert(Bucket {
+            count: 0,
+            window_start: now,
+        });
+        if now.saturating_sub(entry.window_start) >= WINDOW_SECS {
+            entry.count = 0;
+            entry.window_start = now;
+        }
+        if entry.count >= REDEEM_MAX_PER_WINDOW {
+            return Err(AppError::RateLimited {
+                limiter: REDEEM_LIMITER_NAME,
+                message: format!(
+                    "too many invite redemptions ({REDEEM_MAX_PER_WINDOW} per {WINDOW_SECS}s); try again later"
+                ),
+                retry_after_secs: (entry.window_start + WINDOW_SECS).saturating_sub(now),
+            });
+        }
+        entry.count += 1;
+        Ok(())
     }
 }
 
@@ -209,7 +289,33 @@ mod tests {
             l.try_consume(p, 1000).unwrap();
         }
         let err = l.try_consume(p, 1000).unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("rate limit")));
+        assert!(matches!(
+            err,
+            AppError::RateLimited {
+                limiter: LIMITER_NAME,
+                retry_after_secs: WINDOW_SECS,
+                ..
+            }
+        ));
+    }
+
+    /// The retry hint is the time left in the current window, not the whole
+    /// window: a refusal 45s into a 60s window says 15.
+    #[test]
+    fn retry_after_is_the_remainder_of_the_window() {
+        let l = IpRateLimiter::new();
+        let p = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        for _ in 0..MAX_PER_WINDOW {
+            l.try_consume(p, 1000).unwrap();
+        }
+        let err = l.try_consume(p, 1045).unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::RateLimited {
+                retry_after_secs: 15,
+                ..
+            }
+        ));
     }
 
     /// Window rolls over: after `WINDOW_SECS` elapsed, a fresh round

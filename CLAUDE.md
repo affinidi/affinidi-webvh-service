@@ -30,10 +30,13 @@ in the daemon if it falls into any of these buckets:
   unified task, rather than one per service). New periodic work in
   standalone services should land here.
 - **Route changes.** The daemon merges server (public DID resolution
-  only) + control (full management API + UI) at root. The server's
-  `/api/*` routes are not exposed — the control plane provides all
-  management routes. Route additions to either service must be tested
-  in daemon mode.
+  only) + control (its Trust Task listener, `/api/health`, the browser
+  sign-in routes and the UI) at root. Neither has a REST management surface:
+  every management operation is a Trust Task. The server has no
+  management routes at all — an edge serves resolution, `/api/health` and
+  its Trust Task listener (`POST /api/trust-tasks`, which the daemon does
+  not mount: the control plane's listener serves that path). Route
+  additions to either service must be tested in daemon mode.
 - **DIDComm message types.** The daemon runs the control plane's
   inbound DIDComm listener (`build_control_router`). Any new `MSG_*`
   routed there is automatically picked up; no separate daemon wiring
@@ -68,9 +71,10 @@ sense in the all-in-one model.
   the full provisioning protocol on the authoritative store. The
   server's DIDComm path applies only to the distributed deployment
   where it receives sync updates from a remote control plane.
-- **HTTP stats sync.** The standalone server periodically POSTs stats
-  deltas to the standalone control plane. In the daemon, stats are
-  shared in-process via `Arc<StatsCollector>` — there is no HTTP
+- **Stats sync.** A standalone edge periodically sends its stats deltas
+  to its control plane as a signed `server/stats-sync` Trust Task over the
+  transport the control plane's DID document advertises. In the daemon,
+  stats are shared in-process via `Arc<StatsCollector>` — there is no
   round-trip and the sync task is not spawned.
 - **Outbound ATM / mediator client for inter-service sync.** No
   external servers exist to push DID updates to from a daemon's
@@ -193,8 +197,76 @@ If a genuine cross-agent need ever appears, the *only* acceptable shape is a
 the DID string): the caller proves it controls a DID on that domain, and only
 then does the edge reveal its control plane — one relationship, not per-DID, and
 nothing visible to anyone who could not already act on it. Until then, note that
-the unauthenticated `/api/server-info` lives on the **control plane** (not the
-edge), so nothing about the topology leaks today. Keep it that way.
+the unauthenticated `server/info` Trust Task is served by the **control plane**
+(not the edge), so nothing about the topology leaks today. Keep it that way.
+
+## Privileged messages are authorised on their proof, never on the transport
+
+Every inbound message that changes state or discloses more than public data —
+control→edge sync and domain ops, edge→control registration/stats/pongs/acks,
+DID management, ACL, auth — is a Trust Task document authorised on its **own
+Data Integrity proof**: `issuer` in-band and exactly the expected peer, the
+proof's `verificationMethod` controlled by that issuer, `recipient` = this
+service, fresh `issuedAt`, replay-keyed on `(issuer, id)`, and
+`proofPurpose: authentication` with the key under the signer's `authentication`
+relationship — these are operational messages; `assertionMethod` is for
+attestations (credentials) only. The one entry point
+is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
+(the control plane's `dispatch_trust_task_doc` gate; the edge's
+`verify_control_plane`).
+
+- **One table, one rule per task.** The control plane's Trust Tasks are the
+  rows of `did-hosting-control/src/control_tasks` (`control_tasks!`), keyed on
+  the generated `Payload::TYPE_URI`, typed with the generated request and
+  response, each with a `ProofRule` the gate enforces: `Optional` (only
+  `server/info`, `auth/passkey/login/start` and
+  `auth/passkey/enroll/redeem/{start,finish}` — whose authorisation is the
+  invite's token and claim code — plus discovery and `auth/challenge`),
+  `Authentication` (operational), `AssertionMethod` (an
+  approver's decision), `SessionKey` (a passkey login, signed by the `did:key`
+  its session is bound to). A new task is a new row; never a hand-built reply.
+  `POST /api/trust-tasks` is the HTTPS binding of the same dispatch: the
+  document's proof authorises, a bearer session is optional context.
+- **Two passkey stores.** Login (`purpose: session`) passkeys live in
+  `KS_SESSIONS`; step-up-only passkeys in `KS_PASSKEY_STEP_UP`. The login
+  ceremony reads `KS_SESSIONS` only — never make it read both. Enrolment
+  invites are stored hashed (`passkey::invite`); never store or log a token
+  or claim code.
+- **A transport's sender is a routing hint.** `ctx.sender_did`, a TSP sender
+  VID, a DIDComm `from` — each is only required to *agree* with the proof.
+  Never authorise, ACL-check, or key a replay cache on one. Don't add a bare
+  `MSG_*` route that acts on `ctx.sender_did`; add a trust-task arm behind the
+  gate.
+- **Replies are signed** (`seal_reply` on both sides) — every non-error
+  trust-task response, every transport; only `trust-task-error` stays unsigned.
+  No signing identity → the control plane refuses to start
+  (`signing::require_signing_identity`, called by both `server::run` and the
+  daemon's `build_control`); the dispatch path also refuses at request time.
+- **Only a human approver's decision is `assertionMethod`.** Everything a
+  service signs, approval *requests* included, is `authentication`. Decisions
+  (consent, step-up) are checked with `TransportBoundVerifier::verify_approval`
+  — `assertionMethod` purpose *and* relationship, deactivation check — never
+  the bare `ProofVerifier::verify`.
+- **An edge never answers a document that failed `verify_control_plane`** —
+  no signed refusal (it would settle an op the control plane never sent), no
+  unsigned one. Transient failures (unresolvable signer DID, storage/I-O) are
+  reported retryable so the control plane keeps the op queued.
+- **Outbound privileged documents are signed** (`build_signed_request`, signed
+  at send time so retries stay fresh). A new control↔edge op needs both halves.
+- **`TransportBoundVerifier` requires an in-band `issuer`.** Don't reintroduce
+  an issuer-absent path; the passkey session delegate is per-request, HTTPS-only
+  (`with_session_delegate`).
+- **A proof failing against a cached DID document is re-resolved once**
+  (rate-limited per DID) before refusal, so a rotation doesn't strand a peer;
+  the cache TTL is `DID_CACHE_TTL_SECS`.
+- **Edges verify what they serve.** A synced webvh log must pass the chain
+  check and strictly extend the held log and the per-DID high-water mark
+  (`control_register::verify_history`); a deactivated DID takes no further
+  entries. Every path that replaces an edge's log goes through
+  `verify_history` and `stage_high_water`.
+- **Re-sync compares identity, not just versions** (`server_push::
+  edge_is_current`), and domain assign/unassign/purge are re-sent on each
+  registration until acknowledged (`server_push::resend_domain_intents`).
 
 ## Cross-service networking & integration discipline
 
@@ -237,9 +309,9 @@ to each other must keep the document as the source of truth.
   DID carries only `TSPTransport` (`#tsp`) and/or `DIDCommMessaging`
   (`#vta-didcomm`) services — **not** a `WebVHHosting` HTTP endpoint. The
   resolution URL is derivable from the `did:webvh` identifier itself, inter-node
-  traffic is DIDComm/TSP, and clients reach the REST API by explicit config
-  (`webvh_client` takes an explicit `server_url`), so nothing discovers the
-  endpoint from the document. Only a **no-mediator (HTTP-only)** node advertises
+  traffic is DIDComm/TSP, and clients reach the control plane's
+  `POST /api/trust-tasks` by explicit config (`WebVHClient` takes an explicit
+  `server_url`), so nothing discovers the endpoint from the document. Only a **no-mediator (HTTP-only)** node advertises
   `WebVHHosting`, because it has no messaging transport to advertise instead.
 
 - **One builder mints them all.** Every setup path (interactive / recipe /
@@ -258,9 +330,9 @@ to each other must keep the document as the source of truth.
   fallback (the compatibility bridge for DIDs minted before transports were
   published); if neither yields a binding, the send **fails** as unroutable.
   Do **not** reintroduce a blind-DIDComm default, and do **not** add a REST tier
-  — there is no trust-task REST sender or inbound `/api/trust-tasks` route
-  *between these services*, and HTTP-only nodes are served by the pull/watcher
-  model, not a trust-task push.
+  — `POST /api/trust-tasks` is the HTTPS binding, the same dispatch TSP and
+  DIDComm reach, never a separate API; and HTTP-only nodes are served by the
+  pull/watcher model, not a trust-task push.
 
 - **Nothing gates on `WebVHHosting`.** `resolve_send_binding` reads only the
   messaging services; registration and health use the DIDComm identity; the

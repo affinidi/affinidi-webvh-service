@@ -13,6 +13,7 @@ import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { useDomains } from "../../components/DomainProvider";
+import { PasskeysCard } from "../../components/PasskeysCard";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import {
   formatBytes,
@@ -25,18 +26,18 @@ import type {
   AclEntry,
   CreateInviteResponse,
   DidRecord,
-  DomainScope,
+  InvitePurpose,
   InviteListItem,
 } from "../../lib/api";
-
-type ScopeKind = "all" | "allowed" | "allowed_with_default";
-
-interface ScopeDraft {
-  kind: ScopeKind;
-  domains: string[];
-  /** Only meaningful when `kind === "allowed_with_default"`. */
-  default: string;
-}
+import {
+  DEFAULT_SCOPE_DRAFT,
+  aclEntryToDraft,
+  defaultScopeForRole,
+  draftToScope,
+  validateScopeDraft,
+  type ScopeDraft,
+  type ScopeKind,
+} from "../../lib/acl-scope";
 
 interface EditState {
   did: string;
@@ -45,63 +46,6 @@ interface EditState {
   maxTotalSize: string;
   maxDidCount: string;
   scope: ScopeDraft;
-}
-
-/** Default scope draft for new ACL entries — "All domains" unless an admin
- * narrows it. v0.7 backend ultimately defaults new Owners to
- * AllowedWithDefault, but the UI surfaces the choice explicitly so admins
- * don't accidentally grant unrestricted access. */
-const DEFAULT_SCOPE_DRAFT: ScopeDraft = {
-  kind: "all",
-  domains: [],
-  default: "",
-};
-
-function aclEntryToDraft(entry: AclEntry): ScopeDraft {
-  if (!entry.domains || entry.domains.kind === "all") {
-    return { kind: "all", domains: [], default: "" };
-  }
-  if (entry.domains.kind === "allowed") {
-    return { kind: "allowed", domains: [...entry.domains.domains], default: "" };
-  }
-  return {
-    kind: "allowed_with_default",
-    domains: [...entry.domains.domains],
-    default: entry.domains.default,
-  };
-}
-
-/** Convert the draft back to wire shape. Returns `undefined` when the
- * draft is unset/invalid so the caller can omit the field. */
-function draftToScope(draft: ScopeDraft): DomainScope | undefined {
-  if (draft.kind === "all") return { kind: "all" };
-  if (draft.kind === "allowed") {
-    if (draft.domains.length === 0) return undefined;
-    return { kind: "allowed", domains: draft.domains };
-  }
-  if (draft.domains.length === 0 || !draft.default) return undefined;
-  return {
-    kind: "allowed_with_default",
-    domains: draft.domains,
-    default: draft.default,
-  };
-}
-
-/** Validation hook used by the Save / Add buttons — returns an error
- * message when the draft is not submittable. */
-function validateScopeDraft(draft: ScopeDraft): string | null {
-  if (draft.kind === "all") return null;
-  if (draft.domains.length === 0) return "Select at least one domain";
-  if (draft.kind === "allowed_with_default" && !draft.default) {
-    return "Pick a default domain";
-  }
-  if (
-    draft.kind === "allowed_with_default" &&
-    !draft.domains.includes(draft.default)
-  ) {
-    return "Default must be one of the selected domains";
-  }
-  return null;
 }
 
 const formatDate = (ts: number) =>
@@ -323,6 +267,8 @@ const AclEntryRow = memo(function AclEntryRow({
   onChangeMaxTotalSize,
   onChangeMaxDidCount,
   onChangeScope,
+  passkeysExpanded,
+  onTogglePasskeys,
 }: {
   item: AclEntry;
   editing: EditState | null;
@@ -337,11 +283,14 @@ const AclEntryRow = memo(function AclEntryRow({
   onChangeMaxTotalSize: (v: string) => void;
   onChangeMaxDidCount: (v: string) => void;
   onChangeScope: (next: ScopeDraft) => void;
+  passkeysExpanded: boolean;
+  onTogglePasskeys: (did: string) => void;
 }) {
   const isEditing = editing?.did === item.did;
   const scopeError = isEditing && editing ? validateScopeDraft(editing.scope) : null;
 
   return (
+    <View>
     <View style={styles.entryCard}>
       <View style={styles.entryInfo}>
         <Link href={`/dids?owner=${encodeURIComponent(item.did)}`}>
@@ -480,11 +429,26 @@ const AclEntryRow = memo(function AclEntryRow({
             <Text style={styles.editText}>Edit</Text>
           </Pressable>
           <Pressable
+            style={styles.editButton}
+            onPress={() => onTogglePasskeys(item.did)}
+          >
+            <Text style={styles.editText}>
+              {passkeysExpanded ? "Hide passkeys" : "Passkeys"}
+            </Text>
+          </Pressable>
+          <Pressable
             style={styles.deleteButton}
             onPress={() => onDelete(item.did)}
           >
             <Text style={styles.deleteText}>Remove</Text>
           </Pressable>
+        </View>
+      )}
+    </View>
+      {passkeysExpanded && (
+        <View style={styles.passkeysPanel}>
+          <PasskeysCard subject={item.did} purpose="session" title="Sign-in passkeys" />
+          <PasskeysCard subject={item.did} purpose="stepUp" title="Step-up passkeys" />
         </View>
       )}
     </View>
@@ -494,7 +458,7 @@ const AclEntryRow = memo(function AclEntryRow({
 export default function AclManagement() {
   const api = useApi();
   const { isAuthenticated } = useAuth();
-  const { domains: domainCatalog } = useDomains();
+  const { domains: domainCatalog, defaultDomain } = useDomains();
 
   // Trimmed view of `domainCatalog` for ScopeEditor — name + disabled flag,
   // sorted alphabetically. Disabled domains stay visible so admins can
@@ -519,27 +483,56 @@ export default function AclManagement() {
   const [newMaxTotalSize, setNewMaxTotalSize] = useState("");
   const [newMaxDidCount, setNewMaxDidCount] = useState("");
   const [newScope, setNewScope] = useState<ScopeDraft>(DEFAULT_SCOPE_DRAFT);
+  // Whether the operator has touched the scope editor for the entry being
+  // built — once true, the effect below stops overwriting `newScope`.
+  const [newScopeTouched, setNewScopeTouched] = useState(false);
   const [creating, setCreating] = useState(false);
+
+  // See `defaultScopeForRole`. Runs only while the operator hasn't picked a
+  // scope themselves, and only for the "Add Entry" form — editing an
+  // existing entry's role never rewrites its scope, matching the removed
+  // route's `PUT` behaviour, which had no such default either.
+  useEffect(() => {
+    if (newScopeTouched) return;
+    setNewScope(defaultScopeForRole(newRole, defaultDomain));
+  }, [newRole, defaultDomain, newScopeTouched]);
+
+  const handleNewScopeChange = useCallback((next: ScopeDraft) => {
+    setNewScopeTouched(true);
+    setNewScope(next);
+  }, []);
 
   // Invite form
   const [inviteDid, setInviteDid] = useState("");
   const [inviteRole, setInviteRole] =
     useState<"admin" | "owner" | "service">("owner");
   const [inviting, setInviting] = useState(false);
+  const [invitePurpose, setInvitePurpose] = useState<InvitePurpose>("session");
   const [invite, setInvite] = useState<CreateInviteResponse | null>(null);
-  const [inviteCopied, setInviteCopied] = useState(false);
+  const [inviteCopied, setInviteCopied] = useState<"link" | "code" | null>(null);
 
   // Pending invites (from server)
   const [pendingInvites, setPendingInvites] = useState<InviteListItem[]>([]);
   const [editingInvite, setEditingInvite] = useState<
-    { token: string; role: "admin" | "owner" | "service" } | null
+    { inviteId: string; role: "admin" | "owner" | "service" } | null
   >(null);
-  const [invitesBusyToken, setInvitesBusyToken] = useState<string | null>(null);
-  const [inviteCopiedToken, setInviteCopiedToken] = useState<string | null>(null);
+  const [invitesBusyId, setInvitesBusyId] = useState<string | null>(null);
 
   // Inline edit state
   const [editing, setEditing] = useState<EditState | null>(null);
   const [saving, setSaving] = useState(false);
+
+  // Which entries' passkey panel is expanded — a lost passkey is recovered
+  // here: an administrator revokes the missing credential, then re-invites.
+  const [expandedPasskeys, setExpandedPasskeys] = useState<Set<string>>(new Set());
+  const togglePasskeys = useCallback((did: string) => {
+    setExpandedPasskeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(did)) next.delete(did);
+      else next.add(did);
+      return next;
+    });
+  }, []);
 
   const refresh = useCallback(() => {
     if (!isAuthenticated) {
@@ -571,9 +564,9 @@ export default function AclManagement() {
     if (!inviteDid.trim()) return;
     setInviting(true);
     try {
-      const resp = await api.createInvite(inviteDid.trim(), inviteRole);
+      const resp = await api.createInvite(inviteDid.trim(), inviteRole, invitePurpose);
       setInvite(resp);
-      setInviteCopied(false);
+      setInviteCopied(null);
       // Pull in the newly-created invite for the pending list too.
       refresh();
     } catch (e: unknown) {
@@ -584,31 +577,18 @@ export default function AclManagement() {
     }
   };
 
-  const handleCopyPendingInvite = useCallback(
-    async (item: InviteListItem) => {
-      await Clipboard.setStringAsync(item.enrollment_url);
-      setInviteCopiedToken(item.token);
-      setTimeout(
-        () =>
-          setInviteCopiedToken((prev) => (prev === item.token ? null : prev)),
-        2000,
-      );
-    },
-    [],
-  );
-
   const handleRevokeInvite = useCallback(
-    (token: string) => {
+    (inviteId: string) => {
       showConfirm("Revoke invite", "Revoke this enrollment invite?", async () => {
-        setInvitesBusyToken(token);
+        setInvitesBusyId(inviteId);
         try {
-          await api.revokeInvite(token);
+          await api.revokeInvite(inviteId);
           refresh();
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : "Failed to revoke";
           showAlert("Error", msg);
         } finally {
-          setInvitesBusyToken((prev) => (prev === token ? null : prev));
+          setInvitesBusyId((prev) => (prev === inviteId ? null : prev));
         }
       });
     },
@@ -617,7 +597,7 @@ export default function AclManagement() {
 
   const startEditInviteRole = useCallback(
     (item: InviteListItem) =>
-      setEditingInvite({ token: item.token, role: item.role }),
+      setEditingInvite({ inviteId: item.inviteId, role: item.role }),
     [],
   );
 
@@ -625,26 +605,28 @@ export default function AclManagement() {
 
   const handleSaveInviteRole = useCallback(async () => {
     if (!editingInvite) return;
-    setInvitesBusyToken(editingInvite.token);
+    setInvitesBusyId(editingInvite.inviteId);
     try {
-      await api.updateInvite(editingInvite.token, { role: editingInvite.role });
+      await api.updateInvite(editingInvite.inviteId, {
+        role: editingInvite.role,
+      });
       setEditingInvite(null);
       refresh();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Failed to update invite";
       showAlert("Error", msg);
     } finally {
-      setInvitesBusyToken((prev) =>
-        prev === editingInvite.token ? null : prev,
+      setInvitesBusyId((prev) =>
+        prev === editingInvite.inviteId ? null : prev,
       );
     }
   }, [api, editingInvite, refresh]);
 
-  const handleCopyInvite = async () => {
+  const handleCopyInvite = async (what: "link" | "code") => {
     if (!invite) return;
-    await Clipboard.setStringAsync(invite.enrollment_url);
-    setInviteCopied(true);
-    setTimeout(() => setInviteCopied(false), 2000);
+    await Clipboard.setStringAsync(what === "link" ? invite.inviteUrl : invite.claimCode);
+    setInviteCopied(what);
+    setTimeout(() => setInviteCopied(null), 2000);
   };
 
   const handleClearInvite = () => {
@@ -671,7 +653,7 @@ export default function AclManagement() {
       setNewLabel("");
       setNewMaxTotalSize("");
       setNewMaxDidCount("");
-      setNewScope(DEFAULT_SCOPE_DRAFT);
+      setNewScopeTouched(false);
       refresh();
     } catch (e: unknown) {
       const msg =
@@ -839,6 +821,8 @@ export default function AclManagement() {
       onChangeMaxTotalSize={onChangeMaxTotalSize}
       onChangeMaxDidCount={onChangeMaxDidCount}
       onChangeScope={onChangeScope}
+      passkeysExpanded={expandedPasskeys.has(item.did)}
+      onTogglePasskeys={togglePasskeys}
     />
   );
 
@@ -859,24 +843,41 @@ export default function AclManagement() {
       <View style={styles.card}>
         <Text style={styles.sectionTitle}>Invite by Link</Text>
         <Text style={styles.inviteHelp}>
-          Generate an enrollment link. The invitee opens it in a browser,
-          registers a passkey, and is added to the ACL with the selected role.
+          Generate an enrollment link and a claim code. Send them over two
+          different channels — the link by email, say, and the code by chat or
+          phone: either alone redeems nothing. The invitee opens the link,
+          types the code and registers a passkey. A sign-in invite adds them to
+          the ACL with the selected role; a step-up invite enrols a passkey
+          that only confirms sensitive actions and never signs in.
         </Text>
         {invite ? (
           <View>
             <Text style={styles.editFieldLabel}>Enrollment URL</Text>
             <View style={styles.inviteUrlBlock}>
               <Text style={styles.inviteUrlText} selectable numberOfLines={2}>
-                {invite.enrollment_url}
+                {invite.inviteUrl}
+              </Text>
+            </View>
+            <Text style={styles.editFieldLabel}>Claim code (send separately)</Text>
+            <View style={styles.inviteUrlBlock}>
+              <Text style={styles.inviteUrlText} selectable>
+                {invite.claimCode}
               </Text>
             </View>
             <Text style={styles.inviteExpiry}>
-              Expires in {formatExpiry(invite.expires_at)}
+              {invite.purpose === "stepUp" ? "Step-up passkey. " : ""}
+              Expires in {formatExpiry(invite.expiresAt)}. Shown once: neither
+              the link nor the code can be displayed again.
             </Text>
             <View style={styles.editActions}>
-              <Pressable style={styles.saveButton} onPress={handleCopyInvite}>
+              <Pressable style={styles.saveButton} onPress={() => handleCopyInvite("link")}>
                 <Text style={styles.saveText}>
-                  {inviteCopied ? "Copied" : "Copy Link"}
+                  {inviteCopied === "link" ? "Copied" : "Copy Link"}
+                </Text>
+              </Pressable>
+              <Pressable style={styles.saveButton} onPress={() => handleCopyInvite("code")}>
+                <Text style={styles.saveText}>
+                  {inviteCopied === "code" ? "Copied" : "Copy Code"}
                 </Text>
               </Pressable>
               <Pressable
@@ -899,6 +900,31 @@ export default function AclManagement() {
               autoCorrect={false}
             />
             <View style={styles.roleRow}>
+              {([
+                ["session", "Sign-in"],
+                ["stepUp", "Step-up only"],
+              ] as const).map(([p, text]) => (
+                <Pressable
+                  key={p}
+                  style={[
+                    styles.roleButton,
+                    invitePurpose === p && styles.roleActive,
+                  ]}
+                  onPress={() => setInvitePurpose(p)}
+                >
+                  <Text
+                    style={[
+                      styles.roleText,
+                      invitePurpose === p && styles.roleTextActive,
+                    ]}
+                  >
+                    {text}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+            {invitePurpose === "session" && (
+            <View style={styles.roleRow}>
               {(["owner", "admin", "service"] as const).map((r) => (
                 <Pressable
                   key={r}
@@ -919,6 +945,7 @@ export default function AclManagement() {
                 </Pressable>
               ))}
             </View>
+            )}
             <Pressable
               style={[
                 styles.buttonPrimary,
@@ -942,10 +969,10 @@ export default function AclManagement() {
             Pending Invites ({pendingInvites.length})
           </Text>
           {pendingInvites.map((inv) => {
-            const isEditing = editingInvite?.token === inv.token;
-            const busy = invitesBusyToken === inv.token;
+            const isEditing = editingInvite?.inviteId === inv.inviteId;
+            const busy = invitesBusyId === inv.inviteId;
             return (
-              <View key={inv.token} style={styles.pendingInviteRow}>
+              <View key={inv.inviteId} style={styles.pendingInviteRow}>
                 <View style={styles.pendingInviteInfo}>
                   <Text style={styles.entryDid} numberOfLines={1}>
                     {inv.did}
@@ -958,12 +985,14 @@ export default function AclManagement() {
                         inv.role === "service" && styles.serviceBadge,
                       ]}
                     >
-                      <Text style={styles.roleBadgeText}>{inv.role}</Text>
+                      <Text style={styles.roleBadgeText}>
+                        {inv.purpose === "stepUp" ? "step-up" : inv.role}
+                      </Text>
                     </View>
                     <Text style={styles.entryDate}>
                       {inv.expired
                         ? "expired"
-                        : `expires in ${formatExpiry(inv.expires_at)}`}
+                        : `expires in ${formatExpiry(inv.expiresAt)}`}
                     </Text>
                   </View>
                   {isEditing && (
@@ -978,7 +1007,7 @@ export default function AclManagement() {
                             ]}
                             onPress={() =>
                               setEditingInvite({
-                                token: inv.token,
+                                inviteId: inv.inviteId,
                                 role: r,
                               })
                             }
@@ -1017,23 +1046,17 @@ export default function AclManagement() {
                 </View>
                 {!isEditing && (
                   <View style={styles.entryActions}>
-                    <Pressable
-                      style={styles.editButton}
-                      onPress={() => handleCopyPendingInvite(inv)}
-                    >
-                      <Text style={styles.editText}>
-                        {inviteCopiedToken === inv.token ? "Copied" : "Copy"}
-                      </Text>
-                    </Pressable>
-                    <Pressable
-                      style={styles.editButton}
-                      onPress={() => startEditInviteRole(inv)}
-                    >
-                      <Text style={styles.editText}>Role</Text>
-                    </Pressable>
+                    {inv.purpose === "session" && (
+                      <Pressable
+                        style={styles.editButton}
+                        onPress={() => startEditInviteRole(inv)}
+                      >
+                        <Text style={styles.editText}>Role</Text>
+                      </Pressable>
+                    )}
                     <Pressable
                       style={[styles.deleteButton, busy && styles.disabled]}
-                      onPress={() => handleRevokeInvite(inv.token)}
+                      onPress={() => handleRevokeInvite(inv.inviteId)}
                       disabled={busy}
                     >
                       <Text style={styles.deleteText}>Revoke</Text>
@@ -1123,7 +1146,7 @@ export default function AclManagement() {
         <ScopeEditor
           draft={newScope}
           availableDomains={availableDomains}
-          onChange={setNewScope}
+          onChange={handleNewScopeChange}
         />
         <Pressable
           style={[
@@ -1366,6 +1389,10 @@ const styles = StyleSheet.create({
   },
   entryActions: {
     gap: spacing.xs,
+  },
+  passkeysPanel: {
+    marginTop: spacing.md,
+    gap: spacing.sm,
   },
   editButton: {
     borderColor: colors.accent,

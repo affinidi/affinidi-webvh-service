@@ -91,7 +91,7 @@ export default function DomainsScreen() {
     api
       .serverInfo()
       .then((info) => {
-        if (!cancelled) setGraceSeconds(info.disable_purge_grace_seconds);
+        if (!cancelled) setGraceSeconds(info.domainPurgeGraceSeconds ?? null);
       })
       .catch(() => {
         // Server-info is best-effort: a failure here just means we

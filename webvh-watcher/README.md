@@ -1,13 +1,13 @@
 # Affinidi WebVH Watcher
 
-The WebVH Watcher is a read-only DID mirror that receives pushed
-DID updates from [did-hosting-server](../did-hosting-server/) instances and
-serves them publicly. It provides redundancy, geographic
-distribution, and load balancing for DID resolution without
-managing DIDs directly.
+The WebVH Watcher is a read-only DID mirror. The control planes it is
+configured to mirror push it signed `webvh/sync/*` Trust Tasks, and it serves
+what they push publicly. It provides redundancy and geographic distribution
+for DID resolution without managing DIDs.
 
-The watcher has no authentication, no ACL, and no DID lifecycle
-management — it simply stores and serves replicated DID content.
+The watcher has its own DID, with keys in a VTA context, like every other
+service here. It verifies every log it mirrors exactly as a hosting server
+does, and it applies a sync only when its source signed it.
 
 > **IMPORTANT:**
 > did-hosting-service crates are provided "as is" without any
@@ -26,48 +26,40 @@ management — it simply stores and serves replicated DID content.
 ### 1. Build
 
 ```bash
-cargo build -p webvh-watcher --release
+cargo build --locked -p webvh-watcher --release
 ```
 
 The binary is produced at `target/release/webvh-watcher`.
 
-### 2. Configure
+### 2. Set up
 
-Create a `config.toml`:
+`webvh-watcher setup` provisions the watcher's DID from a VTA context
+(interactive, online), or `webvh-watcher setup --from <recipe.toml>` for any
+VTA mode — see `examples/webvh-watcher-build.toml`. It writes `config.toml`,
+stores the DID's keys in the secrets backend, and writes `watcher-did.jsonl`
+for you to publish on a hosting server. The part of `config.toml` that says
+whom it mirrors:
 
 ```toml
-[server]
-host = "0.0.0.0"
-port = 8533
-
-[log]
-level = "info"
-
-[store]
-data_dir = "data/webvh-watcher"
-
 [sync]
-# Shared secret tokens that source servers must present when pushing
-push_tokens = ["my-shared-secret-token"]
-
-# Optional: source servers to pull from for reconciliation
-# [[sync.sources]]
-# url = "http://server1:8530"
-# token = "pull-token"
+# Only a webvh/sync/* Trust Task signed by one of these DIDs is applied.
+source_dids = ["did:webvh:control.example.com"]
 ```
 
-### 3. Configure the source server
+### 3. Configure the control plane
 
-On the did-hosting-server that will push DID updates, add the watcher
-to its `config.toml`:
+On each control plane the watcher mirrors, map the watcher's URL to its DID:
 
 ```toml
-[[watchers]]
-url = "http://watcher1.example.com:8533"
-token = "my-shared-secret-token"
+[[registry.watchers]]
+url = "https://watcher1.example.com"
+did = "did:webvh:…:watcher1.example.com"
 ```
 
-The token must match one of the watcher's `sync.push_tokens`.
+A DID whose log names `https://watcher1.example.com` in its `watchers`
+parameter is then pushed there through the control plane's outbox — the same
+delivery, retry and acknowledgement as its edges — over the transport the
+watcher's DID advertises (TSP, DIDComm, or HTTPS).
 
 ### 4. Start the watcher
 
@@ -78,20 +70,24 @@ webvh-watcher --config config.toml
 ## How It Works
 
 ```
-did-hosting-server ──(POST /api/sync/did)──► webvh-watcher
-             ──(POST /api/sync/delete)──►
+control plane ──(signed webvh/sync/update|delete|batch, TSP · DIDComm · HTTPS)──► webvh-watcher
 
 Clients ──(GET /{mnemonic}/did.jsonl)──► webvh-watcher
 ```
 
-1. A DID is published on a did-hosting-server
-2. The server pushes the DID content to all registered watchers
-3. The watcher stores the content and serves it at the same
-   public paths as the original server
-4. Clients can resolve DIDs from any watcher instance
+1. A DID is published at the control plane.
+2. The control plane queues a signed `webvh/sync/update/0.2` for every
+   configured watcher the log names.
+3. The watcher verifies the document's proof (`proofPurpose:
+   authentication`, bound to its issuer, addressed to the watcher, fresh, not
+   a replay) and that the issuer is one of `sync.source_dids`; then it
+   verifies the log — its chain and witness proofs, the slot it names, and
+   that it strictly extends anything already mirrored for that DID — and
+   answers with a signed `#response`, which settles the outbox entry.
+4. Clients resolve DIDs from any watcher.
 
-Push failures on the server side are logged but do not block the
-primary publish operation.
+A document that does not verify gets no reply. A verified one from a DID that
+is not a source is refused `notAuthorized` (signed), and is not recorded.
 
 ## Configuration
 
@@ -108,19 +104,19 @@ different path with the `--config` flag or the
 | `WATCHER_SERVER_HOST`  | Bind host           |
 | `WATCHER_SERVER_PORT`  | Bind port           |
 | `WATCHER_LOG_LEVEL`    | Log level           |
+| `WATCHER_SERVER_DID`   | The watcher's DID   |
+| `WATCHER_MEDIATOR_DID` | Its mediator        |
+| `WATCHER_SOURCE_DIDS`  | Comma-separated source DIDs |
 
 ## CLI Commands
 
 ```
 webvh-watcher                                  # Run watcher (default)
-webvh-watcher setup                            # Interactive config wizard
-webvh-watcher setup --from <recipe.toml>       # Non-interactive (see examples/)
-webvh-watcher setup --from <recipe.toml> --force-reprovision  # overwrite existing
+webvh-watcher setup                            # Interactive online VTA setup
+webvh-watcher setup --setup-key-out <path>     # Mint a setup key for a headless online setup
+webvh-watcher setup --from <recipe.toml> [--setup-key-file <path>]
+webvh-watcher health                           # Diagnostics
 ```
-
-The watcher has no VTA / no secret store, so the recipe is just
-`[deployment]`, `[output]`, `[server]`, and `[watcher]` — see
-`examples/webvh-watcher-build.toml`.
 
 ## API Endpoints
 
@@ -134,15 +130,14 @@ The watcher has no VTA / no secret store, so the recipe is just
 | `GET`  | `/.well-known/did.jsonl`        | Root DID log        |
 | `GET`  | `/.well-known/did-witness.json` | Root witness        |
 
-### Sync (token-authenticated)
+### Trust Tasks
 
-| Method | Path                | Description              |
-| ------ | ------------------- | ------------------------ |
-| `POST` | `/api/sync/did`     | Receive pushed DID       |
-| `POST` | `/api/sync/delete`  | Receive DID deletion     |
+| Method | Path               | Description |
+| ------ | ------------------ | ----------- |
+| `POST` | `/api/trust-tasks` | The HTTPS binding of `webvh/sync/update/0.2`, `webvh/sync/delete/0.2`, `webvh/sync/batch/0.1` |
 
-Sync endpoints require a `Bearer` token matching one of the
-configured `sync.push_tokens`.
+The same documents are accepted over TSP and DIDComm on the watcher's
+mediator connection.
 
 ## Library Usage
 

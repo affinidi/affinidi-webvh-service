@@ -4,11 +4,12 @@
  * its `host_permissions`. This module is the UI-side feature-detect + a thin
  * wrapper that asks the wallet to log into THIS did-hosting server.
  *
- * The wallet's SIOPv2 path round-trips against `${baseUrl}/auth/challenge` and
- * `${baseUrl}/auth/` — the exact endpoints did-hosting-control exposes — and
- * returns a server-issued bearer token. That token is fed into
- * `AuthProvider.login(...)` identically to the passkey path; both yield the
- * same JWT shape, so nothing else in the UI needs to know which path was taken.
+ * The wallet signs in with `auth/challenge/0.1` then `auth/authenticate/0.2`,
+ * sent to `${baseUrl}/trust-tasks`, and returns a server-issued bearer token.
+ * That token is fed into `AuthProvider.login(...)` identically to the passkey
+ * path; both yield the same JWT shape. Like the passkey path, the login binds
+ * this browser's session key, so later calls are signed without the wallet
+ * (see `wallet-login.ts`).
  *
  * Native (iOS / Android) builds never see `window.vtaWallet`; the helper
  * degrades gracefully via `isWalletAvailable()`.
@@ -16,22 +17,21 @@
 
 import { Platform } from "react-native";
 
-import { api } from "./api";
+import { getApiBase } from "./api-base";
+import { clearSessionKeypair } from "./session-key";
+import { getServiceInfo } from "./trust-task";
+import {
+  authenticateIdTokenBindingSessionKey,
+  loginBindingSessionKey,
+  type VtaWalletLoginParams,
+  type VtaWalletLoginResult,
+} from "./wallet-login";
 
-/** A subset of the wallet provider's interface — just the SIOPv2 login.
- *  Declaring it inline keeps did-hosting-ui from depending on the extension
- *  package. The full interface lives in
- *  `@openvtc/pnm-extension/provider.ts`. */
-interface VtaWalletLoginParams {
-  rpDid: string;
-  baseUrl: string;
-}
-export interface VtaWalletLoginResult {
-  accessToken: string;
-  refreshToken: string;
-  sessionId: string;
-  holderDid: string;
-}
+export type { VtaWalletLoginResult };
+
+/* The subset of the wallet provider's interface this UI uses. Declaring it
+ * inline keeps did-hosting-ui from depending on the extension package. The
+ * full interface lives in `@openvtc/pnm-extension/provider.ts`. */
 interface VtaWalletSignTrustTaskParams {
   envelope: Record<string, unknown>;
 }
@@ -120,6 +120,18 @@ interface VtaWalletProvider {
     target?: { kind: string; [k: string]: unknown };
     ttlSecondsHint?: number;
   }): Promise<ProxyLoginWireResult>;
+  /** Raise an existing session to `aal2`. The wallet sends
+   *  `auth/step-up/start/0.1` to `{baseUrl}/trust-tasks`, verifies the signed
+   *  reply and the approve-request inside it (issuer `rpDid`, this session),
+   *  asks the user, answers with a signed `approve-response/0.5`, and renews
+   *  the session with `auth/refresh/0.1`. Resolves with the renewed tokens. */
+  stepUpVta?(params: {
+    baseUrl: string;
+    rpDid: string;
+    accessToken: string;
+    refreshToken: string;
+    sessionId: string;
+  }): Promise<VtaWalletLoginResult>;
   /** Which persona this site knows the user as, resolving or binding one.
    *  Mints nothing and issues no session. Present from the wallet build that
    *  added first-use persona binding (OpenVTC/vta-browser-plugin#145). */
@@ -147,11 +159,11 @@ export function isWalletAvailable(): boolean {
 /** The RP DID the wallet signs the SIOPv2 `id_token` for.
  *
  *  Sourced at runtime from THIS control plane's own DID via
- *  `GET /api/server-info` (`server_did`). That is the exact value the
+ *  the signed `server/info` Trust Task (`serviceDid`). That is the exact value the
  *  server compares the id_token `aud` against in `auth.rs`, so the wallet
  *  and the verifier can never disagree — and a single prebuilt UI bundle
  *  works against any deployment without baking a DID in at build time.
- *  `api.serverInfo()` caches per-tab, so this is one network round-trip.
+ *  `getServiceInfo()` caches per-tab, so this is one network round-trip.
  *
  *  `EXPO_PUBLIC_RP_DID` remains an explicit override for the unusual case
  *  where the wallet must target a DID other than this deployment's
@@ -159,38 +171,23 @@ export function isWalletAvailable(): boolean {
 export async function getRpDid(): Promise<string> {
   const override = process.env.EXPO_PUBLIC_RP_DID;
   if (override) return override;
-  const info = await api.serverInfo();
-  if (!info.server_did) {
-    throw new Error(
-      "This deployment has no server_did configured (GET /api/server-info returned null), " +
-        "so the wallet can't determine the RP DID for SIOP login. Set `server_did` in the " +
-        "control-plane config (or the CONTROL_SERVER_DID env var).",
-    );
-  }
-  return info.server_did;
+  return (await getServiceInfo()).serviceDid;
 }
 
-/** API base for the wallet's SIOPv2 round-trip. The UI is served same-origin
- *  with the did-hosting-control API at `/api`, so the default resolves the
- *  wallet's `${baseUrl}/auth/challenge` to the right endpoint without
- *  configuration. Override with `EXPO_PUBLIC_API_BASE` if the API is on a
- *  separate origin. */
-export function getApiBase(): string {
-  if (process.env.EXPO_PUBLIC_API_BASE) return process.env.EXPO_PUBLIC_API_BASE;
-  return (typeof window !== "undefined" ? window.location.origin : "") + "/api";
-}
+export { getApiBase };
 
-/** Trigger the wallet's SIOPv2 login. Resolves to the result containing the
- *  server-issued access token (suitable for `AuthProvider.login`); rejects
- *  if the wallet isn't available, the user denies the consent prompt, or the
- *  server rejects the `id_token`. */
+/** Sign in through the wallet, binding this browser's session key to the new
+ *  session. Resolves to the result containing the server-issued access token
+ *  (suitable for `AuthProvider.login`). Rejects if the wallet isn't
+ *  available, the user denies the consent prompt, the control plane refuses
+ *  the login, or the key was not bound. */
 export async function loginWithWallet(): Promise<VtaWalletLoginResult> {
   if (!isWalletAvailable()) {
     throw new Error(
       "VTA wallet extension is not installed (or this isn't running in a web browser).",
     );
   }
-  return window.vtaWallet!.login({
+  return loginBindingSessionKey(window.vtaWallet!, {
     rpDid: await getRpDid(),
     baseUrl: getApiBase(),
   });
@@ -278,9 +275,6 @@ export async function resolveProxyEntry(): Promise<{
 // login UI can render a sequence diagram + decoded id_token after the
 // flow completes. The visualization is the M2B.4 demo deliverable;
 // auth still works without rendering it.
-
-const AUTH_AUTHENTICATE_TYPE_URI =
-  "https://trusttasks.org/spec/auth/authenticate/0.1";
 
 /** One step in the visualisation. Captured with timing so the UI can
  *  render relative durations. */
@@ -406,6 +400,10 @@ export async function loginWithWalletProxy(
       "Chosen entry has no principalDid — only did-self-issued entries are supported for SIOP proxy login.",
     );
   }
+  // Drop any session key left from an earlier sign-in before anything can
+  // fail: `trust-task.ts` signs with whatever key is held, and the control
+  // plane refuses one this session never bound. Step 3 binds a fresh one.
+  clearSessionKeypair();
   const rpDid = await getRpDid();
   const apiBase = getApiBase().replace(/\/+$/, "");
   const steps: ProxyLoginVizStep[] = [];
@@ -485,60 +483,32 @@ export async function loginWithWalletProxy(
     },
   });
 
-  // ─── Step 3: post the id_token to /auth/. The server verifies the
-  //            signature against the entry's DID + checks nonce + aud
-  //            + iat/exp window, then issues access tokens.
+  // ─── Step 3: post the id_token, wrapped as an `auth/authenticate/0.3`
+  //            proxied authenticate, to /trust-tasks. The server verifies
+  //            the outer document's proof (the fresh session key, as the
+  //            delegate), then independently verifies the id_token itself as
+  //            `delegationEvidence` — signature, nonce against this same
+  //            challenge, aud, iat/exp — before honoring `principal`. Success
+  //            issues access tokens for a session bound to that same fresh
+  //            key, so the session's calls are signed without a wallet
+  //            prompt each.
   const tAuth = performance.now();
-  const authEnv = {
-    type: AUTH_AUTHENTICATE_TYPE_URI,
-    payload: {
-      id_token: idTokenCompact,
-      // Server expects snake_case here (no rename_all on
-      // AuthenticatePayload). Read from camelCase sessionId on
-      // chJson — that's the wire shape the challenge endpoint
-      // emits.
-      session_id: chJson.sessionId,
+  const { response: tokenResp, sent: authEnv } = await authenticateIdTokenBindingSessionKey(
+    apiBase,
+    {
+      idToken: idTokenCompact,
+      sessionId: chJson.sessionId,
+      challenge: chJson.challenge,
+      principalDid: entry.principalDid,
+      rpDid,
     },
-  };
-  const authRes = await fetch(`${apiBase}/auth/`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(authEnv),
-  });
-  if (!authRes.ok) {
-    const text = await authRes.text();
-    throw new Error(`/auth/ failed (${authRes.status}): ${text}`);
-  }
-  // /auth/ returns the canonical AuthenticateResponse: `{ session,
-  // tokens }`. Both nested structs (Session, TokenBundle) have
-  // `#[serde(rename_all = "camelCase")]` upstream in did-hosting-
-  // common's types.rs, so the wire shape is fully camelCase. The
-  // earlier draft of this file parsed the response with a flat
-  // snake_case shape (`{ access_token, refresh_token, session_id }`)
-  // — every field came out `undefined`, the wallet stored
-  // `undefined` as the token, and the home page bounced back to
-  // login. Mirror the canonical shape here.
-  const tokenResp = (await authRes.json()) as {
-    session: { id: string; subject: string; issuedAt: string; expiresAt: string };
-    tokens: {
-      accessToken: string;
-      refreshToken?: string;
-      tokenType: string;
-      expiresIn: number;
-      refreshExpiresIn?: number;
-    };
-  };
-  if (!tokenResp.tokens?.accessToken) {
-    throw new Error(
-      `/auth/: missing tokens.accessToken in response — got ${JSON.stringify(tokenResp).slice(0, 200)}`,
-    );
-  }
+  );
   steps.push({
     label: "3. Server verifies + issues bearer",
-    description: `Server resolves the entry's DID, verifies the id_token signature, checks the nonce matches the challenge it issued in step 1, and issues a bearer access token bound to the principal DID.`,
+    description: `Server verifies the outer document's proof from the session key (the delegate), independently verifies the id_token as delegationEvidence for the principal DID, checks its nonce matches the challenge from step 1, and issues a bearer access token bound to the principal DID — and to the session key this browser generated, which signs the session's calls from here on.`,
     durationMs: Math.round(performance.now() - tAuth),
     detail: {
-      url: `${apiBase}/auth/`,
+      url: `${apiBase}/trust-tasks`,
       requestBody: authEnv,
       response: {
         sessionId: tokenResp.session.id,

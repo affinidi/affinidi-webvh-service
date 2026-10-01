@@ -213,6 +213,7 @@ pub fn spawn_mediator_drain(state: &AppState, generation: IdentityGeneration) {
 
     let mediator = generation.mediator_did.clone().unwrap_or_default();
     let generation_id = generation.id;
+    let tsp_state = state.clone();
 
     tokio::spawn(async move {
         info!(
@@ -224,9 +225,17 @@ pub fn spawn_mediator_drain(state: &AppState, generation: IdentityGeneration) {
         let shutdown = CancellationToken::new();
         let config = identity_drain::drain_service_config(listener);
 
-        // The witness carries no TSP listener of its own — TSP rides the control
-        // plane's mediator socket — so there is no `start_with_tsp` arm here.
-        let svc = match DIDCommService::start(config, router, shutdown.clone()).await {
+        let svc = match if generation.protocols.tsp {
+            DIDCommService::start_with_tsp(
+                config,
+                router,
+                crate::tsp::WitnessTspHandler::new(tsp_state),
+                shutdown.clone(),
+            )
+            .await
+        } else {
+            DIDCommService::start(config, router, shutdown.clone()).await
+        } {
             Ok(svc) => svc,
             Err(e) => {
                 identity_drain::warn_drain_failed(&generation, &e.to_string());

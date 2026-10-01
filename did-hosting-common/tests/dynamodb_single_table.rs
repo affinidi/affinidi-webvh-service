@@ -346,6 +346,73 @@ async fn take_raw_on_missing_key_returns_none() {
 }
 
 // ---------------------------------------------------------------------------
+// KeyspaceOps — incr_raw (atomic counter)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn incr_raw_starts_at_one_and_counts_up() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace("sessions").expect("keyspace");
+
+    assert_eq!(ks.incr_raw("lockout:a").await.expect("incr"), 1);
+    assert_eq!(ks.incr_raw("lockout:a").await.expect("incr"), 2);
+    assert_eq!(ks.incr_raw("lockout:a").await.expect("incr"), 3);
+
+    // Counters are per key.
+    assert_eq!(ks.incr_raw("lockout:b").await.expect("incr"), 1);
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn incr_raw_is_scoped_to_its_keyspace() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+
+    let store = open_store(&endpoint, &table).await;
+    let one = store.keyspace("sessions").expect("keyspace");
+    let two = store.keyspace("acl").expect("keyspace");
+
+    // The same sort key in two keyspaces shares the table but not the counter.
+    assert_eq!(one.incr_raw("n").await.expect("incr"), 1);
+    assert_eq!(one.incr_raw("n").await.expect("incr"), 2);
+    assert_eq!(two.incr_raw("n").await.expect("incr"), 1);
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn incr_raw_concurrent_callers_never_see_the_same_value() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace("sessions").expect("keyspace");
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let ks = ks.clone();
+        tasks.push(tokio::spawn(async move {
+            ks.incr_raw("lockout:race").await.expect("incr")
+        }));
+    }
+    let mut seen = Vec::new();
+    for t in tasks {
+        seen.push(t.await.expect("join"));
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, (1..=8).collect::<Vec<u64>>());
+
+    delete_test_table(&client, &table).await;
+}
+
+// ---------------------------------------------------------------------------
 // KeyspaceOps — prefix_iter_raw
 // ---------------------------------------------------------------------------
 

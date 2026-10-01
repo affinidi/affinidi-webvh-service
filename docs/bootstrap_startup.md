@@ -250,11 +250,14 @@ did-hosting-daemon --config config.toml
 #    (typically a did:key from a wallet you control).
 did-hosting-daemon invite --did <ADMIN_DID> --role admin --config config.toml
 
-# 3. Open the printed enrolment URL in a browser and bind a passkey.
+# 3. It prints an enrolment URL and, separately, a claim code. Open the URL
+#    in a browser, type the claim code, and bind a passkey.
 #    Subsequent admin login uses the passkey.
 ```
 
-The `invite` subcommand is the single source of truth for admin onboarding — re-run it any time the operator needs another admin. Lost the URL before redeeming? Just run `did-hosting-daemon invite` again to mint a new one.
+The URL and the claim code are two halves of one invite: deliver them over different channels when the admin is someone else. Neither is stored — the control plane keeps only their hashes — and five wrong claim codes cancel the invite.
+
+The `invite` subcommand is the operator's bootstrap for admin onboarding; once an admin is signed in, further invites are issued from the console (`auth/passkey/enroll/invite/0.2`). Lost the URL or the code before redeeming? Run `did-hosting-daemon invite` again to mint a new invite.
 
 ### Config shape
 
@@ -578,9 +581,14 @@ also scopes the cloud secret backends. Replace `<PREFIX>` below with
 | `<PREFIX>_SECRETS_AZURE_VAULT_URL` | Azure Key Vault URL (e.g. `https://my-vault.vault.azure.net/`) |
 | `<PREFIX>_SECRETS_AZURE_SECRET_NAME` | Azure Key Vault secret name |
 
-Selection precedence at runtime: AWS → GCP → Azure → keyring → plaintext.
-Compile-time feature gates (`aws-secrets`, `gcp-secrets`, `azure-secrets`,
-`keyring`) decide which backends are even compiled in. Only compile in the
+`secrets.backend`, when set, selects the backend outright. Otherwise the
+precedence is AWS → GCP → Azure → Vault → Kubernetes → keyring. Plaintext is
+never chosen implicitly: it needs `backend = "plaintext"` and
+`confirm_plaintext = true`, and is for tests only. A backend selected on a
+binary built without its feature, or a keyring that cannot be opened, is a
+startup error listing the secure backends. Compile-time feature gates
+(`aws-secrets`, `gcp-secrets`, `azure-secrets`, `vault-secrets`,
+`k8s-secrets`, `keyring`) decide which backends are compiled in. Only compile in the
 backends you'll use — they each pull a sizable cloud SDK.
 
 ### Storage backends (all binaries)
@@ -602,3 +610,63 @@ backends you'll use — they each pull a sizable cloud SDK.
 Storage backends are mutually exclusive — exactly one of `store-fjall`,
 `store-redis`, `store-dynamodb`, `store-dynamodb-single`, `store-firestore`,
 `store-cosmosdb` must be enabled at build time.
+
+### Fjall memory settings (all binaries, `store-fjall` only)
+
+The embedded on-disk store (fjall) grows three memory-backed pools with
+the data set: a block cache for reads, buffered writes across every
+keyspace the process opens, and the write-ahead journal it replays at
+startup. Left at fjall's own defaults, none of these are aware of a
+Kubernetes pod's memory `limits` — a service under sustained write load
+can be OOMKilled by its own storage layer even though the request path
+looks fine.
+
+Three optional settings cap them, in a `[fjall]` table in `config.toml`
+(a sibling of `[store]`) or, equivalently, as environment variables —
+the **same three names for every binary** (did-hosting-server,
+did-hosting-control, webvh-witness, webvh-watcher, and
+did-hosting-daemon, which shares one `[fjall]` table across its `store`
+and `witness_store`), since this is a pod-level setting, not a
+per-service one:
+
+| Config key | Env var | fjall knob | Default (unset) |
+|------------|---------|------------|------------------|
+| `fjall.block_cache` | `STORAGE_FJALL_BLOCK_CACHE` | `Database::builder(..).cache_size(..)` | 32 MiB |
+| `fjall.write_buffer` | `STORAGE_FJALL_WRITE_BUFFER` | `Database::builder(..).max_write_buffer_size(..)` | unbounded |
+| `fjall.max_journal` | `STORAGE_FJALL_MAX_JOURNAL` | `Database::builder(..).max_journaling_size(..)` | 512 MiB |
+
+Each value is a byte size — a plain integer, or a number with a binary
+(`KiB`/`MiB`/`GiB`/`TiB`) or decimal (`KB`/`MB`/`GB`/`TB`/`B`) suffix,
+e.g. `"64MiB"`, `"512MB"`, `"1GiB"`. All three are optional; leaving them
+unset keeps today's behaviour unchanged, byte for byte. An env var
+overrides whatever the config file set. An invalid, zero, or absurdly
+small value — fjall itself refuses a write buffer under 1 MiB or a
+journal under 64 MiB — fails startup with an error naming the setting;
+nothing is ever silently clamped or ignored. The effective values are
+logged once when the store opens.
+
+```toml
+[store]
+data_dir = "/srv/did-hosting/data"
+
+[fjall]
+block_cache  = "64MiB"
+write_buffer = "32MiB"
+max_journal  = "128MiB"
+```
+
+**Sizing against the pod's memory limit.** Budget roughly
+`block_cache + write_buffer + max_journal` plus headroom for the rest of
+the process (connections, in-flight requests, DIDComm/TSP state) — a
+common starting point is to keep that sum at 40–60% of the container's
+memory `limit` and leave the remainder for everything else. Startup's
+journal replay briefly holds close to `max_journal` in memory, so a
+limit set right at the steady-state sum above can still OOM on a
+restart. `did-hosting-daemon` opens two fjall stores (`store` and
+`witness_store`) from the *same* `[fjall]` table, so double the budget
+above when sizing its pod.
+
+Only the `store-fjall` backend reads these settings — `store-redis`,
+`store-dynamodb`, `store-firestore`, and `store-cosmosdb` ignore them
+entirely, since they have no local cache, write buffer, or journal of
+their own to tune.

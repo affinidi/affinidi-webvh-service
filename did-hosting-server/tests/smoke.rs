@@ -27,8 +27,8 @@ use did_hosting_common::server::config::{
 use did_hosting_common::server::domain::{
     DomainEntry, DomainStatus, DomainUrlScheme, create_domain,
 };
+use did_hosting_common::server::store::KS_DIDS;
 use did_hosting_common::server::store::Store;
-use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_SESSIONS};
 use did_hosting_server::cache::ContentCache;
 use did_hosting_server::config::{AppConfig, LimitsConfig, StatsConfig};
 use did_hosting_server::server::AppState;
@@ -42,8 +42,6 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         ..StoreConfig::default()
     };
     let store = Store::open(&store_config).await.expect("open store");
-    let sessions_ks = store.keyspace(KS_SESSIONS).expect("sessions ks");
-    let acl_ks = store.keyspace(KS_ACL).expect("acl ks");
     let dids_ks = store.keyspace(KS_DIDS).expect("dids ks");
 
     let config = AppConfig {
@@ -54,13 +52,13 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         server: ServerConfig::default(),
         log: LogConfig::default(),
         store: store_config.clone(),
+        fjall: Default::default(),
         auth: AuthConfig::default(),
         hosting: did_hosting_common::server::config::HostingConfig::default(),
         secrets: SecretsConfig::default(),
         limits: LimitsConfig::default(),
+        replication: Default::default(),
         stats: StatsConfig::default(),
-        watchers: Vec::new(),
-        control_url: None,
         control_did: None,
         vta: VtaConfig::default(),
         identity: Default::default(),
@@ -69,22 +67,63 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
 
     let state = AppState {
         store: store.clone(),
-        sessions_ks,
-        acl_ks,
         dids_ks,
         config: Arc::new(config),
         did_resolver: None,
+        trust_tasks_verifier: None,
         secrets_resolver: None,
         identity: None,
         didcomm_service: std::sync::Arc::new(std::sync::OnceLock::new()),
-        jwt_keys: None,
-        signing_key_bytes: None,
-        http_client: reqwest::Client::new(),
         stats_collector: None,
         did_cache: Arc::new(ContentCache::new(Duration::from_secs(60))),
         trusted_proxy_cidrs: Arc::new(Vec::new()),
+        replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
+            did_hosting_common::server::auth::session::now_epoch(),
+        )),
+        trust_tasks_rate_limiter: Arc::new(
+            did_hosting_common::server::rate_limit::IpRateLimiter::new(
+                did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
+                did_hosting_common::server::rate_limit::TRUST_TASKS_MAX_PER_WINDOW,
+                did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
+            ),
+        ),
+        sync_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     (state, dir)
+}
+
+/// Seed both the raw content and its `DidRecord` for `mnemonic` — the pair
+/// register/publish always write together in one commit. `serve_content`
+/// refuses before ever consulting the cache when the record alone is
+/// missing, so a test that wants a 200 must seed both, not content alone.
+async fn seed_did(state: &AppState, mnemonic: &str, did_id: &str, body: &str) {
+    state
+        .dids_ks
+        .insert_raw(content_log_key(mnemonic), body.as_bytes().to_vec())
+        .await
+        .expect("seed did log");
+    state
+        .dids_ks
+        .insert(
+            did_key(mnemonic),
+            &DidRecord {
+                owner: "did:example:owner".into(),
+                mnemonic: mnemonic.into(),
+                created_at: 0,
+                updated_at: 0,
+                version_count: 1,
+                did_id: Some(did_id.into()),
+                content_size: body.len() as u64,
+                disabled: false,
+                deleted_at: None,
+                method: "webvh".into(),
+                domain: String::new(),
+                services: None,
+                agent_names: Vec::new(),
+            },
+        )
+        .await
+        .expect("seed DidRecord");
 }
 
 #[tokio::test]
@@ -93,13 +132,9 @@ async fn public_did_resolution_round_trip() {
 
     // Seed a DID log under mnemonic "alice".
     let mnemonic = "alice";
-    let body =
-        "{\"versionId\":\"1-test\",\"state\":{\"id\":\"did:webvh:test:server.example.com:alice\"}}";
-    state
-        .dids_ks
-        .insert_raw(content_log_key(mnemonic), body.as_bytes().to_vec())
-        .await
-        .expect("seed did log");
+    let did_id = "did:webvh:test:server.example.com:alice";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, mnemonic, did_id, &body).await;
 
     let app = did_hosting_server::routes::router(1024 * 1024)
         .with_state(state.clone())
@@ -168,6 +203,68 @@ async fn public_did_resolution_round_trip() {
     assert_eq!(cc, "no-store", "404 must not be cached");
 }
 
+/// Regression: a deleted DID must stop resolving immediately, not up to the
+/// content cache's TTL later. `did/delete` (the control plane) removes the
+/// `DidRecord` outright rather than soft-deleting it — a hard delete, not a
+/// disable — so a resolver reading a warm cache entry with no record behind
+/// it any more must refuse before ever consulting that cache.
+#[tokio::test]
+async fn a_deleted_did_stops_resolving_at_once_even_with_a_warm_cache() {
+    let (state, _dir) = make_state().await;
+
+    let mnemonic = "alice";
+    let did_id = "did:webvh:test:server.example.com:alice";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, mnemonic, did_id, &body).await;
+
+    let app = did_hosting_server::routes::router(1024 * 1024).with_state(state.clone());
+
+    // Warm the content cache.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/{mnemonic}/did.jsonl"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "precondition: cache is warm"
+    );
+
+    // A hard delete: the record goes, exactly like `did/delete`. Left
+    // deliberately WITHOUT invalidating the cache and without removing the
+    // raw content bytes — this isolates the `serve_content` guard itself
+    // (a missing record refuses before the cache is ever consulted) from
+    // whether some call site remembered to invalidate.
+    state
+        .dids_ks
+        .remove(did_key(mnemonic))
+        .await
+        .expect("remove record");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/{mnemonic}/did.jsonl"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "a deleted DID must not be served from a warm cache"
+    );
+}
+
 /// T25: with both `method-webvh` and `method-web` enabled, the
 /// per-method dispatchers must not swallow specific routes like
 /// `/api/health` or other non-DID paths. The dispatchers' suffix
@@ -178,29 +275,30 @@ async fn public_did_resolution_round_trip() {
 async fn route_ordering_specific_routes_beat_method_dispatchers() {
     let (state, _dir) = make_state().await;
 
-    let app = did_hosting_server::routes::router(1024 * 1024).with_state(state);
+    let app = did_hosting_server::routes::router(1024 * 1024)
+        .with_state(state)
+        .layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        ));
 
-    // `/api/services` is a specific authenticated route; without
-    // credentials it must reach its handler and return 401, not be
-    // swallowed by the catch-all fallback (which would 404). The
-    // exact 401 vs 403 doesn't matter — anything non-404 proves the
-    // specific route matched first.
+    // `/api/trust-tasks` is a specific route; a malformed body must reach
+    // its handler (400), not be swallowed by the catch-all fallback (which
+    // would 404).
     let response = app
         .clone()
         .oneshot(
             Request::builder()
-                .method("GET")
-                .uri("/api/services")
-                .body(Body::empty())
+                .method("POST")
+                .uri("/api/trust-tasks")
+                .body(Body::from("not a document"))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_ne!(
+    assert_eq!(
         response.status(),
-        StatusCode::NOT_FOUND,
-        "/api/services must reach its handler (any non-404 ok), not be swallowed by method dispatchers; got {}",
-        response.status()
+        StatusCode::BAD_REQUEST,
+        "/api/trust-tasks must reach its handler, not be swallowed by method dispatchers"
     );
 
     // A URL with no DID suffix and no specific route — both
@@ -401,13 +499,9 @@ async fn public_did_resolution_sets_cors_header() {
     let (state, _dir) = make_state().await;
 
     let mnemonic = "alice";
-    let body =
-        "{\"versionId\":\"1-test\",\"state\":{\"id\":\"did:webvh:test:server.example.com:alice\"}}";
-    state
-        .dids_ks
-        .insert_raw(content_log_key(mnemonic), body.as_bytes().to_vec())
-        .await
-        .expect("seed did log");
+    let did_id = "did:webvh:test:server.example.com:alice";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, mnemonic, did_id, &body).await;
 
     // Assemble the router exactly as `run_rest_thread` does: security headers
     // then the public-resolution CORS layer.
@@ -441,43 +535,46 @@ async fn public_did_resolution_sets_cors_header() {
     assert_eq!(acao, "*", "public DID resolution must allow any origin");
 }
 
-/// REGRESSION (upgrade scenario): when an operator runs
-/// `did-hosting-server` with `features.rest_api = false`, the binary
-/// assembles `router_public_only().fallback(did_public::serve_public)`
-/// (server.rs:483). A request for `/{mnemonic}/did.jsonl` must still
-/// route through `serve_public` -> `resolve_webvh::dispatch` ->
-/// `serve_content`, not fall to the default 404. This reproduces the
-/// user-reported 404 on an upgraded v0.6 -> v0.7 server.
+/// The router `run_rest_thread` assembles — resolution, the Trust Task
+/// listener, the DID-serving fallback, then the layers and a trailing
+/// `/api/health` — serves `/{mnemonic}/did.jsonl` through `serve_public` ->
+/// `resolve_webvh::dispatch` -> `serve_content` rather than the default 404
+/// (the regression an upgraded v0.6 -> v0.7 server once hit), and exposes no
+/// management surface: every former `/api/*` route is gone, and only
+/// `POST /api/trust-tasks` answers under `/api`.
 #[tokio::test]
-async fn rest_disabled_router_serves_public_did_via_fallback() {
+async fn the_edge_router_serves_resolution_and_no_management_surface() {
     let (state, _dir) = make_state().await;
 
     let mnemonic = "mediator";
-    let body = "{\"versionId\":\"1-test\",\"state\":{\"id\":\"did:webvh:Q1:server.example.com:mediator\"}}";
-    state
-        .dids_ks
-        .insert_raw(content_log_key(mnemonic), body.as_bytes().to_vec())
-        .await
-        .expect("seed did log");
+    let did_id = "did:webvh:Q1:server.example.com:mediator";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, mnemonic, did_id, &body).await;
 
-    // Reproduce the EXACT layer/route ordering that run_rest_thread
-    // assembles when features.rest_api = false (server.rs:483-503):
-    // base + fallback, .with_state, TraceLayer, security_headers,
-    // public_resolution_cors, then a trailing .route("/api/health",
-    // ...) added AFTER the layers.
-    let app = did_hosting_server::routes::router_public_only()
-        .fallback(did_hosting_server::routes::did_public::serve_public)
+    // The EXACT layer/route ordering run_rest_thread assembles: base +
+    // fallback, .with_state, TraceLayer, security_headers,
+    // public_resolution_cors, then a trailing .route("/api/health", ...)
+    // added AFTER the layers.
+    let app = did_hosting_server::routes::router(1 << 20)
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn(
             did_hosting_common::server::security_headers,
         ))
         .layer(did_hosting_common::server::public_resolution_cors())
+        // `receive` requires a real `ConnectInfo<SocketAddr>`; a router
+        // driven directly via `.oneshot()` carries no real connection, so
+        // this test supplies the mock the production `MockConnectInfo`
+        // layer used to bake into the router itself.
+        .layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        ))
         // Stand-in health handler; only the route SHAPE matters for
         // reproducing the layering/ordering bug, not the body.
         .route("/api/health", axum::routing::get(|| async { "ok" }));
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -491,12 +588,66 @@ async fn rest_disabled_router_serves_public_did_via_fallback() {
     assert_eq!(
         response.status(),
         StatusCode::OK,
-        "REST-disabled router must still serve /{{mnemonic}}/did.jsonl via the fallback"
+        "the edge router must serve /{{mnemonic}}/did.jsonl via the fallback"
     );
     let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
         .await
         .unwrap();
     assert_eq!(&bytes[..], body.as_bytes());
+
+    // The former management routes answer nothing that would act.
+    for (method, uri) in [
+        ("POST", "/api/auth/challenge"),
+        ("POST", "/api/auth/"),
+        ("GET", "/api/dids"),
+        ("PUT", "/api/dids/mediator"),
+        ("DELETE", "/api/dids/mediator"),
+        ("PUT", "/api/witness/mediator"),
+        ("GET", "/api/log/mediator"),
+        ("GET", "/api/raw/mediator"),
+        ("PUT", "/api/disable/mediator"),
+        ("PUT", "/api/enable/mediator"),
+        ("GET", "/api/services"),
+        ("GET", "/api/stats"),
+        ("GET", "/api/config"),
+        ("GET", "/api/acl"),
+        ("POST", "/api/acl"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                response.status(),
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "{method} {uri} answered {}",
+            response.status()
+        );
+    }
+
+    // The Trust Task listener is there: a body that is not a document is a
+    // 400, not a 404.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/trust-tasks")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 /// REGRESSION (v0.6 → v0.7 upgrade parity with the daemon):

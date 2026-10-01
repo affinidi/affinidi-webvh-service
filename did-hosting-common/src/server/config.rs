@@ -217,6 +217,327 @@ impl std::fmt::Debug for StoreConfig {
     }
 }
 
+/// Optional Fjall memory settings, shared by every service that opens a
+/// local fjall store (did-hosting-control, did-hosting-server,
+/// webvh-witness, webvh-watcher, and did-hosting-daemon, which opens two).
+/// Exists so a pod's Kubernetes memory limit can be kept clear of fjall's
+/// block cache, buffered writes and startup journal replay — all three
+/// grow with the data set and, left at fjall's defaults, are sized for a
+/// workstation rather than a constrained pod.
+///
+/// Deliberately **not** a field of [`StoreConfig`]: that type is
+/// constructed as a bare struct literal (`StoreConfig { data_dir: .. }`)
+/// at hundreds of call sites across the workspace, mostly tests opening
+/// an ad hoc store, and adding a field there would force every one of
+/// them to change. Instead this is a sibling value each service loads
+/// separately (a `[fjall]` config-file table, see below) and threads
+/// explicitly into [`crate::server::store::Store::open_with`] alongside
+/// the `StoreConfig` it already had. [`crate::server::store::Store::open`]
+/// — what every existing call site still uses — is `open_with` with
+/// [`FjallTuning::default()`], so nothing already opening a store needed
+/// to change to keep behaving exactly as before.
+///
+/// Every field is optional and defaults to `None`: unset, byte for byte,
+/// leaves fjall's own defaults (and this codebase's behaviour before this
+/// type existed) unchanged. Settable in a service's config file under
+/// `[fjall]` (a bare integer byte count, or a string like `"64MiB"` /
+/// `"512MB"` / `"1GiB"`), and overridable per field by the environment
+/// variables named on each field below — the env var wins when both are
+/// set. The **same** three env var names are used for every consumer
+/// (there is deliberately no per-service prefix): this is a pod-level
+/// Kubernetes memory-limit knob, not a per-service setting.
+///
+/// Validated before use ([`FjallTuning::validate`]): zero, a value fjall
+/// itself would refuse (its own `Builder` asserts under 1 MiB for the
+/// write buffer and under 64 MiB for the journal — panics this type
+/// exists to turn into an ordinary startup error instead), or anything
+/// that fails to parse is refused with a message naming the setting,
+/// never silently ignored or clamped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FjallTuning {
+    /// fjall's shared block cache size, in bytes
+    /// (`fjall::Database::builder(..).cache_size(..)`). fjall's own
+    /// default is 32 MiB. Env override: `STORAGE_FJALL_BLOCK_CACHE`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_block_cache"
+    )]
+    pub block_cache: Option<u64>,
+    /// Maximum size of all active memtables across every keyspace this
+    /// process opens, in bytes
+    /// (`fjall::Database::builder(..).max_write_buffer_size(Some(..))`).
+    /// fjall's own default is unbounded. Env override:
+    /// `STORAGE_FJALL_WRITE_BUFFER`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_write_buffer"
+    )]
+    pub write_buffer: Option<u64>,
+    /// Maximum size of all journals — the write-ahead log fjall replays
+    /// on startup — in bytes
+    /// (`fjall::Database::builder(..).max_journaling_size(..)`). fjall's
+    /// own default is 512 MiB. Env override: `STORAGE_FJALL_MAX_JOURNAL`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_max_journal"
+    )]
+    pub max_journal: Option<u64>,
+}
+
+/// Floor for [`FjallTuning::block_cache`]. fjall places no lower bound on
+/// its cache size itself, but a cache below this buys nothing meaningful
+/// and is far more likely to be a fat-fingered value (bytes typed where
+/// mebibytes were meant) than an intentional setting.
+pub const MIN_BLOCK_CACHE_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+/// Floor for [`FjallTuning::write_buffer`] — mirrors fjall's own
+/// `Builder::max_write_buffer_size`, which panics below this.
+pub const MIN_WRITE_BUFFER_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+/// Floor for [`FjallTuning::max_journal`] — mirrors fjall's own
+/// `Builder::max_journaling_size`, which panics below this.
+pub const MIN_MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+
+/// Byte-size suffixes this module accepts, longest first so e.g. `"MiB"`
+/// is tried before the bare `"B"` it also ends with. IEC (binary, 1024-based)
+/// before SI (decimal, 1000-based) is an arbitrary but fixed tie-break —
+/// there is no overlap between the two suffix spellings, so it never
+/// actually matters which list comes first.
+const BYTE_SIZE_SUFFIXES: &[(&str, u64)] = &[
+    ("TiB", 1024 * 1024 * 1024 * 1024),
+    ("GiB", 1024 * 1024 * 1024),
+    ("MiB", 1024 * 1024),
+    ("KiB", 1024),
+    ("TB", 1_000_000_000_000),
+    ("GB", 1_000_000_000),
+    ("MB", 1_000_000),
+    ("KB", 1_000),
+    ("B", 1),
+];
+
+/// Parse a byte-size value: a plain byte count (`"67108864"`), or a
+/// number followed by a binary (`KiB`/`MiB`/`GiB`/`TiB`) or decimal
+/// (`KB`/`MB`/`GB`/`TB`/`B`) suffix, case-insensitively. Never validates
+/// range — callers combine this with a minimum (see
+/// [`parse_and_validate_fjall_bytes`]).
+pub fn parse_byte_size(raw: &str) -> Result<u64, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("value is empty".to_string());
+    }
+    if trimmed.starts_with('-') {
+        return Err(format!(
+            "{trimmed:?} is negative; a byte size cannot be negative"
+        ));
+    }
+    for (suffix, multiplier) in BYTE_SIZE_SUFFIXES {
+        if trimmed.len() > suffix.len()
+            && trimmed[trimmed.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+        {
+            let number_part = trimmed[..trimmed.len() - suffix.len()].trim();
+            let value: f64 = number_part.parse().map_err(|_| {
+                format!(
+                    "{trimmed:?} is not a valid byte size (expected a number before the {suffix:?} suffix)"
+                )
+            })?;
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!("{trimmed:?} is not a valid byte size"));
+            }
+            return Ok((value * (*multiplier as f64)).round() as u64);
+        }
+    }
+    trimmed.parse::<u64>().map_err(|_| {
+        format!(
+            "{trimmed:?} is not a valid byte size (expected a plain byte count, or a number with \
+             a B/KB/MB/GB/TB or KiB/MiB/GiB/TiB suffix)"
+        )
+    })
+}
+
+/// Render a byte count the way this module's error messages and startup
+/// log line do: the most natural binary unit, two decimal places.
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: &[(&str, u64)] = &[
+        ("TiB", 1024 * 1024 * 1024 * 1024),
+        ("GiB", 1024 * 1024 * 1024),
+        ("MiB", 1024 * 1024),
+        ("KiB", 1024),
+    ];
+    for (unit, size) in UNITS {
+        if bytes >= *size {
+            return format!("{:.2} {unit}", bytes as f64 / *size as f64);
+        }
+    }
+    format!("{bytes} B")
+}
+
+/// Parse then range-check a byte-size value against `minimum`, producing
+/// an error that names `field` (an env var name or a config key path) —
+/// used identically by the config-file deserializer and the env var
+/// overrides so a bad value is refused wherever it came from, with the
+/// same message shape.
+pub fn parse_and_validate_fjall_bytes(field: &str, raw: &str, minimum: u64) -> Result<u64, String> {
+    let bytes = parse_byte_size(raw).map_err(|e| format!("invalid {field} value {raw:?}: {e}"))?;
+    validate_fjall_bytes(field, bytes, minimum, raw)
+}
+
+fn validate_fjall_bytes(
+    field: &str,
+    bytes: u64,
+    minimum: u64,
+    raw_display: &str,
+) -> Result<u64, String> {
+    if bytes == 0 {
+        return Err(format!(
+            "{field} must not be zero (got {raw_display:?}); fjall needs a positive size here"
+        ));
+    }
+    if bytes < minimum {
+        return Err(format!(
+            "{field} value {raw_display:?} ({bytes} bytes) is too small; must be at least \
+             {minimum} bytes ({})",
+            human_bytes(minimum)
+        ));
+    }
+    Ok(bytes)
+}
+
+/// A `[fjall]` field is either a bare integer byte count or a suffixed
+/// string — accept both.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawByteSize {
+    Number(u64),
+    Text(String),
+}
+
+fn deserialize_optional_fjall_byte_size<'de, D>(
+    deserializer: D,
+    field: &str,
+    minimum: u64,
+) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<RawByteSize>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(RawByteSize::Number(n)) => validate_fjall_bytes(field, n, minimum, &n.to_string())
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        Some(RawByteSize::Text(s)) => {
+            let bytes = parse_byte_size(&s).map_err(|e| {
+                serde::de::Error::custom(format!("invalid {field} value {s:?}: {e}"))
+            })?;
+            validate_fjall_bytes(field, bytes, minimum, &s)
+                .map(Some)
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+fn deserialize_block_cache<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_optional_fjall_byte_size(deserializer, "fjall.block_cache", MIN_BLOCK_CACHE_BYTES)
+}
+
+fn deserialize_write_buffer<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_optional_fjall_byte_size(deserializer, "fjall.write_buffer", MIN_WRITE_BUFFER_BYTES)
+}
+
+fn deserialize_max_journal<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_optional_fjall_byte_size(deserializer, "fjall.max_journal", MIN_MAX_JOURNAL_BYTES)
+}
+
+impl FjallTuning {
+    /// Re-check every set field against its floor. Called from
+    /// [`crate::server::store::Store::open_with`] right before the values
+    /// are handed to fjall's builder, so a `FjallTuning` built any other
+    /// way than through the deserializer or [`apply_fjall_env_overrides`]
+    /// (a test fixture, a future caller) still can never reach fjall's
+    /// own asserting `Builder` methods with a value that would panic.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(bytes) = self.block_cache {
+            validate_fjall_bytes(
+                "fjall.block_cache",
+                bytes,
+                MIN_BLOCK_CACHE_BYTES,
+                &bytes.to_string(),
+            )?;
+        }
+        if let Some(bytes) = self.write_buffer {
+            validate_fjall_bytes(
+                "fjall.write_buffer",
+                bytes,
+                MIN_WRITE_BUFFER_BYTES,
+                &bytes.to_string(),
+            )?;
+        }
+        if let Some(bytes) = self.max_journal {
+            validate_fjall_bytes(
+                "fjall.max_journal",
+                bytes,
+                MIN_MAX_JOURNAL_BYTES,
+                &bytes.to_string(),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Apply `STORAGE_FJALL_BLOCK_CACHE` / `STORAGE_FJALL_WRITE_BUFFER` /
+/// `STORAGE_FJALL_MAX_JOURNAL` onto `config`, one field at a time, if set.
+/// The **same** three env var names for every consumer (did-hosting-control,
+/// did-hosting-server, webvh-witness, webvh-watcher, did-hosting-daemon, and
+/// any future one) — this is a pod-level Kubernetes memory-limit knob, not a
+/// per-service setting, so there is deliberately no service-specific prefix.
+/// Called by each service's own config loader, after the config file is
+/// parsed, so an env var overrides the file — an unset var leaves whatever
+/// the file (or the type's `None` default) already set untouched.
+pub fn apply_fjall_env_overrides(config: &mut FjallTuning) -> Result<(), AppError> {
+    if let Ok(raw) = std::env::var("STORAGE_FJALL_BLOCK_CACHE") {
+        config.block_cache = Some(
+            parse_and_validate_fjall_bytes(
+                "STORAGE_FJALL_BLOCK_CACHE",
+                &raw,
+                MIN_BLOCK_CACHE_BYTES,
+            )
+            .map_err(AppError::Config)?,
+        );
+    }
+    if let Ok(raw) = std::env::var("STORAGE_FJALL_WRITE_BUFFER") {
+        config.write_buffer = Some(
+            parse_and_validate_fjall_bytes(
+                "STORAGE_FJALL_WRITE_BUFFER",
+                &raw,
+                MIN_WRITE_BUFFER_BYTES,
+            )
+            .map_err(AppError::Config)?,
+        );
+    }
+    if let Ok(raw) = std::env::var("STORAGE_FJALL_MAX_JOURNAL") {
+        config.max_journal = Some(
+            parse_and_validate_fjall_bytes(
+                "STORAGE_FJALL_MAX_JOURNAL",
+                &raw,
+                MIN_MAX_JOURNAL_BYTES,
+            )
+            .map_err(AppError::Config)?,
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AuthConfig {
     #[serde(default = "default_access_token_expiry")]
@@ -227,11 +548,62 @@ pub struct AuthConfig {
     pub challenge_ttl: u64,
     #[serde(default = "default_session_cleanup_interval")]
     pub session_cleanup_interval: u64,
+    /// How long an admin session may go without user activity before it may
+    /// no longer be renewed, in seconds.
+    ///
+    /// Distinct from [`Self::access_token_expiry`], which is how often a live
+    /// session rotates its token. The console renews on a timer, so if the
+    /// two were the same clock a tab left open would hold its session for as
+    /// long as the browser ran. This is the value that decides when an
+    /// operator who walked away is signed out; it is measured against
+    /// `Session::last_seen`, which only real requests advance.
+    #[serde(default = "default_admin_idle_timeout")]
+    pub admin_idle_timeout: u64,
     #[serde(default = "default_passkey_enrollment_ttl")]
     pub passkey_enrollment_ttl: u64,
     /// How long (in minutes) to keep empty DID records before auto-cleanup.
     #[serde(default = "default_cleanup_ttl_minutes")]
     pub cleanup_ttl_minutes: u64,
+    /// Global cap on concurrently-live pending auth challenges across all DIDs
+    /// (did-hosting-control's in-memory `PendingChallengeTracker`).
+    /// Defence-in-depth bound on the unauthenticated
+    /// `POST /api/auth/challenge` surface: an attacker sweeping many distinct
+    /// DIDs cannot accumulate more than this many live challenges before
+    /// issuance fails closed. Mirrors
+    /// `did_hosting_control::pending_challenges::MAX_GLOBAL_PENDING`, the
+    /// compiled-in default; the two are pinned equal by a unit test in that
+    /// crate. Operators on unusually large or small deployments can tune it.
+    #[serde(default = "default_max_global_pending_challenges")]
+    pub max_global_pending_challenges: usize,
+    /// Per-DID cap on concurrently-live pending auth challenges (the sibling
+    /// of `max_global_pending_challenges`). Bounds a single-DID flood. Mirrors
+    /// `did_hosting_control::routes::auth::MAX_PENDING_CHALLENGES_PER_DID`, the
+    /// compiled-in default; also pinned equal by a unit test in that crate.
+    #[serde(default = "default_max_pending_challenges_per_did")]
+    pub max_pending_challenges_per_did: usize,
+    /// The absolute ceiling on a session's life, in seconds from
+    /// authentication (`auth/authenticate/0.2` or `/0.3`'s `Session.issuedAt`).
+    /// No `auth/refresh/0.2` may advance `Session.expiresAt` — nor, in this
+    /// implementation, the underlying refresh-token deadline — past
+    /// `issuedAt + absolute_session_lifetime`; a session that has already
+    /// reached it refuses refresh outright
+    /// (`auth/refresh:sessionLifetimeExceeded`) rather than silently
+    /// returning a token with a shrunk window. This is the backstop for a
+    /// refresh token (and, where bound, a session key) that stays quietly
+    /// compromised: however long undetected, neither can keep a session
+    /// alive past this instant — only a fresh `auth/authenticate` can.
+    #[serde(default = "default_absolute_session_lifetime")]
+    pub absolute_session_lifetime: u64,
+}
+
+/// 15 minutes of inactivity.
+///
+/// Longer than the 900s access-token lifetime it sits beside, deliberately:
+/// before this existed an admin was signed out 15 minutes after logging in
+/// whether or not they were working, because nothing renewed the token. The
+/// same number now bounds idleness rather than wall-clock.
+fn default_admin_idle_timeout() -> u64 {
+    900
 }
 
 fn default_access_token_expiry() -> u64 {
@@ -258,6 +630,26 @@ fn default_cleanup_ttl_minutes() -> u64 {
     60
 }
 
+/// Default global pending-challenge cap. Must equal
+/// `did_hosting_control::pending_challenges::MAX_GLOBAL_PENDING` (pinned by a
+/// unit test in that crate — the constant lives there because the tracker
+/// does, and did-hosting-common sits below did-hosting-control in the graph).
+fn default_max_global_pending_challenges() -> usize {
+    10_000
+}
+
+/// Default per-DID pending-challenge cap. Must equal
+/// `did_hosting_control::routes::auth::MAX_PENDING_CHALLENGES_PER_DID`.
+fn default_max_pending_challenges_per_did() -> usize {
+    10
+}
+
+/// 30 days. Generous enough that a normally-active session never notices
+/// it, tight enough that a compromise nobody caught still ends on its own.
+fn default_absolute_session_lifetime() -> u64 {
+    30 * 24 * 60 * 60
+}
+
 impl AuthConfig {
     /// Validate configuration values are within acceptable ranges.
     pub fn validate(&self) -> Result<(), AppError> {
@@ -271,12 +663,50 @@ impl AuthConfig {
                 "session_cleanup_interval must be at least 10 seconds".into(),
             ));
         }
+        // A timeout shorter than a minute signs an operator out between
+        // keystrokes; it is a misconfiguration, not a strict policy.
+        if self.admin_idle_timeout < 60 {
+            return Err(AppError::Config(
+                "admin_idle_timeout must be at least 60 seconds".into(),
+            ));
+        }
         if self.access_token_expiry < 30 {
             return Err(AppError::Config(
                 "access_token_expiry must be at least 30 seconds".into(),
             ));
         }
+        // A zero cap fails every challenge closed — bounded, but it takes
+        // authentication down rather than protecting it, so refuse it at load.
+        if self.max_global_pending_challenges == 0 {
+            return Err(AppError::Config(
+                "max_global_pending_challenges must be at least 1".into(),
+            ));
+        }
+        if self.max_pending_challenges_per_did == 0 {
+            return Err(AppError::Config(
+                "max_pending_challenges_per_did must be at least 1".into(),
+            ));
+        }
+        // Shorter than a single refresh cycle, the ceiling would refuse the
+        // very first refresh a normal session attempts.
+        if self.absolute_session_lifetime < self.refresh_token_expiry {
+            return Err(AppError::Config(
+                "absolute_session_lifetime must be at least refresh_token_expiry".into(),
+            ));
+        }
         Ok(())
+    }
+
+    /// `Retry-After` for a refusal on the canonical handler's pending-challenge
+    /// cap (did-hosting-server, webvh-witness). That cap counts `ChallengeSent`
+    /// rows in the store, so a slot frees when its challenge authenticates, or
+    /// when the challenge has expired (`challenge_ttl`) and the session sweep
+    /// has then run (every `session_cleanup_interval`): their sum bounds the
+    /// wait. did-hosting-control does not use this — its in-memory tracker
+    /// frees a slot at `challenge_ttl` and computes the exact hint.
+    pub fn pending_challenge_retry_after_secs(&self) -> u64 {
+        self.challenge_ttl
+            .saturating_add(self.session_cleanup_interval)
     }
 }
 
@@ -287,8 +717,12 @@ impl Default for AuthConfig {
             refresh_token_expiry: default_refresh_token_expiry(),
             challenge_ttl: default_challenge_ttl(),
             session_cleanup_interval: default_session_cleanup_interval(),
+            admin_idle_timeout: default_admin_idle_timeout(),
             passkey_enrollment_ttl: default_passkey_enrollment_ttl(),
             cleanup_ttl_minutes: default_cleanup_ttl_minutes(),
+            max_global_pending_challenges: default_max_global_pending_challenges(),
+            max_pending_challenges_per_did: default_max_pending_challenges_per_did(),
+            absolute_session_lifetime: default_absolute_session_lifetime(),
         }
     }
 }
@@ -416,6 +850,12 @@ impl Default for StoreConfig {
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct SecretsConfig {
+    /// Which backend holds the keys (`keyring`, `aws`, `gcp`, `azure`,
+    /// `vault`, `kubernetes`, `plaintext`). When unset, the backend whose
+    /// selector field is set is used, and failing that the OS keyring — see
+    /// [`crate::server::secret_store::resolve_backend`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<crate::server::secret_store::SecretBackend>,
     pub aws_secret_name: Option<String>,
     pub aws_region: Option<String>,
     pub gcp_project: Option<String>,
@@ -484,33 +924,19 @@ pub struct SecretsConfig {
     /// envelope (k8s-secrets feature). Default `seed`.
     #[serde(default = "default_k8s_secret_key")]
     pub k8s_secret_key: String,
-    /// Explicitly select the plaintext backend even when a keyring backend is
-    /// compiled in. Without this, a keyring-enabled build always prefers the OS
-    /// keyring, which panics on a headless host with no Secret Service. The
-    /// non-interactive recipe sets this for `backend = "plaintext"`; cloud
-    /// backends (AWS/GCP/Azure), when configured, still take precedence.
+    /// Test-only acknowledgement for `backend = "plaintext"`: the service's
+    /// private keys are kept in a clear-text file beside the config. Without
+    /// it, the plaintext backend refuses to build.
     #[serde(default, skip_serializing_if = "is_false")]
-    pub plaintext_mode: bool,
-    /// Plaintext secrets stored directly in the config file.
-    /// Used when no secure backend (keyring, AWS, GCP) is compiled in, or when
-    /// `plaintext_mode` explicitly selects it.
-    pub plaintext: Option<PlaintextSecrets>,
-    /// Plaintext-mode-only stash for the offline-bootstrap ephemeral
-    /// seed (base64url-no-pad, 32 raw bytes). Set during phase 1 of
-    /// the offline wizard when no secure backend is available, and
-    /// removed at the end of phase 2. Never populated when a secure
-    /// backend (keyring, AWS, GCP) is active.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plaintext_bootstrap_seed: Option<String>,
+    pub confirm_plaintext: bool,
 }
 
-// Manual `Debug` redacts the only secret-bearing field
-// (`plaintext_bootstrap_seed`) and delegates to `PlaintextSecrets`'s own
-// redacted Debug for the inline secrets. Cloud-secret-name fields are
+// Manual `Debug` redacts the Vault credentials. Cloud-secret-name fields are
 // non-secret references (operators paste them into config) so they stay.
 impl std::fmt::Debug for SecretsConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SecretsConfig")
+            .field("backend", &self.backend)
             .field("aws_secret_name", &self.aws_secret_name)
             .field("aws_region", &self.aws_region)
             .field("gcp_project", &self.gcp_project)
@@ -541,11 +967,7 @@ impl std::fmt::Debug for SecretsConfig {
             .field("k8s_secret_name", &self.k8s_secret_name)
             .field("k8s_namespace", &self.k8s_namespace)
             .field("k8s_secret_key", &self.k8s_secret_key)
-            .field("plaintext", &self.plaintext)
-            .field(
-                "plaintext_bootstrap_seed",
-                &self.plaintext_bootstrap_seed.as_ref().map(|_| "<redacted>"),
-            )
+            .field("confirm_plaintext", &self.confirm_plaintext)
             .finish()
     }
 }
@@ -636,43 +1058,6 @@ impl IdentityConfig {
     }
 }
 
-/// Plaintext secret key material stored directly in the configuration file.
-///
-/// **WARNING**: This is insecure and should only be used for testing/development.
-/// For production deployments, compile with a secure backend feature:
-/// `keyring`, `aws-secrets`, or `gcp-secrets`.
-#[derive(Clone, Deserialize, Serialize)]
-pub struct PlaintextSecrets {
-    pub signing_key: String,
-    pub key_agreement_key: String,
-    pub jwt_signing_key: String,
-    /// VTA credential bundle (base64url-encoded) for re-authenticating with VTA.
-    /// Optional — only present when the deployment integrates with a VTA host.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vta_credential: Option<String>,
-    /// Key material for identity generations retired but not yet expired.
-    /// Mirrors `ServerSecrets::retired` — without it, a plaintext-backed
-    /// deployment would lose the outgoing key on the very write that installs
-    /// its replacement, and a restart mid-rotation could not decrypt traffic
-    /// still addressed to the old key.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub retired: Vec<crate::server::secret_store::RetiredKeys>,
-}
-
-impl std::fmt::Debug for PlaintextSecrets {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PlaintextSecrets")
-            .field("signing_key", &"<redacted>")
-            .field("key_agreement_key", &"<redacted>")
-            .field("jwt_signing_key", &"<redacted>")
-            .field(
-                "vta_credential",
-                &self.vta_credential.as_ref().map(|_| "<redacted>"),
-            )
-            .finish()
-    }
-}
-
 fn default_keyring_service() -> String {
     "webvh".to_string()
 }
@@ -708,6 +1093,7 @@ fn default_k8s_secret_key() -> String {
 impl Default for SecretsConfig {
     fn default() -> Self {
         Self {
+            backend: None,
             aws_secret_name: None,
             aws_region: None,
             gcp_project: None,
@@ -732,9 +1118,7 @@ impl Default for SecretsConfig {
             k8s_secret_name: None,
             k8s_namespace: None,
             k8s_secret_key: default_k8s_secret_key(),
-            plaintext_mode: false,
-            plaintext: None,
-            plaintext_bootstrap_seed: None,
+            confirm_plaintext: false,
         }
     }
 }
@@ -889,12 +1273,24 @@ pub fn apply_env_overrides(
         auth.session_cleanup_interval
     );
     env_parse!(
+        &format!("{prefix}_AUTH_ADMIN_IDLE_TIMEOUT"),
+        auth.admin_idle_timeout
+    );
+    env_parse!(
         &format!("{prefix}_AUTH_PASSKEY_ENROLLMENT_TTL"),
         auth.passkey_enrollment_ttl
     );
     env_parse!(
         &format!("{prefix}_CLEANUP_TTL_MINUTES"),
         auth.cleanup_ttl_minutes
+    );
+    env_parse!(
+        &format!("{prefix}_AUTH_MAX_GLOBAL_PENDING_CHALLENGES"),
+        auth.max_global_pending_challenges
+    );
+    env_parse!(
+        &format!("{prefix}_AUTH_MAX_PENDING_CHALLENGES_PER_DID"),
+        auth.max_pending_challenges_per_did
     );
 
     // Secrets
@@ -1230,5 +1626,265 @@ mod tests {
         ] {
             assert_eq!(TransportSelection::parse(sel.as_str()).unwrap(), sel);
         }
+    }
+}
+
+#[cfg(test)]
+mod fjall_config_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // `apply_fjall_env_overrides` reads process-wide env vars; `cargo test`
+    // runs test functions concurrently within one process, so every test
+    // here that sets/removes `STORAGE_FJALL_*` serializes on this lock.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const FJALL_ENV_VARS: [&str; 3] = [
+        "STORAGE_FJALL_BLOCK_CACHE",
+        "STORAGE_FJALL_WRITE_BUFFER",
+        "STORAGE_FJALL_MAX_JOURNAL",
+    ];
+
+    fn clear_fjall_env() {
+        // SAFETY: guarded by `ENV_LOCK`, held by every test in this module
+        // that touches these vars — no other test in this crate reads or
+        // writes the `STORAGE_FJALL_*` names.
+        unsafe {
+            for var in FJALL_ENV_VARS {
+                std::env::remove_var(var);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // parse_byte_size: every suffix, plus the error cases
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_byte_size_accepts_a_plain_byte_count() {
+        assert_eq!(parse_byte_size("67108864").unwrap(), 67_108_864);
+        assert_eq!(parse_byte_size("0").unwrap(), 0);
+        assert_eq!(
+            parse_byte_size("  1024  ").unwrap(),
+            1024,
+            "whitespace is trimmed"
+        );
+    }
+
+    #[test]
+    fn parse_byte_size_accepts_every_binary_suffix() {
+        assert_eq!(parse_byte_size("1KiB").unwrap(), 1024);
+        assert_eq!(parse_byte_size("64MiB").unwrap(), 64 * 1024 * 1024);
+        assert_eq!(parse_byte_size("1GiB").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(
+            parse_byte_size("2TiB").unwrap(),
+            2 * 1024 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn parse_byte_size_accepts_every_decimal_suffix() {
+        assert_eq!(parse_byte_size("512B").unwrap(), 512);
+        assert_eq!(parse_byte_size("1KB").unwrap(), 1_000);
+        assert_eq!(parse_byte_size("512MB").unwrap(), 512_000_000);
+        assert_eq!(parse_byte_size("1GB").unwrap(), 1_000_000_000);
+        assert_eq!(parse_byte_size("1TB").unwrap(), 1_000_000_000_000);
+    }
+
+    #[test]
+    fn parse_byte_size_is_case_insensitive_and_accepts_fractions() {
+        assert_eq!(parse_byte_size("64mib").unwrap(), 64 * 1024 * 1024);
+        assert_eq!(
+            parse_byte_size("1.5GiB").unwrap(),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as u64
+        );
+    }
+
+    #[test]
+    fn parse_byte_size_rejects_garbage_and_unknown_suffixes() {
+        assert!(parse_byte_size("").is_err(), "empty");
+        assert!(parse_byte_size("   ").is_err(), "whitespace only");
+        assert!(parse_byte_size("not-a-size").is_err(), "non-numeric");
+        assert!(parse_byte_size("64XiB").is_err(), "unrecognised suffix");
+        assert!(parse_byte_size("-64MiB").is_err(), "negative");
+        assert!(parse_byte_size("-1").is_err(), "negative, no suffix");
+        assert!(parse_byte_size("MiB").is_err(), "suffix with no number");
+    }
+
+    // -----------------------------------------------------------------
+    // Range validation
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_and_validate_rejects_zero_naming_the_field() {
+        let err =
+            parse_and_validate_fjall_bytes("STORAGE_FJALL_BLOCK_CACHE", "0", MIN_BLOCK_CACHE_BYTES)
+                .unwrap_err();
+        assert!(err.contains("STORAGE_FJALL_BLOCK_CACHE"), "got: {err}");
+        assert!(err.contains("zero"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_and_validate_rejects_an_absurdly_small_value_naming_the_field() {
+        let err = parse_and_validate_fjall_bytes(
+            "STORAGE_FJALL_MAX_JOURNAL",
+            "1KiB",
+            MIN_MAX_JOURNAL_BYTES,
+        )
+        .unwrap_err();
+        assert!(err.contains("STORAGE_FJALL_MAX_JOURNAL"), "got: {err}");
+        assert!(err.contains("too small"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_and_validate_rejects_an_unparseable_value_naming_the_field() {
+        let err = parse_and_validate_fjall_bytes(
+            "STORAGE_FJALL_WRITE_BUFFER",
+            "garbage",
+            MIN_WRITE_BUFFER_BYTES,
+        )
+        .unwrap_err();
+        assert!(err.contains("STORAGE_FJALL_WRITE_BUFFER"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_and_validate_accepts_a_value_at_exactly_the_floor() {
+        assert_eq!(
+            parse_and_validate_fjall_bytes(
+                "STORAGE_FJALL_MAX_JOURNAL",
+                "64MiB",
+                MIN_MAX_JOURNAL_BYTES
+            )
+            .unwrap(),
+            MIN_MAX_JOURNAL_BYTES
+        );
+    }
+
+    #[test]
+    fn fjall_tuning_validate_passes_when_every_field_is_unset() {
+        assert!(FjallTuning::default().validate().is_ok());
+    }
+
+    #[test]
+    fn fjall_tuning_validate_reports_a_below_floor_field() {
+        let cfg = FjallTuning {
+            block_cache: None,
+            write_buffer: Some(1024),
+            max_journal: None,
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("fjall.write_buffer"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // Config-file (de)serialization: `[fjall]`, plain int or suffixed string
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn an_absent_fjall_table_defaults_every_field_to_unset() {
+        let cfg: FjallTuning = toml::from_str("").expect("loads");
+        assert_eq!(cfg, FjallTuning::default());
+    }
+
+    #[test]
+    fn fjall_table_accepts_suffixed_strings_and_plain_integers() {
+        let cfg: FjallTuning = toml::from_str(
+            r#"
+            block_cache = "64MiB"
+            write_buffer = "16MiB"
+            max_journal = 134217728
+            "#,
+        )
+        .expect("loads");
+        assert_eq!(cfg.block_cache, Some(64 * 1024 * 1024));
+        assert_eq!(cfg.write_buffer, Some(16 * 1024 * 1024));
+        assert_eq!(cfg.max_journal, Some(134_217_728));
+    }
+
+    #[test]
+    fn fjall_table_refuses_a_below_floor_value_at_parse_time() {
+        let err = toml::from_str::<FjallTuning>(r#"block_cache = "1B""#)
+            .expect_err("a below-floor block_cache must be refused when the file is parsed");
+        let msg = err.to_string();
+        assert!(msg.contains("fjall.block_cache"), "got: {msg}");
+    }
+
+    #[test]
+    fn fjall_table_refuses_an_unknown_suffix_at_parse_time() {
+        let err = toml::from_str::<FjallTuning>(r#"max_journal = "64XiB""#)
+            .expect_err("an unparseable size must be refused when the file is parsed");
+        assert!(err.to_string().contains("fjall.max_journal"));
+    }
+
+    // -----------------------------------------------------------------
+    // Env overrides the file
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn env_override_wins_over_the_file_value() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fjall_env();
+
+        let mut cfg = FjallTuning {
+            block_cache: Some(32 * 1024 * 1024),
+            write_buffer: None,
+            max_journal: None,
+        };
+        // SAFETY: serialized by `ENV_LOCK`.
+        unsafe {
+            std::env::set_var("STORAGE_FJALL_BLOCK_CACHE", "8MiB");
+        }
+        apply_fjall_env_overrides(&mut cfg).expect("valid override applies");
+        assert_eq!(
+            cfg.block_cache,
+            Some(8 * 1024 * 1024),
+            "the env var must win over whatever the file set"
+        );
+
+        clear_fjall_env();
+    }
+
+    #[test]
+    fn an_unset_env_var_leaves_the_file_value_untouched() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fjall_env();
+
+        let mut cfg = FjallTuning {
+            block_cache: Some(32 * 1024 * 1024),
+            write_buffer: Some(MIN_WRITE_BUFFER_BYTES),
+            max_journal: None,
+        };
+        let before = cfg;
+        apply_fjall_env_overrides(&mut cfg).expect("no env vars set: nothing to apply");
+        assert_eq!(
+            cfg, before,
+            "with no STORAGE_FJALL_* vars set, nothing changes"
+        );
+    }
+
+    #[test]
+    fn env_override_refuses_an_invalid_value_naming_the_var() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fjall_env();
+
+        // SAFETY: serialized by `ENV_LOCK`.
+        unsafe {
+            std::env::set_var("STORAGE_FJALL_MAX_JOURNAL", "1KiB");
+        }
+        let err = apply_fjall_env_overrides(&mut FjallTuning::default())
+            .expect_err("a below-floor journal size must be refused");
+        assert!(
+            err.to_string().contains("STORAGE_FJALL_MAX_JOURNAL"),
+            "got: {err}"
+        );
+
+        clear_fjall_env();
+    }
+
+    #[test]
+    fn human_bytes_renders_the_natural_unit() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(64 * 1024 * 1024), "64.00 MiB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.00 GiB");
     }
 }

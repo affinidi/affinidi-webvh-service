@@ -2,6 +2,614 @@
 
 ## Unreleased
 
+### Breaking — the control plane has no REST management surface
+
+- **Kept:** `POST /api/trust-tasks` (the HTTPS binding of the one Trust Task
+  dispatch), `GET /api/health`, the console's static fallback, and the browser
+  sign-in with no Trust Task form: `POST /api/auth/challenge`,
+  `POST /api/auth/` (a SIOPv2 `id_token` minted by the holder's VTA) and
+  `POST /api/auth/refresh` (refresh token plus the browser's bound session
+  key). The daemon inherits the same router.
+- **Removed:** every REST management route — `/api/dids*`, `/api/witness/*`,
+  `/api/log/*`, `/api/raw/*`, `/api/owner/*`, `/api/disable/*`,
+  `/api/enable/*`, `/api/rollback/*`, `/api/agent-names/*`, `/api/domains*`,
+  `/api/me/domains`, `/api/acl*`, `/api/stats*`, `/api/timeseries*`,
+  `/api/services/overview`, `/api/config`, `/api/server-info`,
+  `/api/control/registry*`, `/api/control/register-service`,
+  `/api/control/stats`, `/api/identity/generations*`,
+  `/api/auth/step-up/vta/{start,finish}`, the demo `/api/auth/step-up/check`,
+  `POST /api/task-consent/request` (and its DIDComm decision handler), the
+  `/api/proxy/{server,witness}/*` pass-through, and the Prometheus `/metrics`
+  endpoint. Each has a Trust Task (`server/metrics/0.1` for the metrics); the
+  proxy and task-consent had no caller. The console's SPA fallback no longer
+  answers any `/api/*` path.
+- **Removed:** the permissive `Trust-Task:` header routing (`TrustTaskRouter`),
+  the house `trusttasks.org/did-hosting/*/1.0` URIs, the undocumented
+  `spec/did-hosting/*/1.0` arms (`trust_tasks_did`), the DIDComm-JWS dialect of
+  `POST /api/auth/` and `/api/auth/refresh`, `ControlClient`, the
+  `did-hosting-client` crate (REST-only, unpublished, no caller) and the
+  `prometheus` dependency. `WebVHClient` now signs Trust Tasks
+  (`sign_as` replaces `authenticate`).
+
+### Breaking — secrets use `vti-secrets`, with no insecure default
+
+- **One implementation.** Every secrets backend (keyring, AWS, GCP, Azure,
+  Vault, Kubernetes, plaintext) is now the published `vti-secrets` crate the
+  VTA and VTC use. The local copies are gone. The service's keys and
+  offline-bootstrap seed are one JSON envelope, stored as the backend's
+  payload. Existing stored secrets are not read: recreate the deployment.
+- **`secrets.backend`** names the backend (`keyring`, `aws`, `gcp`, `azure`,
+  `vault`, `kubernetes`, `plaintext`). Setup writes it. When unset, the
+  backend whose selector field is set is used, and failing that the keyring.
+- **No keychain, no start.** A host where the OS keyring cannot be opened (a
+  headless Linux box with no Secret Service), or a binary built without any
+  secure backend, is refused at setup and start with the list of secure
+  backends. Nothing falls back to plaintext, and a backend selected on a
+  binary built without its feature is an error.
+- **Plaintext is tests only.** It needs `backend = "plaintext"` and
+  `confirm_plaintext = true`, in the recipe and in `config.toml`. The keys go
+  to `<config>.secrets.plaintext` beside the config at `0600`, not into
+  `config.toml`. `[secrets.plaintext]`, `plaintext_mode` and
+  `plaintext_bootstrap_seed` are removed. The interactive wizard no longer
+  offers plaintext.
+
+### Breaking — passkey enrolment is Trust Tasks, with hashed invites
+
+- **Served** on TSP, DIDComm and `POST /api/trust-tasks`:
+  `auth/passkey/enroll/invite/0.2`, `auth/passkey/enroll/redeem/start/0.1`,
+  `auth/passkey/enroll/redeem/finish/0.1` and
+  `auth/passkey/enroll/{start,finish}/0.2`. WebAuthn's own ceremony data rides
+  inside the payloads; the browser ceremony is the one non-Trust-Task step.
+- **Invites are two secrets, stored hashed.** An invite is a 256-bit token for
+  the URL and a 60-bit claim code for a second channel, each returned once.
+  The store keeps a SHA-256 of the token (its lookup key) and a salted
+  Argon2id digest of the code, compared in constant time. Five wrong codes
+  delete the invite; redemption is also rate-limited per source (client IP on
+  HTTPS, sender on TSP/DIDComm). Invites expire (default 1 h, capped by
+  `auth.passkey_enrollment_ttl`) and are consumed exactly once, atomically
+  with binding the credential. An unknown token, a wrong code and an expired
+  invite get the same refusal.
+- **Step-up-only passkeys** (`purpose: stepUp`) are held in a new keyspace,
+  `passkey_step_up`, which the login ceremony never reads: one can never sign
+  anyone in, and a login passkey never stands in for one.
+- **User verification is bound to the ceremony.** Enrolling a further passkey
+  of a purpose the subject already holds requires a user-verified assertion
+  from one of them, over a challenge distinct from the registration one and
+  stored only in the ceremony record. The first finish takes the record, so a
+  replayed finish, or an assertion made for another ceremony, is refused.
+- **Removed:** the REST routes `/api/auth/passkey/enroll/{start,finish}`,
+  `/api/auth/passkey/login/{start,finish}`,
+  `/api/auth/step-up/passkey/{start,finish}`, `/api/auth/passkey/invite`,
+  `/api/auth/passkey/invites` and `/api/auth/passkey/invite/{invite_id}`. The
+  console already signed in with `auth/passkey/login/*/0.2`, and a session
+  step-up by passkey is `auth/passkey/login/*` with `purpose: stepUp`.
+- **No migration.** Invites in the old plaintext `enroll:` rows are not read;
+  issue new ones. The `invite` CLI now prints the URL and the claim code
+  separately.
+- **Console.** The enrolment page asks for the claim code, shows whose passkey
+  it will be and what it may do before creating it, and redeems over Trust
+  Tasks; the ACL page issues sign-in or step-up invites and shows the link and
+  the code apart, once.
+
+### Breaking — the watcher is Trust Tasks only, with its own DID
+
+- **Its own DID.** webvh-watcher is provisioned from a VTA context like the
+  other services (`setup`, interactive or `--from <recipe>` in any VTA mode).
+  Its keys and context credential live in the secrets backend.
+- **One listener.** It serves `webvh/sync/update/0.2`, `webvh/sync/delete/0.2`
+  and `webvh/sync/batch/0.1` on TSP, DIDComm and `POST /api/trust-tasks`.
+  - Only a document signed by one of `sync.source_dids` is applied. A document
+    that does not verify gets no reply. A verified one from any other DID gets
+    a signed `notAuthorized` and takes no room in the replay cache.
+  - Logs are verified as an edge verifies them: the chain and witness proofs,
+    the slot, `versionCount`, and strict extension of the held log and a
+    per-DID high-water mark that a delete keeps.
+- **Removed:** `/api/sync/did`, `/api/sync/delete`, `push_tokens`,
+  `sync.sources`, `sync.reconcile_interval`, and the REST sync wire types. The
+  recipe's `[watcher]` section is now just `source_dids`. The daemon's
+  `watcher_sync` is gone, and its embedded watcher serves resolution only.
+- **Control plane fan-out.** A new `[[registry.watchers]]` maps watcher URLs
+  to DIDs. A published DID is queued for every mapped watcher its log's
+  `watchers` parameter names, and a deleted one for every mapped watcher. It
+  goes through the outbox, with the same delivery, retry and signed
+  acknowledgement as edges. A mapped watcher's DID may acknowledge those
+  syncs and nothing else.
+
+### Breaking — the witness is Trust Tasks only
+
+webvh-witness serves `webvh/witness/key/create|list|delete/0.1`,
+`webvh/witness/sign/0.1` and `acl/*` as Trust Tasks, on TSP and DIDComm (its
+mediator connection) and `POST /api/trust-tasks`, through one dispatch.
+
+- **Removed:** `/api/auth/*`, `/api/witnesses*`, `/api/proof/*`, `/api/acl*`,
+  the `/api/didcomm` 501 stub, the witness's JWT sessions and its `[auth]`
+  settings. `/api/health` is unchanged.
+- **Every request is authorised on its own proof** — `proofPurpose:
+  authentication`, bound to the in-band issuer, addressed to the witness,
+  fresh, and not a replay. A document that does not verify gets no reply; a
+  verified one from a DID the witness does not authorise gets a signed
+  `permissionDenied`, and takes no room in the replay cache. Every reply is
+  signed.
+- **`witness/sign` verifies before it signs.** It carries the log, and the
+  witness refuses an entry whose chain does not verify (`invalidLog`), that is
+  not the last (`versionNotLast`), of a deactivated DID (`deactivated`), or
+  whose witness parameter does not name it (`notListed`).
+- **`WitnessClient`** is a Trust Task client over HTTPS; it verifies every
+  reply against the witness DID. The `--witness-*` bootstrap in
+  `did-hosting-server` and `did-hosting-daemon` sends `witness/sign` with the
+  log, signed by the new DID, and stores a well-formed `did-witness.json`.
+- In the daemon, the embedded witness is reached at
+  `POST /witness/api/trust-tasks`.
+
+### Changed — the VTA / Trust Tasks / messaging dependency set moves together
+
+- `vta-sdk` 0.56 → 0.58, `vti-common` 0.29 → 0.31, `vti-secrets` 0.4.8 → 0.5,
+  the six `trust-tasks-*` crates 0.24 → 0.25, `affinidi-tdk` 0.20 → 0.21,
+  `affinidi-messaging-sdk` 0.30 → 0.31, `affinidi-messaging-didcomm-service`
+  0.15 → 0.16, `didwebvh-rs` 0.6 → 0.7, and the dev-only
+  `affinidi-messaging-test-mediator` 0.14 → 0.15.
+- `didwebvh-rs` 0.7 resolves **public hosts only** by default
+  (`HostPolicy::PublicOnly`), and the verifier's `did:webvh` deactivation check
+  reads the signer's log through it. Production behaviour is unchanged: every
+  service's DID cache is already `PublicOnly`. A caller whose resolver allows
+  private hosts (local development against `localhost`) now says so to the
+  verifier too: `TransportBoundVerifier::with_did_cache_and_host_policy`,
+  `WitnessClient::with_host_policy`, and `post_trust_task_https_verified` for
+  the raw HTTPS send. Otherwise every reply from a privately hosted
+  `did:webvh` peer is refused as unreachable.
+- Fixes an unlocked `cargo install` failing with E0631 on `from_vti` in
+  `server::secret_store`. `vti-secrets` 0.4.9 re-pinned onto `vti-common` 0.30,
+  so a resolve that ignored `Cargo.lock` held two `vti-common` copies.
+  `--locked` is still the recommended way to install.
+
+### Fixed — an already-deleted message no longer logs a deletion-handler warning
+
+Takes affinidi-messaging-sdk 0.30.1 (and, through the lock, mediator-common
+0.17.1 / mediator 0.33.1). A mediator on its Fjall or in-memory store answers
+the redundant delete of a redelivered message with `NOT_FOUND: message_hash
+(…)`, which SDK 0.30.0 did not recognise as "already gone", so each one logged
+`WARN deletion_handler: the mediator refused some ids … deleted=0 failed=1`. In
+a hosting service they recur every 30 seconds, in step with the messaging
+service's offline-sync status request.
+0.30.1 recognises it; mediator 0.33.1 also stops sending it.
+
+### Added — offline commands to list, reset and delete TSP relationships
+
+`did-hosting-daemon`, `did-hosting-control` and `did-hosting-server` gain
+`tsp-relationship-list`, `tsp-relationship-reset --peer <did>` and
+`tsp-relationship-delete --peer <did> | --all [--yes]`. Relationship state is
+per endpoint and persisted, so neither restarting the service nor wiping the
+mediator clears it; making two nodes meet as strangers again means clearing
+both halves, and until now there was no way to clear this one. Reset puts our
+half back to `None` (what the SDK does after a reply timeout) so the next send
+re-invites; delete removes the whole record. `--all` covers half-formed
+relationships the store cannot enumerate, and only reports without `--yes`.
+The commands open the store directly, so stop the service first. Shared as
+`server::cli_tsp`.
+
+The keyspace behind the durable relationship store now implements
+`scan_prefix`. It did not, and the trait's default yields nothing, so the SDK's
+enumerating operations (`established_relationships`, `evict_idle`) would have
+seen an empty store. Nothing here called them before; `tsp-relationship-list`
+does.
+
+### Fixed — a wallet proxy login no longer raises an approval popup per request
+
+The console signs every Trust Task it sends. A proxy login (the VTA mints the
+persona's `id_token`) bound no session key, so each call was signed through
+the wallet's `signTrustTask` — which asks the human every time, by design —
+and a page load fired several at once: an endless stack of approval windows.
+The proxy login now binds a fresh session key the way a holder login does,
+sending it as `session_pubkey_b58btc` beside the `id_token` on `POST
+/api/auth/`, and the console signs with it: one approval, at sign-in. The
+route already bound a key it was given; a test now pins that it does.
+
+- **Every route that binds a session key now decodes it.** `/api/auth/` and
+  the REST passkey `login/finish` accepted anything starting `z6Mk`, so a
+  value that only looked like an Ed25519 multikey was stored and every proof
+  it later signed refused. Both now apply the decode `auth/authenticate/0.2`
+  uses for `sessionKey`, shared as
+  `server::auth::session::is_ed25519_multikey`. The passkey route's log line
+  also sliced the refused value by byte, which panicked on a non-ASCII one.
+- **A lost session key ends the session.** A wallet session whose key this
+  browser no longer holds used to fall back to the wallet's `signTrustTask`
+  silently — changing what each request rested on without saying so, and
+  bringing back the popup per request. Every login now binds a key, so the
+  console treats a wallet session like a passkey one: sign in again. The
+  `asDid` principal hint that fallback read is gone with it.
+
+### Added — wallet logins bind a session key (`auth/authenticate/0.2`)
+
+The control plane serves `auth/authenticate/0.2` (trustoverip/dtgwg-trust-tasks-tf#675)
+in place of 0.1. An authenticate document may name a `sessionKey`, a `did:key`
+the subject's own proof covers, and the control plane binds it to the new
+session, as a passkey login binds its browser key.
+
+- **What it can do.** The HTTPS binding accepts that key's `authentication`
+  proofs as the subject, only alongside that session's own bearer token. The
+  key stops working when the session expires, is revoked or logs out. Its
+  `acr` is the login's, so anything that needs a step-up still does.
+- **What it can't do.** It never approves a step-up. Approvals must be signed
+  by the subject's own key, on the Trust Task and REST paths, and the verifier
+  refuses a delegated `assertionMethod` proof outright. This also closes a gap
+  where a passkey session's key could approve its own step-up, because a
+  `did:key` document lists its key under `assertionMethod`. It also never
+  signs `auth/authenticate` or `auth/refresh`, so it cannot mint or extend a
+  session.
+- **Key types.** A key that is not Ed25519 is refused with
+  `auth/authenticate:sessionKeyUnsupported`, before the challenge is spent.
+- **Subject's own key.** A session with a bound key still accepts the
+  subject's own proofs, so a wallet can still sign its step-up approval and
+  its refresh.
+- **Logout.** New `auth/revoke-session/0.2` ends one of the caller's own
+  sessions. The console's sign-out now calls it, signed with the session key,
+  so logout ends the session server-side, not only in the browser. A session
+  key may end only its own session. A session that is gone, or not the
+  caller's to end, answers `revokedCount: 0`, so a retried logout succeeds.
+- **Console.** A wallet login generates a non-extractable session key and
+  passes it as `sessionKey`. Later calls are signed with it instead of
+  prompting the wallet. Step-up still goes through the wallet.
+
+### Added — optional Fjall memory settings
+
+Three optional settings — `STORAGE_FJALL_BLOCK_CACHE`,
+`STORAGE_FJALL_WRITE_BUFFER`, `STORAGE_FJALL_MAX_JOURNAL` (env vars, or a
+`[fjall]` config-file table) — cap the embedded fjall store's block
+cache, buffered writes, and startup journal replay so they stay inside a
+pod's Kubernetes memory `limit`. Same three names across every binary
+(did-hosting-server, did-hosting-control, webvh-witness, webvh-watcher,
+did-hosting-daemon); an env var overrides the file. All optional and
+unset leaves fjall's own defaults unchanged. Only the `store-fjall`
+backend reads them. See `docs/bootstrap_startup.md` for the full table
+and pod-sizing guidance.
+
+### Added — the control plane is served as Trust Tasks on every transport
+
+Every control-plane task that only REST served, and every new specification
+from trustoverip/dtgwg-trust-tasks-tf#661 the control plane owns, is a row of
+the one table, reachable over TSP, DIDComm and HTTPS `POST /api/trust-tasks`:
+`did/{set-state,rollback,log}`, `agent-name/resolve`,
+`domain/{list,create,update,set-state,set-default,purge,assign,unassign}`,
+`registry/{list,get,check,admin-register,deregister,purge-domain}`,
+`stats/{get,timeseries}`, `server/{info,config,metrics}`,
+`identity/{list,retire}`, `auth/step-up/start/0.1`,
+`auth/step-up/approve-response/0.5`, `auth/passkey/login/{start,finish}/0.2`
+and `auth/passkey/enroll/invite/{list,update,revoke}`. The REST routes stay
+until their callers move.
+
+- **Each task's proof is checked against the key relationship it names.**
+  `server/info` and `auth/passkey/login/start` accept a request with no proof
+  (a proof that is present is still verified). Operational requests need
+  `proofPurpose: authentication`; an approver's `approve-response` needs
+  `assertionMethod`, and each is refused under the other. A passkey login is
+  signed by the `did:key` its session is then bound to.
+- **`POST /api/trust-tasks` no longer requires a bearer session.** The
+  document's proof is the authorisation, as on the other transports; a bearer
+  session, when presented, must match the proof and contributes its assurance
+  level (a domain purge needs `aal2`).
+- **Step-up moves to `approve-request/0.3` / `approve-response/0.5`.**
+  `auth/step-up/start` binds a challenge to the caller's own session and
+  answers a signed `approve-request/0.3`; the subject's `approve-response`
+  elevates the session; `auth/refresh` then mints tokens at the session's
+  current level.
+- **Invites are addressed by `inviteId` and never disclose their token after
+  issue** — on REST too: `GET /api/auth/passkey/invites` no longer returns
+  tokens or enrollment URLs, and `PUT`/`DELETE /api/auth/passkey/invite/{id}`
+  take the invite id. The UI follows.
+- **`agent-name/resolve` answers only for DIDs the caller may read**, on REST
+  too, so it cannot be used to test whether a DID is hosted.
+- **`did/rollback`** takes a `targetVersion`.
+
+### Changed (breaking) — DID management answers in its specifications' shapes
+
+The control plane's DID-management Trust Tasks are served from one table keyed
+on the generated `trust-tasks` 0.23.5 Type URIs (`control_tasks`), with the
+generated request and response types end to end. The hand-built `MSG_*` JSON
+bridge (`bridge_did_management` / `dispatch_did_op`) is gone.
+
+- **Every reply matches its schema.** `did/list` answers `{records, total}`
+  (paged by `limit`/`offset`, filtered by `domain`), `did/register`,
+  `did/delete`, `did/change-owner` and the `agent-name/*` verbs answer
+  `{record}` in the shared `DidRecord` shape, `me/domains` answers the shared
+  `DomainEntry` shape. Host-specific members the closed schemas do not define
+  (a record's agent names; a domain's scheme, branding, witnesses, watchers,
+  quota) travel under the `vnd.affinidi.webvh` extension namespace.
+- **Errors are `trust-task-error` documents** with the code the task's
+  specification declares (`did-management/did/info:notFound`,
+  `…/change-owner:notOwner`, `did-management:unknownDomain`, …), not
+  `did/problem-report` replies, which that specification reserves for the
+  host's asynchronous reports.
+- **Requests are held to their schemas.** An unknown payload member —
+  including the snake_case aliases (`new_owner`, `did_log`) — is refused with
+  `malformedRequest`. A non-admin naming another `owner` on `did/list` is
+  refused (`did-management/did/list:forbidden`) rather than silently shown
+  their own slots; `domain` on `did/info`, `did/change-owner` and
+  `did/register` is now checked against the slot instead of dropped.
+- **Sync moves to `webvh/sync/update/0.2` and `webvh/sync/delete/0.2`.** The
+  control plane sends camelCase exactly as schema'd (0.1's implementations
+  sent snake_case its schema never allowed), and the slot's `disabled` state
+  travels with its content: a disabled DID stops resolving on every edge, and
+  resumes on an update carrying `false`. Edges read the generated types, answer
+  `applied` or `unchanged`, drop held witness proofs when an update carries
+  none, refuse under the declared `invalidLog` / `historyRewrite` /
+  `deactivated` codes, report per-entry outcomes for `webvh/sync/batch/0.1`,
+  answer `sync/delete` with `deleted` or `absent`, and remove a deleted slot's
+  agent-name index. Control planes and edges must be upgraded together.
+- **A proof that is present is verified**, on every task, including those that
+  do not require one.
+
+### Changed (breaking) — privileged messages must carry a proof bound to their sender
+
+Every message that changes state or discloses more than public data is now
+authorised on a Data Integrity proof carried in the document itself, never on
+the messaging transport's report of who sent it. A document is acted on only
+when it carries a `proof` whose `verificationMethod` is controlled by its
+in-band `issuer`, the `issuer` is the expected peer (exact match), it is
+addressed to the receiving service (`recipient`), and its `issuedAt` is inside
+the freshness window. Replay protection is keyed on `(proven issuer, document
+id)`. See `did_hosting_common::server::trust_tasks::bound`.
+
+- **Operational proofs use `authentication`.** These are a service's own
+  messages, not attestations (VTI key roles, VTI-KEY-106/107): the proof must
+  carry `proofPurpose: authentication` and its `verificationMethod` must be
+  listed under the signer's `authentication` relationship. `assertionMethod`
+  proofs are refused on these paths (it stays reserved for credentials), and
+  every sender this repo controls now signs with `authentication`.
+- **Key rotation does not open a rejection window.** A proof that fails against
+  a cached DID document is retried once against a freshly resolved one before
+  it is refused (at most one forced refresh per DID per 30s). The service's
+  DID cache TTL is now explicit: 120s (`DID_CACHE_TTL_SECS`).
+- **Replies are signed too.** Every non-error trust-task reply the control
+  plane emits — on DIDComm, TSP and HTTPS alike, including
+  `auth/challenge#response` and `auth/authenticate#response` — is stamped
+  `issuer` = the control plane, `recipient` = the requester, a fresh
+  `issuedAt`, and signed with its operational key (`authentication`). Edges
+  sign their acks and pongs the same way. `trust-task-error` documents stay
+  unsigned. There is no unsigned mode: a control plane (standalone or in the
+  daemon) with no `server_did`, no loaded identity, or no signing key for its
+  current generation **refuses to start**, and should the key ever be missing
+  at request time every trust task is refused with `internalError`.
+- **Approval requests are operational too.** The `task-consent/request` and
+  `auth/step-up/approve-request` documents the control plane sends are signed
+  with `proofPurpose: authentication`. Only the human approver's own decision
+  / approve-response is an `assertionMethod` attestation.
+- **Approver decisions must be attestations.** A `task-consent/decision` and an
+  `auth/step-up/approve-response` must carry `proofPurpose: assertionMethod`
+  with the key listed under the signer's `assertionMethod` relationship, and a
+  deactivated `did:webvh` signer is refused (`verify_approval`). The consent
+  decision's `#response` is now a signed trust-task document in the trust-task
+  envelope.
+- **Edges do not answer documents that fail verification.** A control-plane op
+  or health ping that is not signed by the configured control plane gets no
+  reply at all — neither a signed refusal nor an unsigned one.
+- **Transient failures are retryable.** A signer whose DID cannot be resolved
+  (or whose deactivation status cannot be read) is refused as `unavailable`
+  with an error that names the unreachable DID; an edge's storage or I/O
+  failure applying an op is `internalError`. Both are retryable, so the control
+  plane keeps the op queued rather than settling it. A `sync/batch` with an
+  entry that failed transiently is retried whole.
+- **Registration re-sends what an edge missed.** The delta re-sync compares the
+  DID identity (`did_id`, reported by the edge in `preloaded_dids`) as well as
+  the version count, so a DID deleted and re-created at the same slot reaches
+  an edge that missed the delete. Domain `assign` / `unassign` / `purge` ops are
+  recorded per server and re-sent on each registration until acknowledged
+  (an assignment is kept as the desired state).
+- **The edge's own REST publish (`PUT /api/dids/{mnemonic}`) is held to the
+  sync history rule**: it must extend the held log and the per-DID high-water
+  mark, and records the high-water mark itself.
+- **Deactivation verdicts follow the DID cache.** An edge builds its proof
+  verifier once (it used to build one per message, so nothing was remembered);
+  a verdict is reused while the DID cache serves the same document, and the
+  verdict map is bounded.
+- **Edges keep a high-water mark per DID and per slot that a delete does not
+  clear.** A DID re-created after `sync/delete` must extend everything the edge
+  ever served for it, so a delete-then-resync cannot roll a DID back to before a
+  rotation or bring back a deactivated one. A slot never changes method; a new
+  DID (new SCID) may reuse a deleted slot.
+- **Edges bind each synced DID to its slot and host** (the log's identifier must
+  resolve at that mnemonic on the edge's public URL or an assigned domain),
+  verify `did:webs` updates as continuations of the held and high-water logs,
+  and verify witness proofs — a witnessed DID without its proofs is refused.
+- **The outbox removes an entry only on the target's signed acknowledgement**
+  of the exact document sent (or its signed, non-retryable refusal), re-signing
+  on every retry and re-sending after 60s without an ack; one op in flight per
+  server. Edges re-register at startup, on every mediator reconnect and every
+  10 minutes; each registration re-syncs the delta, queues deletes the edge
+  missed, and replicates every domain record.
+- **Pre-authorisation filtering.** A privileged document from a sender with no
+  ACL entry is refused before any signature or DID-resolution work and never
+  reaches the replay cache. The replay cache refuses (retryable `unavailable`)
+  instead of evicting at its bounds, caps each signer, and expires in O(1).
+- **Other hardening.** The task-consent decision requires `recipient`, a fresh
+  `issuedAt` and is replay-checked; REST DIDComm-JWS sign-in and refresh require
+  a key listed under `authentication`; `POST /api/control/stats` takes a signed
+  stats-sync document instead of a bearer token; proofs from a deactivated
+  `did:webvh` signer are refused.
+- **`TransportBoundVerifier` requires an in-band `issuer`, always.** A proof
+  with no `issuer` used to verify as a bare signature, with the issuer then
+  filled from the transport's sender; it is now refused. The one delegated shape
+  kept is the passkey session key, accepted only on `POST /api/trust-tasks`, and
+  only as the exact JWT-bound key acting for the JWT subject
+  (`with_session_delegate`).
+- **Control plane → edge (sync, domain ops, health ping).** The outbox and the
+  health loop send signed Trust Task documents (TSP frame or DIDComm
+  trust-task envelope, chosen from the edge's DID document). Edges apply
+  `sync/update`, `sync/batch`, `sync/delete` and `domain/{assign,unassign,
+  purge,upsert}` only when signed by the configured `control_did` and addressed
+  to their own DID. The bare `MSG_SYNC_*` / `MSG_DOMAIN_*` / `MSG_HEALTH_PING`
+  DIDComm routes and the serialised-`Message`-over-TSP form are removed.
+  `domain/upsert` moves to `https://trusttasks.org/spec/did-management/domain/upsert/0.1`
+  (queued entries under the old URI are delivered under the new one).
+- **Edges verify the DID logs they are asked to serve.** A `sync/update` is
+  applied only if the log's proof chain verifies (entry hashes, update-key
+  authorisation, pre-rotation), it establishes the DID the push names, and it
+  strictly extends the log already held: a shorter or diverging log is refused
+  as a rollback or fork, and a deactivated DID accepts no further entries.
+- **Edge → control plane (registration, stats, health pong, sync and domain
+  acks).** Sent as signed trust tasks; the bare `MSG_SERVER_REGISTER`,
+  `MSG_STATS_SYNC`, `MSG_HEALTH_PONG` and ack routes are removed. Registration,
+  stats, pongs and domain acks additionally require the signer to hold the
+  `Service` role (pongs previously had no ACL check).
+- **DID management, ACL and auth trust tasks (DIDComm envelope, TSP, HTTPS).**
+  Every trust task except `trust-task-discovery` and `auth/challenge` must be
+  signed by its issuer, and the issuer must be the transport's sender. This
+  includes the typed `did-hosting/*/1.0` ops and the ACL reads (`acl/list`,
+  `acl/show`), which previously went through unsigned.
+- **Removed the non-Trust-Task DID-management transports.** The bare DIDComm
+  `MSG_DID_*`, `MSG_AGENT_NAME_*`, `MSG_ME_DOMAINS` routes and the HTTP-signed
+  `POST /api/didcomm` endpoint are gone; the same operations are reachable as
+  signed documents in the trust-task envelope, over TSP, or on
+  `POST /api/trust-tasks`. A peer still sending a bare type gets a
+  problem report naming it.
+- **`MSG_AUTHENTICATE` over DIDComm requires a signed challenge.** The bare
+  route that issued a session to the reported sender is removed; sign-in over
+  DIDComm/TSP is the `auth/challenge/0.1` → `auth/authenticate/0.1` trust-task
+  pair, whose authenticate document must be signed by the authenticating DID.
+- **`trust_tasks.enforce_proofs = false` is refused at startup.** There is no
+  longer a mode in which proofs are ignored.
+- **Web UI.** Every trust-task envelope except discovery is signed and names
+  the session's subject DID as `issuer`.
+
+**Upgrade the whole fleet together.** A control plane and its edges on either
+side of this change cannot talk to each other. Clients that must change:
+the VTA's DID-management client over DIDComm/TSP
+(`verifiable-trust-infrastructure` `vta-service/src/webvh_didcomm.rs`) must sign
+each document with the VTA DID as `issuer`; the browser extension's DIDComm
+sign-in (`pnm-browser-plugin` `packages/core/src/rp-login/didcomm.ts`) must use
+the challenge → signed-authenticate trust tasks instead of a bare
+`MSG_AUTHENTICATE`, and its `signTrustTask` (used for wallet-signed admin UI
+envelopes) must sign with `proofPurpose: authentication`. REST API callers (bearer JWT from the signed REST sign-in)
+are unaffected.
+
+### Fixed — the daemon's control plane checks signer status like the standalone one
+
+The daemon's embedded control plane built its Trust Task proof verifier over the
+bare DID cache resolver, so — unlike the standalone control plane — it did not
+refuse a proof from a deactivated `did:webvh` signer, did not retry once against
+a fresh DID document after the signer rotated its key, and reported an
+unreachable signer as a bad proof rather than as retryable (`unavailable`). The
+relationship check (`authentication` / `assertionMethod`) already ran.
+
+Every service now builds its verifier with one shared constructor,
+`did_hosting_common::server::trust_tasks::build_verifier`: the standalone
+control plane, the standalone server, and both halves of the daemon. A
+deactivated signer's refusal is now final everywhere: it no longer spends the
+signer's forced re-resolution, since a `did:webvh` deactivation cannot be
+undone. The
+`did-hosting-common` `test-support` feature (dev-only) exposes
+`TransportBoundVerifier::record_deactivation_verdict` for tests.
+
+### Changed — the 0.27 messaging line, with the authcrypt sender bound to its key
+
+- **Moved to the 0.27 messaging line.** `affinidi-tdk` 0.16 → **0.17**,
+  `affinidi-messaging-sdk` 0.26.27 → **0.27.2**,
+  `affinidi-messaging-didcomm-service` 0.11 → **0.12.1**,
+  `affinidi-messaging-didcomm` → **0.15.9** (floor), `vta-sdk` 0.50 → **0.52**
+  with `vti-common` 0.23.1 → **0.25** (all four declarations), `trust-tasks-*`
+  0.21 → **0.22**; dev-graph `affinidi-messaging-test-mediator` 0.9 →
+  **0.10.2** (mediator 0.29.5). One copy of each of `affinidi-messaging-sdk`,
+  `affinidi-tdk`, `trust-tasks-rs`, `vta-sdk` and `vti-common`.
+- **The authcrypt sender is the key that encrypted the message.** In didcomm
+  0.15.9 / SDK 0.27.2 / didcomm-service 0.12.1 the sender is resolved only from
+  the `skid` the envelope names, and an envelope whose `apu` disagrees with it
+  is refused; `HandlerContext::sender_did` is the verified signer or authcrypt
+  sender, never the plaintext `from`.
+- **Signed sign-in verifies the JWS against the resolved key *as* the key of
+  its `kid`.** `didcomm_unpack::unpack_signed` calls `unpack_bound` with a
+  `SignerKey`, so the reported `signer_kid` is the key id the signature was
+  checked against (the key-only `unpack` is deprecated in didcomm 0.15.9).
+
+### Fixed — stats sync uses TSP when the control plane advertises it
+
+- **Stats sync was the last control↔server exchange hard-coded to DIDComm.**
+  A server now sends its periodic per-DID deltas as a
+  `.../server/stats-sync/0.1` trust task when the control plane's DID document
+  advertises `TSPTransport`, so `send_trust_task` carries it (and the ack) over
+  TSP; otherwise it keeps sending the legacy `MSG_STATS_SYNC` DIDComm message.
+  The control plane gains the matching `trust_tasks_infra` arm, and the server
+  owns the `#response` ack. **Upgrade the control plane first** — one that
+  advertises TSP but predates this arm drops the trust task, losing those
+  deltas.
+- **A stats sync must report under its own DID.** The DIDComm and trust-task
+  routes now reject a `server_did` that differs from the transport-proven
+  sender (`e.p.stats.sender_mismatch`), as the REST route already did against
+  its JWT. `server_did` keys the replay window, so a foreign one could advance
+  another server's sequence and have its genuine deltas skipped as stale.
+
+### Changed — messaging-stack refresh for the TSP relationship fixes
+
+- **Took the latest TSP fixes on the 0.26 messaging line.**
+  `affinidi-messaging-sdk` 0.26.10 → **0.26.27**: two endpoints that
+  re-establish a TSP relationship at the same time (fresh environment, or both
+  restarting) no longer fail with `invalid transition: SendInvite in state
+  InviteReceived` (0.26.12); a reply-registration race is closed (0.26.19); and
+  a TSP send retries when its connection is closed under it (0.26.26).
+  `vta-sdk` 0.43 → **0.50** with `vti-common` 0.19.3 → **0.23.1** (the lockstep
+  pair, all four `vti-common` declarations), `trust-tasks-*` 0.21.2/0.21.3 →
+  **0.21.21**; dev-graph `affinidi-messaging-test-mediator` 0.9.1 → 0.9.17
+  (mediator 0.26.2 → 0.28.36). One copy of each of `affinidi-messaging-sdk`,
+  `affinidi-tdk`, `trust-tasks-rs`, `vta-sdk` and `vti-common`.
+- **Two mechanical source changes for vti-common 0.23.** `AuthError` is now
+  `#[non_exhaustive]` with three new variants: `SessionIdleTimeout` and
+  `WrongRecipient` map to `AppError::Authentication`, `MissingRecipient` to
+  `AppError::Validation`, and a wildcard arm fails closed as `Authentication`.
+  `AuthenticateInput` gained a required `audience`; all five sign-in paths pass
+  `AudienceBinding::Transport`, because each has already bound the document to
+  this service before the canonical handler runs (`require_addressed_to` on the
+  signed-DIDComm paths, the id_token `aud` check on SIOPv2, and authcrypt/TSP
+  plus the framework's `recipient` check on the auth trust tasks).
+- **Not yet on sdk 0.27 / `-didcomm-service` 0.12.** Those move the messaging
+  SDK to 0.27 and trust-tasks to 0.22, but the newest published `vta-sdk`
+  (0.50.0) still requires sdk ^0.26 / trust-tasks ^0.21 / affinidi-tdk ^0.16,
+  so taking them now would put a second copy of each in the shipped graph. The
+  move follows the next `vta-sdk` release (verifiable-trust-infrastructure main
+  is already on sdk 0.27 / tdk 0.17 / trust-tasks 0.22).
+
+### Added — TSP relationship persistence & self-healing (Rev 3 §7.2.2)
+
+- **Nodes now persist their TSP relationships and re-establish them on connect,
+  so an edge stops silently dropping the control plane's pushes after a
+  restart.** Under Rev 3 §7.2.2 a receiver drops any application (sync/health)
+  frame from a VID it holds no relationship with; the SDK's default relationship
+  store is in-memory, so a restart forgot every peer and the node went quiet
+  until a re-handshake that nothing triggered. Two halves fix it, on top of the
+  answering arm shipped earlier:
+  - **Durable store.** Both the control plane and the edge server inject a
+    persistent relationship store (`server::tsp_relationship_store`, a
+    backend-agnostic `RelationshipKv` over any configured `StorageBackend` —
+    fjall, DynamoDB, Firestore, CosmosDB — under the new `KS_TSP_RELATIONSHIPS`
+    keyspace) into their TSP listener, so a formed relationship survives a
+    restart.
+  - **Edge re-invite at connect.** The edge calls the facade's
+    `tsp_ensure_relationship` with its control plane on the initial connection
+    and every reconnection (idempotent — it skips when the relationship already
+    admits application messages), repairing a control-plane restart or a
+    never-completed handshake on the edge's next connect. The control plane
+    persists its half and answers, so it does not re-invite.
+
+  Requires `affinidi-messaging-didcomm-service` **0.11** (adds
+  `ListenerConfig::with_relationship_store` and
+  `DIDCommService::tsp_ensure_relationship`; no SDK bump — stays on 0.26.5). See
+  `docs/tsp-transport.md`.
+
+### Changed — dependency refresh (TSP rev3)
+
+- **Upgraded the Affinidi / Trust-Tasks stack to the TSP rev3 line.** The
+  driver is `affinidi-tsp` 0.1 → **0.2**, the Trust Spanning Protocol rev3
+  release, which brings the post-quantum ML-DSA envelope suite underneath the
+  transport. It moves as one coordinated family bump: `affinidi-tdk`
+  0.14 → 0.16, `affinidi-messaging-didcomm-service` 0.8 → 0.10 (SDK
+  0.24 → 0.26), `vta-sdk` 0.38 → 0.41, `vti-common` 0.18.5 → 0.18.9, and all
+  five `trust-tasks-*` lines 0.20 → 0.21. Dev-graph `affinidi-messaging-test-mediator`
+  0.7 → 0.9 to match. No workspace source change was required — this service
+  speaks trust-tasks documents, not TSP envelope internals — and the framework
+  still emits `trust-task-error/0.5`. `cargo tree -d` shows no duplicate of the
+  family in the normal, build or dev graphs.
+- **Refreshed the remaining crates within their existing semver ranges**
+  (AWS SDK, `affinidi-did-resolver-*`, `clap`, `jiff`, `reqwest` subtree, …).
+  The deliberate holds are unchanged: our `jsonwebtoken` stays at 10,
+  `aws-smithy-types` stays below 1.7 (1.6.4), and `base64` at 0.23.
+
 ### Added — `did:webs` hosting
 
 - **The service can host `did:webs` DIDs**, behind the new `method-webs`
@@ -55,6 +663,106 @@
   control plane's push. The webvh sync path is unchanged (structural only), for
   the reason it always was: the control plane has already walked that chain, and
   an edge re-running it would reject logs an older `didwebvh-rs` accepted.
+
+### Fixed — rate-limit refusals are `429`, and say who refused
+
+- **Every refusal from this service's own limiters is now a `429`** carrying
+  `x-rate-limit-source: did-host`, `Retry-After` in seconds, and a JSON body
+  `{ "error": "rate_limited", "limiter": "<name>", "message": "…",
+  "retryAfterSecs": N }` — the contract the VTA, VTC and mediator also emit, and
+  that `vta_sdk::rate_limit` reads. They all answered `400` before, which no
+  client can tell apart from a malformed request: nothing backed off, and an
+  operator could not see which service in the path had refused.
+
+  The limiters, by `limiter` name:
+
+  - `auth-challenge-per-ip` — control plane (and daemon) `POST
+    /api/auth/challenge`, 30 per IP per 60 s. `Retry-After` is the time left in
+    the window.
+  - `auth-challenge-pending-per-did` — the per-DID cap on pending challenges: the
+    control plane's own tracker, and the canonical handler's cap on
+    `did-hosting-server` and `webvh-witness`.
+  - `auth-challenge-pending-global` — the control plane's global pending cap.
+
+  For the canonical per-DID cap on `did-hosting-server` and `webvh-witness`,
+  `Retry-After` is `challenge_ttl + session_cleanup_interval` (630 s by
+  default): a slot frees when its challenge authenticates, or when the sweep
+  removes it after expiry. The control plane's caps compute the exact moment
+  instead (see the next section).
+
+- **New `AppError::RateLimited { limiter, message, retry_after_secs }`** in
+  `did-hosting-common`, and `AuthError::PendingChallengeLimitReached` now
+  converts to it rather than to `Validation`.
+- **`did-hosting-client` gains `ClientError::RateLimited { limit_source,
+  retry_after_secs, body }`**, read from `x-rate-limit-source` and
+  `Retry-After`, and counted by `is_retryable()`. A 429 used to fall through to
+  `Protocol("unexpected status")`; the challenge limit, as a `400`, read as
+  `Validation`. A 429 without the header is reported with `limit_source: None`
+  — a proxy or load balancer, not the host.
+
+  DID resolution (`did.jsonl`, `did.json`, `keri.cesr`) has no limiter, so is
+  unchanged. The per-IP limiter has no Trust Task counterpart; the control
+  plane's pending caps now do (next section).
+
+### Fixed — abandoned auth challenges no longer lock out the control plane
+
+- **An auth challenge nobody redeems now gives its slot back when it expires.**
+  The control plane's `PendingChallengeTracker` released a slot only when its
+  challenge authenticated. A challenge that expired unused, one issued to a DID
+  with no ACL entry (answered without persisting anything, so nothing could
+  ever redeem it), or one authenticated over a different binding than it was
+  issued on held its slot until restart. Ten abandoned challenges locked a DID
+  out of `POST /api/auth/challenge` for good, and ~10,000 across any DIDs locked
+  out every login to the control plane (and daemon) — an unauthenticated denial
+  of service, whose `Retry-After` promised a retry that would never succeed.
+
+  The tracker now holds the set of live challenges, each expiring with
+  `challenge_ttl` — the same bound the authenticate handler enforces — so a
+  missed release can over-count for at most one TTL. A successful authenticate
+  releases exactly its own challenge by session id (a second release is a
+  no-op); a failed one leaves the challenge redeemable and keeps its slot. At
+  boot the tracker is seeded from the still-redeemable `ChallengeSent` rows in
+  the session store, so the caps hold across a restart. `Retry-After` on
+  `auth-challenge-pending-per-did` / `auth-challenge-pending-global` is now the
+  moment the oldest counted challenge expires (≤ `challenge_ttl`, 30 s by
+  default), not 630 s.
+
+  `did-hosting-server` and `webvh-witness` were not affected: their per-DID cap
+  counts `ChallengeSent` rows in the store, which the session sweep removes.
+
+- **`auth/challenge/0.1` over DIDComm, TSP and the HTTPS `/trust-tasks` route
+  is held to the same per-DID and global caps** as `POST /api/auth/challenge`.
+  It called the canonical handler with its per-DID cap disabled and bypassed
+  the tracker, so challenges over those bindings were unbounded. The Trust Task
+  framework defines no rate-limit code, so a refusal answers `permissionDenied`
+  — the arm's existing mapping for every challenge failure — with the limiter
+  and retry hint in the operator log.
+
+- **`PendingChallengeTracker` API**: `try_issue(did, per_did_cap)` returns a
+  `Reservation` to `bind` to the issued session id or `cancel`;
+  `release(did)` is replaced by `release_session(session_id)`; new
+  `for_auth_config`, `with_clock`, `seed_from_sessions`. Counts are `usize`,
+  and the methods are synchronous.
+
+### Changed — pending-challenge caps are operator-configurable
+
+- **The control plane's pending-challenge caps can now be tuned.** Both the
+  global cap (default 10,000) and the per-DID cap (default 10) are now
+  `[auth]` config fields — `max_global_pending_challenges` and
+  `max_pending_challenges_per_did` — overridable by env
+  (`*_AUTH_MAX_GLOBAL_PENDING_CHALLENGES`,
+  `*_AUTH_MAX_PENDING_CHALLENGES_PER_DID`). Defaults are unchanged, so
+  behaviour is identical unless an operator sets them; a zero cap is refused at
+  config load. This is defence-in-depth on already-bounded code, letting large
+  or small deployments size the caps to their footprint.
+
+- **The bounded-memory and locking guarantees are now documented in-code.**
+  `pending_challenges.rs` states explicitly that every internal structure is
+  capped at the global cap (memory cannot grow without limit; refusal at the
+  cap is fail-closed, and the per-IP limiter throttles fill rate — CWE-400),
+  and that its `std::sync::Mutex` guard is never held across an `.await` (which
+  would fail to compile as a non-`Send` future — CWE-667). No behaviour change;
+  the rationale now lives beside the code.
 
 ### Changed — dependencies
 

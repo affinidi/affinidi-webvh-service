@@ -26,13 +26,52 @@ fn refresh_key(token: &str) -> String {
     format!("refresh:{token}")
 }
 
+/// Per-DID reverse index: `session-did:{did}:{session_id}` → `session_id`.
+///
+/// Lets [`demote_non_passkey_step_up_sessions`] find one subject's sessions
+/// without a full `session:` table scan. Written by [`store_session`],
+/// removed by [`delete_session`] and [`cleanup_expired_sessions`] — every
+/// path that writes or removes a `session:` row keeps this in lockstep.
+fn session_did_key(did: &str, session_id: &str) -> String {
+    format!("session-did:{did}:{session_id}")
+}
+
+/// Prefix over `session_did_key` entries for `did` — every one of its
+/// sessions. The trailing colon disambiguates DIDs that are a prefix of one
+/// another (e.g. `did:example:ali` vs. `did:example:alice`).
+fn session_did_prefix(did: &str) -> String {
+    format!("session-did:{did}:")
+}
+
 /// Store a new session in the `sessions` keyspace.
 pub async fn store_session(sessions: &KeyspaceHandle, session: &Session) -> Result<(), AppError> {
     sessions
         .insert(session_key(&session.session_id), session)
         .await?;
+    sessions
+        .insert_raw(
+            session_did_key(&session.did, &session.session_id),
+            session.session_id.as_bytes().to_vec(),
+        )
+        .await?;
     debug!(session_id = %session.session_id, did = %session.did, "session stored");
     Ok(())
+}
+
+/// Whether `multikey` is a base58btc multikey encoding an Ed25519 public key
+/// (`0xed 0x01` + 32 bytes) — the only session key a session can be bound to.
+///
+/// A session key is used by resolving `did:key:{pk}#{pk}` and verifying
+/// `eddsa-jcs-2022`, so nothing else can ever sign. Decoded rather than
+/// prefix-matched: a value that only *looks* like one (`z6Mk…` over the wrong
+/// bytes) would bind a key whose every later proof is refused, on a login its
+/// producer was told succeeded. Every route that accepts a session key checks
+/// it here, before the login spends anything.
+pub fn is_ed25519_multikey(multikey: &str) -> bool {
+    matches!(
+        multibase::decode(multikey),
+        Ok((multibase::Base::Base58Btc, bytes)) if bytes.len() == 34 && bytes[..2] == [0xed, 0x01]
+    )
 }
 
 /// Load a session by session_id.
@@ -108,6 +147,37 @@ pub fn now_epoch() -> u64 {
         .as_secs()
 }
 
+/// How stale `last_seen` must be before an activity touch writes.
+///
+/// Without it a busy console rewrites the session row on every request for
+/// no gain: the idle timeout is measured in minutes, so second-level
+/// precision buys nothing and costs a store write per call.
+pub const LAST_SEEN_GRANULARITY_SECS: u64 = 60;
+
+/// Record activity on `session` by advancing `last_seen` to `now`.
+///
+/// `Ok(false)` means the write was skipped as unnecessary — the row is
+/// already fresh within [`LAST_SEEN_GRANULARITY_SECS`], or the clock went
+/// backwards.
+///
+/// **Only real requests should call this.** It is the clock the idle
+/// timeout is measured against, so anything firing on a timer — a token
+/// renewal above all — would, by touching it, hold the session open for as
+/// long as the client ran and put the timeout permanently out of reach.
+pub async fn touch_last_seen(
+    sessions: &KeyspaceHandle,
+    session: &Session,
+    now: u64,
+) -> Result<bool, AppError> {
+    if now < session.last_seen.saturating_add(LAST_SEEN_GRANULARITY_SECS) {
+        return Ok(false);
+    }
+    let mut updated = session.clone();
+    updated.last_seen = now;
+    store_session(sessions, &updated).await?;
+    Ok(true)
+}
+
 /// Delete a single session and its refresh index.
 pub async fn delete_session(sessions: &KeyspaceHandle, session_id: &str) -> Result<(), AppError> {
     let session: Option<Session> = sessions.get(session_key(session_id)).await?;
@@ -116,9 +186,62 @@ pub async fn delete_session(sessions: &KeyspaceHandle, session_id: &str) -> Resu
             sessions.remove(refresh_key(token)).await?;
         }
         sessions.remove(session_key(session_id)).await?;
+        sessions
+            .remove(session_did_key(&session.did, session_id))
+            .await?;
         debug!(session_id, "session deleted");
     }
     Ok(())
+}
+
+/// Demote every live session of `subject` that is currently elevated
+/// (`acr == "aal2"`) without a passkey factor in `amr` — the wallet/VTA-signed
+/// `didSigned` step-up route this relying party no longer honours for a
+/// subject holding a step-up passkey (once enrolled, only that subject's own
+/// step-up passkeys may satisfy step-up; any elevation reached another way
+/// stops counting, SPEC step-up rule).
+///
+/// Call this once a step-up passkey is enrolled for `subject`. A session
+/// already elevated *with* a passkey (`amr` contains `"passkey"`) is left
+/// untouched — it satisfies the rule that now applies. The demoted row falls
+/// back to the base `aal1`/`["did"]` shape; a live access token already
+/// carrying the higher claims is unaffected until it is next refreshed or
+/// expires, the same bound every other mid-session permission change in this
+/// store is subject to (see `AuthClaims`, which reads `acr`/`amr`/`role` from
+/// the JWT, not the session row, between refreshes).
+///
+/// Returns the number of sessions demoted.
+///
+/// Walks only `subject`'s own sessions, via the `session-did:{subject}:`
+/// index (see [`session_did_key`]) — not a full `session:` table scan.
+pub async fn demote_non_passkey_step_up_sessions(
+    sessions: &KeyspaceHandle,
+    subject: &str,
+) -> Result<u64, AppError> {
+    let entries = sessions
+        .prefix_iter_raw(session_did_prefix(subject))
+        .await?;
+    let mut demoted = 0u64;
+    for (_key, value) in entries {
+        let Ok(session_id) = String::from_utf8(value) else {
+            continue;
+        };
+        let Some(mut session) = get_session(sessions, &session_id).await? else {
+            continue;
+        };
+        if session.did != subject
+            || session.acr != "aal2"
+            || session.amr.iter().any(|m| m == "passkey")
+        {
+            continue;
+        }
+        session.amr = vec!["did".to_string()];
+        session.acr = "aal1".to_string();
+        session.acr_expires_at = None;
+        store_session(sessions, &session).await?;
+        demoted += 1;
+    }
+    Ok(demoted)
 }
 
 /// Remove expired sessions from the store.
@@ -154,22 +277,40 @@ pub async fn cleanup_expired_sessions(
             if let Some(ref token) = session.refresh_token {
                 sessions.remove(refresh_key(token)).await?;
             }
+            sessions
+                .remove(session_did_key(&session.did, &session.session_id))
+                .await?;
             removed += 1;
         }
     }
 
-    // Clean up expired enrollment tokens (have an `expires_at` field).
-    let enrollments = sessions.prefix_iter_raw("enroll:").await?;
-    for (key, value) in enrollments {
-        #[derive(serde::Deserialize)]
-        struct EnrollmentExpiry {
-            expires_at: u64,
-        }
-        if let Ok(e) = serde_json::from_slice::<EnrollmentExpiry>(&value)
-            && now > e.expires_at
-        {
-            sessions.remove(key).await?;
-            removed += 1;
+    // Expired passkey enrolment invites (`pk_invite:` + their `pk_invite_id:`
+    // index and `pk_wrong:` wrong-claim-code counter) and enrolment
+    // ceremonies (`pk_enrol:`). Both carry `expires_at`; an invite past it
+    // can no longer be redeemed, and its hashes go with it.
+    #[derive(serde::Deserialize)]
+    struct Expiry {
+        expires_at: u64,
+        #[serde(default)]
+        invite_id: Option<String>,
+    }
+    for prefix in ["pk_invite:", "pk_enrol:"] {
+        for (key, value) in sessions.prefix_iter_raw(prefix).await? {
+            if let Ok(e) = serde_json::from_slice::<Expiry>(&value)
+                && now > e.expires_at
+            {
+                sessions.remove(key.clone()).await?;
+                if let Some(id) = e.invite_id {
+                    sessions.remove(format!("pk_invite_id:{id}")).await?;
+                }
+                if let Some(token_hash) = key
+                    .strip_prefix(b"pk_invite:".as_slice())
+                    .and_then(|h| std::str::from_utf8(h).ok())
+                {
+                    sessions.remove(format!("pk_wrong:{token_hash}")).await?;
+                }
+                removed += 1;
+            }
         }
     }
 
@@ -505,6 +646,71 @@ mod refresh_token_invariant {
         (ks, keys, dir)
     }
 
+    /// Activity advances the clock the idle timeout is measured against.
+    #[tokio::test]
+    async fn touching_a_session_advances_last_seen() {
+        let (ks, keys, _dir) = make_ks().await;
+        let created = create_authenticated_session(
+            &ks,
+            &keys,
+            "did:example:active",
+            &Role::Owner,
+            60,
+            900,
+            None,
+            None,
+        )
+        .await
+        .expect("create session");
+
+        let mut stored = get_session(&ks, &created.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        // Backdate so the granularity throttle does not swallow the write.
+        stored.last_seen = now_epoch() - (LAST_SEEN_GRANULARITY_SECS + 10);
+        store_session(&ks, &stored).await.unwrap();
+        let before = stored.last_seen;
+
+        let wrote = touch_last_seen(&ks, &stored, now_epoch()).await.unwrap();
+        assert!(wrote, "a stale row must be written");
+
+        let after = get_session(&ks, &created.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(after.last_seen > before);
+    }
+
+    /// …but not on every request. The idle timeout is measured in minutes,
+    /// so a write per call would buy precision nobody reads.
+    #[tokio::test]
+    async fn touching_a_fresh_session_writes_nothing() {
+        let (ks, keys, _dir) = make_ks().await;
+        let created = create_authenticated_session(
+            &ks,
+            &keys,
+            "did:example:busy",
+            &Role::Owner,
+            60,
+            900,
+            None,
+            None,
+        )
+        .await
+        .expect("create session");
+
+        let stored = get_session(&ks, &created.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let wrote = touch_last_seen(&ks, &stored, now_epoch()).await.unwrap();
+        assert!(
+            !wrote,
+            "a row touched within the granularity window must not be rewritten"
+        );
+    }
+
     /// Both production creators must leave a refresh token on the row.
     #[tokio::test]
     async fn sessions_we_create_carry_a_refresh_token() {
@@ -594,5 +800,177 @@ mod refresh_token_invariant {
             "a refresh-less Authenticated session is reaped on the next sweep, however recently \
              it was seen — teach cleanup_expired_sessions about last_seen before creating one"
         );
+    }
+}
+
+/// #191: `demote_non_passkey_step_up_sessions` walks the `session-did:`
+/// index rather than the whole `session:` table, and that index stays in
+/// lockstep with every writer/remover of a session row.
+#[cfg(all(test, feature = "store-fjall"))]
+mod demotion_index_tests {
+    use super::*;
+    use crate::server::config::StoreConfig;
+    use crate::server::store::{KS_SESSIONS, Store};
+    use std::path::PathBuf;
+
+    async fn make_ks() -> (KeyspaceHandle, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&StoreConfig {
+            data_dir: PathBuf::from(dir.path()),
+            ..StoreConfig::default()
+        })
+        .await
+        .unwrap();
+        let ks = store.keyspace(KS_SESSIONS).unwrap();
+        (ks, dir)
+    }
+
+    fn session(did: &str, session_id: &str, acr: &str, amr: Vec<String>) -> Session {
+        Session {
+            session_id: session_id.to_string(),
+            did: did.to_string(),
+            challenge: String::new(),
+            state: SessionState::Authenticated,
+            created_at: now_epoch(),
+            last_seen: now_epoch(),
+            refresh_token: None,
+            refresh_expires_at: Some(now_epoch() + 3600),
+            tee_attested: false,
+            token_id: None,
+            session_pubkey_b58btc: None,
+            amr,
+            acr: acr.to_string(),
+            acr_expires_at: None,
+        }
+    }
+
+    /// Demotion touches only the subject's own sessions — reached via the
+    /// `session-did:{subject}:` index — never another subject's, and never
+    /// one of the subject's own sessions that already carries a passkey
+    /// factor.
+    #[tokio::test]
+    async fn demotion_touches_only_the_subjects_own_sessions_via_the_index() {
+        let (ks, _dir) = make_ks().await;
+
+        let alice_elevated = session("did:example:alice", "s-alice-1", "aal2", vec!["did".into()]);
+        let alice_passkey = session(
+            "did:example:alice",
+            "s-alice-2",
+            "aal2",
+            vec!["did".into(), "passkey".into()],
+        );
+        let bob_elevated = session("did:example:bob", "s-bob-1", "aal2", vec!["did".into()]);
+        for s in [&alice_elevated, &alice_passkey, &bob_elevated] {
+            store_session(&ks, s).await.unwrap();
+        }
+
+        let demoted = demote_non_passkey_step_up_sessions(&ks, "did:example:alice")
+            .await
+            .unwrap();
+        assert_eq!(
+            demoted, 1,
+            "only alice's non-passkey aal2 session is demoted"
+        );
+
+        let alice1 = get_session(&ks, "s-alice-1").await.unwrap().unwrap();
+        assert_eq!(alice1.acr, "aal1");
+
+        let alice2 = get_session(&ks, "s-alice-2").await.unwrap().unwrap();
+        assert_eq!(alice2.acr, "aal2", "a passkey-factor session is left alone");
+
+        let bob1 = get_session(&ks, "s-bob-1").await.unwrap().unwrap();
+        assert_eq!(
+            bob1.acr, "aal2",
+            "another subject's session is never touched"
+        );
+    }
+
+    /// The `session-did:` index entry is removed exactly when the session
+    /// row it points to is — on delete, and on the expiry sweep — so it
+    /// never grows stale pointers to sessions that no longer exist.
+    #[tokio::test]
+    async fn the_did_index_is_removed_on_delete_and_on_cleanup() {
+        let (ks, _dir) = make_ks().await;
+
+        let deleted = session("did:example:carol", "s-carol-1", "aal1", vec!["did".into()]);
+        store_session(&ks, &deleted).await.unwrap();
+        assert!(
+            ks.contains_key(session_did_key(&deleted.did, &deleted.session_id))
+                .await
+                .unwrap(),
+            "store_session must write the index"
+        );
+        delete_session(&ks, &deleted.session_id).await.unwrap();
+        assert!(
+            !ks.contains_key(session_did_key(&deleted.did, &deleted.session_id))
+                .await
+                .unwrap(),
+            "delete_session must remove the did-index entry too"
+        );
+
+        let mut expired = session("did:example:dana", "s-dana-1", "aal1", vec!["did".into()]);
+        expired.refresh_expires_at = Some(0); // already in the past
+        store_session(&ks, &expired).await.unwrap();
+        assert!(
+            ks.contains_key(session_did_key(&expired.did, &expired.session_id))
+                .await
+                .unwrap()
+        );
+        cleanup_expired_sessions(&ks, 300).await.unwrap();
+        assert!(
+            !ks.contains_key(session_did_key(&expired.did, &expired.session_id))
+                .await
+                .unwrap(),
+            "cleanup_expired_sessions must remove the did-index entry too"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_key_tests {
+    use super::is_ed25519_multikey;
+
+    fn multikey(prefix: [u8; 2], key_len: usize) -> String {
+        let mut bytes = prefix.to_vec();
+        bytes.extend(std::iter::repeat_n(7u8, key_len));
+        multibase::encode(multibase::Base::Base58Btc, bytes)
+    }
+
+    #[test]
+    fn an_ed25519_multikey_is_accepted() {
+        let pk = multikey([0xed, 0x01], 32);
+        assert!(pk.starts_with("z6Mk"));
+        assert!(is_ed25519_multikey(&pk));
+    }
+
+    /// Every one of these passed the `starts_with("z6Mk")` check it replaces.
+    #[test]
+    fn a_value_that_only_looks_like_one_is_refused() {
+        let pk = multikey([0xed, 0x01], 32);
+        let truncated = &pk[..pk.len() - 4];
+        let over_long = format!("{pk}zz");
+        let not_base58 = format!("z6Mk{}", "0OIl".repeat(10));
+        for bad in [truncated, over_long.as_str(), not_base58.as_str(), "z6Mk"] {
+            assert!(bad.starts_with("z6Mk"), "{bad}");
+            assert!(!is_ed25519_multikey(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn another_curve_or_encoding_is_refused() {
+        // secp256k1 (0xe7 0x01), and an Ed25519 key in base64 rather than base58btc.
+        assert!(!is_ed25519_multikey(&multikey([0xe7, 0x01], 33)));
+        let mut ed = vec![0xed, 0x01];
+        ed.extend([7u8; 32]);
+        assert!(!is_ed25519_multikey(&multibase::encode(
+            multibase::Base::Base64,
+            ed
+        )));
+    }
+
+    #[test]
+    fn non_ascii_input_is_refused_not_a_panic() {
+        assert!(!is_ed25519_multikey("z6Mk\u{00e9}\u{1f600}"));
+        assert!(!is_ed25519_multikey(""));
     }
 }

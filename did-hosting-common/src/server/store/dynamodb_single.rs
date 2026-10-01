@@ -53,6 +53,7 @@ use super::{BatchOps, BoxFuture, KeyspaceOps, RawKvPair, StorageBackend};
 const PK_ATTR: &str = "pk";
 const SK_ATTR: &str = "sk";
 const VAL_ATTR: &str = "val";
+const CNT_ATTR: &str = "cnt";
 
 // ---------------------------------------------------------------------------
 // SingleTableDynamoDbBackend
@@ -223,6 +224,43 @@ impl KeyspaceOps for SingleTableKeyspace {
                     AppError::Store(format!("dynamodb-single delete (atomic take): {e}"))
                 })?;
             Ok(response.attributes.and_then(extract_val_bytes))
+        })
+    }
+
+    fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
+        Box::pin(async move {
+            let sk = key_as_string(&key)?;
+            // `ADD` on a Number attribute is DynamoDB's native atomic
+            // counter: the read-modify-write happens server-side under the
+            // item's lock, so replicas racing this call each get a distinct,
+            // correctly-ordered result. The counter lives in its own `cnt`
+            // attribute on the (pk, sk) item — same shape as the multi-table
+            // backend — and `UpdatedNew` returns the post-increment value in
+            // the same round trip.
+            let response = self
+                .client
+                .update_item()
+                .table_name(&self.table_name)
+                .key(PK_ATTR, AttributeValue::S(self.keyspace.clone()))
+                .key(SK_ATTR, AttributeValue::S(sk))
+                .update_expression("ADD #cnt :one")
+                .expression_attribute_names("#cnt", CNT_ATTR)
+                .expression_attribute_values(":one", AttributeValue::N("1".to_string()))
+                .return_values(ReturnValue::UpdatedNew)
+                .send()
+                .await
+                .map_err(|e| AppError::Store(format!("dynamodb-single update (incr): {e}")))?;
+            response
+                .attributes
+                .as_ref()
+                .and_then(|attrs| attrs.get(CNT_ATTR))
+                .and_then(|attr| match attr {
+                    AttributeValue::N(s) => s.parse::<u64>().ok(),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    AppError::Store("dynamodb-single incr: no numeric counter in response".into())
+                })
         })
     }
 

@@ -128,7 +128,7 @@ Content-Type: application/json
     "cryptosuite": "eddsa-jcs-2022",
     "verificationMethod": "did:key:z6Mk…#z6Mk…",
     "created": "2026-05-19T10:00:00Z",
-    "proofPurpose": "assertionMethod",
+    "proofPurpose": "authentication",
     "proofValue": "z…"
   }
 }

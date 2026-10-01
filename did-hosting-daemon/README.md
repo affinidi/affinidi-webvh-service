@@ -14,7 +14,7 @@ Each service is mounted at a path prefix:
 | Server  | `/`         | Public DID hosting and resolution |
 | Witness | `/witness`  | Witness proof signing |
 | Watcher | `/watcher`  | Read-only DID mirror |
-| Control | `/`         | DID management (DIDComm + REST API), management UI |
+| Control | `/`         | DID management as Trust Tasks (TSP, DIDComm, `POST /api/trust-tasks`), management UI |
 
 > **IMPORTANT:**
 > did-hosting-service crates are provided "as is" without any
@@ -35,11 +35,11 @@ Each service is mounted at a path prefix:
 
 ```bash
 # Without UI
-cargo build -p did-hosting-daemon --release
+cargo build --locked -p did-hosting-daemon --release
 
 # With embedded management UI
 cd did-hosting-ui && npm install && npm run build:web && cd ..
-cargo build -p did-hosting-daemon --release --features ui
+cargo build --locked -p did-hosting-daemon --release --features ui
 ```
 
 The binary is produced at `target/release/did-hosting-daemon`.
@@ -174,10 +174,16 @@ and `acl` keyspaces).
 | Section          | Service | Description |
 | ---------------- | ------- | ----------- |
 | `[limits]`       | Server  | Upload body limit, per-account quotas |
-| `[[watchers]]`   | Server  | Watcher push endpoints |
 | `[vta]`          | Witness | VTA remote key management |
 | `[watcher_sync]` | Watcher | Push tokens and source servers |
 | `[registry]`     | Control | Service instance registry |
+
+> A default daemon has an empty registry and does not use the reverse proxy, so
+> no extra configuration is needed. **If** you populate `[[registry.instances]]`
+> (or accept `MSG_SERVER_REGISTER`) and proxy to remote instances, you must set
+> `registry.url_allowlist` — the proxy is fail-closed without it. See
+> "Reverse proxy & the registry allowlist" in the
+> [control plane README](../did-hosting-control/README.md).
 
 ### Enable/Disable Services
 
@@ -230,7 +236,7 @@ did-hosting-daemon restore              # Restore data from backup file
 
 When all services are enabled, the daemon exposes endpoints
 at the following paths. `did-hosting-server` (the public-DID-resolver edge
-node) and `did-hosting-control` (the management API + UI) both merge at
+node) and `did-hosting-control` (the Trust Task listener + UI) both merge at
 root — the daemon is a unified front door rather than a multiplexer.
 Witness and watcher are nested under their own prefixes because their
 APIs are operator-facing and benefit from a clean URL boundary.
@@ -240,13 +246,8 @@ APIs are operator-facing and benefit from a clean URL boundary.
 | Path | Description | Source |
 | ---- | ----------- | ------ |
 | `/api/health` | Combined health endpoint | server / control |
-| `/api/auth/*` | DIDComm auth + passkey auth | control plane |
-| `/api/dids/*` | DID lifecycle management | control plane |
-| `/api/acl/*` | ACL management | control plane |
-| `/api/server/{instance_id}/*` | Reverse proxy to a registered server | control plane |
-| `/api/witness/{instance_id}/*` | Reverse proxy to a registered witness | control plane |
-| `/api/control/registry/*` | Service registry CRUD | control plane |
-| `/api/control/stats` | Service-role stats sync ingest | control plane |
+| `/api/trust-tasks` | Every management operation, as a signed Trust Task (the HTTPS binding) | control plane |
+| `/api/auth/challenge`, `/api/auth/`, `/api/auth/refresh` | Browser SIOPv2 sign-in and console session refresh | control plane |
 | `/{mnemonic}/did.jsonl` | Public DID resolution | server |
 | `/.well-known/did.jsonl` | Service-DID resolution | server |
 | `/`, `/assets/*` | Management UI (when `ui` feature enabled) | control plane |
@@ -256,16 +257,13 @@ APIs are operator-facing and benefit from a clean URL boundary.
 | Path | Description |
 | ---- | ----------- |
 | `/witness/api/health` | Witness health |
-| `/witness/api/auth/*` | Witness authentication |
-| `/witness/api/witnesses/*` | Witness management |
-| `/witness/api/proof/*` | Proof signing |
+| `/witness/api/trust-tasks` | The witness's Trust Tasks (`webvh/witness/*`, `acl/*`), HTTPS binding |
 
 ### Watcher (nested at `/watcher`)
 
 | Path | Description |
 | ---- | ----------- |
 | `/watcher/api/health` | Watcher health |
-| `/watcher/api/sync/*` | Server → watcher sync endpoints |
 | `/watcher/{mnemonic}/did.jsonl` | Mirrored public DID resolution |
 
 ### Daemon

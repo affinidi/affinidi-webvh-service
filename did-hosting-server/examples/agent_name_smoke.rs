@@ -23,7 +23,7 @@
 //!   asserts 404, the name gone from the registry, and `check` reporting it
 //!   free again.
 //!
-//! Plus: `/api/server-info` advertises `agentNames`, `check` distinguishes
+//! Plus: `server/info` advertises `agentNames`, `check` distinguishes
 //! taken / free / reserved, and `/@unknown` 404s.
 //!
 //! ## Running it
@@ -58,8 +58,8 @@ use serde_json::{Value, json};
 #[derive(Parser)]
 #[command(about = "Smoke-test the agent-name lifecycle against a running control plane")]
 struct Cli {
-    /// Control-plane base URL — auth, `/api/dids`, `/api/agent-names`,
-    /// `/api/server-info`. In daemon mode this is also the hosting origin.
+    /// Control-plane base URL — its `POST /api/trust-tasks` takes every
+    /// request. In daemon mode this is also the hosting origin.
     #[arg(long)]
     control_url: String,
 
@@ -68,8 +68,8 @@ struct Cli {
     #[arg(long)]
     hosting_url: Option<String>,
 
-    /// The DID-hosting service's own DID — the DIDComm `to` of the signed
-    /// authenticate message (same as `examples/client.rs`).
+    /// The DID-hosting service's own DID: every signed request is addressed
+    /// to it (same as `examples/client.rs`).
     #[arg(long)]
     webvh_did: String,
 
@@ -104,11 +104,11 @@ async fn probe_redirect(probe: &reqwest::Client, hosting: &str, name: &str) -> R
 /// Whether the DID's registry currently lists `name`, and if so its `enabled`
 /// flag. `None` = absent from the registry entirely.
 async fn registry_state(client: &WebVHClient, mnemonic: &str, name: &str) -> Result<Option<bool>> {
-    let detail = client
-        .get_did_detail(mnemonic)
-        .await
-        .context("GET /api/dids/{mnemonic}")?;
-    let Some(names) = detail.get("agentNames").and_then(|v| v.as_array()) else {
+    let detail = client.get_did_detail(mnemonic).await.context("did/info")?;
+    let Some(names) = detail
+        .pointer("/record/ext/vnd.affinidi.webvh/agentNames")
+        .and_then(|v| v.as_array())
+    else {
         return Ok(None);
     };
     Ok(names.iter().find_map(|e| {
@@ -188,23 +188,18 @@ async fn main() -> Result<()> {
         client = client.with_hosting_url(h.clone());
     }
     client
-        .authenticate(&my_did, &secret, &cli.webvh_did)
+        .sign_as(&my_did, &secret, &cli.webvh_did)
         .await
-        .context("authenticate")?;
+        .context("signing identity")?;
 
     // ------------------------------------------------------------------
     // Pre-flight: feature advertised, name free
     // ------------------------------------------------------------------
     println!("\n[pre-flight]");
-    let info: Value = reqwest::get(format!("{control_url}/api/server-info"))
-        .await
-        .context("GET /api/server-info")?
-        .json()
-        .await
-        .context("parse server-info")?;
+    let info: Value = client.server_info().await.context("server/info")?;
     check(
         info.get("agentNames").and_then(|v| v.as_bool()) == Some(true),
-        "server-info advertises agentNames: true",
+        "server/info advertises agentNames: true",
     )?;
     let avail = client.check_agent_name(&name, Some(&authority)).await?;
     check(
@@ -302,7 +297,7 @@ async fn main() -> Result<()> {
     client
         .agent_name_op("disable", &mnemonic, &name, &to_jsonl(&state)?)
         .await
-        .context("POST /api/agent-names/disable")?;
+        .context("agent-name/update (parked)")?;
     check(
         probe_redirect(&probe, &hosting, &name).await? == 404,
         "GET /@name → 404 after park",
@@ -324,7 +319,7 @@ async fn main() -> Result<()> {
     client
         .agent_name_op("enable", &mnemonic, &name, &to_jsonl(&state)?)
         .await
-        .context("POST /api/agent-names/enable")?;
+        .context("agent-name/update (active)")?;
     check(
         probe_redirect(&probe, &hosting, &name).await? == 302,
         "GET /@name → 302 after resume",
@@ -346,7 +341,7 @@ async fn main() -> Result<()> {
     client
         .agent_name_op("remove", &mnemonic, &name, &to_jsonl(&state)?)
         .await
-        .context("POST /api/agent-names/remove")?;
+        .context("agent-name/remove")?;
     check(
         probe_redirect(&probe, &hosting, &name).await? == 404,
         "GET /@name → 404 after remove",

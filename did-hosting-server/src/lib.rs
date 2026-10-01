@@ -11,8 +11,6 @@
 //! surface lives in `did-hosting-common` (DID types, request/response
 //! shapes, shared auth primitives).
 
-pub mod acl;
-pub mod auth;
 pub mod backup;
 pub mod bootstrap;
 pub mod cache;
@@ -27,6 +25,7 @@ pub mod mnemonic;
 #[cfg(feature = "openapi")]
 pub mod openapi;
 pub mod purge_sweep;
+pub mod replication;
 pub mod routes;
 pub mod secret_store;
 pub mod server;
@@ -36,4 +35,3 @@ pub mod stats;
 pub mod store;
 pub mod trust_tasks_infra;
 pub mod tsp;
-pub mod watcher_push;

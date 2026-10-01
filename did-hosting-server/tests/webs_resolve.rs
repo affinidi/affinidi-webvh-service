@@ -27,8 +27,8 @@ use did_hosting_common::did_ops::{DidRecord, content_log_key, did_key};
 use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
 };
+use did_hosting_common::server::store::KS_DIDS;
 use did_hosting_common::server::store::Store;
-use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_SESSIONS};
 use did_hosting_server::cache::ContentCache;
 use did_hosting_server::config::{AppConfig, LimitsConfig, StatsConfig};
 use did_hosting_server::server::AppState;
@@ -49,25 +49,23 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         ..StoreConfig::default()
     };
     let store = Store::open(&store_config).await.expect("open store");
-    let sessions_ks = store.keyspace(KS_SESSIONS).expect("sessions ks");
-    let acl_ks = store.keyspace(KS_ACL).expect("acl ks");
     let dids_ks = store.keyspace(KS_DIDS).expect("dids ks");
 
     let config = AppConfig {
         features: FeaturesConfig::default(),
         server_did: Some("did:webvh:test:server.example.com".into()),
         mediator_did: None,
-        public_url: Some("http://localhost:8530".into()),
+        public_url: Some("http://did-webs-service:7676".into()),
         server: ServerConfig::default(),
         log: LogConfig::default(),
         store: store_config.clone(),
+        fjall: Default::default(),
         auth: AuthConfig::default(),
         hosting: did_hosting_common::server::config::HostingConfig::default(),
         secrets: SecretsConfig::default(),
         limits: LimitsConfig::default(),
+        replication: Default::default(),
         stats: StatsConfig::default(),
-        watchers: Vec::new(),
-        control_url: None,
         control_did: None,
         vta: VtaConfig::default(),
         identity: Default::default(),
@@ -76,20 +74,27 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
 
     let state = AppState {
         store: store.clone(),
-        sessions_ks,
-        acl_ks,
         dids_ks,
         config: Arc::new(config),
         did_resolver: None,
+        trust_tasks_verifier: None,
         secrets_resolver: None,
         identity: None,
         didcomm_service: Arc::new(std::sync::OnceLock::new()),
-        jwt_keys: None,
-        signing_key_bytes: None,
-        http_client: reqwest::Client::new(),
         stats_collector: None,
         did_cache: Arc::new(ContentCache::new(Duration::from_secs(60))),
         trusted_proxy_cidrs: Arc::new(Vec::new()),
+        replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
+            did_hosting_common::server::auth::session::now_epoch(),
+        )),
+        trust_tasks_rate_limiter: Arc::new(
+            did_hosting_common::server::rate_limit::IpRateLimiter::new(
+                did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
+                did_hosting_common::server::rate_limit::TRUST_TASKS_MAX_PER_WINDOW,
+                did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
+            ),
+        ),
+        sync_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     (state, dir)
 }
@@ -343,12 +348,14 @@ async fn a_webs_did_syncs_from_the_control_plane_and_then_serves() {
         log_content: String::from_utf8(KERI.to_vec()).unwrap(),
         witness_content: None,
         version_count: 1,
+        disabled: false,
     };
     did_hosting_server::control_register::apply_single_update(
         &state.dids_ks,
         &state.store,
         &update,
         &state.did_cache,
+        state.config.public_url.as_deref(),
     )
     .await
     .expect("a verifying did:webs log must sync to an edge");
@@ -397,13 +404,67 @@ async fn an_edge_refuses_a_tampered_webs_log_from_the_control_plane() {
         log_content: String::from_utf8(tampered).unwrap(),
         witness_content: None,
         version_count: 1,
+        disabled: false,
     };
     did_hosting_server::control_register::apply_single_update(
         &state.dids_ks,
         &state.store,
         &update,
         &state.did_cache,
+        state.config.public_url.as_deref(),
     )
     .await
     .expect_err("an edge verifies the key event log itself, push or no push");
+}
+
+/// An edge refuses to rewind a held did:webs key event log — including after
+/// the slot was deleted, since its high-water mark survives the delete.
+#[tokio::test]
+async fn an_edge_refuses_to_rewind_a_webs_log_even_after_a_delete() {
+    let (state, _dir) = make_state().await;
+    let update = |log: &[u8]| did_hosting_common::DidSyncUpdate {
+        mnemonic: AID.to_string(),
+        did_id: did_id(),
+        log_content: String::from_utf8(log.to_vec()).unwrap(),
+        witness_content: None,
+        version_count: 1,
+        disabled: false,
+    };
+    let apply = |u: did_hosting_common::DidSyncUpdate| {
+        let state = state.clone();
+        async move {
+            did_hosting_server::control_register::apply_single_update(
+                &state.dids_ks,
+                &state.store,
+                &u,
+                &state.did_cache,
+                state.config.public_url.as_deref(),
+            )
+            .await
+        }
+    };
+    apply(update(KERI)).await.expect("full log applies");
+
+    let second_event = KERI
+        .windows(4)
+        .skip(1)
+        .position(|w| w == br#"{"v""#)
+        .map(|p| p + 1)
+        .expect("stream has more than one message");
+    let truncated = &KERI[..second_event];
+    apply(update(truncated))
+        .await
+        .expect_err("a held log may not be rewound");
+
+    // Delete the slot's content, as `sync/delete` does; the high-water mark
+    // remains.
+    state
+        .dids_ks
+        .remove(did_hosting_common::did_ops::content_log_key(AID))
+        .await
+        .unwrap();
+    state.dids_ks.remove(did_key(AID)).await.unwrap();
+    apply(update(truncated))
+        .await
+        .expect_err("a deleted DID may not come back rewound");
 }

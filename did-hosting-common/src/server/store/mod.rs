@@ -14,7 +14,8 @@ mod redis;
 
 pub use keyspaces::{
     KS_ACL, KS_ASSIGNMENTS, KS_DIDS, KS_DOMAINS, KS_IDENTITY, KS_META, KS_OUTBOUND_QUEUE,
-    KS_PENDING_PURGES, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES, KS_WITNESSES,
+    KS_PASSKEY_STEP_UP, KS_PENDING_PURGES, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
+    KS_TSP_RELATIONSHIPS, KS_WITNESSES,
 };
 
 use std::future::Future;
@@ -24,7 +25,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::config::StoreConfig;
+use super::config::{FjallTuning, StoreConfig};
 use super::error::AppError;
 
 // ---------------------------------------------------------------------------
@@ -89,9 +90,29 @@ pub trait KeyspaceOps: Send + Sync {
     ///
     /// Backends are expected to use a native atomic primitive
     /// (Redis `GETDEL`, DynamoDB `DeleteItem` + `ReturnValues=ALL_OLD`,
-    /// SQL transaction, etc.). Single-replica backends (fjall) wrap the
-    /// non-atomic `get + remove` in a process-local mutex.
+    /// a Cosmos DB `If-Match` delete, a Firestore transaction).
+    /// Single-replica backends (fjall) wrap the non-atomic `get + remove`
+    /// in a process-local mutex.
     fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>>;
+
+    /// Atomically increment a counter stored under `key` and return its new
+    /// value. A key that does not exist yet starts at 0, so the first call
+    /// returns 1.
+    ///
+    /// **Required for cross-replica lockout counters** — the passkey
+    /// enrolment invite's wrong-claim-code count is the first user. A plain
+    /// `get` + increment + `insert` races across replicas: two of them can
+    /// both read the same count, both compute the same next value, and both
+    /// write it back, silently losing an attempt — the exact bug that would
+    /// let an attacker exceed the intended lockout threshold by spreading
+    /// guesses across replicas.
+    ///
+    /// Every shared backend makes this atomic in the store itself: Redis
+    /// `INCR`, DynamoDB `UpdateItem` with an `ADD` expression, Cosmos DB an
+    /// ETag-conditional create/replace, Firestore a read-write transaction.
+    /// Only fjall — single-process by construction — uses a process-local
+    /// mutex.
+    fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>>;
 }
 
 /// Atomic multi-key write batch identified by keyspace name.
@@ -133,8 +154,25 @@ pub struct WriteBatch {
 // ---------------------------------------------------------------------------
 
 impl Store {
+    /// Open a local store, with fjall's own memory tuning (block cache /
+    /// write buffer / journal size — see [`FjallTuning`])
+    /// left at its defaults. Every pre-existing call site uses this.
     pub async fn open(config: &StoreConfig) -> Result<Self, AppError> {
-        let backend = create_backend(config).await?;
+        Self::open_with(config, &FjallTuning::default()).await
+    }
+
+    /// [`Self::open`], applying `tuning`'s fjall memory settings. Only the
+    /// real startup paths (did-hosting-control, did-hosting-server,
+    /// webvh-witness, webvh-watcher, and did-hosting-daemon) build a
+    /// non-default [`FjallTuning`] (their loaded
+    /// config file, then an env var override) and call this directly —
+    /// everywhere else keeps calling [`Self::open`], which is this with
+    /// `FjallTuning::default()` (every field unset), so nothing that
+    /// already opened a store needed to change. Backends other than
+    /// `store-fjall` (redis, dynamodb, firestore, cosmosdb) ignore
+    /// `tuning` entirely — these settings are fjall-specific.
+    pub async fn open_with(config: &StoreConfig, tuning: &FjallTuning) -> Result<Self, AppError> {
+        let backend = create_backend(config, tuning).await?;
         Ok(Self {
             inner: Arc::from(backend),
         })
@@ -247,6 +285,15 @@ impl KeyspaceHandle {
         self.inner.take_raw_atomic(key.into()).await
     }
 
+    /// Atomically increment a counter and return its new value.
+    ///
+    /// Backed by `KeyspaceOps::incr_raw` — safe across replicas that share a
+    /// store, so a caller relying on the returned count for a lockout
+    /// decision gets the same guarantee `take` gives a single-use token.
+    pub async fn incr_raw(&self, key: impl Into<Vec<u8>>) -> Result<u64, AppError> {
+        self.inner.incr_raw(key.into()).await
+    }
+
     pub async fn remove(&self, key: impl Into<Vec<u8>>) -> Result<(), AppError> {
         self.inner.remove(key.into()).await
     }
@@ -317,10 +364,13 @@ impl KeyspaceHandle {
 // ---------------------------------------------------------------------------
 
 #[allow(unused_variables)]
-async fn create_backend(config: &StoreConfig) -> Result<Box<dyn StorageBackend>, AppError> {
+async fn create_backend(
+    config: &StoreConfig,
+    tuning: &FjallTuning,
+) -> Result<Box<dyn StorageBackend>, AppError> {
     #[cfg(feature = "store-fjall")]
     {
-        return fjall::FjallBackend::open(config);
+        return fjall::FjallBackend::open_with(config, tuning);
     }
 
     #[cfg(feature = "store-redis")]

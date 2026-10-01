@@ -79,13 +79,11 @@ export function ControlLink({
   lastInboundAt,
   lastOutboundTransport,
   lastOutboundAt,
-  trustTaskCapable,
 }: {
   lastInboundTransport?: ObservedTransport;
   lastInboundAt?: number;
   lastOutboundTransport?: ObservedTransport;
   lastOutboundAt?: number;
-  trustTaskCapable?: boolean;
 }) {
   return (
     <View style={styles.block}>
@@ -102,13 +100,6 @@ export function ControlLink({
         transport={lastOutboundTransport}
         at={lastOutboundAt}
       />
-      {trustTaskCapable === false && (
-        <Text style={styles.legacyNote}>
-          Legacy messaging — this server predates trust tasks, so it is
-          always pinged over DIDComm regardless of what its DID document
-          advertises.
-        </Text>
-      )}
     </View>
   );
 }
@@ -164,12 +155,5 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontFamily: fonts.regular,
     color: colors.textTertiary,
-  },
-  legacyNote: {
-    fontSize: 11,
-    fontFamily: fonts.regular,
-    color: colors.textTertiary,
-    lineHeight: 16,
-    marginTop: 2,
   },
 });

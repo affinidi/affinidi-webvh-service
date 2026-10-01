@@ -1,34 +1,35 @@
-pub mod acl;
-pub mod auth;
-pub mod didcomm;
 pub mod health;
-pub mod witness;
+pub mod trust_tasks;
 
 use axum::Router;
-use axum::routing::{delete, get, post, put};
+use axum::extract::DefaultBodyLimit;
+use axum::routing::post;
 
 use crate::server::AppState;
 
-pub fn router() -> Router<AppState> {
-    let api = Router::new()
-        // Auth
-        .route("/auth/challenge", post(auth::challenge))
-        .route("/auth/", post(auth::authenticate))
-        .route("/auth/refresh", post(auth::refresh))
-        // Witnesses (admin)
-        .route("/witnesses", post(witness::create_witness))
-        .route("/witnesses", get(witness::list_witnesses))
-        .route("/witnesses/{witness_id}", get(witness::get_witness))
-        .route("/witnesses/{witness_id}", delete(witness::delete_witness))
-        // Proof signing (any authenticated user)
-        .route("/proof/{witness_id}", post(witness::sign_proof))
-        // ACL (admin)
-        .route("/acl", get(acl::list_acl))
-        .route("/acl", post(acl::create_acl))
-        .route("/acl/{did}", put(acl::update_acl))
-        .route("/acl/{did}", delete(acl::delete_acl))
-        // DIDComm
-        .route("/didcomm", post(didcomm::handle));
+/// The largest Trust Task document the witness reads. A `witness/sign`
+/// carries a whole `did.jsonl`; this leaves room for the envelope.
+pub const TRUST_TASKS_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 
-    Router::new().nest("/api", api)
+/// The witness's HTTP surface: the HTTPS binding of its Trust Task listener,
+/// `POST /api/trust-tasks`. There is no REST management API — every operation
+/// is a Trust Task, the same on every transport. (`/api/health` is added by
+/// the caller, outside the security-header layer.)
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/trust-tasks",
+            post(trust_tasks::receive).layer(DefaultBodyLimit::max(TRUST_TASKS_BODY_LIMIT_BYTES)),
+        )
+        // `receive`'s rate limiter reads `ConnectInfo<SocketAddr>`, supplied
+        // per real connection in production by
+        // `into_make_service_with_connect_info`. There is deliberately no
+        // `MockConnectInfo` layer here: production must never silently fall
+        // back to a shared address, so a router driven directly (`.oneshot()`
+        // in tests) with no real connection behind it has to supply its own
+        // mock, or `receive`'s extractor fails the request closed with a 500.
+        // This layer only logs that case; it never masks it.
+        .layer(axum::middleware::from_fn(
+            trust_tasks::log_missing_connect_info,
+        ))
 }

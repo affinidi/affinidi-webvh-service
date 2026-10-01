@@ -212,14 +212,13 @@ pub async fn run_wizard(
             data_dir: witness_store_path,
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
-        watchers: Vec::new(),
         vta: VtaConfig {
             url: outcome.vta_url.clone(),
             did: Some(outcome.vta_did.clone()),
             context_id: None,
         },
-        watcher_sync: webvh_watcher::config::SyncConfig::default(),
         registry: did_hosting_control::config::RegistryConfig::default(),
         features,
         identity: IdentityConfig::default(),
@@ -1007,6 +1006,26 @@ async fn run_self_managed_setup(
             },
         },
     );
+    // A hosting daemon serves HTTP whatever else it speaks, so it always
+    // advertises it. Without this a daemon set up with no mediator minted a DID
+    // with no services, which no VTA could register (Keyring VTI-18).
+    let mut doc = doc;
+    did_hosting_common::did::add_webvh_hosting_service(&mut doc, &public_url);
+    // The daemon's embedded control plane always serves Trust Tasks at
+    // `<public_url>/api/trust-tasks` too. A VTA-provisioned DID gets a
+    // `TrustTaskHTTPS` entry for free from the vta-sdk template; this
+    // self-managed DID is built locally, so it needs the explicit sibling of
+    // the VTI-18 fix above (the endpoint is the Trust-Task *base*, not the
+    // request URL — see `add_trust_task_https_service`).
+    let trust_task_base = format!("{public_url}/api");
+    if did_hosting_common::did::is_https_or_loopback(&trust_task_base) {
+        did_hosting_common::did::add_trust_task_https_service(&mut doc, &trust_task_base);
+    } else {
+        eprintln!(
+            "  Public URL is not HTTPS (and not loopback) — skipping the TrustTaskHTTPS \
+             service; a VTA must not be told to POST Trust Tasks over plaintext HTTP."
+        );
+    }
     let (_scid, jsonl) = create_log_entry(&doc, &signing)
         .await
         .map_err(|e| format!("failed to create DID log entry: {e}"))?;
@@ -1038,10 +1057,9 @@ async fn run_self_managed_setup(
             data_dir: witness_store_path,
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
-        watchers: Vec::new(),
         vta: VtaConfig::default(),
-        watcher_sync: webvh_watcher::config::SyncConfig::default(),
         registry: did_hosting_control::config::RegistryConfig::default(),
         features,
         identity: IdentityConfig {
@@ -1090,9 +1108,9 @@ async fn run_self_managed_setup(
         output_path.display()
     );
     eprintln!();
-    eprintln!("    3. Open the printed enrolment URL in a browser to bind a");
-    eprintln!("       passkey to that DID. Subsequent admin login uses the");
-    eprintln!("       passkey.");
+    eprintln!("    3. Open the printed enrolment URL in a browser, type the");
+    eprintln!("       printed claim code, and bind a passkey to that DID.");
+    eprintln!("       Subsequent admin login uses the passkey.");
     eprintln!();
 
     Ok(())
@@ -1405,14 +1423,13 @@ pub async fn run_setup_offline_complete(
             data_dir: witness_store_path,
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
-        watchers: Vec::new(),
         vta: VtaConfig {
             url: result.vta_url.clone(),
             did: Some(result.vta_did.clone()),
             context_id: None,
         },
-        watcher_sync: webvh_watcher::config::SyncConfig::default(),
         registry: did_hosting_control::config::RegistryConfig::default(),
         features: state.features.clone(),
         identity: IdentityConfig::default(),
@@ -1603,29 +1620,30 @@ async fn finalize_daemon_setup(
         eprintln!("  Importing daemon DID into store at path '{did_path}'...");
         let store = Store::open(&config.store).await?;
         let dids_ks = store.keyspace(KS_DIDS)?;
-        match did_hosting_server::bootstrap::import_did_at_path(
-            &store, &dids_ks, did_path, log_entry, None,
-        )
-        .await
-        {
-            Ok(res) => {
+        use did_hosting_server::bootstrap::{OwnDidImport, import_own_did, stale_own_did_message};
+        // Fails setup rather than warning — see the recipe path, and Keyring
+        // VTI-17: a warning here let a moved daemon report success while
+        // serving its old DID.
+        let did_id = match import_own_did(&store, &dids_ks, did_path, log_entry).await? {
+            OwnDidImport::Imported(res) => {
                 eprintln!("  Daemon DID imported!");
                 eprintln!("  DID:  {}", res.did_id);
                 eprintln!("  SCID: {}", res.scid);
-                did_hosting_server::setup::update_server_did_in_config(
-                    &output_path.to_path_buf(),
-                    &res.did_id,
-                )?;
-                eprintln!("  server_did updated in {}", output_path.display());
+                res.did_id
             }
-            Err(e) => {
-                eprintln!("  Warning: failed to import daemon DID: {e}");
-                eprintln!(
-                    "  You can retry with `did-hosting-server bootstrap-did --path {did_path}` \
-                     against this config's store path."
-                );
+            OwnDidImport::AlreadyPresent { did_id } => {
+                eprintln!("  Daemon DID already present: {did_id}");
+                did_id
             }
-        }
+            OwnDidImport::HeldByAnother { existing, minted } => {
+                return Err(stale_own_did_message(did_path, existing.as_deref(), &minted).into());
+            }
+        };
+        did_hosting_server::setup::update_server_did_in_config(
+            &output_path.to_path_buf(),
+            &did_id,
+        )?;
+        eprintln!("  server_did updated in {}", output_path.display());
     }
 
     // Admin ACL bootstrap — the daemon's control plane store is shared

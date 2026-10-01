@@ -1,5 +1,3 @@
-use std::fmt;
-
 #[derive(Debug, thiserror::Error)]
 pub enum WebVHError {
     #[error("HTTP error: {0}")]
@@ -19,6 +17,15 @@ pub enum WebVHError {
 
     #[error("resolver error: {0}")]
     Resolver(String),
+
+    /// A Trust Task the peer verified and refused, with the error code it
+    /// answered.
+    #[error("trust task refused ({code}): {message}")]
+    Refused { code: String, message: String },
+
+    /// A Trust Task could not be delivered, or its reply did not verify.
+    #[error("trust task transport error: {0}")]
+    Transport(String),
 }
 
 pub type Result<T> = std::result::Result<T, WebVHError>;
@@ -34,22 +41,13 @@ impl WebVHError {
             Self::Server { .. } => "server",
             Self::DIDComm(_) => "didcomm",
             Self::Resolver(_) => "resolver",
+            Self::Refused { .. } => "refused",
+            Self::Transport(_) => "transport",
         }
     }
 }
 
-/// Server error response shape: `{"error": "..."}`.
-#[derive(Debug, serde::Deserialize)]
-pub(crate) struct ServerErrorBody {
-    pub error: String,
-}
-
-impl fmt::Display for ServerErrorBody {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.error)
-    }
-}
-
+#[cfg(feature = "server-core")]
 /// Bound and sanitize a server-supplied error string before it is surfaced to the
 /// SDK caller (CWE-209): collapse control characters/whitespace and cap length, so
 /// a verbose or input-echoing server body can't leak detail or inject control
@@ -77,8 +75,10 @@ pub(crate) fn redact_server_message(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "server-core")]
     use super::*;
 
+    #[cfg(feature = "server-core")]
     #[test]
     fn redact_server_message_bounds_and_sanitizes() {
         assert_eq!(redact_server_message("bad request"), "bad request");

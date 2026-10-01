@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,7 +14,6 @@ use did_hosting_common::server::didcomm_profile::{
 };
 use did_hosting_common::server::identity::{self, ServiceIdentity};
 use did_hosting_common::server::init;
-use did_hosting_common::server::passkey::PasskeyState;
 use did_hosting_common::server::store::{
     KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
 };
@@ -35,26 +33,9 @@ use tokio::sync::{oneshot, watch};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, debug, error, info, warn};
 
-/// An in-flight wallet consent awaiting the holder's authcrypted, signed
-/// `task-consent/decision/0.1`. Keyed by `challenge` in
-/// [`AppState::pending_confirms`]. The REST trigger endpoint parks a
-/// `oneshot::Receiver` while the inbound DIDComm decision handler fires
-/// the approve/deny on `tx`.
-pub struct PendingConfirm {
-    /// The holder DID the `task-consent/request/0.1` was addressed to.
-    /// The inbound decision is only honoured if its authcrypt sender —
-    /// and the DID its proof verifies against — equals this.
-    pub holder_did: String,
-    /// The salted `payloadDigest` sent in the request. The decision must
-    /// echo it verbatim; a mismatch means the wallet answered a
-    /// different question than the one this entry asked.
-    pub expected_digest: String,
-    /// Resolves the parked REST request with the user's decision.
-    pub tx: tokio::sync::oneshot::Sender<bool>,
-}
-
-/// Map of in-flight wallet consents, keyed by `challenge`.
-pub type PendingConfirms = Arc<tokio::sync::Mutex<HashMap<String, PendingConfirm>>>;
+/// A cache-eviction hook: takes the store key whose cached content is now
+/// stale. See `AppState::cache_invalidate`.
+pub type CacheInvalidateFn = dyn Fn(&str) + Send + Sync;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -143,30 +124,48 @@ pub struct AppState {
     /// through one queue, closing the race the last-authority guard
     /// would otherwise have.
     pub acl_locks: did_hosting_common::server::path_locks::PathLocks,
-    /// Bounded counter for pending DIDComm authentication challenges.
-    /// Replaces an O(N) prefix scan in `routes::auth::challenge` with
-    /// O(1) per-DID and global counters; closes the unauthenticated
+    /// Bounded set of live authentication challenges, with per-DID and
+    /// global caps. Replaces an O(N) prefix scan in
+    /// `routes::auth::challenge`; closes the unauthenticated
     /// challenge-endpoint storage-exhaustion + CPU-amplification
-    /// surface (review SM3).
+    /// surface (review SM3). Members expire with `challenge_ttl`, so a
+    /// slot is never held past the life of its challenge.
     pub pending_challenges: Arc<crate::pending_challenges::PendingChallengeTracker>,
     /// Per-IP rate limiter for the unauthenticated challenge endpoint.
     /// Network-layer defence-in-depth that complements the per-DID +
     /// global counters above. See `crate::rate_limit` for the
     /// trusted-proxy / X-Forwarded-For policy.
     pub ip_rate_limiter: Arc<crate::rate_limit::IpRateLimiter>,
-    /// In-flight RP→wallet consent requests, keyed by `challenge`.
-    /// The `POST /task-consent/request` endpoint inserts a pending entry
-    /// and parks on a `oneshot`; the inbound `task-consent/decision/0.1`
-    /// DIDComm handler looks the entry up by challenge, verifies the
-    /// decision's proof and that the authcrypt sender matches the
-    /// addressed holder DID, and resolves the wait.
-    pub pending_confirms: PendingConfirms,
+    /// Per-source limiter for passkey invite redemption
+    /// (`auth/passkey/enroll/redeem/start`). See
+    /// [`crate::rate_limit::SourceRateLimiter`].
+    pub redeem_rate_limiter: Arc<crate::rate_limit::SourceRateLimiter>,
+    /// Per-address budget for large documents (over the framework's default
+    /// 64 KiB) a claimed — not yet verified — known issuer is granted a
+    /// raised size limit for. See
+    /// [`did_hosting_common::server::trust_tasks::size`].
+    pub large_document_budget:
+        Arc<did_hosting_common::server::trust_tasks::size::LargeDocumentBudget>,
     /// Wakes the [`crate::outbox`] worker when a new entry lands in
     /// the durable outbound queue. The route handlers call
     /// `outbox::enqueue_and_notify`, which writes to fjall + fires
     /// this notify so delivery happens promptly in the happy path.
     /// On notify-miss the worker still runs on its 30 s tick.
     pub outbox_notify: Arc<tokio::sync::Notify>,
+    /// Evicts a resolved-content cache entry (keyed by
+    /// `did_ops::content_log_key(mnemonic)`) when this process also serves
+    /// resolution from the same store — the unified `did-hosting-daemon`,
+    /// which wires this to its embedded server's `did_cache`.
+    ///
+    /// `None` for a standalone control plane: it holds no content cache of
+    /// its own, and a registered edge's cache is kept in step independently,
+    /// by `webvh/sync/*` invalidating on receipt
+    /// (`did-hosting-server::control_register`). Without this hook, a direct
+    /// mutation here (register, publish, disable, rollback, delete) would
+    /// leave the daemon's embedded server serving a stale or since-deleted
+    /// cache entry for up to its TTL — there is no sync round-trip within a
+    /// single process to invalidate it the way a standalone edge does.
+    pub cache_invalidate: Option<Arc<CacheInvalidateFn>>,
 }
 
 impl AppState {
@@ -198,31 +197,26 @@ impl AuthState for AppState {
     fn sessions_ks(&self) -> &KeyspaceHandle {
         &self.sessions_ks
     }
-}
 
-impl PasskeyState for AppState {
-    fn webauthn(&self) -> Option<&Arc<Webauthn>> {
-        self.webauthn.as_ref()
-    }
-
-    fn acl_ks(&self) -> &KeyspaceHandle {
-        &self.acl_ks
-    }
-
-    fn access_token_expiry(&self) -> u64 {
-        self.config.auth.access_token_expiry
-    }
-
-    fn refresh_token_expiry(&self) -> u64 {
-        self.config.auth.refresh_token_expiry
-    }
-
-    fn public_url(&self) -> Option<&str> {
-        self.config.public_url.as_deref()
-    }
-
-    fn enrollment_ttl(&self) -> u64 {
-        self.config.auth.passkey_enrollment_ttl
+    /// Whether `did` holds at least one step-up-only passkey credential —
+    /// backs the extractor's TOCTOU close (#190): an `aal2` session whose
+    /// `amr` lacks `"passkey"` is only ever downgraded back to `aal1` when
+    /// this returns `true`, so the store read only happens on that rare
+    /// path, never on every request.
+    fn has_step_up_passkey(&self, did: &str) -> impl std::future::Future<Output = bool> + Send {
+        let store = self.store.clone();
+        let did = did.to_string();
+        async move {
+            let Ok(ks) = store.keyspace(did_hosting_common::server::store::KS_PASSKEY_STEP_UP)
+            else {
+                return false;
+            };
+            did_hosting_common::server::passkey::store::get_passkey_user_by_did(&ks, &did)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|user| !user.credentials.is_empty())
+        }
     }
 }
 
@@ -263,6 +257,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         &store,
     )
     .await;
+    // No unsigned mode: a control plane that cannot sign refuses to start.
+    crate::signing::require_signing_identity(identity.as_deref(), config.server_did.as_deref())?;
     let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
     let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
 
@@ -300,22 +296,15 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let has_auth = jwt_keys.is_some();
 
     let stats_dids_ks = dids_ks.clone();
-    // Trust Tasks verifier — share the configured DIDCacheClient so
-    // `did:web` / `did:webvh` verificationMethod lookups hit the same
-    // cache the DIDComm path already populates. We clone the client
-    // (DIDCacheClient is cheap to clone — internal Arcs) rather than
-    // sharing one Arc, because did_resolver remains `Option<DIDCacheClient>`
-    // for callers that prefer the un-Arc'd form.
-    let trust_tasks_verifier = did_resolver.clone().map(|client| {
-        let resolver = Arc::new(trust_tasks_proof::affinidi::CachedDidResolver::new(
-            Arc::new(client),
-        ));
-        Arc::new(
-            did_hosting_common::server::trust_tasks::TransportBoundVerifier::with_resolver(
-                resolver,
-            ),
-        )
-    });
+    // Trust Tasks verifier — over the configured DID cache, so `did:web` /
+    // `did:webvh` verificationMethod lookups hit the same cache the DIDComm
+    // path already populates. Built by the one shared constructor (the daemon
+    // builds its control-plane verifier with it too).
+    let trust_tasks_verifier =
+        did_hosting_common::server::trust_tasks::build_verifier(did_resolver.as_ref());
+
+    let pending_challenges =
+        crate::pending_challenges::PendingChallengeTracker::for_auth_config(&config.auth);
 
     let state = AppState {
         store: store.clone(),
@@ -336,6 +325,11 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         // and harvest the forwarded JWT.
         http_client: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            // Fail fast: this client backs the Admin reverse proxy, so a slow or
+            // hung (even allow-listed) backend must not pin the handler task and
+            // its connection open indefinitely. Matches the edge/daemon clients.
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("reqwest client construction must succeed"),
         didcomm_service: Arc::new(std::sync::OnceLock::new()),
@@ -387,11 +381,23 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         replay_cache: Arc::new(crate::replay::ReplayCache::new()),
         path_locks: crate::path_locks::PathLocks::new(),
         acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
-        pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
+        pending_challenges: Arc::new(pending_challenges),
         ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
-        pending_confirms: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        redeem_rate_limiter: Arc::new(crate::rate_limit::SourceRateLimiter::new()),
+        large_document_budget: Arc::new(
+            did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
+        ),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
+        // Standalone control plane: no content cache of its own to
+        // invalidate. See the field doc.
+        cache_invalidate: None,
     };
+
+    // Reload challenges issued before a restart, so the caps hold across it.
+    state
+        .pending_challenges
+        .seed_from_sessions_or_warn(&state.sessions_ks)
+        .await;
 
     backfill_service_badges(&state.store).await;
 
@@ -520,6 +526,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let health_control_did = state.config.server_did.clone();
     let health_interval_secs = state.config.registry.health_check_interval.max(10);
     let health_resolver = state.did_resolver.clone();
+    let health_identity = state.identity.clone();
     // Control's own configured mediator, used as the send fallback when a
     // target server's document advertises no transport.
     let health_fallback =
@@ -540,6 +547,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
                         health_interval_secs,
                         &health_fallback,
                         health_resolver.as_ref(),
+                        health_identity.as_deref(),
                     ).await {
                         warn!("health check error: {e}");
                     }
@@ -712,7 +720,7 @@ pub async fn start_didcomm_service(
         _ => Protocols::DIDCOMM_ONLY,
     };
 
-    let listener = ListenerConfig {
+    let mut listener = ListenerConfig {
         id: "control".into(),
         profile,
         restart_policy: RestartPolicy::Always {
@@ -735,6 +743,19 @@ pub async fn start_didcomm_service(
         acl_mode: Some(AccessListModeType::ExplicitDeny),
         ..Default::default()
     };
+    // Persist the control plane's TSP relationships (Rev 3 §7.2.2) across
+    // restarts, so it keeps its half of each edge relationship and does not need
+    // to re-invite: an edge re-invites on its own connect, and this side answers
+    // (`WebvhTspHandler::handle_control`). Without persistence a control restart
+    // would drop every edge until each re-handshakes. Only meaningful when TSP is
+    // on. In daemon mode this is the only listener, so it covers the daemon too.
+    if tsp_enabled {
+        listener.relationship_store = Some(
+            did_hosting_common::server::tsp_relationship_store::build_relationship_store(
+                &state.store,
+            )?,
+        );
+    }
 
     let router = messaging::build_control_router(state.clone())
         .map_err(|e| AppError::Internal(format!("failed to build DIDComm router: {e}")))?;
@@ -848,6 +869,8 @@ pub async fn seed_registry(state: &AppState) {
             last_inbound_at: None,
             last_outbound_transport: None,
             last_outbound_at: None,
+            last_ack_at: None,
+            last_reconcile_at: None,
         };
 
         if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {
@@ -1076,6 +1099,9 @@ pub async fn flush_stats_to_store(
 /// Ping one trust-task-capable instance, letting its DID document choose the
 /// transport. Failures are logged, never fatal — an unreachable server simply
 /// stops ponging and ages into `Unreachable` on the next sweep.
+// One over clippy's 7-arg threshold: the signer joined an already-flat
+// parameter list, and a struct would only move the same values around.
+#[allow(clippy::too_many_arguments)]
 async fn send_health_ping_trust_task(
     svc: &DIDCommService,
     registry_ks: &KeyspaceHandle,
@@ -1084,18 +1110,23 @@ async fn send_health_ping_trust_task(
     inst: &registry::ServiceInstance,
     fallback: &did_hosting_common::server::didcomm_profile::TransportFallback,
     did_resolver: Option<&DIDCacheClient>,
+    signer: &affinidi_tdk::secrets_resolver::secrets::Secret,
 ) {
-    use did_hosting_common::server::trust_tasks::send::{build_request, send_trust_task};
+    use did_hosting_common::server::trust_tasks::send::{build_signed_request, send_trust_task};
 
-    let doc = match build_request(
+    // Signed: an edge answers only a ping its control plane signed.
+    let doc = match build_signed_request(
         did_hosting_common::didcomm_types::MSG_HEALTH_PING,
         control_did,
         server_did,
         serde_json::json!({}),
-    ) {
+        signer,
+    )
+    .await
+    {
         Ok(d) => d,
         Err(e) => {
-            warn!(error = %e, "health ping: MSG_HEALTH_PING is not a valid Type URI");
+            warn!(error = %e, "health ping: could not build the signed ping");
             return;
         }
     };
@@ -1139,6 +1170,11 @@ async fn send_health_ping_trust_task(
 
 /// Send health pings to all registered instances and evaluate staleness-based
 /// status from the last received pong timestamp.
+///
+/// `identity` is the control plane's own identity, read on every sweep so a
+/// rotation is picked up; without it no ping can be signed and none is sent —
+/// instances then age into `Unreachable`, which is the honest status for a
+/// control plane that cannot prove who it is.
 pub async fn run_health_checks(
     registry_ks: &KeyspaceHandle,
     didcomm: &std::sync::OnceLock<DIDCommService>,
@@ -1146,69 +1182,46 @@ pub async fn run_health_checks(
     health_interval_secs: u64,
     fallback: &did_hosting_common::server::didcomm_profile::TransportFallback,
     did_resolver: Option<&DIDCacheClient>,
+    identity: Option<&did_hosting_common::server::identity::ServiceIdentity>,
 ) -> Result<(), AppError> {
     let instances = registry::list_instances(registry_ks).await?;
     let now = crate::auth::session::now_epoch();
 
     // Send health pings (fire-and-forget — the pong handler updates status).
-    //
-    // Two framings, chosen per instance:
-    //
-    // - `trust_task_capable` servers get a `.../server/health/0.1` trust task,
-    //   and `send_trust_task` picks TSP or DIDComm from the *server's own DID
-    //   document*. This is the only way a TSP-only server is ever pinged.
-    // - Everything else gets the legacy `MSG_HEALTH_PING` DIDComm message. An
-    //   older server has no trust-task dispatcher, so a trust task would go
-    //   unrouted and it would decay to Unreachable on a control-plane-only
-    //   upgrade.
-    if let (Some(svc), Some(ctrl_did)) = (didcomm.get(), control_did) {
+    // Every ping is a signed `.../server/health/0.1` trust task, and
+    // `send_trust_task` picks TSP or DIDComm from the *server's own DID
+    // document*.
+    let signer = match (identity, control_did) {
+        (Some(identity), Some(ctrl_did)) => {
+            match did_hosting_common::server::trust_tasks::identity_signing_secret(
+                identity, ctrl_did,
+            ) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!(error = %e, "health pings skipped: cannot sign");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    if let (Some(svc), Some(ctrl_did), Some(signer)) = (didcomm.get(), control_did, signer.as_ref())
+    {
         for inst in &instances {
             let Some(server_did) = inst.did() else {
                 continue;
             };
-
-            if inst.trust_task_capable {
-                send_health_ping_trust_task(
-                    svc,
-                    registry_ks,
-                    ctrl_did,
-                    server_did,
-                    inst,
-                    fallback,
-                    did_resolver,
-                )
-                .await;
-                continue;
-            }
-
-            let msg = affinidi_messaging_didcomm::Message::build(
-                uuid::Uuid::new_v4().to_string(),
-                did_hosting_common::didcomm_types::MSG_HEALTH_PING.to_string(),
-                serde_json::json!({}),
+            send_health_ping_trust_task(
+                svc,
+                registry_ks,
+                ctrl_did,
+                server_did,
+                inst,
+                fallback,
+                did_resolver,
+                signer,
             )
-            .from(ctrl_did.to_string())
-            .to(server_did.to_string())
-            .created_time(now)
-            .finalize();
-
-            match svc.send_message("control", msg, server_did).await {
-                Ok(()) => {
-                    // A legacy ping is DIDComm by construction.
-                    registry::record_outbound_transport(
-                        registry_ks,
-                        &inst.instance_id,
-                        did_hosting_common::server::didcomm_profile::ObservedTransport::Didcomm,
-                        now,
-                    )
-                    .await;
-                }
-                Err(e) => debug!(
-                    instance_id = %inst.instance_id,
-                    server_did,
-                    error = %e,
-                    "failed to send legacy health ping"
-                ),
-            }
+            .await;
         }
     }
 

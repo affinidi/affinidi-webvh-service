@@ -82,6 +82,100 @@ pub struct DidDocumentOptions<'a> {
     pub tsp_endpoint: Option<&'a str>,
 }
 
+/// Advertise a `WebVHHosting` service at `uri` on a document built by
+/// [`build_did_document`], after any transport services it already has.
+///
+/// The shape is exactly what VTI's `did-host-http` template emits, and what a
+/// VTA's `servers add` reads: an object endpoint carrying `uri`, not a bare
+/// string.
+///
+/// Keyring VTI-18. A self-managed hosting daemon minted without a mediator
+/// had **no services at all** — the transport services both need one — so it
+/// served DIDs perfectly well and no VTA could register it: `servers add`
+/// requires a `TSPTransport`, `DIDCommMessaging` or `WebVHHosting` entry. A
+/// hosting daemon serves HTTP whatever else it speaks, so this entry is simply
+/// true of it and needs nothing the operator has not already configured.
+///
+/// Appended rather than folded into [`DidDocumentOptions`]: that struct is
+/// public and built by literal, so a new field would break every caller.
+/// Appending also keeps the canonical order — TSP, then DIDComm, then HTTP.
+pub fn add_webvh_hosting_service(doc: &mut serde_json::Value, uri: &str) {
+    let did_id = doc["id"].as_str().unwrap_or_default().to_string();
+    let entry = json!({
+        "id": format!("{did_id}#webvh-hosting"),
+        "type": "WebVHHosting",
+        "serviceEndpoint": { "uri": uri },
+    });
+    match doc.get_mut("service").and_then(|s| s.as_array_mut()) {
+        Some(services) => services.push(entry),
+        None => doc["service"] = json!([entry]),
+    }
+}
+
+/// Advertise a `TrustTaskHTTPS` service at `base_uri` on a document built by
+/// [`build_did_document`] (typically alongside [`add_webvh_hosting_service`]).
+///
+/// `base_uri` is the Trust-Task **base**, not the request URL — HTTPS binding
+/// 0.2 §6 makes the advertised endpoint the base and the caller composes
+/// `<base>/trust-tasks`. The control plane nests its whole API under `/api`
+/// off the origin root (`did-hosting-control`'s `routes/mod.rs`), so
+/// `base_uri` is `{public_url}/api`; this matches every `vta-sdk`
+/// `did-host-http*` template exactly (`vta-sdk`'s
+/// `TRUST_TASK_HTTPS_SERVICE_TYPE`).
+///
+/// `WebVHHosting` is not this endpoint — it says where DID *documents* are
+/// served, a different claim — so without this entry a VTA either can't find
+/// the Trust-Task endpoint, or falls back to posting Trust Tasks at the
+/// hosting origin, which never agreed to accept them. A VTA-provisioned DID
+/// gets this entry for free from the `vta-sdk` template; a **self-managed**
+/// daemon builds its own document locally instead, so it needs the same
+/// explicit fix `add_webvh_hosting_service` got for `WebVHHosting` (Keyring
+/// VTI-18 sibling).
+///
+/// Callers should gate this on [`is_https_or_loopback`] first — a VTA must
+/// never be told to POST Trust Tasks over plaintext HTTP to a real host.
+pub fn add_trust_task_https_service(doc: &mut serde_json::Value, base_uri: &str) {
+    let did_id = doc["id"].as_str().unwrap_or_default().to_string();
+    let entry = json!({
+        "id": format!("{did_id}#trust-tasks"),
+        "type": "TrustTaskHTTPS",
+        "serviceEndpoint": base_uri,
+    });
+    match doc.get_mut("service").and_then(|s| s.as_array_mut()) {
+        Some(services) => services.push(entry),
+        None => doc["service"] = json!([entry]),
+    }
+}
+
+/// Whether `uri` is safe to advertise as a `TrustTaskHTTPS` endpoint.
+///
+/// `https://` always qualifies. Plain `http://` qualifies only for loopback
+/// (`localhost`, `127.0.0.1`, `[::1]`) — acceptable for a local dev daemon,
+/// never for a real deployment a VTA might actually route Trust Tasks to.
+///
+/// The URL is parsed and its host compared exactly, never by text prefix:
+/// `http://localhost.evil.example` and `http://127.0.0.1.evil.example` are
+/// not loopback, and neither is a URL carrying userinfo. `127.0.0.0/8`
+/// counts, as every address in it is loopback.
+pub fn is_https_or_loopback(uri: &str) -> bool {
+    let Ok(url) = url::Url::parse(uri) else {
+        return false;
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    match url.scheme() {
+        "https" => url.host().is_some(),
+        "http" => match url.host() {
+            Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
 /// Build a standard DID document with `{SCID}` placeholders.
 ///
 /// The returned JSON value uses the did:webvh identifier format with an
@@ -197,12 +291,15 @@ pub fn build_did_document(
 /// HTTP DID-log hosting endpoint (`did-host-http*` templates).
 pub const SERVICE_TYPE_WEBVH_HOSTING: &str = "WebVHHosting";
 /// Legacy read-only alias for [`SERVICE_TYPE_WEBVH_HOSTING`]. Never written;
-/// accepted on read per `docs/did-hosting-client-crate-spec.md` §5.
+/// accepted on read.
 pub const SERVICE_TYPE_WEBVH_HOSTING_LEGACY: &str = "WebVHHostingService";
 /// Trust Spanning Protocol transport (`#tsp`).
 pub const SERVICE_TYPE_TSP: &str = "TSPTransport";
 /// DIDComm v2 transport (`#vta-didcomm`).
 pub const SERVICE_TYPE_DIDCOMM: &str = "DIDCommMessaging";
+/// Trust-Task HTTPS binding endpoint (`#trust-tasks`), HTTPS binding 0.2 §6.
+/// Kept in sync with `vta-sdk`'s `TRUST_TASK_HTTPS_SERVICE_TYPE`.
+pub const SERVICE_TYPE_TRUST_TASK_HTTPS: &str = "TrustTaskHTTPS";
 
 /// True for the services the did:webvh spec *implies* rather than the
 /// operator declaring.
@@ -343,6 +440,109 @@ pub async fn create_log_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keyring VTI-18: a self-managed daemon with no mediator used to mint a
+    /// document with no `service` member at all. The hosting entry alone must
+    /// be enough to create one.
+    #[test]
+    fn hosting_is_advertised_on_a_document_with_no_services() {
+        let mut doc =
+            build_did_document("example.com", ".well-known", "z6MkKey", &Default::default());
+        assert!(
+            doc.get("service").is_none(),
+            "precondition: no transport, no services"
+        );
+
+        add_webvh_hosting_service(&mut doc, "https://example.com");
+
+        let services = doc["service"]
+            .as_array()
+            .expect("a service array now exists");
+        assert_eq!(services.len(), 1);
+        // Exactly the shape VTI's `did-host-http` template emits and a VTA's
+        // `servers add` reads: an object endpoint carrying `uri`.
+        assert_eq!(services[0]["type"], "WebVHHosting");
+        assert_eq!(
+            services[0]["serviceEndpoint"],
+            json!({ "uri": "https://example.com" })
+        );
+        assert_eq!(
+            services[0]["id"],
+            json!(format!("{}#webvh-hosting", doc["id"].as_str().unwrap()))
+        );
+    }
+
+    /// With transports present it goes last, keeping the canonical order —
+    /// TSP, then DIDComm, then HTTP — rather than displacing either.
+    #[test]
+    fn hosting_goes_after_the_transport_services() {
+        let mut doc = build_did_document(
+            "example.com",
+            ".well-known",
+            "z6MkKey",
+            &DidDocumentOptions {
+                key_agreement_multibase: Some("z6LSKa"),
+                mediator_endpoint: Some("did:web:mediator.example"),
+                tsp_endpoint: Some("did:web:mediator.example"),
+            },
+        );
+        add_webvh_hosting_service(&mut doc, "https://example.com");
+
+        let types: Vec<&str> = doc["service"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, ["TSPTransport", "DIDCommMessaging", "WebVHHosting"]);
+    }
+
+    /// The `TrustTaskHTTPS` sibling of the VTI-18 fix above: a self-managed
+    /// daemon builds its document locally rather than through a `vta-sdk`
+    /// template, so it needs the same explicit entry the template would
+    /// otherwise have supplied for free.
+    #[test]
+    fn trust_task_https_is_advertised_with_the_api_base_as_endpoint() {
+        let mut doc =
+            build_did_document("example.com", ".well-known", "z6MkKey", &Default::default());
+        add_webvh_hosting_service(&mut doc, "https://example.com");
+        add_trust_task_https_service(&mut doc, "https://example.com/api");
+
+        let services = doc["service"].as_array().expect("service array");
+        assert_eq!(services.len(), 2);
+        assert_eq!(services[1]["type"], "TrustTaskHTTPS");
+        // A bare string endpoint (the Trust-Task base) — unlike `WebVHHosting`'s
+        // `{ "uri": ... }` object shape.
+        assert_eq!(services[1]["serviceEndpoint"], "https://example.com/api");
+        assert_eq!(
+            services[1]["id"],
+            json!(format!("{}#trust-tasks", doc["id"].as_str().unwrap()))
+        );
+    }
+
+    #[test]
+    fn https_and_loopback_http_qualify_for_trust_task_https() {
+        assert!(is_https_or_loopback("https://example.com/api"));
+        assert!(is_https_or_loopback("http://localhost:8534/api"));
+        assert!(is_https_or_loopback("http://127.0.0.1:8534/api"));
+        assert!(is_https_or_loopback("http://[::1]:8534/api"));
+    }
+
+    #[test]
+    fn plaintext_http_to_a_real_host_does_not_qualify() {
+        assert!(!is_https_or_loopback("http://example.com/api"));
+        assert!(!is_https_or_loopback("http://webvh.example.com/api"));
+        // Lookalikes that only start with a loopback name are not loopback.
+        assert!(!is_https_or_loopback("http://localhost.evil.example/api"));
+        assert!(!is_https_or_loopback("http://127.0.0.1.evil.example/api"));
+        assert!(!is_https_or_loopback("http://localhostevil.example/api"));
+        assert!(!is_https_or_loopback("http://user@localhost/api"));
+        assert!(!is_https_or_loopback("http://evil.example@127.0.0.1/api"));
+        assert!(!is_https_or_loopback("ftp://localhost/api"));
+        assert!(!is_https_or_loopback("not a url"));
+        assert!(is_https_or_loopback("http://127.0.0.2:8534/api"));
+        assert!(is_https_or_loopback("HTTP://LOCALHOST:8534/api"));
+    }
 
     #[test]
     fn encode_host_with_port() {

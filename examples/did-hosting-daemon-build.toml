@@ -76,8 +76,11 @@ enable_witness = true
 enable_watcher = false
 
 [secrets]
-# Backend: "keyring" | "aws" | "gcp" | "azure" | "plaintext"
-#   plaintext writes private keys into config.toml — dev only.
+# Backend: "keyring" | "aws" | "gcp" | "azure" | "vault" | "k8s" | "plaintext"
+#   keyring is refused on a host without an OS credential store (headless
+#   Linux with no Secret Service): pick vault, k8s or a cloud backend there.
+#   plaintext writes private keys to a clear-text file beside config.toml —
+#   tests only.
 #   Requires confirm_plaintext = true as a defence against CI recipes
 #   accidentally being used in production.
 backend = "keyring"

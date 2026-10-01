@@ -67,25 +67,41 @@ enum Command {
     },
     /// Run health check diagnostics
     Health,
-    /// Add an access control entry
-    AddAcl {
-        /// DID to grant access to
-        #[arg(long)]
-        did: String,
-        /// Role: admin or owner
-        #[arg(long, default_value = "owner")]
-        role: String,
-        /// Per-account max total DID document size in bytes (overrides global default)
-        #[arg(long)]
-        max_total_size: Option<u64>,
-        /// Per-account max number of DIDs (overrides global default)
-        #[arg(long)]
-        max_did_count: Option<u64>,
-    },
-    /// List all access control entries
-    ListAcl,
     /// List the service's own identity generations (key material still honoured).
     IdentityList,
+    /// List this service's established TSP relationships (offline; stop the
+    /// service first).
+    ///
+    /// Each endpoint keeps its own half of every relationship; the mediator holds
+    /// none, so resetting a peer pairing means clearing both ends.
+    TspRelationshipList,
+    /// Reset our half of a TSP relationship to `None`, so the next send to the
+    /// peer re-invites (offline). Keeps the cached peer capability.
+    TspRelationshipReset {
+        /// The peer's DID (its TSP VID).
+        #[arg(long)]
+        peer: String,
+        /// This service's VID for the pair. Needed only for a half-formed
+        /// relationship, which `tsp-relationship-list` cannot show.
+        #[arg(long)]
+        our: Option<String>,
+    },
+    /// Delete TSP relationship records outright (offline).
+    TspRelationshipDelete {
+        /// The peer's DID (its TSP VID).
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        peer: Option<String>,
+        /// This service's VID for the pair. Needed only for a half-formed
+        /// relationship, which `tsp-relationship-list` cannot show.
+        #[arg(long, requires = "peer", conflicts_with = "all")]
+        our: Option<String>,
+        /// Delete every record, established or half-formed.
+        #[arg(long)]
+        all: bool,
+        /// Confirm `--all`. Without it, only reports what would be deleted.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Rotate the service's own key-agreement key.
     ///
     /// Publishes a new DID log entry installing a fresh key-agreement key on a
@@ -131,12 +147,6 @@ enum Command {
         #[arg(long)]
         generation: u64,
     },
-    /// Remove an access control entry
-    RemoveAcl {
-        /// DID to remove from the ACL
-        #[arg(long)]
-        did: String,
-    },
     /// Export server data to a backup file
     Backup {
         /// Output file path (use "-" for stdout)
@@ -180,11 +190,17 @@ enum Command {
         #[arg(long)]
         did_witness: Option<PathBuf>,
         /// Witness service URL for requesting a proof (auto-bootstrap only)
-        #[arg(long)]
+        #[arg(long, requires = "witness_did")]
         witness_url: Option<String>,
         /// Witness ID to use when requesting a proof (auto-bootstrap only)
         #[arg(long)]
         witness_id: Option<String>,
+        /// The witness server's own DID (its `server_did`), required with
+        /// --witness-url. The sign-in is addressed to it, and the witness
+        /// server refuses one addressed elsewhere. This is not --witness-id,
+        /// which names one of the witnesses that server hosts.
+        #[arg(long)]
+        witness_did: Option<String>,
     },
     /// Recover a soft-deleted DID
     RecoverDid {
@@ -253,10 +269,6 @@ enum Command {
         /// verified against it; omit to fall back to PinnedOnly trust.
         #[arg(long)]
         producer_pubkey: Option<String>,
-        /// Optional Ed25519 JWT signing key (multibase-encoded,
-        /// auto-generated if omitted).
-        #[arg(long)]
-        jwt_key: Option<String>,
         /// Overwrite existing secrets without prompting.
         #[arg(long)]
         force: bool,
@@ -272,9 +284,6 @@ enum Command {
         /// X25519 key agreement key (multibase-encoded, required with --signing-key)
         #[arg(long)]
         ka_key: Option<String>,
-        /// Ed25519 JWT signing key (multibase-encoded, auto-generated if omitted)
-        #[arg(long)]
-        jwt_key: Option<String>,
         /// VTA credential bundle (base64url-encoded, optional)
         #[arg(long)]
         vta_credential: Option<String>,
@@ -443,24 +452,6 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::AddAcl {
-            did,
-            role,
-            max_total_size,
-            max_did_count,
-        }) => {
-            if let Err(e) = run_add_acl(cli.config, did, role, max_total_size, max_did_count).await
-            {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::ListAcl) => {
-            if let Err(e) = run_list_acl(cli.config).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
         Some(Command::IdentityRotateKeys {
             keys,
             ka_key,
@@ -474,6 +465,29 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Command::TspRelationshipList) => {
+            if let Err(e) = run_tsp_relationship_list(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::TspRelationshipReset { peer, our }) => {
+            if let Err(e) = run_tsp_relationship_reset(cli.config, peer, our).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::TspRelationshipDelete {
+            peer,
+            our,
+            all,
+            yes,
+        }) => {
+            if let Err(e) = run_tsp_relationship_delete(cli.config, peer, our, all, yes).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
         Some(Command::IdentityList) => {
             if let Err(e) = run_identity_list(cli.config).await {
                 eprintln!("Error: {e}");
@@ -482,12 +496,6 @@ async fn main() {
         }
         Some(Command::IdentityRetireNow { generation }) => {
             if let Err(e) = run_identity_retire_now(cli.config, generation).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::RemoveAcl { did }) => {
-            if let Err(e) = run_remove_acl(cli.config, did).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -530,7 +538,6 @@ async fn main() {
             vta_bundle,
             signing_key,
             ka_key,
-            jwt_key,
             vta_credential,
             force,
         }) => {
@@ -539,7 +546,6 @@ async fn main() {
                 vta_bundle,
                 signing_key,
                 ka_key,
-                jwt_key,
                 vta_credential,
                 force,
             )
@@ -564,7 +570,6 @@ async fn main() {
             expect_digest,
             seed,
             producer_pubkey,
-            jwt_key,
             force,
         }) => {
             if let Err(e) = run_import_sealed(
@@ -573,7 +578,6 @@ async fn main() {
                 expect_digest,
                 seed,
                 producer_pubkey,
-                jwt_key,
                 force,
             )
             .await
@@ -674,6 +678,7 @@ async fn main() {
             did_witness,
             witness_url,
             witness_id,
+            witness_did,
         }) => {
             if let Err(e) = run_bootstrap_did(
                 cli.config,
@@ -682,6 +687,7 @@ async fn main() {
                 did_witness,
                 witness_url,
                 witness_id,
+                witness_did,
             )
             .await
             {
@@ -709,38 +715,6 @@ async fn main() {
         }
         None => run_server(cli.config).await,
     }
-}
-
-async fn run_add_acl(
-    config_path: Option<PathBuf>,
-    did: String,
-    role: String,
-    max_total_size: Option<u64>,
-    max_did_count: Option<u64>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = AppConfig::load(config_path)?;
-    did_hosting_common::server::cli_acl::run_add_acl(
-        &config.store,
-        did,
-        role,
-        None,
-        max_total_size,
-        max_did_count,
-    )
-    .await
-}
-
-async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
-    let config = AppConfig::load(config_path)?;
-    did_hosting_common::server::cli_acl::run_list_acl(&config.store).await
-}
-
-async fn run_remove_acl(
-    config_path: Option<PathBuf>,
-    did: String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = AppConfig::load(config_path)?;
-    did_hosting_common::server::cli_acl::run_remove_acl(&config.store, did).await
 }
 
 async fn run_load_did(
@@ -914,6 +888,7 @@ async fn run_bootstrap_did(
     did_witness: Option<PathBuf>,
     witness_url: Option<String>,
     witness_id: Option<String>,
+    witness_did: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use affinidi_tdk::secrets_resolver::secrets::Secret;
 
@@ -1002,51 +977,25 @@ async fn run_bootstrap_did(
         .await?;
 
         // Optional: request witness proof
-        if let (Some(w_url), Some(w_id)) = (witness_url, witness_id) {
-            use did_hosting_common::WitnessClient;
-
+        if let (Some(w_url), Some(w_id), Some(w_did)) = (witness_url, witness_id, witness_did) {
             eprintln!("  Requesting witness proof...");
-            eprintln!("  NOTE: the server must be running (on another process) for the");
-            eprintln!("  witness to resolve the DID during authentication.");
-            eprintln!();
-
-            let mut witness_client = WitnessClient::new(&w_url);
-            if let Err(e) = witness_client
-                .authenticate(&result.did_id, &signing_secret)
+            eprintln!("  NOTE: the DID must already be served (by a running server) for the");
+            eprintln!("  witness to resolve it and verify the request.");
+            match bootstrap::request_witness_proof(&w_url, &w_did, &w_id, &result, &signing_secret)
                 .await
             {
-                eprintln!("  Warning: witness authentication failed: {e}");
-                eprintln!("  The DID was created but has no witness proof.");
-            } else {
-                let version_id = result
-                    .jsonl
-                    .lines()
-                    .last()
-                    .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                    .and_then(|v| {
-                        v.get("versionId")
-                            .and_then(|id| id.as_str())
-                            .map(String::from)
-                    });
-
-                if let Some(vid) = version_id {
-                    match witness_client.request_proof(&w_id, &vid).await {
-                        Ok(proof) => {
-                            let proof_json = serde_json::to_string(&proof)?;
-                            dids_ks
-                                .insert_raw(
-                                    did_hosting_server::did_ops::content_witness_key(&mnemonic),
-                                    proof_json.into_bytes(),
-                                )
-                                .await?;
-                            eprintln!("  Witness proof stored.");
-                        }
-                        Err(e) => {
-                            eprintln!("  Warning: witness proof request failed: {e}");
-                        }
-                    }
-                } else {
-                    eprintln!("  Warning: could not extract versionId for witness proof.");
+                Ok(witness_file) => {
+                    dids_ks
+                        .insert_raw(
+                            did_hosting_server::did_ops::content_witness_key(&mnemonic),
+                            witness_file.into_bytes(),
+                        )
+                        .await?;
+                    eprintln!("  Witness proof stored.");
+                }
+                Err(e) => {
+                    eprintln!("  Warning: witness proof request failed: {e}");
+                    eprintln!("  The DID was created but has no witness proof.");
                 }
             }
         }
@@ -1205,7 +1154,6 @@ async fn run_import_secrets(
     vta_bundle: Option<String>,
     signing_key: Option<String>,
     ka_key: Option<String>,
-    jwt_key: Option<String>,
     vta_credential: Option<String>,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1270,18 +1218,12 @@ async fn run_import_secrets(
     Secret::from_multibase(&resolved_ka, None)
         .map_err(|e| format!("invalid key agreement key: {e}"))?;
 
-    // Generate or validate JWT key
-    let resolved_jwt = match jwt_key {
-        Some(key) => {
-            Secret::from_multibase(&key, None)
-                .map_err(|e| format!("invalid JWT signing key: {e}"))?;
-            key
-        }
-        None => {
-            eprintln!("  Generated JWT signing key.");
-            generate_ed25519_multibase()
-        }
-    };
+    // `ServerSecrets` carries a `jwt_signing_key` for every service alike (one
+    // shared storage format); this edge has no JWT-based session auth to sign
+    // with it (deleted along with the rest of its REST management surface —
+    // see `did-hosting-server`'s module docs), so there is nothing here worth
+    // exposing an operator override for. Always freshly generated.
+    let jwt_signing_key = generate_ed25519_multibase();
 
     // Carry forward any retired key material.
     //
@@ -1305,7 +1247,7 @@ async fn run_import_secrets(
     let server_secrets = secret_store::ServerSecrets {
         signing_key: resolved_signing,
         key_agreement_key: resolved_ka,
-        jwt_signing_key: resolved_jwt,
+        jwt_signing_key,
         vta_credential: resolved_vta_cred,
         retired,
     };
@@ -1374,7 +1316,7 @@ async fn run_server(config_path: Option<PathBuf>) {
         tracing::warn!("============================================================");
     }
 
-    let store = store::Store::open(&config.store)
+    let store = store::Store::open_with(&config.store, &config.fjall)
         .await
         .expect("failed to open store");
 
@@ -1471,7 +1413,6 @@ async fn run_import_sealed(
     expect_digest: String,
     seed: PathBuf,
     producer_pubkey: Option<String>,
-    jwt_key: Option<String>,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use affinidi_tdk::secrets_resolver::secrets::Secret;
@@ -1509,17 +1450,10 @@ async fn run_import_sealed(
     Secret::from_multibase(&result.key_agreement_multibase, None)
         .map_err(|e| format!("invalid key-agreement key in bundle: {e}"))?;
 
-    let resolved_jwt = match jwt_key {
-        Some(key) => {
-            Secret::from_multibase(&key, None)
-                .map_err(|e| format!("invalid JWT signing key: {e}"))?;
-            key
-        }
-        None => {
-            eprintln!("  Generated JWT signing key.");
-            generate_ed25519_multibase()
-        }
-    };
+    // See `run_import_secrets`: this edge never reads its own JWT signing
+    // key back (its REST session auth was deleted with the rest of its
+    // management surface), so nothing here needs an operator override.
+    let jwt_signing_key = generate_ed25519_multibase();
 
     // Carry forward any retired key material.
     //
@@ -1543,7 +1477,7 @@ async fn run_import_sealed(
     let server_secrets = secret_store::ServerSecrets {
         signing_key: result.signing_key_multibase,
         key_agreement_key: result.key_agreement_multibase,
-        jwt_signing_key: resolved_jwt,
+        jwt_signing_key,
         vta_credential: None,
         retired,
     };
@@ -1614,6 +1548,39 @@ fn print_banner() {
 }
 
 /// `identity-list` — show which key material this service still honours.
+async fn run_tsp_relationship_list(
+    config_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    did_hosting_common::server::cli_tsp::run_list(&config.store).await
+}
+
+async fn run_tsp_relationship_reset(
+    config_path: Option<PathBuf>,
+    peer: String,
+    our: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use did_hosting_common::server::cli_tsp::{Target, run_reset};
+    let config = AppConfig::load(config_path)?;
+    run_reset(&config.store, Target::Peer { peer, our }).await
+}
+
+async fn run_tsp_relationship_delete(
+    config_path: Option<PathBuf>,
+    peer: Option<String>,
+    our: Option<String>,
+    all: bool,
+    yes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use did_hosting_common::server::cli_tsp::{Target, run_delete};
+    let config = AppConfig::load(config_path)?;
+    let target = match peer {
+        Some(peer) if !all => Target::Peer { peer, our },
+        _ => Target::All,
+    };
+    run_delete(&config.store, target, yes).await
+}
+
 async fn run_identity_list(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load(config_path)?;
     did_hosting_common::server::cli_identity::run_list_generations(&config.store).await

@@ -5,7 +5,7 @@
 //! are independent of any particular server's `AppState` or business logic.
 
 use didwebvh_rs::DIDWebVHState;
-use didwebvh_rs::log_entry::LogEntry;
+use didwebvh_rs::log_entry::{LogEntry, LogEntryMethods};
 use didwebvh_rs::log_entry_state::{LogEntryState, LogEntryValidationStatus};
 use didwebvh_rs::parameters::Parameters;
 use serde::{Deserialize, Serialize};
@@ -200,6 +200,14 @@ pub fn watcher_sync_key(mnemonic: &str) -> String {
 // JSONL validation & extraction
 // ---------------------------------------------------------------------------
 
+/// Upper bound on the number of log entries (versions) a single `did.jsonl`
+/// may carry. This is a denial-of-service guard on the per-entry proof
+/// verification, not a protocol limit — a webvh DID realistically accrues at
+/// most tens to low-hundreds of versions over its lifetime, so this ceiling is
+/// only ever reached by a degenerate or deliberately-inflated chain. Bump it if
+/// a legitimate deployment ever genuinely needs more.
+pub const MAX_LOG_ENTRIES: usize = 10_000;
+
 /// Validate that every line in the JSONL body is a well-formed did:webvh log entry.
 ///
 /// In addition to structural shape, the *last* entry's `state.id` must start
@@ -213,7 +221,22 @@ pub fn validate_did_jsonl(content: &str) -> Result<(), String> {
         return Err("did.jsonl content cannot be empty".into());
     }
 
-    let mut had_entry = false;
+    // Bound the entry count up front, before any O(n) per-entry work (the
+    // deserialize loop here, and the per-entry Ed25519 proof verification in
+    // `verify_did_log_proofs`). The 10 MB request limit alone would still admit
+    // thousands of versions and let a slot owner amplify CPU by republishing a
+    // max-length multi-version log. `MAX_LOG_ENTRIES` is far above any realistic
+    // webvh history, so it only ever refuses a degenerate/abusive chain.
+    let entry_count = content.lines().filter(|l| !l.trim().is_empty()).count();
+    if entry_count == 0 {
+        return Err("did.jsonl content has no entries".into());
+    }
+    if entry_count > MAX_LOG_ENTRIES {
+        return Err(format!(
+            "did.jsonl has too many log entries (limit {MAX_LOG_ENTRIES})"
+        ));
+    }
+
     for (idx, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -221,11 +244,6 @@ pub fn validate_did_jsonl(content: &str) -> Result<(), String> {
         }
         LogEntry::deserialize_string(line, None)
             .map_err(|e| format!("invalid log entry at line {}: {e}", idx + 1))?;
-        had_entry = true;
-    }
-
-    if !had_entry {
-        return Err("did.jsonl content has no entries".into());
     }
 
     // Must encode a did:webvh identifier on the latest entry.
@@ -263,6 +281,363 @@ pub fn validate_did_jsonl(content: &str) -> Result<(), String> {
 /// failures and a "proof verification failed: ..." prefix on the
 /// upstream verifier's report.
 pub fn verify_did_log_proofs(content: &str) -> Result<(), String> {
+    verify_did_log_chain(content, None).map(|_| ())
+}
+
+/// [`verify_did_log_proofs`] plus the DID's witness proofs.
+///
+/// For a hosting node that serves a log it did not author: when the log
+/// configures witnesses, the published witness proofs must be supplied and must
+/// meet the threshold — a witnessed DID is refused outright without them rather
+/// than served unwitnessed.
+pub fn verify_did_log_and_witness_proofs(
+    content: &str,
+    witness_content: Option<&str>,
+) -> Result<(), String> {
+    let witnessed = verify_did_log_chain(content, witness_content)?;
+    if witnessed && witness_content.is_none_or(|w| w.trim().is_empty()) {
+        return Err(
+            "the DID log configures witnesses but no witness proofs were supplied; refusing to \
+             serve it unwitnessed"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Parse `content` into log entries and run the full chain check every
+/// caller of it needs: signature against the authorised updateKeys,
+/// parameter transitions, the hash chain, pre-rotation, and (via
+/// `Parameters::validate`) refusing any entry after a deactivation. Witness
+/// proofs are deliberately not part of this — callers that need them layer
+/// their own check on top, using each entry's now-populated
+/// `validated_parameters.active_witness`.
+fn parse_and_verify_chain(content: &str) -> Result<DIDWebVHState, String> {
+    validate_did_jsonl(content)?;
+
+    let mut state = DIDWebVHState::default();
+    let mut version = None;
+    for (idx, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let entry = LogEntry::deserialize_string(line, version)
+            .map_err(|e| format!("invalid log entry at line {}: {e}", idx + 1))?;
+        version = Some(entry.get_webvh_version());
+        let version_number = entry
+            .get_version_id_fields()
+            .map_err(|e| format!("invalid versionId at line {}: {e}", idx + 1))?
+            .0;
+        state.log_entries_mut().push(LogEntryState {
+            log_entry: entry,
+            version_number,
+            validation_status: LogEntryValidationStatus::NotValidated,
+            validated_parameters: Parameters::default(),
+        });
+    }
+
+    {
+        let entries = state.log_entries_mut();
+        for idx in 0..entries.len() {
+            let (before, rest) = entries.split_at_mut(idx);
+            rest[0].verify_log_entry(before.last()).map_err(|e| {
+                format!(
+                    "proof verification failed: entry {} does not verify: {e}",
+                    rest[0].get_version_id()
+                )
+            })?;
+        }
+    }
+
+    Ok(state)
+}
+
+/// Verify one incoming witness proof against this DID's own stored log,
+/// before the control plane persists it to the witness-proof store
+/// (`webvh/witness/publish`).
+///
+/// This is deliberately *not* the threshold check [`verify_did_log_for_publish`]
+/// and [`servable_did_log`] do — threshold is a property of the whole set of
+/// stored proofs, and partial proofs must be allowed to accumulate one at a
+/// time, so it stays a resolve-time concern. What belongs at write time is
+/// authenticity: the proof must cryptographically verify over the
+/// `versionId` it names, *and* the key that signed it must actually be one
+/// of the witnesses this exact log entry's parameters configure. The second
+/// check is the one that matters — a `did:key` proof is self-certifying (the
+/// public key travels inside `verificationMethod`), so a bare signature
+/// check alone would "verify" a proof from any key an attacker just
+/// generated, trusted by no one.
+///
+/// `content` is this DID's currently stored did:webvh log
+/// (`content_log_key`); `version_id` and `proof_value` are the two fields
+/// `webvh/witness/publish` accepted from the wire.
+///
+/// Gated on `server-core`: `affinidi_data_integrity` is an optional
+/// dependency of this crate, pulled in only by that feature (this module
+/// itself is not — a client-only build must still compile without it).
+#[cfg(feature = "server-core")]
+pub fn verify_witness_proof_for_version(
+    content: &str,
+    version_id: &str,
+    proof_value: &serde_json::Value,
+) -> Result<(), String> {
+    use affinidi_data_integrity::DataIntegrityProof;
+
+    let proof: DataIntegrityProof = serde_json::from_value(proof_value.clone())
+        .map_err(|e| format!("invalid witness proof shape: {e}"))?;
+
+    let state = parse_and_verify_chain(content)?;
+    let entry = state
+        .log_entries()
+        .iter()
+        .find(|e| e.get_version_id() == version_id)
+        .ok_or_else(|| {
+            format!(
+                "witness proof names versionId {version_id:?}, which is not in this DID's \
+                 published log"
+            )
+        })?;
+
+    let witnesses = entry
+        .validated_parameters
+        .active_witness
+        .as_ref()
+        .and_then(|w| w.witnesses())
+        .ok_or_else(|| format!("versionId {version_id:?} does not configure an active witness"))?;
+
+    if !witnesses
+        .iter()
+        .any(|w| w.as_did_key() == proof.verification_method)
+    {
+        return Err(format!(
+            "witness proof's verificationMethod ({}) does not name a witness configured for \
+             versionId {version_id:?}",
+            proof.verification_method
+        ));
+    }
+
+    let options = didwebvh_rs::witness::WitnessVerifyOptions::new();
+    entry
+        .log_entry
+        .validate_witness_proof(&proof, &options)
+        .map_err(|e| format!("witness proof failed verification: {e}"))?;
+
+    Ok(())
+}
+
+/// Verify a submitted did:webvh log for `did/register` or a publish.
+///
+/// Every entry's own proof and the hash/parameter chain is checked in full,
+/// for the whole log — but the witness threshold is enforced only on
+/// entries that were already part of the DID's published log before this
+/// call.
+///
+/// `didwebvh_rs::DIDWebVHState::validate` enforces the witness threshold
+/// unconditionally, on every entry including the log's last one. That is
+/// right for a resolver — which only ever sees an already-published log,
+/// witnessed or not — but wrong for register/publish: a version's witness
+/// proofs arrive *after* it is published, via `webvh/witness/publish`, so no
+/// proof can exist yet for the version this call is adding. Enforcing the
+/// threshold on it here would make the first witnessed version, and every
+/// later republish (register/publish re-verifies the whole log each time),
+/// permanently unregistrable — see `verify_did_log_proofs`, which is what
+/// this function replaces on that path.
+///
+/// `previously_published` is the number of entries the currently stored log
+/// already has (`0` for a brand-new registration) — the caller computes it
+/// from its own storage, never from the request, so a submitter cannot
+/// widen or shrink which entries this check applies to. Entries before that
+/// index must still meet their witness threshold, using `witness_content`
+/// (the DID's currently stored witness-proof file, if any); entries at or
+/// after it are the new, not-yet-witnessed tail and are exempt from the
+/// threshold check outright — their own chain/signature proof is still
+/// verified in full, exactly like every other entry.
+pub fn verify_did_log_for_publish(
+    content: &str,
+    witness_content: Option<&str>,
+    previously_published: usize,
+) -> Result<(), String> {
+    let mut state = parse_and_verify_chain(content)?;
+
+    let previously_published = previously_published.min(state.log_entries().len());
+
+    if previously_published == 0 {
+        // Nothing has been published yet — every entry here is new tail,
+        // exempt from the witness threshold outright.
+        return Ok(());
+    }
+
+    // Nothing to check if none of the already-published entries are
+    // themselves witnessed — skip parsing `witness_content` at all. A slot
+    // can hold stale or unrelated bytes at its witness-content key (e.g. an
+    // admin takeover, which republishes under a new identity and clears the
+    // prior owner's witness file in the same commit this call's caller is
+    // about to make); an unwitnessed republish must not fail over content
+    // that was never going to be consulted.
+    let needs_witness = state.log_entries()[..previously_published].iter().any(|e| {
+        e.validated_parameters
+            .active_witness
+            .as_ref()
+            .is_some_and(|w| w.witnesses().is_some())
+    });
+    if !needs_witness {
+        return Ok(());
+    }
+
+    // Witness threshold, only for the entries already published. Scoped to
+    // that range's highest version so a proof cannot be misapplied to a
+    // later entry it does not cover — mirrors `DIDWebVHState::validate`'s
+    // own steps 3/4, just capped short of the new tail instead of the whole
+    // log.
+    let highest_already_published = state.log_entries()[previously_published - 1].version_number;
+
+    let mut proofs = match witness_content.filter(|w| !w.trim().is_empty()) {
+        Some(raw) => DIDWebVHState::parse_witness_proofs(raw)
+            .map_err(|e| format!("invalid witness proofs: {e}"))?,
+        None => didwebvh_rs::witness::proofs::WitnessProofCollection::default(),
+    };
+    proofs
+        .generate_proof_state(highest_already_published)
+        .map_err(|e| format!("invalid witness proofs: {e}"))?;
+
+    let options = didwebvh_rs::witness::WitnessVerifyOptions::new();
+    for entry in state
+        .log_entries_mut()
+        .iter_mut()
+        .take(previously_published)
+    {
+        proofs
+            .validate_log_entry(entry, highest_already_published, &options)
+            .map_err(|e| format!("proof verification failed: {e}"))?;
+    }
+
+    Ok(())
+}
+
+/// What a resolver may serve for a stored did:webvh log, honouring the
+/// witness threshold at every entry that configures one.
+///
+/// Walks the chain in order — full signature and parameter-transition
+/// verification, exactly like [`verify_did_log_proofs`] — and, for each
+/// entry that configures an active witness, checks it against
+/// `witness_content` (the DID's current witness-proof file, if any). The
+/// first entry that fails its witness threshold ends what is servable: every
+/// entry before it still resolves. This is did:webvh's own truncation
+/// semantics (a resolver serves up to the last version it can fully verify,
+/// not "all or nothing"), applied to the witness threshold — so a DID with a
+/// satisfied genesis and an unwitnessed republish still resolves to its last
+/// witnessed version, rather than going dark the moment a new,
+/// not-yet-witnessed version is registered.
+///
+/// A chain/signature failure is a different matter: register and publish
+/// already gate on it, so stored content should never have one, and this
+/// function's job is only the witness threshold — not re-litigating chain
+/// integrity on every resolve. If an entry fails to verify structurally,
+/// this returns `content` unchanged rather than guessing at a truncation
+/// point; the same goes for content that plainly isn't a did:webvh log at
+/// all (a caller with unrelated content at this key, or an integration
+/// test's simplified fixture, must not be gated on witnessing it never
+/// declared).
+///
+/// Unparseable `witness_content` is treated the same as none — a corrupt or
+/// legacy blob at the witness-content key must not make an otherwise-good,
+/// already-witnessed log stop resolving; it just means nothing further is
+/// witnessed than the stored file can actually attest.
+///
+/// Returns `None` only when a *witness* check fails on the first (genesis)
+/// entry — nothing at all is servable then; `Some(jsonl)` otherwise (either
+/// `content` verbatim, or its servable prefix, verbatim by entry).
+pub fn servable_did_log(content: &str, witness_content: Option<&str>) -> Option<String> {
+    if validate_did_jsonl(content).is_err() {
+        return Some(content.to_string());
+    }
+
+    let mut state = DIDWebVHState::default();
+    let mut version = None;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = LogEntry::deserialize_string(line, version) else {
+            return Some(content.to_string());
+        };
+        version = Some(entry.get_webvh_version());
+        let Ok((version_number, _)) = entry.get_version_id_fields() else {
+            return Some(content.to_string());
+        };
+        state.log_entries_mut().push(LogEntryState {
+            log_entry: entry,
+            version_number,
+            validation_status: LogEntryValidationStatus::NotValidated,
+            validated_parameters: Parameters::default(),
+        });
+    }
+    if state.log_entries().is_empty() {
+        return Some(content.to_string());
+    }
+
+    let highest_version_number = state
+        .log_entries()
+        .last()
+        .map(|e| e.version_number)
+        .unwrap_or(0);
+
+    // An unparseable witness file is "no proofs available", not a hard
+    // error — see the doc comment above.
+    let mut proofs = witness_content
+        .filter(|w| !w.trim().is_empty())
+        .and_then(|raw| DIDWebVHState::parse_witness_proofs(raw).ok())
+        .unwrap_or_default();
+    let _ = proofs.generate_proof_state(highest_version_number);
+
+    let options = didwebvh_rs::witness::WitnessVerifyOptions::new();
+    let total = state.log_entries().len();
+    let mut servable = 0usize;
+    {
+        let entries = state.log_entries_mut();
+        for idx in 0..entries.len() {
+            let (before, rest) = entries.split_at_mut(idx);
+            let entry = &mut rest[0];
+            if entry.verify_log_entry(before.last()).is_err() {
+                // Chain/signature failure — not this function's call to
+                // make; see the doc comment.
+                return Some(content.to_string());
+            }
+            let witnessed_here = entry
+                .validated_parameters
+                .active_witness
+                .as_ref()
+                .is_some_and(|w| w.witnesses().is_some());
+            if witnessed_here
+                && proofs
+                    .validate_log_entry(entry, highest_version_number, &options)
+                    .is_err()
+            {
+                break;
+            }
+            servable = idx + 1;
+        }
+    }
+
+    if servable == total {
+        return Some(content.to_string());
+    }
+    if servable == 0 {
+        return None;
+    }
+
+    let lines: Vec<String> = state.log_entries()[..servable]
+        .iter()
+        .filter_map(|e| serde_json::to_string(&e.log_entry).ok())
+        .collect();
+    Some(lines.join("\n"))
+}
+
+/// Walk and validate the chain; returns whether the (current) parameters
+/// configure witnesses.
+fn verify_did_log_chain(content: &str, witness_content: Option<&str>) -> Result<bool, String> {
     // Re-run the structural parse so callers can use this function
     // as a single gate. Cheap relative to the proof-verification cost.
     validate_did_jsonl(content)?;
@@ -289,6 +664,12 @@ pub fn verify_did_log_proofs(content: &str) -> Result<(), String> {
         });
     }
 
+    if let Some(raw) = witness_content.filter(|w| !w.trim().is_empty()) {
+        let proofs = DIDWebVHState::parse_witness_proofs(raw)
+            .map_err(|e| format!("invalid witness proofs: {e}"))?;
+        state.set_witness_proofs(proofs);
+    }
+
     let report = state
         .validate()
         .map_err(|e| format!("proof verification failed: {e}"))?;
@@ -299,6 +680,223 @@ pub fn verify_did_log_proofs(content: &str) -> Result<(), String> {
         .assert_complete()
         .map_err(|e| format!("proof verification failed (chain incomplete): {e}"))?;
 
+    let witnessed = state.log_entries().last().is_some_and(|e| {
+        e.validated_parameters
+            .witness
+            .as_ref()
+            .and_then(|w| serde_json::to_value(w).ok())
+            .and_then(|v| v.get("threshold").and_then(|t| t.as_u64()))
+            .is_some_and(|t| t > 0)
+    });
+    Ok(witnessed)
+}
+
+/// Why a witness refuses to witness an entry — the refusals
+/// `webvh/witness/sign/0.1` declares, in the order it checks them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WitnessLogRefusal {
+    /// The log does not verify as a did:webvh log (`invalidLog`).
+    InvalidLog(String),
+    /// The versionId asked for is not the log's last entry (`versionNotLast`).
+    VersionNotLast { last: String },
+    /// An entry *before* the one asked for already deactivated the DID
+    /// (`deactivated`). The entry that itself first deactivates the DID is
+    /// not refused by this rule — did:webvh witnessing applies to it like
+    /// any other entry; only an entry after it is.
+    Deactivated,
+    /// The witness parameter in force for the entry does not name this
+    /// witness (`notListed`).
+    NotListed,
+}
+
+/// What [`verify_log_for_witnessing`] established about a log it accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WitnessedLog {
+    /// The DID's SCID: its identity across every host it moves to.
+    pub scid: String,
+    /// Every entry's versionId, in log order (`version_ids[n - 1]` is entry
+    /// `n`'s). The hash chain makes a matching versionId at position `n` a
+    /// match of the whole log up to it.
+    pub version_ids: Vec<String>,
+}
+
+/// Verify a did:webvh log a witness has been asked to witness, *before* it
+/// signs anything: the chain up to and including the entry (every entry's
+/// proof against its authorised `updateKeys`, the hash chain, pre-rotation and
+/// the parameter transitions), that `version_id` is the last entry, that no
+/// entry *before* it already deactivated the DID, and that the witness
+/// parameter in force for that entry names `witness_did`.
+///
+/// A DID's deactivating entry — the first to set `parameters.deactivated:
+/// true` — is not refused by the deactivation check: did:webvh does not
+/// exempt it from witnessing. While a witness set is active, a threshold of
+/// it MUST provide valid proofs for every log entry, with no carve-out for
+/// the entry that happens to deactivate the DID (did:webvh "DID Witnesses" >
+/// "Witness Lists": "while there are active witnesses, a threshold of the
+/// active witnesses must provide valid proofs associated with each DID log
+/// entry before the DID log entry can be published"). A witness that refused
+/// to sign a deactivating entry *as such* would make a DID that ever had
+/// witnesses undeactivatable. Only an entry *after* the deactivating one is
+/// refused, since nothing is witnessed once a DID is deactivated.
+///
+/// The entry's own witness proofs are not checked — they are what is being
+/// produced. Every other rule of [`verify_did_log_proofs`] applies.
+pub fn verify_log_for_witnessing(
+    content: &str,
+    version_id: &str,
+    witness_did: &str,
+) -> Result<WitnessedLog, WitnessLogRefusal> {
+    validate_did_jsonl(content).map_err(WitnessLogRefusal::InvalidLog)?;
+
+    let mut entries: Vec<LogEntryState> = Vec::new();
+    let mut version = None;
+    for (idx, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let entry = LogEntry::deserialize_string(line, version).map_err(|e| {
+            WitnessLogRefusal::InvalidLog(format!("invalid log entry at line {}: {e}", idx + 1))
+        })?;
+        version = Some(entry.get_webvh_version());
+        let version_number = entry
+            .get_version_id_fields()
+            .map_err(|e| {
+                WitnessLogRefusal::InvalidLog(format!("invalid versionId at line {}: {e}", idx + 1))
+            })?
+            .0;
+        entries.push(LogEntryState {
+            log_entry: entry,
+            version_number,
+            validation_status: LogEntryValidationStatus::NotValidated,
+            validated_parameters: Parameters::default(),
+        });
+    }
+
+    // did:webvh deactivation is itself a log entry, and did:webvh does not
+    // exempt it from witnessing (see this function's doc comment) — so the
+    // entry that *first* sets `deactivated: true` is witnessed like any
+    // other, and only an entry *after* it is refused.
+    //
+    // didwebvh-rs's own per-entry parameter validation already refuses (as a
+    // generic, structural error) any entry whose predecessor deactivated the
+    // DID — deactivation is terminal for it, not merely un-witnessable. A raw
+    // (unverified) look at each entry's own declared `parameters.deactivated`
+    // finds that entry *before* full verification reaches — and reports on —
+    // it, so the more specific `deactivated` refusal is used instead of the
+    // less specific `invalidLog`. This is safe to read unverified: the
+    // outcome below is refusal either way, never a signature, and entries up
+    // to and including the deactivating one are still fully verified.
+    let deactivating_index = entries
+        .iter()
+        .position(|e| e.log_entry.get_parameters().deactivated == Some(true));
+    let last_index = entries.len().checked_sub(1);
+    let past_deactivation =
+        matches!((deactivating_index, last_index), (Some(d), Some(last)) if d < last);
+    let verify_through = deactivating_index.map_or(entries.len(), |d| d + 1);
+
+    for idx in 0..verify_through {
+        let (before, rest) = entries.split_at_mut(idx);
+        let entry = &mut rest[0];
+        entry.verify_log_entry(before.last()).map_err(|e| {
+            WitnessLogRefusal::InvalidLog(format!(
+                "entry {} does not verify: {e}",
+                entry.get_version_id()
+            ))
+        })?;
+    }
+
+    // `get_version_id` reads the raw entry, so this check does not need
+    // `last` to have been in the verified range above.
+    let last = entries
+        .last()
+        .ok_or_else(|| WitnessLogRefusal::InvalidLog("the log has no entries".into()))?;
+    if last.get_version_id() != version_id {
+        return Err(WitnessLogRefusal::VersionNotLast {
+            last: last.get_version_id().to_string(),
+        });
+    }
+    if past_deactivation {
+        return Err(WitnessLogRefusal::Deactivated);
+    }
+    let listed = last
+        .validated_parameters
+        .active_witness
+        .as_deref()
+        .and_then(|w| w.witnesses())
+        .is_some_and(|ws| {
+            ws.iter().any(|w| {
+                let id = w.id.to_string();
+                id == witness_did || format!("did:key:{id}") == witness_did
+            })
+        });
+    if !listed {
+        return Err(WitnessLogRefusal::NotListed);
+    }
+    let scid = last
+        .validated_parameters
+        .scid
+        .as_deref()
+        .map(|s| s.to_string())
+        .ok_or_else(|| WitnessLogRefusal::InvalidLog("the log establishes no SCID".into()))?;
+    Ok(WitnessedLog {
+        scid,
+        version_ids: entries
+            .iter()
+            .map(|e| e.get_version_id().to_string())
+            .collect(),
+    })
+}
+
+/// Check that `next` is an acceptable successor of the `did.jsonl` a host
+/// already holds (`previous`), independent of who sent it.
+///
+/// A webvh log is append-only: every version commits to the one before it, so
+/// the only legitimate way for a hosted log to change is to gain entries at the
+/// end. This refuses:
+///
+/// - **rollback / fork** — a `next` that is not `previous` with zero or more
+///   entries appended (shorter, or diverging anywhere in the shared prefix).
+///   Serving an older log would resurrect keys the controller has rotated out,
+///   or a document it has since changed;
+/// - **resurrection** — any change at all to a log whose history already
+///   contains a deactivation. A deactivated DID stays deactivated.
+///
+/// Resending the identical log is accepted (idempotent sync). This is a
+/// history check only; pair it with [`verify_did_log_proofs`] for the chain's
+/// own validity.
+pub fn verify_log_extends(previous: Option<&str>, next: &str) -> Result<(), String> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    let entries = |log: &str| -> Vec<String> {
+        log.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let old = entries(previous);
+    let new = entries(next);
+    if new.len() < old.len() || new[..old.len()] != old[..] {
+        return Err(format!(
+            "did.jsonl is not an extension of the hosted log ({} entries held, {} received, \
+             or the shared history differs); refusing a rollback or fork",
+            old.len(),
+            new.len()
+        ));
+    }
+    let deactivated = old.iter().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v.get("parameters")?.get("deactivated")?.as_bool())
+            .unwrap_or(false)
+    });
+    if deactivated && new.len() != old.len() {
+        return Err(
+            "the hosted DID is deactivated; refusing entries appended after deactivation".into(),
+        );
+    }
     Ok(())
 }
 
@@ -715,6 +1313,18 @@ mod tests {
     }
 
     #[test]
+    fn validate_jsonl_too_many_entries_rejected() {
+        // One line over the cap is refused on the count check, before any
+        // per-entry parse/verify work (SEC hardening — DoS guard).
+        let content = "x\n".repeat(MAX_LOG_ENTRIES + 1);
+        let err = validate_did_jsonl(&content).unwrap_err();
+        assert!(
+            err.contains("too many log entries"),
+            "expected entry-count rejection, got: {err}"
+        );
+    }
+
+    #[test]
     fn did_record_deserialize_without_content_size() {
         let json = r#"{"owner":"did:example:a","mnemonic":"test","created_at":100,"updated_at":100,"version_count":1}"#;
         let record: DidRecord = serde_json::from_str(json).unwrap();
@@ -780,5 +1390,520 @@ mod agent_name_tests {
     fn no_also_known_as_is_empty() {
         let log = "{\"versionId\":\"1\",\"state\":{\"id\":\"did:webvh:x:host.example\"}}";
         assert!(extract_agent_names(log, "host.example").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod log_extension_tests {
+    use super::verify_log_extends;
+
+    const V1: &str = r#"{"versionId":"1-a","parameters":{}}"#;
+    const V2: &str = r#"{"versionId":"2-b","parameters":{}}"#;
+    const V2_FORK: &str = r#"{"versionId":"2-x","parameters":{}}"#;
+    const V2_DEACT: &str = r#"{"versionId":"2-b","parameters":{"deactivated":true}}"#;
+    const V3: &str = r#"{"versionId":"3-c","parameters":{}}"#;
+
+    fn log(lines: &[&str]) -> String {
+        lines.join("\n") + "\n"
+    }
+
+    #[test]
+    fn a_first_log_is_accepted() {
+        verify_log_extends(None, &log(&[V1])).unwrap();
+    }
+
+    #[test]
+    fn appending_and_resending_are_accepted() {
+        verify_log_extends(Some(&log(&[V1])), &log(&[V1, V2])).unwrap();
+        verify_log_extends(Some(&log(&[V1, V2])), &log(&[V1, V2])).unwrap();
+    }
+
+    #[test]
+    fn a_shorter_log_is_a_rollback() {
+        let err = verify_log_extends(Some(&log(&[V1, V2])), &log(&[V1])).unwrap_err();
+        assert!(err.contains("rollback"), "{err}");
+    }
+
+    #[test]
+    fn a_diverging_log_is_a_fork() {
+        let err = verify_log_extends(Some(&log(&[V1, V2])), &log(&[V1, V2_FORK, V3])).unwrap_err();
+        assert!(err.contains("fork"), "{err}");
+    }
+
+    #[test]
+    fn a_deactivated_log_cannot_grow_or_be_replaced() {
+        let held = log(&[V1, V2_DEACT]);
+        verify_log_extends(Some(&held), &held).unwrap();
+        let err = verify_log_extends(Some(&held), &log(&[V1, V2_DEACT, V3])).unwrap_err();
+        assert!(err.contains("deactivated"), "{err}");
+        // Replacing the deactivating entry is a fork, and refused as one.
+        assert!(verify_log_extends(Some(&held), &log(&[V1, V2, V3])).is_err());
+    }
+}
+
+/// Tests for [`verify_did_log_for_publish`] — the register/publish witness
+/// split: full chain verification for every entry, but the witness
+/// threshold enforced only on already-published ones.
+#[cfg(test)]
+mod verify_for_publish_tests {
+    use std::sync::Arc;
+
+    use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
+    use affinidi_secrets_resolver::secrets::Secret;
+    use chrono::{DateTime, Duration, FixedOffset, Utc};
+    use didwebvh_rs::Multibase;
+    use didwebvh_rs::witness::{Witness, Witnesses};
+    use serde_json::json;
+
+    use super::verify_did_log_for_publish;
+    use didwebvh_rs::{DIDWebVHState, parameters::Parameters};
+
+    /// A `versionTime` comfortably in the past, so a second entry built at
+    /// `base_time() + 1s` is never mistaken for the same instant as the
+    /// first — `create_log_entry(None, ...)` stamps "now", and two calls in
+    /// the same test can land in the same wall-clock second.
+    fn base_time() -> DateTime<FixedOffset> {
+        (Utc::now() - Duration::seconds(10)).fixed_offset()
+    }
+
+    /// A fresh Ed25519 key with the `did:key:{pk}#{pk}` verification-method
+    /// id `create_log_entry`/witness-proof lookup both require. Mirrors
+    /// didwebvh-rs's own (private) `test_utils::generate_signing_key`.
+    fn signing_key() -> Secret {
+        let mut key = Secret::generate_ed25519(None, None);
+        let pk = key.get_public_keymultibase().unwrap();
+        key.id = format!("did:key:{pk}#{pk}");
+        key
+    }
+
+    /// A witness identity: its signing key, plus the bare `did:key:...` id a
+    /// `Witness` list entry names it by.
+    fn witness_identity() -> (Secret, String) {
+        let key = signing_key();
+        let witness_did = key.id.split('#').next().unwrap().to_string();
+        (key, witness_did)
+    }
+
+    /// The smallest DID document `verify_log_entry` accepts. Mirrors
+    /// didwebvh-rs's own (private) `test_utils::did_doc_with_key`.
+    fn doc_with_key(did: &str, key: &Secret) -> serde_json::Value {
+        let pk = key.get_public_keymultibase().unwrap();
+        json!({
+            "id": did,
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "verificationMethod": [{
+                "id": format!("{did}#key-0"),
+                "type": "Multikey",
+                "publicKeyMultibase": pk,
+                "controller": did
+            }],
+            "authentication": [format!("{did}#key-0")],
+            "assertionMethod": [format!("{did}#key-0")],
+        })
+    }
+
+    /// Serialize a state's current log entries back to jsonl, the shape
+    /// `verify_did_log_for_publish` parses.
+    fn to_jsonl(state: &DIDWebVHState) -> String {
+        state
+            .log_entries()
+            .iter()
+            .map(|e| serde_json::to_string(&e.log_entry).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A signed witness proof over `version_id`.
+    async fn sign_witness_proof(witness_key: &Secret, version_id: &str) -> DataIntegrityProof {
+        DataIntegrityProof::sign(
+            &json!({ "versionId": version_id }),
+            witness_key,
+            SignOptions::new(),
+        )
+        .await
+        .expect("sign witness proof")
+    }
+
+    /// A `did-witness.json`-shaped file naming one proof for `version_id` —
+    /// the wire format `DIDWebVHState::parse_witness_proofs` reads.
+    fn witness_file(version_id: &str, proof: &DataIntegrityProof) -> String {
+        json!([{ "versionId": version_id, "proof": [proof] }]).to_string()
+    }
+
+    /// Genesis parameters naming one witness at the given threshold. Per
+    /// didwebvh 1.0, a witness param on the *first* entry is active
+    /// immediately — no one-version delay — so the genesis entry itself
+    /// needs a threshold-meeting proof to resolve as witnessed.
+    fn witnessed_genesis_params(key: &Secret, witness_did: &str, threshold: u32) -> Parameters {
+        Parameters {
+            update_keys: Some(Arc::new(vec![Multibase::new(
+                key.get_public_keymultibase().unwrap(),
+            )])),
+            portable: Some(false),
+            witness: Some(Arc::new(Witnesses::Value {
+                threshold,
+                witnesses: vec![Witness {
+                    id: Multibase::new(witness_did.to_string()),
+                }],
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// Bug #1's exact scenario: a brand-new registration whose genesis
+    /// entry names an active witness. No proof can exist yet — it is the
+    /// witness's job to sign the version *after* it is published — so this
+    /// must succeed with no witness content at all, as long as the chain
+    /// itself verifies. This is what
+    /// `did_hosting_common::did_ops::verify_did_log_proofs` (unconditional
+    /// witness_content: None, whole-log threshold) always refused.
+    #[tokio::test]
+    async fn a_freshly_registered_witnessed_genesis_is_accepted_with_no_proof_yet() {
+        let key = signing_key();
+        let (_witness_key, witness_did) = witness_identity();
+        let params = witnessed_genesis_params(&key, &witness_did, 1);
+        let doc = doc_with_key("did:webvh:{SCID}:example.com", &key);
+
+        let mut state = DIDWebVHState::default();
+        state
+            .create_log_entry(None, &doc, &params, &key)
+            .await
+            .expect("genesis entry");
+        let jsonl = to_jsonl(&state);
+
+        verify_did_log_for_publish(&jsonl, None, 0)
+            .expect("a witnessed DID's first version registers with no witness proof yet");
+    }
+
+    /// A republish (or a second `did/register` of the same slot) extends
+    /// the log the DID already has. The already-published genesis must
+    /// still meet its witness threshold — from the *stored* witness
+    /// content, which this call supplies as `witness_content` — while the
+    /// new, not-yet-witnessed tail entry is exempt.
+    #[tokio::test]
+    async fn a_republish_still_requires_the_stored_proof_for_already_published_entries() {
+        let key = signing_key();
+        let (witness_key, witness_did) = witness_identity();
+        let params = witnessed_genesis_params(&key, &witness_did, 1);
+        let doc = doc_with_key("did:webvh:{SCID}:example.com", &key);
+
+        let mut state = DIDWebVHState::default();
+        state
+            .create_log_entry(Some(base_time()), &doc, &params, &key)
+            .await
+            .expect("genesis entry");
+        let genesis_version_id = state
+            .log_entries()
+            .last()
+            .unwrap()
+            .get_version_id()
+            .to_string();
+        let genesis_doc = state.log_entries().last().unwrap().get_state().clone();
+
+        // A second entry — new tail, no witness proof possible for it yet.
+        state
+            .create_log_entry(
+                Some(base_time() + Duration::seconds(1)),
+                &genesis_doc,
+                &Parameters::default(),
+                &key,
+            )
+            .await
+            .expect("second entry");
+        let jsonl = to_jsonl(&state);
+
+        // Nothing supplied for the already-published genesis: its threshold
+        // (1) is not met, so this must be refused.
+        let err = verify_did_log_for_publish(&jsonl, None, 1)
+            .expect_err("the stored genesis has no witness proof yet; threshold not met");
+        assert!(err.contains("threshold"), "{err}");
+
+        // The genesis's own stored witness proof now satisfies it, and the
+        // new tail is still exempt — so this succeeds.
+        let proof = sign_witness_proof(&witness_key, &genesis_version_id).await;
+        let witness_content = witness_file(&genesis_version_id, &proof);
+        verify_did_log_for_publish(&jsonl, Some(&witness_content), 1).expect(
+            "the already-published entry's stored witness proof satisfies its threshold; \
+             the new tail needs none",
+        );
+    }
+
+    /// An unwitnessed DID is unaffected by the split — the ordinary
+    /// register/publish path for the overwhelming majority of DIDs, which
+    /// never configure witnesses at all.
+    #[tokio::test]
+    async fn an_unwitnessed_log_registers_and_republishes_normally() {
+        let key = signing_key();
+        let params = Parameters {
+            update_keys: Some(Arc::new(vec![Multibase::new(
+                key.get_public_keymultibase().unwrap(),
+            )])),
+            portable: Some(false),
+            ..Default::default()
+        };
+        let doc = doc_with_key("did:webvh:{SCID}:example.com", &key);
+
+        let mut state = DIDWebVHState::default();
+        state
+            .create_log_entry(Some(base_time()), &doc, &params, &key)
+            .await
+            .expect("genesis entry");
+        verify_did_log_for_publish(&to_jsonl(&state), None, 0).expect("plain register");
+
+        let genesis_doc = state.log_entries().last().unwrap().get_state().clone();
+        state
+            .create_log_entry(
+                Some(base_time() + Duration::seconds(1)),
+                &genesis_doc,
+                &Parameters::default(),
+                &key,
+            )
+            .await
+            .expect("second entry");
+        verify_did_log_for_publish(&to_jsonl(&state), None, 1).expect("plain republish");
+    }
+
+    /// A tampered chain is still refused regardless of `previously_published`
+    /// — the witness-threshold split narrows *which* proofs are demanded,
+    /// it never widens what counts as a valid chain.
+    #[tokio::test]
+    async fn a_broken_chain_is_refused_even_as_new_tail() {
+        let key = signing_key();
+        let params = Parameters {
+            update_keys: Some(Arc::new(vec![Multibase::new(
+                key.get_public_keymultibase().unwrap(),
+            )])),
+            portable: Some(false),
+            ..Default::default()
+        };
+        let doc = doc_with_key("did:webvh:{SCID}:example.com", &key);
+        let mut state = DIDWebVHState::default();
+        state
+            .create_log_entry(None, &doc, &params, &key)
+            .await
+            .expect("genesis entry");
+        let mut jsonl = to_jsonl(&state);
+        jsonl.push_str("\nnot a log entry");
+
+        let err =
+            verify_did_log_for_publish(&jsonl, None, 0).expect_err("garbage tail must be refused");
+        assert!(!err.is_empty());
+    }
+
+    // ---- servable_did_log ----
+
+    /// An unwitnessed log is served unchanged — the ordinary case.
+    #[tokio::test]
+    async fn servable_serves_an_unwitnessed_log_unchanged() {
+        let key = signing_key();
+        let params = Parameters {
+            update_keys: Some(Arc::new(vec![Multibase::new(
+                key.get_public_keymultibase().unwrap(),
+            )])),
+            portable: Some(false),
+            ..Default::default()
+        };
+        let doc = doc_with_key("did:webvh:{SCID}:example.com", &key);
+        let mut state = DIDWebVHState::default();
+        state
+            .create_log_entry(None, &doc, &params, &key)
+            .await
+            .expect("genesis entry");
+        let jsonl = to_jsonl(&state);
+
+        assert_eq!(super::servable_did_log(&jsonl, None), Some(jsonl));
+    }
+
+    /// A witnessed genesis with no proof yet is not servable at all —
+    /// nothing has ever been witnessed, so there is no earlier version to
+    /// fall back to.
+    #[tokio::test]
+    async fn servable_refuses_a_witnessed_genesis_with_no_proof() {
+        let key = signing_key();
+        let (_witness_key, witness_did) = witness_identity();
+        let params = witnessed_genesis_params(&key, &witness_did, 1);
+        let doc = doc_with_key("did:webvh:{SCID}:example.com", &key);
+        let mut state = DIDWebVHState::default();
+        state
+            .create_log_entry(None, &doc, &params, &key)
+            .await
+            .expect("genesis entry");
+        let jsonl = to_jsonl(&state);
+
+        assert_eq!(super::servable_did_log(&jsonl, None), None);
+    }
+
+    /// A witnessed genesis whose proof has arrived is served in full,
+    /// including an unwitnessed republish that follows it — did:webvh's own
+    /// truncation semantics: the DID still resolves to its last witnessed
+    /// version rather than going dark the moment a new version registers.
+    #[tokio::test]
+    async fn servable_truncates_an_unwitnessed_tail_but_keeps_the_witnessed_prefix() {
+        let key = signing_key();
+        let (witness_key, witness_did) = witness_identity();
+        let params = witnessed_genesis_params(&key, &witness_did, 1);
+        let doc = doc_with_key("did:webvh:{SCID}:example.com", &key);
+
+        let mut state = DIDWebVHState::default();
+        state
+            .create_log_entry(Some(base_time()), &doc, &params, &key)
+            .await
+            .expect("genesis entry");
+        let genesis_jsonl = to_jsonl(&state);
+        let genesis_version_id = state
+            .log_entries()
+            .last()
+            .unwrap()
+            .get_version_id()
+            .to_string();
+        let genesis_doc = state.log_entries().last().unwrap().get_state().clone();
+
+        state
+            .create_log_entry(
+                Some(base_time() + Duration::seconds(1)),
+                &genesis_doc,
+                &Parameters::default(),
+                &key,
+            )
+            .await
+            .expect("second entry");
+        let full_jsonl = to_jsonl(&state);
+
+        let proof = sign_witness_proof(&witness_key, &genesis_version_id).await;
+        let witness_content = witness_file(&genesis_version_id, &proof);
+
+        assert_eq!(
+            super::servable_did_log(&full_jsonl, Some(&witness_content)),
+            Some(genesis_jsonl),
+            "only the witnessed genesis is servable; the unwitnessed republish is truncated"
+        );
+    }
+
+    /// Content that doesn't parse as a did:webvh log at all — an integration
+    /// test's simplified fixture, or unrelated bytes — is served unchanged.
+    /// Witness enforcement is not this function's call to make when it
+    /// cannot even tell whether witnessing was declared.
+    #[test]
+    fn servable_fails_open_on_content_it_cannot_parse() {
+        let fixture =
+            "{\"versionId\":\"1-test\",\"state\":{\"id\":\"did:webvh:test:example.com:alice\"}}";
+        assert_eq!(
+            super::servable_did_log(fixture, None),
+            Some(fixture.to_string())
+        );
+    }
+
+    // ---- verify_witness_proof_for_version (SEC finding #165) ----
+
+    /// A proof from the log's own configured witness, over the genesis
+    /// versionId, verifies.
+    #[tokio::test]
+    async fn witness_proof_for_version_accepts_a_proof_from_the_named_witness() {
+        let key = signing_key();
+        let (witness_key, witness_did) = witness_identity();
+        let params = witnessed_genesis_params(&key, &witness_did, 1);
+        let doc = doc_with_key("did:webvh:{SCID}:example.com", &key);
+        let mut state = DIDWebVHState::default();
+        state
+            .create_log_entry(None, &doc, &params, &key)
+            .await
+            .expect("genesis entry");
+        let jsonl = to_jsonl(&state);
+        let version_id = state
+            .log_entries()
+            .last()
+            .unwrap()
+            .get_version_id()
+            .to_string();
+
+        let proof = sign_witness_proof(&witness_key, &version_id).await;
+        let proof_value = serde_json::to_value(&proof).unwrap();
+
+        super::verify_witness_proof_for_version(&jsonl, &version_id, &proof_value)
+            .expect("a proof from the named witness, over the right versionId, must verify");
+    }
+
+    /// A proof that is cryptographically well-formed and self-consistent —
+    /// it verifies against its own embedded `did:key` — but signed by a key
+    /// the log's `witness` parameter does not name, must still be refused.
+    /// This is the actual fix: a bare signature check alone would accept
+    /// this, since a `did:key` proof always "verifies" against itself.
+    #[tokio::test]
+    async fn witness_proof_for_version_rejects_a_proof_from_an_unnamed_key() {
+        let key = signing_key();
+        let (_witness_key, witness_did) = witness_identity();
+        let params = witnessed_genesis_params(&key, &witness_did, 1);
+        let doc = doc_with_key("did:webvh:{SCID}:example.com", &key);
+        let mut state = DIDWebVHState::default();
+        state
+            .create_log_entry(None, &doc, &params, &key)
+            .await
+            .expect("genesis entry");
+        let jsonl = to_jsonl(&state);
+        let version_id = state
+            .log_entries()
+            .last()
+            .unwrap()
+            .get_version_id()
+            .to_string();
+
+        let (forger_key, _forger_did) = witness_identity();
+        let proof = sign_witness_proof(&forger_key, &version_id).await;
+        let proof_value = serde_json::to_value(&proof).unwrap();
+
+        let err = super::verify_witness_proof_for_version(&jsonl, &version_id, &proof_value)
+            .expect_err("a proof from a non-witness key must not verify");
+        assert!(err.contains("does not name a witness"), "{err}");
+    }
+
+    /// A proof naming a `versionId` this log has never published is
+    /// refused outright — there is no entry to check it against, and
+    /// nothing should be persisted for a version that doesn't exist yet.
+    #[tokio::test]
+    async fn witness_proof_for_version_rejects_an_unknown_version_id() {
+        let key = signing_key();
+        let (witness_key, witness_did) = witness_identity();
+        let params = witnessed_genesis_params(&key, &witness_did, 1);
+        let doc = doc_with_key("did:webvh:{SCID}:example.com", &key);
+        let mut state = DIDWebVHState::default();
+        state
+            .create_log_entry(None, &doc, &params, &key)
+            .await
+            .expect("genesis entry");
+        let jsonl = to_jsonl(&state);
+
+        let proof = sign_witness_proof(&witness_key, "99-doesnotexist").await;
+        let proof_value = serde_json::to_value(&proof).unwrap();
+
+        let err = super::verify_witness_proof_for_version(&jsonl, "99-doesnotexist", &proof_value)
+            .expect_err("an unpublished versionId must be refused");
+        assert!(err.contains("not in this DID's"), "{err}");
+    }
+
+    /// Malformed `proof` shape (not a `DataIntegrityProof` at all) is
+    /// refused before anything else is checked.
+    #[tokio::test]
+    async fn witness_proof_for_version_rejects_a_malformed_proof_shape() {
+        let key = signing_key();
+        let (_witness_key, witness_did) = witness_identity();
+        let params = witnessed_genesis_params(&key, &witness_did, 1);
+        let doc = doc_with_key("did:webvh:{SCID}:example.com", &key);
+        let mut state = DIDWebVHState::default();
+        state
+            .create_log_entry(None, &doc, &params, &key)
+            .await
+            .expect("genesis entry");
+        let jsonl = to_jsonl(&state);
+        let version_id = state
+            .log_entries()
+            .last()
+            .unwrap()
+            .get_version_id()
+            .to_string();
+
+        let bogus = json!({ "type": "DataIntegrityProof" });
+        let err = super::verify_witness_proof_for_version(&jsonl, &version_id, &bogus)
+            .expect_err("a malformed proof shape must be refused");
+        assert!(err.contains("invalid witness proof shape"), "{err}");
     }
 }

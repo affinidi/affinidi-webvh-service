@@ -283,7 +283,7 @@ pub struct SecretsSection {
     #[serde(default)]
     pub k8s_secret_key: Option<String>,
     /// Required when `backend = "plaintext"`. Acknowledges the recipe
-    /// will produce a config file containing private keys in clear text.
+    /// will produce a clear-text file of private keys (tests only).
     #[serde(default)]
     pub confirm_plaintext: bool,
 }
@@ -301,8 +301,25 @@ pub enum SecretsBackend {
     /// Native Kubernetes `Secret` resource.
     #[serde(rename = "k8s", alias = "kubernetes")]
     K8s,
-    /// Stores key material directly in `config.toml`. Dev only.
+    /// Keeps key material in a clear-text file beside `config.toml`.
+    /// Tests only; requires `confirm_plaintext = true`.
     Plaintext,
+}
+
+impl SecretsBackend {
+    /// The `vti-secrets` backend this recipe value selects.
+    pub fn to_vti(self) -> crate::server::secret_store::SecretBackend {
+        use crate::server::secret_store::SecretBackend as B;
+        match self {
+            Self::Keyring => B::Keyring,
+            Self::Aws => B::Aws,
+            Self::Gcp => B::Gcp,
+            Self::Azure => B::Azure,
+            Self::Vault => B::Vault,
+            Self::K8s => B::Kubernetes,
+            Self::Plaintext => B::Plaintext,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -360,23 +377,11 @@ pub struct DaemonSection {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WatcherSection {
-    /// Bearer tokens that source servers must present when pushing.
-    /// Empty disables auth (only safe on a trusted private network).
+    /// The DIDs of the control planes this watcher mirrors. Only a
+    /// `webvh/sync/*` document one of them signed is applied; empty means the
+    /// watcher accepts no sync at all.
     #[serde(default)]
-    pub push_tokens: Vec<String>,
-    #[serde(default)]
-    pub sources: Vec<WatcherSourceConfig>,
-    /// Reconcile interval in seconds. 0 disables outbound reconcile.
-    #[serde(default)]
-    pub reconcile_interval: u64,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct WatcherSourceConfig {
-    pub url: String,
-    #[serde(default)]
-    pub token: Option<String>,
+    pub source_dids: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -439,17 +444,6 @@ impl SetupRecipe {
             });
         }
 
-        // The watcher has no VTA / DID identity — only `online` makes
-        // sense (and even then it skips the VTA path entirely; we accept
-        // the value but warn nothing).
-        if service == Watcher && mode != Online {
-            return Err(RecipeError::UnsupportedMode {
-                service,
-                mode,
-                reason: "watcher has no VTA integration; only vta_mode = \"online\" is accepted",
-            });
-        }
-
         // Plaintext confirmation gate — defends CI recipes from leaking
         // into prod.
         if matches!(self.secrets.backend, Some(SecretsBackend::Plaintext))
@@ -472,7 +466,7 @@ impl SetupRecipe {
 
         // VTA section — required for any mode that talks to the VTA.
         match (service, mode) {
-            (Watcher, _) | (_, SelfManaged) => {}
+            (_, SelfManaged) => {}
             (_, Online) => {
                 if self.vta.did.is_none() {
                     return Err(RecipeError::MissingField {
@@ -638,15 +632,19 @@ mod tests {
         r.validate().expect("self-managed daemon is valid");
     }
 
+    /// The watcher has its own DID, provisioned from a VTA context like any
+    /// other service: every VTA mode is accepted, and online needs the VTA.
     #[test]
-    fn watcher_only_accepts_online_mode() {
+    fn watcher_provisions_from_a_vta_like_the_others() {
         let mut r = minimal(ServiceKind::Watcher);
-        r.deployment.vta_mode = VtaMode::OfflinePrepare;
+        r.validate().unwrap();
+        r.vta.did = None;
         assert!(matches!(
             r.validate().unwrap_err(),
-            RecipeError::UnsupportedMode { .. }
+            RecipeError::MissingField { field, .. } if field.starts_with("vta.did")
         ));
-        r.deployment.vta_mode = VtaMode::Online;
+        r.deployment.vta_mode = VtaMode::OfflinePrepare;
+        r.vta.request_path = Some(PathBuf::from("bootstrap-request.json"));
         r.validate().unwrap();
     }
 

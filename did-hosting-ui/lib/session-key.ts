@@ -6,9 +6,9 @@
  * Lifecycle:
  *  1. `generateSessionKeypair()` on login — fresh Ed25519 keypair per
  *     login via WebCrypto. Public key is encoded as an Ed25519
- *     multikey (`z6Mk…`) and sent to the server during
- *     `/api/auth/passkey/login/finish`; the server stores it on the
- *     session record. The keypair is mirrored to IndexedDB so it
+ *     multikey (`z6Mk…`); the key signs the `auth/passkey/login/finish`
+ *     document as its own `did:key`, and the server binds the new
+ *     session to it. The keypair is mirrored to IndexedDB so it
  *     survives full page reloads while the JWT is still valid.
  *  2. `signEnvelope()` on every REQUIRED-spec request — implements the
  *     `eddsa-jcs-2022` cryptosuite (W3C VC Data Integrity ed25519):
@@ -21,11 +21,14 @@
  *     session-bound `did:key`, and lets the AffinidiVerifier verify
  *     the signature.
  *
- * The private key is generated as a non-extractable `CryptoKey` —
- * IndexedDB stores the opaque wrapper, not the raw bytes; even
- * inspection through devtools cannot extract the private key material.
- * The browser's CryptoKey-to-IDB serialiser is structured-clone-aware
- * and keeps the non-extractable invariant across the round-trip.
+ * The private key is generated non-extractable (`generateKey(…, false,
+ * …)`) — IndexedDB stores the opaque wrapper, not the raw bytes, and
+ * neither devtools nor any other script in this origin can export the
+ * private key material. The browser's CryptoKey-to-IDB serialiser is
+ * structured-clone-aware and keeps the non-extractable invariant across
+ * the round-trip. That flag applies to the private key alone; the
+ * public key of a generated pair is always extractable, which is what
+ * lets `generateSessionKeypair()` read the raw 32 public bytes out.
  *
  * Storage scope: per-origin (the standard IndexedDB scope). Multiple
  * tabs on the same origin share the same persisted keypair, which
@@ -70,14 +73,24 @@ export async function generateSessionKeypair(): Promise<{
   }
 
   // Ed25519 in WebCrypto is supported on Chrome 137+, Firefox 130+,
-  // Safari 17+. `extractable=true` is needed to export the raw public
-  // key bytes; the private key stays inside the CryptoKey wrapper and
-  // is used only via `crypto.subtle.sign(...)`. IndexedDB's
-  // structured-clone serialiser preserves the wrapper across the
-  // round-trip without exposing key material.
+  // Safari 17+.
+  //
+  // The `extractable` argument governs the **private** key only. For an
+  // asymmetric generateKey, WebCrypto sets `publicKey.[[extractable]]`
+  // to `true` unconditionally (Web Cryptography API, "generateKey" —
+  // the public key of a key pair is always extractable), so the
+  // `exportKey("raw", publicKey)` below returns the 32 public bytes
+  // either way. Passing `true` here would buy nothing for the public
+  // key and would make `exportKey("pkcs8" | "jwk", privateKey)` succeed
+  // — i.e. hand the session signing key to any script running in this
+  // origin. `false` makes that export throw `InvalidAccessError`, which
+  // is the whole point: the private key is usable only via
+  // `crypto.subtle.sign(...)` and cannot be read out. Structured clone
+  // carries a non-extractable key into IndexedDB with the flag intact,
+  // so persistence does not reopen the hole.
   const keypair = (await crypto.subtle.generateKey(
     { name: "Ed25519" },
-    true,
+    false,
     ["sign", "verify"],
   )) as CryptoKeyPair;
 
@@ -116,6 +129,19 @@ export async function generateSessionKeypair(): Promise<{
  * to attempt an IDB restore before checking. */
 export function hasSessionKeypair(): boolean {
   return sessionKeypair !== null;
+}
+
+/** The current session keypair's `did:key`, or `null` if none is cached.
+ * Synchronous, same caveat as {@link hasSessionKeypair}: call
+ * `restoreSessionKeypair()` first if the cache may be empty after a reload.
+ *
+ * Callers that build their own envelope around this key — the auth family's
+ * `auth/authenticate/0.3` and `auth/refresh/0.2` calls, which the session key
+ * signs as its *own* issuer rather than as a delegate for the session's
+ * subject (see `trust-task.ts`'s `"fresh-session-key"` signer) — read this to
+ * set `issuer` to the same `did:key` {@link signEnvelope} signs with. */
+export function getSessionDidKey(): string | null {
+  return sessionDidKey;
 }
 
 /**
@@ -227,7 +253,9 @@ export async function signEnvelope<T extends SignableEnvelope>(
     cryptosuite: "eddsa-jcs-2022",
     verificationMethod: `${sessionDidKey}#${sessionDidKey.slice("did:key:".length)}`,
     created: new Date(Date.now() - CREATED_BACKDATE_MS).toISOString(),
-    proofPurpose: "assertionMethod",
+    // Operational, not an attestation: the control plane accepts only
+    // `authentication` proofs on the envelopes a session signs.
+    proofPurpose: "authentication",
   };
 
   // Hash the proof config and the doc (envelope minus proof).

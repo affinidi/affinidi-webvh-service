@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 
 use crate::server::acl::Role;
 use crate::server::auth::jwt::JwtKeys;
-use crate::server::auth::session::{SessionState, get_session};
+use crate::server::auth::session::{SessionState, get_session, now_epoch, touch_last_seen};
 use crate::server::error::AppError;
 use crate::server::store::KeyspaceHandle;
 
@@ -20,6 +20,19 @@ use crate::server::store::KeyspaceHandle;
 pub trait AuthState: Clone + Send + Sync + 'static {
     fn jwt_keys(&self) -> Option<&Arc<JwtKeys>>;
     fn sessions_ks(&self) -> &KeyspaceHandle;
+
+    /// Whether `did` holds at least one step-up-only passkey credential
+    /// (`KS_PASSKEY_STEP_UP`).
+    ///
+    /// Consulted by [`AuthClaims`] to close a TOCTOU on
+    /// `demote_non_passkey_step_up_sessions`: a concurrent `/auth/refresh`
+    /// can read the session row before demotion and write an `aal2`/
+    /// passkey-less row back after it, resurrecting an elevation this
+    /// relying party no longer honours for a subject who has since
+    /// enrolled a step-up passkey. The store read only happens for an
+    /// `aal2` session whose `amr` lacks a passkey factor, so this is rare
+    /// on the hot path.
+    fn has_step_up_passkey(&self, did: &str) -> impl std::future::Future<Output = bool> + Send;
 }
 
 /// Extracted from a valid JWT Bearer token on protected routes.
@@ -42,11 +55,16 @@ pub struct AuthClaims {
     /// `verificationMethod` came from the same session that issued the
     /// JWT.
     pub session_pubkey_b58btc: Option<String>,
-    /// Authentication methods on the session's token (`["did"]` base,
-    /// plus `"webauthn"`/`"vta"` after a step-up).
+    /// Authentication methods on the session (`["did"]` base, plus
+    /// `"webauthn"`/`"vta"` after a step-up). Read from the session row,
+    /// not the JWT — see [`FromRequestParts`] impl below — so a demotion
+    /// (e.g. `demote_non_passkey_step_up_sessions`) is reflected on the
+    /// very next request rather than waiting for the token to be refreshed.
     pub amr: Vec<String>,
-    /// Assurance level on the session's token (`"aal1"` base, `"aal2"`
-    /// after a step-up). Gated by [`StepUpAuth`].
+    /// Assurance level on the session (`"aal1"` base, `"aal2"` after a
+    /// step-up). Gated by [`StepUpAuth`]. `"aal2"` only when the JWT, the
+    /// session row, and (for a passkey-holding subject) the row's `amr`
+    /// all agree — see the extractor impl for the exact rule.
     pub acr: String,
 }
 
@@ -105,6 +123,69 @@ impl<S: AuthState> FromRequestParts<S> for AuthClaims {
 
         let role = claims.role.parse::<Role>()?;
 
+        // The session row, not the JWT, is authoritative for assurance.
+        //
+        // A JWT is a point-in-time snapshot: it keeps whatever `acr`/`amr`
+        // it was minted with until it expires, however the session that
+        // issued it is demoted in the meantime (e.g. a step-up passkey
+        // lands and `demote_non_passkey_step_up_sessions` drops the row to
+        // `aal1`). Re-deriving `acr`/`amr` here — the session is already
+        // loaded on every request — means a demotion takes effect on the
+        // very next request rather than waiting for the token to expire
+        // or be refreshed.
+        //
+        // Effective `acr` is `"aal2"` only when *both* the JWT and the row
+        // say so, and the row's `acr_expires_at`, when set, has not yet
+        // passed (an unset deadline is a login-time `aal2` with no lapse
+        // window, not "never elevated" — see `Session::acr_expires_at`).
+        // Otherwise it is `"aal1"`. `amr` always comes from the row: it is
+        // the same authority, and a stale JWT's `amr` is exactly what a
+        // demotion needs to stop being trusted.
+        let now = now_epoch();
+        let row_says_aal2 =
+            session.acr == "aal2" && session.acr_expires_at.is_none_or(|deadline| now < deadline);
+        let mut acr = if claims.acr == "aal2" && row_says_aal2 {
+            "aal2".to_string()
+        } else {
+            "aal1".to_string()
+        };
+        let amr = session.amr.clone();
+
+        // Close the TOCTOU on that same demotion: a concurrent `/auth/refresh`
+        // can read the pre-demotion row and write an `aal2`/passkey-less row
+        // back after `demote_non_passkey_step_up_sessions` already ran,
+        // resurrecting an elevation this relying party no longer honours for
+        // a subject who has since enrolled a step-up passkey. Enforced here,
+        // at the point assurance is actually used, rather than relied on
+        // demotion alone to have already closed it.
+        if acr == "aal2"
+            && !amr.iter().any(|m| m == "passkey")
+            && state.has_step_up_passkey(&session.did).await
+        {
+            acr = "aal1".to_string();
+        }
+
+        // Record the activity the idle timeout is measured against.
+        //
+        // Every client here is a bearer client, so unlike a cookie-session
+        // console there is no token source to tell a browser from a service
+        // integration apart by — the throttle inside `touch_last_seen` is
+        // what keeps this from becoming a store write per request.
+        //
+        // The renewal endpoint deliberately does not pass through this
+        // extractor, so a client's refresh timer cannot keep its own session
+        // alive: only requests that do actual work count as activity.
+        //
+        // Best-effort. A failed touch must not fail an otherwise valid
+        // request — it costs an early sign-out, never access.
+        if let Err(e) = touch_last_seen(state.sessions_ks(), &session, now).await {
+            warn!(
+                session_id = %claims.session_id,
+                error = %e,
+                "failed to record session activity; session may idle out early",
+            );
+        }
+
         debug!(did = %claims.sub, role = %claims.role, session_id = %claims.session_id, "request authenticated");
 
         Ok(AuthClaims {
@@ -112,9 +193,37 @@ impl<S: AuthState> FromRequestParts<S> for AuthClaims {
             role,
             session_id: claims.session_id,
             session_pubkey_b58btc: session.session_pubkey_b58btc,
-            amr: claims.amr,
-            acr: claims.acr,
+            amr,
+            acr,
         })
+    }
+}
+
+/// An optional bearer session: `None` when the request carries no
+/// `Authorization` header at all, the authenticated claims when it carries a
+/// valid one — and a refusal, exactly as [`AuthClaims`] refuses, when it
+/// carries one that does not authenticate. A bad credential is never quietly
+/// treated as none.
+///
+/// For the one route that authorises on something other than a bearer
+/// session — `POST /api/trust-tasks`, where a signed document is the
+/// authorisation and a bearer session only adds the session's context.
+impl<S: AuthState> axum::extract::OptionalFromRequestParts<S> for AuthClaims {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        if !parts
+            .headers
+            .contains_key(axum::http::header::AUTHORIZATION)
+        {
+            return Ok(None);
+        }
+        <AuthClaims as FromRequestParts<S>>::from_request_parts(parts, state)
+            .await
+            .map(Some)
     }
 }
 
@@ -213,6 +322,19 @@ mod tests {
     struct TestState {
         keys: Arc<JwtKeys>,
         ks: KeyspaceHandle,
+        /// Stand-in for `KS_PASSKEY_STEP_UP`: DIDs marked here are reported
+        /// by `has_step_up_passkey` as holding a step-up passkey, without
+        /// standing up the real WebAuthn credential store.
+        step_up_passkey_dids: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    }
+
+    impl TestState {
+        fn mark_step_up_passkey(&self, did: &str) {
+            self.step_up_passkey_dids
+                .lock()
+                .unwrap()
+                .insert(did.to_string());
+        }
     }
 
     impl AuthState for TestState {
@@ -221,6 +343,10 @@ mod tests {
         }
         fn sessions_ks(&self) -> &KeyspaceHandle {
             &self.ks
+        }
+        fn has_step_up_passkey(&self, did: &str) -> impl std::future::Future<Output = bool> + Send {
+            let has = self.step_up_passkey_dids.lock().unwrap().contains(did);
+            async move { has }
         }
     }
 
@@ -234,7 +360,16 @@ mod tests {
         .unwrap();
         let ks = store.keyspace(KS_SESSIONS).unwrap();
         let keys = Arc::new(JwtKeys::from_ed25519_bytes(&[9u8; 32]).unwrap());
-        (TestState { keys, ks }, dir)
+        (
+            TestState {
+                keys,
+                ks,
+                step_up_passkey_dids: Arc::new(std::sync::Mutex::new(
+                    std::collections::HashSet::new(),
+                )),
+            },
+            dir,
+        )
     }
 
     fn parts_with_bearer(token: &str) -> axum::http::request::Parts {
@@ -283,6 +418,28 @@ mod tests {
             60,
         );
         claims.jti = jti.into();
+        state.keys.encode(&claims).unwrap()
+    }
+
+    /// Like [`issue`], but with a caller-chosen `amr`/`acr` — for exercising
+    /// a JWT minted at `aal2` before the session it belongs to is demoted.
+    fn issue_with_aal(
+        state: &TestState,
+        session_id: &str,
+        role: &str,
+        jti: &str,
+        amr: Vec<String>,
+        acr: &str,
+    ) -> String {
+        let mut claims = JwtKeys::new_claims(
+            "did:example:caller".into(),
+            session_id.into(),
+            role.into(),
+            60,
+        );
+        claims.jti = jti.into();
+        claims.amr = amr;
+        claims.acr = acr.into();
         state.keys.encode(&claims).unwrap()
     }
 
@@ -431,5 +588,151 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    /// #192: a JWT minted while a session was `aal2` must not outlive that
+    /// session's demotion. Once `demote_non_passkey_step_up_sessions` drops
+    /// the row to `aal1` (a step-up passkey landed for the subject), the
+    /// still-`aal2` JWT is read back as `aal1` on the very next request —
+    /// the session row is authoritative, not the token.
+    #[tokio::test]
+    async fn a_stale_aal2_jwt_is_aal1_after_demotion() {
+        let (state, _dir) = make_state().await;
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let session = Session {
+            session_id: session_id.clone(),
+            did: "did:example:caller".into(),
+            challenge: String::new(),
+            state: SessionState::Authenticated,
+            created_at: 0,
+            last_seen: 0,
+            refresh_token: None,
+            refresh_expires_at: None,
+            tee_attested: false,
+            token_id: Some("tok".into()),
+            session_pubkey_b58btc: None,
+            // Elevated without a passkey factor — exactly what
+            // `demote_non_passkey_step_up_sessions` targets.
+            amr: vec!["did".to_string()],
+            acr: "aal2".into(),
+            acr_expires_at: None,
+        };
+        store_session(&state.ks, &session).await.unwrap();
+        // Minted while the row was still aal2.
+        let stale_token = issue_with_aal(
+            &state,
+            &session_id,
+            "owner",
+            "tok",
+            vec!["did".to_string()],
+            "aal2",
+        );
+
+        let demoted = crate::server::auth::session::demote_non_passkey_step_up_sessions(
+            &state.ks,
+            "did:example:caller",
+        )
+        .await
+        .unwrap();
+        assert_eq!(demoted, 1);
+
+        let mut parts = parts_with_bearer(&stale_token);
+        let claims = AuthClaims::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap();
+        assert_eq!(claims.acr, "aal1", "the demoted row must win over the JWT");
+        assert_eq!(claims.amr, vec!["did".to_string()]);
+    }
+
+    /// #190: closes the TOCTOU on demotion. A concurrent `/auth/refresh` can
+    /// read the session before it is demoted and write an `aal2`/passkey-less
+    /// row back after — resurrecting an elevation the relying party no
+    /// longer honours once the subject holds a step-up passkey. The
+    /// extractor must catch this at use-time, not rely on demotion alone.
+    #[tokio::test]
+    async fn a_refreshed_aal2_row_without_passkey_amr_is_aal1_for_a_passkey_holder() {
+        let (state, _dir) = make_state().await;
+        state.mark_step_up_passkey("did:example:caller");
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let session = Session {
+            session_id: session_id.clone(),
+            did: "did:example:caller".into(),
+            challenge: String::new(),
+            state: SessionState::Authenticated,
+            created_at: 0,
+            last_seen: 0,
+            refresh_token: None,
+            refresh_expires_at: None,
+            tee_attested: false,
+            token_id: Some("tok".into()),
+            session_pubkey_b58btc: None,
+            // As if a refresh just re-minted aal2 with the pre-demotion amr —
+            // the row and the JWT agree, but neither carries a passkey factor.
+            amr: vec!["did".to_string()],
+            acr: "aal2".into(),
+            acr_expires_at: None,
+        };
+        store_session(&state.ks, &session).await.unwrap();
+        let token = issue_with_aal(
+            &state,
+            &session_id,
+            "owner",
+            "tok",
+            vec!["did".to_string()],
+            "aal2",
+        );
+
+        let mut parts = parts_with_bearer(&token);
+        let claims = AuthClaims::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap();
+        assert_eq!(
+            claims.acr, "aal1",
+            "a passkey-holding subject's non-passkey aal2 must not survive, \
+             even when the JWT and row agree"
+        );
+    }
+
+    /// A session whose `amr` already contains `"passkey"` is untouched by
+    /// the use-time check, even for a subject who holds a step-up passkey —
+    /// it already satisfies the rule that now applies.
+    #[tokio::test]
+    async fn an_aal2_session_with_passkey_amr_is_left_at_aal2() {
+        let (state, _dir) = make_state().await;
+        state.mark_step_up_passkey("did:example:caller");
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let session = Session {
+            session_id: session_id.clone(),
+            did: "did:example:caller".into(),
+            challenge: String::new(),
+            state: SessionState::Authenticated,
+            created_at: 0,
+            last_seen: 0,
+            refresh_token: None,
+            refresh_expires_at: None,
+            tee_attested: false,
+            token_id: Some("tok".into()),
+            session_pubkey_b58btc: None,
+            amr: vec!["did".to_string(), "passkey".to_string()],
+            acr: "aal2".into(),
+            acr_expires_at: None,
+        };
+        store_session(&state.ks, &session).await.unwrap();
+        let token = issue_with_aal(
+            &state,
+            &session_id,
+            "owner",
+            "tok",
+            vec!["did".to_string(), "passkey".to_string()],
+            "aal2",
+        );
+
+        let mut parts = parts_with_bearer(&token);
+        let claims = AuthClaims::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap();
+        assert_eq!(claims.acr, "aal2");
     }
 }

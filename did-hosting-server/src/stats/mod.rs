@@ -12,61 +12,46 @@ pub use did_hosting_common::server::stats_collector::{StatsAggregate, StatsColle
 
 use affinidi_messaging_didcomm_service::DIDCommService;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Monotonic sequence counter for stats sync idempotency.
 static SYNC_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Push per-DID stat deltas to the control plane via HTTP.
+/// Push per-DID stat deltas to the control plane over the messaging transport.
 ///
-/// Drains the collector's accumulated deltas. If nothing changed since the
-/// last sync, the HTTP POST is skipped entirely (zero cost when idle).
-/// Each payload includes a monotonic sequence number so the control plane
-/// can detect replayed or out-of-order payloads.
-pub async fn sync_to_control(
-    http: &reqwest::Client,
-    control_url: &str,
-    server_did: &str,
-    collector: &StatsCollector,
-) {
-    let deltas = collector.drain_for_sync();
-    if deltas.is_empty() {
-        return; // Nothing changed — skip the POST
-    }
-
-    let seq = SYNC_SEQ.fetch_add(1, Ordering::Relaxed);
-
-    let payload = did_hosting_common::StatsSyncPayload {
-        server_did: server_did.to_string(),
-        seq,
-        did_deltas: deltas,
-    };
-
-    let url = format!("{control_url}/api/control/stats");
-    match http.post(&url).json(&payload).send().await {
-        Ok(_) => {
-            #[cfg(feature = "metrics")]
-            did_hosting_common::server::metrics::inc_stats_sync();
-        }
-        Err(e) => {
-            warn!(error = %e, url = %url, "failed to sync stats to control plane");
-        }
-    }
-}
-
-/// Push per-DID stat deltas to the control plane via DIDComm.
+/// The binding (TSP or DIDComm) follows the control plane's DID document;
+/// there is no HTTPS side channel to the control plane.
 ///
-/// Same semantics as `sync_to_control` but routes through the mediator
-/// instead of requiring direct HTTP access to the control plane.
-pub async fn sync_to_control_didcomm(
+/// Sent as a signed `.../server/stats-sync/0.1` trust task: the control plane
+/// credits the deltas to the server whose DID signed the document, so an
+/// unsigned push — the bare-message form this replaced — is refused there.
+pub async fn sync_to_control_messaging(
     svc: &DIDCommService,
+    state: &crate::server::AppState,
     server_did: &str,
     control_did: &str,
     collector: &StatsCollector,
 ) {
-    use affinidi_messaging_didcomm::Message;
     use did_hosting_common::didcomm_types::MSG_STATS_SYNC;
+    use did_hosting_common::server::didcomm_profile::TransportFallback;
+    use did_hosting_common::server::trust_tasks::send::{build_signed_request, send_trust_task};
     use serde_json::json;
+
+    // Resolve the signer before draining, so a node that cannot sign keeps
+    // its deltas for a later tick instead of discarding them.
+    let Some(identity) = state.identity.as_deref() else {
+        debug!("stats sync skipped: service identity not loaded, cannot sign");
+        return;
+    };
+    let signer = match did_hosting_common::server::trust_tasks::identity_signing_secret(
+        identity, server_did,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!(error = %e, "stats sync skipped: no signing key");
+            return;
+        }
+    };
 
     let deltas = collector.drain_for_sync();
     if deltas.is_empty() {
@@ -88,26 +73,32 @@ pub async fn sync_to_control_didcomm(
         })
         .collect();
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let body = json!({
+        "server_did": server_did,
+        "seq": seq,
+        "did_deltas": did_deltas,
+    });
 
-    let msg = Message::build(
-        uuid::Uuid::new_v4().to_string(),
-        MSG_STATS_SYNC.to_string(),
-        json!({
-            "server_did": server_did,
-            "seq": seq,
-            "did_deltas": did_deltas,
-        }),
-    )
-    .from(server_did.to_string())
-    .to(control_did.to_string())
-    .created_time(now)
-    .finalize();
-
-    if let Err(e) = svc.send_message("server", msg, control_did).await {
-        debug!(error = %e, "failed to sync stats to control plane via DIDComm");
+    let fallback = TransportFallback::from_config(
+        state.config.mediator_did.as_deref(),
+        state.config.features.tsp,
+    );
+    let sent =
+        match build_signed_request(MSG_STATS_SYNC, server_did, control_did, body, &signer).await {
+            Ok(doc) => send_trust_task(
+                svc,
+                "server",
+                server_did,
+                control_did,
+                &doc,
+                &fallback,
+                state.did_resolver.as_ref(),
+            )
+            .await
+            .map(|_| ()),
+            Err(e) => Err(e),
+        };
+    if let Err(e) = sent {
+        debug!(error = %e, "failed to sync stats to control plane (trust task)");
     }
 }

@@ -102,6 +102,21 @@ async fn handle_inner(
         )
     })?;
 
+    // The subject must be a DID. Resolving an agent name to its DID is the
+    // client's job (the console does it through `agent-name/resolve`); a
+    // name stored verbatim would be an ACL entry no signer can ever match.
+    if proposed
+        .did
+        .parse::<affinidi_tdk::did_common::DID>()
+        .is_err()
+    {
+        return Err(reject_with(
+            &doc,
+            ErrorPayload::new(StandardCode::MalformedRequest)
+                .with_message("the entry's subject is not a DID; resolve an agent name first"),
+        ));
+    }
+
     // ─── 3. Spec invariants on the proposed entry shape. ──────────
     // The spec models scopes as an opaque string array (e.g.
     // `["context:project-alpha"]`). We don't model webvh's domain
@@ -413,10 +428,28 @@ mod tests {
             cryptosuite: "eddsa-rdfc-2022".into(),
             verification_method: "did:web:admin.example#key-1".into(),
             created: chrono::Utc::now(),
-            proof_purpose: "assertionMethod".into(),
+            proof_purpose: "authentication".into(),
             proof_value: "z-stub".into(),
             extra: Default::default(),
         });
+    }
+
+    #[tokio::test]
+    async fn a_subject_that_is_not_a_did_is_refused() {
+        let (_store, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        let ctx = ctx(&acl_ks, &acl_locks);
+        let transport = transport(ADMIN_DID);
+        let doc = grant_request(ADMIN_DID, "alice@example.com", "owner");
+
+        let outcome = handle(&ctx, &transport, no_verifier(), doc).await;
+
+        match outcome {
+            DispatchOutcome::Rejected(e) => {
+                assert!(serde_json::to_string(&e).unwrap().contains("not a DID"));
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
     }
 
     #[tokio::test]

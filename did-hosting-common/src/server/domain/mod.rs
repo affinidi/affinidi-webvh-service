@@ -29,6 +29,7 @@ pub mod scope;
 pub mod seed;
 pub mod store;
 pub mod types;
+pub mod wire;
 
 pub use detect::{HostHeaders, parse_forwarded_host, parse_trusted_cidrs, resolve_request_host};
 pub use normalize::normalize_domain_name;

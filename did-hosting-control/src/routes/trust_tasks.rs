@@ -1,13 +1,10 @@
 //! `POST /api/trust-tasks` — the Trust Tasks transport endpoint
 //! introduced in v0.7.0.
 //!
-//! Receives a JSON-encoded `TrustTask<serde_json::Value>` envelope,
-//! authenticates the caller via the existing JWT-bearer flow, and
-//! hands the document to [`did_hosting_common::server::trust_tasks::dispatch_inbound`].
-//! The dispatch layer narrows the untyped document to one of the six
-//! typed handlers (five `acl/*` + `trust-task-discovery`), runs
-//! SPEC.md §7.2 items 4–8 against it, and produces a typed response
-//! or routed error.
+//! Receives a JSON-encoded `TrustTask<serde_json::Value>` document and hands
+//! it to `messaging::dispatch_trust_task_doc` — the same dispatch TSP and
+//! DIDComm use. The document's proof is the authorisation; a bearer session
+//! is optional context.
 //!
 //! ## Body-parse failures are spec-conformant
 //!
@@ -36,30 +33,123 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 use trust_tasks_https::{HttpsHandler, status_for_code};
-use trust_tasks_rs::{ErrorPayload, ProofPolicy, RejectReason, TrustTask};
+use trust_tasks_rs::{ErrorPayload, RejectReason, TrustTask};
 use uuid::Uuid;
 
-use did_hosting_common::server::trust_tasks::{
-    DispatchOutcome, TransportBoundVerifier, TrustTaskContext, build_dispatcher, dispatch_inbound,
-};
+use did_hosting_common::server::trust_tasks::DispatchOutcome;
 
 use crate::auth::AuthClaims;
 use crate::error::AppError;
 use crate::server::AppState;
 
-/// `POST /api/trust-tasks` handler.
+/// The mounted `POST /api/trust-tasks` route: [`dispatch_trust_task`], after
+/// the per-source limit on invite redemption.
 ///
-/// Bearer-auth'd via [`AuthClaims`]; the caller's DID becomes the
-/// transport-authenticated peer for SPEC.md §4.8.1 precedence inside
-/// each typed handler.
+/// `auth/passkey/enroll/redeem/start` is the one task a stranger may send that
+/// makes the service hash a guess (the claim code, with Argon2). Over HTTPS
+/// the only source a stranger cannot choose is the client IP, so it is counted
+/// here, before the document is parsed any further; the messaging transports
+/// count their authenticated sender in the task itself.
+pub async fn trust_tasks_endpoint(
+    auth: Option<AuthClaims>,
+    State(state): State<AppState>,
+    connect: Result<
+        axum::extract::ConnectInfo<std::net::SocketAddr>,
+        <axum::extract::ConnectInfo<std::net::SocketAddr> as axum::extract::FromRequestParts<
+            AppState,
+        >>::Rejection,
+    >,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, AppError> {
+    // The client IP, resolved the same way whether it is about to gate an
+    // invite redemption or a large document's per-address budget below —
+    // both count the one source a stranger cannot choose over HTTPS.
+    //
+    // A request with no connection address is refused rather than counted
+    // under a shared placeholder: every production server is built with
+    // `into_make_service_with_connect_info`, so its absence is a wiring
+    // fault, and a shared bucket would skip the redemption limit and pool
+    // every such caller's large-document budget.
+    let Ok(axum::extract::ConnectInfo(addr)) = connect else {
+        tracing::error!(
+            "trust-tasks request without a connection address; the server must be built with \
+             into_make_service_with_connect_info"
+        );
+        return Err(AppError::Internal(
+            "no connection address for this request".into(),
+        ));
+    };
+    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    let ip =
+        crate::rate_limit::resolve_client_ip(addr.ip(), xff, &state.config.server.trusted_proxies);
+    let client_ip = Some(ip);
+    if is_redeem_start(&body) {
+        let limited = state.redeem_rate_limiter.try_consume(
+            &format!("ip:{ip}"),
+            did_hosting_common::server::auth::session::now_epoch(),
+        );
+        if let Err(AppError::RateLimited {
+            retry_after_secs, ..
+        }) = limited
+        {
+            tracing::warn!(%ip, "invite redemption rate limited");
+            // Refused as the task would be — a routed `unavailable` document
+            // with its retry time — not as a bare REST 429.
+            if let Ok(doc) = serde_json::from_slice::<TrustTask<Value>>(&body) {
+                let reject = RejectReason::Unavailable {
+                    retry_after: Some(
+                        chrono::Utc::now() + chrono::Duration::seconds(retry_after_secs as i64),
+                    ),
+                };
+                let routed = doc.reject_with(format!("urn:uuid:{}", Uuid::new_v4()), reject);
+                return Ok(into_response(DispatchOutcome::Rejected(routed)));
+            }
+        }
+    }
+    dispatch_trust_task(auth, State(state), client_ip, body).await
+}
+
+/// Whether `body` is an `auth/passkey/enroll/redeem/start` document.
+///
+/// Read exactly as [`dispatch_trust_task`] and the task table read it — the
+/// whole body as a `TrustTask`, its parsed `type` compared as the router
+/// compares it — so no body the router serves as a redemption (duplicate
+/// members, escapes, any other quirk of a lighter parse) slips past the limit.
+fn is_redeem_start(body: &[u8]) -> bool {
+    use trust_tasks_rs::Payload;
+    serde_json::from_slice::<TrustTask<Value>>(body).is_ok_and(|doc| {
+        doc.type_uri.to_string()
+            == trust_tasks_rs::specs::auth::passkey::enroll::redeem::start::v0_1::Payload::TYPE_URI
+    })
+}
+
+/// `POST /api/trust-tasks` handler — the HTTPS binding of the same dispatch
+/// TSP and DIDComm use.
+///
+/// The document's own proof is the authorisation, exactly as on the other two
+/// transports; a bearer session is optional. Without one the document's
+/// in-band `issuer` stands where a messaging transport's reported sender
+/// would — a routing hint the proof must agree with — and a task whose
+/// `ProofRule` is `Optional` (`server/info`, opening a passkey login) may be
+/// sent with neither. With one, the session is the peer, a proof must be bound
+/// to it (below), and the session's assurance level travels with the request.
 ///
 /// Body is accepted as raw bytes so a parse failure surfaces as a
 /// `trust-task-error` document with `code: malformed_request`
 /// rather than axum's text/plain default. The route mount caps body
-/// size separately (see [`crate::routes::TRUST_TASKS_BODY_LIMIT`]).
+/// size separately (see [`crate::routes::trust_tasks_body_limit_bytes`]);
+/// the per-type narrowing below is what actually decides most requests.
+///
+/// `client_ip`, when known, is this document's address for the per-address
+/// large-document budget below (`ip:{client_ip}`) — `None` for a direct,
+/// non-HTTPS call (tests exercising this handler without a real socket),
+/// which then shares one placeholder address rather than being charged
+/// against nothing.
 pub async fn dispatch_trust_task(
-    auth: AuthClaims,
+    auth: Option<AuthClaims>,
     State(state): State<AppState>,
+    client_ip: Option<std::net::IpAddr>,
     body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
     // ─── 1. Service DID required. Without one configured the §7.2
@@ -71,6 +161,36 @@ pub async fn dispatch_trust_task(
         .server_did
         .as_deref()
         .ok_or_else(|| AppError::Config("server_did not configured".into()))?;
+
+    // ─── 1b. Per-type document size, decided from the body alone —
+    //         before it is parsed into `TrustTask<Value>` — on every
+    //         transport (`size`). The route mount already caps the raw
+    //         body at the largest limit any served type declares
+    //         (`crate::routes::trust_tasks_body_limit_bytes`); this
+    //         narrows further for a type whose own limit is smaller.
+    //
+    //         A document large enough to need its claimed (not yet
+    //         verified) issuer's ACL entry for the raised limit is charged
+    //         against that address's large-document budget first — see
+    //         `size`'s module docs for why an unverified claim alone would
+    //         otherwise be a DoS amplifier.
+    let address = client_ip
+        .map(|ip| format!("ip:{ip}"))
+        .unwrap_or_else(|| "ip:unknown".to_string());
+    let large_doc_charge =
+        match did_hosting_common::server::trust_tasks::size::check_for_known_issuer(
+            &body,
+            &crate::control_tasks::SERVED_TRUST_TASK_URIS,
+            &state.acl_ks,
+            &state.large_document_budget,
+            &address,
+            did_hosting_common::server::auth::session::now_epoch(),
+        )
+        .await
+        {
+            Ok(charge) => charge,
+            Err(err) => return Ok(into_response(DispatchOutcome::Rejected(err))),
+        };
 
     // ─── 2. Parse the body to `TrustTask<Value>`. A parse failure
     //        emits a routed `trust-task-error` document with
@@ -84,129 +204,118 @@ pub async fn dispatch_trust_task(
         }
     };
 
-    // ─── 3. Proof-verificationMethod binding pre-check (SECURITY).
+    // Replay protection runs inside `dispatch_trust_task_doc`, keyed on the
+    // proven issuer and the document id, after the proof has been verified.
+
+    // ─── 3. With a bearer session, the proof must be bound to it (SECURITY).
     //
-    // Two cases, depending on how the JWT was issued:
+    // Two keys may sign for the session's subject:
     //
-    // (a) JWT carries an ephemeral session pubkey (passkey Web UI flow).
-    //     The proof's `verificationMethod` MUST be the matching
-    //     `did:key:{pk}#{pk}` URL. Otherwise the proof was signed by a key
-    //     the server hasn't bound to this JWT — even if the signature
-    //     verifies, accepting it would let any key holder forge requests
-    //     as the JWT subject.
+    // (a) The subject's own key: the proof's `verificationMethod` belongs to
+    //     the session's DID. Always accepted. It is what a wallet signs an
+    //     approval or a refresh with, even in a session that has a key bound.
     //
-    // (b) JWT carries no session pubkey (wallet SIOPv2 flow, machine-to-
-    //     machine auth). The proof's `verificationMethod` MUST resolve to
-    //     a DID that matches `auth.did` (the JWT `sub`). Without this
-    //     check, the framework's verifier would happily accept a proof
-    //     from ANY resolvable DID — letting a wallet user with one
-    //     authenticated session sign trust-tasks attributed to a totally
-    //     different DID, as long as that other DID's key can be resolved.
+    // (b) The session key bound at login (`auth/authenticate/0.2`
+    //     `sessionKey`, or a passkey login's browser key): exactly
+    //     `did:key:{pk}#{pk}`, and only for a task a session key may sign
+    //     (`session_key_may_sign`). Never an approval, and never the auth
+    //     family, so it cannot step itself up or outlive the login.
     //
-    // The framework's verifier handles signature verification + DID
-    // resolution; this pre-check enforces caller binding *before*
-    // verification so a forged-attribution attempt is rejected with the
-    // explicit reason rather than a generic "proof_invalid".
-    if let Some(proof) = doc.proof.as_ref() {
-        if let Some(pk) = auth.session_pubkey_b58btc.as_deref() {
-            // Case (a): session-key flow.
-            let expected_vm = format!("did:key:{pk}#{pk}");
-            if proof.verification_method != expected_vm {
-                tracing::warn!(
-                    actual_vm = %proof.verification_method,
-                    expected_vm,
-                    "trust-task proof verificationMethod does not match the JWT-bound \
-                     session pubkey — rejecting as proof_invalid"
-                );
-                let reject = RejectReason::ProofInvalid {
-                    reason: "proof verificationMethod is not bound to this session".to_string(),
-                };
-                let routed = doc.reject_with(format!("urn:uuid:{}", Uuid::new_v4()), reject);
-                return Ok(into_response(DispatchOutcome::Rejected(routed)));
-            }
-        } else {
-            // Case (b): no session-key bound; verify the proof's DID matches
-            // the authenticated caller (JWT.sub).
-            let proof_did = proof
-                .verification_method
-                .split_once('#')
-                .map(|(d, _)| d)
-                .unwrap_or("");
-            if proof_did != auth.did {
-                tracing::warn!(
-                    proof_did = %proof_did,
-                    auth_did = %auth.did,
-                    "trust-task proof verificationMethod DID does not match the \
-                     authenticated caller — rejecting as proof_invalid"
-                );
-                let reject = RejectReason::ProofInvalid {
-                    reason: "proof verificationMethod DID does not match the authenticated caller"
-                        .to_string(),
-                };
-                let routed = doc.reject_with(format!("urn:uuid:{}", Uuid::new_v4()), reject);
-                return Ok(into_response(DispatchOutcome::Rejected(routed)));
-            }
+    // Anything else is refused, or any resolvable DID's key could be
+    // attributed to the subject. Checked before verification, so a forged
+    // attribution is refused with its reason rather than a generic
+    // `proofInvalid`.
+    let session_key_vm = auth
+        .as_ref()
+        .and_then(|a| a.session_pubkey_b58btc.as_deref())
+        .filter(|_| crate::messaging::session_key_may_sign(&doc.type_uri.to_string()))
+        .map(|pk| format!("did:key:{pk}#{pk}"));
+    if let (Some(auth), Some(proof)) = (auth.as_ref(), doc.proof.as_ref()) {
+        let own_key = did_hosting_common::server::trust_tasks::verifier::controller_did(
+            &proof.verification_method,
+        ) == auth.did;
+        let session_key = session_key_vm.as_deref() == Some(proof.verification_method.as_str());
+        if !own_key && !session_key {
+            tracing::warn!(
+                actual_vm = %proof.verification_method,
+                auth_did = %auth.did,
+                session_key_vm = ?session_key_vm,
+                type_uri = %doc.type_uri,
+                "trust-task proof is neither the session subject's key nor a session key \
+                 this task accepts — rejecting as proof_invalid"
+            );
+            let reject = RejectReason::ProofInvalid {
+                reason: "proof verificationMethod is not bound to this session".to_string(),
+            };
+            let routed = doc.reject_with(format!("urn:uuid:{}", Uuid::new_v4()), reject);
+            return Ok(into_response(DispatchOutcome::Rejected(routed)));
         }
     }
 
-    // ─── Route by Type URI (parity with the TSP + DIDComm transports).
+    // ─── Route, through `messaging::dispatch_trust_task_doc`: the same entry
+    // DIDComm and TSP use, so what a document means is decided in one place.
     //
-    // Framework ops (ACL + discovery) run the typed §7.2 pipeline below,
-    // mapping outcomes to HTTP status codes. DID-management ops
-    // (`did/publish`, `register`, `delete`, `change-owner`, `info`,
-    // `list`, `check-name`, `witness/publish`) are bridged to
-    // `dispatch_did_op` and returned as `200` with the Trust Task response
-    // document — the problem-report shape carries any error, exactly as on
-    // the DIDComm transport (which has no HTTP status either).
-    let type_uri = doc.type_uri.to_string();
-    if !build_dispatcher()
-        .registered_uris()
-        .contains(&type_uri.as_str())
+    // A session with a bound key signs with it on behalf of the session's
+    // subject, so its verifier accepts exactly that key for exactly that
+    // principal. It is built per request from the verified bearer token, never
+    // on the shared verifier, and only for a task that key may sign. Every
+    // other caller signs as itself.
+    let shared = state
+        .trust_tasks_verifier
+        .as_deref()
+        .ok_or_else(|| AppError::Config("no trust-task proof verifier configured".into()))?;
+    let delegated;
+    let verifier = match (auth.as_ref(), session_key_vm) {
+        (Some(auth), Some(vm)) => {
+            delegated = shared.clone().with_session_delegate(auth.did.clone(), vm);
+            &delegated
+        }
+        _ => shared,
+    };
+
+    // The peer: the bearer session's subject, or — with no session — the
+    // document's own issuer, which the proof must then bind (empty when an
+    // anonymous public read names none).
+    let peer = match auth.as_ref() {
+        Some(auth) => auth.did.clone(),
+        None => doc.issuer.clone().unwrap_or_default(),
+    };
+    let transport = HttpsHandler::new(my_vid.to_string(), (!peer.is_empty()).then(|| peer.clone()));
+    match crate::messaging::dispatch_trust_task_doc(
+        &state,
+        &peer,
+        auth.as_ref(),
+        &transport,
+        doc,
+        verifier,
+        large_doc_charge,
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?
     {
-        let value = crate::messaging::bridge_did_management(&state, &auth.did, my_vid, &doc)
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        return Ok((
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            serde_json::to_vec(&value).expect("Trust Task response serialises"),
-        )
-            .into_response());
+        // The framework outcome keeps its reject code, which is the whole reason
+        // the router hands it back whole: SPEC's status table is HTTPS's alone.
+        crate::messaging::RoutedReply::Framework(outcome) => Ok(into_response(*outcome)),
+        crate::messaging::RoutedReply::Document(value) => {
+            // `trust_tasks_auth::dispatch` (the auth family's own local
+            // dispatcher — see `messaging::route_trust_task_doc`) hands back a
+            // bare serialised document, success or `trust-task-error` alike,
+            // with no `DispatchOutcome` wrapper to carry a status through. A
+            // refusal — `delegationNotRecognized`, `sessionKeyProofRequired`,
+            // `sessionLifetimeExceeded`, every code this family raises —
+            // answered `200 OK` would tell a caller that gates on the status
+            // line, before ever reading the body, that its login or refresh
+            // succeeded. Map it through the same table `into_response` uses.
+            let status = document_status(&value);
+            Ok((
+                status,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::to_vec(&value).expect("Trust Task response serialises"),
+            )
+                .into_response())
+        }
+        crate::messaging::RoutedReply::Suppressed => Ok(StatusCode::NO_CONTENT.into_response()),
     }
-
-    // ─── 4. Build the transport adapter + context.
-    let transport = HttpsHandler::new(my_vid.to_string(), auth.did);
-    let ctx = TrustTaskContext {
-        acl_ks: &state.acl_ks,
-        acl_locks: &state.acl_locks,
-        my_vid,
-    };
-
-    // ─── 5. Dispatch.
-    //
-    // Map the operator's `enforce_proofs` toggle to a framework
-    // [`ProofPolicy`]:
-    //
-    //   * `true` + verifier configured → `Verify(&verifier)` — proof-
-    //     bearing documents are verified, proofless REQUIRED-spec
-    //     documents are rejected `proof_required`.
-    //   * `false` (default) → `RejectIfPresent` — proof-bearing
-    //     documents are rejected `malformed_request` with the
-    //     framework-shared sanitised wire message (see
-    //     `trust_tasks_rs::PROOF_NOT_ACCEPTED_BY_POLICY`). The
-    //     operator-actionable diagnostic moves to a `tracing::warn!`
-    //     in `dispatch_inbound`. Silently dropping a proof would
-    //     mislead the producer about the integrity guarantees of
-    //     the exchange.
-    let policy: ProofPolicy<'_, TransportBoundVerifier> = match (
-        state.config.trust_tasks.enforce_proofs,
-        state.trust_tasks_verifier.as_deref(),
-    ) {
-        (true, Some(v)) => ProofPolicy::Verify(v),
-        _ => ProofPolicy::RejectIfPresent,
-    };
-    let outcome = dispatch_inbound::<TransportBoundVerifier>(&ctx, &transport, policy, doc).await;
-    Ok(into_response(outcome))
 }
 
 /// Build a `trust-task-error` document for a body-parse failure.
@@ -280,11 +389,43 @@ fn into_response(outcome: DispatchOutcome) -> Response {
             // an `error!` log on the off-chance the invariant breaks.
             tracing::error!(
                 should_not_happen = true,
-                "trust-tasks dispatch returned Suppressed on HTTPS — bearer auth always resolves a peer"
+                "trust-tasks dispatch suppressed its reply on HTTPS"
             );
             StatusCode::NO_CONTENT.into_response()
         }
     }
+}
+
+/// The status for a bare serialised reply document from
+/// `trust_tasks_auth::dispatch` — `200` for a success (or anything not shaped
+/// like a framework error), and [`status_for_code`]'s mapping for a
+/// `trust-task-error` document, exactly as [`into_response`] applies it to a
+/// routed [`DispatchOutcome::Rejected`].
+fn document_status(value: &Value) -> StatusCode {
+    let error_type_uri =
+        did_hosting_common::server::trust_tasks::framework_error_type_uri().to_string();
+    let is_error = value
+        .get("type")
+        .and_then(Value::as_str)
+        .map(|t| t == error_type_uri)
+        .unwrap_or(false);
+    if !is_error {
+        return StatusCode::OK;
+    }
+    let Some(code) = value
+        .get("payload")
+        .and_then(|p| p.get("code"))
+        .and_then(Value::as_str)
+    else {
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    };
+    let Ok(code) = code.parse::<trust_tasks_rs::TrustTaskCode>() else {
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    };
+    StatusCode::from_u16(status_for_code(&code)).unwrap_or_else(|_| {
+        tracing::error!(code = %code, "unexpected status code from status_for_code");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 #[cfg(test)]

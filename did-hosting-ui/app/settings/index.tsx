@@ -16,6 +16,7 @@ import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showConfirm } from "../../lib/alert";
 import { useAgentNames } from "../../lib/use-agent-names";
 import type { ControlPlaneConfig, IdentityGeneration } from "../../lib/api";
+import { PasskeysCard } from "../../components/PasskeysCard";
 
 function formatDuration(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
@@ -96,7 +97,12 @@ function StatusRow({ label, enabled }: { label: string; enabled: boolean }) {
 
 export default function SettingsPage() {
   const api = useApi();
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, role } = useAuth();
+  // Settings shows control-plane topology (mediator/VTA DIDs, listen address,
+  // registry, TTLs) — the same operator data the backend now gates behind
+  // an admin (`server/config`, `identity/list`). Non-admins get
+  // an explanatory panel instead of a blank page or a 403 error box.
+  const isAdmin = role === "admin";
 
   const [config, setConfig] = useState<ControlPlaneConfig | null>(null);
   const [loading, setLoading] = useState(true);
@@ -130,9 +136,9 @@ export default function SettingsPage() {
   }, [api]);
 
   useEffect(() => {
-    if (!isAuthenticated) return;
+    if (!isAuthenticated || !isAdmin) return;
     loadGenerations();
-  }, [isAuthenticated, loadGenerations]);
+  }, [isAuthenticated, isAdmin, loadGenerations]);
 
   // The "honoured for" countdown is only meaningful if it actually counts down.
   useEffect(() => {
@@ -175,7 +181,7 @@ export default function SettingsPage() {
   };
 
   useEffect(() => {
-    if (!isAuthenticated) {
+    if (!isAuthenticated || !isAdmin) {
       setLoading(false);
       return;
     }
@@ -187,7 +193,7 @@ export default function SettingsPage() {
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, [api, isAuthenticated]);
+  }, [api, isAuthenticated, isAdmin]);
 
   if (!isAuthenticated) {
     return (
@@ -199,6 +205,20 @@ export default function SettingsPage() {
           </Pressable>
         </Link>
       </View>
+    );
+  }
+
+  // Everything below "My Passkeys" is control-plane topology, admin only.
+  // Passkeys are the caller's own account, regardless of role.
+  if (!isAdmin) {
+    return (
+      <ScrollView style={styles.scroll} contentContainerStyle={styles.container}>
+        <Text style={styles.title}>Account Settings</Text>
+        <PasskeysCard title="My Passkeys" />
+        <Text style={styles.hint}>
+          Control plane settings are available to administrators only.
+        </Text>
+      </ScrollView>
     );
   }
 
@@ -226,6 +246,8 @@ export default function SettingsPage() {
       contentContainerStyle={styles.container}
     >
       <Text style={styles.title}>Control Plane Settings</Text>
+
+      <PasskeysCard title="My Passkeys" />
 
       {/* Identity */}
       <View style={styles.card}>
@@ -282,11 +304,11 @@ export default function SettingsPage() {
                 )}
               </View>
 
-              <Row label="Key agreement" value={g.key_agreement_kid} />
-              {g.expires_at !== null && (
+              <Row label="Key agreement" value={g.keyAgreementKid} />
+              {g.expiresAt !== null && (
                 <Row
                   label="Honoured for"
-                  value={remainingLabel(g.expires_at, now)}
+                  value={remainingLabel(g.expiresAt, now)}
                 />
               )}
             </View>
@@ -304,10 +326,11 @@ export default function SettingsPage() {
           spells out the consequences when they do. */}
       <View style={styles.card}>
         <Text style={styles.sectionTitle}>Connectivity</Text>
-        <Row label="Listen Address" value={config.listenAddress} />
+        {config.listenAddress ? (
+          <Row label="Listen Address" value={config.listenAddress} />
+        ) : null}
         <StatusRow label="DIDComm" enabled={config.didcommEnabled} />
         <StatusRow label="TSP" enabled={config.tspEnabled} />
-        <StatusRow label="REST API" enabled={config.restApiEnabled} />
         <View style={styles.row}>
           <Text style={styles.label}>Advertised services</Text>
           {config.advertisedServices ? (
@@ -317,7 +340,7 @@ export default function SettingsPage() {
             />
           ) : (
             <Text style={styles.advertisedUnknown}>
-              {config.controlDid ? "DID not resolved" : "no control DID"}
+              DID not resolved
             </Text>
           )}
         </View>
@@ -338,43 +361,52 @@ export default function SettingsPage() {
         </View>
       )}
 
-      {/* Service Registry */}
-      <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Service Registry</Text>
-        <Row
-          label="Health Check Interval"
-          value={formatDuration(config.healthCheckIntervalSecs)}
-        />
-        <Row
-          label="Configured Instances"
-          value={config.configuredInstances.toString()}
-        />
-      </View>
+      {/* The sections below are optional in `server/config`: each renders
+          only when the control plane states it. */}
+      {config.registry && (
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>Service Registry</Text>
+          <Row
+            label="Health Check Interval"
+            value={formatDuration(config.registry.healthCheckIntervalSecs)}
+          />
+          <Row
+            label="Configured Instances"
+            value={config.registry.configuredInstances.toString()}
+          />
+        </View>
+      )}
 
-      {/* Authentication */}
-      <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Authentication</Text>
-        <Row
-          label="Access Token Expiry"
-          value={formatDuration(config.accessTokenExpiry)}
-        />
-        <Row
-          label="Refresh Token Expiry"
-          value={formatDuration(config.refreshTokenExpiry)}
-        />
-        <Row
-          label="Passkey Enrollment TTL"
-          value={formatDuration(config.passkeyEnrollmentTtl)}
-        />
-      </View>
+      {config.sessions && (
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>Authentication</Text>
+          <Row
+            label="Sign Out After Inactivity"
+            value={formatDuration(config.sessions.adminIdleTimeout)}
+          />
+          <Row
+            label="Access Token Expiry"
+            value={formatDuration(config.sessions.accessTokenExpiry)}
+          />
+          <Row
+            label="Refresh Token Expiry"
+            value={formatDuration(config.sessions.refreshTokenExpiry)}
+          />
+          <Row
+            label="Passkey Enrollment TTL"
+            value={formatDuration(config.sessions.passkeyEnrollmentTtl)}
+          />
+        </View>
+      )}
 
-      {/* Storage & Logging */}
-      <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Storage & Logging</Text>
-        <Row label="Data Directory" value={config.dataDir} />
-        <Row label="Log Level" value={config.logLevel} />
-        <Row label="Log Format" value={config.logFormat} />
-      </View>
+      {config.dataDir || config.logLevel || config.logFormat ? (
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>Storage & Logging</Text>
+          {config.dataDir ? <Row label="Data Directory" value={config.dataDir} /> : null}
+          {config.logLevel ? <Row label="Log Level" value={config.logLevel} /> : null}
+          {config.logFormat ? <Row label="Log Format" value={config.logFormat} /> : null}
+        </View>
+      ) : null}
     </ScrollView>
   );
 }

@@ -34,6 +34,22 @@ use crate::store::KeyspaceHandle;
 /// permissive when the `domains` keyspace is empty (legacy / test
 /// state) and strict otherwise.
 ///
+/// Evict `mnemonic`'s resolved-content cache entry, if this process also
+/// serves resolution from the same store (the unified daemon).
+///
+/// Call this after every commit that changes or removes `content_log_key`,
+/// or the record's `disabled`/`deleted_at` state — register, publish,
+/// disable, rollback, delete. A no-op for a standalone control plane; see
+/// `AppState::cache_invalidate`'s doc.
+fn invalidate_cached_content(state: &AppState, mnemonic: &str) {
+    if let Some(invalidate) = &state.cache_invalidate {
+        invalidate(&content_log_key(mnemonic));
+        // The witness file is served from the same cache, keyed the same
+        // way — `webvh/witness/publish` and rollback both change it.
+        invalidate(&content_witness_key(mnemonic));
+    }
+}
+
 /// Pulled out as a helper so `register_did_atomic` and `publish_did`
 /// can share the call without duplicating the ACL lookup.
 async fn check_did_host_safety(
@@ -150,6 +166,100 @@ async fn get_authorized_record(
         return Err(AppError::Forbidden("not the owner of this DID".into()));
     }
     Ok(record)
+}
+
+// ---------------------------------------------------------------------------
+// Per-account quota enforcement (SEC-4045 W3)
+// ---------------------------------------------------------------------------
+//
+// The edge server enforces `max_did_count` / `max_total_size`; the control
+// plane — the authoritative write side, and in daemon mode the ONLY write path
+// — did not, so an admin-set per-account quota was silently a no-op. The
+// control plane has no global default limit (unlike the edge config), so a
+// `None` ACL max means "no cap" and preserves prior behaviour; a quota only
+// bites once an admin sets one on the caller's ACL entry.
+
+/// The caller's current usage from the `owner:` reverse index: (owned-slot
+/// count, summed `content_size`). O(n) in the caller's slots. Filters the
+/// string-prefix collisions the `owner:` index can return (a DID that is a
+/// prefix of a longer DID), exactly as [`list_dids`] does.
+async fn owner_usage(state: &AppState, owner: &str) -> Result<(u64, u64), AppError> {
+    let prefix = format!("owner:{owner}:");
+    let raw = state.dids_ks.prefix_iter_raw(prefix).await?;
+    let mut count: u64 = 0;
+    let mut total_size: u64 = 0;
+    for (_key, value) in raw {
+        let mnemonic = String::from_utf8(value)
+            .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
+        if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
+            if record.owner != owner {
+                continue;
+            }
+            count += 1;
+            total_size = total_size.saturating_add(record.content_size);
+        }
+    }
+    Ok((count, total_size))
+}
+
+/// Enforce the caller's per-account `max_did_count` before adding a new slot.
+/// Admin-exempt. `None` ACL max (or no ACL entry) means no cap.
+async fn check_did_count_limit(auth: &AuthClaims, state: &AppState) -> Result<(), AppError> {
+    use crate::acl::Role;
+    if auth.role == Role::Admin {
+        return Ok(());
+    }
+    let Some(entry) =
+        did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &auth.did).await?
+    else {
+        return Ok(());
+    };
+    let max = entry.effective_max_did_count(u64::MAX);
+    if max == u64::MAX {
+        return Ok(());
+    }
+    let (count, _) = owner_usage(state, &auth.did).await?;
+    if count >= max {
+        warn!(did = %auth.did, count, max, "DID count quota exceeded (control)");
+        return Err(AppError::QuotaExceeded(format!(
+            "DID count limit reached ({max})"
+        )));
+    }
+    Ok(())
+}
+
+/// Enforce the caller's per-account `max_total_size` before a write that grows
+/// stored content. `old_size` is what the target slot already contributes (0
+/// for a fresh slot); `new_size` is what it will contribute after the write.
+/// Admin-exempt; `None` ACL max (or no ACL entry) means no cap.
+async fn check_total_size_limit(
+    auth: &AuthClaims,
+    state: &AppState,
+    old_size: u64,
+    new_size: u64,
+) -> Result<(), AppError> {
+    use crate::acl::Role;
+    if auth.role == Role::Admin {
+        return Ok(());
+    }
+    let Some(entry) =
+        did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &auth.did).await?
+    else {
+        return Ok(());
+    };
+    let max = entry.effective_max_total_size(u64::MAX);
+    if max == u64::MAX {
+        return Ok(());
+    }
+    let (_, total) = owner_usage(state, &auth.did).await?;
+    let proposed = total.saturating_sub(old_size).saturating_add(new_size);
+    if proposed > max {
+        warn!(did = %auth.did, proposed, max, "total size quota exceeded (control)");
+        return Err(AppError::QuotaExceeded(format!(
+            "total content size limit reached ({max} bytes)"
+        )));
+    }
+    Ok(())
 }
 
 /// Resolve a custom path during create, applying force-replace semantics.
@@ -288,6 +398,17 @@ pub async fn create_did(
         agent_names: Vec::new(),
     };
 
+    // Per-account DID-count quota (SEC-4045 W3). Only a slot this owner does not
+    // already hold counts against the cap — a force-replace of the caller's own
+    // slot is not a net-new DID, so it must not be refused at the cap.
+    let adds_slot = match state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
+        Some(existing) => existing.owner != auth.did,
+        None => true,
+    };
+    if adds_slot {
+        check_did_count_limit(auth, state).await?;
+    }
+
     let mut batch = state.store.batch();
     batch.insert(&state.dids_ks, did_key(&mnemonic), &record)?;
     batch.insert_raw(
@@ -380,16 +501,45 @@ pub async fn register_did_atomic(
         validate_mnemonic(path)?;
     }
 
+    // Hold the per-path write lock from here through the commit below —
+    // covering the `existing_log`/`existing_witness` read, the
+    // witness-threshold verification that trusts it, and the write. Without
+    // this, a concurrent publish/register on the same path could commit a
+    // longer, already-witnessed log *between* this read and this call's own
+    // commit; this call's `verify_publication` would have computed
+    // `previously_published` from the stale, shorter snapshot it read
+    // first, exempting from the witness threshold entries that are, by the
+    // time this call writes, already published and meant to require one — a
+    // real witness-threshold bypass, not merely a lost update. Locking only
+    // around the later record-read + write (as this used to) closes the
+    // lost-update race but not this one, since `verify_publication` had
+    // already run — and had already decided which entries need a proof —
+    // before the lock was ever taken.
+    let _path_guard = state.path_locks.guard(path).await;
+
+    // The slot's currently stored log and witness proofs, if any — a
+    // fresh registration has neither, a re-register of an existing slot
+    // (owner republishing through `did/register` rather than `did/publish`)
+    // has both. For webvh, `verify_publication` uses these to tell
+    // already-published entries (which must still meet their witness
+    // threshold, from the stored witness content) from the new tail this
+    // call is adding (exempt — its proofs arrive later via
+    // `webvh/witness/publish`). See `did_ops::verify_did_log_for_publish`.
+    let existing_log = state.dids_ks.get_raw(content_log_key(path)).await?;
+    let existing_witness = state.dids_ks.get_raw(content_witness_key(path)).await?;
+
     // Verify the publication with its own method's verifier, and reduce
     // it to the facts the shared tail below needs. For webvh this runs
-    // exactly the log-proof chain it always did; for webs it verifies
-    // the key event log and proves the stream establishes the AID this
-    // slot's identifier ends in.
+    // the full log-proof chain, enforcing the witness threshold on
+    // already-published entries only; for webs it verifies the key event
+    // log and proves the stream establishes the AID this slot's identifier
+    // ends in.
     let publication = did_hosting_common::method::publication::verify_publication(
         domain.unwrap_or_default(),
         path,
         did_log.as_bytes(),
-        None,
+        existing_log.as_deref(),
+        existing_witness.as_deref(),
     )
     .map_err(publication_error)?;
 
@@ -430,15 +580,11 @@ pub async fn register_did_atomic(
             .map_err(AppError::Validation)?;
     }
 
-    // Hold the per-path write lock for the read + build + commit
-    // window. Without this, two concurrent fresh-slot calls could both
-    // observe `existing == None`, both build records, and both commit
-    // — fjall batches are atomic per-commit but not conditional, so
-    // the second would silently overwrite the first. The lock is held
-    // until this function returns; dropped automatically on `?` early
-    // exit too.
-    let _path_guard = state.path_locks.guard(path).await;
-
+    // `_path_guard`, acquired above, already covers this read: without it,
+    // two concurrent fresh-slot calls could both observe `existing == None`,
+    // both build records, and both commit — fjall batches are atomic
+    // per-commit but not conditional, so the second would silently
+    // overwrite the first.
     let existing: Option<DidRecord> = state.dids_ks.get(did_key(path)).await?;
 
     let owner_changed = match &existing {
@@ -471,6 +617,16 @@ pub async fn register_did_atomic(
         }
         None => false,
     };
+
+    // Per-account quota (SEC-4045 W3). A fresh slot counts against
+    // `max_did_count`; the published log counts against `max_total_size`
+    // (old size 0 for a fresh slot, else the slot's current content_size).
+    // Both helpers are admin-exempt and no-op when the ACL sets no cap.
+    if existing.is_none() {
+        check_did_count_limit(auth, state).await?;
+    }
+    let old_content_size = existing.as_ref().map(|r| r.content_size).unwrap_or(0);
+    check_total_size_limit(auth, state, old_content_size, did_log.len() as u64).await?;
 
     // Preserve created_at when the same owner is re-publishing; reset
     // on takeover or fresh allocation.
@@ -582,6 +738,7 @@ pub async fn register_did_atomic(
         batch.remove(&state.dids_ks, agent_name_key(&reg_domain, name));
     }
     batch.commit().await?;
+    invalidate_cached_content(state, path);
 
     // Same rationale as `publish_did`: the atomic register path commits
     // a new log entry, so it must advance the update counters when the
@@ -664,22 +821,36 @@ async fn prepare_republish(
     }
 
     // Verify with the publishing method's own verifier. For webvh this
-    // is the didwebvh-rs chain walk it always was; for webs it verifies
-    // the key event log and refuses an update that rewinds or forks it.
+    // walks the full chain, enforcing the witness threshold on
+    // already-published entries only (the new tail's proofs arrive later
+    // via `webvh/witness/publish` — see
+    // `did_ops::verify_did_log_for_publish`); for webs it verifies the key
+    // event log and refuses an update that rewinds or forks it.
     let existing = state
         .dids_ks
         .get_raw(content_log_key(mnemonic).as_str())
+        .await?;
+    let existing_witness = state
+        .dids_ks
+        .get_raw(content_witness_key(mnemonic).as_str())
         .await?;
     let publication = did_hosting_common::method::publication::verify_publication(
         &record.domain,
         mnemonic,
         did_log.as_bytes(),
         existing.as_deref(),
+        existing_witness.as_deref(),
     )
     .map_err(publication_error)?;
 
     let new_size = did_log.len() as u64;
     let did_id_val = publication.did_id.clone();
+
+    // Per-account total-size quota (SEC-4045 W3). The republished log replaces
+    // this slot's current content, so the owner's usage moves by
+    // `new_size - record.content_size`. `record.content_size` is still the OLD
+    // size here (it is overwritten below). Admin-exempt; no-op with no ACL cap.
+    check_total_size_limit(auth, state, record.content_size, new_size).await?;
 
     // T20b: same safety check as register_did_atomic — the embedded
     // DID's host must be a configured active domain on this server
@@ -960,6 +1131,7 @@ pub async fn publish_did(
         batch.remove(&state.dids_ks, agent_name_key(&domain, name));
     }
     batch.commit().await?;
+    invalidate_cached_content(state, mnemonic);
 
     // Mirror did-hosting-server's `record_update` call so total_updates /
     // last_updated_at advance when the control plane is the authoritative
@@ -1238,35 +1410,110 @@ pub async fn upload_witness(
     auth: &AuthClaims,
     state: &AppState,
     mnemonic: &str,
-    witness_content: &str,
+    witness_entry: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), AppError> {
     validate_mnemonic(mnemonic)?;
+
+    // Same per-path write lock as `register_did_atomic`: merging a proof
+    // into the stored witness file is a read-modify-write, and two
+    // witnesses publishing at once would otherwise each write back only
+    // their own proof, silently dropping the other's.
+    let _path_guard = state.path_locks.guard(mnemonic).await;
+
     get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
     use did_hosting_common::server::error::ValidationKind;
-    if witness_content.is_empty() {
-        return Err(AppError::validation(
-            ValidationKind::InvalidWitness,
-            "did-witness.json content cannot be empty",
-        ));
-    }
 
-    serde_json::from_str::<serde_json::Value>(witness_content).map_err(|e| {
+    // `webvh/witness/publish`'s `witness` member is one witness's proof for
+    // one version — `{versionId, witness, proof}` — not the did-witness.json
+    // file shape (`[{versionId, proof: [...]}, ...]`, one entry per version,
+    // each aggregating every witness's proof for it). Extract the two fields
+    // the stored file needs; `witness` (which witness signed) travels inside
+    // `proof.verificationMethod` already and is not stored separately. The
+    // proof is verified below, against this DID's own stored log, before
+    // either field is persisted.
+    let version_id = witness_entry
+        .get("versionId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            AppError::validation(
+                ValidationKind::InvalidWitness,
+                "witness object must have a string \"versionId\"",
+            )
+        })?
+        .to_string();
+    let proof = witness_entry.get("proof").cloned().ok_or_else(|| {
         AppError::validation(
             ValidationKind::InvalidWitness,
-            format!("did-witness.json must be valid JSON: {e}"),
+            "witness object must have a \"proof\"",
         )
     })?;
 
+    // Verify the proof before it ever touches storage: it must
+    // cryptographically verify over `version_id`, and the key that signed it
+    // must actually be one of the witnesses this DID's own log configures
+    // for that version — not merely a self-consistent `did:key` signature,
+    // which any attacker-generated key can produce for itself. Deferring
+    // this to resolve time (as before) let any caller authorized on the
+    // mnemonic — not necessarily a witness — persist an arbitrary proof
+    // blob; resolve-time verification meant it was never *served*, but it
+    // still polluted the witness-content store. See
+    // `did_hosting_common::did_ops::verify_witness_proof_for_version`'s doc
+    // for why the threshold itself stays a resolve-time check.
+    let log_content = state
+        .dids_ks
+        .get_raw(content_log_key(mnemonic))
+        .await?
+        .ok_or_else(|| {
+            AppError::validation(
+                ValidationKind::InvalidWitness,
+                "no published log exists for this DID yet",
+            )
+        })?;
+    let log_content = String::from_utf8(log_content)
+        .map_err(|e| AppError::Internal(format!("stored did:webvh log is not valid UTF-8: {e}")))?;
+    did_hosting_common::did_ops::verify_witness_proof_for_version(
+        &log_content,
+        &version_id,
+        &proof,
+    )
+    .map_err(|e| AppError::validation(ValidationKind::InvalidWitness, e))?;
+
+    // Merge into the existing file rather than overwrite it: a threshold
+    // greater than one needs more than one witness's proof recorded per
+    // version, and earlier versions' entries must survive a later
+    // publish. An existing blob this control plane cannot parse is
+    // replaced rather than left to wedge every future publish — the
+    // resolver-side threshold check is what actually gates serving, so
+    // losing a corrupt blob costs nothing that mattered.
+    let existing = state.dids_ks.get_raw(content_witness_key(mnemonic)).await?;
+    let mut entries: Vec<serde_json::Value> = existing
+        .and_then(|bytes| serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).ok())
+        .unwrap_or_default();
+
+    match entries
+        .iter_mut()
+        .find(|e| e.get("versionId").and_then(|v| v.as_str()) == Some(version_id.as_str()))
+    {
+        Some(entry) => match entry.get_mut("proof").and_then(|p| p.as_array_mut()) {
+            Some(proofs) => proofs.push(proof),
+            None => {
+                entry["proof"] = serde_json::json!([proof]);
+            }
+        },
+        None => entries.push(serde_json::json!({ "versionId": version_id, "proof": [proof] })),
+    }
+
+    let witness_content = serde_json::to_string(&entries)
+        .map_err(|e| AppError::Internal(format!("failed to serialise did-witness.json: {e}")))?;
+
     state
         .dids_ks
-        .insert_raw(
-            content_witness_key(mnemonic),
-            witness_content.as_bytes().to_vec(),
-        )
+        .insert_raw(content_witness_key(mnemonic), witness_content.into_bytes())
         .await?;
+    invalidate_cached_content(state, mnemonic);
 
-    info!(did = %auth.did, mnemonic = %mnemonic, "did-witness.json uploaded on control plane");
+    info!(did = %auth.did, mnemonic = %mnemonic, %version_id, "did-witness.json uploaded on control plane");
 
     Ok(())
 }
@@ -1393,9 +1640,13 @@ pub async fn list_dids(
         }
     }
 
-    // Apply pagination
+    // Apply pagination. Cap the caller-supplied limit so a single request can't
+    // ask for an unbounded page. The per-owner scan is already bounded by the
+    // account's `max_did_count` quota; this additionally bounds the response
+    // size (and the allocation) regardless of what the client passes.
+    const MAX_LIST_LIMIT: usize = 1000;
     let offset = offset.unwrap_or(0);
-    let limit = limit.unwrap_or(1000);
+    let limit = limit.unwrap_or(MAX_LIST_LIMIT).min(MAX_LIST_LIMIT);
     let total = entries.len();
     let entries: Vec<_> = entries.into_iter().skip(offset).take(limit).collect();
 
@@ -1442,6 +1693,94 @@ async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> 
     Ok(entries)
 }
 
+/// One page of the slots a caller may see, with each slot's lifetime resolve
+/// count, and the size of the whole (unpaged) set.
+///
+/// The scoping rule is [`list_dids`]'s: an admin sees every slot, or one
+/// owner's when `requested_owner` names one; anyone else sees their own.
+/// Refusing a non-admin who names another owner is the caller's job — this
+/// never widens a non-admin's view, whatever it is passed. `domain` (already
+/// canonical) keeps only slots hosted under it. Ordered by mnemonic so paging
+/// is stable.
+///
+/// `replica` is set when the caller is a hosting server this control plane
+/// drives, reconciling against the full listing (see
+/// `control_tasks::did::list`): with no `owner` filter it is shown every slot,
+/// as an administrator is — the slots it is already sent to serve.
+pub async fn list_dids_page(
+    auth: &AuthClaims,
+    replica: bool,
+    state: &AppState,
+    requested_owner: Option<&str>,
+    domain: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<(Vec<(DidRecord, u64)>, u64), AppError> {
+    use crate::acl::Role;
+
+    const MAX_LIST_LIMIT: usize = 1000;
+
+    let mut records: Vec<DidRecord> =
+        if (auth.role == Role::Admin || replica) && requested_owner.is_none() {
+            let raw = state.dids_ks.prefix_iter_raw("did:").await?;
+            raw.into_iter()
+                .filter_map(|(_, value)| serde_json::from_slice::<DidRecord>(&value).ok())
+                .collect()
+        } else {
+            let target_owner = if auth.role == Role::Admin {
+                requested_owner.unwrap_or(&auth.did)
+            } else {
+                &auth.did
+            };
+            let raw = state
+                .dids_ks
+                .prefix_iter_raw(format!("owner:{target_owner}:"))
+                .await?;
+            let mut out = Vec::with_capacity(raw.len());
+            for (_key, value) in raw {
+                let mnemonic = String::from_utf8(value)
+                    .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
+                // The owner index is a string prefix, and DIDs contain colons, so a
+                // DID that prefixes another shares rows with it: re-check the owner.
+                if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await?
+                    && record.owner == target_owner
+                {
+                    out.push(record);
+                }
+            }
+            out
+        };
+    if let Some(domain) = domain {
+        records.retain(|r| {
+            let host = if r.domain.is_empty() {
+                r.did_id
+                    .as_deref()
+                    .and_then(|d| did_hosting_common::server::domain::extract_did_host(d).ok())
+                    .unwrap_or_default()
+            } else {
+                r.domain.clone()
+            };
+            host.eq_ignore_ascii_case(domain)
+        });
+    }
+    records.sort_by(|a, b| a.mnemonic.cmp(&b.mnemonic));
+
+    let total = records.len() as u64;
+    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(MAX_LIST_LIMIT).min(MAX_LIST_LIMIT);
+    let mut page = Vec::with_capacity(limit.min(records.len()));
+    for record in records.into_iter().skip(offset).take(limit) {
+        let stats: did_hosting_common::DidStats = state
+            .stats_ks
+            .get(format!("stats:{}", record.mnemonic))
+            .await?
+            .unwrap_or_default();
+        page.push((record, stats.total_resolves));
+    }
+    info!(did = %auth.did, total, returned = page.len(), "DID page listed on control plane");
+    Ok((page, total))
+}
+
 /// Cross-check a caller's explicit domain against the slot's own domain.
 ///
 /// A DID's host IS its domain, so a caller naming a different one is either
@@ -1450,7 +1789,7 @@ async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> 
 /// `record.domain`; falls back to the DID's embedded host for legacy slots
 /// that never had a domain resolved, and passes when neither is known (an
 /// un-domained install has nothing to compare against).
-fn ensure_slot_domain_matches(
+pub(crate) fn ensure_slot_domain_matches(
     record: &DidRecord,
     request_domain: Option<&str>,
 ) -> Result<(), AppError> {
@@ -1487,6 +1826,14 @@ pub async fn delete_did(
 
     let did_id = record.did_id.clone();
 
+    // Re-check the caller's DomainScope at time-of-use, as create/publish do at
+    // create-time (SEC-4045 W7). Ownership alone is not enough: a domain-scoped
+    // Owner who came to own a DID on another domain would otherwise destroy it.
+    // Only a published slot has a DID to host-check.
+    if let Some(did_id) = did_id.as_deref() {
+        check_did_host_safety(state, auth, did_id).await?;
+    }
+
     ensure_slot_domain_matches(&record, request_domain)?;
 
     let mut batch = state.store.batch();
@@ -1495,6 +1842,7 @@ pub async fn delete_did(
     batch.remove(&state.dids_ks, content_witness_key(mnemonic));
     batch.remove(&state.dids_ks, owner_key(&record.owner, mnemonic));
     batch.commit().await?;
+    invalidate_cached_content(state, mnemonic);
 
     info!(did = %auth.did, mnemonic = %mnemonic, "DID deleted on control plane");
 
@@ -1529,6 +1877,12 @@ pub async fn change_did_owner(
     // caller submits a malformed target. Any new-owner format check after
     // this point only runs for authorized callers.
     let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+
+    // Re-check the caller's DomainScope at time-of-use (SEC-4045 W7), mirroring
+    // create/publish; ownership is not a substitute for domain scoping.
+    if let Some(did_id) = record.did_id.as_deref() {
+        check_did_host_safety(state, auth, did_id).await?;
+    }
 
     // Canonicalise (trim + format check) before any storage I/O so a
     // typo in the new-owner DID can't silently mismatch later
@@ -1585,8 +1939,13 @@ pub async fn set_did_disabled(
 ) -> Result<(), AppError> {
     validate_mnemonic(mnemonic)?;
     let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+    // Re-check DomainScope at time-of-use (SEC-4045 W7).
+    if let Some(did_id) = record.did_id.as_deref() {
+        check_did_host_safety(state, auth, did_id).await?;
+    }
     record.disabled = disabled;
     state.dids_ks.insert(did_key(mnemonic), &record).await?;
+    invalidate_cached_content(state, mnemonic);
     info!(
         did = %auth.did,
         mnemonic = %mnemonic,
@@ -1602,10 +1961,29 @@ pub async fn rollback_did(
     state: &AppState,
     mnemonic: &str,
 ) -> Result<(DidRecord, Option<LogMetadata>), AppError> {
+    let (record, metadata, _) = rollback_did_to(auth, state, mnemonic, None).await?;
+    Ok((record, metadata))
+}
+
+/// Discard every log entry after `target_version` (1-based), or — with no
+/// target — the newest entry alone. Returns the updated record, the log's
+/// metadata and how many entries were removed. A target outside
+/// `1..=versionCount` is refused; the current version removes nothing.
+pub async fn rollback_did_to(
+    auth: &AuthClaims,
+    state: &AppState,
+    mnemonic: &str,
+    target_version: Option<u64>,
+) -> Result<(DidRecord, Option<LogMetadata>, u64), AppError> {
     use crate::auth::session::now_epoch;
 
     validate_mnemonic(mnemonic)?;
     let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+
+    // Re-check DomainScope at time-of-use (SEC-4045 W7).
+    if let Some(did_id) = record.did_id.as_deref() {
+        check_did_host_safety(state, auth, did_id).await?;
+    }
 
     let bytes = state
         .dids_ks
@@ -1617,13 +1995,32 @@ pub async fn rollback_did(
         .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
 
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-    if lines.len() < 2 {
-        return Err(AppError::Validation(
-            "cannot rollback: DID log must have at least 2 entries".into(),
-        ));
+    let keep = match target_version {
+        None => {
+            if lines.len() < 2 {
+                return Err(AppError::Validation(
+                    "cannot rollback: DID log must have at least 2 entries".into(),
+                ));
+            }
+            lines.len() - 1
+        }
+        Some(target) => {
+            if target < 1 || target as usize > lines.len() {
+                return Err(AppError::Validation(format!(
+                    "invalid target version {target}: the log holds {} entries",
+                    lines.len()
+                )));
+            }
+            target as usize
+        }
+    };
+    let removed = (lines.len() - keep) as u64;
+    if removed == 0 {
+        let metadata = Some(extract_log_metadata(&content));
+        return Ok((record, metadata, 0));
     }
 
-    let truncated_lines = &lines[..lines.len() - 1];
+    let truncated_lines = &lines[..keep];
     let truncated = truncated_lines.join("\n");
 
     let new_did_id = extract_did_id(&truncated);
@@ -1646,6 +2043,7 @@ pub async fn rollback_did(
     batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
     batch.remove(&state.dids_ks, content_witness_key(mnemonic));
     batch.commit().await?;
+    invalidate_cached_content(state, mnemonic);
 
     let log_metadata = Some(extract_log_metadata(&truncated));
 
@@ -1653,10 +2051,11 @@ pub async fn rollback_did(
         did = %auth.did,
         mnemonic = %mnemonic,
         remaining = truncated_lines.len(),
-        "DID log entry rolled back on control plane"
+        removed,
+        "DID log rolled back on control plane"
     );
 
-    Ok((record, log_metadata))
+    Ok((record, log_metadata, removed))
 }
 
 /// Check if a custom path is available.
@@ -1904,8 +2303,14 @@ pub async fn resolve_agent_name_to_did(
 /// DID the caller already holds. It is authenticated regardless — it answers
 /// questions about arbitrary DIDs, and an unauthenticated batch endpoint is an
 /// enumeration surface even when each individual answer is public.
+///
+/// Answers only for DIDs `reader` may read — its own, or any for an
+/// administrator — so a DID not hosted here, one the reader may not read and
+/// one serving no name are indistinguishable, and the call cannot be used to
+/// test whether a DID is hosted.
 pub async fn resolve_agent_names(
     state: &AppState,
+    reader: &AuthClaims,
     dids: &[String],
 ) -> Result<std::collections::HashMap<String, Vec<String>>, AppError> {
     use std::collections::HashMap;
@@ -1947,6 +2352,9 @@ pub async fn resolve_agent_names(
             || record.disabled
             || record.deleted_at.is_some()
         {
+            continue;
+        }
+        if reader.role != crate::acl::Role::Admin && record.owner != reader.did {
             continue;
         }
         let names: Vec<String> = record
@@ -2081,6 +2489,7 @@ mod tests_atomic {
             server: ServerConfig::default(),
             log: LogConfig::default(),
             store: store_config,
+            fjall: Default::default(),
             auth: AuthConfig::default(),
             secrets: SecretsConfig::default(),
             vta: VtaConfig::default(),
@@ -2115,8 +2524,12 @@ mod tests_atomic {
             acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
             pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
             ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
-            pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            redeem_rate_limiter: Arc::new(crate::rate_limit::SourceRateLimiter::new()),
+            large_document_budget: Arc::new(
+                did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
+            ),
             outbox_notify: Arc::new(tokio::sync::Notify::new()),
+            cache_invalidate: None,
         };
 
         (state, dir)
@@ -2186,6 +2599,81 @@ mod tests_atomic {
 
         let owner_idx = state.dids_ks.get_raw(owner_key(owner, path)).await.unwrap();
         assert!(owner_idx.is_some(), "owner index must be written");
+    }
+
+    /// The unified daemon's mutations (register, publish, disable, delete —
+    /// rollback follows the identical one-line `invalidate_cached_content`
+    /// call) must evict the embedded server's resolved-content cache in the
+    /// same process, since there is no `webvh/sync/*` round-trip within a
+    /// single process to do it the way a standalone edge does. A standalone
+    /// control plane leaves `cache_invalidate: None` and none of these calls
+    /// panic or otherwise misbehave without a hook installed.
+    #[tokio::test]
+    async fn mutations_call_the_cache_invalidate_hook_when_one_is_installed() {
+        let (mut state, _dir) = test_state().await;
+        let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        state.cache_invalidate = Some(Arc::new(move |key: &str| {
+            recorded.lock().unwrap().push(key.to_string());
+        }));
+
+        let owner = "did:example:owner";
+        let path = "cache-hook";
+        let did_log = build_test_did_log("scid-cache-hook", "control.test", path).await;
+        let expected_log_key = content_log_key(path);
+        let expected_witness_key = content_witness_key(path);
+        // Every mutation invalidates both the log and the witness cache
+        // entries — the same `serve_content` serves each, keyed the same
+        // way.
+        let count_of = |calls: &[String], key: &str| calls.iter().filter(|k| *k == key).count();
+
+        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
+            .await
+            .expect("register");
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(count_of(&calls, &expected_log_key), 1, "register: log key");
+            assert_eq!(
+                count_of(&calls, &expected_witness_key),
+                1,
+                "register: witness key"
+            );
+        }
+
+        publish_did(&owner_auth(owner), &state, path, &did_log, None)
+            .await
+            .expect("publish");
+        assert_eq!(
+            count_of(&calls.lock().unwrap(), &expected_log_key),
+            2,
+            "publish must invalidate too"
+        );
+
+        set_did_disabled(&owner_auth(owner), &state, path, true)
+            .await
+            .expect("disable");
+        assert_eq!(
+            count_of(&calls.lock().unwrap(), &expected_log_key),
+            3,
+            "disable must invalidate too"
+        );
+
+        delete_did(&owner_auth(owner), &state, path, None)
+            .await
+            .expect("delete");
+        assert_eq!(
+            count_of(&calls.lock().unwrap(), &expected_log_key),
+            4,
+            "delete must invalidate too"
+        );
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|k| *k == expected_log_key || *k == expected_witness_key),
+            "every call must invalidate this mnemonic's own content keys"
+        );
     }
 
     /// Same owner re-registering: idempotent path. Slot stays owned by the
@@ -4258,6 +4746,239 @@ mod tests_atomic {
                 .as_deref(),
             Some("slot-a"),
             "A's index entry must survive B's release"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // register/publish witness-threshold race (SEC finding #166)
+    // -----------------------------------------------------------------
+
+    /// A fresh Ed25519 key with the `did:key:{pk}#{pk}` verification-method
+    /// id `create_log_entry`/witness-proof lookups both require. Mirrors
+    /// `did_hosting_common::did_ops`'s own (private) test helper of the
+    /// same shape.
+    fn race_signing_key() -> Secret {
+        let mut key = Secret::generate_ed25519(None, None);
+        let pk = key.get_public_keymultibase().unwrap();
+        key.id = format!("did:key:{pk}#{pk}");
+        key
+    }
+
+    /// A witness identity: its signing key, plus the bare `did:key:...` id a
+    /// `Witness` list entry names it by.
+    fn race_witness_identity() -> (Secret, String) {
+        let key = race_signing_key();
+        let witness_did = key.id.split('#').next().unwrap().to_string();
+        (key, witness_did)
+    }
+
+    /// The smallest DID document `verify_log_entry` accepts.
+    fn race_doc_with_key(did: &str, key: &Secret) -> serde_json::Value {
+        let pk = key.get_public_keymultibase().unwrap();
+        serde_json::json!({
+            "id": did,
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "verificationMethod": [{
+                "id": format!("{did}#key-0"),
+                "type": "Multikey",
+                "publicKeyMultibase": pk,
+                "controller": did
+            }],
+            "authentication": [format!("{did}#key-0")],
+            "assertionMethod": [format!("{did}#key-0")],
+        })
+    }
+
+    /// A signed witness proof over `version_id`.
+    async fn race_sign_witness_proof(
+        witness_key: &Secret,
+        version_id: &str,
+    ) -> affinidi_data_integrity::DataIntegrityProof {
+        affinidi_data_integrity::DataIntegrityProof::sign(
+            &serde_json::json!({ "versionId": version_id }),
+            witness_key,
+            affinidi_data_integrity::SignOptions::new(),
+        )
+        .await
+        .expect("sign witness proof")
+    }
+
+    /// A witnessed genesis (threshold 1, naming `witness_did`) plus a second
+    /// entry extending it. Per didwebvh's own parameter-inheritance rule, the
+    /// second entry's empty `Parameters` does not clear the witness config —
+    /// it stays active, so the second entry needs its own proof too, once it
+    /// stops being exempt as the "new tail".
+    ///
+    /// Returns `(genesis-only jsonl, genesis+second jsonl, genesis version_id)`.
+    async fn race_witnessed_log_and_extension(witness_did: &str) -> (String, String, String) {
+        use didwebvh_rs::Multibase;
+        use didwebvh_rs::parameters::Parameters;
+        use didwebvh_rs::witness::{Witness, Witnesses};
+
+        let key = race_signing_key();
+        let params = Parameters {
+            update_keys: Some(Arc::new(vec![Multibase::new(
+                key.get_public_keymultibase().unwrap(),
+            )])),
+            portable: Some(false),
+            witness: Some(Arc::new(Witnesses::Value {
+                threshold: 1,
+                witnesses: vec![Witness {
+                    id: Multibase::new(witness_did.to_string()),
+                }],
+            })),
+            ..Default::default()
+        };
+        let doc = race_doc_with_key("did:webvh:{SCID}:control.test:race", &key);
+
+        // Explicit, one-second-apart `versionTime`s: two `create_log_entry`
+        // calls landing in the same wall-clock second (`None` stamps "now")
+        // would otherwise fail the chain's own monotonic-versionTime check.
+        let base_time = (chrono::Utc::now() - chrono::Duration::seconds(10)).fixed_offset();
+
+        let mut state = didwebvh_rs::DIDWebVHState::default();
+        state
+            .create_log_entry(Some(base_time), &doc, &params, &key)
+            .await
+            .expect("genesis entry");
+        let genesis_version_id = state
+            .log_entries()
+            .last()
+            .unwrap()
+            .get_version_id()
+            .to_string();
+        let genesis_doc = state.log_entries().last().unwrap().get_state().clone();
+        let to_jsonl = |state: &didwebvh_rs::DIDWebVHState| {
+            state
+                .log_entries()
+                .iter()
+                .map(|e| serde_json::to_string(&e.log_entry).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let genesis_jsonl = to_jsonl(&state);
+
+        state
+            .create_log_entry(
+                Some(base_time + chrono::Duration::seconds(1)),
+                &genesis_doc,
+                &Parameters::default(),
+                &key,
+            )
+            .await
+            .expect("second entry");
+        let extended_jsonl = to_jsonl(&state);
+
+        (genesis_jsonl, extended_jsonl, genesis_version_id)
+    }
+
+    /// Regression for the write-time TOCTOU behind SEC finding #166:
+    /// `register_did_atomic` used to read `existing_log`/`existing_witness`
+    /// — and run the whole witness-threshold verification against them —
+    /// *before* acquiring `state.path_locks`. A commit landing on the same
+    /// path between that read and this call's own (later) lock acquisition
+    /// was invisible to a verification that had already run and already
+    /// decided which entries were exempt "new tail".
+    ///
+    /// Rather than relying on real scheduler timing to reproduce the race,
+    /// this test holds the path lock itself, spawns the call, and only then
+    /// mutates the stored log — deterministically standing in for "another
+    /// commit landed first". If `register_did_atomic` read before acquiring
+    /// the lock (the bug), it would have already captured the log as it
+    /// stood *before* this mutation, computed a smaller
+    /// `previously_published`, and succeeded; fixed, it reads only after
+    /// the mutation is visible, correctly inflating `previously_published`
+    /// to cover the new entry too — which has no matching witness proof, so
+    /// the call must fail.
+    #[tokio::test]
+    async fn register_atomic_rereads_state_under_the_path_lock_not_before_it() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:race-owner";
+        let path = "race";
+
+        let (witness_key, witness_did) = race_witness_identity();
+        let (genesis_jsonl, extended_jsonl, genesis_version_id) =
+            race_witnessed_log_and_extension(&witness_did).await;
+
+        // Fresh registration: no prior content, so the witnessed genesis is
+        // exempt from the threshold check outright — its proof arrives later.
+        register_did_atomic(
+            &owner_auth(owner),
+            &state,
+            path,
+            &genesis_jsonl,
+            false,
+            None,
+        )
+        .await
+        .expect("witnessed genesis registers with no proof yet");
+
+        // The witness now attests the genesis, satisfying its threshold.
+        let proof = race_sign_witness_proof(&witness_key, &genesis_version_id).await;
+        let witness_entry = serde_json::json!({
+            "versionId": genesis_version_id,
+            "proof": serde_json::to_value(&proof).unwrap(),
+        });
+        upload_witness(
+            &owner_auth(owner),
+            &state,
+            path,
+            witness_entry.as_object().unwrap(),
+        )
+        .await
+        .expect("witness proof verifies and is stored");
+
+        // Hold the path lock ourselves, standing in for a commit in flight.
+        let guard = state.path_locks.guard(path).await;
+
+        let state_clone = state.clone();
+        let owner_clone = owner.to_string();
+        let path_clone = path.to_string();
+        let extended = extended_jsonl.clone();
+        let task = tokio::spawn(async move {
+            register_did_atomic(
+                &owner_auth(&owner_clone),
+                &state_clone,
+                &path_clone,
+                &extended,
+                false,
+                None,
+            )
+            .await
+        });
+
+        // Give the spawned call a chance to run up to — and block on — the
+        // lock we're holding.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !task.is_finished(),
+            "the spawned call must block on our guard"
+        );
+
+        // Stand in for "a concurrent commit already landed": inflate the
+        // stored log's line count so a read taken *after* the lock sees two
+        // already-published entries — both now requiring their own witness
+        // proof — rather than the one genesis entry that was really there
+        // when this test started.
+        state
+            .dids_ks
+            .insert_raw(content_log_key(path), b"1\n2\n3\n4\n5\n".to_vec())
+            .await
+            .unwrap();
+
+        drop(guard);
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("spawned call must finish once the guard is dropped")
+            .unwrap()
+            .expect_err(
+                "a read taken under the lock must see the inflated previously_published count \
+                 and demand a witness proof for the new entry, which was never provided",
+            );
+        assert!(
+            err.to_string().contains("threshold"),
+            "expected a witness-threshold refusal, got: {err}"
         );
     }
 

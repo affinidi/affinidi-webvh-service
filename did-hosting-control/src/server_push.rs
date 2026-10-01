@@ -21,14 +21,73 @@ use tracing::{info, warn};
 use crate::registry::{self, ServiceType};
 use crate::server::AppState;
 
-/// Enqueue published DIDs to one server's outbox — only the ones it doesn't
-/// already have at the current version.
+/// What a registering server reports holding in one slot (an entry of the
+/// `preloaded_dids` in its register payload).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportedDid {
+    /// The DID the slot holds. `None` from a server that did not say — which
+    /// never counts as current.
+    pub did_id: Option<String>,
+    pub version_count: u64,
+    /// The slot's disabled state as the server holds it. `None` from a server
+    /// that did not say, which is then not compared.
+    pub disabled: Option<bool>,
+}
+
+/// Whether a server that reports `reported` for a slot already holds the
+/// control plane's `record` for it, so nothing need be pushed.
 ///
-/// `reported` maps mnemonic → the `version_count` the registering server says
-/// it already holds (from the `preloaded_dids` in its register payload). Any
-/// DID at or above that version is skipped. An **empty** map means a full push
-/// — the back-compat path for a client that sends no `preloaded_dids`, and the
-/// correct behaviour for a server with an empty store.
+/// Both the **identity** and the version must match: a DID deleted and
+/// re-created at the same mnemonic has a new identifier but may well have the
+/// same number of versions, and an edge that missed the delete (offline past
+/// its outbox budget, say) would otherwise keep serving the old DID. On a
+/// mismatch the new log is pushed; the edge's own per-identity high-water mark
+/// still refuses anything that would roll a DID back.
+///
+/// A server that reports the slot's `disabled` state must also hold the
+/// control plane's: a disable it missed is re-sent with the content.
+pub fn edge_is_current(record: &DidRecord, reported: Option<&ReportedDid>) -> bool {
+    reported.is_some_and(|have| {
+        have.did_id.is_some()
+            && have.did_id == record.did_id
+            && have.version_count >= record.version_count
+            && have.disabled.is_none_or(|d| d == record.disabled)
+    })
+}
+
+/// Parse the `preloaded_dids` of a register payload into mnemonic →
+/// [`ReportedDid`]. Absent or malformed → empty, i.e. a full push.
+pub fn parse_reported(body: &serde_json::Value) -> std::collections::HashMap<String, ReportedDid> {
+    body.get("preloaded_dids")
+        .and_then(|v| v.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| {
+                    let mnemonic = e.get("mnemonic")?.as_str()?.to_string();
+                    let version_count = e.get("version_count")?.as_u64()?;
+                    let did_id = e.get("did_id").and_then(|v| v.as_str()).map(String::from);
+                    let disabled = e.get("disabled").and_then(|v| v.as_bool());
+                    Some((
+                        mnemonic,
+                        ReportedDid {
+                            did_id,
+                            version_count,
+                            disabled,
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Enqueue published DIDs to one server's outbox — only the ones it doesn't
+/// already hold, as the same DID at the current version ([`edge_is_current`]).
+///
+/// `reported` maps mnemonic → what the registering server says it holds (from
+/// the `preloaded_dids` in its register payload). An **empty** map means a full
+/// push — the correct behaviour for a server with an empty store.
 ///
 /// Each DID is one outbox row; the worker drains them in enqueue order so the
 /// server applies them deterministically, and a control restart mid-bulk
@@ -38,7 +97,7 @@ use crate::server::AppState;
 pub fn sync_all_dids_to_server(
     state: &AppState,
     server_did: String,
-    reported: std::collections::HashMap<String, u64>,
+    reported: std::collections::HashMap<String, ReportedDid>,
 ) {
     let dids_ks = state.dids_ks.clone();
     let registry_ks = state.registry_ks.clone();
@@ -69,6 +128,9 @@ pub fn sync_all_dids_to_server(
 
         let mut count = 0u64; // DIDs queued
         let mut frames = 0u64; // outbox rows (transport frames) enqueued
+        // Mnemonics this control plane publishes; whatever the server reports
+        // beyond these it should no longer serve (a delete it missed).
+        let mut published: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut pending: Vec<serde_json::Value> = Vec::new();
         let mut pending_bytes = 0usize;
 
@@ -81,13 +143,11 @@ pub fn sync_all_dids_to_server(
             if record.version_count == 0 {
                 continue;
             }
+            published.insert(record.mnemonic.clone());
 
-            // Delta: the registering server already has this DID at this
+            // Delta: the registering server already has this same DID at this
             // version or newer — nothing to push.
-            if reported
-                .get(&record.mnemonic)
-                .is_some_and(|&have| have >= record.version_count)
-            {
+            if edge_is_current(&record, reported.get(&record.mnemonic)) {
                 continue;
             }
 
@@ -110,13 +170,9 @@ pub fn sync_all_dids_to_server(
                 _ => None,
             };
 
-            let body = json!({
-                "mnemonic": record.mnemonic,
-                "did_id": record.did_id.unwrap_or_default(),
-                "log_content": log_content,
-                "witness_content": witness_content,
-                "version_count": record.version_count,
-            });
+            let Some(body) = sync_update_body(&record, log_content, witness_content) else {
+                continue;
+            };
 
             if !batch {
                 if let Err(e) =
@@ -164,6 +220,28 @@ pub fn sync_all_dids_to_server(
             }
         }
 
+        // Deletes the server missed: it reports a DID this control plane no
+        // longer publishes. Queued after the updates, in order.
+        let mut deletes = 0u64;
+        for mnemonic in reported.keys().filter(|m| !published.contains(*m)) {
+            if let Err(e) = crate::outbox::enqueue(
+                &store,
+                &server_did,
+                MSG_SYNC_DELETE,
+                json!({ "mnemonic": mnemonic }),
+            )
+            .await
+            {
+                warn!(server_did = %server_did, %mnemonic, error = %e, "resync: delete enqueue failed");
+            } else {
+                deletes += 1;
+            }
+        }
+        if deletes > 0 {
+            notify.notify_one();
+            info!(server_did = %server_did, deletes, "resync: queued deletes the server missed");
+        }
+
         if count > 0 {
             notify.notify_one();
             info!(
@@ -175,6 +253,40 @@ pub fn sync_all_dids_to_server(
             );
         }
     });
+}
+
+/// The `webvh/sync/update/0.2` payload for a stored slot — the same shape each
+/// entry of a `webvh/sync/batch/0.1` carries — or `None` when the slot has no
+/// published DID to replicate.
+///
+/// The slot's `disabled` state travels with its content, so disabling a DID
+/// reaches every replica through the same channel as publishing one. The body
+/// is read back through the generated type before it is queued: it leaves
+/// only in the shape its schema allows.
+pub(crate) fn sync_update_body(
+    record: &DidRecord,
+    log_content: String,
+    witness_content: Option<String>,
+) -> Option<serde_json::Value> {
+    use trust_tasks_rs::specs::webvh::sync::update::v0_2 as update;
+
+    let did_id = record.did_id.clone().filter(|d| !d.is_empty())?;
+    let body = serde_json::to_value(did_hosting_common::DidSyncUpdate {
+        mnemonic: record.mnemonic.clone(),
+        did_id,
+        log_content,
+        witness_content: witness_content.filter(|w| !w.is_empty()),
+        version_count: record.version_count,
+        disabled: record.disabled,
+    })
+    .ok()?;
+    match serde_json::from_value::<update::Payload>(body.clone()) {
+        Ok(_) => Some(body),
+        Err(e) => {
+            warn!(mnemonic = %record.mnemonic, error = %e, "DID sync: slot does not fit sync/update/0.2; not sending it");
+            None
+        }
+    }
 }
 
 /// Max DIDs per `MSG_SYNC_BATCH`, and max serialized bytes. Bounds message size
@@ -189,6 +301,7 @@ const SYNC_BATCH_MAX_BYTES: usize = 512 * 1024;
 /// servers that are offline at enqueue time still get the update
 /// when they reconnect.
 pub fn notify_servers_did(state: &AppState, mnemonic: String) {
+    let watcher_peers = state.config.registry.watchers.clone();
     let registry_ks = state.registry_ks.clone();
     let dids_ks = state.dids_ks.clone();
     let store = state.store.clone();
@@ -235,18 +348,46 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
             _ => None,
         };
 
-        let body = json!({
-            "mnemonic": mnemonic,
-            "did_id": record.did_id.unwrap_or_default(),
-            "log_content": log_content,
-            "witness_content": witness_content,
-            "version_count": record.version_count,
-        });
+        let log_for_watchers = log_content.clone();
+        let Some(body) = sync_update_body(&record, log_content, witness_content) else {
+            return;
+        };
+
+        // The watchers the log names, through the configured URL → DID map.
+        let watchers = watcher_dids_for(&watcher_peers, &log_for_watchers);
+        for watcher_did in &watchers {
+            match crate::outbox::enqueue(&store, watcher_did, MSG_SYNC_UPDATE, body.clone()).await {
+                Ok(_) => info!(watcher_did, mnemonic = %mnemonic, "DID sync: queued for watcher"),
+                Err(e) => warn!(
+                    watcher_did,
+                    mnemonic = %mnemonic,
+                    error = %e,
+                    "DID sync: outbox enqueue failed"
+                ),
+            }
+        }
+        // Record which watchers this publish named, so a later delete for the
+        // same mnemonic (`notify_servers_delete`) reaches only them — a slot
+        // most watchers never held is not their business, and fanning a
+        // delete out to every configured watcher would tell watchers that
+        // never mirrored the DID that its mnemonic even existed. Written on
+        // every publish (even an empty list) so the record always reflects
+        // the log's current `watchers` parameter, not a stale earlier one.
+        if let Err(e) = dids_ks
+            .insert(notified_watchers_key(&mnemonic), &watchers)
+            .await
+        {
+            warn!(mnemonic = %mnemonic, error = %e, "DID sync: failed to record notified watchers");
+        }
 
         let servers = match get_active_servers(&registry_ks).await {
             Some(s) => s,
             None => {
-                warn!(mnemonic = %mnemonic, "DID sync: no active servers in registry");
+                if watchers.is_empty() {
+                    warn!(mnemonic = %mnemonic, "DID sync: no active servers in registry");
+                } else {
+                    notify.notify_one();
+                }
                 return;
             }
         };
@@ -278,21 +419,50 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
 /// Enqueue a DID-delete sync to every active server instance.
 pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
     let registry_ks = state.registry_ks.clone();
+    let dids_ks = state.dids_ks.clone();
     let store = state.store.clone();
     let notify = state.outbox_notify.clone();
 
     tokio::spawn(async move {
         info!(mnemonic = %mnemonic, "DID deleted — queueing sync to servers");
 
+        let body = json!({ "mnemonic": mnemonic });
+        // The log is gone, so which watchers it named at publish time is read
+        // back from what `notify_servers_did` recorded there — not every
+        // configured watcher. A watcher this mnemonic was never sent to has
+        // no business learning it ever existed, which fanning the delete out
+        // to the whole registry would do. One of the named watchers that
+        // mirrors nothing for the slot (already deleted, missed the publish)
+        // answers `absent`, same as before.
+        let watcher_dids: Vec<String> = dids_ks
+            .get(notified_watchers_key(&mnemonic))
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        for watcher_did in &watcher_dids {
+            if let Err(e) =
+                crate::outbox::enqueue(&store, watcher_did, MSG_SYNC_DELETE, body.clone()).await
+            {
+                warn!(watcher_did, mnemonic = %mnemonic, error = %e, "DID delete sync: outbox enqueue failed");
+            }
+        }
+        if let Err(e) = dids_ks.remove(notified_watchers_key(&mnemonic)).await {
+            warn!(mnemonic = %mnemonic, error = %e, "DID delete sync: failed to clear notified-watchers record");
+        }
+
         let servers = match get_active_servers(&registry_ks).await {
             Some(s) => s,
             None => {
-                warn!(mnemonic = %mnemonic, "DID delete sync: no active servers in registry");
+                if watcher_dids.is_empty() {
+                    warn!(mnemonic = %mnemonic, "DID delete sync: no active servers in registry");
+                } else {
+                    notify.notify_one();
+                }
                 return;
             }
         };
 
-        let body = json!({ "mnemonic": mnemonic });
         for (server_did, instance_id) in &servers {
             if let Err(e) =
                 crate::outbox::enqueue(&store, server_did, MSG_SYNC_DELETE, body.clone()).await
@@ -315,6 +485,65 @@ pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
         }
         notify.notify_one();
     });
+}
+
+// ---------------------------------------------------------------------------
+// Watchers
+// ---------------------------------------------------------------------------
+
+/// Key holding the watcher DIDs a mnemonic's log named the last time
+/// `notify_servers_did` ran for it. Read (and cleared) by
+/// `notify_servers_delete`, so a delete reaches only the watchers the DID was
+/// actually published to.
+fn notified_watchers_key(mnemonic: &str) -> String {
+    format!("notified_watchers:{mnemonic}")
+}
+
+/// The watcher URLs a did:webvh log names: its `watchers` parameter as last
+/// set (parameters carry forward; `null` or `[]` clears it).
+pub fn watchers_named(log: &str) -> Vec<String> {
+    let mut current: Vec<String> = Vec::new();
+    for line in log.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(watchers) = entry.get("parameters").and_then(|p| p.get("watchers")) else {
+            continue;
+        };
+        current = watchers
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|u| u.trim_end_matches('/').to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    current
+}
+
+/// The DIDs of the configured watchers `log` names. A named URL with no
+/// configured DID is skipped (and logged): the control plane pushes only to
+/// watchers it was told the DID of.
+pub fn watcher_dids_for(peers: &[crate::config::WatcherPeer], log: &str) -> Vec<String> {
+    let mut dids = Vec::new();
+    for url in watchers_named(log) {
+        match peers.iter().find(|p| p.url.trim_end_matches('/') == url) {
+            Some(peer) if !dids.contains(&peer.did) => dids.push(peer.did.clone()),
+            Some(_) => {}
+            None => {
+                warn!(watcher_url = %url, "DID sync: the log names a watcher with no configured DID; not pushing to it")
+            }
+        }
+    }
+    dids
+}
+
+/// Whether `did` is a watcher this control plane is configured to push to —
+/// the only standing a watcher has here: acknowledging what it was sent.
+pub fn is_configured_watcher(state: &AppState, did: &str) -> bool {
+    state.config.registry.watchers.iter().any(|p| p.did == did)
 }
 
 // ---------------------------------------------------------------------------
@@ -362,25 +591,161 @@ async fn get_active_servers(
 // idempotent (assign/unassign/purge/upsert all no-op on repeat).
 // ---------------------------------------------------------------------------
 
-/// Enqueue `MSG_DOMAIN_ASSIGN { domain }` for one server. Returns once
+/// A domain operation the control plane has sent a server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DomainOp {
+    Assign,
+    Unassign,
+    Purge,
+}
+
+/// The latest domain operation sent to one server for one domain — what that
+/// server's assignment of the domain should be. Kept so a server that missed
+/// the op (offline past its outbox budget) is brought back in line when it
+/// next registers ([`resend_domain_intents`]); an unassign or purge is settled
+/// once the server acknowledges it, an assign is kept (it is the desired
+/// state, and re-sending it is a no-op).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DomainIntent {
+    pub domain: String,
+    pub op: DomainOp,
+    pub at: u64,
+}
+
+/// `|` cannot occur in a DID, so one server's prefix never matches another's.
+fn domain_intent_prefix(server_did: &str) -> String {
+    format!("domain-intent:{server_did}|")
+}
+
+fn domain_intent_key(server_did: &str, domain: &str) -> String {
+    format!("{}{domain}", domain_intent_prefix(server_did))
+}
+
+/// Record `op` as the latest domain operation for `server_did`.
+async fn record_domain_intent(
+    state: &AppState,
+    server_did: &str,
+    domain: &str,
+    op: DomainOp,
+) -> Result<(), did_hosting_common::server::error::AppError> {
+    state
+        .registry_ks
+        .insert(
+            domain_intent_key(server_did, domain),
+            &DomainIntent {
+                domain: domain.to_string(),
+                op,
+                at: crate::auth::session::now_epoch(),
+            },
+        )
+        .await
+}
+
+/// Every recorded domain intent for one server.
+pub async fn domain_intents(
+    state: &AppState,
+    server_did: &str,
+) -> Result<Vec<DomainIntent>, did_hosting_common::server::error::AppError> {
+    Ok(state
+        .registry_ks
+        .prefix_iter_raw(domain_intent_prefix(server_did))
+        .await?
+        .into_iter()
+        .filter_map(|(_, v)| serde_json::from_slice(&v).ok())
+        .collect())
+}
+
+/// A server acknowledged `op` for `domain`: an unassign or purge is settled —
+/// but only when it is still the latest op, so the ack of an older unassign
+/// cannot erase a newer assign.
+pub async fn settle_domain_intent(state: &AppState, server_did: &str, domain: &str, op: DomainOp) {
+    if op == DomainOp::Assign {
+        return;
+    }
+    let key = domain_intent_key(server_did, domain);
+    match state.registry_ks.get::<DomainIntent>(key.clone()).await {
+        Ok(Some(intent)) if intent.op == op => {
+            if let Err(e) = state.registry_ks.remove(key).await {
+                warn!(server_did, domain, error = %e, "failed to settle domain intent");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => warn!(server_did, domain, error = %e, "failed to read domain intent"),
+    }
+}
+
+/// Re-send every unsettled domain operation to a (re-)registering server: its
+/// assignments, and any unassign or purge it has not acknowledged. Idempotent
+/// on the server. A purge is preceded by its unassign, so a server that missed
+/// both ends up unassigned and purged.
+pub async fn resend_domain_intents(state: &AppState, server_did: &str) {
+    let intents = match domain_intents(state, server_did).await {
+        Ok(i) => i,
+        Err(e) => {
+            warn!(server_did, error = %e, "domain resync: failed to list domain intents");
+            return;
+        }
+    };
+    for intent in intents {
+        let ops: &[&str] = match intent.op {
+            DomainOp::Assign => &[MSG_REPLICA_DOMAIN_ASSIGN],
+            DomainOp::Unassign => &[MSG_REPLICA_DOMAIN_UNASSIGN],
+            DomainOp::Purge => &[MSG_REPLICA_DOMAIN_UNASSIGN, MSG_REPLICA_DOMAIN_PURGE],
+        };
+        for op in ops {
+            if let Err(e) = crate::outbox::enqueue(
+                &state.store,
+                server_did,
+                op,
+                json!({ "domain": intent.domain }),
+            )
+            .await
+            {
+                warn!(server_did, domain = %intent.domain, op, error = %e, "domain resync: enqueue failed");
+            }
+        }
+    }
+    state.outbox_notify.notify_one();
+}
+
+/// Enqueue `replica/domain/assign { domain }` for one server. Returns once
 /// the outbox row is durable; the worker handles actual delivery and
 /// retry.
+///
+/// A purge of the same domain still queued for this server is dropped first.
+/// Each delivery attempt is signed afresh, so a purge re-sent after this
+/// assignment would carry a later `issuedAt` than the assignment and pass the
+/// server's `stalePurge` check: `replica/domain/purge/0.1` makes dropping it
+/// the control plane's job.
 pub async fn send_domain_assign(
     state: &AppState,
     target_did: &str,
     domain: &str,
 ) -> Result<(), did_hosting_common::server::error::AppError> {
+    record_domain_intent(state, target_did, domain, DomainOp::Assign).await?;
+    let dropped =
+        crate::outbox::drop_queued(&state.store, target_did, MSG_REPLICA_DOMAIN_PURGE, |body| {
+            body.get("domain").and_then(|d| d.as_str()) == Some(domain)
+        })
+        .await?;
+    if dropped > 0 {
+        info!(
+            target_did,
+            domain, dropped, "re-assign dropped a purge still queued for this server"
+        );
+    }
     crate::outbox::enqueue_and_notify(
         state,
         target_did,
-        MSG_DOMAIN_ASSIGN,
+        MSG_REPLICA_DOMAIN_ASSIGN,
         json!({ "domain": domain }),
     )
     .await?;
     Ok(())
 }
 
-/// Enqueue `MSG_DOMAIN_PURGE { domain }` for one server. Bypasses the
+/// Enqueue `replica/domain/purge { domain }` for one server. Bypasses the
 /// grace window on the recipient (audit-logged as
 /// `reason: "admin-immediate"`). Use sparingly.
 pub async fn send_domain_purge(
@@ -388,27 +753,29 @@ pub async fn send_domain_purge(
     target_did: &str,
     domain: &str,
 ) -> Result<(), did_hosting_common::server::error::AppError> {
+    record_domain_intent(state, target_did, domain, DomainOp::Purge).await?;
     crate::outbox::enqueue_and_notify(
         state,
         target_did,
-        MSG_DOMAIN_PURGE,
+        MSG_REPLICA_DOMAIN_PURGE,
         json!({ "domain": domain }),
     )
     .await?;
     Ok(())
 }
 
-/// Enqueue `MSG_DOMAIN_UNASSIGN { domain }` for one server. Same
+/// Enqueue `replica/domain/unassign { domain }` for one server. Same
 /// at-least-once semantics as [`send_domain_assign`].
 pub async fn send_domain_unassign(
     state: &AppState,
     target_did: &str,
     domain: &str,
 ) -> Result<(), did_hosting_common::server::error::AppError> {
+    record_domain_intent(state, target_did, domain, DomainOp::Unassign).await?;
     crate::outbox::enqueue_and_notify(
         state,
         target_did,
-        MSG_DOMAIN_UNASSIGN,
+        MSG_REPLICA_DOMAIN_UNASSIGN,
         json!({ "domain": domain }),
     )
     .await?;
@@ -419,20 +786,48 @@ pub async fn send_domain_unassign(
 // Domain replication push (split-deployment lifecycle)
 // ---------------------------------------------------------------------------
 
-/// Enqueue `MSG_DOMAIN_UPSERT { ...DomainEntry }` for one server.
+/// Enqueue `replica/domain/upsert { entry }` for one server.
 /// Replicates a control-side create / update / disable / enable so the
 /// server's local store + sweeper stay in sync. Idempotent on the
 /// receiver — re-sending the same row is harmless.
+///
+/// The entry travels in the shared `DomainEntry` wire shape
+/// ([`did_hosting_common::server::domain::wire`]), already canonical.
 pub async fn send_domain_upsert(
     state: &AppState,
     target_did: &str,
     entry: &did_hosting_common::server::domain::DomainEntry,
 ) -> Result<(), did_hosting_common::server::error::AppError> {
-    let body = serde_json::to_value(entry).map_err(|e| {
-        did_hosting_common::server::error::AppError::Internal(format!("serialise DomainEntry: {e}"))
-    })?;
-    crate::outbox::enqueue_and_notify(state, target_did, MSG_DOMAIN_UPSERT, body).await?;
+    let body = json!({ "entry": did_hosting_common::server::domain::wire::to_spec(entry) });
+    crate::outbox::enqueue_and_notify(state, target_did, MSG_REPLICA_DOMAIN_UPSERT, body).await?;
     Ok(())
+}
+
+/// Replicate every control-side `DomainEntry` to one server, then re-send its
+/// unsettled domain assign/unassign/purge ops ([`resend_domain_intents`]) — run
+/// on each (re-)registration so a server that missed any of them while
+/// unreachable converges on the control plane's domain records, statuses and
+/// assignments.
+pub fn sync_all_domains_to_server(state: &AppState, server_did: String) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        sync_all_domains_now(&state, &server_did).await;
+    });
+}
+
+/// The body of [`sync_all_domains_to_server`], awaited (for tests).
+pub async fn sync_all_domains_now(state: &AppState, server_did: &str) {
+    match did_hosting_common::server::domain::list_domains(&state.store).await {
+        Ok(domains) => {
+            for entry in &domains {
+                if let Err(e) = send_domain_upsert(state, server_did, entry).await {
+                    warn!(server_did, domain = %entry.name, error = %e, "domain resync: enqueue failed");
+                }
+            }
+        }
+        Err(e) => warn!(server_did, error = %e, "domain resync: list failed"),
+    }
+    resend_domain_intents(state, server_did).await;
 }
 
 /// Fan an upsert out to every registered server. Used after every
@@ -482,4 +877,46 @@ pub async fn fanout_domain_upsert(
         }
     }
     (enqueued, skipped)
+}
+
+#[cfg(test)]
+mod watcher_tests {
+    use super::*;
+    use crate::config::WatcherPeer;
+
+    fn log(params: &[serde_json::Value]) -> String {
+        params
+            .iter()
+            .map(|p| json!({ "versionId": "1-x", "parameters": p }).to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_last_watchers_parameter_wins() {
+        let l = log(&[
+            json!({ "watchers": ["https://a.example/"] }),
+            json!({}),
+            json!({ "watchers": ["https://b.example", "https://c.example"] }),
+        ]);
+        assert_eq!(
+            watchers_named(&l),
+            vec!["https://b.example", "https://c.example"]
+        );
+        let cleared = log(&[
+            json!({ "watchers": ["https://a.example"] }),
+            json!({ "watchers": null }),
+        ]);
+        assert!(watchers_named(&cleared).is_empty());
+    }
+
+    #[test]
+    fn only_configured_watchers_are_pushed_to() {
+        let peers = vec![WatcherPeer {
+            url: "https://b.example/".into(),
+            did: "did:example:b".into(),
+        }];
+        let l = log(&[json!({ "watchers": ["https://a.example", "https://b.example"] })]);
+        assert_eq!(watcher_dids_for(&peers, &l), vec!["did:example:b"]);
+    }
 }

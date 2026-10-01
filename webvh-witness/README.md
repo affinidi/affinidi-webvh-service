@@ -22,7 +22,7 @@ DID document was observed at a specific point in time.
 ### 1. Build
 
 ```bash
-cargo build -p webvh-witness --release
+cargo build --locked -p webvh-witness --release
 ```
 
 The binary is produced at `target/release/webvh-witness`.
@@ -145,47 +145,37 @@ webvh-witness list-witnesses
 webvh-witness delete-witness --id z6Mk...
 ```
 
-## API Endpoints
+## Trust Tasks
 
-All API endpoints are under the `/api` prefix.
+The witness has no REST management API. Every operation is a
+[Trust Task](https://trusttasks.org) document signed by its requester
+(`proofPurpose: authentication`, by one of the requester's `authentication`
+keys) and addressed to the witness's DID. The same documents are served on
+every transport:
 
-### Authentication
+- **TSP** and **DIDComm**, on the witness's mediator connection;
+- **HTTPS**, `POST /api/trust-tasks`.
 
-| Method | Path                  | Description         |
-| ------ | --------------------- | ------------------- |
-| `POST` | `/api/auth/challenge` | Request challenge   |
-| `POST` | `/api/auth/`          | Submit DIDComm auth |
-| `POST` | `/api/auth/refresh`   | Refresh token       |
+| Task | Who may send it |
+| ---- | --------------- |
+| `webvh/witness/key/create/0.1` | an Admin |
+| `webvh/witness/key/list/0.1` | an Admin |
+| `webvh/witness/key/delete/0.1` | an Admin |
+| `webvh/witness/sign/0.1` | an Admin |
+| `acl/grant\|revoke\|change-role\|show\|list/0.1` | per the ACL family's rules |
 
-### Witness Management (admin only)
+`webvh/witness/sign` carries the DID log up to and including the entry to
+witness, and the witness verifies it before signing: the chain must verify,
+`versionId` must be the last entry, the DID must not be deactivated, and the
+witness parameter in force for the entry must name the witness identity.
 
-| Method   | Path                           | Description        |
-| -------- | ------------------------------ | ------------------ |
-| `GET`    | `/api/witnesses`               | List witnesses     |
-| `POST`   | `/api/witnesses`               | Create witness     |
-| `GET`    | `/api/witnesses/{witness_id}`  | Get witness detail |
-| `DELETE` | `/api/witnesses/{witness_id}`  | Delete witness     |
+A document that does not verify — unsigned, signed with the wrong proof
+purpose, not addressed to this witness, stale, or a replay — gets no reply
+(HTTPS answers `403` with an unsigned, detail-free body). A verified document
+from a DID the witness does not authorise is refused with a signed
+`permissionDenied`. Every other reply is signed by the witness.
 
-### Proof Signing (authenticated)
-
-| Method | Path                        | Description     |
-| ------ | --------------------------- | --------------- |
-| `POST` | `/api/proof/{witness_id}`   | Sign a proof    |
-
-### Access Control (admin only)
-
-| Method   | Path             | Description      |
-| -------- | ---------------- | ---------------- |
-| `GET`    | `/api/acl`       | List ACL entries |
-| `POST`   | `/api/acl`       | Create ACL entry |
-| `PUT`    | `/api/acl/{did}` | Update ACL entry |
-| `DELETE` | `/api/acl/{did}` | Remove ACL entry |
-
-### DIDComm
-
-| Method | Path           | Description           |
-| ------ | -------------- | --------------------- |
-| `POST` | `/api/didcomm` | DIDComm v2 messaging  |
+`GET /api/health` stays a plain, unauthenticated liveness probe.
 
 ## Library Usage
 
@@ -194,7 +184,8 @@ The webvh-witness crate can be used as a library (e.g., by the
 
 - `webvh_witness::config::AppConfig` — configuration
 - `webvh_witness::server::AppState` — application state
-- `webvh_witness::routes::router()` — Axum router
+- `webvh_witness::routes::router()` — Axum router (`POST /api/trust-tasks`)
+- `webvh_witness::trust_tasks::dispatch_inbound_document` — the one inbound dispatch
 - `webvh_witness::server::run()` — standalone entry point
 - `webvh_witness::signing::LocalSigner` — witness proof signing
 

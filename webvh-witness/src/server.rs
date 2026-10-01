@@ -1,21 +1,22 @@
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_service::{
-    DIDCommService, DIDCommServiceConfig, ListenerConfig, RestartPolicy, RetryConfig,
+    DIDCommService, DIDCommServiceConfig, ListenerConfig, Protocols, RestartPolicy, RetryConfig,
 };
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
-use did_hosting_common::server::auth::extractor::AuthState;
-use did_hosting_common::server::didcomm_profile::build_tdk_profile_for_identity;
+use did_hosting_common::server::didcomm_profile::{
+    advertised_protocols, build_tdk_profile_for_identity, reconcile_listener_protocols,
+};
 use did_hosting_common::server::identity::{self, ServiceIdentity};
 use did_hosting_common::server::init;
-use did_hosting_common::server::store::{KS_ACL, KS_SESSIONS, KS_WITNESSES};
+use did_hosting_common::server::path_locks::PathLocks;
+use did_hosting_common::server::replay::ReplayCache;
+use did_hosting_common::server::store::{KS_ACL, KS_WITNESSES};
+use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
 use tokio_util::sync::CancellationToken;
 
-use crate::auth::jwt::JwtKeys;
-use crate::auth::session::cleanup_expired_sessions;
-use crate::config::{AppConfig, AuthConfig};
+use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::messaging;
 use crate::routes;
@@ -30,7 +31,6 @@ use tracing::{Level, error, info, warn};
 #[derive(Clone)]
 pub struct AppState {
     pub store: Store,
-    pub sessions_ks: KeyspaceHandle,
     pub acl_ks: KeyspaceHandle,
     pub witnesses_ks: KeyspaceHandle,
     pub config: Arc<AppConfig>,
@@ -38,7 +38,7 @@ pub struct AppState {
     pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
     /// The service's own DID identity — every generation of key material still
     /// honoured, and the kids each one answers to. The two resolvers above are
-    /// cheap clones taken from this.
+    /// cheap clones taken from this. Signs every Trust Task reply.
     pub identity: Option<Arc<ServiceIdentity>>,
     /// The running messaging service, once started.
     ///
@@ -47,69 +47,76 @@ pub struct AppState {
     /// `remove_listener` / `add_listener` take `&self`, so the *service* is
     /// never replaced — only its one listener — and a `OnceLock` suffices.
     pub didcomm_service: Arc<OnceLock<DIDCommService>>,
-    pub jwt_keys: Option<Arc<JwtKeys>>,
     pub signer: Arc<dyn WitnessSigner>,
+    /// Verifies every inbound Trust Task's proof. `None` when no resolver is
+    /// configured, in which case no request is accepted.
+    pub trust_tasks_verifier: Option<Arc<TransportBoundVerifier>>,
+    /// Serialises the ACL write handlers (`acl/grant|revoke|change-role`).
+    pub acl_locks: PathLocks,
+    /// Requests already acted on, keyed on `(proven issuer, document id)`.
+    pub replay_cache: Arc<ReplayCache>,
+    /// Serialises `witness/sign`: the check that an entry extends what the
+    /// witness has already witnessed, the signature, and the record of it are
+    /// one step, so two forks of the same DID cannot both be witnessed.
+    pub sign_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-address rate limiter for `POST /api/trust-tasks`. Applied before
+    /// the document's claimed issuer is checked against the ACL, so a single
+    /// address cannot force unbounded DID-resolution work by posting
+    /// documents that name a fresh issuer on every request.
+    pub trust_tasks_rate_limiter: Arc<did_hosting_common::server::rate_limit::IpRateLimiter>,
 }
 
 impl AppState {
-    /// Unwrap the DIDComm auth components, returning an error if any are not configured.
-    pub fn require_didcomm_auth(
-        &self,
-    ) -> Result<(&DIDCacheClient, &ThreadedSecretsResolver, &JwtKeys), AppError> {
-        let did_resolver = self
-            .did_resolver
-            .as_ref()
-            .ok_or_else(|| AppError::Authentication("DID resolver not configured".into()))?;
-        let secrets_resolver = self
-            .secrets_resolver
-            .as_ref()
-            .ok_or_else(|| AppError::Authentication("secrets resolver not configured".into()))?;
-        let jwt_keys = self
-            .jwt_keys
-            .as_ref()
-            .ok_or_else(|| AppError::Authentication("JWT keys not configured".into()))?;
-        Ok((did_resolver, secrets_resolver.as_ref(), jwt_keys.as_ref()))
-    }
-}
-
-impl AuthState for AppState {
-    fn jwt_keys(&self) -> Option<&Arc<JwtKeys>> {
-        self.jwt_keys.as_ref()
-    }
-
-    fn sessions_ks(&self) -> &KeyspaceHandle {
-        &self.sessions_ks
+    /// A witness state over `store`, with the Trust Task machinery built from
+    /// `identity`'s resolver.
+    pub fn new(
+        store: Store,
+        config: AppConfig,
+        identity: Option<Arc<ServiceIdentity>>,
+        signer: Arc<dyn WitnessSigner>,
+    ) -> Result<Self, AppError> {
+        let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
+        let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
+        Ok(Self {
+            acl_ks: store.keyspace(KS_ACL)?,
+            witnesses_ks: store.keyspace(KS_WITNESSES)?,
+            store,
+            config: Arc::new(config),
+            trust_tasks_verifier: crate::trust_tasks::build_verifier(did_resolver.as_ref()),
+            did_resolver,
+            secrets_resolver,
+            identity,
+            didcomm_service: Arc::new(OnceLock::new()),
+            signer,
+            acl_locks: PathLocks::new(),
+            replay_cache: Arc::new(ReplayCache::new()),
+            sign_lock: Arc::new(tokio::sync::Mutex::new(())),
+            trust_tasks_rate_limiter: Arc::new(
+                did_hosting_common::server::rate_limit::IpRateLimiter::new(
+                    did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
+                    did_hosting_common::server::rate_limit::TRUST_TASKS_MAX_PER_WINDOW,
+                    did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
+                ),
+            ),
+        })
     }
 }
 
 pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
-    // Open keyspace handles
-    let sessions_ks = store.keyspace(KS_SESSIONS)?;
-    let acl_ks = store.keyspace(KS_ACL)?;
-    let witnesses_ks = store.keyspace(KS_WITNESSES)?;
-
     // Load the service's own identity (requires server_did). Resolves the DID
     // document for the *real* verification-method key IDs and seeds the secrets
     // resolver under them, rather than assuming `#key-0` / `#key-1`.
-    //
-    // The witness carries no TSP listener of its own — TSP rides the control
-    // plane's mediator socket.
     let identity = identity::load_identity(
         config.server_did.as_deref(),
         config.mediator_did.as_deref(),
         identity::ProtocolSet {
             didcomm: config.features.didcomm,
-            tsp: false,
+            tsp: config.features.tsp,
         },
         &secrets,
         &store,
     )
     .await;
-    let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
-    let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
-
-    // Initialize JWT keys
-    let jwt_keys = init::init_jwt_keys(&secrets);
 
     // Bind TCP listener on the main thread for early port validation
     let std_listener = if config.features.rest_api {
@@ -122,24 +129,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         None
     };
 
-    // Gather storage thread inputs before moving config into Arc
-    let storage_sessions_ks = sessions_ks.clone();
-    let storage_auth_config = config.auth.clone();
-    let has_auth = jwt_keys.is_some();
-
-    let state = AppState {
-        store: store.clone(),
-        sessions_ks,
-        acl_ks,
-        witnesses_ks,
-        config: Arc::new(config),
-        did_resolver,
-        secrets_resolver,
-        identity,
-        didcomm_service: Arc::new(OnceLock::new()),
-        jwt_keys,
-        signer: Arc::new(LocalSigner),
-    };
+    let state = AppState::new(store.clone(), config, identity, Arc::new(LocalSigner))?;
 
     // Log startup configuration
     info!("--- enabled services ---");
@@ -194,15 +184,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let mut storage_shutdown = storage_shutdown_rx.clone();
     let storage_handle = std::thread::Builder::new()
         .name("witness-storage".into())
-        .spawn(move || {
-            run_storage_thread(
-                store,
-                storage_sessions_ks,
-                storage_auth_config,
-                has_auth,
-                &mut storage_shutdown,
-            )
-        })
+        .spawn(move || run_storage_thread(store, &mut storage_shutdown))
         .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
 
     // 3. Wait for REST, then start DIDComm service
@@ -325,30 +307,56 @@ async fn start_didcomm_service(
     // was seeded with.
     let profile = build_tdk_profile_for_identity("witness", identity, Some(&mediator_did)).await?;
 
-    let listener = ListenerConfig {
+    // DIDComm and/or TSP ride the same mediator socket. The listener carries
+    // every transport the witness's own DID document advertises, whatever the
+    // config flags say — the document is how peers reach it.
+    let advertised = advertised_protocols(&identity.did, Some(&identity.did_resolver)).await;
+    let transports = reconcile_listener_protocols(identity.protocols(), advertised, &identity.did);
+    let tsp_enabled = transports.tsp;
+    let protocols = match (transports.didcomm, transports.tsp) {
+        (true, true) => Protocols::BOTH,
+        (false, true) => Protocols::TSP_ONLY,
+        _ => Protocols::DIDCOMM_ONLY,
+    };
+
+    let mut listener = ListenerConfig {
         id: "witness".into(),
         profile,
         restart_policy: RestartPolicy::Always {
             backoff: RetryConfig::default(),
         },
         auto_delete: true,
+        protocols,
         ..Default::default()
     };
+    if tsp_enabled {
+        listener.relationship_store = Some(
+            did_hosting_common::server::tsp_relationship_store::build_relationship_store(
+                &state.store,
+            )?,
+        );
+    }
 
     let router = messaging::build_witness_router(state.clone())
         .map_err(|e| AppError::Internal(format!("failed to build DIDComm router: {e}")))?;
 
-    let svc = DIDCommService::start(
-        DIDCommServiceConfig {
-            listeners: vec![listener],
-        },
-        router,
-        shutdown,
-    )
-    .await
-    .map_err(|e| AppError::Internal(format!("failed to start DIDComm service: {e}")))?;
+    let config = DIDCommServiceConfig {
+        listeners: vec![listener],
+    };
+    let svc = if tsp_enabled {
+        DIDCommService::start_with_tsp(
+            config,
+            router,
+            crate::tsp::WitnessTspHandler::new(state.clone()),
+            shutdown,
+        )
+        .await
+    } else {
+        DIDCommService::start(config, router, shutdown).await
+    }
+    .map_err(|e| AppError::Internal(format!("failed to start messaging service: {e}")))?;
 
-    info!(witness_did = %identity.did, "DIDComm service started");
+    info!(tsp = tsp_enabled, witness_did = %identity.did, "messaging service started");
     Ok(Some(svc))
 }
 
@@ -393,13 +401,16 @@ fn run_rest_thread(
         let _ = ready_tx.send(());
 
         let shutdown_rx = shutdown_rx.clone();
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let mut rx = shutdown_rx;
-                let _ = rx.changed().await;
-            })
-            .await
-            .expect("axum serve failed");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let mut rx = shutdown_rx;
+            let _ = rx.changed().await;
+        })
+        .await
+        .expect("axum serve failed");
 
         info!("REST thread shutting down");
     });
@@ -409,13 +420,7 @@ fn run_rest_thread(
 // Storage thread
 // ---------------------------------------------------------------------------
 
-fn run_storage_thread(
-    store: Store,
-    sessions_ks: KeyspaceHandle,
-    auth_config: AuthConfig,
-    has_auth: bool,
-    shutdown_rx: &mut watch::Receiver<bool>,
-) {
+fn run_storage_thread(store: Store, shutdown_rx: &mut watch::Receiver<bool>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -423,24 +428,8 @@ fn run_storage_thread(
 
     rt.block_on(async {
         info!("storage thread started");
-
-        let session_interval = Duration::from_secs(auth_config.session_cleanup_interval);
-        let mut session_timer = tokio::time::interval(session_interval);
-        session_timer.tick().await; // skip first immediate tick
-
-        loop {
-            tokio::select! {
-                _ = session_timer.tick(), if has_auth => {
-                    if let Err(e) = cleanup_expired_sessions(&sessions_ks, auth_config.challenge_ttl).await {
-                        warn!("session cleanup error: {e}");
-                    }
-                }
-                _ = shutdown_rx.changed() => {
-                    info!("storage thread shutting down");
-                    break;
-                }
-            }
-        }
+        let _ = shutdown_rx.changed().await;
+        info!("storage thread shutting down");
 
         if let Err(e) = store.persist().await {
             error!("failed to persist store on shutdown: {e}");
@@ -449,7 +438,3 @@ fn run_storage_thread(
         }
     });
 }
-
-// ---------------------------------------------------------------------------
-// Auth initialization
-// ---------------------------------------------------------------------------

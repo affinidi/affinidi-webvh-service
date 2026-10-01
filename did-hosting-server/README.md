@@ -2,12 +2,16 @@
 
 The DID Hosting Server is a read-only DID hosting edge node for
 [WebVH](https://www.w3.org/TR/did-web-vh/) DIDs. It serves DID
-documents publicly and receives sync updates from the
-[control plane](../did-hosting-control/) via DIDComm through a mediator.
+documents publicly and is fed by its
+[control plane](../did-hosting-control/) with signed Trust Tasks —
+`webvh/sync/*` and `did-management/replica/domain/*` — over TSP,
+DIDComm or HTTPS (`POST /api/trust-tasks`).
 
 All DID lifecycle management (create, publish, delete) is handled
-by the control plane. The server's role is to host and resolve
-DIDs at its public URL. For a self-contained deployment, use the
+by the control plane. The edge has no management API, no sessions and
+no ACL: the only party it takes directives from is its configured
+`control_did`, established from each document's proof. It does not
+start without one. For a single-host deployment, use the
 [daemon](../did-hosting-daemon/) instead.
 
 > **IMPORTANT:**
@@ -34,7 +38,7 @@ the interactive setup wizard.
 ```bash
 git clone https://github.com/affinidi/did-hosting-service.git
 cd did-hosting-service
-cargo build -p did-hosting-server --release
+cargo build --locked -p did-hosting-server --release
 ```
 
 The binary is produced at `target/release/did-hosting-server`.
@@ -114,14 +118,15 @@ different path with the `--config` flag or the
 ### Example `config.toml`
 
 ```toml
-# Server DID identity (required for DIDComm auth)
+# Server DID identity (required: the control plane addresses and verifies it)
 server_did = "did:webvh:webvh.example.com"
 mediator_did = "did:webvh:mediator.example.com"
 public_url = "https://webvh.example.com"
+# The control plane that drives this edge (required)
+control_did = "did:webvh:control.example.com"
 
 [features]
 didcomm = true
-rest_api = true
 # agent_names = true   # serve GET /@alice -> 302 to the DID. On by default;
                        # set false to leave the /@… namespace unserved.
 
@@ -137,10 +142,6 @@ format = "text"      # text or json
 data_dir = "data/did-hosting-server"   # Persistent data directory (fjall)
 
 [auth]
-access_token_expiry = 900                   # 15 minutes
-refresh_token_expiry = 86400                # 24 hours
-challenge_ttl = 300                         # 5 minutes
-session_cleanup_interval = 600              # 10 minutes
 cleanup_ttl_minutes = 60                    # Empty DID cleanup (minutes)
 
 [secrets]
@@ -157,14 +158,11 @@ keyring_service = "webvh"                   # OS keyring service name (default b
 # k8s_namespace = "webvh"                          # optional; defaults to the pod's namespace
 
 [limits]
-upload_body_limit = 102400                  # Max upload body size (bytes), default 100KB
-default_max_total_size = 1048576            # Per-account total DID size (bytes), default 1MB
-default_max_did_count = 20                  # Per-account max number of DIDs
+upload_body_limit = 102400                  # Max Trust Task body over HTTPS (floor 1 MiB)
 
-# Optional: push DID updates to watcher instances
-# [[watchers]]
-# url = "http://watcher1.example.com:8533"
-# token = "shared-secret-token"
+[replication]
+staleness_bound_secs = 300                  # /api/health answers 503 past this (default 5 min)
+reconcile_interval_secs = 60                # How often to reconcile with the control plane
 ```
 
 Private keys (signing, key agreement, JWT signing) are **not**
@@ -172,45 +170,52 @@ stored in the config file. They are managed by the secrets
 backend selected during `did-hosting-server setup`. See
 [Secrets Backends](#secrets-backends) below.
 
-#### Resource Limits
+#### Replication staleness bound
 
-The `[limits]` section controls per-account resource quotas:
+The control plane delivers every change through its durable outbox and
+retries until the edge acknowledges it. As the backstop, the edge
+reconciles against the control plane's `did-management/did/list` every
+`reconcile_interval_secs` (default 60), as a signed Trust Task whose
+signed reply must come from its configured `control_did`:
 
-- **`upload_body_limit`** — Maximum request body size for
-  `did.jsonl` and witness uploads. Requests exceeding this are
-  rejected with `413 Payload Too Large`. Default: `102400`
-  (100 KB).
+- a slot whose **disabled** state differs is repaired on the spot, so a
+  DID the control plane disabled stops resolving here even if the push
+  was lost;
+- a slot the edge is missing, holds behind, or holds but the control
+  plane no longer lists makes the edge re-register, and the control plane
+  queues exactly the updates and deletes it needs.
 
-- **`default_max_total_size`** — Default per-account total size
-  across all DID documents. When an upload would push an
-  account's combined DID content above this limit, the request
-  is rejected. Default: `1048576` (1 MB).
+When the edge has not completed a clean reconcile within
+`staleness_bound_secs` (default **300 seconds**, which must exceed the
+interval), `GET /api/health` answers `503`, so a load balancer drains
+it rather than let it serve state that may be out of date. The reconcile
+age is reported to the control plane in `did-management/server/metrics/0.1`;
+the control plane's own `server/metrics` carries each edge's outbox
+depth, the age of its oldest unacknowledged directive, and the time
+since its last acknowledgement and last reconcile, labelled by edge DID.
+Both are also settable as `DID_HOSTING_REPLICATION_STALENESS_BOUND_SECS`
+and `DID_HOSTING_REPLICATION_RECONCILE_INTERVAL_SECS`.
 
-- **`default_max_did_count`** — Default per-account maximum
-  number of DIDs. Once reached, new DID creation requests are
-  rejected. Default: `20`.
+**A restart resets the grace period.** The staleness clock counts from the
+last *clean* reconcile, or, when there has not been one yet this process,
+from when the process started — so a freshly started edge answers healthy
+for a full `staleness_bound_secs` even before its first reconcile completes.
+Restarting the process (a crash loop, a bad deploy repeatedly bounced by a
+supervisor, a manual restart) resets that clock every time: `/api/health`
+can read healthy indefinitely across repeated restarts even if the edge
+never actually completes a clean reconcile — e.g. because its control plane
+has been unreachable the whole time. A load balancer or supervisor relying
+solely on `/api/health` to detect a genuinely stuck edge should also watch
+for repeated restarts, not just probe failures.
 
-Admins are exempt from all quota checks. Per-account overrides
-can be set via the ACL API by including `max_total_size` and/or
-`max_did_count` in the ACL entry — these take precedence over
-the global defaults.
+#### Limits
 
-#### Watcher Push
+- **`upload_body_limit`** — Maximum body of a `POST /api/trust-tasks`
+  request. Never below 1 MiB, so the control plane's largest
+  `sync/batch` always fits.
 
-The optional `[[watchers]]` section configures DID replication
-to [watcher](../webvh-watcher/) instances. When a DID is
-published, updated, or deleted, the server pushes the change to
-each registered watcher. Push failures are logged but do not
-block the primary operation.
-
-```toml
-[[watchers]]
-url = "http://watcher1.example.com:8533"
-token = "shared-secret-token"
-
-[[watchers]]
-url = "http://watcher2.example.com:8533"
-```
+Per-account quotas are the control plane's concern: an edge serves
+whatever its control plane has accepted.
 
 ### Secrets Backends
 
@@ -226,7 +231,13 @@ time via feature flags and at runtime via config/env vars.
 | Azure Key Vault      | `azure-secrets` | `secrets.azure_vault_url`, `secrets.azure_secret_name`                         |
 | HashiCorp Vault      | `vault-secrets` | `secrets.vault_addr`, `secrets.vault_secret_path`, `secrets.vault_auth_method` (`kubernetes`/`token`/`approle`) |
 | Kubernetes Secret    | `k8s-secrets`   | `secrets.k8s_secret_name`, `secrets.k8s_namespace`                             |
-| Plaintext (testing)  | *(default)*     | `[secrets.plaintext]` — **do not use in production**, secrets land on disk    |
+| Plaintext (tests)    | *(always)*      | `secrets.backend = "plaintext"` + `secrets.confirm_plaintext = true` — **tests only**, keys in a clear-text file beside the config |
+
+Every backend is the published [`vti-secrets`](https://crates.io/crates/vti-secrets)
+crate, shared with the VTA and VTC. The OS keyring is the default. A host
+where it cannot be opened (a headless Linux box with no Secret Service) is
+refused at setup with the list of secure backends above: nothing falls back
+to plaintext. Set `secrets.backend` to name the backend explicitly.
 
 The server stores its key material as a JSON-serialized record
 in the backend:
@@ -247,19 +258,19 @@ To compile with a non-default backend:
 
 ```bash
 # AWS Secrets Manager
-cargo build -p did-hosting-server --release --features aws-secrets
+cargo build --locked -p did-hosting-server --release --features aws-secrets
 
 # GCP Secret Manager
-cargo build -p did-hosting-server --release --features gcp-secrets
+cargo build --locked -p did-hosting-server --release --features gcp-secrets
 
 # HashiCorp Vault (Kubernetes / token / AppRole auth)
-cargo build -p did-hosting-server --release --features vault-secrets
+cargo build --locked -p did-hosting-server --release --features vault-secrets
 
 # Native Kubernetes Secret
-cargo build -p did-hosting-server --release --features k8s-secrets
+cargo build --locked -p did-hosting-server --release --features k8s-secrets
 
 # Multiple backends
-cargo build -p did-hosting-server --release --features "keyring,aws-secrets"
+cargo build --locked -p did-hosting-server --release --features "keyring,aws-secrets"
 ```
 
 ### Storage Backends
@@ -281,7 +292,7 @@ external services.
 To build with a non-default storage backend:
 
 ```bash
-cargo build -p did-hosting-server --release \
+cargo build --locked -p did-hosting-server --release \
   --no-default-features --features "keyring,store-redis"
 ```
 
@@ -305,7 +316,7 @@ Both ship in the default feature set, so the most common builds
 need no special handling:
 
 ```bash
-cargo build -p did-hosting-server --release
+cargo build --locked -p did-hosting-server --release
 cargo install did-hosting-server --locked
 ```
 
@@ -318,7 +329,7 @@ cargo install did-hosting-server --locked
 > minimal, opt the methods back in explicitly:
 >
 > ```bash
-> cargo build -p did-hosting-server --release \
+> cargo build --locked -p did-hosting-server --release \
 >   --no-default-features \
 >   --features "keyring,store-fjall,method-webvh,method-web"
 > ```
@@ -360,7 +371,7 @@ with the `DID_HOSTING_` prefix:
 ### Default (with OS keyring)
 
 ```bash
-cargo build -p did-hosting-server --release
+cargo build --locked -p did-hosting-server --release
 ```
 
 This builds with the `keyring` and `store-fjall` features
@@ -374,9 +385,6 @@ did-hosting-server setup                # Interactive config wizard
 did-hosting-server setup --from <recipe.toml>  # Non-interactive — see below
 did-hosting-server uninstall            # Teardown: clear secrets + remove config
 did-hosting-server health               # Run health check diagnostics
-did-hosting-server add-acl              # Add ACL entry
-did-hosting-server list-acl             # List ACL entries
-did-hosting-server remove-acl           # Remove ACL entry
 did-hosting-server list-dids            # List all DIDs in the store
 did-hosting-server remove-did           # Remove a DID from the store
 did-hosting-server dump-did             # Dump DID log for a path
@@ -387,35 +395,6 @@ did-hosting-server recover-did          # Recover a soft-deleted DID
 did-hosting-server import-secrets       # Import secrets from VTA bundle or keys
 did-hosting-server backup               # Export data to backup file
 did-hosting-server restore              # Restore data from backup file
-```
-
-### Access Control
-
-The `add-acl` command creates ACL entries directly from the
-command line, without needing a running server or authenticated
-API call. Useful for bootstrapping the first admin account.
-
-```bash
-# Add an admin
-did-hosting-server add-acl --did did:key:z6Mk... --role admin
-
-# Add an owner (default role)
-did-hosting-server add-acl --did did:key:z6Mk...
-
-# Add an owner with per-account quota overrides
-did-hosting-server add-acl --did did:key:z6Mk... --max-total-size 2097152 --max-did-count 50
-
-# With a specific config file
-did-hosting-server --config /path/to/config.toml add-acl --did did:key:z6Mk... --role admin
-```
-
-The command will refuse to overwrite an existing entry — delete
-it via the API first if you need to change a role.
-
-### Listing ACL entries
-
-```bash
-did-hosting-server list-acl
 ```
 
 ### Backup & Restore
@@ -442,66 +421,19 @@ Ephemeral data (active sessions, refresh tokens, auth
 challenges) is excluded. All keys and values are base64url
 encoded.
 
-## API Endpoints
-
-All API endpoints are under the `/api` prefix.
-
-### Public
+## HTTP Endpoints
 
 | Method | Path                            | Description     |
 | ------ | ------------------------------- | --------------- |
-| `GET`  | `/api/health`                   | Health check    |
+| `GET`  | `/api/health`                   | Liveness probe; 503 past the staleness bound |
+| `POST` | `/api/trust-tasks`              | Trust Task listener (HTTPS binding) |
 | `GET`  | `/{mnemonic}/did.jsonl`         | Resolve DID log |
 | `GET`  | `/{mnemonic}/did-witness.json`  | Resolve witness |
 | `GET`  | `/.well-known/did.jsonl`        | Root DID log    |
 | `GET`  | `/.well-known/did-witness.json` | Root witness    |
 
-### Authentication
-
-| Method | Path                  | Description         |
-| ------ | --------------------- | ------------------- |
-| `POST` | `/api/auth/challenge` | Request challenge   |
-| `POST` | `/api/auth/`          | Submit DIDComm auth |
-| `POST` | `/api/auth/refresh`   | Refresh token       |
-
-### DID Sync & Introspection (authenticated)
-
-| Method   | Path                           | Description         |
-| -------- | ------------------------------ | ------------------- |
-| `GET`    | `/api/dids`                    | List DIDs           |
-| `GET`    | `/api/dids/{mnemonic}`         | Get DID details     |
-| `PUT`    | `/api/dids/{mnemonic}`         | Upload DID log      |
-| `PUT`    | `/api/witness/{mnemonic}`      | Upload witness      |
-| `PUT`    | `/api/disable/{mnemonic}`      | Disable a DID       |
-| `PUT`    | `/api/enable/{mnemonic}`       | Enable a DID        |
-| `DELETE` | `/api/dids/{mnemonic}`         | Delete a DID        |
-| `GET`    | `/api/log/{mnemonic}`          | Get DID log entries |
-| `GET`    | `/api/raw/{mnemonic}`          | Get raw DID log     |
-| `GET`    | `/api/services`                | List services       |
-
-### Statistics (authenticated)
-
-| Method | Path                           | Description         |
-| ------ | ------------------------------ | ------------------- |
-| `GET`  | `/api/stats`                   | Server-wide stats   |
-| `GET`  | `/api/stats/{mnemonic}`        | Per-DID stats       |
-| `GET`  | `/api/timeseries`              | Server time-series  |
-| `GET`  | `/api/timeseries/{mnemonic}`   | Per-DID time-series |
-
-### Configuration (admin only)
-
-| Method | Path          | Description    |
-| ------ | ------------- | -------------- |
-| `GET`  | `/api/config` | Server config  |
-
-### Access Control (admin only)
-
-| Method   | Path             | Description      |
-| -------- | ---------------- | ---------------- |
-| `GET`    | `/api/acl`       | List ACL entries |
-| `POST`   | `/api/acl`       | Create ACL entry |
-| `PUT`    | `/api/acl/{did}` | Update ACL entry |
-| `DELETE` | `/api/acl/{did}` | Remove ACL entry |
+There is no management API. DIDs, domains and their state reach the
+edge only as Trust Tasks signed by its control plane.
 
 ## Performance Testing
 
@@ -514,7 +446,7 @@ workers, and error rates.
 ### Building
 
 ```bash
-cargo build --example perf_test -p did-hosting-server
+cargo build --locked --example perf_test -p did-hosting-server
 ```
 
 ### Usage

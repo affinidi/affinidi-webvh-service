@@ -573,7 +573,7 @@ async fn run_server(config_path: Option<PathBuf>) {
         tracing::warn!("============================================================");
     }
 
-    let store = store::Store::open(&config.store)
+    let store = store::Store::open_with(&config.store, &config.fjall)
         .await
         .expect("failed to open store");
 

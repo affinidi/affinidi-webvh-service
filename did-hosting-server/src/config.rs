@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 // Re-export shared config types so existing code can still use `crate::config::*`
 pub use did_hosting_common::server::config::{
-    AuthConfig, FeaturesConfig, HostingConfig, LogConfig, LogFormat, SecretsConfig, ServerConfig,
-    StoreConfig, TransportSelection, VtaConfig,
+    AuthConfig, FeaturesConfig, FjallTuning, HostingConfig, LogConfig, LogFormat, SecretsConfig,
+    ServerConfig, StoreConfig, TransportSelection, VtaConfig,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -21,6 +21,13 @@ pub struct AppConfig {
     pub log: LogConfig,
     #[serde(default)]
     pub store: StoreConfig,
+    /// Optional Fjall memory tuning (`[fjall]`) — the block cache, write
+    /// buffer and journal-size caps that keep the store's memory use
+    /// inside a pod's Kubernetes limit. Every field defaults to `None`
+    /// (fjall's own defaults, unchanged). See
+    /// [`did_hosting_common::server::config::FjallTuning`].
+    #[serde(default)]
+    pub fjall: FjallTuning,
     #[serde(default)]
     pub auth: AuthConfig,
     /// Multi-domain hosting (bootstrap_domains + unassigned_purge_grace).
@@ -36,11 +43,13 @@ pub struct AppConfig {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub stats: StatsConfig,
+    /// How far behind its control plane this edge may fall before it reports
+    /// itself degraded.
     #[serde(default)]
-    pub watchers: Vec<WatcherEndpoint>,
-    /// URL of the control plane for service registration.
-    pub control_url: Option<String>,
-    /// DID of the control plane service (for DIDComm authentication).
+    pub replication: ReplicationConfig,
+    /// DID of the control plane that drives this edge — the one party whose
+    /// signed Trust Tasks it applies. Required: the server does not start
+    /// without it.
     pub control_did: Option<String>,
     #[serde(default)]
     pub vta: VtaConfig,
@@ -53,21 +62,62 @@ pub struct AppConfig {
     pub config_path: PathBuf,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
-pub struct WatcherEndpoint {
-    pub url: String,
-    pub token: Option<String>,
+/// The replication staleness bound.
+///
+/// The control plane delivers every change through its outbox and retries
+/// until this edge acknowledges it. As a backstop for anything that still goes
+/// missing — an outbox entry dropped past its retry budget, a push lost while
+/// the edge was down — the edge reconciles against the control plane's
+/// `did-management/did/list` every `reconcile_interval_secs`, repairing a
+/// missed disable on the spot and asking for a resync of anything else. When it
+/// has not completed a clean reconcile within `staleness_bound_secs`, its
+/// `/api/health` probe answers `503`, so a load balancer drains it instead of
+/// letting it serve state that may be out of date.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReplicationConfig {
+    /// The longest an edge may go without a clean reconcile and still report
+    /// healthy. Default 300 (5 minutes).
+    #[serde(default = "default_staleness_bound_secs")]
+    pub staleness_bound_secs: u64,
+    /// How often the edge reconciles. Must be shorter than the bound, so a
+    /// single missed round does not trip it. Default 60.
+    #[serde(default = "default_reconcile_interval_secs")]
+    pub reconcile_interval_secs: u64,
 }
 
-// Manual Debug: `token` is a bearer secret used by webvh-watcher's /sync push
-// auth. Leaking it via a stray debug/trace log of the loaded config would
-// hand any reader live push credentials.
-impl std::fmt::Debug for WatcherEndpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WatcherEndpoint")
-            .field("url", &self.url)
-            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
-            .finish()
+fn default_staleness_bound_secs() -> u64 {
+    300
+}
+
+fn default_reconcile_interval_secs() -> u64 {
+    60
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            staleness_bound_secs: default_staleness_bound_secs(),
+            reconcile_interval_secs: default_reconcile_interval_secs(),
+        }
+    }
+}
+
+impl ReplicationConfig {
+    /// Refuse a bound the reconcile interval cannot keep.
+    pub fn validate(&self) -> Result<(), AppError> {
+        if self.reconcile_interval_secs == 0 {
+            return Err(AppError::Config(
+                "replication.reconcile_interval_secs must be at least 1".into(),
+            ));
+        }
+        if self.staleness_bound_secs <= self.reconcile_interval_secs {
+            return Err(AppError::Config(format!(
+                "replication.staleness_bound_secs ({}) must be longer than \
+                 replication.reconcile_interval_secs ({})",
+                self.staleness_bound_secs, self.reconcile_interval_secs
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -175,6 +225,10 @@ impl AppConfig {
             &mut config.auth,
             &mut config.secrets,
         )?;
+        // Fjall memory settings (STORAGE_FJALL_BLOCK_CACHE / _WRITE_BUFFER /
+        // _MAX_JOURNAL) — shared, unprefixed names; see
+        // `did_hosting_common::server::config::apply_fjall_env_overrides`.
+        did_hosting_common::server::config::apply_fjall_env_overrides(&mut config.fjall)?;
 
         // Server identity (did-hosting-server specific env vars)
         macro_rules! env_opt {
@@ -197,7 +251,6 @@ impl AppConfig {
         env_opt!("DID_HOSTING_SERVER_DID", config.server_did);
         env_opt!("DID_HOSTING_MEDIATOR_DID", config.mediator_did);
         env_opt!("DID_HOSTING_PUBLIC_URL", config.public_url);
-        env_opt!("DID_HOSTING_CONTROL_URL", config.control_url);
         env_opt!("DID_HOSTING_CONTROL_DID", config.control_did);
 
         // VTA config
@@ -206,6 +259,14 @@ impl AppConfig {
         env_opt!("DID_HOSTING_VTA_CONTEXT_ID", config.vta.context_id);
 
         // Limits
+        env_parse!(
+            "DID_HOSTING_REPLICATION_STALENESS_BOUND_SECS",
+            config.replication.staleness_bound_secs
+        );
+        env_parse!(
+            "DID_HOSTING_REPLICATION_RECONCILE_INTERVAL_SECS",
+            config.replication.reconcile_interval_secs
+        );
         env_parse!(
             "DID_HOSTING_LIMITS_UPLOAD_BODY_LIMIT",
             config.limits.upload_body_limit
@@ -249,10 +310,6 @@ impl AppConfig {
 
         // Normalize: strip trailing slashes from URLs
         if let Some(ref mut url) = config.public_url {
-            let trimmed = url.trim_end_matches('/').to_string();
-            *url = trimmed;
-        }
-        if let Some(ref mut url) = config.control_url {
             let trimmed = url.trim_end_matches('/').to_string();
             *url = trimmed;
         }

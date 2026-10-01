@@ -674,66 +674,6 @@ pub struct StatsSyncPayload {
 }
 
 // ---------------------------------------------------------------------------
-// Witness types
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WitnessResponse {
-    pub witness_id: String,
-    pub did: String,
-    pub label: Option<String>,
-    pub created_at: u64,
-    pub proofs_signed: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WitnessListResponse {
-    pub witnesses: Vec<WitnessResponse>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SignProofRequest {
-    pub version_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SignProofResponse {
-    pub version_id: String,
-    pub proof: serde_json::Value,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CreateWitnessRequest {
-    pub label: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
-// Watcher sync types
-// ---------------------------------------------------------------------------
-
-/// Pushed from did-hosting-server to webvh-watcher when a DID is published.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncDidRequest {
-    pub mnemonic: String,
-    pub did_id: Option<String>,
-    pub log_content: String,
-    pub witness_content: Option<String>,
-    pub source_url: String,
-    pub updated_at: u64,
-    pub disabled: bool,
-}
-
-/// Pushed from did-hosting-server to webvh-watcher when a DID is deleted.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncDeleteRequest {
-    pub mnemonic: String,
-    pub source_url: String,
-}
-
-// ---------------------------------------------------------------------------
 // High-level create result
 // ---------------------------------------------------------------------------
 
@@ -750,6 +690,22 @@ pub struct CreateDidResult {
     pub did: String,
     /// The public key multibase of the signing key.
     pub public_key_multibase: String,
+}
+
+/// An update the control plane sends back for a DID that needs refreshing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DidSyncUpdate {
+    pub mnemonic: String,
+    pub did_id: String,
+    pub log_content: String,
+    /// Absent means the slot holds no witness proofs, never "unchanged".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness_content: Option<String>,
+    pub version_count: u64,
+    /// Whether the source has disabled the slot. A replica stops serving a
+    /// disabled slot and resumes only on an update carrying `false`.
+    pub disabled: bool,
 }
 
 #[cfg(test)]

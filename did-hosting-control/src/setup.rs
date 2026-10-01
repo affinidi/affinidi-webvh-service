@@ -254,6 +254,7 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
             data_dir: PathBuf::from(&data_dir),
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         auth: AuthConfig::default(),
         secrets: secrets_config,
         vta: VtaConfig {
@@ -937,6 +938,7 @@ pub async fn run_setup_offline_complete(
             data_dir: PathBuf::from(&state.data_dir),
             ..StoreConfig::default()
         },
+        fjall: Default::default(),
         auth: AuthConfig::default(),
         secrets: state.secrets.clone(),
         vta: VtaConfig {

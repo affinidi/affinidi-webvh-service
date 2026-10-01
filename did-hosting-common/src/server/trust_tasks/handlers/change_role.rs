@@ -309,7 +309,7 @@ mod tests {
             cryptosuite: "eddsa-jcs-2022".into(),
             verification_method: "did:web:admin.example#key-1".into(),
             created: chrono::Utc::now(),
-            proof_purpose: "assertionMethod".into(),
+            proof_purpose: "authentication".into(),
             proof_value: "z-stub".into(),
             extra: Default::default(),
         });

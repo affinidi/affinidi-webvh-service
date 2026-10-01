@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use did_hosting_common::server::config::{
-    AuthConfig, FeaturesConfig, HostingConfig, IdentityConfig, IdentityMode, LogConfig,
-    SecretsConfig, ServerConfig, StoreConfig,
+    AuthConfig, FeaturesConfig, FjallTuning, HostingConfig, IdentityConfig, IdentityMode,
+    LogConfig, SecretsConfig, ServerConfig, StoreConfig,
 };
 use did_hosting_common::server::error::AppError;
 
@@ -31,20 +31,22 @@ pub struct DaemonConfig {
     pub store: StoreConfig,
     #[serde(default = "default_witness_store")]
     pub witness_store: StoreConfig,
+    /// Optional Fjall memory tuning (`[fjall]`) — the block cache, write
+    /// buffer and journal-size caps that keep both stores' memory use
+    /// inside the pod's Kubernetes limit. Shared by `store` and
+    /// `witness_store` — this is a pod-level setting, not a per-store one.
+    /// Every field defaults to `None` (fjall's own defaults, unchanged).
+    /// See [`did_hosting_common::server::config::FjallTuning`].
+    #[serde(default)]
+    pub fjall: FjallTuning,
 
     // Server-specific
     #[serde(default)]
     pub limits: did_hosting_server::config::LimitsConfig,
-    #[serde(default)]
-    pub watchers: Vec<did_hosting_server::config::WatcherEndpoint>,
 
     // Witness-specific
     #[serde(default)]
     pub vta: did_hosting_common::server::config::VtaConfig,
-
-    // Watcher-specific
-    #[serde(default)]
-    pub watcher_sync: webvh_watcher::config::SyncConfig,
 
     // Control-specific
     #[serde(default)]
@@ -189,6 +191,11 @@ impl DaemonConfig {
             &mut config.witness_store,
         );
 
+        // Fjall memory settings (STORAGE_FJALL_BLOCK_CACHE / _WRITE_BUFFER /
+        // _MAX_JOURNAL) — shared, unprefixed names; see
+        // `did_hosting_common::server::config::apply_fjall_env_overrides`.
+        did_hosting_common::server::config::apply_fjall_env_overrides(&mut config.fjall)?;
+
         // Normalize
         if let Some(ref mut url) = config.public_url {
             *url = url.trim_end_matches('/').to_string();
@@ -210,12 +217,12 @@ impl DaemonConfig {
             server: self.server.clone(),
             log: self.log.clone(),
             store: self.store.clone(),
+            fjall: self.fjall,
             auth: self.auth.clone(),
             hosting: self.hosting.clone(),
             secrets: self.secrets.clone(),
             limits: self.limits.clone(),
-            watchers: self.watchers.clone(),
-            control_url: None,
+            replication: Default::default(),
             control_did: None,
             vta: self.vta.clone(),
             stats: did_hosting_server::config::StatsConfig::default(),
@@ -236,7 +243,7 @@ impl DaemonConfig {
             server: self.server.clone(),
             log: self.log.clone(),
             store: self.witness_store.clone(),
-            auth: self.auth.clone(),
+            fjall: self.fjall,
             secrets: self.secrets.clone(),
             vta: self.vta.clone(),
             // Carried through for completeness. The daemon's control plane owns
@@ -250,10 +257,19 @@ impl DaemonConfig {
     /// Build a webvh-watcher AppConfig from the daemon config.
     pub fn watcher_config(&self) -> webvh_watcher::config::AppConfig {
         webvh_watcher::config::AppConfig {
+            // The embedded watcher serves resolution only: it has no DID and
+            // no listener of its own (see `build_watcher`).
+            features: self.features_config(),
+            server_did: None,
+            mediator_did: None,
             server: self.server.clone(),
             log: self.log.clone(),
             store: self.store.clone(),
-            sync: self.watcher_sync.clone(),
+            fjall: self.fjall,
+            secrets: self.secrets.clone(),
+            vta: self.vta.clone(),
+            identity: self.identity.clone(),
+            sync: Default::default(),
             config_path: self.config_path.clone(),
         }
     }
@@ -269,6 +285,7 @@ impl DaemonConfig {
             server: self.server.clone(),
             log: self.log.clone(),
             store: self.store.clone(),
+            fjall: self.fjall,
             auth: self.auth.clone(),
             secrets: self.secrets.clone(),
             vta: self.vta.clone(),

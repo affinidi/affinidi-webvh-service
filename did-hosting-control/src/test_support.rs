@@ -141,6 +141,7 @@ impl TestServer {
             server: ServerConfig::default(),
             log: LogConfig::default(),
             store: store_config,
+            fjall: Default::default(),
             auth: AuthConfig::default(),
             secrets: SecretsConfig::default(),
             vta: opts.vta,
@@ -157,6 +158,16 @@ impl TestServer {
             .with_jwt
             .then(|| Arc::new(JwtKeys::from_ed25519_bytes(&[7u8; 32]).expect("jwt keys")));
 
+        // Every trust-task reply is signed, so a node that serves them needs a
+        // signing identity for its own DID.
+        let identity = match config.server_did.as_deref() {
+            Some(did) => Some(
+                did_hosting_common::server::identity::ServiceIdentity::generated_for(did)
+                    .await
+                    .expect("test identity"),
+            ),
+            None => None,
+        };
         let state = AppState {
             store: store.clone(),
             sessions_ks,
@@ -166,7 +177,7 @@ impl TestServer {
             config: Arc::new(config),
             did_resolver: None,
             secrets_resolver: None,
-            identity: None,
+            identity,
             trust_tasks_verifier: None,
             jwt_keys,
             webauthn: None,
@@ -181,8 +192,12 @@ impl TestServer {
             acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
             pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
             ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
-            pending_confirms: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            redeem_rate_limiter: Arc::new(crate::rate_limit::SourceRateLimiter::new()),
+            large_document_budget: Arc::new(
+                did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
+            ),
             outbox_notify: Arc::new(tokio::sync::Notify::new()),
+            cache_invalidate: None,
         };
 
         Self { state, _dir: dir }
@@ -194,7 +209,13 @@ impl TestServer {
     /// unmatched path instead of serving the SPA, which is what an HTTP-shape
     /// test wants.
     pub fn router(&self) -> axum::Router {
-        crate::routes::router_without_fallback().with_state(self.state.clone())
+        // A test drives the router with no real connection behind it, so it
+        // supplies the address a production server records per connection.
+        crate::routes::router_without_fallback()
+            .with_state(self.state.clone())
+            .layer(axum::extract::connect_info::MockConnectInfo(
+                std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            ))
     }
 
     /// Grant `did` an ACL entry with `role` and unrestricted domain scope.

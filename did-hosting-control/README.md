@@ -1,13 +1,12 @@
 # Affinidi DID Hosting Control Plane
 
 The DID Hosting Control Plane is the authoritative source of truth for
-all DID management. It handles DID lifecycle operations (create,
-publish, delete) via DIDComm and optional REST API, and pushes
-updates to server edge nodes via DIDComm through a mediator.
-It also hosts an optional web-based management UI, maintains a
-service registry, acts as a reverse proxy to backend service
-instances, and supports DIDComm v2 and passkey (WebAuthn)
-authentication.
+all DID management. Every management operation (DID lifecycle, agent
+names, domains, ACL, the service registry, stats) is a signed Trust Task,
+served the same over TSP, DIDComm and HTTPS (`POST /api/trust-tasks`); there
+is no REST management API. It pushes updates to server edge nodes as signed
+Trust Tasks, hosts an optional web-based management UI, maintains a service
+registry, and supports passkey (WebAuthn) sign-in.
 
 > **IMPORTANT:**
 > did-hosting-service crates are provided "as is" without any
@@ -28,11 +27,11 @@ authentication.
 
 ```bash
 # Without UI
-cargo build -p did-hosting-control --release
+cargo build --locked -p did-hosting-control --release
 
 # With embedded management UI
 cd did-hosting-ui && npm install && npm run build:web && cd ..
-cargo build -p did-hosting-control --release --features ui
+cargo build --locked -p did-hosting-control --release --features ui
 ```
 
 The binary is produced at `target/release/did-hosting-control`.
@@ -120,12 +119,21 @@ keyring_service = "did-hosting-control"
 
 [registry]
 health_check_interval = 60    # seconds
+# Hosts the control plane may register — see "Registry allowlist" below.
+url_allowlist = ["server-eu.internal", "witness-eu.internal"]
+
+# Watchers: a DID whose log names this URL in its `watchers` parameter is
+# pushed there (signed webvh/sync/* Trust Tasks, through the outbox). The DID
+# may acknowledge those syncs and nothing else.
+# [[registry.watchers]]
+# url = "https://watcher1.example.com"
+# did = "did:webvh:...:watcher1.example.com"
 ```
 
 ### Service Registry
 
 The `[registry]` section configures backend service instances
-that the control plane manages and proxies requests to.
+that the control plane manages.
 
 Static instances can be defined in `config.toml`:
 
@@ -146,7 +154,21 @@ service_type = "watcher"
 url = "http://watcher-eu:8533"
 ```
 
-Instances can also be managed dynamically via the registry API.
+Instances can also be managed dynamically with the `registry/*` Trust Tasks.
+
+### Registry allowlist
+
+`registry.url_allowlist` bounds which hosts may be registered (by an
+administrator's `registry/admin-register`, or a server's `server/register`).
+Matching is on the URL **host only** (scheme and port are ignored),
+case-insensitive, and **exact** — `example.com` does not match
+`sub.example.com`.
+
+- **Empty (the default):** registration refuses non-routable / internal
+  *literal* hosts (loopback, RFC1918, `169.254.169.254`, CGNAT, …); a public
+  host is accepted.
+- **Non-empty:** only listed hosts may be registered. If a backend is on an
+  internal IP literal (e.g. `10.0.0.5`), list that literal exactly.
 
 ### Environment Variable Overrides
 
@@ -198,108 +220,50 @@ providing browser-based passwordless authentication alongside DIDComm
 challenge-response auth. Without a `public_url`, WebAuthn is not
 initialised and authentication falls back to DID challenge-response.
 
-### Reverse Proxy
-
-The control plane proxies requests to registered backend
-service instances. This allows the UI to communicate with
-all services through a single origin (no CORS issues):
-
-```
-UI → /api/server/{instance_id}/dids → did-hosting-server
-UI → /api/witness/{instance_id}/witnesses → webvh-witness
-```
-
 ### Health Checking
 
 Registered service instances are periodically health-checked.
 The health check interval is configurable via
 `registry.health_check_interval` (default: 60 seconds).
 
-## API Endpoints
+## HTTP surface
 
-All API endpoints are under the `/api` prefix.
+The control plane has no REST management API. Its HTTP surface is:
 
-### Authentication
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| `POST` | `/api/trust-tasks` | The HTTPS binding of the Trust Task listener: the same dispatch TSP and DIDComm reach. Every management operation arrives here, authorised on the document's own proof. |
+| `GET` | `/api/health` | Unauthenticated liveness probe |
+| `POST` | `/api/auth/challenge` | Browser sign-in, step 1: a challenge for a SIOPv2 `id_token` |
+| `POST` | `/api/auth/` | Browser sign-in, step 2: redeem a SIOPv2 `id_token` minted by the holder's VTA |
+| `POST` | `/api/auth/refresh` | Renew a console session: its refresh token, plus a proof from the browser's bound session key |
+| `GET` | `/*` | The management UI (`ui` feature), for any path outside `/api` |
 
-| Method | Path                              | Description            |
-| ------ | --------------------------------- | ---------------------- |
-| `POST` | `/api/auth/challenge`             | Request challenge      |
-| `POST` | `/api/auth/`                      | Submit DIDComm auth    |
-| `POST` | `/api/auth/refresh`               | Refresh token          |
-| `POST` | `/api/auth/passkey/enroll/start`  | Start passkey enroll   |
-| `POST` | `/api/auth/passkey/enroll/finish` | Finish passkey enroll  |
-| `POST` | `/api/auth/passkey/login/start`   | Start passkey login    |
-| `POST` | `/api/auth/passkey/login/finish`  | Finish passkey login   |
+The three `/api/auth/*` routes are the one sign-in with no Trust Task form:
+`auth/authenticate/0.2` carries no `id_token`, and a browser session does not
+hold the subject key a Trust Task `auth/refresh` must be signed with. A peer
+that signs its own documents signs in with `auth/challenge/0.1` and
+`auth/authenticate/0.2` on `POST /api/trust-tasks`.
 
-### Access Control (admin only)
+Operational metrics are the admin-only `did-management/server/metrics/0.1`
+Trust Task; there is no Prometheus scrape endpoint.
 
-| Method   | Path             | Description      |
-| -------- | ---------------- | ---------------- |
-| `GET`    | `/api/acl`       | List ACL entries |
-| `POST`   | `/api/acl`       | Create ACL entry |
-| `PUT`    | `/api/acl/{did}` | Update ACL entry |
-| `DELETE` | `/api/acl/{did}` | Remove ACL entry |
+### Passkeys
 
-### DID Management
+Enrolment and login are Trust Tasks on `POST /api/trust-tasks` (and TSP and
+DIDComm), with WebAuthn's ceremony data inside their payloads:
 
-All routes require Bearer-token authentication; ownership and admin
-gating is enforced per-handler.
+| Trust Task | Proof | Purpose |
+| --- | --- | --- |
+| `auth/passkey/enroll/invite/0.2` | administrator | Issue an invite: a URL token and a separate claim code, stored only as hashes |
+| `auth/passkey/enroll/redeem/start/0.1` | optional | Present token + claim code; get creation options (and `uvOptions` over existing passkeys of the purpose) |
+| `auth/passkey/enroll/redeem/finish/0.1` | optional | Bind the passkey to the invite's subject and consume the invite |
+| `auth/passkey/enroll/start/0.2`, `finish/0.2` | the subject | Add a login passkey to your own VID (re-verified with an existing one) |
+| `auth/passkey/enroll/invite/{list,update,revoke}/0.1` | administrator | Manage invites by `inviteId` |
+| `auth/passkey/login/start/0.2`, `finish/0.2` | optional / session key | Sign in, or step a session up |
 
-| Method   | Path                            | Description |
-| -------- | ------------------------------- | ----------- |
-| `GET`    | `/api/dids`                     | List DIDs (owners see their own; admins see all, or filter by `?owner=did:...`). |
-| `POST`   | `/api/dids`                     | Reserve a DID slot (mnemonic + URL). Body: `{ "path"?: string, "force"?: bool }`. |
-| `POST`   | `/api/dids/check`               | Check whether a custom path is available. Body: `{ "path": string }`. |
-| `POST`   | `/api/dids/register`            | Atomic claim-and-publish (closes the resolvability gap of `POST /api/dids` + `PUT /api/dids/{m}`). Body: `{ "path": string, "did_log": string, "force"?: bool }`. |
-| `GET`    | `/api/dids/{*mnemonic}`         | Get DID record + log metadata. |
-| `PUT`    | `/api/dids/{*mnemonic}`         | Publish a signed `did.jsonl` log. Body: `text/plain` JSONL. |
-| `DELETE` | `/api/dids/{*mnemonic}`         | Delete a DID and its associated content. |
-| `PUT`    | `/api/owner/{*mnemonic}`        | Transfer ownership. Body: `{ "new_owner": string }`. New owner must be in the ACL. |
-| `PUT`    | `/api/disable/{*mnemonic}`      | Toggle `disabled = true` on the record (resolvers serve gone). |
-| `PUT`    | `/api/enable/{*mnemonic}`       | Toggle `disabled = false`. |
-| `POST`   | `/api/rollback/{*mnemonic}`     | Remove the last log entry (decrements `version_count`). |
-| `GET`    | `/api/log/{*mnemonic}`          | Parsed log entries as structured JSON. |
-| `GET`    | `/api/raw/{*mnemonic}`          | Raw `did.jsonl` content as `text/plain`. |
-| `PUT`    | `/api/witness/{*mnemonic}`      | Upload a witness proof file. Body: `application/json`. |
-
-### Statistics & Time-series
-
-| Method | Path                              | Description |
-| ------ | --------------------------------- | ----------- |
-| `GET`  | `/api/stats`                      | Aggregate stats across the control plane. |
-| `GET`  | `/api/stats/{*mnemonic}`          | Per-DID stats. |
-| `GET`  | `/api/timeseries`                 | Server-wide time-series buckets. Query: `?range=1h\|24h\|7d\|30d` (default `24h`). |
-| `GET`  | `/api/timeseries/{*mnemonic}`     | Per-DID time-series. Same `range` query. |
-
-### Service Topology & Configuration
-
-| Method | Path                       | Description |
-| ------ | -------------------------- | ----------- |
-| `GET`  | `/api/services/overview`   | Full topology: control plane info + every registered service + aggregate stats. |
-| `GET`  | `/api/config`              | Non-sensitive control-plane configuration (DIDs, URLs, feature flags). |
-
-### Service Registry (admin only)
-
-| Method   | Path                                         | Description          |
-| -------- | -------------------------------------------- | -------------------- |
-| `GET`    | `/api/control/registry`                      | List instances       |
-| `POST`   | `/api/control/registry`                      | Register instance    |
-| `GET`    | `/api/control/registry/{instance_id}`        | Get instance         |
-| `DELETE` | `/api/control/registry/{instance_id}`        | Deregister instance  |
-| `POST`   | `/api/control/registry/{instance_id}/health` | Trigger health check |
-
-### Reverse Proxy
-
-| Method | Path                                       | Description              |
-| ------ | ------------------------------------------ | ------------------------ |
-| `*`    | `/api/server/{instance_id}/{path}`         | Proxy to server instance |
-| `*`    | `/api/witness/{instance_id}/{path}`        | Proxy to witness instance|
-
-### Health
-
-| Method | Path          | Description  |
-| ------ | ------------- | ------------ |
-| `GET`  | `/api/health` | Health check |
+A `stepUp` invite enrols a step-up-only passkey, kept in its own keyspace
+(`passkey_step_up`) that the login ceremony never reads.
 
 ## Library Usage
 

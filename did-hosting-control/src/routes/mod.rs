@@ -1,442 +1,63 @@
-mod acl;
-mod auth;
-// `pub(crate)` so the DIDComm dispatch table reuses the REST request types
-// and helpers verbatim — the two transports must not grow separate shapes.
-pub(crate) mod did_manage;
-mod didcomm;
-pub(crate) mod domain;
+//! The control plane's HTTP surface.
+//!
+//! Every management operation is a Trust Task. `POST /api/trust-tasks` is
+//! its HTTPS binding, the same dispatch TSP and DIDComm reach
+//! (`messaging::dispatch_trust_task_doc`), so there is no REST management
+//! surface beside it. What else stays plain HTTP:
+//!
+//! - `GET /api/health`, the unauthenticated liveness probe;
+//! - `POST /api/auth/challenge`, which mints the challenge every sign-in
+//!   completes over the Trust Task surface (`auth/authenticate/0.2` for the
+//!   VTI Wallet extension, which this deployment cannot re-version; `0.3` for
+//!   the did-hosting UI's own wallet login and its VTA-proxied SIOP login —
+//!   see `trust_tasks_auth`). The console's session refresh went the same
+//!   way: `auth/refresh/0.2` over `/api/trust-tasks`, not a REST route;
+//! - the admin console's static assets, as the fallback (standalone mode).
+
+pub(crate) mod auth;
 pub mod health;
-mod identity;
-mod passkey;
-mod proxy;
-mod registry;
-pub mod server_info;
-pub(crate) mod stats_sync;
-pub mod task_consent;
-mod trust_tasks;
+pub(crate) mod trust_tasks;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{any, get, post, put};
-use did_hosting_common::did_hosting_tasks::*;
-use did_hosting_common::server::trust_task::TrustTaskRouter;
+use axum::routing::{get, post};
 
 use crate::server::AppState;
 
-/// Maximum body size accepted on `POST /api/trust-tasks` (in bytes).
-/// Sized for the largest legitimate envelope a client produces
-/// (`acl/list` response with a full page) plus headroom; an
-/// authenticated-Owner attacker can no longer drive multi-MB JSON
-/// allocations before the handler-level Admin check rejects.
-pub const TRUST_TASKS_BODY_LIMIT_BYTES: usize = 64 * 1024;
+/// Maximum body size accepted on `POST /api/trust-tasks` (in bytes) — the
+/// largest limit any type this control plane serves declares
+/// (`did_hosting_common::server::trust_tasks::size`). Every type not
+/// individually raised there still takes
+/// `size::DEFAULT_MAX_DOCUMENT_BYTES` (64 KiB); an authenticated-Owner
+/// attacker can no longer drive multi-MB JSON allocations before the
+/// handler-level Admin check rejects. `dispatch_trust_task` narrows
+/// further per the document's own `type` once it is read, so a request for
+/// a type with a smaller limit than this route's blanket cap is still
+/// refused at its own, tighter ceiling.
+pub fn trust_tasks_body_limit_bytes() -> usize {
+    did_hosting_common::server::trust_tasks::size::largest_max_document_bytes(
+        &crate::control_tasks::SERVED_TRUST_TASK_URIS,
+    )
+}
+
+/// Maximum body size accepted on the **unauthenticated** `/auth/challenge`
+/// route, in bytes. It takes no credential before parsing: the body is a
+/// DID and nothing else. 32 KB is generous.
+pub const AUTH_BODY_LIMIT_BYTES: usize = 32 * 1024;
 
 /// Build the control plane router without the UI fallback (daemon mode).
-///
-/// ## T8b: Trust-Task header gating
-///
-/// Every authenticated route is registered through [`TrustTaskRouter`]
-/// in **permissive** mode so existing clients (UI, CLI) keep working
-/// during the v0.7→v0.8 migration. A new client that opts in to the
-/// `Trust-Task:` header gets the exact-match correctness guarantee
-/// from the middleware. The exempt routes are:
-///
-/// - `/api/health` — operator monitoring; never authed.
-/// - `/api/didcomm` — terminal DIDComm envelope; the inner message
-///   `typ` is the actual task identifier, validated separately by
-///   the DIDComm dispatcher.
-/// - `/api/proxy/...` — pass-through to a registered service; the
-///   upstream service runs its own Trust-Task validation.
-/// - `/api/control/stats` — server-to-control stats sync; servers
-///   self-identify by DID, not by Trust-Task header.
-// The deprecated `_0_1` auth consts are wired here intentionally — as
-// the accepted-but-deprecated inbound aliases alongside their `_0_2`
-// primaries — so this compatibility layer opts out of the deprecation
-// lint rather than dropping the backwards-compat routing.
-#[allow(deprecated)]
 pub fn router_without_fallback() -> Router<AppState> {
-    let control: Router<AppState> = TrustTaskRouter::new()
-        .route_with_task_permissive(
-            "/registry",
-            get(registry::list).post(registry::register),
-            (*TASK_REGISTRY_LIST_1_0).clone(),
-        )
-        .route_with_task_permissive(
-            "/registry/{instance_id}",
-            get(registry::get).delete(registry::deregister),
-            (*TASK_REGISTRY_GET_1_0).clone(),
-        )
-        .route_with_task_permissive(
-            "/registry/{instance_id}/health",
-            post(registry::health_check),
-            (*TASK_REGISTRY_HEALTH_1_0).clone(),
-        )
-        // T28: admin-triggered domain assignment to a specific server.
-        // Both routes are fire-and-forget DIDComm pushes; the server's
-        // ack flows back asynchronously. Idempotent on the server side.
-        .route_with_task_permissive(
-            "/registry/{instance_id}/domains/{domain}/assign",
-            post(registry::assign_domain_to_server),
-            (*TASK_DOMAIN_ASSIGN_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/registry/{instance_id}/domains/{domain}/unassign",
-            post(registry::unassign_domain_from_server),
-            (*TASK_DOMAIN_UNASSIGN_0_1).clone(),
-        )
-        // T30: admin "Purge now". Bypasses the grace period.
-        .route_with_task_permissive(
-            "/registry/{instance_id}/domains/{domain}/purge",
-            post(registry::purge_domain_on_server),
-            (*TASK_DOMAIN_PURGE_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/register-service",
-            post(registry::register_service),
-            (*TASK_SERVER_REGISTER_0_1).clone(),
-        )
-        .into_router();
-
-    // Upload routes with a custom body-size limit (DID log + witness).
-    // `/dids/register` carries the full did.jsonl in the body too — same
-    // ceiling, same router so the limit applies uniformly.
-    let upload_routes: Router<AppState> = TrustTaskRouter::new()
-        // `did/publish` is retired (spec supersededBy: `did/register`): the
-        // canonical task for "upload a new signed log for a slot I own" —
-        // including completing a reserved slot — is a register, whose
-        // owner-update rule makes this the same operation.
-        .route_with_task_permissive(
-            "/dids/{*mnemonic}",
-            put(did_manage::upload_did),
-            (*TASK_DID_REGISTER_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/witness/{*mnemonic}",
-            put(did_manage::upload_witness),
-            (*TASK_WEBVH_WITNESS_PUBLISH_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/dids/register",
-            post(did_manage::register_did),
-            (*TASK_DID_REGISTER_0_1).clone(),
-        )
-        // Agent-name mutations carry the new signed did.jsonl in the body, so
-        // they share the register/publish body ceiling. All four require the
-        // owner (or admin) — plain `AuthClaims`, no step-up.
-        //
-        // `remove`/`disable` briefly required aal2 here; #108 removed it,
-        // because the gate was uncallable: the VTA's did-hosting session is
-        // aal1 by construction, so no agent could ever satisfy it. Elevation
-        // for the destructive verbs lives at the agent's consent layer, which
-        // classifies those tasks `Destructive` and forces a cross-device
-        // type-to-confirm. `remove_reaches_did_ops_without_step_up` and
-        // `disable_reaches_did_ops_without_step_up` pin the current behaviour.
-        .route_with_task_permissive(
-            "/agent-names/update",
-            post(did_manage::update_agent_name),
-            (*TASK_AGENT_NAME_UPDATE_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/agent-names/remove",
-            post(did_manage::remove_agent_name),
-            (*TASK_AGENT_NAME_REMOVE_0_1).clone(),
-        )
-        .into_router()
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)); // 10 MB
-
-    let api: Router<AppState> = TrustTaskRouter::new()
-        // Auth (DIDComm challenge-response)
-        .route_with_task_permissive(
-            "/auth/challenge",
-            post(auth::challenge),
-            (*TASK_AUTH_CHALLENGE_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/auth/",
-            post(auth::authenticate),
-            (*TASK_AUTH_AUTHENTICATE_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/auth/refresh",
-            post(auth::refresh),
-            (*TASK_AUTH_REFRESH_0_1).clone(),
-        )
-        // RP-initiated wallet consent (admin-only). Sends a
-        // `task-consent/request/0.1` document to a holder DID over DIDComm
-        // and waits for the wallet's signed `task-consent/decision/0.1`.
-        // (Replaces the retired `confirm/{request,response}/0.1` flow.)
-        .route_with_task_permissive(
-            "/task-consent/request",
-            post(task_consent::request),
-            (*TASK_CONSENT_REQUEST_0_1).clone(),
-        )
-        // Passkey (WebAuthn)
-        .route_with_task_permissive(
-            "/auth/passkey/enroll/start",
-            post(passkey::enroll_start::<AppState>),
-            (*TASK_AUTH_PASSKEY_ENROLL_START_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/auth/passkey/enroll/finish",
-            post(passkey::enroll_finish::<AppState>),
-            (*TASK_AUTH_PASSKEY_ENROLL_FINISH_0_1).clone(),
-        )
-        // Passkey login + step-up tasks moved to the 0.2 spec; the 0.1
-        // URIs stay accepted on inbound (deprecated) for backwards
-        // compatibility via `route_with_tasks_permissive`.
-        .route_with_tasks_permissive(
-            "/auth/passkey/login/start",
-            post(passkey::login_start::<AppState>),
-            (*TASK_AUTH_PASSKEY_LOGIN_START_0_2).clone(),
-            vec![(*TASK_AUTH_PASSKEY_LOGIN_START_0_1).clone()],
-        )
-        .route_with_tasks_permissive(
-            "/auth/passkey/login/finish",
-            post(passkey::login_finish::<AppState>),
-            (*TASK_AUTH_PASSKEY_LOGIN_FINISH_0_2).clone(),
-            vec![(*TASK_AUTH_PASSKEY_LOGIN_FINISH_0_1).clone()],
-        )
-        // Step-up: elevate the current session to aal2 via a WebAuthn assertion.
-        .route_with_tasks_permissive(
-            "/auth/step-up/passkey/start",
-            post(passkey::step_up_start::<AppState>),
-            (*TASK_AUTH_STEP_UP_PASSKEY_START_0_2).clone(),
-            vec![(*TASK_AUTH_STEP_UP_PASSKEY_START_0_1).clone()],
-        )
-        .route_with_tasks_permissive(
-            "/auth/step-up/passkey/finish",
-            post(passkey::step_up_finish::<AppState>),
-            (*TASK_AUTH_STEP_UP_PASSKEY_FINISH_0_2).clone(),
-            vec![(*TASK_AUTH_STEP_UP_PASSKEY_FINISH_0_1).clone()],
-        )
-        // Step-up via VTA approval (wallet-driven, works cross-origin).
-        .route_with_tasks_permissive(
-            "/auth/step-up/vta/start",
-            post(auth::step_up_vta_start),
-            (*TASK_AUTH_STEP_UP_VTA_START_0_2).clone(),
-            vec![(*TASK_AUTH_STEP_UP_VTA_START_0_1).clone()],
-        )
-        .route_with_tasks_permissive(
-            "/auth/step-up/vta/finish",
-            post(auth::step_up_vta_finish),
-            (*TASK_AUTH_STEP_UP_VTA_FINISH_0_2).clone(),
-            vec![(*TASK_AUTH_STEP_UP_VTA_FINISH_0_1).clone()],
-        )
-        // Demo sensitive op gated on aal2 (proves the StepUpAuth gate).
-        .route_with_task_permissive(
-            "/auth/step-up/check",
-            get(passkey::step_up_check),
-            (*TASK_AUTH_STEP_UP_CHECK_1_0).clone(),
-        )
-        .route_with_task_permissive(
-            "/auth/passkey/invite",
-            post(passkey::create_invite::<AppState>),
-            (*TASK_AUTH_PASSKEY_INVITE_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/auth/passkey/invites",
-            get(passkey::list_invites::<AppState>),
-            (*TASK_AUTH_PASSKEY_INVITE_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/auth/passkey/invite/{token}",
-            put(passkey::update_invite::<AppState>).delete(passkey::revoke_invite::<AppState>),
-            (*TASK_AUTH_PASSKEY_INVITE_0_1).clone(),
-        )
-        // ACL
-        .route_with_task_permissive(
-            "/acl",
-            get(acl::list_acl).post(acl::create_acl),
-            (*TASK_ACL_LIST_1_0).clone(),
-        )
-        .route_with_task_permissive(
-            "/acl/{did}",
-            put(acl::update_acl).delete(acl::delete_acl),
-            (*TASK_ACL_UPDATE_1_0).clone(),
-        )
-        // Domains (multi-domain)
-        .route_with_task_permissive(
-            "/domains",
-            get(domain::list_domains).post(domain::create_domain_route),
-            (*TASK_DOMAIN_LIST_1_0).clone(),
-        )
-        .route_with_task_permissive(
-            "/domains/{name}",
-            put(domain::update_domain_route).delete(domain::delete_domain_route),
-            (*TASK_DOMAIN_UPDATE_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/domains/{name}/disable",
-            post(domain::disable_domain_route),
-            (*TASK_DOMAIN_SET_STATE_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/domains/{name}/enable",
-            post(domain::enable_domain_route),
-            (*TASK_DOMAIN_SET_STATE_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/domains/{name}/set-default",
-            post(domain::set_default_domain_route),
-            (*TASK_DOMAIN_SET_DEFAULT_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/me/domains",
-            get(domain::list_my_domains),
-            (*TASK_ME_DOMAINS_0_1).clone(),
-        )
-        // DID management (authenticated)
-        .route_with_task_permissive(
-            "/dids/check",
-            post(did_manage::check_name),
-            (*TASK_DID_CHECK_NAME_0_1).clone(),
-        )
-        // Agent-name availability probe (read-only; the mutating verbs carry
-        // a did.jsonl and live in `upload_routes` under the larger body limit).
-        .route_with_task_permissive(
-            "/agent-names/check",
-            post(did_manage::check_agent_name),
-            (*TASK_AGENT_NAME_CHECK_0_1).clone(),
-        )
-        // DID -> names, the reverse of the `/@name` redirect. Read-only and
-        // batched; sits here rather than in `upload_routes` because it carries
-        // no did.jsonl.
-        .route_with_task_permissive(
-            "/agent-names/resolve",
-            post(did_manage::resolve_agent_names),
-            (*TASK_AGENT_NAME_RESOLVE_1_0).clone(),
-        )
-        .route_with_task_permissive(
-            "/dids",
-            post(did_manage::request_uri).get(did_manage::list_dids),
-            (*TASK_DID_CHECK_NAME_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/dids/{*mnemonic}",
-            get(did_manage::get_did).delete(did_manage::delete_did),
-            (*TASK_DID_INFO_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/log/{*mnemonic}",
-            get(did_manage::get_did_log),
-            (*TASK_DID_LOG_1_0).clone(),
-        )
-        .route_with_task_permissive(
-            "/owner/{*mnemonic}",
-            put(did_manage::change_owner),
-            (*TASK_DID_CHANGE_OWNER_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/disable/{*mnemonic}",
-            put(did_manage::disable_did),
-            (*TASK_DID_SET_STATE_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/enable/{*mnemonic}",
-            put(did_manage::enable_did),
-            (*TASK_DID_SET_STATE_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/rollback/{*mnemonic}",
-            post(did_manage::rollback_did),
-            (*TASK_DID_ROLLBACK_0_1).clone(),
-        )
-        .route_with_task_permissive(
-            "/raw/{*mnemonic}",
-            get(did_manage::get_raw_log),
-            (*TASK_DID_RAW_LOG_1_0).clone(),
-        )
-        // Stats & time-series
-        .route_with_task_permissive(
-            "/stats",
-            get(did_manage::get_server_stats),
-            (*TASK_STATS_SERVER_1_0).clone(),
-        )
-        .route_with_task_permissive(
-            "/stats/{*mnemonic}",
-            get(did_manage::get_did_stats),
-            (*TASK_STATS_DID_1_0).clone(),
-        )
-        .route_with_task_permissive(
-            "/timeseries",
-            get(did_manage::get_server_timeseries),
-            (*TASK_TIMESERIES_SERVER_1_0).clone(),
-        )
-        .route_with_task_permissive(
-            "/timeseries/{*mnemonic}",
-            get(did_manage::get_did_timeseries),
-            (*TASK_TIMESERIES_DID_1_0).clone(),
-        )
-        .route_with_task_permissive(
-            "/services/overview",
-            get(did_manage::get_services_overview),
-            (*TASK_SERVICES_OVERVIEW_1_0).clone(),
-        )
-        .route_with_task_permissive(
-            "/config",
-            get(did_manage::get_config),
-            (*TASK_CONFIG_1_0).clone(),
-        )
-        // Exempt: Trust Tasks transport (v0.7.0+). The envelope's
-        // `type` URI is the task identifier; the legacy
-        // `Trust-Task:` header isn't carried on this surface.
-        //
-        // Body limit is tight (64 KB) — the largest envelope a
-        // well-behaved client produces is the `acl/list` response
-        // payload at ~16 KB on a full page; doubling for ext + safety
-        // gives 64 KB. Caps an authenticated-Owner DoS class where a
-        // compromised credential drives parsing of multi-MB documents
-        // before the handler-level Admin check rejects.
-        .route_exempt(
-            "/trust-tasks",
-            post(trust_tasks::dispatch_trust_task)
-                .layer(DefaultBodyLimit::max(TRUST_TASKS_BODY_LIMIT_BYTES)),
-        )
-        // Exempt: DIDComm envelope (inner message type is the real
-        // task identifier).
-        .route_exempt("/didcomm", post(didcomm::handle))
-        // Exempt: server-to-control stats sync (servers self-identify
-        // by DID, not by Trust-Task header).
-        .route_exempt("/control/stats", post(stats_sync::receive_stats))
-        // Exempt: proxy pass-through. The upstream service runs its
-        // own validation.
-        .route_exempt(
-            "/proxy/server/{instance_id}/{*path}",
-            any(proxy::proxy_to_service),
-        )
-        .route_exempt(
-            "/proxy/witness/{instance_id}/{*path}",
-            any(proxy::proxy_to_service),
-        )
-        .into_router()
-        // Control plane (admin operations) — nested separately so the
-        // /control/* prefix gates its own subset of Trust-Task URLs.
-        .nest("/control", control)
-        // The service's own identity generations, and the kill switch that
-        // stops honouring a superseded one ahead of its grace period. Plain
-        // admin-gated routes rather than Trust Tasks: this is a local operator
-        // action on this process's in-memory key material, not a delegable
-        // authority that a peer could ever hold.
-        .route("/identity/generations", get(identity::list_generations))
+    Router::new()
         .route(
-            "/identity/generations/{id}/retire",
-            post(identity::retire_generation),
+            "/api/trust-tasks",
+            post(trust_tasks::trust_tasks_endpoint)
+                .layer(DefaultBodyLimit::max(trust_tasks_body_limit_bytes())),
         )
-        // Merge upload routes (body-limited).
-        .merge(upload_routes);
-
-    #[allow(unused_mut)]
-    let mut router = Router::new()
-        .nest("/api", api)
+        .route(
+            "/api/auth/challenge",
+            post(auth::challenge).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT_BYTES)),
+        )
         .route("/api/health", get(health::health))
-        .route("/api/server-info", get(server_info::server_info));
-
-    // Prometheus metrics endpoint (only when metrics feature is enabled)
-    #[cfg(feature = "metrics")]
-    {
-        router = router.route("/metrics", get(metrics_handler));
-    }
-
-    router
 }
 
 /// Build the full control plane router with UI fallback (standalone mode).
@@ -450,17 +71,4 @@ pub fn router() -> Router<AppState> {
     }
 
     r
-}
-
-#[cfg(feature = "metrics")]
-async fn metrics_handler() -> (
-    axum::http::StatusCode,
-    [(&'static str, &'static str); 1],
-    String,
-) {
-    (
-        axum::http::StatusCode::OK,
-        [("content-type", "text/plain; version=0.0.4")],
-        did_hosting_common::server::metrics::render(),
-    )
 }

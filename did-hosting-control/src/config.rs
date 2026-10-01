@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 // Re-export shared config types so existing code can still use `crate::config::*`
 pub use did_hosting_common::server::config::{
-    AuthConfig, FeaturesConfig, HostingConfig, LogConfig, LogFormat, SecretsConfig, ServerConfig,
-    StoreConfig, TransportSelection, VtaConfig,
+    AuthConfig, FeaturesConfig, FjallTuning, HostingConfig, LogConfig, LogFormat, SecretsConfig,
+    ServerConfig, StoreConfig, TransportSelection, VtaConfig,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -22,6 +22,13 @@ pub struct AppConfig {
     pub log: LogConfig,
     #[serde(default = "default_store")]
     pub store: StoreConfig,
+    /// Optional Fjall memory tuning (`[fjall]`) — the block cache, write
+    /// buffer and journal-size caps that keep the store's memory use
+    /// inside a pod's Kubernetes limit. Every field defaults to `None`
+    /// (fjall's own defaults, unchanged). See
+    /// [`did_hosting_common::server::config::FjallTuning`].
+    #[serde(default)]
+    pub fjall: FjallTuning,
     #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
@@ -50,30 +57,16 @@ pub struct AppConfig {
 }
 
 /// Trust Tasks framework runtime knobs.
-///
-/// Introduced in v0.7.0 with `enforce_proofs` defaulting to `true`
-/// — the framework's 0.1.1 `IS_PROOF_REQUIRED` enforcement makes
-/// `acl/grant`, `acl/revoke`, and `acl/change-role` unreachable
-/// without a verified proof, and the Web UI ships ephemeral Ed25519
-/// session-key signing in this release so the default produces a
-/// working deployment out-of-the-box.
-///
-/// Setting this to `false` switches the dispatcher to
-/// [`trust_tasks_rs::ProofPolicy::RejectIfPresent`] — a proof-bearing
-/// document is rejected with `malformed_request`. RECOMMENDED specs
-/// (acl/list, acl/show, trust-task-discovery) continue to work
-/// proofless under either policy.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TrustTasksConfig {
-    /// When `true` (default), dispatch passes the configured proof
-    /// verifier (`state.trust_tasks_verifier`) through as
-    /// [`trust_tasks_rs::ProofPolicy::Verify`]. Proof-bearing documents
-    /// are verified; REQUIRED-spec documents without a proof are
-    /// rejected with `proof_required`. When `false`, the dispatcher
-    /// runs in [`trust_tasks_rs::ProofPolicy::RejectIfPresent`] mode:
-    /// proof-bearing documents are rejected with `malformed_request`,
-    /// so a producer that signed in-band is never silently
-    /// downgraded.
+    /// Retained only so an existing config that sets it still parses.
+    ///
+    /// Proofs are now verified on every trust-task path, and every privileged
+    /// document must carry one bound to its sender; there is no mode that
+    /// accepts or ignores proofs. `true` (the default) is a no-op, and
+    /// `false` is refused at startup by [`AppConfig::load`] rather than
+    /// silently disregarded — an operator who turned verification off must
+    /// learn that it is back on.
     #[serde(default = "default_enforce_proofs")]
     pub enforce_proofs: bool,
 }
@@ -112,16 +105,38 @@ pub struct RegistryConfig {
     pub instances: Vec<InstanceConfig>,
     #[serde(default = "default_health_check_interval")]
     pub health_check_interval: u64,
-    /// Hostname allowlist for service registration via the API.
+    /// Hostname allowlist for registered service-instance URLs
+    /// (`registry/admin-register`, `server/register`).
     ///
-    /// When non-empty, `register_service` rejects URLs whose host is not in
-    /// this list. The proxy at `/api/server/{instance}/{*path}` only
-    /// forwards to URLs that have been registered, so the allowlist
-    /// transitively bounds where the proxy can reach. When empty, registry
-    /// URLs are accepted unrestricted (back-compat default for trusted
-    /// internal deployments).
+    /// Matching is on the URL **host only** (scheme and port are ignored),
+    /// case-insensitive, and **exact** — an entry `example.com` does NOT match
+    /// `evil.example.com`.
+    ///
+    /// - **Non-empty:** registration rejects any URL whose host is not listed.
+    /// - **Empty (the default):** registration still **default-denies**
+    ///   non-routable / internal *literal* hosts (loopback, RFC1918,
+    ///   link-local incl. `169.254.169.254`, CGNAT, ULA, IPv4-mapped); a
+    ///   public host is accepted.
+    ///
+    /// See `validate_registered_url` for the enforcement.
     #[serde(default)]
     pub url_allowlist: Vec<String>,
+    /// The watchers this control plane may push to (`[[registry.watchers]]`).
+    ///
+    /// A DID log names its watchers by URL (the `watchers` parameter); this map
+    /// says which DID answers at each URL, so the control plane can send that
+    /// watcher signed `webvh/sync/*` Trust Tasks through its outbox. A watcher
+    /// a log names but this map does not is not pushed to. A listed watcher's
+    /// DID may acknowledge what it was sent, and nothing else.
+    #[serde(default)]
+    pub watchers: Vec<WatcherPeer>,
+}
+
+/// One watcher: the URL DID logs name it by, and its DID.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WatcherPeer {
+    pub url: String,
+    pub did: String,
 }
 
 impl Default for RegistryConfig {
@@ -130,6 +145,7 @@ impl Default for RegistryConfig {
             instances: Vec::new(),
             health_check_interval: default_health_check_interval(),
             url_allowlist: Vec::new(),
+            watchers: Vec::new(),
         }
     }
 }
@@ -164,6 +180,14 @@ impl AppConfig {
 
         config.config_path = path;
 
+        if !config.trust_tasks.enforce_proofs {
+            return Err(AppError::Config(
+                "trust_tasks.enforce_proofs = false is no longer supported: every privileged \
+                 trust task must carry a proof bound to its sender. Remove the setting."
+                    .into(),
+            ));
+        }
+
         // Apply shared env overrides for common config fields
         did_hosting_common::server::config::apply_env_overrides(
             "CONTROL",
@@ -174,6 +198,10 @@ impl AppConfig {
             &mut config.auth,
             &mut config.secrets,
         )?;
+        // Fjall memory settings (STORAGE_FJALL_BLOCK_CACHE / _WRITE_BUFFER /
+        // _MAX_JOURNAL) — shared, unprefixed names; see
+        // `did_hosting_common::server::config::apply_fjall_env_overrides`.
+        did_hosting_common::server::config::apply_fjall_env_overrides(&mut config.fjall)?;
 
         // Control-specific env vars
         macro_rules! env_opt {

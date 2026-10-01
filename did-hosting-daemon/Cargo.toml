@@ -125,11 +125,9 @@ did-hosting-server = { version = "0.8", path = "../did-hosting-server", default-
 webvh-witness = { version = "0.8", path = "../webvh-witness", default-features = false }
 webvh-watcher = { version = "0.8", path = "../webvh-watcher", default-features = false }
 did-hosting-control = { version = "0.8", path = "../did-hosting-control", default-features = false }
-# Trust Tasks proof verifier — daemon's `build_control` constructs
-# `AppState.trust_tasks_verifier` directly, so it needs the type to
-# be visible. Kept aligned with the workspace pin in case did-hosting-control
-# ever drops the dep.
-trust-tasks-proof = { workspace = true }
+# Names the DID cache client handed to the shared Trust Tasks verifier
+# constructor (`did_hosting_common::server::trust_tasks::build_verifier`).
+affinidi-did-resolver-cache-sdk = { workspace = true }
 affinidi-messaging-didcomm-service = { workspace = true }
 affinidi-tdk = { workspace = true }
 axum = "0.8"
@@ -149,3 +147,33 @@ vta-sdk = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# `test-support` seeds the verifier's deactivation verdicts in the daemon's
+# verifier tests; dev-only, so never part of a release build.
+did-hosting-common = { version = "0.8", path = "../did-hosting-common", default-features = false, features = ["server-core", "test-support"] }
+trust-tasks-rs = { workspace = true }
+# `tests/e2e_*.rs`: real daemon (bin) + distributed-mode (in-process) end to
+# end smoke tests, driven across TSP, DIDComm and HTTPS.
+uuid = { workspace = true }
+chrono = { workspace = true }
+trust-tasks-didcomm = { workspace = true }
+affinidi-messaging-didcomm = { workspace = true }
+affinidi-data-integrity = { workspace = true }
+didwebvh-rs = { workspace = true }
+# Embedded mediator fixture — same pin `did-hosting-control`'s own
+# `tests/mediator_replication_smoke.rs` uses; see the note there. Unlike that
+# file, this workspace's tests drive genuine TSP traffic through it (the
+# admin RPC client's TSP transport), so — unlike every other consumer of this
+# dependency in the workspace — the `tsp` feature is turned on here.
+affinidi-messaging-test-mediator = { version = "0.15.0", features = ["tsp"] }
+# A hand-rolled capturing `TspHandler` for the e2e admin RPC client (there is
+# no library-provided one — every other TSP-driving test in this workspace
+# dispatches in-process instead of over a real socket).
+async-trait = "0.1"
+# Reads the body out of an in-process `axum::response::Response` when
+# checking the edge's HTTP resolution and driving the daemon's HTTPS API.
+http-body-util = "0.1"
+# `HostPolicy::AllowPrivate` — the daemon-mode e2e test's own DID resolver
+# has to resolve a real did:webvh whose host is `localhost`, which the
+# resolver's default `PublicOnly` policy refuses (SSRF hardening that a
+# same-machine test has no use for).
+affinidi-did-web = "0.1"

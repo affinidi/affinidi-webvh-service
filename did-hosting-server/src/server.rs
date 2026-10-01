@@ -3,16 +3,16 @@ use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_service::{
-    DIDCommService, DIDCommServiceConfig, ListenerConfig, Protocols, RestartPolicy, RetryConfig,
+    DIDCommService, DIDCommServiceConfig, ListenerConfig, ListenerEvent, Protocols, RestartPolicy,
+    RetryConfig,
 };
 use affinidi_tdk::messaging::protocols::mediator::acls::AccessListModeType;
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use axum::routing::get;
 use did_hosting_common::server::domain::parse_trusted_cidrs;
-use did_hosting_common::server::store::{KS_ACL, KS_DIDS, KS_SESSIONS};
+use did_hosting_common::server::store::KS_DIDS;
 use ipnetwork::IpNetwork;
 
-use did_hosting_common::server::auth::extractor::AuthState;
 use did_hosting_common::server::didcomm_profile::{
     advertised_protocols, build_tdk_profile_for_identity, reconcile_listener_protocols,
     wait_for_did_resolution,
@@ -21,8 +21,6 @@ use did_hosting_common::server::identity::{self, ServiceIdentity};
 use did_hosting_common::server::init;
 use tokio_util::sync::CancellationToken;
 
-use crate::auth::jwt::JwtKeys;
-use crate::auth::session::cleanup_expired_sessions;
 use crate::config::{AppConfig, AuthConfig};
 use crate::control_register;
 use crate::did_ops::cleanup_empty_dids;
@@ -39,11 +37,15 @@ use tracing::{Level, debug, error, info, warn};
 #[derive(Clone)]
 pub struct AppState {
     pub store: Store,
-    pub sessions_ks: KeyspaceHandle,
-    pub acl_ks: KeyspaceHandle,
     pub dids_ks: KeyspaceHandle,
     pub config: Arc<AppConfig>,
     pub did_resolver: Option<DIDCacheClient>,
+    /// The proof verifier for control-plane documents, built once over
+    /// `did_resolver` so its DID-status verdicts and forced-refresh rate limit
+    /// persist across messages. `None` when no resolver is configured, in which
+    /// case no control-plane document can be accepted.
+    pub trust_tasks_verifier:
+        Option<Arc<did_hosting_common::server::trust_tasks::TransportBoundVerifier>>,
     pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
     /// The service's own DID identity: every generation of key material still
     /// honoured, and the kids each one answers to. `did_resolver` and
@@ -59,9 +61,6 @@ pub struct AppState {
     /// rotation rebuild the profile in place. A `OnceLock` suffices precisely
     /// because the *service* is never replaced — only its listeners are.
     pub didcomm_service: Arc<OnceLock<DIDCommService>>,
-    pub jwt_keys: Option<Arc<JwtKeys>>,
-    pub signing_key_bytes: Option<[u8; 32]>,
-    pub http_client: reqwest::Client,
     pub stats_collector: Option<Arc<stats::StatsCollector>>,
     /// In-memory cache for DID content (did.jsonl). TTL-based eviction on read.
     pub did_cache: Arc<crate::cache::ContentCache>,
@@ -69,43 +68,97 @@ pub struct AppState {
     /// have their `Forwarded` / `X-Forwarded-Host` headers honoured
     /// for request-host detection (multi-domain, T19/T21).
     pub trusted_proxy_cidrs: Arc<Vec<IpNetwork>>,
+    /// How far this edge is behind its control plane — the reconcile loop
+    /// writes it, `/api/health` and `server/metrics` read it.
+    pub replication: Arc<crate::replication::ReplicationStatus>,
+    /// Per-address rate limiter for `POST /api/trust-tasks`. Applied before
+    /// the document's claimed issuer is checked against `control_did`, so a
+    /// single address cannot force unbounded DID-resolution work by posting
+    /// documents that name a fresh issuer on every request.
+    pub trust_tasks_rate_limiter: Arc<did_hosting_common::server::rate_limit::IpRateLimiter>,
+    /// Serialises `sync/update`, `sync/batch` and `sync/delete`: each reads
+    /// what this edge holds for a slot, checks the new log extends it (or, for
+    /// a delete, reads the record to remove), and writes — two such
+    /// operations running at once could each pass their read-check against
+    /// the same stale state. Mirrors the watcher's `sync_lock`.
+    pub sync_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
-    /// Unwrap the DIDComm auth components, returning an error if any are not configured.
-    pub fn require_didcomm_auth(
-        &self,
-    ) -> Result<(&DIDCacheClient, &ThreadedSecretsResolver, &JwtKeys), AppError> {
-        let did_resolver = self
-            .did_resolver
-            .as_ref()
-            .ok_or_else(|| AppError::Authentication("DID resolver not configured".into()))?;
-        let secrets_resolver = self
-            .secrets_resolver
-            .as_ref()
-            .ok_or_else(|| AppError::Authentication("secrets resolver not configured".into()))?;
-        let jwt_keys = self
-            .jwt_keys
-            .as_ref()
-            .ok_or_else(|| AppError::Authentication("JWT keys not configured".into()))?;
-        Ok((did_resolver, secrets_resolver.as_ref(), jwt_keys.as_ref()))
+    /// An edge over `store` with nothing wired but its configuration and a
+    /// fresh content cache: no identity, no resolver, no messaging service.
+    /// The caller — `run`, the daemon, a test — fills in what it has.
+    pub fn new(store: Store, config: AppConfig) -> Result<Self, AppError> {
+        let (parsed_cidrs, bad_cidrs) = parse_trusted_cidrs(&config.server.trusted_proxy_cidrs);
+        if !bad_cidrs.is_empty() {
+            warn!(
+                bad_cidrs = ?bad_cidrs,
+                "server.trusted_proxy_cidrs contains unparseable entries; ignoring them"
+            );
+        }
+        Ok(Self {
+            dids_ks: store.keyspace(KS_DIDS)?,
+            store,
+            config: Arc::new(config),
+            did_resolver: None,
+            trust_tasks_verifier: None,
+            secrets_resolver: None,
+            identity: None,
+            didcomm_service: Arc::new(OnceLock::new()),
+            stats_collector: None,
+            did_cache: Arc::new(crate::cache::ContentCache::new(Duration::from_secs(300))),
+            trusted_proxy_cidrs: Arc::new(parsed_cidrs),
+            replication: Arc::new(crate::replication::ReplicationStatus::new(
+                did_hosting_common::server::auth::session::now_epoch(),
+            )),
+            trust_tasks_rate_limiter: Arc::new(
+                did_hosting_common::server::rate_limit::IpRateLimiter::new(
+                    did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
+                    did_hosting_common::server::rate_limit::TRUST_TASKS_MAX_PER_WINDOW,
+                    did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
+                ),
+            ),
+            sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+        })
+    }
+
+    /// Carry `identity`: the resolvers and proof verifier are taken from it.
+    pub fn with_identity(mut self, identity: Option<Arc<ServiceIdentity>>) -> Self {
+        self.did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
+        self.secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
+        self.trust_tasks_verifier = crate::messaging::build_verifier(self.did_resolver.as_ref());
+        self.identity = identity;
+        self
     }
 }
 
-impl AuthState for AppState {
-    fn jwt_keys(&self) -> Option<&Arc<JwtKeys>> {
-        self.jwt_keys.as_ref()
+/// Refuse to start an edge that no control plane drives.
+///
+/// An edge is a cache of its control plane: every write it applies is a Trust
+/// Task that control plane signed, and it has no management surface of its
+/// own. Without `control_did` nothing could ever write to it, so a
+/// single-host deployment runs `did-hosting-daemon` instead.
+pub fn require_control_plane(config: &AppConfig) -> Result<(), AppError> {
+    config.replication.validate()?;
+    if config.control_did.as_deref().is_none_or(str::is_empty) {
+        return Err(AppError::Config(
+            "control_did is not set. did-hosting-server is an edge that a control plane drives \
+             over Trust Tasks, and does not run without one; for a single-host deployment run \
+             did-hosting-daemon"
+                .into(),
+        ));
     }
-
-    fn sessions_ks(&self) -> &KeyspaceHandle {
-        &self.sessions_ks
+    if config.server_did.as_deref().is_none_or(str::is_empty) {
+        return Err(AppError::Config(
+            "server_did is not set: the control plane addresses and verifies this edge by it"
+                .into(),
+        ));
     }
+    Ok(())
 }
 
 pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
-    // Open keyspace handles
-    let sessions_ks = store.keyspace(KS_SESSIONS)?;
-    let acl_ks = store.keyspace(KS_ACL)?;
+    require_control_plane(&config)?;
     let dids_ks = store.keyspace(KS_DIDS)?;
 
     // Integrity check on DID keyspace
@@ -131,7 +184,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     //   2. seed_assignments_first_boot — same tier chain, populates
     //      KS_ASSIGNMENTS so this server knows which domains it
     //      serves (matters once a control plane starts driving
-    //      MSG_DOMAIN_ASSIGN / unassign).
+    //      replica/domain/assign / unassign).
     //   3. MigrationRunner::run_pending — runs T13 M-01 which fills
     //      DidRecord.domain for legacy records by parsing the
     //      embedded did_id host. Required for write-side checks
@@ -158,18 +211,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         &store,
     )
     .await;
-    let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
-    let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
-
-    // Initialize JWT keys independently — needed by both DIDComm and passkey auth
-    let jwt_keys = init::init_jwt_keys(&secrets);
-
-    // Extract raw signing key bytes for pack_signed operations
-    let signing_key_bytes = init::decode_multibase_ed25519_key(&secrets.signing_key).ok();
-
-    // Always bind TCP — the server must serve public DID documents even when
-    // the management REST API is disabled. The rest_api flag controls whether
-    // /api/* routes are included, not whether HTTP is served.
+    // Bind TCP before anything else: public resolution and the Trust Task
+    // listener's HTTPS binding are served from it.
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let std_listener = {
         let listener = std::net::TcpListener::bind(&addr).map_err(AppError::Io)?;
@@ -179,10 +222,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     };
 
     // Gather storage thread inputs before moving config into Arc
-    let storage_sessions_ks = sessions_ks.clone();
     let storage_dids_ks = dids_ks.clone();
     let storage_auth_config = config.auth.clone();
-    let has_auth = jwt_keys.is_some();
 
     let upload_body_limit = config.limits.upload_body_limit;
     let stats_config = config.stats.clone();
@@ -200,47 +241,11 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         Arc::new(collector)
     };
 
-    let (parsed_cidrs, bad_cidrs) = parse_trusted_cidrs(&config.server.trusted_proxy_cidrs);
-    if !bad_cidrs.is_empty() {
-        warn!(
-            bad_cidrs = ?bad_cidrs,
-            "server.trusted_proxy_cidrs contains unparseable entries; ignoring them"
-        );
-    }
-
-    let state = AppState {
-        store: store.clone(),
-        sessions_ks,
-        acl_ks,
-        dids_ks,
-        config: Arc::new(config),
-        did_resolver,
-        secrets_resolver,
-        identity,
-        didcomm_service: Arc::new(OnceLock::new()),
-        jwt_keys,
-        signing_key_bytes,
-        http_client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("failed to build HTTP client"),
-        stats_collector: Some(stats_collector.clone()),
-        did_cache: Arc::new(crate::cache::ContentCache::new(Duration::from_secs(300))),
-        trusted_proxy_cidrs: Arc::new(parsed_cidrs),
-    };
+    let mut state = AppState::new(store.clone(), config)?.with_identity(identity);
+    state.stats_collector = Some(stats_collector.clone());
 
     // Log startup configuration
     info!("--- enabled services ---");
-    info!(
-        "  REST API : {}",
-        if state.config.features.rest_api {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    );
     info!(
         "  DIDComm  : {}",
         if state.config.features.didcomm {
@@ -283,9 +288,6 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // 2. Spawn storage thread (independent cleanup, flush, sync)
     let mut storage_shutdown = storage_shutdown_rx.clone();
     let storage_collector = stats_collector.clone();
-    let storage_http = state.http_client.clone();
-    let storage_control_url = state.config.control_url.clone();
-    let storage_server_did = state.config.server_did.clone();
     let storage_stats_config = stats_config;
     let storage_handle = std::thread::Builder::new()
         .name("webvh-storage".into())
@@ -293,15 +295,10 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
             run_storage_thread(
                 StorageThreadParams {
                     store,
-                    sessions_ks: storage_sessions_ks,
                     dids_ks: storage_dids_ks,
                     auth_config: storage_auth_config,
-                    has_auth,
                     collector: storage_collector,
                     stats_config: storage_stats_config,
-                    http: storage_http,
-                    control_url: storage_control_url,
-                    server_did: storage_server_did,
                 },
                 &mut storage_shutdown,
             )
@@ -343,11 +340,45 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         let reg_state = state.clone();
         let reg_svc = svc.clone();
         tokio::spawn(async move {
-            control_register::register_via_didcomm(&reg_state, &reg_svc).await;
+            keep_registered(reg_state, reg_svc).await;
         });
     }
 
-    // 6. Spawn DIDComm stats sync task (runs on main tokio runtime)
+    // 5a. Reconcile against the control plane's listing every interval — the
+    //     backstop behind the outbox, and what the staleness bound measures.
+    let (reconcile_shutdown_tx, reconcile_shutdown_rx) = watch::channel(false);
+    if let Some(svc) = didcomm_service {
+        let rec_state = state.clone();
+        let rec_svc = svc.clone();
+        tokio::spawn(async move {
+            crate::replication::run_reconcile_loop(rec_state, rec_svc, reconcile_shutdown_rx).await;
+        });
+    } else {
+        warn!(
+            "no messaging service: this edge cannot reconcile with its control plane, and will \
+             report degraded once the staleness bound passes"
+        );
+    }
+
+    // 5b. Keep a TSP relationship with the control plane established. Under Rev 3
+    //     §7.2.2 the control plane's application pushes (sync/health) are dropped
+    //     unless this edge holds a relationship with it, and forming one is the
+    //     edge's job — the control plane persists its half and does not re-invite.
+    //     The ensure is idempotent (skips when already Bidirectional) and MUST
+    //     fire on every (re)connect, not just first boot: a control-plane restart,
+    //     or a handshake that never completed, is repaired on the edge's next
+    //     connect. See docs/tsp-transport.md.
+    if let (Some(svc), Some(control_did)) = (didcomm_service, state.config.control_did.as_ref())
+        && state.config.features.tsp
+    {
+        let svc = svc.clone();
+        let control_did = control_did.clone();
+        tokio::spawn(async move {
+            ensure_control_tsp_relationship(svc, control_did).await;
+        });
+    }
+
+    // 6. Spawn stats sync task — TSP or DIDComm, per the control DID (main runtime)
     let stats_sync_shutdown = CancellationToken::new();
     let didcomm_sync_interval = state.config.stats.sync_interval_secs;
     if let (Some(svc), Some(control_did), Some(server_did)) = (
@@ -361,6 +392,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         let control_did = control_did.clone();
         let server_did = server_did.clone();
         let collector = stats_collector.clone();
+        let sync_state = state.clone();
         tokio::spawn(async move {
             let mut timer =
                 tokio::time::interval(Duration::from_secs(didcomm_sync_interval.max(1)));
@@ -368,8 +400,9 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
             loop {
                 tokio::select! {
                     _ = timer.tick() => {
-                        stats::sync_to_control_didcomm(
+                        stats::sync_to_control_messaging(
                             &svc,
+                            &sync_state,
                             &server_did,
                             &control_did,
                             &collector,
@@ -409,6 +442,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         warn!("identity sweep task didn't shut down cleanly: {e}");
     }
 
+    let _ = reconcile_shutdown_tx.send(true);
     stats_sync_shutdown.cancel();
     didcomm_shutdown.cancel();
     if let Some(svc) = didcomm_service {
@@ -475,6 +509,103 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 // DIDComm service startup
 // ---------------------------------------------------------------------------
 
+/// The listener id [`start_didcomm_service`] registers for the edge's mediator
+/// connection. Must match, or the relationship ensure targets a listener that
+/// does not exist.
+const SERVER_LISTENER_ID: &str = "server";
+
+/// Establish, and keep re-establishing, this edge's TSP relationship with its
+/// control plane.
+///
+/// Under Rev 3 §7.2.2 the control plane's application pushes are dropped unless
+/// this edge holds a relationship with it. Forming one is a control message the
+/// edge must actually *send* — a relationship never forms as a side effect of an
+/// application send, so this has to run explicitly, and on **every** (re)connect
+/// before the first send, not just first boot: the durable store keeps a formed
+/// relationship across our own restarts, but a control-plane restart, or a
+/// handshake that never completed, is only repaired when the edge re-invites on
+/// its next connection.
+///
+/// [`DIDCommService::tsp_ensure_relationship`] is idempotent (it skips when the
+/// relationship already admits application messages), so re-running it every
+/// connect is cheap and a duplicate for the initial connect is harmless.
+/// How often an edge re-registers with its control plane even when nothing
+/// else prompts it. Registration reports the DIDs this edge holds, and the
+/// control plane answers with whatever it is missing or behind on (and deletes
+/// for what it should no longer serve) — so this bounds how long an edge can
+/// serve stale state after missing pushes.
+pub const RESYNC_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// Register with the control plane at startup, again on every mediator
+/// reconnect, and every [`RESYNC_INTERVAL`] — each registration is a delta
+/// re-sync request.
+async fn keep_registered(state: AppState, svc: DIDCommService) {
+    let mut events = svc.subscribe();
+    control_register::register_via_didcomm(&state, &svc).await;
+    let mut timer = tokio::time::interval(RESYNC_INTERVAL);
+    timer.tick().await; // the first tick is immediate; registration just ran
+    loop {
+        tokio::select! {
+            _ = timer.tick() => {}
+            event = events.recv() => match event {
+                Ok(ListenerEvent::Connected { listener_id }) if listener_id == SERVER_LISTENER_ID => {}
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+        }
+        control_register::register_via_didcomm(&state, &svc).await;
+    }
+}
+
+async fn ensure_control_tsp_relationship(svc: DIDCommService, control_did: String) {
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+    // Subscribe before the initial wait so a reconnect that races the first
+    // ensure is not missed.
+    let mut events = svc.subscribe();
+
+    // The initial connection may have completed before `subscribe`, so its
+    // `Connected` event can be absent from the stream — cover it explicitly.
+    if svc
+        .wait_connected(SERVER_LISTENER_ID, CONNECT_TIMEOUT)
+        .await
+        .is_ok()
+    {
+        ensure_control_tsp_relationship_once(&svc, &control_did).await;
+    }
+
+    loop {
+        match events.recv().await {
+            Ok(ListenerEvent::Connected { listener_id }) if listener_id == SERVER_LISTENER_ID => {
+                ensure_control_tsp_relationship_once(&svc, &control_did).await;
+            }
+            Ok(_) => {}
+            // A lagged receiver only means we missed some events; the next
+            // `Connected` still re-ensures, and the relationship is idempotent.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            // The service shut down; nothing more to ensure.
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+async fn ensure_control_tsp_relationship_once(svc: &DIDCommService, control_did: &str) {
+    match svc
+        .tsp_ensure_relationship(SERVER_LISTENER_ID, control_did)
+        .await
+    {
+        Ok(()) => {
+            debug!(control = %control_did, "TSP: relationship with control plane ensured")
+        }
+        Err(e) => warn!(
+            control = %control_did,
+            error = %e,
+            "TSP: failed to ensure relationship with control plane — control-plane pushes may be \
+             dropped until the next reconnect"
+        ),
+    }
+}
+
 pub async fn start_didcomm_service(
     state: &AppState,
     shutdown: CancellationToken,
@@ -533,7 +664,7 @@ pub async fn start_didcomm_service(
         _ => Protocols::DIDCOMM_ONLY,
     };
 
-    let listener = ListenerConfig {
+    let mut listener = ListenerConfig {
         id: "server".into(),
         profile,
         restart_policy: RestartPolicy::Always {
@@ -550,6 +681,18 @@ pub async fn start_didcomm_service(
         acl_mode: Some(AccessListModeType::ExplicitDeny),
         ..Default::default()
     };
+    // Persist this listener's TSP relationships (Rev 3 §7.2.2) across restarts.
+    // The default store is in-memory, so without this a restart forgets every
+    // peer and then silently drops each peer's application traffic — the peers
+    // still hold the relationship the restarted node forgot — until a
+    // re-handshake. Only meaningful when TSP is on. See docs/tsp-transport.md.
+    if tsp_enabled {
+        listener.relationship_store = Some(
+            did_hosting_common::server::tsp_relationship_store::build_relationship_store(
+                &state.store,
+            )?,
+        );
+    }
 
     let router = messaging::build_server_router(state.clone())
         .map_err(|e| AppError::Internal(format!("failed to build DIDComm router: {e}")))?;
@@ -602,16 +745,17 @@ fn run_rest_thread(
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .expect("failed to convert std TcpListener to tokio TcpListener");
 
-        // When rest_api is disabled, serve only public DID routes + health.
-        // When enabled, serve full management API + public DID routes.
-        let base_router = if state.config.features.rest_api {
-            info!("HTTP thread started (REST API + public DID serving)");
-            routes::router(upload_body_limit)
-        } else {
-            info!("HTTP thread started (public DID serving only, REST API disabled)");
-            routes::router_public_only().fallback(routes::did_public::serve_public)
-        };
+        // Public DID resolution and the Trust Task listener's HTTPS binding.
+        // There is no management surface to switch on.
+        info!("HTTP thread started (public DID serving + Trust Task listener)");
+        let base_router = routes::router(upload_body_limit);
 
+        // Cloned before `with_state` consumes `state`: the health route is
+        // added below the router's state type has already collapsed to
+        // `()` (deliberately, so it sits outside the CORS/security-header
+        // layers), so it closes over its own `AppState` rather than using
+        // axum's `State` extractor.
+        let health_state = state.clone();
         let app = base_router
             .with_state(state)
             .layer(
@@ -629,19 +773,28 @@ fn run_rest_thread(
             // Allow browser-based resolvers to fetch public DID documents
             // cross-origin. Read-only, unauthenticated, wildcard origin.
             .layer(did_hosting_common::server::public_resolution_cors())
-            .route("/api/health", get(routes::health::health));
+            .route(
+                "/api/health",
+                get(move || {
+                    let health_state = health_state.clone();
+                    async move { routes::health::health(health_state).await }
+                }),
+            );
 
         // Signal that REST is ready to serve
         let _ = ready_tx.send(());
 
         let shutdown_rx = shutdown_rx.clone();
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let mut rx = shutdown_rx;
-                let _ = rx.changed().await;
-            })
-            .await
-            .expect("axum serve failed");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let mut rx = shutdown_rx;
+            let _ = rx.changed().await;
+        })
+        .await
+        .expect("axum serve failed");
 
         info!("REST thread shutting down");
     });
@@ -654,29 +807,19 @@ fn run_rest_thread(
 /// Parameters for the background storage thread.
 struct StorageThreadParams {
     store: Store,
-    sessions_ks: KeyspaceHandle,
     dids_ks: KeyspaceHandle,
     auth_config: AuthConfig,
-    has_auth: bool,
     collector: Arc<stats::StatsCollector>,
     stats_config: crate::config::StatsConfig,
-    http: reqwest::Client,
-    control_url: Option<String>,
-    server_did: Option<String>,
 }
 
 fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Receiver<bool>) {
     let StorageThreadParams {
         store,
-        sessions_ks,
         dids_ks,
         auth_config,
-        has_auth,
         collector,
         stats_config,
-        http,
-        control_url,
-        server_did,
     } = params;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -685,48 +828,29 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
 
     rt.block_on(async {
         info!(
-            sync_interval = stats_config.sync_interval_secs,
+            flush_interval = stats_config.flush_interval_secs,
             "storage thread started"
         );
 
-        let session_interval = Duration::from_secs(auth_config.session_cleanup_interval);
         let did_ttl_seconds = auth_config.cleanup_ttl_minutes * 60;
         let did_interval = Duration::from_secs(did_ttl_seconds.max(60));
-        let sync_enabled = stats_config.sync_interval_secs > 0 && control_url.is_some();
-        let sync_interval = Duration::from_secs(stats_config.sync_interval_secs.max(1));
-
-        let mut session_timer = tokio::time::interval(session_interval);
         let mut did_timer = tokio::time::interval(did_interval);
-        let mut sync_timer = tokio::time::interval(sync_interval);
 
         // First tick completes immediately; skip so cleanup doesn't run at startup
-        session_timer.tick().await;
         did_timer.tick().await;
-        sync_timer.tick().await;
 
         loop {
             tokio::select! {
-                _ = session_timer.tick(), if has_auth => {
-                    if let Err(e) = cleanup_expired_sessions(&sessions_ks, auth_config.challenge_ttl).await {
-                        warn!("session cleanup error: {e}");
-                    }
-                }
                 _ = did_timer.tick() => {
                     match cleanup_empty_dids(&dids_ks, did_ttl_seconds).await {
                         Ok(0) => {}
                         Ok(n) => {
                             info!(count = n, "cleaned up empty DID records");
-                            // Adjust count for cleaned up records
                             for _ in 0..n {
                                 collector.decrement_total_dids();
                             }
                         }
                         Err(e) => warn!("DID cleanup error: {e}"),
-                    }
-                }
-                _ = sync_timer.tick(), if sync_enabled => {
-                    if let (Some(url), Some(did)) = (&control_url, &server_did) {
-                        stats::sync_to_control(&http, url, did, &collector).await;
                     }
                 }
                 _ = shutdown_rx.changed() => {
@@ -769,7 +893,7 @@ use did_hosting_common::server::identity::mnemonic_from_did;
 ///    on every resolve and emits a per-request warn-log.
 /// 2. **Assignment seed** (`seed_assignments_first_boot`) — same tier
 ///    chain, populates `KS_ASSIGNMENTS`. Matters once a control plane
-///    starts driving `MSG_DOMAIN_ASSIGN` / unassign messages.
+///    starts driving `replica/domain/assign` / unassign messages.
 /// 3. **Migration runner** (`MigrationRunner::run_pending`) — runs
 ///    `m01_tag_did_records_with_domain` which fills
 ///    `DidRecord.domain` for legacy records by parsing the embedded
@@ -915,6 +1039,30 @@ mod tests {
     fn mnemonic_from_did_deep_path() {
         let did = "did:webvh:QmABC:example.com:people:staff:glenn";
         assert_eq!(mnemonic_from_did(did).unwrap(), "people/staff/glenn");
+    }
+
+    /// A standalone edge with no control plane is not a supported shape: the
+    /// server refuses to start rather than run with nothing able to write to it.
+    #[test]
+    fn an_edge_without_a_control_plane_does_not_start() {
+        let config = |control: Option<&str>, server: Option<&str>| {
+            let mut c: AppConfig = toml::from_str("").expect("defaults parse");
+            c.control_did = control.map(String::from);
+            c.server_did = server.map(String::from);
+            c
+        };
+        for (control, server) in [
+            (None, Some("did:key:edge")),
+            (Some(""), Some("did:key:edge")),
+            (Some("did:key:control"), None),
+        ] {
+            let err = require_control_plane(&config(control, server)).unwrap_err();
+            assert!(matches!(err, AppError::Config(_)), "{err:?}");
+        }
+        let err = require_control_plane(&config(None, Some("did:key:edge"))).unwrap_err();
+        assert!(err.to_string().contains("did-hosting-daemon"), "{err}");
+        require_control_plane(&config(Some("did:key:control"), Some("did:key:edge")))
+            .expect("an edge with a control plane starts");
     }
 
     #[test]

@@ -155,6 +155,46 @@ pub struct ServiceInstance {
     /// Epoch seconds of that outbound ping.
     #[serde(default)]
     pub last_outbound_at: Option<u64>,
+
+    // ---- Replication lag ----
+    /// Epoch seconds of the last signed acknowledgement (or final refusal)
+    /// this server sent for a queued directive — the last time the outbox
+    /// moved for it.
+    #[serde(default)]
+    pub last_ack_at: Option<u64>,
+    /// Epoch seconds of the last reconcile this server started against the
+    /// full `did/list` — its staleness-bound backstop.
+    #[serde(default)]
+    pub last_reconcile_at: Option<u64>,
+}
+
+/// Record an edge's acknowledgement at `now` (best effort: a failure only
+/// leaves the lag metric older than it is).
+pub async fn record_ack(registry_ks: &KeyspaceHandle, did: &str, now: u64) {
+    update_instance(registry_ks, did, |i| i.last_ack_at = Some(now)).await;
+}
+
+/// Record the start of an edge's reconcile at `now` (best effort).
+pub async fn record_reconcile(registry_ks: &KeyspaceHandle, did: &str, now: u64) {
+    update_instance(registry_ks, did, |i| i.last_reconcile_at = Some(now)).await;
+}
+
+async fn update_instance(
+    registry_ks: &KeyspaceHandle,
+    did: &str,
+    change: impl FnOnce(&mut ServiceInstance),
+) {
+    let id = did.replace(':', "_");
+    match get_instance(registry_ks, &id).await {
+        Ok(Some(mut instance)) => {
+            change(&mut instance);
+            if let Err(e) = register_instance(registry_ks, &instance).await {
+                tracing::warn!(instance_id = %id, error = %e, "failed to record replication progress");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(instance_id = %id, error = %e, "failed to read instance"),
+    }
 }
 
 fn default_enabled_methods() -> Vec<String> {
@@ -371,9 +411,6 @@ pub async fn update_instance_status(
 /// forward an Admin caller's `Authorization` header to that URL — SSRF
 /// + token exfil in one step.
 pub fn validate_registered_url(url: &str, allowlist: &[String]) -> Result<(), AppError> {
-    if allowlist.is_empty() {
-        return Ok(());
-    }
     let parsed = url::Url::parse(url)
         .map_err(|_| AppError::Forbidden("registered URL is malformed".into()))?;
     let host = match parsed.host_str() {
@@ -384,6 +421,38 @@ pub fn validate_registered_url(url: &str, allowlist: &[String]) -> Result<(), Ap
             ));
         }
     };
+
+    // Default-deny dangerous address classes for a *literal* host, applied
+    // UNCONDITIONALLY — including when the allowlist is empty (SEC-4045 W6).
+    // Previously an empty allowlist (the config default) accepted any URL, so a
+    // Service-role DID could register a metadata / RFC1918 / loopback / CGNAT /
+    // link-local host and the admin proxy would then forward an Admin bearer
+    // token there (SSRF + credential exfil). `is_globally_routable` covers
+    // loopback, RFC1918, link-local (incl. 169.254.169.254), CGNAT
+    // (100.64/10 — Alibaba/Oracle metadata), ULA, unspecified, and IPv4-mapped
+    // IPv6 forms. A non-literal (DNS) host is not classified here; the proxy's
+    // connect path is the second layer for a name that resolves internal.
+    //
+    // An operator who *explicitly* allowlists an internal host below has opted
+    // in and is trusted; this default-deny only bites the unconfigured default.
+    if let Ok(ip) = host.parse::<std::net::IpAddr>()
+        && !affinidi_net_guard::is_globally_routable(ip)
+        && !allowlist
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(&host))
+    {
+        return Err(AppError::Forbidden(
+            "registered URL host is a non-routable / internal address; allowlist it explicitly to permit it".into(),
+        ));
+    }
+
+    if allowlist.is_empty() {
+        // No host allowlist configured: the address-class default-deny above is
+        // the whole gate. Operators exposing the proxy route should still set an
+        // allowlist; this default is now fail-closed against internal literals
+        // rather than open.
+        return Ok(());
+    }
     if allowlist
         .iter()
         .any(|entry| entry.eq_ignore_ascii_case(&host))
@@ -473,6 +542,8 @@ mod tests {
             last_inbound_at: Some(1111),
             last_outbound_transport: Some(ObservedTransport::Didcomm),
             last_outbound_at: Some(2222),
+            last_ack_at: None,
+            last_reconcile_at: None,
         };
         let bytes = serde_json::to_vec(&original).unwrap();
         let parsed: ServiceInstance = serde_json::from_slice(&bytes).unwrap();
@@ -491,13 +562,20 @@ mod tests {
         assert_eq!(parsed.protocol_version, original.protocol_version);
     }
 
-    /// Empty allowlist preserves the existing "operator opted out" behaviour.
-    /// Documented as backwards-compatible — if you operate the proxy you
-    /// should configure an allowlist.
+    /// Empty allowlist no longer means "accept anything" (SEC-4045 W6). A
+    /// public host (DNS name or globally-routable literal) is still accepted —
+    /// the operator opted out of host *allowlisting* — but a non-routable /
+    /// metadata literal is refused by the address-class default-deny, so a
+    /// default-config proxy can't be pointed at an internal target.
     #[test]
-    fn empty_allowlist_accepts_anything() {
+    fn empty_allowlist_accepts_public_but_blocks_internal_literals() {
         assert!(validate_registered_url("http://anywhere.example/", &[]).is_ok());
-        assert!(validate_registered_url("http://169.254.169.254/", &[]).is_ok());
+        assert!(validate_registered_url("https://1.2.3.4/", &[]).is_ok());
+        assert!(validate_registered_url("http://169.254.169.254/", &[]).is_err());
+        assert!(validate_registered_url("http://127.0.0.1:5432/", &[]).is_err());
+        assert!(validate_registered_url("http://192.168.1.10/", &[]).is_err());
+        // CGNAT range — Alibaba/Oracle metadata.
+        assert!(validate_registered_url("http://100.100.100.200/", &[]).is_err());
     }
 
     #[test]
@@ -525,11 +603,10 @@ mod tests {
         assert!(validate_registered_url("http://evil.example.com/", &allow).is_err());
     }
 
-    /// SSRF surface: cloud-metadata, loopback, and RFC1918 hosts are NOT
-    /// auto-rejected when not in the allowlist — operators must opt in to
-    /// the allowlist to block them. (A future hardening change can add
-    /// default-denylist semantics; this test pins the current behaviour
-    /// so any change is deliberate.)
+    /// SSRF surface: cloud-metadata, loopback, and RFC1918 literal hosts are
+    /// rejected when not explicitly allowlisted — both by the allowlist
+    /// mismatch and, since SEC-4045 W6, by the unconditional address-class
+    /// default-deny.
     #[test]
     fn metadata_ip_rejected_when_allowlist_excludes_it() {
         let allow = list(&["server-1.internal"]);
