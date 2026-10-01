@@ -199,6 +199,16 @@ fn refused(reply: &Value, to: &str) -> String {
 
 /// A did:webvh log for `mnemonic` on `origin.example.com`: one entry, or two
 /// with the second deactivating it.
+/// The genesis `versionTime` of every test log: fixed, because the SCID — and
+/// so the DID — hashes it. Taken from the wall clock, two `did_log` calls for
+/// one identity a second boundary apart produced two different DIDs, and
+/// `logs_are_verified_before_they_are_mirrored` failed (intermittently) as
+/// `invalidLog` on a log that was valid. In the past, so a later entry (the
+/// deactivation, stamped now) is always later.
+fn genesis_time() -> chrono::DateTime<chrono::FixedOffset> {
+    chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").expect("a fixed instant")
+}
+
 async fn did_log(mnemonic: &str, entries: usize) -> (String, String) {
     let secret = Secret::generate_ed25519(None, Some(&[7u8; 32]));
     let pk_mb = secret.get_public_keymultibase().unwrap();
@@ -217,7 +227,7 @@ async fn did_log(mnemonic: &str, entries: usize) -> (String, String) {
     let mut state = didwebvh_rs::DIDWebVHState::default();
     state
         .create_log_entry(
-            Some((chrono::Utc::now() - chrono::Duration::hours(1)).fixed_offset()),
+            Some(genesis_time()),
             &doc,
             &params,
             &signing,
@@ -556,7 +566,7 @@ async fn did_log_on(host: &str, mnemonic: &str) -> (String, String) {
     let mut state = didwebvh_rs::DIDWebVHState::default();
     state
         .create_log_entry(
-            Some((chrono::Utc::now() - chrono::Duration::hours(1)).fixed_offset()),
+            Some(genesis_time()),
             &doc,
             &params,
             &signing,
