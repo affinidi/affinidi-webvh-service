@@ -141,6 +141,27 @@ mediator connection) and `POST /api/trust-tasks`, through one dispatch.
 - In the daemon, the embedded witness is reached at
   `POST /witness/api/trust-tasks`.
 
+### Changed — the VTA / Trust Tasks / messaging dependency set moves together
+
+- `vta-sdk` 0.56 → 0.58, `vti-common` 0.29 → 0.31, `vti-secrets` 0.4.8 → 0.5,
+  the six `trust-tasks-*` crates 0.24 → 0.25, `affinidi-tdk` 0.20 → 0.21,
+  `affinidi-messaging-sdk` 0.30 → 0.31, `affinidi-messaging-didcomm-service`
+  0.15 → 0.16, `didwebvh-rs` 0.6 → 0.7, and the dev-only
+  `affinidi-messaging-test-mediator` 0.14 → 0.15.
+- `didwebvh-rs` 0.7 resolves **public hosts only** by default
+  (`HostPolicy::PublicOnly`), and the verifier's `did:webvh` deactivation check
+  reads the signer's log through it. Production behaviour is unchanged: every
+  service's DID cache is already `PublicOnly`. A caller whose resolver allows
+  private hosts (local development against `localhost`) now says so to the
+  verifier too: `TransportBoundVerifier::with_did_cache_and_host_policy`,
+  `WitnessClient::with_host_policy`, and `post_trust_task_https_verified` for
+  the raw HTTPS send. Otherwise every reply from a privately hosted
+  `did:webvh` peer is refused as unreachable.
+- Fixes an unlocked `cargo install` failing with E0631 on `from_vti` in
+  `server::secret_store`. `vti-secrets` 0.4.9 re-pinned onto `vti-common` 0.30,
+  so a resolve that ignored `Cargo.lock` held two `vti-common` copies.
+  `--locked` is still the recommended way to install.
+
 ### Fixed — an already-deleted message no longer logs a deletion-handler warning
 
 Takes affinidi-messaging-sdk 0.30.1 (and, through the lock, mediator-common

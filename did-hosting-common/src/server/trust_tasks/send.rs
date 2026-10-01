@@ -61,7 +61,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::server::didcomm_profile::{PeerTransport, TransportFallback, resolve_send_binding};
-use crate::server::trust_tasks::{build_verifier, verify_sender_bound};
+use crate::server::trust_tasks::{TransportBoundVerifier, build_verifier, verify_sender_bound};
 
 /// Boxed transport error — mirrors the outbox's error type so `deliver()` can
 /// eventually be rewritten on top of this without changing its signature.
@@ -283,6 +283,22 @@ pub async fn post_trust_task_https(
     doc: &trust_tasks_rs::TrustTask<Value>,
     did_resolver: Option<&DIDCacheClient>,
 ) -> Result<trust_tasks_rs::TrustTask<Value>, SendError> {
+    let verifier = build_verifier(did_resolver).ok_or_else(|| {
+        format!("trust task HTTPS reply from {to}: no DID resolver configured to verify it")
+    })?;
+    post_trust_task_https_verified(from, to, url, doc, &verifier).await
+}
+
+/// [`post_trust_task_https`], verifying the reply with `verifier` — for a
+/// caller whose DID cache is not the default one [`build_verifier`] assumes
+/// (one built with a non-default host policy, say).
+pub async fn post_trust_task_https_verified(
+    from: &str,
+    to: &str,
+    url: &str,
+    doc: &trust_tasks_rs::TrustTask<Value>,
+    verifier: &TransportBoundVerifier,
+) -> Result<trust_tasks_rs::TrustTask<Value>, SendError> {
     let resp = crate::http::outbound_client()
         .post(url)
         .json(doc)
@@ -318,10 +334,7 @@ pub async fn post_trust_task_https(
 
     // Signed by the peer we addressed, and addressed back to us — the same
     // sender-bound rule every inbound document on any transport is held to.
-    let verifier = build_verifier(did_resolver).ok_or_else(|| {
-        format!("trust task HTTPS reply from {to}: no DID resolver configured to verify it")
-    })?;
-    verify_sender_bound(&reply, Some(to), None, from, &verifier).await?;
+    verify_sender_bound(&reply, Some(to), None, from, verifier).await?;
 
     Ok(reply)
 }

@@ -42,7 +42,10 @@ use trust_tasks_rs::specs::did_management::did;
 
 use did_hosting_common::WitnessClient;
 use did_hosting_common::did_ops::extract_did_id;
-use did_hosting_common::server::trust_tasks::send::{build_signed_request, post_trust_task_https};
+use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
+use did_hosting_common::server::trust_tasks::send::{
+    build_signed_request, post_trust_task_https_verified,
+};
 
 #[path = "support/mod.rs"]
 mod support;
@@ -237,15 +240,15 @@ enable_watcher = false
         .await
         .unwrap_or_else(|e| panic!("build request {type_uri}: {e}"));
         let url = format!("{}/api/trust-tasks", self.base_url);
-        post_trust_task_https(
-            &self.admin_did,
-            &self.daemon_did,
-            &url,
-            &doc,
-            Some(&self.did_resolver),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("https send {type_uri}: {e}"))
+        // The daemon's reply is signed by its `localhost` did:webvh, so the
+        // deactivation check needs the resolver's `AllowPrivate` too.
+        let verifier = TransportBoundVerifier::with_did_cache_and_host_policy(
+            self.did_resolver.clone(),
+            didwebvh_rs::host_policy::HostPolicy::AllowPrivate,
+        );
+        post_trust_task_https_verified(&self.admin_did, &self.daemon_did, &url, &doc, &verifier)
+            .await
+            .unwrap_or_else(|e| panic!("https send {type_uri}: {e}"))
     }
 
     async fn get_log(&self, mnemonic: &str) -> reqwest::Response {
@@ -325,7 +328,8 @@ async fn daemon_lifecycle_over_https() {
         &daemon.admin_did,
         daemon.admin_signer.clone(),
         daemon.did_resolver.clone(),
-    );
+    )
+    .with_host_policy(didwebvh_rs::host_policy::HostPolicy::AllowPrivate);
     let key = witness_client
         .create_key(Some("e2e"))
         .await
