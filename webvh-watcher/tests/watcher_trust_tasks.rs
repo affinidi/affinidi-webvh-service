@@ -226,12 +226,7 @@ async fn did_log(mnemonic: &str, entries: usize) -> (String, String) {
     };
     let mut state = didwebvh_rs::DIDWebVHState::default();
     state
-        .create_log_entry(
-            Some(genesis_time()),
-            &doc,
-            &params,
-            &signing,
-        )
+        .create_log_entry(Some(genesis_time()), &doc, &params, &signing)
         .await
         .expect("create webvh log entry");
     if entries > 1 {
@@ -565,12 +560,7 @@ async fn did_log_on(host: &str, mnemonic: &str) -> (String, String) {
     };
     let mut state = didwebvh_rs::DIDWebVHState::default();
     state
-        .create_log_entry(
-            Some(genesis_time()),
-            &doc,
-            &params,
-            &signing,
-        )
+        .create_log_entry(Some(genesis_time()), &doc, &params, &signing)
         .await
         .expect("create webvh log entry");
     let log = state
