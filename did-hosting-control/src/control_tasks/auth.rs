@@ -725,10 +725,8 @@ pub(crate) async fn login_finish(
                     "no live session".into(),
                 )
             })?;
-        for m in ["passkey"] {
-            if !session.amr.iter().any(|a| a == m) {
-                session.amr.push(m.into());
-            }
+        if !session.amr.iter().any(|a| a == "passkey") {
+            session.amr.push("passkey".into());
         }
         session.acr = STEP_UP_ACR.to_string();
         session.acr_expires_at = None;
