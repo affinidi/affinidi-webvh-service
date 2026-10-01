@@ -188,10 +188,13 @@ impl StaleKeyRefresh for CacheRefresher {
 /// Whether a `did:webvh` signer has deactivated its DID, remembered for the
 /// DID cache TTL.
 ///
-/// The DID cache keeps only the document and drops resolution metadata, and a
-/// deactivated webvh DID still resolves to its last document — keys included.
-/// So deactivation is read from the DID's own log (`didwebvh-rs` resolution
-/// metadata). A DID whose deactivation cannot be established is refused: an
+/// The DID cache keeps only the document and drops resolution metadata. Before
+/// `affinidi-did-resolver-cache-sdk` 0.8.39 a deactivated webvh DID still
+/// resolved to its last document — keys included — and a document cached
+/// before the deactivation still does. So deactivation is read from the DID's
+/// own log (`didwebvh-rs` resolution metadata), both after a resolution and
+/// when one fails: 0.8.39 refuses to resolve a deactivated did:webvh at all,
+/// and that refusal must read as final, not as an unreachable signer. A DID whose deactivation cannot be established is refused: an
 /// unreadable log proves nothing about the key.
 ///
 /// The verdict follows the DID cache: it is reused while the cache serves the
@@ -297,12 +300,24 @@ impl ProofPurposeResolver for SignerKeyResolver {
         purpose: ProofPurpose,
     ) -> Result<ResolvedKey, DataIntegrityError> {
         let did = controller_did(vm);
-        let resolved = self.client.resolve(did).await.map_err(|e| {
-            DataIntegrityError::Resolver(format!(
-                "{UNREACHABLE}: cannot resolve {did} (is its DID document reachable from \
-                 this service?): {e}"
-            ))
-        })?;
+        let resolved = match self.client.resolve(did).await {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                // The cache SDK (0.8.39+) refuses to resolve a deactivated
+                // did:webvh. That is final, not an unreachable signer: ask the
+                // DID's own log, so it is not retried as if it might come back.
+                if did.starts_with("did:webvh:")
+                    && let Some(deactivation) = &self.deactivation
+                    && let Ok(true) = deactivation.is_deactivated(did, false).await
+                {
+                    return Err(DataIntegrityError::Resolver(format!("{did} {DEACTIVATED}")));
+                }
+                return Err(DataIntegrityError::Resolver(format!(
+                    "{UNREACHABLE}: cannot resolve {did} (is its DID document reachable from \
+                     this service?): {e}"
+                )));
+            }
+        };
         // The relationship check (and key decoding) is the library's.
         let key = self.decode.resolve_vm_for_purpose(vm, purpose).await?;
         // A deactivated DID's keys sign nothing.
@@ -1259,6 +1274,142 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("deactivated"), "{err}");
+    }
+
+    /// A signed did:webvh log for `localhost:{port}` with `secret` as its
+    /// `authentication` key, ending in a deactivation when `deactivate`:
+    /// the DID and its `did.jsonl`.
+    async fn webvh_log(port: u16, secret: &Secret, deactivate: bool) -> (String, String) {
+        use didwebvh_rs::{
+            DIDWebVHState, Multibase, log_entry::LogEntryMethods, parameters::Parameters,
+        };
+
+        let mut update_key = Secret::generate_ed25519(None, None);
+        let update_pk = update_key.get_public_keymultibase().unwrap();
+        update_key.id = format!("did:key:{update_pk}#{update_pk}");
+        let pk = secret.get_public_keymultibase().unwrap();
+        let template = format!("did:webvh:{{SCID}}:localhost%3A{port}");
+        let doc = json!({
+            "id": template,
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "verificationMethod": [{
+                "id": format!("{template}#key-1"),
+                "type": "Multikey",
+                "controller": template,
+                "publicKeyMultibase": pk,
+            }],
+            "authentication": [format!("{template}#key-1")],
+        });
+        let params = Parameters {
+            update_keys: Some(Arc::new(vec![Multibase::new(update_pk)])),
+            portable: Some(false),
+            ..Default::default()
+        };
+        // Backdated so a deactivation entry's versionTime is strictly later.
+        let genesis = (chrono::Utc::now() - chrono::Duration::seconds(100)).fixed_offset();
+        let mut state = DIDWebVHState::default();
+        state
+            .create_log_entry(Some(genesis), &doc, &params, &update_key)
+            .await
+            .unwrap();
+        if deactivate {
+            state.deactivate(&update_key).await.unwrap();
+        }
+        let did = state
+            .log_entries()
+            .last()
+            .unwrap()
+            .log_entry
+            .get_did_document()
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let jsonl = state
+            .log_entries()
+            .iter()
+            .map(|e| serde_json::to_string(&e.log_entry).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (did, jsonl)
+    }
+
+    /// Serve `body` to every request on `listener`.
+    fn serve(listener: tokio::net::TcpListener, body: String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4096];
+                    let _ = socket.read(&mut request).await;
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/jsonl\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+    }
+
+    /// A deactivated `did:webvh` signer the DID cache has never seen is refused
+    /// as **deactivated** — final — and not as unreachable. Since
+    /// `affinidi-did-resolver-cache-sdk` 0.8.39 the cache refuses to resolve a
+    /// deactivated did:webvh at all; that refusal used to be reported as an
+    /// unreachable signer, so the proof was retried (a cache eviction and a
+    /// re-resolution each time) and the caller told to try again. A live DID
+    /// served beside it shows the harness serves logs that resolve.
+    #[tokio::test]
+    async fn an_uncached_deactivated_webvh_signer_is_refused_as_final() {
+        use affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder;
+        use affinidi_did_resolver_cache_sdk::network_resolvers::HostPolicy as CacheHostPolicy;
+
+        let secret = Secret::generate_ed25519(None, Some(&[7u8; 32]));
+        let live_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (live, live_log) =
+            webvh_log(live_listener.local_addr().unwrap().port(), &secret, false).await;
+        let (dead, dead_log) =
+            webvh_log(dead_listener.local_addr().unwrap().port(), &secret, true).await;
+        serve(live_listener, live_log);
+        serve(dead_listener, dead_log);
+
+        let client = DIDCacheClient::new(
+            DIDCacheConfigBuilder::default()
+                .with_host_policy(CacheHostPolicy::AllowPrivate)
+                .build(),
+        )
+        .await
+        .unwrap();
+        let signers = SignerKeyResolver {
+            client: client.clone(),
+            decode: CachedDidResolver::new(Arc::new(client)),
+            deactivation: Some(Arc::new(DeactivationCache {
+                host_policy: HostPolicy::AllowPrivate,
+                ..DeactivationCache::default()
+            })),
+        };
+        let resolver = PurposeBound::new(&signers, ProofPurpose::Authentication);
+
+        resolver
+            .resolve_vm(&format!("{live}#key-1"))
+            .await
+            .expect("a live signer resolves");
+        let err = resolver
+            .resolve_vm(&format!("{dead}#key-1"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(DEACTIVATED), "{err}");
+        assert!(
+            !err.contains(UNREACHABLE),
+            "a deactivated signer is final: {err}"
+        );
+        assert!(
+            !is_unreachable(&map_error(DataIntegrityError::Resolver(err.clone()))),
+            "{err}"
+        );
     }
 
     // ─── Cross-language interop with the JS wallet ───
