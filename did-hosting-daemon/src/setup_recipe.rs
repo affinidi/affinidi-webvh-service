@@ -406,6 +406,15 @@ pub async fn apply_recipe(
     eprintln!();
     eprintln!("  [setup-recipe] setup complete");
     eprintln!();
+
+    // The ephemeral setup key was an admin did:key at the VTA; erase it now
+    // that online provisioning succeeded.
+    if recipe.deployment.vta_mode == VtaMode::Online
+        && let Some(path) = setup_key_file.as_deref()
+    {
+        crate::setup_key_erase::erase_after_provision(path);
+    }
+
     eprintln!(
         "  Next: did-hosting-daemon --config {}",
         recipe.output.config_path.display()

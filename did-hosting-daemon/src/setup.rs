@@ -255,6 +255,12 @@ pub async fn run_wizard(
     )
     .await?;
 
+    // Headless phase 2 supplied a setup key file; it was an admin did:key at
+    // the VTA, so erase it now that provisioning succeeded.
+    if let Some(path) = preloaded_setup_key_file.as_deref() {
+        crate::setup_key_erase::erase_after_provision(path);
+    }
+
     eprintln!();
     eprintln!("  Setup complete!");
     eprintln!();
