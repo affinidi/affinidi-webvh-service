@@ -217,22 +217,24 @@ fn parse_role(s: &str) -> Result<Role, ()> {
 fn role_not_recognized_details(offending: &str) -> serde_json::Value {
     json!({
         "offendingRole": offending,
-        "knownRoles": ["admin", "owner", "service"],
+        "knownRoles": ["admin", "owner", "service", "metricsreader"],
     })
 }
 
 /// Strict role ordering for the self-promotion guard. We define a
-/// total order: `Service < Owner < Admin`. Self-promotion to a
-/// strictly greater role is forbidden.
+/// total order: `MetricsReader < Service < Owner < Admin`. Self-promotion
+/// to a strictly greater role is forbidden. `MetricsReader` ranks lowest —
+/// a read-only metrics credential can never self-promote into anything.
 fn is_strict_promotion(from: &Role, to: &Role) -> bool {
     role_rank(to) > role_rank(from)
 }
 
 fn role_rank(r: &Role) -> u8 {
     match r {
-        Role::Service => 0,
-        Role::Owner => 1,
-        Role::Admin => 2,
+        Role::MetricsReader => 0,
+        Role::Service => 1,
+        Role::Owner => 2,
+        Role::Admin => 3,
     }
 }
 

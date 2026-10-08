@@ -333,6 +333,23 @@ impl Cx<'_> {
         Ok(auth)
     }
 
+    /// [`Cx::auth`], refused with `permissionDenied` unless the caller is an
+    /// administrator **or** a `MetricsReader`. The returned claims carry the
+    /// caller's role so a handler can still narrow what it exposes (the
+    /// `metrics` task gives a `MetricsReader` the counters only, gauges
+    /// `Admin`-only).
+    pub async fn metrics_read(&self) -> Result<AuthClaims, TaskError> {
+        use crate::acl::Role;
+        let auth = self.auth().await?;
+        if !matches!(auth.role, Role::Admin | Role::MetricsReader) {
+            return Err(TaskError::Standard(
+                StandardCode::PermissionDenied,
+                "this task requires administrator or metrics-reader standing".into(),
+            ));
+        }
+        Ok(auth)
+    }
+
     /// The caller's authority: the proven issuer and the role its ACL entry
     /// grants now. A document is a single signed request, not a session, so
     /// its assurance level is the base one — unless it arrived with a bearer
