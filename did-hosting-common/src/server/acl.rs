@@ -24,6 +24,13 @@ use super::store::KeyspaceHandle;
 /// neither be accepted by admin-only routes nor by the public DID-
 /// management routes a tenant would use — service accounts are
 /// deliberately scoped down.
+///
+/// `MetricsReader` is the narrowest role: it can read the service's
+/// `webvh_*` counters via `did-management/server/metrics/0.1` and nothing
+/// else. It is not accepted by any `*Auth` HTTP extractor, cannot manage
+/// the ACL, cannot operate on DIDs, and cannot push sync data. The
+/// `metrics` task gives a `MetricsReader` the `counters` only; the
+/// `gauges` (internal replication health) stay `Admin`-only.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -34,6 +41,9 @@ pub enum Role {
     /// (`register-service`, `stats`); cannot access admin management
     /// endpoints or tenant DID-management routes.
     Service,
+    /// Read-only metrics role. Can read the `webvh_*` counters via
+    /// `server/metrics/0.1` and nothing else.
+    MetricsReader,
 }
 
 impl fmt::Display for Role {
@@ -42,6 +52,7 @@ impl fmt::Display for Role {
             Role::Admin => write!(f, "admin"),
             Role::Owner => write!(f, "owner"),
             Role::Service => write!(f, "service"),
+            Role::MetricsReader => write!(f, "metricsreader"),
         }
     }
 }
@@ -54,6 +65,7 @@ impl std::str::FromStr for Role {
             "admin" => Ok(Role::Admin),
             "owner" => Ok(Role::Owner),
             "service" => Ok(Role::Service),
+            "metricsreader" => Ok(Role::MetricsReader),
             _ => Err(AppError::Validation(format!("unknown role: {s}"))),
         }
     }
@@ -416,6 +428,11 @@ mod tests {
     }
 
     #[test]
+    fn role_from_str_metricsreader() {
+        assert_eq!(Role::from_str("metricsreader").unwrap(), Role::MetricsReader);
+    }
+
+    #[test]
     fn role_from_str_unknown_returns_error() {
         assert!(Role::from_str("superuser").is_err());
     }
@@ -425,6 +442,23 @@ mod tests {
         assert_eq!(Role::Admin.to_string(), "admin");
         assert_eq!(Role::Owner.to_string(), "owner");
         assert_eq!(Role::Service.to_string(), "service");
+        assert_eq!(Role::MetricsReader.to_string(), "metricsreader");
+    }
+
+    /// `Display`, `FromStr`, and serde must agree on the wire string —
+    /// the ACL stores the role via serde, so a mismatch would make a
+    /// `metricsreader` entry unparseable by `FromStr` (and vice versa).
+    #[test]
+    fn metricsreader_display_fromstr_serde_agree() {
+        let serialized = serde_json::to_string(&Role::MetricsReader).unwrap();
+        assert_eq!(serialized, "\"metricsreader\"");
+        assert_eq!(Role::MetricsReader.to_string(), "metricsreader");
+        assert_eq!(
+            Role::from_str(&Role::MetricsReader.to_string()).unwrap(),
+            Role::MetricsReader
+        );
+        let back: Role = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(back, Role::MetricsReader);
     }
 
     // --- effective_max_total_size ---
