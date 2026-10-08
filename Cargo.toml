@@ -295,12 +295,23 @@ affinidi-did-webs = "0.7"
 # (`session::TspPingSession`, `atm.tsp().send/unpack`) that the TSP
 # transport binding rides on. Pulls `affinidi-tdk/tsp` +
 # `affinidi-messaging-sdk/tsp`.
+#
+# `acl-setup` feature: on DIDComm connect, the SDK opens the connecting
+# client's own mediator account to forwarded delivery (allow-all ACL). The
+# setup wizards (`setup --setup-key-file`, online provision) connect as an
+# ephemeral `did:key` whose mediator account starts closed on mediators with
+# deny-by-default (`ExplicitAllow`) account defaults; without this the VTA's
+# reply to every provisioning request is refused (`e.p.delivery.refused`) and
+# setup fails with "timeout waiting for DIDComm response". The runtime
+# listeners already open their own ACL (`acl_mode: ExplicitDeny`), so this only
+# changes the SDK-driven setup connection.
 vta-sdk = { version = "0.58.1", features = [
   "session",
   "provision-integration",
   "provision-client",
   "client",
   "tsp",
+  "acl-setup",
 ] }
 
 # Logging / tracing
