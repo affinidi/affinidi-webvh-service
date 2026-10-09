@@ -483,23 +483,32 @@ mod tests {
         assert_eq!(err.payload.code, extended_code(ERR_ROLE_NOT_RECOGNIZED));
         let details = err.payload.details.unwrap();
         assert_eq!(details["offendingRole"], "superuser");
-        assert_eq!(details["knownRoles"], json!(["admin", "owner", "service"]));
+        assert_eq!(
+            details["knownRoles"],
+            json!(["admin", "owner", "service", "metricsreader"])
+        );
     }
 
     /// `is_strict_promotion` is the gate for the self-promotion
-    /// refusal. Admin is the top of the 3-role enum, so an
+    /// refusal. Admin is the top of the 4-role enum, so an
     /// end-to-end "self-promotes from Admin → ??" test is
     /// unreachable today; this unit test is what catches a
     /// regression in the predicate if a future role landing
     /// reorders the rank.
     #[test]
     fn role_rank_unit() {
+        // Total order: MetricsReader < Service < Owner < Admin.
+        assert!(role_rank(&Role::MetricsReader) < role_rank(&Role::Service));
         assert!(role_rank(&Role::Service) < role_rank(&Role::Owner));
         assert!(role_rank(&Role::Owner) < role_rank(&Role::Admin));
         assert!(is_strict_promotion(&Role::Owner, &Role::Admin));
         assert!(is_strict_promotion(&Role::Service, &Role::Owner));
+        // A read-only metrics credential can never self-promote.
+        assert!(is_strict_promotion(&Role::MetricsReader, &Role::Service));
+        assert!(is_strict_promotion(&Role::MetricsReader, &Role::Admin));
         assert!(!is_strict_promotion(&Role::Owner, &Role::Owner));
         assert!(!is_strict_promotion(&Role::Admin, &Role::Owner));
+        assert!(!is_strict_promotion(&Role::MetricsReader, &Role::MetricsReader));
     }
 
     #[tokio::test]
