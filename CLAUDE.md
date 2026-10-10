@@ -227,6 +227,15 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
   its session is bound to). A new task is a new row; never a hand-built reply.
   `POST /api/trust-tasks` is the HTTPS binding of the same dispatch: the
   document's proof authorises, a bearer session is optional context.
+- **One temporary exception: `auth/oob/*`** (wallet sign-in with a trigger
+  link, `did-hosting-control/src/oob`). The published `trust-tasks-rs` has no
+  bindings for it yet, so `POST /api/trust-tasks` routes it to its own state
+  machine before the table, HTTPS only, with local types marked
+  `TODO: replace with generated trust-tasks types`. It still verifies with
+  `TransportBoundVerifier` (`identify` for `authentication`, `grant` for
+  `assertionMethod`) and signs every reply; per contract C5 its step 1 and
+  step 2 replies are signed for `assertionMethod`. Move it into the table
+  once `trust_tasks_rs::specs::auth::oob` is published.
 - **Two passkey stores.** Login (`purpose: session`) passkeys live in
   `KS_SESSIONS`; step-up-only passkeys in `KS_PASSKEY_STEP_UP`. The login
   ceremony reads `KS_SESSIONS` only — never make it read both. Enrolment

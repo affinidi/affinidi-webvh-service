@@ -20,6 +20,7 @@ pub mod frontend;
 pub mod health;
 pub mod identity_rotation;
 pub mod messaging;
+pub mod oob;
 pub mod outbox;
 pub mod path_locks;
 pub mod pending_challenges;
