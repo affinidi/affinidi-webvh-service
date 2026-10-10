@@ -255,7 +255,14 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
   service signs, approval *requests* included, is `authentication`. Decisions
   (consent, step-up) are checked with `TransportBoundVerifier::verify_approval`
   — `assertionMethod` purpose *and* relationship, deactivation check — never
-  the bare `ProofVerifier::verify`.
+  the bare `ProofVerifier::verify`. **The one exception** is the `auth/oob/*`
+  step 1 (`claim`) and step 2 (`prove`) responses, which the cross-repo
+  sign-in contract (C5) requires signed for `assertionMethod`: the wallet
+  shows their contents (service name, portal origin, requester) to the
+  member as the service's statement, and the step 2 response is bound into
+  the member's grant via `contextDigest`. Every other signed `auth/oob/*` reply,
+  like every other service reply, is `authentication`. Don't widen the
+  exception; it goes when the contract does.
 - **An edge never answers a document that failed `verify_control_plane`** —
   no signed refusal (it would settle an op the control plane never sent), no
   unsigned one. Transient failures (unresolvable signer DID, storage/I-O) are
