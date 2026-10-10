@@ -26,6 +26,17 @@ pub const FINISHED_RETENTION_SECS: u64 = 300;
 /// addresses past the per-IP limit stops here, not at memory exhaustion.
 pub const MAX_OPEN_REQUESTS: usize = 10_000;
 
+/// The most document ids remembered at once for the replay check. Past it a
+/// new document is refused (fail closed: one that cannot be remembered could
+/// be replayed) until older ids age out.
+pub const MAX_SEEN_DOCUMENTS: usize = 50_000;
+
+/// The most `redeem` long polls held open at once, from all addresses
+/// together. Each request may hold one and each address
+/// [`super::service::OobConfig::max_polls_per_ip`]; this bounds the sum, so
+/// many addresses cannot pin an unbounded number of held connections.
+pub const MAX_OPEN_POLLS: usize = 1_000;
+
 /// One sign-in request (base design 7.2).
 #[derive(Debug, Clone, PartialEq)]
 pub struct OobRecord {
@@ -112,6 +123,26 @@ pub enum CreateError {
     Full,
 }
 
+/// Why a document id could not be remembered.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SeenError {
+    /// Already remembered: a replay.
+    Replay,
+    /// [`MAX_SEEN_DOCUMENTS`] are remembered; refused until some age out.
+    Full,
+}
+
+/// Why a `redeem` poll could not be opened.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PollRefused {
+    /// The request already has its one poll.
+    AlreadyOpen,
+    /// The address holds its share of polls.
+    AddressCap,
+    /// [`MAX_OPEN_POLLS`] are open across all addresses.
+    Full,
+}
+
 impl OobStore {
     pub fn new() -> Self {
         Self::default()
@@ -159,17 +190,26 @@ impl OobStore {
         ok
     }
 
-    /// Record a document `(issuer, id)` until `until`. Returns false if it was
-    /// already recorded: a replay.
-    pub fn remember_document(&self, issuer: &str, id: &str, until: u64, now: u64) -> bool {
+    /// Record a document `(issuer, id)` until `until`. Refused if it was
+    /// already recorded (a replay), or if [`MAX_SEEN_DOCUMENTS`] are held.
+    pub fn remember_document(
+        &self,
+        issuer: &str,
+        id: &str,
+        until: u64,
+        now: u64,
+    ) -> Result<(), SeenError> {
         let mut g = self.lock();
         g.seen.retain(|_, exp| *exp >= now);
         let key = (issuer.to_string(), id.to_string());
         if g.seen.contains_key(&key) {
-            return false;
+            return Err(SeenError::Replay);
+        }
+        if g.seen.len() >= MAX_SEEN_DOCUMENTS {
+            return Err(SeenError::Full);
         }
         g.seen.insert(key, until);
-        true
+        Ok(())
     }
 
     /// The notifier for a request's changes.
@@ -181,22 +221,29 @@ impl OobStore {
             .clone()
     }
 
-    /// Open the one poll a request may have, counted against `ip`. Returns
-    /// `None` if a poll is already open for the request or `ip` has
-    /// `max_per_ip` open. The guard closes it when dropped, including when
-    /// the client goes away and the handler future is dropped.
-    pub fn open_poll(&self, request_id: &str, ip: &str, max_per_ip: usize) -> Option<PollGuard> {
+    /// Open the one poll a request may have, counted against `ip` and
+    /// against [`MAX_OPEN_POLLS`]. The guard closes it when dropped,
+    /// including when the client goes away and the handler future is dropped.
+    pub fn open_poll(
+        &self,
+        request_id: &str,
+        ip: &str,
+        max_per_ip: usize,
+    ) -> Result<PollGuard, PollRefused> {
         let mut g = self.lock();
         if g.open_polls.contains(request_id) {
-            return None;
+            return Err(PollRefused::AlreadyOpen);
         }
         let n = g.polls_per_ip.get(ip).copied().unwrap_or(0);
         if n >= max_per_ip {
-            return None;
+            return Err(PollRefused::AddressCap);
+        }
+        if g.open_polls.len() >= MAX_OPEN_POLLS {
+            return Err(PollRefused::Full);
         }
         g.open_polls.insert(request_id.to_string());
         g.polls_per_ip.insert(ip.to_string(), n + 1);
-        Some(PollGuard {
+        Ok(PollGuard {
             store: self.clone(),
             request_id: request_id.to_string(),
             ip: ip.to_string(),
@@ -206,6 +253,17 @@ impl OobStore {
     #[cfg(test)]
     pub fn record_count(&self) -> usize {
         self.lock().records.len()
+    }
+
+    #[cfg(test)]
+    pub fn waiter_count(&self) -> usize {
+        self.lock().waiters.len()
+    }
+
+    /// Sweep as a write would, without writing.
+    #[cfg(test)]
+    pub fn sweep_now(&self, now: u64) {
+        sweep(&mut self.lock(), now);
     }
 }
 
@@ -246,9 +304,15 @@ fn sweep(g: &mut Inner, now: u64) {
         .collect();
     for id in stale {
         g.records.remove(&id);
-        if !g.open_polls.contains(&id) {
-            g.waiters.remove(&id);
-        }
     }
+    // A waiter lives while its record or its poll does. One whose poll was
+    // still open when the record went is dropped on a later sweep.
+    let Inner {
+        records,
+        waiters,
+        open_polls,
+        ..
+    } = &mut *g;
+    waiters.retain(|id, _| records.contains_key(id) || open_polls.contains(id));
     g.seen.retain(|_, exp| *exp >= now);
 }

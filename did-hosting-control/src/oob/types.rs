@@ -132,7 +132,9 @@ pub struct GrantPayload {
     pub not_after: u64,
 }
 
-/// The successful `redeem` body (C9): never tokens.
+/// The successful `redeem` body (C9): never tokens in its fields. A
+/// bearer-token service such as this one returns its tokens to the starter in
+/// `ext` under its own namespace (C9, "Redeem on a bearer-token service").
 // TODO: replace with generated trust-tasks types
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

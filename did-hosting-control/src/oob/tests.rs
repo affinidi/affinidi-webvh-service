@@ -839,6 +839,48 @@ async fn one_open_poll_per_request() {
 }
 
 #[tokio::test]
+async fn a_member_removed_before_redeem_gets_no_session_and_the_grant_is_spent() {
+    let w = world();
+    let rid = w.request().await;
+    w.claim(&rid).await;
+    let step2 = w.prove(&rid).await;
+    let grant = w.grant(&rid, &step2, "approve", "assertionMethod").await;
+    assert_eq!(w.respond_with(grant).await.0, 200);
+    assert_eq!(w.state(&rid), OobState::Approved);
+    w.env.allowed.lock().unwrap().clear();
+    let (status, body) = w.redeem(&rid).await;
+    assert_eq!((status, code(&body)), (403, "notAuthorized"), "{body}");
+    assert_eq!(w.state(&rid), OobState::Consumed, "spent in one step");
+    // Re-admitting the member does not revive it.
+    w.env.allowed.lock().unwrap().insert(w.member.did.clone());
+    assert_eq!(code(&w.redeem(&rid).await.1), "requestExpired");
+}
+
+#[tokio::test]
+async fn concurrent_redeems_of_one_approval_yield_one_session() {
+    let w = Arc::new(world());
+    let rid = w.request().await;
+    w.claim(&rid).await;
+    let step2 = w.prove(&rid).await;
+    let grant = w.grant(&rid, &step2, "approve", "assertionMethod").await;
+    assert_eq!(w.respond_with(grant).await.0, 200);
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let (w, rid) = (w.clone(), rid.clone());
+        tasks.push(tokio::spawn(async move { w.redeem(&rid).await }));
+    }
+    let mut approved = 0;
+    for t in tasks {
+        let (_, body) = t.await.unwrap();
+        if body.get("approved").is_some() {
+            approved += 1;
+        }
+    }
+    assert_eq!(approved, 1);
+    assert_eq!(w.state(&rid), OobState::Consumed);
+}
+
+#[tokio::test]
 async fn cancel_by_the_starter_is_seen_by_redeem() {
     let w = world();
     let rid = w.request().await;
@@ -935,6 +977,163 @@ fn compare_and_set_refuses_a_stale_version() {
         .create(other, now + super::store::FINISHED_RETENTION_SECS + 1)
         .unwrap();
     assert!(store.get("r").is_none());
+}
+
+fn pending_record(request_id: &str, now: u64) -> super::store::OobRecord {
+    super::store::OobRecord {
+        request_id: request_id.into(),
+        state: OobState::Pending,
+        version: 0,
+        purpose: "login".into(),
+        origin: ORIGIN.into(),
+        start_key: "k".into(),
+        start_network: Some("ip".into()),
+        location: "unknown".into(),
+        browser: "unknown".into(),
+        os: "unknown".into(),
+        created_at: now,
+        approver_key: None,
+        match_number: None,
+        identified_did: None,
+        step2_digest: None,
+        claim_deadline: now + 120,
+        decision_deadline: None,
+        grant: None,
+        grant_not_after: None,
+        finished_at: None,
+    }
+}
+
+#[test]
+fn the_store_refuses_when_full_and_frees_room_by_sweeping() {
+    use super::store::{CreateError, FINISHED_RETENTION_SECS, MAX_OPEN_REQUESTS};
+    let store = OobStore::new();
+    let now = 1_000;
+    for i in 0..MAX_OPEN_REQUESTS {
+        store
+            .create(pending_record(&format!("r{i}"), now), now)
+            .unwrap();
+    }
+    assert_eq!(
+        store.create(pending_record("one-more", now), now),
+        Err(CreateError::Full)
+    );
+    // Once their claim window and the retention have passed, they are swept
+    // on the next write and the new request fits.
+    let later = now + 120 + FINISHED_RETENTION_SECS + 1;
+    store
+        .create(pending_record("one-more", later), later)
+        .unwrap();
+    assert_eq!(store.record_count(), 1);
+}
+
+#[tokio::test]
+async fn a_full_store_refuses_request_as_rate_limited() {
+    use super::store::MAX_OPEN_REQUESTS;
+    let w = world();
+    let now = w.env.now();
+    for i in 0..MAX_OPEN_REQUESTS {
+        w.svc
+            .store()
+            .create(pending_record(&format!("r{i}"), now), now)
+            .unwrap();
+    }
+    let d = w
+        .doc(
+            &w.starter,
+            TYPE_REQUEST,
+            json!({"purpose": "login", "mode": "scan"}),
+            "assertionMethod",
+        )
+        .await;
+    let (status, body) = w.send(d).await;
+    assert_eq!((status, code(&body)), (429, "rateLimited"), "{body}");
+}
+
+#[test]
+fn the_replay_cache_is_bounded_and_fails_closed() {
+    use super::store::{MAX_SEEN_DOCUMENTS, SeenError};
+    let store = OobStore::new();
+    let now = 1_000;
+    for i in 0..MAX_SEEN_DOCUMENTS {
+        store
+            .remember_document("did:key:z", &i.to_string(), now + 600, now)
+            .unwrap();
+    }
+    assert_eq!(
+        store.remember_document("did:key:z", "new", now + 600, now),
+        Err(SeenError::Full),
+        "an id that cannot be remembered is refused, never accepted unremembered"
+    );
+    assert_eq!(
+        store.remember_document("did:key:z", "0", now + 600, now),
+        Err(SeenError::Replay)
+    );
+    // Room again once the remembered ids age out.
+    store
+        .remember_document("did:key:z", "new", now + 1_200, now + 601)
+        .unwrap();
+}
+
+#[test]
+fn polls_are_capped_per_request_per_address_and_overall() {
+    use super::store::{MAX_OPEN_POLLS, PollRefused};
+    let store = OobStore::new();
+    let first = store.open_poll("r0", "a", 2).unwrap();
+    assert_eq!(
+        store.open_poll("r0", "b", 2).err(),
+        Some(PollRefused::AlreadyOpen)
+    );
+    let _second = store.open_poll("r1", "a", 2).unwrap();
+    assert_eq!(
+        store.open_poll("r2", "a", 2).err(),
+        Some(PollRefused::AddressCap)
+    );
+    drop(first);
+    let _again = store.open_poll("r0", "a", 2).unwrap();
+
+    // Spread over many addresses, the total is still capped.
+    let mut held = Vec::new();
+    for i in 2..MAX_OPEN_POLLS {
+        held.push(
+            store
+                .open_poll(&format!("r{i}"), &format!("ip{i}"), 2)
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        store.open_poll("last", "fresh", 2).err(),
+        Some(PollRefused::Full)
+    );
+    held.pop();
+    assert!(store.open_poll("last", "fresh", 2).is_ok());
+}
+
+#[test]
+fn a_waiter_outliving_its_record_is_swept() {
+    use super::store::FINISHED_RETENTION_SECS;
+    let store = OobStore::new();
+    let now = 1_000;
+    store.create(pending_record("r", now), now).unwrap();
+    let guard = store.open_poll("r", "a", 8).unwrap();
+    let _ = store.waiter("r");
+    let later = now + 120 + FINISHED_RETENTION_SECS + 1;
+    store.sweep_now(later);
+    assert!(store.get("r").is_none());
+    assert_eq!(store.waiter_count(), 1, "kept while its poll is open");
+    drop(guard);
+    store.sweep_now(later);
+    assert_eq!(store.waiter_count(), 0);
+}
+
+#[test]
+fn overlong_windows_are_shortened_not_a_panic() {
+    let mut config = OobConfig::new("did:key:z".into(), "x".into(), ORIGIN.into());
+    config.claim_window_secs = 600;
+    config.decision_window_secs = 181;
+    let svc = OobService::new(config);
+    assert_eq!(svc.config.claim_window_secs, MAX_WINDOW_SECS);
+    assert_eq!(svc.config.decision_window_secs, MAX_WINDOW_SECS);
 }
 
 #[test]
@@ -1115,6 +1314,130 @@ mod https {
     }
 
     #[tokio::test]
+    async fn request_needs_exactly_one_canonical_portal_origin() {
+        let (state, _dir) = harness::state().await;
+        let starter = key(2);
+        let mut refused = vec![
+            Some("null"),
+            Some("http://control.test/"),
+            Some("http://control.test/login"),
+            Some("http://CONTROL.test"),
+            Some("http://control.test:8080"),
+            Some("https://control.test"),
+            Some("http://user@control.test"),
+            Some("http://control.test.evil.example"),
+            Some("not a url"),
+        ];
+        refused.push(None);
+        for origin in refused {
+            let req = doc(
+                &starter,
+                TYPE_REQUEST,
+                json!({"purpose": "login", "mode": "scan"}),
+                "assertionMethod",
+            )
+            .await;
+            let (status, _, body) = post(&state, &req, origin).await;
+            assert_eq!(
+                (status, code(&body)),
+                (403, "notAuthorized"),
+                "Origin {origin:?}"
+            );
+        }
+
+        // Two Origin headers, even if one is the portal's.
+        for pair in [[PORTAL, "https://evil.example"], [PORTAL, PORTAL]] {
+            let req = doc(
+                &starter,
+                TYPE_REQUEST,
+                json!({"purpose": "login", "mode": "scan"}),
+                "assertionMethod",
+            )
+            .await;
+            let mut headers = HeaderMap::new();
+            for o in pair {
+                headers.append(header::ORIGIN, HeaderValue::from_static(o));
+            }
+            let body = serde_json::to_vec(&req).unwrap();
+            let resp = crate::oob::http::maybe_handle(
+                &state,
+                "198.51.100.5".parse().unwrap(),
+                &headers,
+                &body,
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status().as_u16(), 403, "{pair:?}");
+        }
+    }
+
+    #[test]
+    fn the_portal_origin_is_never_opaque() {
+        use crate::oob::http::{origin_is_portal, portal_origin};
+        assert_eq!(
+            portal_origin("https://dids.example.org:8443/x").unwrap().0,
+            "https://dids.example.org:8443"
+        );
+        assert_eq!(
+            portal_origin("https://dids.example.org:443/").unwrap().0,
+            "https://dids.example.org",
+            "the default port is not written"
+        );
+        // These would serialise as `null`, the Origin of a sandboxed frame.
+        assert!(portal_origin("file:///srv/console").is_none());
+        assert!(portal_origin("data:text/html,x").is_none());
+        let mut h = HeaderMap::new();
+        h.insert(header::ORIGIN, HeaderValue::from_static("null"));
+        assert!(!origin_is_portal(&h, "null"));
+    }
+
+    #[tokio::test]
+    async fn request_has_a_global_ceiling_across_addresses() {
+        use crate::oob::http::{GLOBAL_REQUEST_MAX_PER_MINUTE, REQUEST_MAX_PER_MINUTE};
+        let (state, _dir) = harness::state().await;
+        let starter = key(2);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, HeaderValue::from_static(PORTAL));
+        // A refused origin does not spend the global budget.
+        let req = doc(
+            &starter,
+            TYPE_REQUEST,
+            json!({"purpose": "login", "mode": "scan"}),
+            "assertionMethod",
+        )
+        .await;
+        let (status, _, _) = post(&state, &req, Some("https://evil.example")).await;
+        assert_eq!(status, 403);
+
+        let send = async |n: u64| {
+            // Spread over addresses, each under its own limit.
+            let ip: std::net::IpAddr = format!(
+                "10.{}.{}.1",
+                n / REQUEST_MAX_PER_MINUTE / 256,
+                (n / REQUEST_MAX_PER_MINUTE) % 256
+            )
+            .parse()
+            .unwrap();
+            let req = doc(
+                &starter,
+                TYPE_REQUEST,
+                json!({"purpose": "login", "mode": "scan"}),
+                "assertionMethod",
+            )
+            .await;
+            let body = serde_json::to_vec(&req).unwrap();
+            let resp = crate::oob::http::maybe_handle(&state, ip, &headers, &body)
+                .await
+                .unwrap();
+            resp.status().as_u16()
+        };
+        for n in 0..GLOBAL_REQUEST_MAX_PER_MINUTE {
+            assert_eq!(send(n).await, 200, "request {n}");
+        }
+        assert_eq!(send(GLOBAL_REQUEST_MAX_PER_MINUTE).await, 429);
+    }
+
+    #[tokio::test]
     async fn redeem_creates_a_console_session_bound_to_the_starter_key() {
         let (state, _dir) = harness::state().await;
         let m = harness::member(&state, 40, Role::Admin).await;
@@ -1223,7 +1546,7 @@ mod https {
         assert!(p.get("tokens").is_none());
         let refresh = p["ext"][crate::oob::http::SESSION_EXT_NAMESPACE]["tokens"]["refreshToken"]
             .as_str()
-            .expect("bearer tokens under ext (C9 conflict)");
+            .expect("bearer tokens under ext (C9, bearer-token service)");
         let sid = get_session_by_refresh(&state.sessions_ks, refresh)
             .await
             .unwrap()

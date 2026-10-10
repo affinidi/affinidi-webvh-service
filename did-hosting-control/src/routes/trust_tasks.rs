@@ -84,8 +84,19 @@ pub async fn trust_tasks_endpoint(
     let ip =
         crate::rate_limit::resolve_client_ip(addr.ip(), xff, &state.config.server.trusted_proxies);
     let client_ip = Some(ip);
-    // Wallet sign-in with a trigger link (`auth/oob/*`) has its own state
-    // machine and checks; see `crate::oob`. A bearer session plays no part.
+    // Wallet sign-in with a trigger link (`auth/oob/*`) is the one family
+    // served outside the `control_tasks` table (CLAUDE.md, "One temporary
+    // exception"). It cannot be a row yet: the table is keyed and typed on
+    // generated `Payload`s, which `trust-tasks-rs` does not publish for this
+    // family, and its issuers are throwaway `did:key`s (`K_a`, `K_b`) that are
+    // not in the ACL. It is not unauthenticated: `crate::oob::http` lists what
+    // it checks in place of the gate — envelope, recipient, freshness, replay,
+    // an Ed25519 `did:key` proof bound to the request's own keys, the ACL
+    // before any member DID is resolved, `TransportBoundVerifier` for member
+    // proofs, the portal origin on `request`, per-address and global limits,
+    // and signed replies. A bearer session sent with one is ignored: nothing
+    // in the family is authorised by it. Move it into the table once
+    // `trust_tasks_rs::specs::auth::oob` is published.
     if let Some(resp) = crate::oob::http::maybe_handle(&state, ip, &headers, &body).await {
         return Ok(resp);
     }

@@ -11,11 +11,30 @@
 //! What this layer adds to the state machine:
 //! - `Cache-Control: no-store` and `Referrer-Policy: no-referrer` on every
 //!   response;
-//! - `request` only from the portal's origin (base design 12 item 10);
-//! - per-address rate limits;
+//! - a size limit on the document ([`MAX_OOB_DOCUMENT_BYTES`]), under the
+//!   route's own body limit;
+//! - `request` only from the portal's origin (base design 12 item 10): exactly
+//!   one `Origin` header, naming the portal's scheme, host and port
+//!   ([`origin_is_portal`]);
+//! - per-address rate limits on every `auth/oob/*` document, and a global
+//!   one on `request`, so addresses that multiply (many hosts, or a too-broad
+//!   `trusted_proxies`) still meet a ceiling;
 //! - requester details from the connection (IP, User-Agent; no GeoIP);
 //! - on a successful `redeem`, this service's existing session: a bearer
 //!   session bound to `K_b` as its session key.
+//!
+//! What the state machine ([`super::service`]) checks on every document, in
+//! place of the `control_tasks` gate: the envelope (`type`, `id`, in-band
+//! `issuer`, `recipient` = this service, fresh `issuedAt`, `expiresAt`), an
+//! Ed25519 `did:key` issuer whose proof verifies with its own key and no I/O,
+//! replay on `(issuer, id)`, and the per-request key bindings (`request`,
+//! `redeem`: `K_b`; `claim`, `prove`, `respond`: the lock `K_a`; `cancel`:
+//! either). Member documents (`identify`, `grant`) are checked against the
+//! ACL by issuer string before any DID resolution, then verified with the
+//! shared [`TransportBoundVerifier`] (`verify_operational`,
+//! `verify_approval`). Every success is signed; only errors are unsigned.
+//! A bearer session sent with an `auth/oob/*` document is ignored: nothing
+//! here is authorised by one.
 
 use std::net::IpAddr;
 use std::sync::OnceLock;
@@ -47,12 +66,20 @@ pub const REQUEST_MAX_PER_MINUTE: u64 = 20;
 /// Other `auth/oob/*` documents per client address per minute. A redeem long
 /// poll re-sends every 25 s, so this leaves room for several sign-ins.
 pub const OTHER_MAX_PER_MINUTE: u64 = 120;
+/// `request` documents per minute from all addresses together: the ceiling
+/// that holds when the per-address limit is spread over many addresses.
+pub const GLOBAL_REQUEST_MAX_PER_MINUTE: u64 = 600;
+
+/// The single key of the global limiter (an [`IpRateLimiter`] with one
+/// bucket).
+const GLOBAL_KEY: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
 
 /// Per-process state: the service (built on first use, from config) and the
 /// limiters.
 pub struct OobRuntime {
     service: OnceLock<Option<OobService>>,
     request_limiter: IpRateLimiter,
+    global_request_limiter: IpRateLimiter,
     other_limiter: IpRateLimiter,
 }
 
@@ -63,6 +90,11 @@ impl Default for OobRuntime {
             request_limiter: IpRateLimiter::new(
                 "auth-oob-request-per-ip",
                 REQUEST_MAX_PER_MINUTE,
+                60,
+            ),
+            global_request_limiter: IpRateLimiter::new(
+                "auth-oob-request-global",
+                GLOBAL_REQUEST_MAX_PER_MINUTE,
                 60,
             ),
             other_limiter: IpRateLimiter::new("auth-oob-per-ip", OTHER_MAX_PER_MINUTE, 60),
@@ -86,10 +118,51 @@ impl OobRuntime {
 
 /// The origin and host of the portal, from the control plane's public URL:
 /// the console's login page is served there (`SignInPortal`, C4).
+///
+/// `None` unless the URL is `http` or `https` with a host: any other scheme
+/// has an opaque origin, which serialises as `null` — the `Origin` a
+/// sandboxed frame on any site sends.
 pub fn portal_origin(public_url: &str) -> Option<(String, String)> {
     let url = url::Url::parse(public_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
     let host = url.host_str()?.to_string();
-    Some((url.origin().ascii_serialization(), host))
+    let origin = url.origin();
+    if !origin.is_tuple() {
+        return None;
+    }
+    Some((origin.ascii_serialization(), host))
+}
+
+/// Whether the request's `Origin` is the portal's: exactly one `Origin`
+/// header, not `null`, an `http` or `https` origin whose scheme, host and
+/// port equal `portal`'s, written as a browser writes it (no path, no
+/// trailing slash, no user info). Anything else — missing, repeated,
+/// unparseable, opaque — is refused.
+pub fn origin_is_portal(headers: &HeaderMap, portal: &str) -> bool {
+    let mut values = headers.get_all(header::ORIGIN).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return false;
+    };
+    let Ok(sent) = value.to_str() else {
+        return false;
+    };
+    if sent == "null" {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(sent) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let origin = url.origin();
+    if !origin.is_tuple() {
+        return false;
+    }
+    let canonical = origin.ascii_serialization();
+    canonical == sent && canonical == portal
 }
 
 /// The `SignInPortal` endpoint for a control plane at `public_url`: its
@@ -202,19 +275,35 @@ async fn handle(
         tracing::warn!(%ip, type_uri, "auth/oob rate limited");
         return refuse(OobErrorCode::RateLimited, "too many requests");
     }
-    // `request` only from the portal itself: a browser always sends
-    // `Origin` on a POST, and no CORS is offered, so another site's page
-    // cannot open requests in this service's name.
     if type_uri == TYPE_REQUEST {
-        let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
-        if origin != Some(service.config.origin.as_str()) {
+        // `request` only from the portal itself: a browser always sends
+        // `Origin` on a POST, and no CORS is offered for POST, so another
+        // site's page cannot open requests in this service's name.
+        if !origin_is_portal(headers, &service.config.origin) {
+            let origin: Vec<_> = headers
+                .get_all(header::ORIGIN)
+                .iter()
+                .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+                .collect();
             tracing::warn!(
                 ?origin,
                 "auth/oob/request refused: not from the portal origin"
             );
             return refuse(OobErrorCode::NotAuthorized, "not from the sign-in portal");
         }
+        // Counted after the origin check, so another site's page cannot
+        // spend the global budget.
+        if state
+            .oob
+            .global_request_limiter
+            .try_consume(GLOBAL_KEY, now_epoch())
+            .is_err()
+        {
+            tracing::warn!("auth/oob/request refused: global rate limit");
+            return refuse(OobErrorCode::RateLimited, "too many sign-in requests");
+        }
     }
+    tracing::debug!(target: "auth_oob", %ip, type_uri, "auth/oob document handled outside the control_tasks table");
 
     let ua = headers
         .get(header::USER_AGENT)
@@ -255,15 +344,16 @@ async fn handle(
 
 /// Create this service's session for `session.subject`, bound to `K_b`.
 ///
-/// CONTRACT CONFLICT (C9): C9 says the session travels in HttpOnly cookies
-/// and the redeem body never carries tokens. This service has no cookie
-/// session: every client is a bearer client (`server::auth::extractor`), and
-/// the console holds its access and refresh tokens exactly as after a passkey
-/// or wallet login. Until that is settled, the tokens ride in a `tokens`
-/// member of the response's `ext`, under [`SESSION_EXT_NAMESPACE`] (the
-/// schema's only open member), and the C9 fields are unchanged. Only the holder of
-/// `K_b` can redeem, so this reaches no one the passkey login's response
-/// would not.
+/// Contract C9, "Redeem on a bearer-token service": a service without cookie
+/// sessions returns its tokens to the starter in `redeem`'s `ext` under its
+/// own namespace, and never to the approver. This service is one: every
+/// client is a bearer client (`server::auth::extractor`), and the console
+/// holds its access and refresh tokens exactly as after a passkey or wallet
+/// login. So the tokens ride in a `tokens` member of the response's `ext`,
+/// under [`SESSION_EXT_NAMESPACE`], and the C9 body fields are unchanged.
+/// Only the holder of `K_b` can redeem, so this reaches no one the passkey
+/// login's response would not. The session is bound to `K_b`, so a refresh
+/// needs a proof by that key (`auth/refresh:sessionKeyProofRequired`).
 async fn create_session(state: &AppState, session: &ApprovedSession) -> Result<Value, String> {
     let role = crate::acl::check_acl(&state.acl_ks, &session.subject)
         .await

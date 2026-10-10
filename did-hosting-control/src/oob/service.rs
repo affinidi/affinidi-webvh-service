@@ -23,9 +23,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use trust_tasks_rs::{ProofVerifier, TrustTask};
 
-use super::store::{CreateError, OobRecord, OobStore};
+use super::store::{CreateError, OobRecord, OobStore, PollRefused, SeenError};
 use super::types::*;
 
+/// The longest claim or decision window, seconds (base design 10: "each at
+/// most 180 s").
+pub const MAX_WINDOW_SECS: u64 = 180;
 /// Oldest acceptable `issuedAt`, seconds.
 pub const MAX_DOCUMENT_AGE_SECS: u64 = 300;
 /// Allowed `issuedAt` in the future, seconds.
@@ -153,11 +156,25 @@ pub struct OobService {
 }
 
 impl OobService {
-    pub fn new(config: OobConfig) -> Self {
-        assert!(
-            config.claim_window_secs <= 180 && config.decision_window_secs <= 180,
-            "claim and decision windows are at most 180 s"
-        );
+    /// A window over [`MAX_WINDOW_SECS`] is shortened to it, with a warning,
+    /// rather than refused: the service is built lazily on the first
+    /// `auth/oob/*` document, where a panic would take the request down
+    /// with it.
+    pub fn new(mut config: OobConfig) -> Self {
+        for (name, w) in [
+            ("claim", &mut config.claim_window_secs),
+            ("decision", &mut config.decision_window_secs),
+        ] {
+            if *w > MAX_WINDOW_SECS {
+                tracing::warn!(
+                    window = name,
+                    configured = *w,
+                    max = MAX_WINDOW_SECS,
+                    "auth/oob window too long; using the maximum"
+                );
+                *w = MAX_WINDOW_SECS;
+            }
+        }
         Self {
             config,
             store: OobStore::new(),
@@ -455,12 +472,11 @@ impl OobService {
         if payload.request_id != rec.request_id {
             return Err(OobError::not_authorized());
         }
-        if !self.store.remember_document(
-            &did,
-            &identify.id,
-            env.now() + SEEN_ID_TTL_SECS,
-            env.now(),
-        ) {
+        if self
+            .store
+            .remember_document(&did, &identify.id, env.now() + SEEN_ID_TTL_SECS, env.now())
+            .is_err()
+        {
             return Err(OobError::not_authorized());
         }
         Ok((did, payload))
@@ -531,9 +547,10 @@ impl OobService {
             tracing::warn!(error = %e, "auth/oob grant proof refused");
             return Err(OobError::not_authorized());
         }
-        if !self
+        if self
             .store
             .remember_document(&did, &grant.id, env.now() + SEEN_ID_TTL_SECS, env.now())
+            .is_err()
         {
             return Err(OobError::not_authorized());
         }
@@ -584,15 +601,17 @@ impl OobService {
         self.fresh(env, &doc)?;
 
         let ip = conn.ip.clone().unwrap_or_else(|| "unknown".into());
-        let Some(_guard) = self
+        let _guard = self
             .store
             .open_poll(&rec.request_id, &ip, self.config.max_polls_per_ip)
-        else {
-            return Err(OobError::new(
-                OobErrorCode::RateLimited,
-                "a poll is already open for this request",
-            ));
-        };
+            .map_err(|refused| {
+                let msg = match refused {
+                    PollRefused::AlreadyOpen => "a poll is already open for this request",
+                    PollRefused::AddressCap => "too many polls are open from this address",
+                    PollRefused::Full => "too many sign-in polls are open; try again shortly",
+                };
+                OobError::new(OobErrorCode::RateLimited, msg)
+            })?;
         let notify = self.store.waiter(&rec.request_id);
         let until = tokio::time::Instant::now() + self.config.redeem_hold;
         loop {
@@ -634,6 +653,16 @@ impl OobService {
         }
     }
 
+    /// `approved → consumed` in one step, then membership again (base design
+    /// 7.6 item 3, T18).
+    ///
+    /// The order is deliberate. The compare-and-set is the single atomic step
+    /// that spends the grant: of any number of concurrent redeems, exactly one
+    /// wins it. Membership is checked after, against the state as it is when
+    /// the session is about to exist; a member removed at any point before
+    /// that gets no session, and the grant stays spent (fail closed: it is
+    /// never put back for a retry). Checking first would leave a window
+    /// between the check and the spend.
     async fn consume(
         &self,
         env: &dyn OobEnv,
@@ -652,6 +681,7 @@ impl OobService {
         }
         let did = rec.identified_did.clone().unwrap_or_default();
         if !env.is_allowed(&did).await {
+            tracing::info!(audit = true, op = "auth/oob/redeem", request_id = %rec.request_id, did = %did, "sign-in refused at redeem: no longer allowed; the grant is spent");
             return Err(OobError::not_authorized());
         }
         let limit = now + self.config.session_limit_secs;
@@ -782,18 +812,24 @@ impl OobService {
     /// Refuse a replayed `(issuer, id)`.
     fn fresh(&self, env: &dyn OobEnv, doc: &TrustTask<Value>) -> Result<(), OobError> {
         let now = env.now();
-        if self.store.remember_document(
+        match self.store.remember_document(
             doc.issuer.as_deref().unwrap_or_default(),
             &doc.id,
             now + SEEN_ID_TTL_SECS,
             now,
         ) {
-            Ok(())
-        } else {
-            Err(OobError::new(
+            Ok(()) => Ok(()),
+            Err(SeenError::Replay) => Err(OobError::new(
                 OobErrorCode::NotAuthorized,
                 "document id already used",
-            ))
+            )),
+            Err(SeenError::Full) => {
+                tracing::warn!("auth/oob replay cache full; refusing new documents");
+                Err(OobError::new(
+                    OobErrorCode::RateLimited,
+                    "the service is busy; try again shortly",
+                ))
+            }
         }
     }
 
