@@ -18,6 +18,9 @@ pub async fn static_handler(uri: Uri) -> Response {
     // Try exact file first
     if let Some(file) = Assets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
+        if mime.essence_str() == "text/html" {
+            return html(file.data);
+        }
         return (
             StatusCode::OK,
             [(header::CONTENT_TYPE, mime.as_ref())],
@@ -36,12 +39,25 @@ pub async fn static_handler(uri: Uri) -> Response {
 
     // Otherwise, serve index.html for client-side routing
     match Assets::get("index.html") {
-        Some(file) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/html")],
-            file.data,
-        )
-            .into_response(),
+        Some(file) => html(file.data),
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// The console's HTML. It is a single-page app, so every page, the login page
+/// that shows the sign-in trigger link included, is this document: never
+/// cached, no referrer, never framed (VTI-LNK-082, contract C2, base design
+/// 13 item 6).
+fn html(body: std::borrow::Cow<'static, [u8]>) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/html"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::REFERRER_POLICY, "no-referrer"),
+            (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+        ],
+        body,
+    )
+        .into_response()
 }
