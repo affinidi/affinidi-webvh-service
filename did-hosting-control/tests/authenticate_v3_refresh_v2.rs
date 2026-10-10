@@ -747,3 +747,131 @@ async fn revoking_a_proxied_session_takes_its_meta_row_and_refresh_token_with_it
         "a revoked session's refresh token must not work: {body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Legacy wallet login pin (contract C7)
+// ---------------------------------------------------------------------------
+
+/// Pins the VTA-proxied SIOP wallet login exactly as the console and the
+/// wallet use it today, now that it sits behind "Using an older wallet?" and
+/// `auth/oob/*` shares `POST /api/trust-tasks` with it. The harness has a
+/// service DID and a public URL, so wallet sign-in with a trigger link is
+/// live here too and must not intercept or reshape this login.
+///
+/// Fixed: the response type, the `session` and `tokens` members, the token
+/// type and lifetimes (the configured access and refresh expiries, the
+/// absolute lifetime), the `did` amr and `aal1` acr, the bound session key,
+/// the access token's claims, and a reply signed for `authentication`.
+#[tokio::test]
+async fn legacy_siop_proxied_login_is_unchanged() {
+    let h = harness().await;
+    assert!(
+        h.state.config.server_did.is_some() && h.state.config.public_url.is_some(),
+        "wallet sign-in with a trigger link is configured in this harness"
+    );
+    let (principal, delegate, session_key) = (key(60), key(61), key(62));
+    h.add_acl(&principal.did, Role::Owner).await;
+
+    let (challenge, session_id) = challenge(&h, &principal).await;
+    let id_token = siop_id_token(&principal, CONTROL, &challenge, now_secs());
+    let d = proxied_authenticate(
+        &delegate,
+        &principal.did,
+        &challenge,
+        &session_id,
+        delegation_evidence("siopIdToken", json!({ "idToken": id_token })),
+        Some(&session_key.did),
+    )
+    .await;
+    let before = now_secs();
+    let (status, body) = post(&h, &d).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["type"], format!("{TT}auth/authenticate/0.3#response"));
+    assert_eq!(body["issuer"], CONTROL);
+    assert_eq!(body["recipient"], delegate.did);
+    assert_eq!(body["proof"]["proofPurpose"], "authentication");
+
+    let payload = body["payload"].as_object().unwrap();
+    let mut members: Vec<&str> = payload.keys().map(String::as_str).collect();
+    members.sort_unstable();
+    assert_eq!(members, ["session", "tokens"], "{body}");
+
+    let auth = &h.state.config.auth;
+    let tokens = &body["payload"]["tokens"];
+    let mut token_members: Vec<&str> = tokens
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    token_members.sort_unstable();
+    assert_eq!(
+        token_members,
+        [
+            "accessToken",
+            "expiresIn",
+            "refreshExpiresIn",
+            "refreshToken",
+            "tokenType"
+        ]
+    );
+    assert_eq!(tokens["tokenType"], "Bearer");
+    assert_eq!(tokens["expiresIn"], auth.access_token_expiry);
+    assert_eq!(tokens["refreshExpiresIn"], auth.refresh_token_expiry);
+
+    let session = &body["payload"]["session"];
+    assert_eq!(session["subject"], principal.did);
+    assert_eq!(session["actor"], delegate.did);
+    assert_eq!(session["sessionKey"], session_key.did);
+    assert_eq!(session["amr"], json!(["did"]));
+    assert_eq!(session["acr"], "aal1");
+    let absolute = chrono::DateTime::parse_from_rfc3339(
+        session["absoluteExpiresAt"]
+            .as_str()
+            .expect("absoluteExpiresAt"),
+    )
+    .unwrap()
+    .timestamp() as u64;
+    let lifetime = absolute.saturating_sub(before);
+    assert!(
+        lifetime.abs_diff(auth.absolute_session_lifetime) <= 5,
+        "absolute lifetime {lifetime}, configured {}",
+        auth.absolute_session_lifetime
+    );
+
+    let access = tokens["accessToken"].as_str().unwrap();
+    let parts: Vec<&str> = access.split('.').collect();
+    assert_eq!(parts.len(), 3, "a compact JWS");
+    let header: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+    assert_eq!(header["alg"], "EdDSA");
+    let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+    let mut claim_names: Vec<&str> = claims
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    claim_names.sort_unstable();
+    assert_eq!(
+        claim_names,
+        [
+            "acr",
+            "amr",
+            "aud",
+            "exp",
+            "iat",
+            "jti",
+            "role",
+            "session_id",
+            "sub"
+        ]
+    );
+    assert_eq!(claims["aud"], "WebVH");
+    assert_eq!(claims["sub"], principal.did);
+    assert_eq!(claims["role"], "owner");
+    assert_eq!(claims["amr"], json!(["did"]));
+    assert_eq!(
+        claims["exp"].as_u64().unwrap() - claims["iat"].as_u64().unwrap(),
+        auth.access_token_expiry
+    );
+}
