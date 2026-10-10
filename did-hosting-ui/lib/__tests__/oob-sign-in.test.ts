@@ -9,6 +9,7 @@ import {
   buildTriggerLink,
   createSignIn,
   encodeFromParam,
+  isUnavailable,
   renderQrSvg,
   shortCode,
   TRIGGER_LINK_MAX_BYTES,
@@ -196,5 +197,20 @@ describe("sign-in controller", () => {
     await s.cancel();
     expect(s.state.status).toBe("cancelled");
     expect(svc.sent.some((d) => String(d.type).endsWith("/cancel/0.1"))).toBe(true);
+  });
+
+  it("reports a server without the sign-in as unavailable, so the page falls back", async () => {
+    // A control plane with no service DID or public URL answers a plain 503.
+    const f = (async () => new Response("wallet sign-in is not configured on this server", { status: 503 })) as unknown as typeof fetch;
+    const s = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: f, keys: keys(), document: new FakeDocument() as unknown as Document, pageHost: "dids.example.org" });
+    await s.start();
+    const st = await until(() => s.state, "error");
+    expect(isUnavailable(st)).toBe(true);
+  });
+
+  it("does not treat an ordinary refusal as unavailable", () => {
+    expect(isUnavailable({ status: "error", code: "auth/oob:rateLimited", message: "x" })).toBe(false);
+    expect(isUnavailable({ status: "error", code: "timeout", message: "x" })).toBe(false);
+    expect(isUnavailable({ status: "expired" })).toBe(false);
   });
 });

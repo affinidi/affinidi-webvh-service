@@ -179,7 +179,9 @@ const sessionKeys: StarterKeys = {
 };
 
 export interface SignInOptions {
-  /** The service's trust-task endpoint, e.g. `/api/trust-tasks`. */
+  /** The URL the documents are POSTed to, e.g. `/api/trust-tasks`: the
+   *  service's `TrustTaskHTTPS` base (`/api`) with `/trust-tasks` appended
+   *  (HTTPS binding 0.2 section 6). */
   endpoint: string;
   /** The service DID: `recipient` of every document and `_from`. */
   serviceDid: string;
@@ -506,6 +508,18 @@ export class SignInController {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Whether a failed start means this server does not offer the sign-in at
+ * all: not configured (503, no service DID or public URL), or a control plane
+ * that predates it (no such route or task).
+ */
+export function isUnavailable(state: SignInState): boolean {
+  return (
+    state.status === "error" &&
+    (state.code === "http503" || state.code === "http404" || state.code === "http405")
+  );
 }
 
 /** The link host this console uses: `EXPO_PUBLIC_TRIGGER_LINK_HOST`, else the default. */

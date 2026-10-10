@@ -18,6 +18,7 @@ import { getApiBase } from "../lib/api-base";
 import {
   configuredLinkHost,
   createSignIn,
+  isUnavailable,
   renderQrSvg,
   type QrEncoder,
   type SignInController,
@@ -50,10 +51,14 @@ function tokensOf(payload: Record<string, unknown>): Tokens | null {
 export function WalletSignIn({
   serviceDid,
   onSignedIn,
+  onUnavailable,
 }: {
   serviceDid: string | null;
   /** Called with the access token after "Continue". */
   onSignedIn: (accessToken: string) => void;
+  /** Called when this server does not offer the sign-in ({@link isUnavailable}),
+   *  so the page can fall back to its other login methods. */
+  onUnavailable?: () => void;
 }) {
   const [state, setState] = useState<SignInState>({ status: "idle" });
   const controller = useRef<SignInController | null>(null);
@@ -73,6 +78,10 @@ export function WalletSignIn({
     controller.current = c;
     return () => c.destroy();
   }, [serviceDid]);
+
+  useEffect(() => {
+    if (isUnavailable(state)) onUnavailable?.();
+  }, [state, onUnavailable]);
 
   if (Platform.OS !== "web") return null;
   const c = controller.current;

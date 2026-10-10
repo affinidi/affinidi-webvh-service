@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   View,
   Text,
@@ -41,6 +41,14 @@ export default function Login() {
   // Contract C7: the SIOPv2 / extension logins are kept, deprecated, behind
   // "Using an older wallet?". Wallet sign-in with a trigger link is first.
   const [showLegacy, setShowLegacy] = useState(false);
+  // A control plane without the sign-in configured (no service DID or public
+  // URL) answers 503: drop the new flow and show the older options open, so
+  // the page offers exactly what it did before.
+  const [oobUnavailable, setOobUnavailable] = useState(false);
+  const onOobUnavailable = useCallback(() => {
+    setOobUnavailable(true);
+    setShowLegacy(true);
+  }, []);
 
   // M2B.4 — VTA-proxied login.
   // The user picks a did-self-issued vault entry pinned to this RP's
@@ -262,14 +270,23 @@ export default function Login() {
         <AffinidiLogo size={36} />
         <Text style={styles.title}>Login</Text>
 
-        <Text style={styles.sectionTitle}>Sign in with your wallet</Text>
-        <WalletSignIn
-          serviceDid={serverDid}
-          onSignedIn={(accessToken) => {
-            login(accessToken);
-            router.replace("/");
-          }}
-        />
+        {oobUnavailable ? (
+          <Text style={styles.hint}>
+            Wallet sign-in with a code is not set up on this server.
+          </Text>
+        ) : (
+          <>
+            <Text style={styles.sectionTitle}>Sign in with your wallet</Text>
+            <WalletSignIn
+              serviceDid={serverDid}
+              onSignedIn={(accessToken) => {
+                login(accessToken);
+                router.replace("/");
+              }}
+              onUnavailable={onOobUnavailable}
+            />
+          </>
+        )}
 
         <View style={styles.divider}>
           <View style={styles.dividerLine} />
