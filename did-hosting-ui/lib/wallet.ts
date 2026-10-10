@@ -147,7 +147,11 @@ declare global {
 
 /** True iff this is a web build AND the wallet extension has injected its
  *  provider into the page. False on iOS/Android or when the extension is
- *  missing — callers should hide the wallet button + show an install hint. */
+ *  missing — callers should hide the wallet button + show an install hint. *
+ * @deprecated Contract C7: SIOPv2 / extension login is legacy. Use wallet
+ * sign-in with a trigger link (`oob-sign-in.ts`); kept, behind "Using an
+ * older wallet?", until a removal date is set.
+ */
 export function isWalletAvailable(): boolean {
   return (
     Platform.OS === "web" &&
@@ -180,7 +184,11 @@ export { getApiBase };
  *  session. Resolves to the result containing the server-issued access token
  *  (suitable for `AuthProvider.login`). Rejects if the wallet isn't
  *  available, the user denies the consent prompt, the control plane refuses
- *  the login, or the key was not bound. */
+ *  the login, or the key was not bound. *
+ * @deprecated Contract C7: SIOPv2 / extension login is legacy. Use wallet
+ * sign-in with a trigger link (`oob-sign-in.ts`); kept, behind "Using an
+ * older wallet?", until a removal date is set.
+ */
 export async function loginWithWallet(): Promise<VtaWalletLoginResult> {
   if (!isWalletAvailable()) {
     throw new Error(
@@ -201,7 +209,11 @@ export async function loginWithWallet(): Promise<VtaWalletLoginResult> {
  *  Presence detection, not version negotiation — the extension may simply not
  *  be installed. There is deliberately no separate probe per method: every
  *  build that has one has all three, so a second probe would only describe a
- *  wallet that does not exist. */
+ *  wallet that does not exist. *
+ * @deprecated Contract C7: SIOPv2 / extension login is legacy. Use wallet
+ * sign-in with a trigger link (`oob-sign-in.ts`); kept, behind "Using an
+ * older wallet?", until a removal date is set.
+ */
 export function isWalletProxyAvailable(): boolean {
   return (
     isWalletAvailable() &&
@@ -225,6 +237,10 @@ export function isWalletProxyAvailable(): boolean {
  *
  * The persona DID must be known before `/auth/challenge`, which is bound to it
  * — so this cannot be folded into `proxyLogin` as one call.
+ *
+ * @deprecated Contract C7: SIOPv2 / extension login is legacy. Use wallet
+ * sign-in with a trigger link (`oob-sign-in.ts`); kept, behind "Using an
+ * older wallet?", until a removal date is set.
  */
 export async function resolveProxyEntry(): Promise<{
   entry: ProxyVaultEntry;
@@ -368,7 +384,11 @@ export function decodeIdToken(compact: string): DecodedIdToken {
 
 /** Enumerate proxy-login candidates for this RP via the wallet's
  *  page-world `vaultList`. Filters to `did-self-issued` entries pinned
- *  to the RP's DID. Used by the login UI to populate the entry picker. */
+ *  to the RP's DID. Used by the login UI to populate the entry picker. *
+ * @deprecated Contract C7: SIOPv2 / extension login is legacy. Use wallet
+ * sign-in with a trigger link (`oob-sign-in.ts`); kept, behind "Using an
+ * older wallet?", until a removal date is set.
+ */
 export async function listProxyCandidates(): Promise<ProxyVaultEntry[]> {
   if (!isWalletProxyAvailable()) {
     throw new Error(
@@ -386,7 +406,11 @@ export async function listProxyCandidates(): Promise<ProxyVaultEntry[]> {
 /** Run the full VTA-proxied login flow against a chosen entry. Returns
  *  both the auth result (suitable for `AuthProvider.login`) and a
  *  visualization payload describing what happened, for the demo's
- *  walkthrough UI. */
+ *  walkthrough UI. *
+ * @deprecated Contract C7: SIOPv2 / extension login is legacy. Use wallet
+ * sign-in with a trigger link (`oob-sign-in.ts`); kept, behind "Using an
+ * older wallet?", until a removal date is set.
+ */
 export async function loginWithWalletProxy(
   entry: ProxyVaultEntry,
 ): Promise<ProxyLoginOutcome> {

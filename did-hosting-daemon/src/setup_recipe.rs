@@ -610,9 +610,11 @@ mod force_reprovision_tests {
             record.services,
             Some(vec![
                 "WebVHHosting".to_string(),
-                "TrustTaskHTTPS".to_string()
+                "TrustTaskHTTPS".to_string(),
+                "SignInPortal".to_string()
             ]),
-            "a no-mediator self-managed daemon must advertise hosting + trust tasks"
+            "a no-mediator self-managed daemon must advertise hosting + trust tasks + its \
+             sign-in portal (contract C4)"
         );
         assert!(
             did_hosting_common::server::health::own_did_served_locally(

@@ -113,6 +113,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         ),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
         cache_invalidate: None,
+        oob: Default::default(),
     };
 
     (state, dir)

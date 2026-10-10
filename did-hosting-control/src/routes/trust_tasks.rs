@@ -84,6 +84,11 @@ pub async fn trust_tasks_endpoint(
     let ip =
         crate::rate_limit::resolve_client_ip(addr.ip(), xff, &state.config.server.trusted_proxies);
     let client_ip = Some(ip);
+    // Wallet sign-in with a trigger link (`auth/oob/*`) has its own state
+    // machine and checks; see `crate::oob`. A bearer session plays no part.
+    if let Some(resp) = crate::oob::http::maybe_handle(&state, ip, &headers, &body).await {
+        return Ok(resp);
+    }
     if is_redeem_start(&body) {
         let limited = state.redeem_rate_limiter.try_consume(
             &format!("ip:{ip}"),

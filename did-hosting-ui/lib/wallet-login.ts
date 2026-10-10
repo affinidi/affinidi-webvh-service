@@ -28,6 +28,9 @@
  *
  * Kept free of `react-native` so the test runner can reach it; `wallet.ts`
  * re-exports the entry point.
+ *
+ * @deprecated Contract C7: the legacy SIOPv2 / `auth/authenticate` wallet
+ * login. The default is wallet sign-in with a trigger link (`oob-sign-in.ts`).
  */
 
 import { clearSessionKeypair, generateSessionKeypair, signEnvelope } from "./session-key";

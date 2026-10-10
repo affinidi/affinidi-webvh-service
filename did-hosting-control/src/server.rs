@@ -165,6 +165,9 @@ pub struct AppState {
     /// cache entry for up to its TTL — there is no sync round-trip within a
     /// single process to invalidate it the way a standalone edge does.
     pub cache_invalidate: Option<Arc<CacheInvalidateFn>>,
+    /// Wallet sign-in with a trigger link (`auth/oob/*`): the open requests
+    /// and their limiters. See [`crate::oob`].
+    pub oob: Arc<crate::oob::OobRuntime>,
 }
 
 impl AppState {
@@ -390,6 +393,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         // Standalone control plane: no content cache of its own to
         // invalidate. See the field doc.
         cache_invalidate: None,
+        oob: Arc::default(),
     };
 
     // Reload challenges issued before a restart, so the caps hold across it.
