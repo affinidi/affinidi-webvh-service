@@ -147,6 +147,32 @@ pub fn add_trust_task_https_service(doc: &mut serde_json::Value, base_uri: &str)
     }
 }
 
+/// Advertise a `SignInPortal` service at `endpoint` on a document built by
+/// [`build_did_document`]: the page where this service's people sign in with
+/// a wallet (contract C4, VTI-LNK-102).
+///
+/// A wallet reading a sign-in trigger link compares the origin of
+/// `serviceEndpoint` with the page the link was activated from, and refuses
+/// a mismatch (`wrong-origin`, VTI-LNK-105). So `endpoint` must be the
+/// console's login page on the origin that serves it; for a hosting daemon
+/// that is `{origin}/login`. The `auth/oob/*` tasks themselves travel over
+/// the `TrustTaskHTTPS` service ([`add_trust_task_https_service`]).
+///
+/// Callers should gate this on [`is_https_or_loopback`], like the
+/// `TrustTaskHTTPS` entry.
+pub fn add_sign_in_portal_service(doc: &mut serde_json::Value, endpoint: &str) {
+    let did_id = doc["id"].as_str().unwrap_or_default().to_string();
+    let entry = json!({
+        "id": format!("{did_id}#sign-in-portal"),
+        "type": SERVICE_TYPE_SIGN_IN_PORTAL,
+        "serviceEndpoint": endpoint,
+    });
+    match doc.get_mut("service").and_then(|s| s.as_array_mut()) {
+        Some(services) => services.push(entry),
+        None => doc["service"] = json!([entry]),
+    }
+}
+
 /// Whether `uri` is safe to advertise as a `TrustTaskHTTPS` endpoint.
 ///
 /// `https://` always qualifies. Plain `http://` qualifies only for loopback
@@ -300,6 +326,9 @@ pub const SERVICE_TYPE_DIDCOMM: &str = "DIDCommMessaging";
 /// Trust-Task HTTPS binding endpoint (`#trust-tasks`), HTTPS binding 0.2 §6.
 /// Kept in sync with `vta-sdk`'s `TRUST_TASK_HTTPS_SERVICE_TYPE`.
 pub const SERVICE_TYPE_TRUST_TASK_HTTPS: &str = "TrustTaskHTTPS";
+/// The page where people sign in with a wallet (`#sign-in-portal`), contract
+/// C4 / VTI-LNK-102.
+pub const SERVICE_TYPE_SIGN_IN_PORTAL: &str = "SignInPortal";
 
 /// True for the services the did:webvh spec *implies* rather than the
 /// operator declaring.
@@ -517,6 +546,24 @@ mod tests {
         assert_eq!(
             services[1]["id"],
             json!(format!("{}#trust-tasks", doc["id"].as_str().unwrap()))
+        );
+    }
+
+    /// Contract C4: `{ id: <did>#sign-in-portal, type: SignInPortal,
+    /// serviceEndpoint: <login page URL> }`, a bare string endpoint.
+    #[test]
+    fn sign_in_portal_is_advertised_with_the_login_page_as_endpoint() {
+        let mut doc =
+            build_did_document("example.com", ".well-known", "z6MkKey", &Default::default());
+        add_trust_task_https_service(&mut doc, "https://example.com/api");
+        add_sign_in_portal_service(&mut doc, "https://example.com/login");
+
+        let services = doc["service"].as_array().expect("service array");
+        assert_eq!(services[1]["type"], SERVICE_TYPE_SIGN_IN_PORTAL);
+        assert_eq!(services[1]["serviceEndpoint"], "https://example.com/login");
+        assert_eq!(
+            services[1]["id"],
+            json!(format!("{}#sign-in-portal", doc["id"].as_str().unwrap()))
         );
     }
 
