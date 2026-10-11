@@ -84,6 +84,50 @@ export interface BuildTriggerLinkParams {
   nowSecs?: number;
 }
 
+/** What a DID method offers a reader, for the contact rule of VTI-LNK-102. */
+export interface ContactMethodCapabilities {
+  /** The identifier names the host that serves the DID document. */
+  namesHost: boolean;
+  /** The DID document can list services (the `SignInPortal` service). */
+  listsServices: boolean;
+  /** Readers verify the document under VTI-LNK-052. */
+  verified: boolean;
+}
+
+/**
+ * DID methods by capability (VTI-LNK-102 / 112), mirroring the wallet
+ * reader's table. An allow-list by capability: a method absent here is
+ * refused, and a new method with all three properties qualifies by adding
+ * its row.
+ */
+export const CONTACT_METHOD_CAPABILITIES: Readonly<Record<string, ContactMethodCapabilities>> = {
+  "did:webvh": { namesHost: true, listsServices: true, verified: true },
+  "did:web": { namesHost: true, listsServices: true, verified: true },
+  // Self-certifying, and named after no host: no domain to show, and nothing
+  // ties a portal origin in the document to anyone the person recognises.
+  "did:key": { namesHost: false, listsServices: false, verified: true },
+  "did:peer": { namesHost: false, listsServices: true, verified: true },
+};
+
+function didMethodOf(did: string): string {
+  const parts = did.split(":");
+  return parts.length >= 2 ? `${parts[0]}:${parts[1]}` : did;
+}
+
+/**
+ * The contact rule of VTI-LNK-102 / 112: a DID of a method whose identifier
+ * names the host serving its document, whose document can list services, and
+ * whose document readers verify. In practice `did:webvh` and `did:web`.
+ */
+export function isHostNamedServiceContact(did: string): boolean {
+  const method = didMethodOf(did);
+  // Own properties only: `did:constructor` must not find Object.prototype.
+  const caps = Object.prototype.hasOwnProperty.call(CONTACT_METHOD_CAPABILITIES, method)
+    ? CONTACT_METHOD_CAPABILITIES[method]
+    : undefined;
+  return caps !== undefined && caps.namesHost && caps.listsServices && caps.verified;
+}
+
 /** Build `https://<host>/t#_from=…&_id=…&_exp=…&_type=…`, enforcing the producer rules. */
 export function buildTriggerLink(p: BuildTriggerLinkParams): string {
   const linkHost = p.linkHost ?? DEFAULT_LINK_HOST;
@@ -94,8 +138,15 @@ export function buildTriggerLink(p: BuildTriggerLinkParams): string {
   if (p.pageHost && approximateRegistrableDomain(linkHost) === approximateRegistrableDomain(p.pageHost)) {
     throw new TriggerLinkError("same-domain-host", `link host ${linkHost} is on the page's own domain`);
   }
-  if (!/^did:[a-z0-9]+:\S+$/.test(p.from) || p.from.startsWith("did:key:") || p.from.includes("/@")) {
-    throw new TriggerLinkError("bad-from", "_from must be a DID that can list a SignInPortal service");
+  if (!/^did:[a-z0-9]+:\S+$/.test(p.from) || p.from.includes("/@")) {
+    throw new TriggerLinkError("bad-from", "_from must be a DID");
+  }
+  if (!isHostNamedServiceContact(p.from)) {
+    throw new TriggerLinkError(
+      "bad-from",
+      `${didMethodOf(p.from)} is not an allowed contact (VTI-LNK-102): the contact must be a DID whose method ` +
+        "names the host serving its document, can list services, and is verified (did:webvh, did:web)",
+    );
   }
   if (!/^[A-Za-z0-9_-]{22,43}$/.test(p.requestId)) {
     throw new TriggerLinkError("bad-id", "_id must be 16 to 32 bytes of unpadded base64url");

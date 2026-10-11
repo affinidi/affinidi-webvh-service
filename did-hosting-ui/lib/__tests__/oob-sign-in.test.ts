@@ -9,6 +9,7 @@ import {
   buildTriggerLink,
   createSignIn,
   encodeFromParam,
+  isHostNamedServiceContact,
   isUnavailable,
   renderQrSvg,
   shortCode,
@@ -43,6 +44,23 @@ describe("trigger link", () => {
     expect(() =>
       buildTriggerLink({ from: DID, requestId: RID, exp: 1, linkHost: "link.example.org", pageHost: "dids.example.org" }),
     ).toThrow(/same-domain-host/);
+  });
+
+  it("accepts only host-named service contacts (VTI-LNK-102)", () => {
+    for (const from of [DID, "did:web:dids.example.org"]) {
+      expect(isHostNamedServiceContact(from)).toBe(true);
+      expect(buildTriggerLink({ from, requestId: RID, exp: 1 })).toContain(`_from=${from}&`);
+    }
+    for (const from of [
+      "did:peer:0z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK", // numalgo 0
+      "did:peer:2.Vz6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK.SeyJ0IjoiZG0ifQ", // numalgo 2
+      "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+      "did:ion:EiClkZMDxPKqC9c",
+      "did:constructor:x",
+    ]) {
+      expect(isHostNamedServiceContact(from)).toBe(false);
+      expect(() => buildTriggerLink({ from, requestId: RID, exp: 1 })).toThrow(/bad-from.*VTI-LNK-102/);
+    }
   });
 
   it("refuses did:key, bad handles, far expiries and over-long links", () => {
