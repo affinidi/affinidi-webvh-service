@@ -352,6 +352,8 @@ async fn sign_in_end_to_end() {
     let (status, ok) = w.respond_with(grant).await;
     assert_eq!(status, 200, "{ok}");
     assert_eq!(ok["payload"], json!({"status": "approved"}));
+    // The wallet refuses any reply not signed for `assertionMethod` (C5).
+    assert_signed(&ok, "assertionMethod").await;
     assert!(
         ok["payload"].get("tokens").is_none(),
         "no session material to the approver"
@@ -966,7 +968,9 @@ async fn cancel_by_the_lock_holder_and_not_by_others() {
             "authentication",
         )
         .await;
-    assert_eq!(w.send(d).await.0, 200);
+    let (status, body) = w.send(d).await;
+    assert_eq!(status, 200);
+    assert_signed(&body, "assertionMethod").await;
     assert_eq!(w.state(&rid), OobState::Cancelled);
 }
 
