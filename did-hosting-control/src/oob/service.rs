@@ -233,14 +233,16 @@ impl OobService {
         session: &ApprovedSession,
         ext: Option<Value>,
     ) -> Result<Value, OobError> {
-        let body = RedeemResponse {
-            subject: session.subject.clone(),
-            display_name: display_name_or_did(session.display_name.as_deref(), &session.subject),
-            not_after: session.not_after,
-            amr: OOB_AMR.iter().map(|s| s.to_string()).collect(),
-            ext,
-        };
-        let payload = serde_json::to_value(body).expect("redeem response serialises");
+        let mut body = json!({
+            "subject": session.subject,
+            "displayName": display_name_or_did(session.display_name.as_deref(), &session.subject),
+            "notAfter": session.not_after,
+            "amr": OOB_AMR,
+        });
+        if let Some(ext) = ext {
+            body["ext"] = ext;
+        }
+        let payload = response::<RedeemResponse>(body)?;
         let issuer = request.issuer.clone().unwrap_or_default();
         self.signed(env, request, &issuer, payload, OPERATIONAL)
             .await
@@ -254,21 +256,25 @@ impl OobService {
         raw: &Value,
         conn: &Connection,
     ) -> Result<Value, OobError> {
-        let (doc, payload) = self
-            .key_doc::<RequestPayload>(env, raw, TYPE_REQUEST)
-            .await?;
-        if payload.purpose != "login" {
+        let (doc, payload) = self.key_doc::<Value>(env, raw, TYPE_REQUEST).await?;
+        // `purpose` and `mode` are closed enums in the generated type, so an
+        // unserved value would only read as malformed there. Each has its own
+        // code (C9), decided first, from the member as sent.
+        let member = |name: &str| payload.get(name).and_then(Value::as_str);
+        if member("purpose").is_some_and(|p| p != "login") {
             return Err(OobError::new(
                 OobErrorCode::PurposeUnsupported,
                 "purpose must be login",
             ));
         }
-        if payload.mode != "scan" {
+        if member("mode").is_some_and(|m| m != "scan") {
             return Err(OobError::new(
                 OobErrorCode::ModeUnsupported,
                 "mode must be scan",
             ));
         }
+        let _: RequestPayload = serde_json::from_value(payload)
+            .map_err(|e| OobError::malformed(format!("payload: {e}")))?;
         self.fresh(env, &doc)?;
         let now = env.now();
         let request_id = new_request_id();
@@ -300,30 +306,18 @@ impl OobService {
             CreateError::Duplicate => OobError::malformed("request id collision"),
         })?;
         tracing::info!(audit = true, op = "auth/oob/request", request_id = %request_id, "sign-in request opened");
-        let body = RequestResponse {
-            request_id,
-            claim_deadline,
-        };
+        let body = response::<RequestResponse>(json!({
+            "requestId": request_id,
+            "claimDeadline": claim_deadline,
+        }))?;
         let recipient = doc.issuer.clone().unwrap_or_default();
-        self.signed(
-            env,
-            &doc,
-            &recipient,
-            serde_json::to_value(body).expect("serialises"),
-            OPERATIONAL,
-        )
-        .await
+        self.signed(env, &doc, &recipient, body, OPERATIONAL).await
     }
 
     // ---- claim (7.3) --------------------------------------------------------
 
     async fn claim(&self, env: &dyn OobEnv, raw: &Value) -> Result<Value, OobError> {
-        let (doc, payload) = self
-            .key_doc::<RequestIdPayload>(env, raw, TYPE_CLAIM)
-            .await?;
-        if !is_request_id(&payload.request_id) {
-            return Err(OobError::malformed("payload.requestId is malformed"));
-        }
+        let (doc, payload) = self.key_doc::<ClaimPayload>(env, raw, TYPE_CLAIM).await?;
         // VTI-LNK-054, C5: the handle travels as `parentThreadId` too.
         if doc.parent_thread_id.as_deref() != Some(payload.request_id.as_str()) {
             return Err(OobError::malformed(
@@ -360,15 +354,9 @@ impl OobService {
             ));
         }
         tracing::info!(audit = true, op = "auth/oob/claim", request_id = %rec.request_id, "sign-in request claimed");
-        let step1 = self.step1(&next);
-        self.signed(
-            env,
-            &doc,
-            &approver_key,
-            serde_json::to_value(step1).expect("serialises"),
-            ATTESTATION,
-        )
-        .await
+        let step1 = response::<Step1Response>(self.step1(&next))?;
+        self.signed(env, &doc, &approver_key, step1, ATTESTATION)
+            .await
     }
 
     // ---- prove (7.4) --------------------------------------------------------
@@ -379,8 +367,8 @@ impl OobService {
         raw: &Value,
         conn: &Connection,
     ) -> Result<Value, OobError> {
-        let (doc, payload) = self.key_doc::<Value>(env, raw, TYPE_PROVE).await?;
-        let identify_raw = carried(&payload, "identify")?;
+        let (doc, payload) = self.key_doc::<ProvePayload>(env, raw, TYPE_PROVE).await?;
+        let identify_raw = Value::Object(payload.identify);
         let request_id = carried_request_id(&identify_raw)?;
         same_thread(&doc, &request_id)?;
         // 1. The outer issuer holds the lock; the request is claimed and in
@@ -396,7 +384,7 @@ impl OobService {
             Err(err) => return Err(self.decline(env, &rec, err, "auth/oob/prove")),
         };
         // 5. The number.
-        if Some(&identify_payload.entered_number) != rec.match_number.as_ref() {
+        if rec.match_number.as_deref() != Some(identify_payload.entered_number.as_str()) {
             return Err(self.decline(
                 env,
                 &rec,
@@ -410,27 +398,18 @@ impl OobService {
             (Some(a), Some(b)) => Value::Bool(a == b),
             _ => Value::String("unknown".into()),
         };
-        let step2 = Step2Response {
-            step1: self.step1(&rec),
-            session_key: rec.start_key.clone(),
-            requester: Requester {
-                location: rec.location.clone(),
-                browser: rec.browser.clone(),
-                os: rec.os.clone(),
-                created_at: rfc3339(rec.created_at),
-                same_network,
-            },
-            identified_as: identify_did.clone(),
-        };
-        let signed = self
-            .signed(
-                env,
-                &doc,
-                &issuer,
-                serde_json::to_value(step2).expect("serialises"),
-                ATTESTATION,
-            )
-            .await?;
+        let mut step2 = self.step1(&rec);
+        step2["sessionKey"] = json!(rec.start_key);
+        step2["requester"] = json!({
+            "location": rec.location,
+            "browser": rec.browser,
+            "os": rec.os,
+            "createdAt": rfc3339(rec.created_at),
+            "sameNetwork": same_network,
+        });
+        step2["identifiedAs"] = json!(identify_did);
+        let step2 = response::<Step2Response>(step2)?;
+        let signed = self.signed(env, &doc, &issuer, step2, ATTESTATION).await?;
         let now = env.now();
         let mut next = rec.next(OobState::Identified, now);
         next.identified_did = Some(identify_did.clone());
@@ -474,7 +453,7 @@ impl OobService {
         }
         let payload: IdentifyPayload = serde_json::from_value(identify.payload.clone())
             .map_err(|_| OobError::not_authorized())?;
-        if payload.request_id != rec.request_id {
+        if payload.request_id.as_str() != rec.request_id {
             return Err(OobError::not_authorized());
         }
         if self
@@ -490,8 +469,10 @@ impl OobService {
     // ---- respond (7.5) ------------------------------------------------------
 
     async fn respond(&self, env: &dyn OobEnv, raw: &Value) -> Result<Value, OobError> {
-        let (doc, payload) = self.key_doc::<Value>(env, raw, TYPE_RESPOND).await?;
-        let grant_raw = carried(&payload, "grant")?;
+        let (doc, payload) = self
+            .key_doc::<RespondPayload>(env, raw, TYPE_RESPOND)
+            .await?;
+        let grant_raw = Value::Object(payload.grant);
         let request_id = carried_request_id(&grant_raw)?;
         same_thread(&doc, &request_id)?;
         let issuer = doc.issuer.clone().unwrap_or_default();
@@ -499,12 +480,12 @@ impl OobService {
         let rec = self.lock_holder_record(env, &request_id, &issuer, OobState::Identified)?;
         self.fresh(env, &doc)?;
 
-        let (decision, not_after) = match self.grant_checks(env, &rec, &grant_raw).await {
+        let (approve, not_after) = match self.grant_checks(env, &rec, &grant_raw).await {
             Ok(v) => v,
             Err(err) => return Err(self.decline(env, &rec, err, "auth/oob/respond")),
         };
         // 6.
-        let approve = decision == "approve";
+        let decision = if approve { "approve" } else { "decline" };
         let now = env.now();
         let mut next = rec.next(
             if approve {
@@ -527,8 +508,8 @@ impl OobService {
         }
         tracing::info!(audit = true, op = "auth/oob/respond", request_id = %rec.request_id, decision = %decision, "sign-in request decided");
         let status = if approve { "approved" } else { "declined" };
-        self.signed(env, &doc, &issuer, json!({ "status": status }), OPERATIONAL)
-            .await
+        let body = response::<RespondResponse>(json!({ "status": status }))?;
+        self.signed(env, &doc, &issuer, body, OPERATIONAL).await
     }
 
     /// Steps 2 to 5 of 7.5. Any `Err` declines the request.
@@ -537,7 +518,7 @@ impl OobService {
         env: &dyn OobEnv,
         rec: &OobRecord,
         grant_raw: &Value,
-    ) -> Result<(String, u64), OobError> {
+    ) -> Result<(bool, u64), OobError> {
         let grant: TrustTask<Value> =
             serde_json::from_value(grant_raw.clone()).map_err(|_| OobError::not_authorized())?;
         // 2. Issued by the DID that proved, against `assertionMethod`.
@@ -559,18 +540,16 @@ impl OobService {
         {
             return Err(OobError::not_authorized());
         }
-        let p: GrantPayload = serde_json::from_value(grant.payload.clone())
-            .map_err(|_| OobError::not_authorized())?;
-        if p.decision != "approve" && p.decision != "decline" {
-            return Err(OobError::not_authorized());
-        }
+        let (p, origin) =
+            read::<GrantPayload>(&grant.payload).map_err(|_| OobError::not_authorized())?;
+        let approve = p.decision == GrantDecision::Approve;
         let not_after = p.not_after;
         // 3. and 4. The bindings.
         let mismatch = || OobError::new(OobErrorCode::ContextMismatch, "context mismatch");
-        if p.request_id != rec.request_id
-            || Some(&p.approver_key) != rec.approver_key.as_ref()
-            || p.session_key != rec.start_key
-            || p.origin != rec.origin
+        if p.request_id.as_str() != rec.request_id
+            || rec.approver_key.as_deref() != Some(p.approver_key.as_str())
+            || p.session_key.as_str() != rec.start_key
+            || origin.as_deref() != Some(rec.origin.as_str())
         {
             return Err(mismatch());
         }
@@ -578,14 +557,14 @@ impl OobService {
         if !context_digests_equal(&p.context_digest, stored) {
             return Err(mismatch());
         }
-        if p.decision == "approve" && not_after <= env.now() {
+        if approve && not_after <= env.now() {
             return Err(OobError::not_authorized());
         }
         // 5. Still allowed.
         if !env.is_allowed(&did).await {
             return Err(OobError::not_authorized());
         }
-        Ok((p.decision, not_after))
+        Ok((approve, not_after))
     }
 
     // ---- redeem (7.6) -------------------------------------------------------
@@ -596,9 +575,7 @@ impl OobService {
         raw: &Value,
         conn: &Connection,
     ) -> Result<(TrustTask<Value>, ApprovedSession), OobError> {
-        let (doc, payload) = self
-            .key_doc::<RequestIdPayload>(env, raw, TYPE_REDEEM)
-            .await?;
+        let (doc, payload) = self.key_doc::<RedeemPayload>(env, raw, TYPE_REDEEM).await?;
         let rec = self.current(env, &payload.request_id)?;
         if doc.issuer.as_deref() != Some(rec.start_key.as_str()) {
             return Err(OobError::new(OobErrorCode::NotStarter, "not the starter"));
@@ -707,16 +684,14 @@ impl OobService {
     // ---- cancel -------------------------------------------------------------
 
     async fn cancel(&self, env: &dyn OobEnv, raw: &Value) -> Result<Value, OobError> {
-        let (doc, payload) = self
-            .key_doc::<RequestIdPayload>(env, raw, TYPE_CANCEL)
-            .await?;
+        let (doc, payload) = self.key_doc::<CancelPayload>(env, raw, TYPE_CANCEL).await?;
         let rec = self.current(env, &payload.request_id)?;
         let issuer = doc.issuer.clone().unwrap_or_default();
         if issuer != rec.start_key && Some(&issuer) != rec.approver_key.as_ref() {
             return Err(OobError::not_authorized());
         }
         self.fresh(env, &doc)?;
-        let body = json!({ "status": "cancelled" });
+        let body = response::<CancelResponse>(json!({ "status": "cancelled" }))?;
         if rec.state == OobState::Cancelled {
             return self.signed(env, &doc, &issuer, body, OPERATIONAL).await;
         }
@@ -901,17 +876,19 @@ impl OobService {
         err
     }
 
-    fn step1(&self, rec: &OobRecord) -> Step1Response {
-        Step1Response {
-            request_id: rec.request_id.clone(),
-            service: ServiceRef {
-                did: self.config.service_did.clone(),
-                name: self.config.service_name.clone(),
+    /// The step 1 members (also the start of step 2), before they are read
+    /// into either generated response.
+    fn step1(&self, rec: &OobRecord) -> Value {
+        json!({
+            "requestId": rec.request_id,
+            "service": {
+                "did": self.config.service_did,
+                "name": self.config.service_name,
             },
-            origin: rec.origin.clone(),
-            purpose: rec.purpose.clone(),
-            decision_deadline: rec.decision_deadline.unwrap_or_default(),
-        }
+            "origin": rec.origin,
+            "purpose": rec.purpose,
+            "decisionDeadline": rec.decision_deadline.unwrap_or_default(),
+        })
     }
 
     /// A response document to `request`, signed for `purpose`.
@@ -981,19 +958,17 @@ pub struct Connection {
     pub os: Option<String>,
 }
 
-fn carried(payload: &Value, member: &str) -> Result<Value, OobError> {
-    let obj = payload
-        .as_object()
-        .ok_or_else(|| OobError::malformed("payload must be an object"))?;
-    if obj.keys().any(|k| k != member && k != "ext") {
-        return Err(OobError::malformed(format!(
-            "payload must be exactly {{{member}}}"
-        )));
-    }
-    obj.get(member)
-        .filter(|v| v.is_object())
-        .cloned()
-        .ok_or_else(|| OobError::malformed(format!("payload.{member} missing")))
+/// A response payload, built with its generated type ([`super::types::write`]).
+/// A value the type refuses is this service's own fault, never the caller's;
+/// it is logged and nothing is sent.
+fn response<T: DeserializeOwned + serde::Serialize>(value: Value) -> Result<Value, OobError> {
+    write::<T>(value).map_err(|e| {
+        tracing::error!(error = %e, "auth/oob: a response does not fit its schema");
+        OobError::new(
+            OobErrorCode::MalformedRequest,
+            "the service could not build its response",
+        )
+    })
 }
 
 /// `prove` and `respond` SHOULD carry `parentThreadId` (C9); when they do,

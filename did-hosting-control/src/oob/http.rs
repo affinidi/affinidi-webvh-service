@@ -51,7 +51,7 @@ use trust_tasks_proof::affinidi::{CryptoSuite, SignOptions, sign_trust_task};
 use super::service::{
     ApprovedSession, Connection, OOB_AMR, OobConfig, OobEnv, OobReply, OobService,
 };
-use super::types::{OobErrorCode, TYPE_REDEEM, TYPE_REQUEST, is_oob_type};
+use super::types::{OobErrorCode, TYPE_REDEEM, TYPE_REQUEST};
 use crate::server::AppState;
 
 /// The `ext` namespace of the redeem response that carries this service's
@@ -235,7 +235,7 @@ pub async fn maybe_handle(
 ) -> Option<Response> {
     let raw: Value = serde_json::from_slice(body).ok()?;
     let type_uri = raw.get("type")?.as_str()?.to_string();
-    if !is_oob_type(&type_uri) {
+    if !type_uri.starts_with("https://trusttasks.org/spec/auth/oob/") {
         return None;
     }
     Some(handle(state, ip, headers, body.len(), raw, &type_uri).await)

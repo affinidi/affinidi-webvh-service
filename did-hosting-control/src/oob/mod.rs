@@ -9,7 +9,7 @@
 //! starter key `K_b`, redeems the request by long poll and gets an ordinary
 //! console session bound to `K_b` as its session key.
 //!
-//! - [`types`]: local wire types until the generated bindings exist.
+//! - [`types`]: the generated `trust_tasks_rs::specs::auth::oob` wire types.
 //! - [`store`]: the request store, compare-and-set, and the two clocks.
 //! - [`service`]: the state machine and its checks, transport-neutral.
 //! - [`http`]: the `POST /api/trust-tasks` binding and the session.

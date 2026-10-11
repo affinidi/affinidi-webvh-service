@@ -1660,3 +1660,77 @@ async fn prove_with_a_different_parent_thread_is_malformed() {
         "refused before the attempt counts"
     );
 }
+
+// ---- the wire, against fixtures ----------------------------------------------
+
+/// The generated `auth/oob/*` types read and write exactly what the local
+/// types they replaced did. `testdata/wire.json`'s `outbound` members were
+/// captured from those local types; `inbound` are schema-valid payloads.
+///
+/// Every inbound payload reads into its generated type and writes back
+/// byte-for-byte; every outbound payload is rebuilt through its generated
+/// response type byte-for-byte — including the plain-http portal origin the
+/// generated `Origin` cannot hold by itself (`types` module docs).
+#[test]
+fn wire_fixtures_round_trip() {
+    use super::types::{read, write};
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
+
+    let fixtures: Value = serde_json::from_str(include_str!("testdata/wire.json")).unwrap();
+
+    fn inbound<T: DeserializeOwned + Serialize>(v: &Value) {
+        let (typed, origin) = read::<T>(v).unwrap_or_else(|e| panic!("{v}: {e}"));
+        let mut back = serde_json::to_value(typed).unwrap();
+        if let Some(o) = origin {
+            back["origin"] = json!(o);
+        }
+        assert_eq!(
+            serde_json::to_string(&back).unwrap(),
+            serde_json::to_string(v).unwrap()
+        );
+    }
+    let i = &fixtures["inbound"];
+    inbound::<RequestPayload>(&i["request"]);
+    inbound::<RequestPayload>(&i["requestWithExt"]);
+    inbound::<ClaimPayload>(&i["claim"]);
+    inbound::<RedeemPayload>(&i["redeem"]);
+    inbound::<CancelPayload>(&i["cancel"]);
+    inbound::<IdentifyPayload>(&i["identify"]);
+    inbound::<GrantPayload>(&i["grant"]);
+    inbound::<GrantPayload>(&i["grantDecline"]);
+    inbound::<ProvePayload>(&i["prove"]);
+    inbound::<RespondPayload>(&i["respond"]);
+    let mut http_grant = i["grant"].clone();
+    http_grant["origin"] = json!("http://control.test");
+    inbound::<GrantPayload>(&http_grant);
+
+    fn outbound<T: DeserializeOwned + Serialize>(v: &Value) {
+        let built = write::<T>(v.clone()).unwrap_or_else(|e| panic!("{v}: {e}"));
+        assert_eq!(
+            serde_json::to_string(&built).unwrap(),
+            serde_json::to_string(v).unwrap()
+        );
+    }
+    let o = &fixtures["outbound"];
+    outbound::<RequestResponse>(&o["request"]);
+    outbound::<Step1Response>(&o["claim"]);
+    outbound::<Step2Response>(&o["prove"]);
+    outbound::<Step2Response>(&o["proveUnknownNetwork"]);
+    outbound::<RespondResponse>(&o["respondApproved"]);
+    outbound::<RespondResponse>(&o["respondDeclined"]);
+    outbound::<RedeemResponse>(&o["redeem"]);
+    outbound::<RedeemResponse>(&o["redeemNoExt"]);
+    outbound::<CancelResponse>(&o["cancel"]);
+    let mut http_step1 = o["claim"].clone();
+    http_step1["origin"] = json!("http://control.test");
+    outbound::<Step1Response>(&http_step1);
+
+    // What the schema refuses stays refused: no member it does not name, no
+    // `purpose` or `mode` it does not list, no malformed request id.
+    let mut extra = i["identify"].clone();
+    extra["ext"] = json!({});
+    assert!(read::<IdentifyPayload>(&extra).is_err());
+    assert!(read::<RequestPayload>(&json!({"purpose": "stepUp", "mode": "scan"})).is_err());
+    assert!(read::<ClaimPayload>(&json!({"requestId": "short"})).is_err());
+}

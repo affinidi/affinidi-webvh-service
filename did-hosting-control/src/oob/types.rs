@@ -1,152 +1,98 @@
-//! Local wire types for the `auth/oob/*` Trust Task family (base design
-//! section 10, plus contract C5 and C9).
+//! The `auth/oob/*` wire types: the generated bindings in
+//! `trust_tasks_rs::specs::auth::oob::*::v0_1` (dtgwg-trust-tasks-tf #738),
+//! plus the request states and error codes this service keeps.
 //!
-//! `trust-tasks-rs` 0.25 has no `auth/oob/*` bindings yet, so the shapes live
-//! here, matching the schemas on `dtgwg-trust-tasks-tf` branch `feat/auth-oob`
-//! (`trust_tasks_rs::specs::auth::oob::*::v0_1` once published) and contract
-//! C9: deadlines and `notAfter` are integer epoch seconds only.
+//! Every payload this service reads and every response it writes goes
+//! through a generated type, so a member the schema does not allow, a missing
+//! one, or a value outside its pattern is refused (or, on the way out, never
+//! written). Deadlines and `notAfter` are integer epoch seconds (C9).
+//!
+//! The wire is unchanged from the local types these replaced: the responses
+//! are serialised through `serde_json::Value`, whose maps are key-sorted, so
+//! member order never depended on a struct's field order, and every member
+//! keeps its name and encoding. `oob::tests::wire_fixtures_round_trip` pins
+//! that against fixtures captured from the old types.
+//!
+//! # `origin` and a plain-http portal
+//!
+//! The published `Origin` admits `https://` only. [`super::http::portal_origin`]
+//! also accepts an `http://` public URL, which is what a console run locally
+//! for development has. No conforming wallet will approve such a request (the
+//! VTA vault refuses a grant for a non-https origin), but the exchange must
+//! still round-trip in process. So `origin` is the one member that passes
+//! through a generated type by proxy: an `http://` origin is replaced by
+//! [`HTTP_ORIGIN_STANDIN`] while the rest of the value is checked by (or
+//! built with) the generated type, and the real string is what this service
+//! compares and writes. An `https://` origin is never replaced: it is checked
+//! by the generated `Origin` itself.
 
-// TODO: replace with generated trust-tasks types
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+use trust_tasks_rs::Payload as _;
+use trust_tasks_rs::specs::auth::oob as spec;
 
-// TODO: replace with generated trust-tasks types
-pub const OOB_TYPE_PREFIX: &str = "https://trusttasks.org/spec/auth/oob/";
+pub use spec::cancel::v0_1::{Payload as CancelPayload, Response as CancelResponse};
+pub use spec::claim::v0_1::{Payload as ClaimPayload, Response as Step1Response};
+pub use spec::grant::v0_1::{Payload as GrantPayload, PayloadDecision as GrantDecision};
+pub use spec::identify::v0_1::Payload as IdentifyPayload;
+pub use spec::prove::v0_1::{Payload as ProvePayload, Response as Step2Response};
+pub use spec::redeem::v0_1::{Payload as RedeemPayload, Response as RedeemResponse};
+pub use spec::request::v0_1::{Payload as RequestPayload, Response as RequestResponse};
+pub use spec::respond::v0_1::{Payload as RespondPayload, Response as RespondResponse};
 
-// TODO: replace with generated trust-tasks types
-pub const TYPE_REQUEST: &str = "https://trusttasks.org/spec/auth/oob/request/0.1";
-// TODO: replace with generated trust-tasks types
-pub const TYPE_CLAIM: &str = "https://trusttasks.org/spec/auth/oob/claim/0.1";
-// TODO: replace with generated trust-tasks types
-pub const TYPE_PROVE: &str = "https://trusttasks.org/spec/auth/oob/prove/0.1";
-// TODO: replace with generated trust-tasks types
-pub const TYPE_IDENTIFY: &str = "https://trusttasks.org/spec/auth/oob/identify/0.1";
-// TODO: replace with generated trust-tasks types
-pub const TYPE_RESPOND: &str = "https://trusttasks.org/spec/auth/oob/respond/0.1";
-// TODO: replace with generated trust-tasks types
-pub const TYPE_GRANT: &str = "https://trusttasks.org/spec/auth/oob/grant/0.1";
-// TODO: replace with generated trust-tasks types
-pub const TYPE_REDEEM: &str = "https://trusttasks.org/spec/auth/oob/redeem/0.1";
-// TODO: replace with generated trust-tasks types
-pub const TYPE_CANCEL: &str = "https://trusttasks.org/spec/auth/oob/cancel/0.1";
+pub const TYPE_REQUEST: &str = RequestPayload::TYPE_URI;
+pub const TYPE_CLAIM: &str = ClaimPayload::TYPE_URI;
+pub const TYPE_PROVE: &str = ProvePayload::TYPE_URI;
+pub const TYPE_IDENTIFY: &str = IdentifyPayload::TYPE_URI;
+pub const TYPE_RESPOND: &str = RespondPayload::TYPE_URI;
+pub const TYPE_GRANT: &str = GrantPayload::TYPE_URI;
+pub const TYPE_REDEEM: &str = RedeemPayload::TYPE_URI;
+pub const TYPE_CANCEL: &str = CancelPayload::TYPE_URI;
 
-/// Whether `type_uri` names a member of the `auth/oob/*` family.
-pub fn is_oob_type(type_uri: &str) -> bool {
-    type_uri.starts_with(OOB_TYPE_PREFIX)
+/// What an `http://` portal origin is replaced by while a value passes
+/// through a generated type (module docs). `.invalid` (RFC 2606) can never
+/// name a real portal, so it can never match one by accident.
+pub const HTTP_ORIGIN_STANDIN: &str = "https://http-portal.invalid";
+
+/// `origin` as a generated `Origin` will take it.
+fn typed_origin(origin: &str) -> &str {
+    if origin.starts_with("https://") {
+        origin
+    } else {
+        HTTP_ORIGIN_STANDIN
+    }
 }
 
-// TODO: replace with generated trust-tasks types
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RequestPayload {
-    pub purpose: String,
-    pub mode: String,
-    #[serde(default)]
-    pub ext: Option<serde_json::Value>,
+/// Read `value` into a generated type, with any `origin` member taken by
+/// proxy (module docs). Returns the parsed value and the `origin` exactly as
+/// sent, when there was one.
+pub fn read<T: DeserializeOwned>(value: &Value) -> Result<(T, Option<String>), String> {
+    let origin = value
+        .get("origin")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let parsed = match &origin {
+        Some(o) if typed_origin(o) != o.as_str() => {
+            let mut proxied = value.clone();
+            proxied["origin"] = Value::String(HTTP_ORIGIN_STANDIN.into());
+            serde_json::from_value(proxied)
+        }
+        _ => serde_json::from_value(value.clone()),
+    };
+    parsed.map(|p| (p, origin)).map_err(|e| e.to_string())
 }
 
-// TODO: replace with generated trust-tasks types
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RequestResponse {
-    pub request_id: String,
-    /// Epoch seconds (C9). The starter uses it as the link's `_exp`.
-    pub claim_deadline: u64,
-}
-
-// TODO: replace with generated trust-tasks types
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RequestIdPayload {
-    pub request_id: String,
-    #[serde(default)]
-    pub ext: Option<serde_json::Value>,
-}
-
-// TODO: replace with generated trust-tasks types
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ServiceRef {
-    pub did: String,
-    pub name: String,
-}
-
-/// Step 1: the claim response. Nothing about the starter.
-// TODO: replace with generated trust-tasks types
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct Step1Response {
-    pub request_id: String,
-    pub service: ServiceRef,
-    pub origin: String,
-    pub purpose: String,
-    /// Epoch seconds (C9).
-    pub decision_deadline: u64,
-}
-
-// TODO: replace with generated trust-tasks types
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct Requester {
-    pub location: String,
-    pub browser: String,
-    pub os: String,
-    /// RFC 3339, as the reference starter writes it (C9 does not cover it).
-    pub created_at: String,
-    /// `true`, `false` or `"unknown"`.
-    pub same_network: serde_json::Value,
-}
-
-/// Step 2: the prove response.
-// TODO: replace with generated trust-tasks types
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct Step2Response {
-    #[serde(flatten)]
-    pub step1: Step1Response,
-    pub session_key: String,
-    pub requester: Requester,
-    pub identified_as: String,
-}
-
-/// `auth/oob/identify` payload. `additionalProperties: false`, no `ext`.
-// TODO: replace with generated trust-tasks types
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct IdentifyPayload {
-    pub request_id: String,
-    pub approver_key: String,
-    pub entered_number: String,
-}
-
-/// `auth/oob/grant` payload. Closed: no `ext`.
-// TODO: replace with generated trust-tasks types
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct GrantPayload {
-    pub request_id: String,
-    pub decision: String,
-    pub session_key: String,
-    pub approver_key: String,
-    pub origin: String,
-    pub context_digest: String,
-    /// Integer epoch seconds only (C9).
-    pub not_after: u64,
-}
-
-/// The successful `redeem` body (C9): never tokens in its fields. A
-/// bearer-token service such as this one returns its tokens to the starter in
-/// `ext` under its own namespace (C9, "Redeem on a bearer-token service").
-// TODO: replace with generated trust-tasks types
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RedeemResponse {
-    pub subject: String,
-    /// Required by the schema, 1 to 128 characters.
-    pub display_name: String,
-    /// Epoch seconds (C9).
-    pub not_after: u64,
-    pub amr: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ext: Option<serde_json::Value>,
+/// Build a generated response from `value` and write it back out: the
+/// response is exactly what the generated type serialises, with `origin`
+/// (when present) restored to the string given (module docs).
+pub fn write<T: DeserializeOwned + Serialize>(value: Value) -> Result<Value, String> {
+    let (typed, origin) = read::<T>(&value)?;
+    let mut out = serde_json::to_value(typed).map_err(|e| e.to_string())?;
+    if let Some(o) = origin {
+        out["origin"] = Value::String(o);
+    }
+    Ok(out)
 }
 
 /// Request states (base design 7.2).
@@ -195,7 +141,6 @@ impl OobState {
 }
 
 /// Machine-readable error codes used across the family (base design 10).
-// TODO: replace with generated trust-tasks types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OobErrorCode {
     PurposeUnsupported,
@@ -217,25 +162,29 @@ pub enum OobErrorCode {
 }
 
 impl OobErrorCode {
-    /// The wire code: `auth/oob:*` for the shared family, `auth/oob/<task>:*`
+    /// The wire code, read from the generated `error_codes` of a task that
+    /// declares it: `auth/oob:*` for the shared family, `auth/oob/<task>:*`
     /// for one task (C9), and the framework's own `malformedRequest`.
     pub fn as_str(self) -> &'static str {
+        use spec::{claim, prove, redeem, request, respond};
         match self {
-            OobErrorCode::PurposeUnsupported => "auth/oob/request:purposeUnsupported",
-            OobErrorCode::ModeUnsupported => "auth/oob/request:modeUnsupported",
-            OobErrorCode::KeyUnsupported => "auth/oob:keyUnsupported",
-            OobErrorCode::RateLimited => "auth/oob:rateLimited",
-            OobErrorCode::RequestNotFound => "auth/oob:requestNotFound",
-            OobErrorCode::RequestExpired => "auth/oob:requestExpired",
-            OobErrorCode::AlreadyClaimed => "auth/oob/claim:alreadyClaimed",
-            OobErrorCode::NotClaimant => "auth/oob:notClaimant",
-            OobErrorCode::NumberMismatch => "auth/oob/prove:numberMismatch",
-            OobErrorCode::NotAuthorized => "auth/oob:notAuthorized",
-            OobErrorCode::AlreadyDecided => "auth/oob:alreadyDecided",
-            OobErrorCode::ContextMismatch => "auth/oob/respond:contextMismatch",
-            OobErrorCode::Pending => "auth/oob/redeem:pending",
-            OobErrorCode::Declined => "auth/oob/redeem:declined",
-            OobErrorCode::NotStarter => "auth/oob:notStarter",
+            OobErrorCode::PurposeUnsupported => {
+                request::v0_1::error_codes::PURPOSE_UNSUPPORTED.code
+            }
+            OobErrorCode::ModeUnsupported => request::v0_1::error_codes::MODE_UNSUPPORTED.code,
+            OobErrorCode::KeyUnsupported => request::v0_1::error_codes::KEY_UNSUPPORTED.code,
+            OobErrorCode::RateLimited => request::v0_1::error_codes::RATE_LIMITED.code,
+            OobErrorCode::RequestNotFound => redeem::v0_1::error_codes::REQUEST_NOT_FOUND.code,
+            OobErrorCode::RequestExpired => redeem::v0_1::error_codes::REQUEST_EXPIRED.code,
+            OobErrorCode::AlreadyClaimed => claim::v0_1::error_codes::ALREADY_CLAIMED.code,
+            OobErrorCode::NotClaimant => prove::v0_1::error_codes::NOT_CLAIMANT.code,
+            OobErrorCode::NumberMismatch => prove::v0_1::error_codes::NUMBER_MISMATCH.code,
+            OobErrorCode::NotAuthorized => prove::v0_1::error_codes::NOT_AUTHORIZED.code,
+            OobErrorCode::AlreadyDecided => respond::v0_1::error_codes::ALREADY_DECIDED.code,
+            OobErrorCode::ContextMismatch => respond::v0_1::error_codes::CONTEXT_MISMATCH.code,
+            OobErrorCode::Pending => redeem::v0_1::error_codes::PENDING.code,
+            OobErrorCode::Declined => redeem::v0_1::error_codes::DECLINED.code,
+            OobErrorCode::NotStarter => redeem::v0_1::error_codes::NOT_STARTER.code,
             OobErrorCode::MalformedRequest => "malformedRequest",
         }
     }
