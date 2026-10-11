@@ -35,6 +35,9 @@ pub const MAX_DOCUMENT_AGE_SECS: u64 = 300;
 pub const CLOCK_SKEW_SECS: u64 = 60;
 /// How long a document id is remembered: longer than it is acceptable.
 pub const SEEN_ID_TTL_SECS: u64 = 600;
+/// Longest accepted document `id`, bytes. Ids are remembered for replay
+/// checks, so an unbounded id would let anyone grow that cache by its size.
+pub const MAX_DOCUMENT_ID_LEN: usize = 128;
 /// The `amr` of a session this flow creates (base design 7.6).
 pub const OOB_AMR: [&str; 3] = ["did", "oob", "uv"];
 
@@ -327,7 +330,6 @@ impl OobService {
                 "parentThreadId must equal payload.requestId",
             ));
         }
-        self.fresh(env, &doc)?;
         let rec = self.current(env, &payload.request_id)?;
         if rec.state == OobState::Expired {
             return Err(OobError::new(
@@ -342,6 +344,9 @@ impl OobService {
                 "already claimed",
             ));
         }
+        // Only a claim on a live, pending request is remembered, so claims
+        // for requests that don't exist cannot fill the replay cache.
+        self.fresh(env, &doc)?;
         let now = env.now();
         let approver_key = doc.issuer.clone().unwrap_or_default();
         let mut next = rec.next(OobState::Claimed, now);
@@ -788,6 +793,9 @@ impl OobService {
         }
         if doc.id.is_empty() || doc.issuer.as_deref().unwrap_or_default().is_empty() {
             return Err(OobError::malformed("missing id or issuer"));
+        }
+        if doc.id.len() > MAX_DOCUMENT_ID_LEN {
+            return Err(OobError::malformed("id is too long"));
         }
         if doc.recipient.as_deref() != Some(self.config.service_did.as_str()) {
             return Err(OobError::not_authorized());

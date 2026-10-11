@@ -272,7 +272,9 @@ async fn handle(
         &state.oob.other_limiter
     };
     if limiter.try_consume(ip, now_epoch()).is_err() {
-        tracing::warn!(%ip, type_uri, "auth/oob rate limited");
+        // `type_uri` is the caller's; log a bounded prefix only.
+        let type_prefix: String = type_uri.chars().take(64).collect();
+        tracing::warn!(%ip, type_uri = %type_prefix, "auth/oob rate limited");
         return refuse(OobErrorCode::RateLimited, "too many requests");
     }
     if type_uri == TYPE_REQUEST {

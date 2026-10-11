@@ -530,6 +530,49 @@ async fn only_the_first_claim_succeeds() {
 }
 
 #[tokio::test]
+async fn a_claim_for_no_live_request_does_not_spend_its_document_id() {
+    let w = world();
+    let rid = w.request().await;
+    let missing = "BBBBBBBBBBBBBBBBBBBBBB";
+    let doc_for = |request_id: &str| {
+        json!({
+            "id": "urn:uuid:same-id", "type": TYPE_CLAIM, "issuer": w.approver.did,
+            "recipient": w.service_did(), "issuedAt": rfc3339(w.env.now()),
+            "parentThreadId": request_id, "payload": {"requestId": request_id},
+        })
+    };
+    let d = sign(doc_for(missing), &w.approver.secret, "authentication")
+        .await
+        .unwrap();
+    let (status, _) = w.send(d).await;
+    assert_ne!(status, 200, "no such request");
+    // The same (issuer, id) is still unused, so nothing was remembered.
+    let d = sign(doc_for(&rid), &w.approver.secret, "authentication")
+        .await
+        .unwrap();
+    let (status, body) = w.send(d).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+async fn an_overlong_document_id_is_refused() {
+    use super::service::MAX_DOCUMENT_ID_LEN;
+    let w = world();
+    let rid = w.request().await;
+    let unsigned = json!({
+        "id": "x".repeat(MAX_DOCUMENT_ID_LEN + 1), "type": TYPE_CLAIM,
+        "issuer": w.approver.did, "recipient": w.service_did(),
+        "issuedAt": rfc3339(w.env.now()),
+        "parentThreadId": rid, "payload": {"requestId": rid},
+    });
+    let d = sign(unsigned, &w.approver.secret, "authentication")
+        .await
+        .unwrap();
+    assert_eq!(code(&w.send(d).await.1), "malformedRequest");
+    assert_eq!(w.state(&rid), OobState::Pending, "nothing changed");
+}
+
+#[tokio::test]
 async fn claim_window_closes() {
     let w = world();
     let rid = w.request().await;
