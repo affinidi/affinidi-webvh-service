@@ -59,6 +59,9 @@ pub struct OobRecord {
     pub approver_key: Option<String>,
     /// Two digits, set at claim.
     pub match_number: Option<String>,
+    /// Whether a `redeem` poll has handed the number to the starter. The first
+    /// poll after the claim returns it at once instead of holding.
+    pub match_number_delivered: bool,
     /// Set at prove.
     pub identified_did: Option<String>,
     /// `contextDigest` of the signed step 2 response, set at prove.

@@ -401,6 +401,52 @@ async fn redeem_long_poll_wakes_on_approval() {
     );
 }
 
+#[tokio::test]
+async fn redeem_hands_over_the_number_as_soon_as_the_request_is_claimed() {
+    let mut w = world();
+    w.svc.config.redeem_hold = Duration::from_secs(10);
+    let w = Arc::new(w);
+    let rid = w.request().await;
+
+    // A poll open before the claim wakes on it and returns the number.
+    let poller = {
+        let w = w.clone();
+        let rid = rid.clone();
+        tokio::spawn(async move { w.redeem(&rid).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let started = std::time::Instant::now();
+    w.claim(&rid).await;
+    let (_, body) = poller.await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "not held to the end"
+    );
+    assert_eq!(code(&body), "pending");
+    let n = w.svc.store().get(&rid).unwrap().match_number.unwrap();
+    assert_eq!(body["payload"]["details"]["matchNumber"], json!(n));
+
+    // Delivered once: the next poll holds rather than spinning.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), w.redeem(&rid))
+            .await
+            .is_err(),
+        "the second poll holds"
+    );
+}
+
+#[tokio::test]
+async fn a_poll_started_after_the_claim_gets_the_number_at_once() {
+    let mut w = world();
+    w.svc.config.redeem_hold = Duration::from_secs(10);
+    let rid = w.request().await;
+    w.claim(&rid).await;
+    let started = std::time::Instant::now();
+    let n = w.number(&rid).await;
+    assert!(started.elapsed() < Duration::from_secs(2), "not held");
+    assert_eq!(n, w.svc.store().get(&rid).unwrap().match_number.unwrap());
+}
+
 // ---- request ----------------------------------------------------------------
 
 #[tokio::test]
@@ -994,6 +1040,7 @@ fn compare_and_set_refuses_a_stale_version() {
         created_at: now,
         approver_key: None,
         match_number: None,
+        match_number_delivered: false,
         identified_did: None,
         step2_digest: None,
         claim_deadline: now + 120,
@@ -1041,6 +1088,7 @@ fn pending_record(request_id: &str, now: u64) -> super::store::OobRecord {
         created_at: now,
         approver_key: None,
         match_number: None,
+        match_number_delivered: false,
         identified_did: None,
         step2_digest: None,
         claim_deadline: now + 120,

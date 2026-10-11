@@ -312,6 +312,7 @@ impl OobService {
             created_at: now,
             approver_key: None,
             match_number: None,
+            match_number_delivered: false,
             identified_did: None,
             step2_digest: None,
             claim_deadline,
@@ -640,6 +641,21 @@ impl OobService {
                         OobError::new(OobErrorCode::RequestExpired, "request expired")
                             .with_details(json!({ "state": rec.state.as_str() })),
                     );
+                }
+                OobState::Claimed if !rec.match_number_delivered => {
+                    // The starter is waiting to show the number: hand it over
+                    // now rather than at the end of the hold (as the VTC does).
+                    if let Some(n) = rec.match_number.clone() {
+                        let mut next = rec.next(OobState::Claimed, env.now());
+                        next.match_number_delivered = true;
+                        if !self.store.compare_and_set(rec.version, next) {
+                            continue;
+                        }
+                        return Err(OobError::new(OobErrorCode::Pending, "not decided yet")
+                            .with_details(
+                                json!({ "state": rec.state.as_str(), "matchNumber": n }),
+                            ));
+                    }
                 }
                 _ => {}
             }
