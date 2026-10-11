@@ -213,6 +213,7 @@ impl Topology {
             // Distributed topology: the edge's cache is kept in step by its
             // own `webvh/sync/*` handling, not by this hook.
             cache_invalidate: None,
+            oob: Default::default(),
         };
         dirs.push(control_dir);
 

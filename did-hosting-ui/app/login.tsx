@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   View,
   Text,
@@ -10,6 +10,7 @@ import { useRouter } from "expo-router";
 import { useAuth } from "../components/AuthProvider";
 import { AffinidiLogo } from "../components/AffinidiLogo";
 import { AgentNameChips } from "../components/AgentNameChips";
+import { WalletSignIn } from "../components/WalletSignIn";
 import {
   api,
   setAuthMethod,
@@ -37,6 +38,17 @@ export default function Login() {
   const [walletError, setWalletError] = useState<string | null>(null);
   const walletAvailable = isWalletAvailable();
   const proxyAvailable = isWalletProxyAvailable();
+  // Contract C7: the SIOPv2 / extension logins are kept, deprecated, behind
+  // "Using an older wallet?". Wallet sign-in with a trigger link is first.
+  const [showLegacy, setShowLegacy] = useState(false);
+  // A control plane without the sign-in configured (no service DID or public
+  // URL) answers 503: drop the new flow and show the older options open, so
+  // the page offers exactly what it did before.
+  const [oobUnavailable, setOobUnavailable] = useState(false);
+  const onOobUnavailable = useCallback(() => {
+    setOobUnavailable(true);
+    setShowLegacy(true);
+  }, []);
 
   // M2B.4 — VTA-proxied login.
   // The user picks a did-self-issued vault entry pinned to this RP's
@@ -257,9 +269,30 @@ export default function Login() {
       <View style={styles.card}>
         <AffinidiLogo size={36} />
         <Text style={styles.title}>Login</Text>
-        <Text style={styles.hint}>
-          Use your registered passkey to authenticate with this server.
-        </Text>
+
+        {oobUnavailable ? (
+          <Text style={styles.hint}>
+            Wallet sign-in with a code is not set up on this server.
+          </Text>
+        ) : (
+          <>
+            <Text style={styles.sectionTitle}>Sign in with your wallet</Text>
+            <WalletSignIn
+              serviceDid={serverDid}
+              onSignedIn={(accessToken) => {
+                login(accessToken);
+                router.replace("/");
+              }}
+              onUnavailable={onOobUnavailable}
+            />
+          </>
+        )}
+
+        <View style={styles.divider}>
+          <View style={styles.dividerLine} />
+          <Text style={styles.dividerText}>or</Text>
+          <View style={styles.dividerLine} />
+        </View>
 
         {serverDid && (
           <View style={styles.serverDidRow}>
@@ -278,7 +311,7 @@ export default function Login() {
                 </View>
               )}
               <Text style={styles.serverDidHint}>
-                Grant access to this DID in your wallet to enable proxied SIOP login.
+                Your wallet needs a record of this DID to sign in here.
               </Text>
             </View>
             <Pressable style={styles.copyButton} onPress={() => void handleCopyServerDid()}>
@@ -303,11 +336,27 @@ export default function Login() {
           <Text style={styles.errorText}>{passkeyError}</Text>
         )}
 
-        <View style={styles.divider}>
-          <View style={styles.dividerLine} />
-          <Text style={styles.dividerText}>or</Text>
-          <View style={styles.dividerLine} />
-        </View>
+        <Pressable
+          onPress={() => setShowLegacy(!showLegacy)}
+          style={styles.legacyToggle}
+          accessibilityRole="button"
+          accessibilityState={{ expanded: showLegacy }}
+        >
+          <Text style={styles.legacyToggleText}>
+            {showLegacy ? "Hide older wallet options" : "Using an older wallet?"}
+          </Text>
+        </Pressable>
+
+        {showLegacy && (
+        <>
+        {/* @deprecated (contract C7): the VTA Wallet extension's SIOPv2 /
+            auth/authenticate login and the VTA-proxied SIOP login. Kept for
+            wallets that cannot read a sign-in code yet; not deleted until a
+            removal date is set. */}
+        <Text style={styles.cliHint}>
+          These sign-in methods are deprecated. Use "Sign in with your wallet"
+          above if your wallet supports it.
+        </Text>
 
         {walletAvailable && (
           <Pressable
@@ -377,6 +426,8 @@ export default function Login() {
             </Pressable>
             {proxyError && <Text style={styles.errorText}>{proxyError}</Text>}
           </>
+        )}
+        </>
         )}
 
         <View style={styles.divider}>
@@ -539,6 +590,21 @@ const styles = StyleSheet.create({
     color: colors.textPrimary,
     marginTop: spacing.lg,
     marginBottom: spacing.md,
+  },
+  sectionTitle: {
+    fontSize: 16,
+    fontFamily: fonts.semibold,
+    color: colors.textPrimary,
+    marginBottom: spacing.sm,
+  },
+  legacyToggle: {
+    marginTop: spacing.lg,
+    alignItems: "center",
+  },
+  legacyToggleText: {
+    color: colors.accent,
+    fontSize: 13,
+    fontFamily: fonts.medium,
   },
   hint: {
     fontSize: 14,

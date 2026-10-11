@@ -620,7 +620,7 @@ fn auth_proxy_meta_key(session_id: &str) -> String {
     format!("auth-proxy-meta:{session_id}")
 }
 
-async fn store_auth_proxy_meta(
+pub(crate) async fn store_auth_proxy_meta(
     state: &AppState,
     session_id: &str,
     actor: Option<String>,

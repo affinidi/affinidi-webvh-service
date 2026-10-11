@@ -330,6 +330,9 @@ async fn generate_self_managed_keys(recipe: &SetupRecipe) -> Result<VtaSetupOutc
         let trust_task_base = format!("{origin}/api");
         if crate::did::is_https_or_loopback(&trust_task_base) {
             crate::did::add_trust_task_https_service(&mut doc, &trust_task_base);
+            // The daemon serves the console, and so its login page, at the
+            // same origin: wallet sign-in with a trigger link (C4).
+            crate::did::add_sign_in_portal_service(&mut doc, &format!("{origin}/login"));
         } else {
             eprintln!(
                 "  [setup-recipe] public_url is not HTTPS (and not loopback) — skipping \

@@ -227,6 +227,15 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
   its session is bound to). A new task is a new row; never a hand-built reply.
   `POST /api/trust-tasks` is the HTTPS binding of the same dispatch: the
   document's proof authorises, a bearer session is optional context.
+- **One temporary exception: `auth/oob/*`** (wallet sign-in with a trigger
+  link, `did-hosting-control/src/oob`). The published `trust-tasks-rs` has no
+  bindings for it yet, so `POST /api/trust-tasks` routes it to its own state
+  machine before the table, HTTPS only, with local types marked
+  `TODO: replace with generated trust-tasks types`. It still verifies with
+  `TransportBoundVerifier` (`identify` for `authentication`, `grant` for
+  `assertionMethod`) and signs every reply; per contract C5 its step 1 and
+  step 2 replies are signed for `assertionMethod`. Move it into the table
+  once `trust_tasks_rs::specs::auth::oob` is published.
 - **Two passkey stores.** Login (`purpose: session`) passkeys live in
   `KS_SESSIONS`; step-up-only passkeys in `KS_PASSKEY_STEP_UP`. The login
   ceremony reads `KS_SESSIONS` only — never make it read both. Enrolment
@@ -246,7 +255,14 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
   service signs, approval *requests* included, is `authentication`. Decisions
   (consent, step-up) are checked with `TransportBoundVerifier::verify_approval`
   — `assertionMethod` purpose *and* relationship, deactivation check — never
-  the bare `ProofVerifier::verify`.
+  the bare `ProofVerifier::verify`. **The one exception** is the `auth/oob/*`
+  step 1 (`claim`) and step 2 (`prove`) responses, which the cross-repo
+  sign-in contract (C5) requires signed for `assertionMethod`: the wallet
+  shows their contents (service name, portal origin, requester) to the
+  member as the service's statement, and the step 2 response is bound into
+  the member's grant via `contextDigest`. Every other signed `auth/oob/*` reply,
+  like every other service reply, is `authentication`. Don't widen the
+  exception; it goes when the contract does.
 - **An edge never answers a document that failed `verify_control_plane`** —
   no signed refusal (it would settle an op the control plane never sent), no
   unsigned one. Transient failures (unresolvable signer DID, storage/I-O) are

@@ -198,6 +198,7 @@ impl TestServer {
             ),
             outbox_notify: Arc::new(tokio::sync::Notify::new()),
             cache_invalidate: None,
+            oob: Default::default(),
         };
 
         Self { state, _dir: dir }
