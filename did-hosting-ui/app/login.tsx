@@ -17,6 +17,11 @@ import {
   setRefreshToken,
 } from "../lib/api";
 import { getPasskeyCredential } from "../lib/passkey";
+import {
+  fetchSignInReadiness,
+  notSetUpNote,
+  offersWalletSignIn,
+} from "../lib/sign-in-readiness";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 import {
   isWalletAvailable,
@@ -49,6 +54,22 @@ export default function Login() {
     setOobUnavailable(true);
     setShowLegacy(true);
   }, []);
+  // The server's self-check of its own DID document: when it lacks the
+  // services wallets need, the sign-in would only end in "This code can't be
+  // used", so say why and fall back the same way. Anything but a clear
+  // "not set up" (including a failed check) keeps the sign-in offered.
+  const [oobNote, setOobNote] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void fetchSignInReadiness().then((r) => {
+      if (cancelled || offersWalletSignIn(r)) return;
+      setOobNote(notSetUpNote(r));
+      onOobUnavailable();
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [onOobUnavailable]);
 
   // M2B.4 — VTA-proxied login.
   // The user picks a did-self-issued vault entry pinned to this RP's
@@ -272,7 +293,7 @@ export default function Login() {
 
         {oobUnavailable ? (
           <Text style={styles.hint}>
-            Wallet sign-in with a code is not set up on this server.
+            {oobNote ?? "Wallet sign-in with a code is not set up on this server."}
           </Text>
         ) : (
           <>
