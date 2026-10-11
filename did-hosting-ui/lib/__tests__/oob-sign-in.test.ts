@@ -16,6 +16,7 @@ import {
   type SignInState,
   type StarterKeys,
 } from "../oob-sign-in";
+import { defaultQrEncoder } from "../qr-encoder";
 
 const DID = "did:webvh:QmSCIDabcdefghijklmnopqrstuvwxyz0123456789ABCD:dids.example.org";
 const RID = "AAAAAAAAAAAAAAAAAAAAAA";
@@ -56,6 +57,18 @@ describe("trigger link", () => {
     expect(svg).toContain('viewBox="0 0 29 29"');
     expect(svg).toContain('width="116"');
     expect(svg).toContain("M4 4h1v1h-1z");
+  });
+
+  it("encodes the longest trigger link at level M with the default encoder", () => {
+    // Version 11-M holds 251 bytes; the level-M limit (VTI-LNK-081) is chosen to fit it.
+    const longest = defaultQrEncoder("h".repeat(TRIGGER_LINK_MAX_BYTES));
+    expect(longest.size).toBe(61);
+    const link = buildTriggerLink({ from: DID, requestId: RID, exp: 1 });
+    const m = defaultQrEncoder(link);
+    // Finder pattern corners: dark top-left module, light separator next to the finder.
+    expect(m.isDark(0, 0)).toBe(true);
+    expect(m.isDark(7, 7)).toBe(false);
+    expect(renderQrSvg(link, defaultQrEncoder)).toContain('fill="#000000"');
   });
 
   it("reads codes with or without the family prefix", () => {

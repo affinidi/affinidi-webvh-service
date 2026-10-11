@@ -15,9 +15,9 @@
  *  - `K_b` is this console's session key (`session-key.ts`), so after
  *    `redeem` the session's calls are signed with it without another step.
  *
- * The QR encoder is a pluggable {@link QrEncoder}. This UI has no QR library
- * in its dependencies, so none is bundled: without an encoder the page shows
- * the same `https` link as a button (same-device sign-in still works).
+ * The QR encoder is a pluggable {@link QrEncoder}, as in rp-sdk: this module
+ * imports no QR library. The page passes the default one from `qr-encoder.ts`
+ * (`qrcode-generator`); swap it there.
  *
  * Free of `react-native` so the test runner can reach it.
  */
@@ -130,11 +130,22 @@ export interface QrMatrix {
 /** Encodes ASCII text in byte mode at error-correction level M. */
 export type QrEncoder = (text: string) => QrMatrix;
 
+/** The laid-out code: modules plus the quiet zone, as one SVG path. */
+export interface QrLayout {
+  /** Width and height in modules, quiet zone included. */
+  units: number;
+  /** Width and height in CSS px. */
+  pixels: number;
+  /** The dark modules as 1x1 squares in module units. */
+  path: string;
+}
+
 /**
- * The code as an SVG string: a quiet zone of at least 4 modules, at least 4
- * CSS px per module, dark on light, never inverted (C1).
+ * Lay out the code: a quiet zone of 4 modules and at least 4 CSS px per
+ * module (C1). Colours are the renderer's: always dark on light, never
+ * inverted, in either theme.
  */
-export function renderQrSvg(text: string, encoder: QrEncoder, moduleSize = 4): string {
+export function layoutQr(text: string, encoder: QrEncoder, moduleSize = 4): QrLayout {
   const quiet = 4;
   const px = Math.max(4, Math.floor(moduleSize));
   const m = encoder(text);
@@ -143,10 +154,20 @@ export function renderQrSvg(text: string, encoder: QrEncoder, moduleSize = 4): s
     for (let c = 0; c < m.size; c++) if (m.isDark(r, c)) path += `M${c + quiet} ${r + quiet}h1v1h-1z`;
   }
   const units = m.size + 2 * quiet;
+  return { units, pixels: units * px, path };
+}
+
+/** Dark modules and the light background behind them, in both themes. */
+export const QR_DARK = "#000000";
+export const QR_LIGHT = "#ffffff";
+
+/** The code as an SVG string (see {@link layoutQr}). */
+export function renderQrSvg(text: string, encoder: QrEncoder, moduleSize = 4): string {
+  const { units, pixels, path } = layoutQr(text, encoder, moduleSize);
   return (
-    `<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Sign-in code" width="${units * px}" ` +
-    `height="${units * px}" viewBox="0 0 ${units} ${units}" shape-rendering="crispEdges">` +
-    `<rect width="${units}" height="${units}" fill="#ffffff"/><path d="${path}" fill="#000000"/></svg>`
+    `<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Sign-in code" width="${pixels}" ` +
+    `height="${pixels}" viewBox="0 0 ${units} ${units}" shape-rendering="crispEdges">` +
+    `<rect width="${units}" height="${units}" fill="${QR_LIGHT}"/><path d="${path}" fill="${QR_DARK}"/></svg>`
   );
 }
 

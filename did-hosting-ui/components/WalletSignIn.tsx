@@ -8,9 +8,10 @@
  * person approves in the wallet; this page then asks "Continue as …?".
  *
  * Web only: the starter key is a WebCrypto key and the code is a DOM link.
+ * The QR encoder (`qrcode-generator`) sits behind `lib/qr-encoder.ts`.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Platform, Pressable, StyleSheet, Text, View } from "react-native";
 
 import { api, setAuthMethod, setRefreshToken, setToken } from "../lib/api";
@@ -19,20 +20,14 @@ import {
   configuredLinkHost,
   createSignIn,
   isUnavailable,
-  renderQrSvg,
-  type QrEncoder,
+  layoutQr,
+  QR_DARK,
+  QR_LIGHT,
   type SignInController,
   type SignInState,
 } from "../lib/oob-sign-in";
+import { defaultQrEncoder } from "../lib/qr-encoder";
 import { colors, fonts, radii, spacing } from "../lib/theme";
-
-/**
- * The QR encoder. None is bundled: the UI has no QR library among its
- * dependencies, and adding one is a separate decision. Until then the code is
- * shown as its link only (same-device sign-in works; scanning does not).
- * TODO: set to a level-M byte-mode encoder (rp-sdk uses qrcode-generator 2.0.4).
- */
-const QR_ENCODER: QrEncoder | null = null;
 
 /** The `ext` namespace the control plane puts this console's tokens under. */
 const SESSION_EXT = "com.affinidi.did-hosting";
@@ -206,30 +201,54 @@ export function WalletSignIn({
   }
 }
 
+/** CSS px per module: 5 keeps the longest link (61 modules + quiet zone) under 350 px. */
+const QR_MODULE_PX = 5;
+
 /**
  * The code wrapped in `<a href>` (C2, VTI-LNK-086), so a wallet on this
- * device opens it by click. Without an encoder, the link alone.
+ * device opens it by click, and the same link as a button below it for
+ * same-device use. The code is always dark modules on a light quiet zone,
+ * whatever the theme, so phones read it in dark mode too.
  */
 function TriggerLinkCode({ link }: { link: string }) {
-  if (QR_ENCODER) {
-    return (
-      <a
-        href={link}
-        rel="noreferrer"
-        referrerPolicy="no-referrer"
-        aria-label="Sign-in code. Scan it with your wallet, or click it to open your wallet."
-        // The SVG is built from our own encoder output and fixed strings only.
-        dangerouslySetInnerHTML={{ __html: renderQrSvg(link, QR_ENCODER, 5) }}
-        style={{ display: "inline-block", lineHeight: 0, background: "#ffffff" }}
-      />
-    );
-  }
+  const qr = useMemo(() => {
+    try {
+      return layoutQr(link, defaultQrEncoder, QR_MODULE_PX);
+    } catch {
+      // Too long for a QR code (the starter checks this already): the button still works.
+      return null;
+    }
+  }, [link]);
   return (
-    <a href={link} rel="noreferrer" referrerPolicy="no-referrer" style={{ textDecoration: "none" }}>
-      <View style={styles.button}>
-        <Text style={styles.buttonText}>Open in your wallet</Text>
-      </View>
-    </a>
+    <View style={styles.center}>
+      {qr && (
+        <a
+          href={link}
+          rel="noreferrer"
+          referrerPolicy="no-referrer"
+          style={{ display: "inline-block", lineHeight: 0, background: QR_LIGHT, borderRadius: radii.md }}
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            role="img"
+            aria-label="Sign-in code. Scan it with your wallet app, or click it to open your wallet on this device."
+            width={qr.pixels}
+            height={qr.pixels}
+            viewBox={`0 0 ${qr.units} ${qr.units}`}
+            shapeRendering="crispEdges"
+            style={{ display: "block", maxWidth: "100%", height: "auto" }}
+          >
+            <rect width={qr.units} height={qr.units} fill={QR_LIGHT} />
+            <path d={qr.path} fill={QR_DARK} />
+          </svg>
+        </a>
+      )}
+      <a href={link} rel="noreferrer" referrerPolicy="no-referrer" style={{ textDecoration: "none" }}>
+        <View style={styles.button}>
+          <Text style={styles.buttonText}>Open in your wallet</Text>
+        </View>
+      </a>
+    </View>
   );
 }
 
