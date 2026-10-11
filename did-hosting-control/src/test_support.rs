@@ -136,7 +136,9 @@ impl TestServer {
             features: opts.features.unwrap_or_default(),
             server_did,
             mediator_did: None,
-            public_url: Some("http://control.test".into()),
+            // `https`, so wallet sign-in (`auth/oob/*`, https portals only)
+            // is live in this harness too.
+            public_url: Some("https://control.test".into()),
             did_hosting_url: Some("http://control.test".into()),
             server: ServerConfig::default(),
             log: LogConfig::default(),

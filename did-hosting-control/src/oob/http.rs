@@ -113,13 +113,23 @@ impl Default for OobRuntime {
 }
 
 impl OobRuntime {
-    /// The service, or `None` when this deployment has no service DID or
-    /// public URL (and so no portal origin and no `SignInPortal` service).
+    /// The service, or `None` when this deployment has no service DID or no
+    /// `https` public URL (and so no portal origin and no `SignInPortal`
+    /// service). Every `auth/oob/*` document is then answered `503` "wallet
+    /// sign-in is not configured on this server".
     fn service(&self, state: &AppState) -> Option<&OobService> {
         self.service
             .get_or_init(|| {
                 let did = state.config.server_did.clone()?;
-                let (origin, host) = portal_origin(state.config.public_url.as_deref()?)?;
+                let public_url = state.config.public_url.as_deref()?;
+                let Some((origin, host)) = portal_origin(public_url) else {
+                    tracing::warn!(
+                        public_url,
+                        "wallet sign-in (auth/oob) is off: the public URL is not an https \
+                         origin, and a sign-in portal must be one"
+                    );
+                    return None;
+                };
                 Some(OobService::new(OobConfig::new(did, host, origin)))
             })
             .as_ref()
@@ -129,14 +139,18 @@ impl OobRuntime {
 /// The origin and host of the portal, from the control plane's public URL:
 /// the console's login page is served there (`SignInPortal`, C4).
 ///
-/// `None` unless the URL is `http` or `https` with a host: any other scheme
-/// has an opaque origin, which serialises as `null` — the `Origin` a
-/// sandboxed frame on any site sends.
+/// `None` unless the URL is `https` with a host and no userinfo
+/// ([`did_hosting_common::did::is_sign_in_portal_url`], the same rule the
+/// daemon's setup applies before it advertises a `SignInPortal`). The
+/// published `auth/oob` `Origin` admits `https://` only, so a plain-http
+/// portal — loopback included — could never complete a conforming sign-in;
+/// and any other scheme has an opaque origin, which serialises as `null`,
+/// the `Origin` a sandboxed frame on any site sends.
 pub fn portal_origin(public_url: &str) -> Option<(String, String)> {
-    let url = url::Url::parse(public_url).ok()?;
-    if !matches!(url.scheme(), "http" | "https") {
+    if !did_hosting_common::did::is_sign_in_portal_url(public_url) {
         return None;
     }
+    let url = url::Url::parse(public_url).ok()?;
     let host = url.host_str()?.to_string();
     let origin = url.origin();
     if !origin.is_tuple() {

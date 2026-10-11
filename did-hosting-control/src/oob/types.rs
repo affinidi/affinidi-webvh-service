@@ -13,18 +13,8 @@
 //! keeps its name and encoding. `oob::tests::wire_fixtures_round_trip` pins
 //! that against fixtures captured from the old types.
 //!
-//! # `origin` and a plain-http portal
-//!
-//! The published `Origin` admits `https://` only. [`super::http::portal_origin`]
-//! also accepts an `http://` public URL, which is what a console run locally
-//! for development has. No conforming wallet will approve such a request (the
-//! VTA vault refuses a grant for a non-https origin), but the exchange must
-//! still round-trip in process. So `origin` is the one member that passes
-//! through a generated type by proxy: an `http://` origin is replaced by
-//! [`HTTP_ORIGIN_STANDIN`] while the rest of the value is checked by (or
-//! built with) the generated type, and the real string is what this service
-//! compares and writes. An `https://` origin is never replaced: it is checked
-//! by the generated `Origin` itself.
+//! The published `Origin` admits `https://` only, so the portal is `https`
+//! (see [`super::http::portal_origin`], which refuses anything else).
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -50,49 +40,16 @@ pub const TYPE_GRANT: &str = GrantPayload::TYPE_URI;
 pub const TYPE_REDEEM: &str = RedeemPayload::TYPE_URI;
 pub const TYPE_CANCEL: &str = CancelPayload::TYPE_URI;
 
-/// What an `http://` portal origin is replaced by while a value passes
-/// through a generated type (module docs). `.invalid` (RFC 2606) can never
-/// name a real portal, so it can never match one by accident.
-pub const HTTP_ORIGIN_STANDIN: &str = "https://http-portal.invalid";
-
-/// `origin` as a generated `Origin` will take it.
-fn typed_origin(origin: &str) -> &str {
-    if origin.starts_with("https://") {
-        origin
-    } else {
-        HTTP_ORIGIN_STANDIN
-    }
-}
-
-/// Read `value` into a generated type, with any `origin` member taken by
-/// proxy (module docs). Returns the parsed value and the `origin` exactly as
-/// sent, when there was one.
-pub fn read<T: DeserializeOwned>(value: &Value) -> Result<(T, Option<String>), String> {
-    let origin = value
-        .get("origin")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let parsed = match &origin {
-        Some(o) if typed_origin(o) != o.as_str() => {
-            let mut proxied = value.clone();
-            proxied["origin"] = Value::String(HTTP_ORIGIN_STANDIN.into());
-            serde_json::from_value(proxied)
-        }
-        _ => serde_json::from_value(value.clone()),
-    };
-    parsed.map(|p| (p, origin)).map_err(|e| e.to_string())
+/// Read `value` into a generated type.
+pub fn read<T: DeserializeOwned>(value: &Value) -> Result<T, String> {
+    serde_json::from_value(value.clone()).map_err(|e| e.to_string())
 }
 
 /// Build a generated response from `value` and write it back out: the
-/// response is exactly what the generated type serialises, with `origin`
-/// (when present) restored to the string given (module docs).
+/// response is exactly what the generated type serialises.
 pub fn write<T: DeserializeOwned + Serialize>(value: Value) -> Result<Value, String> {
-    let (typed, origin) = read::<T>(&value)?;
-    let mut out = serde_json::to_value(typed).map_err(|e| e.to_string())?;
-    if let Some(o) = origin {
-        out["origin"] = Value::String(o);
-    }
-    Ok(out)
+    let typed: T = read(&value)?;
+    serde_json::to_value(typed).map_err(|e| e.to_string())
 }
 
 /// Request states (base design 7.2).

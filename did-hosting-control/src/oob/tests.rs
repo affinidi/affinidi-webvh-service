@@ -1218,10 +1218,10 @@ fn portal_endpoint_is_the_login_page_on_the_public_origin() {
         sign_in_portal_endpoint("https://dids.example.org/some/path").unwrap(),
         "https://dids.example.org/login"
     );
-    assert_eq!(
-        sign_in_portal_endpoint("http://localhost:8530").unwrap(),
-        "http://localhost:8530/login"
-    );
+    // No plain-http portal, loopback included: the `auth/oob` origin is
+    // `https://` only.
+    assert_eq!(sign_in_portal_endpoint("http://localhost:8530"), None);
+    assert_eq!(sign_in_portal_endpoint("http://dids.example.org"), None);
 }
 
 #[test]
@@ -1248,7 +1248,7 @@ mod https {
     };
     use http_body_util::BodyExt;
 
-    const PORTAL: &str = "http://control.test";
+    const PORTAL: &str = "https://control.test";
 
     async fn post(
         state: &crate::server::AppState,
@@ -1362,13 +1362,13 @@ mod https {
         let starter = key(2);
         let mut refused = vec![
             Some("null"),
-            Some("http://control.test/"),
-            Some("http://control.test/login"),
-            Some("http://CONTROL.test"),
-            Some("http://control.test:8080"),
-            Some("https://control.test"),
-            Some("http://user@control.test"),
-            Some("http://control.test.evil.example"),
+            Some("https://control.test/"),
+            Some("https://control.test/login"),
+            Some("https://CONTROL.test"),
+            Some("https://control.test:8080"),
+            Some("http://control.test"),
+            Some("https://user@control.test"),
+            Some("https://control.test.evil.example"),
             Some("not a url"),
         ];
         refused.push(None);
@@ -1669,8 +1669,7 @@ async fn prove_with_a_different_parent_thread_is_malformed() {
 ///
 /// Every inbound payload reads into its generated type and writes back
 /// byte-for-byte; every outbound payload is rebuilt through its generated
-/// response type byte-for-byte — including the plain-http portal origin the
-/// generated `Origin` cannot hold by itself (`types` module docs).
+/// response type byte-for-byte.
 #[test]
 fn wire_fixtures_round_trip() {
     use super::types::{read, write};
@@ -1680,11 +1679,8 @@ fn wire_fixtures_round_trip() {
     let fixtures: Value = serde_json::from_str(include_str!("testdata/wire.json")).unwrap();
 
     fn inbound<T: DeserializeOwned + Serialize>(v: &Value) {
-        let (typed, origin) = read::<T>(v).unwrap_or_else(|e| panic!("{v}: {e}"));
-        let mut back = serde_json::to_value(typed).unwrap();
-        if let Some(o) = origin {
-            back["origin"] = json!(o);
-        }
+        let typed = read::<T>(v).unwrap_or_else(|e| panic!("{v}: {e}"));
+        let back = serde_json::to_value(typed).unwrap();
         assert_eq!(
             serde_json::to_string(&back).unwrap(),
             serde_json::to_string(v).unwrap()
@@ -1701,9 +1697,6 @@ fn wire_fixtures_round_trip() {
     inbound::<GrantPayload>(&i["grantDecline"]);
     inbound::<ProvePayload>(&i["prove"]);
     inbound::<RespondPayload>(&i["respond"]);
-    let mut http_grant = i["grant"].clone();
-    http_grant["origin"] = json!("http://control.test");
-    inbound::<GrantPayload>(&http_grant);
 
     fn outbound<T: DeserializeOwned + Serialize>(v: &Value) {
         let built = write::<T>(v.clone()).unwrap_or_else(|e| panic!("{v}: {e}"));
@@ -1722,9 +1715,13 @@ fn wire_fixtures_round_trip() {
     outbound::<RedeemResponse>(&o["redeem"]);
     outbound::<RedeemResponse>(&o["redeemNoExt"]);
     outbound::<CancelResponse>(&o["cancel"]);
+    // The portal origin is `https://` only, on the way in and out.
+    let mut http_grant = i["grant"].clone();
+    http_grant["origin"] = json!("http://control.test");
+    assert!(read::<GrantPayload>(&http_grant).is_err());
     let mut http_step1 = o["claim"].clone();
     http_step1["origin"] = json!("http://control.test");
-    outbound::<Step1Response>(&http_step1);
+    assert!(write::<Step1Response>(http_step1).is_err());
 
     // What the schema refuses stays refused: no member it does not name, no
     // `purpose` or `mode` it does not list, no malformed request id.

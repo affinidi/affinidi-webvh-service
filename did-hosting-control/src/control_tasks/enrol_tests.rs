@@ -163,7 +163,7 @@ async fn an_invite_discloses_its_secrets_once_and_stores_only_hashes() {
     let admin = member(&state, 1, Role::Admin).await;
     let issued = issue(&state, &admin, "did:example:carol", "session").await;
     let url = issued.body["invite"]["url"].as_str().unwrap();
-    assert!(url.starts_with("http://control.test/enroll?token="));
+    assert!(url.starts_with("https://control.test/enroll?token="));
     assert!(url.contains(&issued.token));
     assert!(!url.contains(&issued.code));
     assert_eq!(issued.body["purpose"], "session");

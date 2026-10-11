@@ -56,7 +56,9 @@ pub(crate) async fn state() -> (AppState, tempfile::TempDir) {
         features: FeaturesConfig::default(),
         server_did: Some(CONTROL.into()),
         mediator_did: None,
-        public_url: Some("http://control.test".into()),
+        // `https`: wallet sign-in (`auth/oob/*`) is served only for an https
+        // portal, and these tests drive it.
+        public_url: Some("https://control.test".into()),
         did_hosting_url: Some("http://control.test".into()),
         server: ServerConfig::default(),
         log: LogConfig::default(),

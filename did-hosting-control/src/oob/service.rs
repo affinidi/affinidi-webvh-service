@@ -564,8 +564,7 @@ impl OobService {
         {
             return Err(OobError::not_authorized());
         }
-        let (p, origin) =
-            read::<GrantPayload>(&grant.payload).map_err(|_| OobError::not_authorized())?;
+        let p = read::<GrantPayload>(&grant.payload).map_err(|_| OobError::not_authorized())?;
         let approve = p.decision == GrantDecision::Approve;
         let not_after = p.not_after;
         // 3. and 4. The bindings.
@@ -573,7 +572,7 @@ impl OobService {
         if p.request_id.as_str() != rec.request_id
             || rec.approver_key.as_deref() != Some(p.approver_key.as_str())
             || p.session_key.as_str() != rec.start_key
-            || origin.as_deref() != Some(rec.origin.as_str())
+            || p.origin.as_str() != rec.origin
         {
             return Err(mismatch());
         }
