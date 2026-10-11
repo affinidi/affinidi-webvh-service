@@ -84,22 +84,6 @@ pub async fn trust_tasks_endpoint(
     let ip =
         crate::rate_limit::resolve_client_ip(addr.ip(), xff, &state.config.server.trusted_proxies);
     let client_ip = Some(ip);
-    // Wallet sign-in with a trigger link (`auth/oob/*`) is the one family
-    // served outside the `control_tasks` table (CLAUDE.md, "One temporary
-    // exception"). It cannot be a row yet: the table is keyed and typed on
-    // generated `Payload`s, which `trust-tasks-rs` does not publish for this
-    // family, and its issuers are throwaway `did:key`s (`K_a`, `K_b`) that are
-    // not in the ACL. It is not unauthenticated: `crate::oob::http` lists what
-    // it checks in place of the gate — envelope, recipient, freshness, replay,
-    // an Ed25519 `did:key` proof bound to the request's own keys, the ACL
-    // before any member DID is resolved, `TransportBoundVerifier` for member
-    // proofs, the portal origin on `request`, per-address and global limits,
-    // and signed replies. A bearer session sent with one is ignored: nothing
-    // in the family is authorised by it. Move it into the table once
-    // `trust_tasks_rs::specs::auth::oob` is published.
-    if let Some(resp) = crate::oob::http::maybe_handle(&state, ip, &headers, &body).await {
-        return Ok(resp);
-    }
     if is_redeem_start(&body) {
         let limited = state.redeem_rate_limiter.try_consume(
             &format!("ip:{ip}"),
@@ -123,7 +107,7 @@ pub async fn trust_tasks_endpoint(
             }
         }
     }
-    dispatch_trust_task(auth, State(state), client_ip, body).await
+    dispatch_trust_task(auth, State(state), client_ip, &headers, body).await
 }
 
 /// Whether `body` is an `auth/passkey/enroll/redeem/start` document.
@@ -162,10 +146,16 @@ fn is_redeem_start(body: &[u8]) -> bool {
 /// non-HTTPS call (tests exercising this handler without a real socket),
 /// which then shares one placeholder address rather than being charged
 /// against nothing.
+///
+/// `client_ip`, `headers` and the body's size travel to the router as
+/// [`HttpsFacts`](crate::messaging::HttpsFacts): a bound-key row (wallet
+/// sign-in) is admitted on them — its origin, rate limits and size — and
+/// reads its requester details from them.
 pub async fn dispatch_trust_task(
     auth: Option<AuthClaims>,
     State(state): State<AppState>,
     client_ip: Option<std::net::IpAddr>,
+    headers: &axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
     // ─── 1. Service DID required. Without one configured the §7.2
@@ -222,6 +212,13 @@ pub async fn dispatch_trust_task(
 
     // Replay protection runs inside `dispatch_trust_task_doc`, keyed on the
     // proven issuer and the document id, after the proof has been verified.
+
+    // A task whose rule takes no bearer session (`ProofRule::BoundKey`: wallet
+    // sign-in, whose exchange is its only authority) is served exactly as if
+    // none were sent — no session binding below, no session context, and the
+    // document's own issuer as the peer.
+    let auth =
+        auth.filter(|_| crate::messaging::proof_rule(&doc.type_uri.to_string()).admits_bearer());
 
     // ─── 3. With a bearer session, the proof must be bound to it (SECURITY).
     //
@@ -297,10 +294,16 @@ pub async fn dispatch_trust_task(
         None => doc.issuer.clone().unwrap_or_default(),
     };
     let transport = HttpsHandler::new(my_vid.to_string(), (!peer.is_empty()).then(|| peer.clone()));
+    let https = crate::messaging::HttpsFacts {
+        ip: client_ip,
+        headers,
+        body_len: body.len(),
+    };
     match crate::messaging::dispatch_trust_task_doc(
         &state,
         &peer,
         auth.as_ref(),
+        Some(&https),
         &transport,
         doc,
         verifier,
@@ -331,7 +334,32 @@ pub async fn dispatch_trust_task(
                 .into_response())
         }
         crate::messaging::RoutedReply::Suppressed => Ok(StatusCode::NO_CONTENT.into_response()),
+        crate::messaging::RoutedReply::Sealed(sealed) => Ok(sealed_response(sealed)),
     }
+}
+
+/// A bound-key row's reply (`RoutedReply::Sealed`), with the status its
+/// family assigned. Never cached and never sent as a referrer: these replies
+/// carry one-time numbers and, from `redeem`, session tokens.
+fn sealed_response(sealed: crate::control_tasks::SealedReply) -> Response {
+    use axum::http::{HeaderValue, header};
+    let mut resp = match sealed {
+        crate::control_tasks::SealedReply::Document { status, body } => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+            axum::Json(body),
+        )
+            .into_response(),
+        crate::control_tasks::SealedReply::Unavailable(message) => {
+            (StatusCode::SERVICE_UNAVAILABLE, message).into_response()
+        }
+    };
+    let h = resp.headers_mut();
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    resp
 }
 
 /// Build a `trust-task-error` document for a body-parse failure.

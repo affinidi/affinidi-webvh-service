@@ -45,7 +45,7 @@ affinidi-messaging-didcomm = { workspace = true }
 affinidi-secrets-resolver = { workspace = true }
 tokio-util = { workspace = true }
 affinidi-did-resolver-cache-sdk = { workspace = true }
-affinidi-data-integrity = "0.7"
+affinidi-data-integrity = "0.8"
 affinidi-tsp = { workspace = true }
 trust-tasks-rs = { workspace = true }
 trust-tasks-didcomm = { workspace = true }

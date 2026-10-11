@@ -1218,10 +1218,10 @@ fn portal_endpoint_is_the_login_page_on_the_public_origin() {
         sign_in_portal_endpoint("https://dids.example.org/some/path").unwrap(),
         "https://dids.example.org/login"
     );
-    assert_eq!(
-        sign_in_portal_endpoint("http://localhost:8530").unwrap(),
-        "http://localhost:8530/login"
-    );
+    // No plain-http portal, loopback included: the `auth/oob` origin is
+    // `https://` only.
+    assert_eq!(sign_in_portal_endpoint("http://localhost:8530"), None);
+    assert_eq!(sign_in_portal_endpoint("http://dids.example.org"), None);
 }
 
 #[test]
@@ -1248,7 +1248,7 @@ mod https {
     };
     use http_body_util::BodyExt;
 
-    const PORTAL: &str = "http://control.test";
+    const PORTAL: &str = "https://control.test";
 
     async fn post(
         state: &crate::server::AppState,
@@ -1362,13 +1362,13 @@ mod https {
         let starter = key(2);
         let mut refused = vec![
             Some("null"),
-            Some("http://control.test/"),
-            Some("http://control.test/login"),
-            Some("http://CONTROL.test"),
-            Some("http://control.test:8080"),
-            Some("https://control.test"),
-            Some("http://user@control.test"),
-            Some("http://control.test.evil.example"),
+            Some("https://control.test/"),
+            Some("https://control.test/login"),
+            Some("https://CONTROL.test"),
+            Some("https://control.test:8080"),
+            Some("http://control.test"),
+            Some("https://user@control.test"),
+            Some("https://control.test.evil.example"),
             Some("not a url"),
         ];
         refused.push(None);
@@ -1659,4 +1659,113 @@ async fn prove_with_a_different_parent_thread_is_malformed() {
         OobState::Claimed,
         "refused before the attempt counts"
     );
+}
+
+// ---- the wire, against fixtures ----------------------------------------------
+
+/// The generated `auth/oob/*` types read and write exactly what the local
+/// types they replaced did. `testdata/wire.json`'s `outbound` members were
+/// captured from those local types; `inbound` are schema-valid payloads.
+///
+/// Every inbound payload reads into its generated type and writes back
+/// byte-for-byte; every outbound payload is rebuilt through its generated
+/// response type byte-for-byte.
+#[test]
+fn wire_fixtures_round_trip() {
+    use super::types::{read, write};
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
+
+    let fixtures: Value = serde_json::from_str(include_str!("testdata/wire.json")).unwrap();
+
+    fn inbound<T: DeserializeOwned + Serialize>(v: &Value) {
+        let typed = read::<T>(v).unwrap_or_else(|e| panic!("{v}: {e}"));
+        let back = serde_json::to_value(typed).unwrap();
+        assert_eq!(
+            serde_json::to_string(&back).unwrap(),
+            serde_json::to_string(v).unwrap()
+        );
+    }
+    let i = &fixtures["inbound"];
+    inbound::<RequestPayload>(&i["request"]);
+    inbound::<RequestPayload>(&i["requestWithExt"]);
+    inbound::<ClaimPayload>(&i["claim"]);
+    inbound::<RedeemPayload>(&i["redeem"]);
+    inbound::<CancelPayload>(&i["cancel"]);
+    inbound::<IdentifyPayload>(&i["identify"]);
+    inbound::<GrantPayload>(&i["grant"]);
+    inbound::<GrantPayload>(&i["grantDecline"]);
+    inbound::<ProvePayload>(&i["prove"]);
+    inbound::<RespondPayload>(&i["respond"]);
+
+    fn outbound<T: DeserializeOwned + Serialize>(v: &Value) {
+        let built = write::<T>(v.clone()).unwrap_or_else(|e| panic!("{v}: {e}"));
+        assert_eq!(
+            serde_json::to_string(&built).unwrap(),
+            serde_json::to_string(v).unwrap()
+        );
+    }
+    let o = &fixtures["outbound"];
+    outbound::<RequestResponse>(&o["request"]);
+    outbound::<Step1Response>(&o["claim"]);
+    outbound::<Step2Response>(&o["prove"]);
+    outbound::<Step2Response>(&o["proveUnknownNetwork"]);
+    outbound::<RespondResponse>(&o["respondApproved"]);
+    outbound::<RespondResponse>(&o["respondDeclined"]);
+    outbound::<RedeemResponse>(&o["redeem"]);
+    outbound::<RedeemResponse>(&o["redeemNoExt"]);
+    outbound::<CancelResponse>(&o["cancel"]);
+    // The portal origin is `https://` only, on the way in and out.
+    let mut http_grant = i["grant"].clone();
+    http_grant["origin"] = json!("http://control.test");
+    assert!(read::<GrantPayload>(&http_grant).is_err());
+    let mut http_step1 = o["claim"].clone();
+    http_step1["origin"] = json!("http://control.test");
+    assert!(write::<Step1Response>(http_step1).is_err());
+
+    // What the schema refuses stays refused: no member it does not name, no
+    // `purpose` or `mode` it does not list, no malformed request id.
+    let mut extra = i["identify"].clone();
+    extra["ext"] = json!({});
+    assert!(read::<IdentifyPayload>(&extra).is_err());
+    assert!(read::<RequestPayload>(&json!({"purpose": "stepUp", "mode": "scan"})).is_err());
+    assert!(read::<ClaimPayload>(&json!({"requestId": "short"})).is_err());
+}
+
+/// A `prove` refused by its member checks answers no sooner than the floor,
+/// whether its `identify` issuer is a stranger (refused on an ACL lookup) or
+/// a member whose proof fails after resolution: the time says nothing about
+/// ACL membership. Success is not held.
+#[tokio::test]
+async fn a_refused_prove_is_held_to_the_floor() {
+    use std::time::Instant;
+    let floor = Duration::from_millis(400);
+    let run = async |signer: Option<u8>| {
+        let mut w = world();
+        w.svc.config.prove_refusal_floor = floor;
+        let rid = w.request().await;
+        w.claim(&rid).await;
+        let n = w.number(&rid).await;
+        let id = match signer {
+            // A stranger, refused before anything is resolved.
+            Some(seed) => w.identify(&key(seed), &rid, &n, "authentication").await,
+            // The member, but signed for the wrong purpose: resolved, refused.
+            None => w.identify(&w.member, &rid, &n, "assertionMethod").await,
+        };
+        let t = Instant::now();
+        let (status, _) = w.prove_with(id).await;
+        (status, t.elapsed())
+    };
+    for signer in [Some(9), None] {
+        let (status, took) = run(signer).await;
+        assert_eq!(status, 403);
+        assert!(took >= floor, "{signer:?}: answered in {took:?}");
+    }
+    let mut w = world();
+    w.svc.config.prove_refusal_floor = floor;
+    let rid = w.request().await;
+    w.claim(&rid).await;
+    let t = Instant::now();
+    w.prove(&rid).await;
+    assert!(t.elapsed() < floor, "success is not held");
 }

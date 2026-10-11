@@ -273,6 +273,7 @@ mod tests {
             amr: vec!["passkey".into()],
             acr: "aal1".into(),
             acr_expires_at: None,
+            not_after: None,
             token_id: Some("jti".into()),
             session_pubkey_b58btc: pubkey.map(str::to_string),
         }

@@ -892,6 +892,7 @@ pub(crate) async fn run_trust_tasks_envelope(
         state,
         sender,
         None,
+        None,
         &transport,
         doc,
         verifier,
@@ -992,6 +993,14 @@ pub(crate) enum RoutedReply {
     /// Nothing goes on the wire (SPEC §8.1: identity mismatch with no
     /// transport-authenticated sender).
     Suppressed,
+    /// A reply a bound-key row (`ProofRule::BoundKey`) produced whole: a
+    /// success its task signed under its own specification's rule (wallet
+    /// sign-in's step 1 and step 2 for `assertionMethod`, and a step 2 whose
+    /// signed bytes the member's grant is bound to), or an unsigned
+    /// `trust-task-error` in its family's documented shape. [`seal_reply`]
+    /// passes it through untouched — re-signing would break exactly that
+    /// binding — and HTTPS answers with its status, never cached.
+    Sealed(crate::control_tasks::SealedReply),
 }
 
 impl RoutedReply {
@@ -1010,8 +1019,24 @@ impl RoutedReply {
             },
             RoutedReply::Document(value) => Some(value),
             RoutedReply::Suppressed => None,
+            RoutedReply::Sealed(sealed) => sealed.into_document(),
         }
     }
+}
+
+/// What the HTTPS binding knows about the request a document arrived in,
+/// which the document cannot carry: the client address, the headers (a
+/// browser's `Origin`, its `User-Agent`) and the body's size. `None` on the
+/// messaging transports.
+///
+/// Read only by a bound-key row's admission and handler (`ProofRule::
+/// BoundKey`), which is served over HTTPS alone.
+pub(crate) struct HttpsFacts<'a> {
+    /// The client address, as `routes::trust_tasks` resolved it; `None` for a
+    /// direct call with no socket (tests), which shares one bucket.
+    pub ip: Option<std::net::IpAddr>,
+    pub headers: &'a axum::http::HeaderMap,
+    pub body_len: usize,
 }
 
 /// Route one Trust Task document, for **every** transport.
@@ -1032,10 +1057,13 @@ impl RoutedReply {
 /// returned, if this document was large enough to need one — settled below,
 /// once proof verification concludes, against exactly the address it was
 /// charged against.
+// One argument per thing a binding knows; a struct here would only rename them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_trust_task_doc(
     state: &AppState,
     sender: &str,
     bearer: Option<&crate::auth::AuthClaims>,
+    https: Option<&HttpsFacts<'_>>,
     transport: &(impl trust_tasks_rs::TransportHandler + Sync),
     doc: trust_tasks_rs::TrustTask<Value>,
     verifier: &did_hosting_common::server::trust_tasks::TransportBoundVerifier,
@@ -1072,6 +1100,7 @@ pub(crate) async fn dispatch_trust_task_doc(
         state,
         sender,
         bearer,
+        https,
         transport,
         doc,
         verifier,
@@ -1126,6 +1155,7 @@ async fn seal_reply(
             }
         }
         RoutedReply::Suppressed => RoutedReply::Suppressed,
+        sealed @ RoutedReply::Sealed(_) => sealed,
     }
 }
 
@@ -1170,10 +1200,13 @@ pub(crate) async fn sign_reply_doc(
 
 /// The routing half of [`dispatch_trust_task_doc`]; replies are signed by the
 /// caller.
+// One argument per thing a binding knows; a struct here would only rename them.
+#[allow(clippy::too_many_arguments)]
 async fn route_trust_task_doc(
     state: &AppState,
     sender: &str,
     bearer: Option<&crate::auth::AuthClaims>,
+    https: Option<&HttpsFacts<'_>>,
     transport: &(impl trust_tasks_rs::TransportHandler + Sync),
     doc: trust_tasks_rs::TrustTask<Value>,
     verifier: &did_hosting_common::server::trust_tasks::TransportBoundVerifier,
@@ -1181,7 +1214,7 @@ async fn route_trust_task_doc(
 ) -> Result<RoutedReply, DIDCommServiceError> {
     use did_hosting_common::server::trust_tasks::{
         DispatchOutcome, TransportBoundVerifier, TrustTaskContext, dispatch_inbound,
-        verify_sender_bound, verify_sender_bound_approval,
+        verify_bound_key, verify_sender_bound, verify_sender_bound_approval,
     };
 
     let my_vid = state
@@ -1271,7 +1304,16 @@ async fn route_trust_task_doc(
     //      the approver's `assertionMethod` relationship;
     //    - `SessionKey`: a ceremony that mints a session for a key the caller
     //      has just generated, signed by that `did:key` — which has no ACL entry
-    //      of its own; the ceremony names the subject.
+    //      of its own; the ceremony names the subject;
+    //    - `BoundKey(purposes)`: a step of an exchange whose parties are fresh
+    //      Ed25519 `did:key`s the exchange binds (wallet sign-in). HTTPS only.
+    //      The row's admission runs first — its size cap, rate limits and, for
+    //      a browser's step, the origin — before any proof work. Then a proof
+    //      by exactly the issuer's own key, for one of the row's purposes,
+    //      verified locally (`verify_bound_key`); no ACL pre-filter (the key is
+    //      never in the ACL) and no shared replay cache (the row keeps its own,
+    //      which a stranger cannot fill; see `ProofRule::BoundKey`). The row
+    //      then checks that the key is the one the exchange recorded.
     //
     //    Before any signature work — which can mean resolving a DID over the
     //    network — the reported sender must at least *have* an ACL entry: every
@@ -1283,6 +1325,22 @@ async fn route_trust_task_doc(
     //    A document that carries a proof it was not required to carry is held
     //    to the same rule: a proof that is present is verified, never ignored.
     let rule = proof_rule(&type_uri);
+    if let ProofRule::BoundKey(_) = rule {
+        let Some(https) = https else {
+            warn!(sender, %type_uri, "trust task refused: a bound-key exchange is served over HTTPS only");
+            return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
+                doc.reject_with(
+                    format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                    trust_tasks_rs::RejectReason::PermissionDenied {
+                        reason: "this task is served over HTTPS only".into(),
+                    },
+                ),
+            ))));
+        };
+        if let Err(refused) = crate::control_tasks::admit_bound(state, https, &doc).await {
+            return Ok(RoutedReply::Sealed(refused));
+        }
+    }
     let signed = rule != ProofRule::Optional || doc.proof.is_some();
     let needs_acl = matches!(rule, ProofRule::Authentication | ProofRule::AssertionMethod);
     // A session ceremony is signed by a `did:key` the caller holds: as the
@@ -1335,6 +1393,22 @@ async fn route_trust_task_doc(
             ProofRule::AssertionMethod => {
                 verify_sender_bound_approval(&doc, Some(sender), my_vid, verifier).await
             }
+            ProofRule::BoundKey(purposes) => match verify_bound_key(&doc, purposes).await {
+                Ok(issuer) => Ok(issuer),
+                Err(e) => {
+                    did_hosting_common::server::trust_tasks::size::settle_large_document_charge(
+                        &state.large_document_budget,
+                        large_doc_charge.as_ref(),
+                        None,
+                    );
+                    // Not `sender`: here it is the document's own, unverified
+                    // issuer, as long as the caller cares to make it.
+                    warn!(%type_uri, error = %e, "trust task refused: not signed by its bound key");
+                    return Ok(RoutedReply::Sealed(crate::control_tasks::refuse_bound(
+                        state, &doc, &e,
+                    )));
+                }
+            },
             _ => verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await,
         };
         // Settle any large-document charge against this verification's own
@@ -1364,7 +1438,10 @@ async fn route_trust_task_doc(
     // document id. A captured document re-submitted inside the freshness window
     // — on any transport, in any framing — is refused as an id conflict.
     // At its bounds the cache refuses (retryable) rather than forgetting.
-    if signed && let Err(e) = state.replay_cache.check(&principal, &doc.id) {
+    if signed
+        && rule.uses_shared_replay_cache()
+        && let Err(e) = state.replay_cache.check(&principal, &doc.id)
+    {
         warn!(did = %principal, doc_id = %doc.id, %type_uri, ?e, "trust task refused: replay cache");
         let reason = match e {
             did_hosting_common::server::replay::ReplayError::Duplicate => {
@@ -1429,13 +1506,14 @@ async fn route_trust_task_doc(
     let doc = match crate::control_tasks::route(
         state,
         bearer,
+        https,
         transport,
         trust_tasks_rs::ProofPolicy::<TransportBoundVerifier>::AcceptUnverified,
         doc,
     )
     .await
     {
-        Ok(outcome) => return Ok(RoutedReply::Framework(Box::new(outcome))),
+        Ok(reply) => return Ok(reply),
         Err(unclaimed) => *unclaimed,
     };
 

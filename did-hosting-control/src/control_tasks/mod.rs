@@ -19,6 +19,19 @@
 //! here and reads each row's [`ProofRule`]. The handlers authorise on
 //! [`Cx::auth`] — the proven issuer and its ACL role — and never on anything a
 //! transport reported.
+//!
+//! ## Bound-key rows
+//!
+//! The `bound_key` rows (wallet sign-in, `auth/oob/*`) are steps of an
+//! exchange whose parties are fresh Ed25519 `did:key`s the exchange binds,
+//! not DIDs the service knows. Their rule is [`ProofRule::BoundKey`], which
+//! carries the proof purposes each row accepts; the gate admits them through
+//! their family's admission ([`admit_bound`]: size, rate limits, origin),
+//! verifies the proof by the issuer's own key locally, and skips the ACL
+//! pre-filter and the shared replay cache, both of which the family does
+//! itself against its own record. A row's handler is a state machine that
+//! owns its reply documents ([`SealedReply`]): successes signed under its own
+//! specification's rule, errors in its family's documented shape.
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -57,6 +70,7 @@ mod tests;
 
 use trust_tasks_rs::specs::{
     auth::{
+        oob as tt_oob,
         passkey::{
             admin_list as tt_pk_admin_list, enroll as tt_enroll, enroll::invite as tt_invite,
             list as tt_pk_list, login as tt_login, revoke as tt_pk_revoke,
@@ -70,34 +84,51 @@ use trust_tasks_rs::specs::{
     webvh::witness as tt_witness,
 };
 
-/// One row per served task: `module => proof rule, handler;`.
+/// One row per served task: `module => proof rule, handler;`, then the
+/// bound-key rows: `@bound_key(family) { module => purposes, handler; }`.
 ///
 /// Expands to [`TASKS`] — the Type URIs and their proof rules, which the gate
 /// and the tests read — and [`route`], which narrows a document into the
-/// row's generated `Payload` and runs its handler. There is no second list to
-/// keep in step: a task is served exactly when it has a row.
+/// row's generated `Payload` and runs its handler, or hands a bound-key row's
+/// document to its handler whole. There is no second list to keep in step: a
+/// task is served exactly when it has a row.
+///
+/// `family` names the module of the bound-key rows' family: its `admit` runs
+/// before the gate verifies a proof, and its `refuse` renders the gate's
+/// refusal in the family's own error shape ([`admit_bound`], [`refuse_bound`]).
 macro_rules! control_tasks {
-    ($( $($seg:ident)::+ => $rule:ident, $handler:path; )*) => {
+    (
+        $( $($seg:ident)::+ => $rule:ident, $handler:path; )*
+        @bound_key($($fam:ident)::+) {
+            $( $($bseg:ident)::+ => $purposes:expr, $bhandler:path; )*
+        }
+    ) => {
         /// Every Trust Task [`route`] serves, with the proof it requires.
         pub(crate) const TASKS: &[(&str, ProofRule)] = &[
             $( (<$($seg)::+::Payload as trust_tasks_rs::Payload>::TYPE_URI, ProofRule::$rule), )*
+            $( (<$($bseg)::+::Payload as trust_tasks_rs::Payload>::TYPE_URI, ProofRule::BoundKey($purposes)), )*
         ];
 
         /// Run `doc` through its row, or hand it back when no row claims it.
+        ///
+        /// A bound-key row is reached only through the gate's
+        /// [`ProofRule::BoundKey`] arm, which has admitted it and verified its
+        /// proof; `https` is then always present.
         pub(crate) async fn route<V>(
             state: &AppState,
             bearer: Option<&AuthClaims>,
+            https: Option<&crate::messaging::HttpsFacts<'_>>,
             transport: &(impl TransportHandler + Sync),
             policy: ProofPolicy<'_, V>,
             doc: TrustTask<Value>,
-        ) -> Result<DispatchOutcome, Box<TrustTask<Value>>>
+        ) -> Result<crate::messaging::RoutedReply, Box<TrustTask<Value>>>
         where
             V: ProofVerifier + ?Sized,
         {
             let type_uri = doc.type_uri.to_string();
             $(
                 if type_uri == <$($seg)::+::Payload as trust_tasks_rs::Payload>::TYPE_URI {
-                    return Ok(
+                    return Ok(crate::messaging::RoutedReply::Framework(Box::new(
                         serve::<$($seg)::+::Payload, _>(
                             state,
                             bearer,
@@ -108,12 +139,65 @@ macro_rules! control_tasks {
                             $handler,
                         )
                         .await,
-                    );
+                    )));
+                }
+            )*
+            $(
+                if type_uri == <$($bseg)::+::Payload as trust_tasks_rs::Payload>::TYPE_URI {
+                    let Some(https) = https else {
+                        // Unreachable through the gate, which refuses a
+                        // bound-key document on any other transport first.
+                        return Err(Box::new(doc));
+                    };
+                    return Ok(crate::messaging::RoutedReply::Sealed(
+                        $bhandler(state, https, doc).await,
+                    ));
                 }
             )*
             Err(Box::new(doc))
         }
+
+        /// A bound-key row's admission, before the gate does any proof work:
+        /// its family's size, rate and origin checks.
+        pub(crate) async fn admit_bound(
+            state: &AppState,
+            https: &crate::messaging::HttpsFacts<'_>,
+            doc: &TrustTask<Value>,
+        ) -> Result<(), SealedReply> {
+            $($fam)::+::admit(state, https, doc).await
+        }
+
+        /// The gate's refusal of a bound-key row's proof, in its family's
+        /// error shape.
+        pub(crate) fn refuse_bound(
+            state: &AppState,
+            doc: &TrustTask<Value>,
+            error: &did_hosting_common::server::trust_tasks::BoundKeyError,
+        ) -> SealedReply {
+            $($fam)::+::refuse(state, doc, error)
+        }
     };
+}
+
+/// A reply a bound-key row produced whole (`messaging::RoutedReply::Sealed`).
+#[derive(Debug)]
+pub(crate) enum SealedReply {
+    /// A signed success, or an unsigned `trust-task-error`, with the HTTPS
+    /// status its family assigns.
+    Document { status: u16, body: Value },
+    /// The family is not configured on this deployment: a plain-text `503`,
+    /// with no document to address.
+    Unavailable(&'static str),
+}
+
+impl SealedReply {
+    /// The reply document, for a transport with no status codes to carry.
+    pub(crate) fn into_document(self) -> Option<Value> {
+        match self {
+            SealedReply::Document { body, .. } => Some(body),
+            SealedReply::Unavailable(_) => None,
+        }
+    }
 }
 
 control_tasks! {
@@ -192,6 +276,21 @@ control_tasks! {
     tt_pk_admin_list::v0_1 => Authentication, passkey::admin_list;
     tt_pk_revoke::start::v0_2 => Authentication, passkey::revoke_start;
     tt_pk_revoke::finish::v0_2 => Authentication, passkey::revoke_finish;
+
+    // Wallet sign-in with a trigger link: the browser's starter key `K_b`
+    // opens and redeems a request, the wallet's lock key `K_a` claims it and
+    // carries the member's `identify` and `grant` (verified inside the row,
+    // after the ACL check on their issuer, with `TransportBoundVerifier`).
+    // `identify` and `grant` are not rows: they are only ever carried, and
+    // one sent by itself is refused as an unsupported type.
+    @bound_key(crate::oob::http) {
+        tt_oob::request::v0_1 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
+        tt_oob::claim::v0_1 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
+        tt_oob::prove::v0_1 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
+        tt_oob::respond::v0_1 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
+        tt_oob::redeem::v0_1 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
+        tt_oob::cancel::v0_1 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
+    }
 }
 
 /// The proof rule for `type_uri`, when this table serves it.
