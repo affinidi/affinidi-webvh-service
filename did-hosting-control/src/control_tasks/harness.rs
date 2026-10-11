@@ -233,6 +233,7 @@ pub(crate) async fn https(state: &AppState, bearer: Option<AuthClaims>, doc: Val
         bearer,
         axum::extract::State(state.clone()),
         None,
+        &axum::http::HeaderMap::new(),
         axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
     )
     .await

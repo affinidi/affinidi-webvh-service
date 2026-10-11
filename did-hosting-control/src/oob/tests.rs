@@ -1734,3 +1734,41 @@ fn wire_fixtures_round_trip() {
     assert!(read::<RequestPayload>(&json!({"purpose": "stepUp", "mode": "scan"})).is_err());
     assert!(read::<ClaimPayload>(&json!({"requestId": "short"})).is_err());
 }
+
+/// A `prove` refused by its member checks answers no sooner than the floor,
+/// whether its `identify` issuer is a stranger (refused on an ACL lookup) or
+/// a member whose proof fails after resolution: the time says nothing about
+/// ACL membership. Success is not held.
+#[tokio::test]
+async fn a_refused_prove_is_held_to_the_floor() {
+    use std::time::Instant;
+    let floor = Duration::from_millis(400);
+    let run = async |signer: Option<u8>| {
+        let mut w = world();
+        w.svc.config.prove_refusal_floor = floor;
+        let rid = w.request().await;
+        w.claim(&rid).await;
+        let n = w.number(&rid).await;
+        let id = match signer {
+            // A stranger, refused before anything is resolved.
+            Some(seed) => w.identify(&key(seed), &rid, &n, "authentication").await,
+            // The member, but signed for the wrong purpose: resolved, refused.
+            None => w.identify(&w.member, &rid, &n, "assertionMethod").await,
+        };
+        let t = Instant::now();
+        let (status, _) = w.prove_with(id).await;
+        (status, t.elapsed())
+    };
+    for signer in [Some(9), None] {
+        let (status, took) = run(signer).await;
+        assert_eq!(status, 403);
+        assert!(took >= floor, "{signer:?}: answered in {took:?}");
+    }
+    let mut w = world();
+    w.svc.config.prove_refusal_floor = floor;
+    let rid = w.request().await;
+    w.claim(&rid).await;
+    let t = Instant::now();
+    w.prove(&rid).await;
+    assert!(t.elapsed() < floor, "success is not held");
+}

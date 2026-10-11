@@ -224,18 +224,32 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
   invite's token and claim code — plus discovery and `auth/challenge`),
   `Authentication` (operational), `AssertionMethod` (an
   approver's decision), `SessionKey` (a passkey login, signed by the `did:key`
-  its session is bound to). A new task is a new row; never a hand-built reply.
-  `POST /api/trust-tasks` is the HTTPS binding of the same dispatch: the
-  document's proof authorises, a bearer session is optional context.
-- **One temporary exception: `auth/oob/*`** (wallet sign-in with a trigger
-  link, `did-hosting-control/src/oob`). The published `trust-tasks-rs` has no
-  bindings for it yet, so `POST /api/trust-tasks` routes it to its own state
-  machine before the table, HTTPS only, with local types marked
-  `TODO: replace with generated trust-tasks types`. It still verifies with
-  `TransportBoundVerifier` (`identify` for `authentication`, `grant` for
-  `assertionMethod`) and signs every reply; per contract C5 its step 1 and
-  step 2 replies are signed for `assertionMethod`. Move it into the table
-  once `trust_tasks_rs::specs::auth::oob` is published.
+  its session is bound to), `BoundKey(purposes)` (see below). A new task is a
+  new row; never a hand-built reply. `POST /api/trust-tasks` is the HTTPS
+  binding of the same dispatch: the document's proof authorises, a bearer
+  session is optional context.
+- **Bound-key rows: `auth/oob/*`** (wallet sign-in with a trigger link,
+  `did-hosting-control/src/oob`). Its six outer tasks are the
+  `@bound_key(...)` rows of the table, typed with
+  `trust_tasks_rs::specs::auth::oob`. Their issuers are fresh Ed25519
+  `did:key`s the exchange binds (`K_a`, `K_b`), never in the ACL, so
+  `ProofRule::BoundKey` differs from the other rules in exactly these ways,
+  and no others: HTTPS only; any bearer session is ignored; the family's
+  admission (size, per-address and global limits, the portal `Origin` on
+  `request`) runs before any proof work; the proof must be by the issuer's
+  own key for a purpose the row lists, verified locally
+  (`verify_bound_key`); no ACL pre-filter; and no shared replay cache — the
+  state machine keeps its own, recorded only for a live request, because a
+  stranger can mint keys for free and the shared cache fails closed for every
+  task. The row's state machine then checks the key is the one the request
+  recorded, the envelope, and the members' documents (`identify` for
+  `authentication`, `grant` for `assertionMethod`, via
+  `TransportBoundVerifier`, after an ACL check on the issuer string). Its
+  replies are `RoutedReply::Sealed`: signed by the row (step 1 and step 2 for
+  `assertionMethod`, per contract C5; the step 2 bytes are bound into the
+  grant), so the router does not re-sign them. Don't give `BoundKey` to a
+  task whose signer is a DID the service knows; that is what the other rules
+  are for.
 - **Two passkey stores.** Login (`purpose: session`) passkeys live in
   `KS_SESSIONS`; step-up-only passkeys in `KS_PASSKEY_STEP_UP`. The login
   ceremony reads `KS_SESSIONS` only — never make it read both. Enrolment

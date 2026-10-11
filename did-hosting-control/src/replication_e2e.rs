@@ -253,6 +253,7 @@ impl Fleet {
                     None,
                     axum::extract::State(self.control.clone()),
                     None,
+                    &axum::http::HeaderMap::new(),
                     axum::body::Bytes::from(serde_json::to_vec(&reply).unwrap()),
                 )
                 .await

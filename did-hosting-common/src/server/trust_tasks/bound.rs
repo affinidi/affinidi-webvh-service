@@ -260,6 +260,90 @@ where
     Ok(issuer.to_string())
 }
 
+/// Why a document failed [`verify_bound_key`].
+#[derive(Debug, thiserror::Error)]
+pub enum BoundKeyError {
+    /// The issuer is not an Ed25519 `did:key`. Decided from the identifier
+    /// alone, before any proof work.
+    #[error("the issuer must be an Ed25519 did:key")]
+    KeyUnsupported,
+    #[error("document carries no proof; a signed document is required")]
+    MissingProof,
+    /// The proof names a key other than the one the issuer string encodes.
+    #[error("the proof's verificationMethod is not the issuer's own key")]
+    NotIssuerKey,
+    #[error("proofPurpose {0} is not one this task accepts")]
+    Purpose(String),
+    #[error("proof verification failed: {0}")]
+    Proof(#[from] VerificationError),
+}
+
+impl BoundKeyError {
+    /// The framework rejection this failure is reported as, for a caller with
+    /// no family code of its own to map it onto.
+    pub fn reject_reason(&self) -> RejectReason {
+        match self {
+            BoundKeyError::MissingProof => RejectReason::ProofRequired,
+            BoundKeyError::KeyUnsupported => RejectReason::PermissionDenied {
+                reason: self.to_string(),
+            },
+            _ => RejectReason::ProofInvalid {
+                reason: self.to_string(),
+            },
+        }
+    }
+}
+
+/// The verifier for [`verify_bound_key`]: keys come from the `did:key`
+/// identifier itself, so nothing is resolved and nothing leaves the process.
+fn did_key_verifier() -> &'static TransportBoundVerifier {
+    static VERIFIER: std::sync::OnceLock<TransportBoundVerifier> = std::sync::OnceLock::new();
+    VERIFIER.get_or_init(|| {
+        TransportBoundVerifier::with_resolver(std::sync::Arc::new(
+            affinidi_data_integrity::DidKeyResolver,
+        ))
+    })
+}
+
+/// Verify a document signed by a fresh key its exchange binds, rather than by
+/// a DID the service knows (`ProofRule::BoundKey`). Returns the issuer.
+///
+/// In this order, all decided locally with no DID resolution and no I/O:
+///
+/// 1. the in-band `issuer` is an Ed25519 `did:key` (anything else is
+///    [`BoundKeyError::KeyUnsupported`], from the identifier alone);
+/// 2. there is a proof, and its `verificationMethod` is exactly
+///    `{issuer}#{multikey}` — the key the issuer string encodes;
+/// 3. its `proofPurpose` is one of `purposes`;
+/// 4. the signature verifies, bound to that purpose.
+///
+/// What this does not decide is whether the key is *the* key: that is the
+/// exchange's own record (a sign-in request's starter or lock key), which
+/// only the task's handler holds. Recipient, freshness and replay are the
+/// handler's too, for the same reason — see `ProofRule::BoundKey`.
+pub async fn verify_bound_key<P>(
+    doc: &TrustTask<P>,
+    purposes: &[&str],
+) -> Result<String, BoundKeyError>
+where
+    P: Serialize + Send + Sync,
+{
+    let issuer = doc.issuer.as_deref().unwrap_or_default();
+    let multikey = issuer
+        .strip_prefix("did:key:")
+        .filter(|mk| crate::server::auth::session::is_ed25519_multikey(mk))
+        .ok_or(BoundKeyError::KeyUnsupported)?;
+    let proof = doc.proof.as_ref().ok_or(BoundKeyError::MissingProof)?;
+    if proof.verification_method != format!("{issuer}#{multikey}") {
+        return Err(BoundKeyError::NotIssuerKey);
+    }
+    if !purposes.contains(&proof.proof_purpose.as_str()) {
+        return Err(BoundKeyError::Purpose(proof.proof_purpose.clone()));
+    }
+    trust_tasks_rs::ProofVerifier::verify(did_key_verifier(), doc).await?;
+    Ok(issuer.to_string())
+}
+
 /// Sign an unsigned document (no `proof`) with `signer`, returning it with the
 /// proof attached. `eddsa-jcs-2022`, `proofPurpose: authentication` — the
 /// operational purpose [`verify_sender_bound`] requires. `signer` must be one
@@ -353,6 +437,56 @@ mod tests {
         let (did, secret) = signer(seed);
         let doc = build_request(TYPE, &did, to, json!({ "mnemonic": "alice" })).unwrap();
         (did.clone(), sign_document(&doc, &secret).await.unwrap())
+    }
+
+    const PURPOSES: &[&str] = &["authentication", "assertionMethod"];
+
+    #[tokio::test]
+    async fn a_bound_key_document_verifies_locally_to_its_issuer() {
+        let (did, doc) = signed_by(3, ME).await;
+        assert_eq!(verify_bound_key(&doc, PURPOSES).await.unwrap(), did);
+    }
+
+    #[tokio::test]
+    async fn a_bound_key_document_is_refused_for_a_purpose_its_task_does_not_list() {
+        let (_, doc) = signed_by(3, ME).await;
+        assert!(matches!(
+            verify_bound_key(&doc, &["assertionMethod"]).await,
+            Err(BoundKeyError::Purpose(p)) if p == "authentication"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_bound_key_document_must_be_signed_by_the_key_its_issuer_names() {
+        // Not a did:key: refused from the identifier, before any proof work.
+        let (_, mut doc) = signed_by(3, ME).await;
+        doc.issuer = Some("did:web:example.com".into());
+        assert!(matches!(
+            verify_bound_key(&doc, PURPOSES).await,
+            Err(BoundKeyError::KeyUnsupported)
+        ));
+        // Another did:key's proof on this issuer.
+        let (other, _) = signed_by(4, ME).await;
+        let (_, mut doc) = signed_by(3, ME).await;
+        doc.issuer = Some(other);
+        assert!(matches!(
+            verify_bound_key(&doc, PURPOSES).await,
+            Err(BoundKeyError::NotIssuerKey)
+        ));
+        // Tampered after signing.
+        let (_, mut doc) = signed_by(3, ME).await;
+        doc.id = "urn:uuid:tampered".into();
+        assert!(matches!(
+            verify_bound_key(&doc, PURPOSES).await,
+            Err(BoundKeyError::Proof(_))
+        ));
+        // No proof.
+        let (_, mut doc) = signed_by(3, ME).await;
+        doc.proof = None;
+        assert!(matches!(
+            verify_bound_key(&doc, PURPOSES).await,
+            Err(BoundKeyError::MissingProof)
+        ));
     }
 
     #[tokio::test]

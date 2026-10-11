@@ -60,8 +60,8 @@ pub mod transport;
 pub mod verifier;
 
 pub use bound::{
-    BoundError, identity_signing_secret, sign_document, verify_sender_bound,
-    verify_sender_bound_approval,
+    BoundError, BoundKeyError, identity_signing_secret, sign_document, verify_bound_key,
+    verify_sender_bound, verify_sender_bound_approval,
 };
 pub use transport::{TSP_BINDING_URI, TspTransportHandler};
 pub use verifier::{TransportBoundVerifier, build_verifier, is_unreachable};
@@ -159,6 +159,41 @@ pub enum ProofRule {
     /// no ACL entry of its own — the ceremony names the subject, and the
     /// session it mints is bound to that key.
     SessionKey,
+    /// A step of an exchange whose parties are keys the exchange itself
+    /// binds — fresh Ed25519 `did:key`s generated for one exchange and used
+    /// nowhere else (wallet sign-in's starter key `K_b` and lock key `K_a`).
+    /// The value is the proof purposes the task accepts.
+    ///
+    /// Such a key has no standing of its own: it is never in the ACL, so
+    /// there is no ACL pre-filter, and authority comes only from the
+    /// exchange's record of which key may take which step. The gate requires
+    /// an Ed25519 `did:key` issuer and a proof by exactly that key, for one of
+    /// the listed purposes, verified locally with no DID resolution
+    /// ([`verify_bound_key`]). Whether it is *the* key, and the document's
+    /// recipient, freshness and `(issuer, id)` replay, are the task's own
+    /// checks: the shared replay cache is not used, because keys like these
+    /// cost nothing to mint, and a stranger filling a shared cache would lock
+    /// every other task out (it fails closed). The task's own cache records an
+    /// id only once the document concerns a live exchange.
+    ///
+    /// No bearer session takes part: a bound-key task is served exactly as if
+    /// none were sent ([`Self::admits_bearer`]).
+    BoundKey(&'static [&'static str]),
+}
+
+impl ProofRule {
+    /// Whether a bearer session sent with the document is context for it.
+    /// `false` only for [`Self::BoundKey`], whose exchange is the only
+    /// authority.
+    pub fn admits_bearer(self) -> bool {
+        !matches!(self, ProofRule::BoundKey(_))
+    }
+
+    /// Whether the gate keys the shared replay cache on `(issuer, id)` for
+    /// this task. `false` only for [`Self::BoundKey`] (see there).
+    pub fn uses_shared_replay_cache(self) -> bool {
+        !matches!(self, ProofRule::BoundKey(_))
+    }
 }
 
 /// Result of [`dispatch_inbound`]. The calling transport (HTTPS or

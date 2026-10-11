@@ -11,17 +11,16 @@
 //! through [`OobEnv`], so the tests drive the real checks with `did:key`
 //! members and a fake clock.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use affinidi_data_integrity::DidKeyResolver;
 use async_trait::async_trait;
-use did_hosting_common::server::auth::session::is_ed25519_multikey;
-use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
+use did_hosting_common::server::trust_tasks::{
+    BoundKeyError, TransportBoundVerifier, verify_bound_key,
+};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use trust_tasks_rs::{ProofVerifier, TrustTask};
+use trust_tasks_rs::TrustTask;
 
 use super::store::{CreateError, OobRecord, OobStore, PollRefused, SeenError};
 use super::types::*;
@@ -35,11 +34,31 @@ pub const MAX_DOCUMENT_AGE_SECS: u64 = 300;
 pub const CLOCK_SKEW_SECS: u64 = 60;
 /// How long a document id is remembered: longer than it is acceptable.
 pub const SEEN_ID_TTL_SECS: u64 = 600;
+/// The least time a `prove` refused by its member checks takes to answer.
+///
+/// Those checks look the `identify` issuer up in the ACL before anything is
+/// resolved, so a stranger is refused at the cost of a key lookup while a
+/// member's DID is resolved (often over the network) before its proof fails.
+/// Unpadded, the difference in response time says whether a DID is in the
+/// ACL. Every refusal from those checks is held to this floor instead, which
+/// covers an ordinary resolution; a resolution slower than the floor still
+/// shows. The successful path is not held: only a member's own key reaches
+/// it.
+pub const PROVE_REFUSAL_FLOOR: Duration = Duration::from_secs(2);
 /// Longest accepted document `id`, bytes. Ids are remembered for replay
 /// checks, so an unbounded id would let anyone grow that cache by its size.
 pub const MAX_DOCUMENT_ID_LEN: usize = 128;
 /// The `amr` of a session this flow creates (base design 7.6).
 pub const OOB_AMR: [&str; 3] = ["did", "oob", "uv"];
+/// The proof purposes a `K_a` or `K_b` document may be signed for: the
+/// purposes of the `auth/oob/*` rows (`ProofRule::BoundKey`).
+///
+/// The keys are `did:key`s, which list their one key under every
+/// relationship, so the purpose says nothing about the key; it is bounded to
+/// the two any client uses: this console's starter signs for
+/// `authentication`, the reference starter (`@openvtc/rp-sdk`) for
+/// `assertionMethod`, and the wallet's lock key for `authentication`.
+pub const KEY_PURPOSES: &[&str] = &["authentication", "assertionMethod"];
 
 /// What the deployment supplies.
 #[async_trait]
@@ -77,6 +96,8 @@ pub struct OobConfig {
     pub redeem_hold: Duration,
     /// Open `redeem` polls per client address.
     pub max_polls_per_ip: usize,
+    /// [`PROVE_REFUSAL_FLOOR`].
+    pub prove_refusal_floor: Duration,
 }
 
 impl OobConfig {
@@ -90,6 +111,7 @@ impl OobConfig {
             session_limit_secs: 8 * 3600,
             redeem_hold: Duration::from_secs(25),
             max_polls_per_ip: 8,
+            prove_refusal_floor: PROVE_REFUSAL_FLOOR,
         }
     }
 }
@@ -154,8 +176,6 @@ pub enum OobReply {
 pub struct OobService {
     pub config: OobConfig,
     store: OobStore,
-    /// Verifies `K_a` / `K_b` documents locally, with no I/O.
-    key_verifier: TransportBoundVerifier,
 }
 
 impl OobService {
@@ -181,7 +201,6 @@ impl OobService {
         Self {
             config,
             store: OobStore::new(),
-            key_verifier: TransportBoundVerifier::with_resolver(Arc::new(DidKeyResolver)),
         }
     }
 
@@ -378,10 +397,15 @@ impl OobService {
         self.fresh(env, &doc)?;
 
         // From here every failure declines the request.
+        let started = tokio::time::Instant::now();
         let outcome = self.prove_checks(env, &rec, identify_raw).await;
         let (identify_did, identify_payload) = match outcome {
             Ok(v) => v,
-            Err(err) => return Err(self.decline(env, &rec, err, "auth/oob/prove")),
+            Err(err) => {
+                let err = self.decline(env, &rec, err, "auth/oob/prove");
+                tokio::time::sleep_until(started + self.config.prove_refusal_floor).await;
+                return Err(err);
+            }
         };
         // 5. The number.
         if rec.match_number.as_deref() != Some(identify_payload.entered_number.as_str()) {
@@ -717,8 +741,8 @@ impl OobService {
     // ---- helpers ------------------------------------------------------------
 
     /// Parse, check the envelope, and verify a document issued and signed by
-    /// an Ed25519 `did:key` (`K_a` or `K_b`). Anything else is
-    /// `keyUnsupported`.
+    /// an Ed25519 `did:key` (`K_a` or `K_b`), for one of [`KEY_PURPOSES`].
+    /// Any other issuer is `keyUnsupported`.
     async fn key_doc<P: DeserializeOwned>(
         &self,
         env: &dyn OobEnv,
@@ -728,28 +752,20 @@ impl OobService {
         let doc: TrustTask<Value> = serde_json::from_value(raw.clone())
             .map_err(|_| OobError::malformed("not a Trust Task document"))?;
         self.envelope(env, &doc, type_uri)?;
-        let issuer = doc.issuer.as_deref().unwrap_or_default();
-        let Some(multikey) = issuer.strip_prefix("did:key:") else {
-            return Err(OobError::new(
-                OobErrorCode::KeyUnsupported,
-                "Ed25519 did:key only",
-            ));
-        };
-        if !is_ed25519_multikey(multikey) {
-            return Err(OobError::new(
-                OobErrorCode::KeyUnsupported,
-                "Ed25519 did:key only",
-            ));
-        }
-        let Some(proof) = &doc.proof else {
-            return Err(OobError::not_authorized());
-        };
-        if proof.verification_method != format!("{issuer}#{multikey}") {
-            return Err(OobError::not_authorized());
-        }
-        if let Err(e) = ProofVerifier::verify(&self.key_verifier, &doc).await {
-            tracing::debug!(error = %e, "auth/oob key proof refused");
-            return Err(OobError::not_authorized());
+        // The same check the gate makes for a bound-key row, made again here
+        // so the state machine never depends on its caller having made it.
+        match verify_bound_key(&doc, KEY_PURPOSES).await {
+            Ok(_) => {}
+            Err(BoundKeyError::KeyUnsupported) => {
+                return Err(OobError::new(
+                    OobErrorCode::KeyUnsupported,
+                    "Ed25519 did:key only",
+                ));
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "auth/oob key proof refused");
+                return Err(OobError::not_authorized());
+            }
         }
         let payload: P = serde_json::from_value(doc.payload.clone())
             .map_err(|e| OobError::malformed(format!("payload: {e}")))?;

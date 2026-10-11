@@ -168,6 +168,7 @@ pub(crate) async fn run_tsp_trust_task(
         state,
         sender,
         None,
+        None,
         &transport,
         doc,
         verifier,
