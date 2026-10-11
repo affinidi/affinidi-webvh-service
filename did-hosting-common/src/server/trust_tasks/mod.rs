@@ -137,7 +137,11 @@ pub fn build_dispatcher() -> Dispatcher<TypedInbound> {
 ///
 /// One value per row of a service's dispatch table, so the gate that reads it
 /// and the table that serves the task cannot disagree about a task.
+///
+/// `#[non_exhaustive]`: a rule is added when a family needs one
+/// (`BoundKey` was), so a `match` outside this crate needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProofRule {
     /// A request that authorises nothing and that a peer with no key yet must
     /// be able to send: accepted unsigned. A proof that is present is still
