@@ -162,6 +162,23 @@ mediator connection) and `POST /api/trust-tasks`, through one dispatch.
   so a resolve that ignored `Cargo.lock` held two `vti-common` copies.
   `--locked` is still the recommended way to install.
 
+### Added — a self-check that the server DID lists what wallet sign-in needs
+
+- Wallet sign-in (`auth/oob/*`, contract C4) needs the server's own DID to
+  list `SignInPortal` (`<origin>/login`), `TrustTaskHTTPS` (`<origin>/api`)
+  and `WebVHHosting` (`{ "uri": "<public_url>" }`). A DID minted from a
+  template without them left wallets saying only "This code can't be used".
+- At startup the control plane (and the daemon) resolves its own DID in the
+  background and, if any are missing or wrong, logs one warning with the exact
+  JSON entries to add and `pnm did-mgmt dids edit --did <server_did>`. It
+  re-checks every 5 minutes (every minute while resolution fails), so a fix is
+  picked up without a restart. Startup never waits on it.
+- New unauthenticated `GET /api/sign-in/readiness` returns
+  `{"walletSignIn": "ready" | "not-set-up" | "unknown"}` plus, when not set
+  up, the missing service types. The login page reads it: when not set up it
+  says which services the DID lacks and opens the older logins; a failed or
+  pending check keeps wallet sign-in offered.
+
 ### Fixed — an already-deleted message no longer logs a deletion-handler warning
 
 Takes affinidi-messaging-sdk 0.30.1 (and, through the lock, mediator-common

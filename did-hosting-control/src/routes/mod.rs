@@ -6,6 +6,9 @@
 //! surface beside it. What else stays plain HTTP:
 //!
 //! - `GET /api/health`, the unauthenticated liveness probe;
+//! - `GET /api/sign-in/readiness`, whether this server's DID lists the
+//!   services wallet sign-in needs (`crate::sign_in_readiness`), read by the
+//!   login page;
 //! - `POST /api/auth/challenge`, which mints the challenge every sign-in
 //!   completes over the Trust Task surface (`auth/authenticate/0.2` for the
 //!   VTI Wallet extension, which this deployment cannot re-version; `0.3` for
@@ -58,6 +61,10 @@ pub fn router_without_fallback() -> Router<AppState> {
             post(auth::challenge).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT_BYTES)),
         )
         .route("/api/health", get(health::health))
+        .route(
+            "/api/sign-in/readiness",
+            get(crate::sign_in_readiness::readiness_endpoint),
+        )
 }
 
 /// Build the full control plane router with UI fallback (standalone mode).

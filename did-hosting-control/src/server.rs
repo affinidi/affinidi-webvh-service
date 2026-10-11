@@ -593,6 +593,10 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         crate::outbox::run_outbox_loop(outbox_state, outbox_notify, outbox_shutdown_rx).await;
     });
 
+    // 7. Check, in the background, that our own DID lists the services
+    // wallet sign-in needs; warn once with the fix if not. Never blocks.
+    crate::sign_in_readiness::spawn(&state);
+
     // Wait for shutdown signal
     init::shutdown_signal().await;
 

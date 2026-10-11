@@ -1482,6 +1482,10 @@ async fn build_control(
     // Seed registry from static config
     did_hosting_control::server::seed_registry(&state).await;
 
+    // Mirrors `did_hosting_control::server`: check in the background that the
+    // daemon's DID lists the services wallet sign-in needs. Never blocks.
+    did_hosting_control::sign_in_readiness::spawn(&state);
+
     // In daemon mode, no outbound ATM is needed — there are no external
     // servers to sync with.  The server_push::notify_servers_* functions
     // gracefully no-op when state.atm is None.

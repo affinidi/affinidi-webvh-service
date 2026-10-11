@@ -247,6 +247,7 @@ APIs are operator-facing and benefit from a clean URL boundary.
 | ---- | ----------- | ------ |
 | `/api/health` | Combined health endpoint | server / control |
 | `/api/trust-tasks` | Every management operation, as a signed Trust Task (the HTTPS binding) | control plane |
+| `/api/sign-in/readiness` | Whether the service DID lists the services wallet sign-in needs (read by the login page) | control plane |
 | `/api/auth/challenge`, `/api/auth/`, `/api/auth/refresh` | Browser SIOPv2 sign-in and console session refresh | control plane |
 | `/{mnemonic}/did.jsonl` | Public DID resolution | server |
 | `/.well-known/did.jsonl` | Service-DID resolution | server |
