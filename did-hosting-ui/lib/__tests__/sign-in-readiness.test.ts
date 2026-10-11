@@ -32,24 +32,42 @@ describe("sign-in readiness", () => {
     const r = await fetchSignInReadiness(
       fakeFetch(200, {
         walletSignIn: "not-set-up",
-        missingServices: ["SignInPortal", "TrustTaskHTTPS", "WebVHHosting"],
+        missingServices: ["SignInPortal", "TrustTaskHTTPS"],
+        missingRecommended: ["WebVHHosting"],
       }),
       BASE,
     );
     expect(offersWalletSignIn(r)).toBe(false);
+    // The recommended service is not part of the note.
     expect(notSetUpNote(r)).toBe(
       "Wallet sign-in isn't set up on this server yet: its DID doesn't list " +
-        "SignInPortal, TrustTaskHTTPS and WebVHHosting.",
+        "SignInPortal and TrustTaskHTTPS.",
     );
+  });
+
+  it("still offers it, with no note, when only WebVHHosting is missing", async () => {
+    const r = await fetchSignInReadiness(
+      fakeFetch(200, { walletSignIn: "ready", missingRecommended: ["WebVHHosting"] }),
+      BASE,
+    );
+    expect(offersWalletSignIn(r)).toBe(true);
+    expect(notSetUpNote(r)).toBeNull();
+    expect(r).toEqual({ walletSignIn: "ready", missingRecommended: ["WebVHHosting"] });
+  });
+
+  it("does not let a recommended service alone hide sign-in", () => {
+    // An answer naming only WebVHHosting as required is not a valid not-set-up.
+    const r = parseReadiness({ walletSignIn: "not-set-up", missingServices: ["WebVHHosting"] });
+    expect(offersWalletSignIn(r)).toBe(true);
   });
 
   it("lists only the missing services, in a fixed order", () => {
     expect(
       notSetUpNote(
-        parseReadiness({ walletSignIn: "not-set-up", missingServices: ["WebVHHosting", "SignInPortal"] }),
+        parseReadiness({ walletSignIn: "not-set-up", missingServices: ["TrustTaskHTTPS", "SignInPortal"] }),
       ),
     ).toBe(
-      "Wallet sign-in isn't set up on this server yet: its DID doesn't list SignInPortal and WebVHHosting.",
+      "Wallet sign-in isn't set up on this server yet: its DID doesn't list SignInPortal and TrustTaskHTTPS.",
     );
     expect(
       notSetUpNote(parseReadiness({ walletSignIn: "not-set-up", missingServices: ["TrustTaskHTTPS"] })),

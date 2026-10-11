@@ -2,19 +2,27 @@
 //! sign-in (`auth/oob/*`, contract C4) needs?
 //!
 //! A wallet reading a sign-in trigger link resolves the service DID and looks
-//! for three services on it:
+//! for these services on it:
 //!
-//! - `#webvh-hosting`, `WebVHHosting`, `{ "uri": "<public_url>" }`;
-//! - `#trust-tasks`, `TrustTaskHTTPS`, `"<origin>/api"` (where it sends the
-//!   `auth/oob/*` tasks);
 //! - `#sign-in-portal`, `SignInPortal`, `"<origin>/login"` (whose origin it
-//!   compares with the page the link came from).
+//!   compares with the page the link came from) — **required**;
+//! - `#trust-tasks`, `TrustTaskHTTPS`, `"<origin>/api"` (where it sends the
+//!   `auth/oob/*` tasks) — **required**;
+//! - `#webvh-hosting`, `WebVHHosting`, `{ "uri": "<public_url>" }` —
+//!   **recommended**. The wallet uses it only to decide whether to offer a
+//!   server it does not know yet the "Use <host> to host your DIDs?" join; a
+//!   person whose wallet already knows the server signs in without it. So a
+//!   missing or wrong `WebVHHosting` never stops the login page offering
+//!   wallet sign-in. This is consistent with CLAUDE.md's rule that a
+//!   mediator-configured node advertises only its messaging transports, not
+//!   `WebVHHosting`: such a node signs in fine, and simply won't be offered
+//!   the wallet join.
 //!
-//! A server DID minted from a template that lacks them serves everything
-//! else perfectly well, and the wallet only says "This code can't be used"
-//! (the `did:webvh:…:webvh.storm.ws` case). So at startup a background task
+//! A server DID minted from a template that lacks the required ones serves
+//! everything else perfectly well, and the wallet only says "This code can't
+//! be used" (the `did:webvh:…:webvh.storm.ws` case). So at startup a background task
 //! resolves the server's own DID with the service's resolver, checks the
-//! latest document, and logs one warning naming what is missing, the exact
+//! latest document, and logs one warning naming what is missing or wrong, the exact
 //! JSON to add (built with the same `did_hosting_common::did::add_*` helpers
 //! a self-managed daemon uses) and the command that publishes the fix. It
 //! re-checks every [`RECHECK_INTERVAL`], so a fix is picked up without a
@@ -23,7 +31,7 @@
 //! The result is also served, read-only and unauthenticated, at
 //! `GET /api/sign-in/readiness` ([`readiness_endpoint`]): the login page
 //! reads it to decide whether to offer wallet sign-in. It names only the
-//! service types that are missing or wrong, which anyone can already read
+//! service types that are missing or wrong (required and recommended apart), which anyone can already read
 //! from the public DID document. A failed resolution is reported as
 //! `unknown`, never as missing, and the page then still offers the sign-in:
 //! a transient failure must not hide it.
@@ -56,42 +64,49 @@ pub const RETRY_INTERVAL: Duration = Duration::from_secs(60);
 /// the DID (the daemon) is up first.
 const FIRST_CHECK_DELAY: Duration = Duration::from_secs(5);
 
-/// A service wallet sign-in needs on the server's DID document.
+/// A service wallet sign-in reads on the server's DID document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RequiredService {
+pub enum SignInService {
     SignInPortal,
     TrustTaskHttps,
     WebVhHosting,
 }
 
-impl RequiredService {
+impl SignInService {
     /// In the order the warning and the login page list them.
-    pub const ALL: [RequiredService; 3] = [
-        RequiredService::SignInPortal,
-        RequiredService::TrustTaskHttps,
-        RequiredService::WebVhHosting,
+    pub const ALL: [SignInService; 3] = [
+        SignInService::SignInPortal,
+        SignInService::TrustTaskHttps,
+        SignInService::WebVhHosting,
     ];
 
     /// The service `type`.
     pub fn type_name(self) -> &'static str {
         match self {
-            RequiredService::SignInPortal => SERVICE_TYPE_SIGN_IN_PORTAL,
-            RequiredService::TrustTaskHttps => "TrustTaskHTTPS",
-            RequiredService::WebVhHosting => "WebVHHosting",
+            SignInService::SignInPortal => SERVICE_TYPE_SIGN_IN_PORTAL,
+            SignInService::TrustTaskHttps => "TrustTaskHTTPS",
+            SignInService::WebVhHosting => "WebVHHosting",
         }
+    }
+
+    /// Whether sign-in fails without it. `WebVHHosting` is only recommended:
+    /// it decides whether a wallet that does not know this server offers to
+    /// add it, nothing more.
+    pub fn is_required(self) -> bool {
+        !matches!(self, SignInService::WebVhHosting)
     }
 
     /// The `id` fragment the `add_*` helpers give it.
     fn fragment(self) -> &'static str {
         match self {
-            RequiredService::SignInPortal => "#sign-in-portal",
-            RequiredService::TrustTaskHttps => "#trust-tasks",
-            RequiredService::WebVhHosting => "#webvh-hosting",
+            SignInService::SignInPortal => "#sign-in-portal",
+            SignInService::TrustTaskHttps => "#trust-tasks",
+            SignInService::WebVhHosting => "#webvh-hosting",
         }
     }
 }
 
-/// What is wrong with one required service.
+/// What is wrong with one service.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Defect {
     /// No service of this type, and none with its `id` either.
@@ -102,23 +117,51 @@ pub enum Defect {
     WrongEndpoint { found: String, expected: String },
 }
 
-/// One required service that is missing or wrong.
+/// One service that is missing or wrong.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Problem {
-    pub service: RequiredService,
+    pub service: SignInService,
     pub defect: Defect,
 }
 
 /// The outcome of a check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Readiness {
-    /// Every required service is present and right.
-    Ready,
-    /// The document resolved, and these services are missing or wrong.
-    NotSetUp(Vec<Problem>),
+    /// The document resolved; these services are missing or wrong (empty
+    /// when all is well). Sign-in is set up unless one of them is required.
+    Checked(Vec<Problem>),
     /// The check could not run (resolution failed, no resolver, no public
     /// URL). Not the same as missing: the sign-in is still offered.
     Unknown(String),
+}
+
+impl Readiness {
+    /// The required services that are missing or wrong.
+    pub fn missing_required(&self) -> Vec<&Problem> {
+        self.problems()
+            .filter(|p| p.service.is_required())
+            .collect()
+    }
+
+    /// The recommended services that are missing or wrong.
+    pub fn missing_recommended(&self) -> Vec<&Problem> {
+        self.problems()
+            .filter(|p| !p.service.is_required())
+            .collect()
+    }
+
+    /// Whether the login page should offer wallet sign-in: yes unless a
+    /// required service is known to be missing or wrong.
+    pub fn offers_sign_in(&self) -> bool {
+        self.missing_required().is_empty()
+    }
+
+    fn problems(&self) -> impl Iterator<Item = &Problem> {
+        match self {
+            Readiness::Checked(p) => p.iter(),
+            Readiness::Unknown(_) => [].iter(),
+        }
+    }
 }
 
 /// The public origin (`scheme://host[:port]`) of `url`, as a browser writes
@@ -148,22 +191,22 @@ impl Expected {
         })
     }
 
-    fn endpoint(&self, service: RequiredService) -> String {
+    fn endpoint(&self, service: SignInService) -> String {
         match service {
-            RequiredService::SignInPortal => format!("{}/login", self.origin),
-            RequiredService::TrustTaskHttps => format!("{}/api", self.origin),
-            RequiredService::WebVhHosting => self.public_url.clone(),
+            SignInService::SignInPortal => format!("{}/login", self.origin),
+            SignInService::TrustTaskHttps => format!("{}/api", self.origin),
+            SignInService::WebVhHosting => self.public_url.clone(),
         }
     }
 
     /// Whether `endpoint` (a string, or an object's `uri`) is acceptable for
     /// `service`.
-    fn accepts(&self, service: RequiredService, endpoint: &Value) -> bool {
+    fn accepts(&self, service: SignInService, endpoint: &Value) -> bool {
         let uri = match (service, endpoint) {
             // `WebVHHosting` is an object carrying `uri` (what a VTA's
             // `servers add` reads), never a bare string.
-            (RequiredService::WebVhHosting, Value::Object(m)) => m.get("uri"),
-            (RequiredService::WebVhHosting, _) => None,
+            (SignInService::WebVhHosting, Value::Object(m)) => m.get("uri"),
+            (SignInService::WebVhHosting, _) => None,
             (_, Value::String(_)) => Some(endpoint),
             (_, Value::Object(m)) => m.get("uri"),
             _ => None,
@@ -176,11 +219,11 @@ impl Expected {
         }
         match service {
             // The base the caller composes `<base>/trust-tasks` from.
-            RequiredService::TrustTaskHttps => {
-                uri.trim_end_matches('/') == self.endpoint(RequiredService::TrustTaskHttps)
+            SignInService::TrustTaskHttps => {
+                uri.trim_end_matches('/') == self.endpoint(SignInService::TrustTaskHttps)
             }
             // A wallet refuses a portal on another origin (`wrong-origin`).
-            RequiredService::SignInPortal | RequiredService::WebVhHosting => {
+            SignInService::SignInPortal | SignInService::WebVhHosting => {
                 origin_of(uri).as_deref() == Some(self.origin.as_str())
             }
         }
@@ -209,7 +252,7 @@ pub fn check_document(doc: &Value, public_url: &str) -> Readiness {
         .unwrap_or_default();
 
     let mut problems = Vec::new();
-    for required in RequiredService::ALL {
+    for required in SignInService::ALL {
         let of_type: Vec<&Value> = services
             .iter()
             .filter(|s| types_of(s).contains(&required.type_name()))
@@ -247,60 +290,83 @@ pub fn check_document(doc: &Value, public_url: &str) -> Readiness {
         });
     }
 
-    if problems.is_empty() {
-        Readiness::Ready
-    } else {
-        Readiness::NotSetUp(problems)
-    }
+    Readiness::Checked(problems)
 }
 
 /// The exact service entry to publish for `service`, built with the same
 /// helper setup uses, so it cannot drift from what a self-managed daemon
 /// writes.
-pub fn fix_entry(server_did: &str, public_url: &str, service: RequiredService) -> Option<Value> {
+pub fn fix_entry(server_did: &str, public_url: &str, service: SignInService) -> Option<Value> {
     let expected = Expected::new(public_url)?;
     let mut doc = json!({ "id": server_did });
     let endpoint = expected.endpoint(service);
     match service {
-        RequiredService::SignInPortal => add_sign_in_portal_service(&mut doc, &endpoint),
-        RequiredService::TrustTaskHttps => add_trust_task_https_service(&mut doc, &endpoint),
-        RequiredService::WebVhHosting => add_webvh_hosting_service(&mut doc, &endpoint),
+        SignInService::SignInPortal => add_sign_in_portal_service(&mut doc, &endpoint),
+        SignInService::TrustTaskHttps => add_trust_task_https_service(&mut doc, &endpoint),
+        SignInService::WebVhHosting => add_webvh_hosting_service(&mut doc, &endpoint),
     }
     doc["service"].as_array()?.first().cloned()
 }
 
-/// The one warning logged when sign-in is not set up: what is missing or
-/// wrong, the JSON to add, and the command that publishes it.
-pub fn warning_text(server_did: &str, public_url: &str, problems: &[Problem]) -> String {
+/// One problem, in words.
+fn describe(p: &Problem) -> String {
+    let name = p.service.type_name();
+    match &p.defect {
+        Defect::Missing => format!("{name} missing"),
+        Defect::WrongType { found } => format!(
+            "the {} service has type {found:?}, not {name}",
+            p.service.fragment()
+        ),
+        Defect::WrongEndpoint { found, expected } => {
+            format!("{name} points at {found:?}, it must be {expected:?}")
+        }
+    }
+}
+
+/// The one warning logged when the DID lacks something: what is missing or
+/// wrong and what that costs, the JSON to add, and the command that
+/// publishes it. Empty `problems` → `None`.
+pub fn warning_text(server_did: &str, public_url: &str, problems: &[Problem]) -> Option<String> {
+    if problems.is_empty() {
+        return None;
+    }
+    let (required, recommended): (Vec<&Problem>, Vec<&Problem>) =
+        problems.iter().partition(|p| p.service.is_required());
+    let list = |ps: &[&Problem]| {
+        ps.iter()
+            .map(|p| describe(p))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
     let mut what = Vec::new();
-    for p in problems {
-        let name = p.service.type_name();
-        what.push(match &p.defect {
-            Defect::Missing => format!("{name} is missing"),
-            Defect::WrongType { found } => format!(
-                "the {} service has type {found:?}, not {name}",
-                p.service.fragment()
-            ),
-            Defect::WrongEndpoint { found, expected } => {
-                format!("{name} points at {found:?}, it must be {expected:?}")
-            }
-        });
+    if !required.is_empty() {
+        what.push(format!(
+            "Wallet sign-in is not set up: the server DID {server_did} does not list the \
+             services wallets need ({}). Wallets will show \"This code can't be used\" until \
+             it does.",
+            list(&required)
+        ));
+    }
+    if !recommended.is_empty() {
+        what.push(format!(
+            "Wallets that don't already know this server won't offer to add it ({}). Sign-in \
+             itself works.",
+            list(&recommended)
+        ));
     }
     let entries: Vec<Value> = problems
         .iter()
         .filter_map(|p| fix_entry(server_did, public_url, p.service))
         .collect();
     let json = serde_json::to_string_pretty(&entries).unwrap_or_default();
-    format!(
-        "wallet sign-in is not set up: the server DID {server_did} does not list the services \
-         wallets need ({}). Wallets will show \"This code can't be used\" until it does. Add \
-         (or replace, by id) these entries in the DID document's \"service\" array:\n{json}\n\
-         then publish the new log entry with:\n  pnm did-mgmt dids edit --did {server_did}\n\
-         (the VTA publishes it to this host). This is re-checked every {} minutes; no restart \
-         is needed.",
-        what.join("; "),
+    Some(format!(
+        "{} Add (or replace, by id) these entries in the DID document's \"service\" array of \
+         {server_did}:\n{json}\nthen publish the new log entry with:\n  \
+         pnm did-mgmt dids edit --did {server_did}\n(the VTA publishes it to this host). This is \
+         re-checked every {} minutes; no restart is needed.",
+        what.join(" "),
         RECHECK_INTERVAL.as_secs() / 60,
-    )
+    ))
 }
 
 /// Resolve the server's own DID afresh and check it.
@@ -355,14 +421,14 @@ fn log_transition(server_did: &str, public_url: &str, previous: &Readiness, now:
         return;
     }
     match now {
-        Readiness::NotSetUp(problems) => {
-            warn!("{}", warning_text(server_did, public_url, problems))
-        }
-        Readiness::Ready => {
-            if matches!(previous, Readiness::NotSetUp(_)) {
-                info!("wallet sign-in: the server DID now lists the services it needs");
+        Readiness::Checked(problems) => match warning_text(server_did, public_url, problems) {
+            Some(text) => warn!("{text}"),
+            None => {
+                if matches!(previous, Readiness::Checked(p) if !p.is_empty()) {
+                    info!("wallet sign-in: the server DID now lists the services it needs");
+                }
             }
-        }
+        },
         Readiness::Unknown(reason) => {
             if !matches!(previous, Readiness::Unknown(_)) {
                 info!(
@@ -403,20 +469,27 @@ pub fn spawn(state: &AppState) {
     });
 }
 
-/// The public body of `GET /api/sign-in/readiness`: the state, and for
-/// `not-set-up` the service types that are missing or wrong. Nothing else.
+/// The public body of `GET /api/sign-in/readiness`: the state; for
+/// `not-set-up` the required service types that are missing or wrong
+/// (`missingServices`); and, in either checked state, the recommended ones
+/// (`missingRecommended`), when there are any. Nothing else.
 pub fn response_body(readiness: &Readiness) -> Value {
-    match readiness {
-        Readiness::Ready => json!({ "walletSignIn": "ready" }),
-        Readiness::Unknown(_) => json!({ "walletSignIn": "unknown" }),
-        Readiness::NotSetUp(problems) => json!({
+    let names = |ps: Vec<&Problem>| -> Vec<&'static str> {
+        ps.iter().map(|p| p.service.type_name()).collect()
+    };
+    let mut body = match readiness {
+        Readiness::Unknown(_) => return json!({ "walletSignIn": "unknown" }),
+        Readiness::Checked(_) if readiness.offers_sign_in() => json!({ "walletSignIn": "ready" }),
+        Readiness::Checked(_) => json!({
             "walletSignIn": "not-set-up",
-            "missingServices": problems
-                .iter()
-                .map(|p| p.service.type_name())
-                .collect::<Vec<_>>(),
+            "missingServices": names(readiness.missing_required()),
         }),
+    };
+    let recommended = names(readiness.missing_recommended());
+    if !recommended.is_empty() {
+        body["missingRecommended"] = json!(recommended);
     }
+    body
 }
 
 /// `GET /api/sign-in/readiness`: the latest self-check result. Reads the
@@ -435,7 +508,7 @@ mod tests {
     const DID: &str = "did:webvh:QmSNo2TJRq5xiiYhHZNrTqoaq8bivffWq4PZXjQQAzvNtr:webvh.storm.ws";
     const URL: &str = "https://webvh.storm.ws";
 
-    fn entry(service: RequiredService) -> Value {
+    fn entry(service: SignInService) -> Value {
         fix_entry(DID, URL, service).unwrap()
     }
 
@@ -444,19 +517,22 @@ mod tests {
     }
 
     fn complete() -> Vec<Value> {
-        RequiredService::ALL.iter().map(|s| entry(*s)).collect()
+        SignInService::ALL.iter().map(|s| entry(*s)).collect()
     }
 
-    fn not_set_up(r: Readiness) -> Vec<Problem> {
+    /// Every problem a check found (required and recommended).
+    fn problems(r: Readiness) -> Vec<Problem> {
         match r {
-            Readiness::NotSetUp(p) => p,
-            other => panic!("expected NotSetUp, got {other:?}"),
+            Readiness::Checked(p) => p,
+            other => panic!("expected Checked, got {other:?}"),
         }
     }
 
+    const READY: Readiness = Readiness::Checked(Vec::new());
+
     #[test]
     fn all_present_is_ready() {
-        assert_eq!(check_document(&doc_with(complete()), URL), Readiness::Ready);
+        assert_eq!(check_document(&doc_with(complete()), URL), READY);
         // With other services around them, and a trailing slash on public_url.
         let mut services = complete();
         services.insert(
@@ -465,7 +541,7 @@ mod tests {
         );
         assert_eq!(
             check_document(&doc_with(services), "https://webvh.storm.ws/"),
-            Readiness::Ready
+            READY
         );
     }
 
@@ -477,12 +553,12 @@ mod tests {
             let t = s["type"].clone();
             s["type"] = json!([t]);
         }
-        assert_eq!(check_document(&doc_with(services), URL), Readiness::Ready);
+        assert_eq!(check_document(&doc_with(services), URL), READY);
     }
 
     #[test]
     fn no_services_lists_all_three_in_order() {
-        let problems = not_set_up(check_document(&json!({ "id": DID }), URL));
+        let problems = problems(check_document(&json!({ "id": DID }), URL));
         let names: Vec<_> = problems.iter().map(|p| p.service.type_name()).collect();
         assert_eq!(names, ["SignInPortal", "TrustTaskHTTPS", "WebVHHosting"]);
         assert!(problems.iter().all(|p| p.defect == Defect::Missing));
@@ -490,14 +566,15 @@ mod tests {
 
     #[test]
     fn each_missing_service_is_named_alone() {
-        for missing in RequiredService::ALL {
+        for missing in SignInService::ALL {
             let services = complete()
                 .into_iter()
                 .filter(|s| s["type"] != missing.type_name())
                 .collect();
-            let problems = not_set_up(check_document(&doc_with(services), URL));
+            let r = check_document(&doc_with(services), URL);
+            assert_eq!(r.offers_sign_in(), !missing.is_required(), "{missing:?}");
             assert_eq!(
-                problems,
+                problems(r),
                 vec![Problem {
                     service: missing,
                     defect: Defect::Missing
@@ -506,7 +583,7 @@ mod tests {
         }
     }
 
-    fn with_endpoint(service: RequiredService, endpoint: Value) -> Vec<Value> {
+    fn with_endpoint(service: SignInService, endpoint: Value) -> Vec<Value> {
         complete()
             .into_iter()
             .map(|mut s| {
@@ -526,12 +603,12 @@ mod tests {
             json!("https://other.example/api"),
             json!("http://webvh.storm.ws/api"),
         ] {
-            let problems = not_set_up(check_document(
-                &doc_with(with_endpoint(RequiredService::TrustTaskHttps, bad.clone())),
+            let problems = problems(check_document(
+                &doc_with(with_endpoint(SignInService::TrustTaskHttps, bad.clone())),
                 URL,
             ));
             assert_eq!(problems.len(), 1, "{bad}");
-            assert_eq!(problems[0].service, RequiredService::TrustTaskHttps);
+            assert_eq!(problems[0].service, SignInService::TrustTaskHttps);
             assert!(matches!(
                 &problems[0].defect,
                 Defect::WrongEndpoint { expected, .. } if expected == "https://webvh.storm.ws/api"
@@ -541,12 +618,12 @@ mod tests {
         assert_eq!(
             check_document(
                 &doc_with(with_endpoint(
-                    RequiredService::TrustTaskHttps,
+                    SignInService::TrustTaskHttps,
                     json!("https://webvh.storm.ws/api/")
                 )),
                 URL
             ),
-            Readiness::Ready
+            READY
         );
     }
 
@@ -558,12 +635,12 @@ mod tests {
             json!("https://webvh.storm.ws:8443/login"),
             json!({"not": "a url"}),
         ] {
-            let problems = not_set_up(check_document(
-                &doc_with(with_endpoint(RequiredService::SignInPortal, bad.clone())),
+            let problems = problems(check_document(
+                &doc_with(with_endpoint(SignInService::SignInPortal, bad.clone())),
                 URL,
             ));
             assert_eq!(problems.len(), 1, "{bad}");
-            assert_eq!(problems[0].service, RequiredService::SignInPortal);
+            assert_eq!(problems[0].service, SignInService::SignInPortal);
             assert!(matches!(problems[0].defect, Defect::WrongEndpoint { .. }));
         }
     }
@@ -574,12 +651,15 @@ mod tests {
             json!("https://webvh.storm.ws"),
             json!({"uri": "https://elsewhere.example"}),
         ] {
-            let problems = not_set_up(check_document(
-                &doc_with(with_endpoint(RequiredService::WebVhHosting, bad.clone())),
+            let r = check_document(
+                &doc_with(with_endpoint(SignInService::WebVhHosting, bad.clone())),
                 URL,
-            ));
+            );
+            // Recommended only: sign-in is still offered.
+            assert!(r.offers_sign_in(), "{bad}");
+            let problems = problems(r);
             assert_eq!(problems.len(), 1, "{bad}");
-            assert_eq!(problems[0].service, RequiredService::WebVhHosting);
+            assert_eq!(problems[0].service, SignInService::WebVhHosting);
         }
     }
 
@@ -594,11 +674,11 @@ mod tests {
                 s
             })
             .collect();
-        let problems = not_set_up(check_document(&doc_with(services), URL));
+        let problems = problems(check_document(&doc_with(services), URL));
         assert_eq!(
             problems,
             vec![Problem {
-                service: RequiredService::SignInPortal,
+                service: SignInService::SignInPortal,
                 defect: Defect::WrongType {
                     found: "LinkedDomains".into()
                 }
@@ -609,17 +689,17 @@ mod tests {
     #[test]
     fn fix_entries_are_what_setup_writes() {
         assert_eq!(
-            entry(RequiredService::WebVhHosting),
+            entry(SignInService::WebVhHosting),
             json!({"id": format!("{DID}#webvh-hosting"), "type": "WebVHHosting",
                    "serviceEndpoint": {"uri": URL}})
         );
         assert_eq!(
-            entry(RequiredService::TrustTaskHttps),
+            entry(SignInService::TrustTaskHttps),
             json!({"id": format!("{DID}#trust-tasks"), "type": "TrustTaskHTTPS",
                    "serviceEndpoint": "https://webvh.storm.ws/api"})
         );
         assert_eq!(
-            entry(RequiredService::SignInPortal),
+            entry(SignInService::SignInPortal),
             json!({"id": format!("{DID}#sign-in-portal"), "type": "SignInPortal",
                    "serviceEndpoint": "https://webvh.storm.ws/login"})
         );
@@ -627,37 +707,68 @@ mod tests {
 
     #[test]
     fn the_warning_has_the_json_and_the_command() {
-        let problems = not_set_up(check_document(&json!({ "id": DID }), URL));
-        let text = warning_text(DID, URL, &problems);
-        assert!(text.contains("SignInPortal is missing"));
-        assert!(text.contains("TrustTaskHTTPS is missing"));
-        assert!(text.contains("WebVHHosting is missing"));
+        let problems = problems(check_document(&json!({ "id": DID }), URL));
+        let text = warning_text(DID, URL, &problems).unwrap();
+        assert!(text.contains("Wallet sign-in is not set up"));
+        assert!(text.contains("SignInPortal missing"));
+        assert!(text.contains("TrustTaskHTTPS missing"));
+        assert!(text.contains("This code can't be used"));
+        assert!(text.contains(
+            "Wallets that don't already know this server won't offer to add it \
+             (WebVHHosting missing)"
+        ));
         let entries: Vec<Value> = problems.iter().map(|p| entry(p.service)).collect();
         assert!(text.contains(&serde_json::to_string_pretty(&entries).unwrap()));
         assert!(text.contains(&format!("pnm did-mgmt dids edit --did {DID}")));
-        assert!(text.contains("This code can't be used"));
     }
 
     #[test]
     fn the_warning_lists_only_what_is_wrong() {
         let problems = vec![Problem {
-            service: RequiredService::TrustTaskHttps,
+            service: SignInService::TrustTaskHttps,
             defect: Defect::WrongEndpoint {
                 found: "https://webvh.storm.ws".into(),
                 expected: "https://webvh.storm.ws/api".into(),
             },
         }];
-        let text = warning_text(DID, URL, &problems);
+        let text = warning_text(DID, URL, &problems).unwrap();
         assert!(text.contains("TrustTaskHTTPS points at \"https://webvh.storm.ws\""));
         assert!(text.contains("#trust-tasks"));
         assert!(!text.contains("#sign-in-portal"));
         assert!(!text.contains("#webvh-hosting"));
+        assert!(!text.contains("won't offer to add it"));
+        // Nothing wrong, nothing to warn about.
+        assert_eq!(warning_text(DID, URL, &[]), None);
+    }
+
+    #[test]
+    fn a_missing_webvh_hosting_alone_warns_softly_and_keeps_sign_in() {
+        let services = complete()
+            .into_iter()
+            .filter(|s| s["type"] != "WebVHHosting")
+            .collect();
+        let r = check_document(&doc_with(services), URL);
+        assert!(r.offers_sign_in());
+        let text = warning_text(DID, URL, &problems(r)).unwrap();
+        assert!(text.starts_with(
+            "Wallets that don't already know this server won't offer to add it \
+             (WebVHHosting missing)."
+        ));
+        assert!(!text.contains("This code can't be used"));
+        assert!(text.contains(
+            &serde_json::to_string_pretty(&[entry(SignInService::WebVhHosting)]).unwrap()
+        ));
+        assert!(text.contains(&format!("pnm did-mgmt dids edit --did {DID}")));
     }
 
     #[test]
     fn unknown_is_not_missing_and_still_offers_sign_in() {
-        let body = response_body(&Readiness::Unknown("resolver timed out".into()));
-        assert_eq!(body, json!({ "walletSignIn": "unknown" }));
+        let unknown = Readiness::Unknown("resolver timed out".into());
+        assert!(unknown.offers_sign_in());
+        assert_eq!(
+            response_body(&unknown),
+            json!({ "walletSignIn": "unknown" })
+        );
         // A public URL the check cannot use is unknown too, not missing.
         assert!(matches!(
             check_document(&json!({ "id": DID }), "not a url"),
@@ -672,26 +783,38 @@ mod tests {
     }
 
     #[test]
-    fn the_endpoint_names_only_the_missing_service_types() {
-        let problems = not_set_up(check_document(
-            &doc_with(vec![entry(RequiredService::WebVhHosting)]),
-            URL,
-        ));
+    fn the_endpoint_separates_required_from_recommended() {
+        // Only WebVHHosting present: the two required ones block.
+        let r = check_document(&doc_with(vec![entry(SignInService::WebVhHosting)]), URL);
+        assert!(!r.offers_sign_in());
         assert_eq!(
-            response_body(&Readiness::NotSetUp(problems)),
+            response_body(&r),
             json!({ "walletSignIn": "not-set-up",
                     "missingServices": ["SignInPortal", "TrustTaskHTTPS"] })
         );
+        // Nothing at all: both lists.
         assert_eq!(
-            response_body(&Readiness::Ready),
-            json!({ "walletSignIn": "ready" })
+            response_body(&check_document(&json!({ "id": DID }), URL)),
+            json!({ "walletSignIn": "not-set-up",
+                    "missingServices": ["SignInPortal", "TrustTaskHTTPS"],
+                    "missingRecommended": ["WebVHHosting"] })
         );
+        // Only WebVHHosting missing: ready, with the recommendation.
+        let services = complete()
+            .into_iter()
+            .filter(|s| s["type"] != "WebVHHosting")
+            .collect();
+        assert_eq!(
+            response_body(&check_document(&doc_with(services), URL)),
+            json!({ "walletSignIn": "ready", "missingRecommended": ["WebVHHosting"] })
+        );
+        assert_eq!(response_body(&READY), json!({ "walletSignIn": "ready" }));
     }
 
     #[test]
     fn a_change_is_recorded_per_did() {
         let did = "did:example:recorded-per-did";
-        record(did, Readiness::Ready);
-        assert_eq!(latest(Some(did)), Readiness::Ready);
+        record(did, READY);
+        assert_eq!(latest(Some(did)), READY);
     }
 }
