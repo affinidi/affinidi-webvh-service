@@ -405,6 +405,7 @@ mod tests {
             amr: Vec::new(),
             acr: String::new(),
             acr_expires_at: None,
+            not_after: None,
         };
         store_session(&state.ks, &session).await.unwrap();
         session_id
@@ -513,6 +514,7 @@ mod tests {
             amr: Vec::new(),
             acr: String::new(),
             acr_expires_at: None,
+            not_after: None,
         };
         store_session(&state.ks, &session).await.unwrap();
         let token = issue(&state, &session_id, "owner", "tok");
@@ -616,6 +618,7 @@ mod tests {
             amr: vec!["did".to_string()],
             acr: "aal2".into(),
             acr_expires_at: None,
+            not_after: None,
         };
         store_session(&state.ks, &session).await.unwrap();
         // Minted while the row was still aal2.
@@ -672,6 +675,7 @@ mod tests {
             amr: vec!["did".to_string()],
             acr: "aal2".into(),
             acr_expires_at: None,
+            not_after: None,
         };
         store_session(&state.ks, &session).await.unwrap();
         let token = issue_with_aal(
@@ -718,6 +722,7 @@ mod tests {
             amr: vec!["did".to_string(), "passkey".to_string()],
             acr: "aal2".into(),
             acr_expires_at: None,
+            not_after: None,
         };
         store_session(&state.ks, &session).await.unwrap();
         let token = issue_with_aal(

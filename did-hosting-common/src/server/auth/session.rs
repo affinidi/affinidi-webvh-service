@@ -527,6 +527,7 @@ pub async fn create_authenticated_session(
         // deadline: our step-up is bounded by the access token's TTL, not by
         // vti-common's read-time downgrade in `resolve_did_session`.
         acr_expires_at: None,
+        not_after: None,
     };
 
     store_session(sessions, &session).await?;
@@ -787,6 +788,7 @@ mod refresh_token_invariant {
             amr: vec!["did".to_string()],
             acr: "aal1".to_string(),
             acr_expires_at: None,
+            not_after: None,
         };
         store_session(&ks, &intrinsic).await.expect("store");
 
@@ -841,6 +843,7 @@ mod demotion_index_tests {
             amr,
             acr: acr.to_string(),
             acr_expires_at: None,
+            not_after: None,
         }
     }
 
