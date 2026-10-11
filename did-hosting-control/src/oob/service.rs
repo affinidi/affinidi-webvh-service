@@ -534,7 +534,9 @@ impl OobService {
         tracing::info!(audit = true, op = "auth/oob/respond", request_id = %rec.request_id, decision = %decision, "sign-in request decided");
         let status = if approve { "approved" } else { "declined" };
         let body = response::<RespondResponse>(json!({ "status": status }))?;
-        self.signed(env, &doc, &issuer, body, OPERATIONAL).await
+        // The wallet checks every reply it receives for `assertionMethod` (C5),
+        // as the VTC signs them.
+        self.signed(env, &doc, &issuer, body, ATTESTATION).await
     }
 
     /// Steps 2 to 5 of 7.5. Any `Err` declines the request.
@@ -730,9 +732,16 @@ impl OobService {
             return Err(OobError::not_authorized());
         }
         self.fresh(env, &doc)?;
+        // To the approver's wallet, `assertionMethod` like its other replies
+        // (C5); to the starter, `authentication` as before.
+        let purpose = if Some(&issuer) == rec.approver_key.as_ref() {
+            ATTESTATION
+        } else {
+            OPERATIONAL
+        };
         let body = response::<CancelResponse>(json!({ "status": "cancelled" }))?;
         if rec.state == OobState::Cancelled {
-            return self.signed(env, &doc, &issuer, body, OPERATIONAL).await;
+            return self.signed(env, &doc, &issuer, body, purpose).await;
         }
         if rec.state.is_final() || rec.state == OobState::Approved {
             return Err(OobError::new(
@@ -750,7 +759,7 @@ impl OobService {
             ));
         }
         tracing::info!(audit = true, op = "auth/oob/cancel", request_id = %rec.request_id, "sign-in request cancelled");
-        self.signed(env, &doc, &issuer, body, OPERATIONAL).await
+        self.signed(env, &doc, &issuer, body, purpose).await
     }
 
     // ---- helpers ------------------------------------------------------------

@@ -33,8 +33,11 @@
 //!    about a live request. Member documents (`identify`, `grant`) are checked
 //!    against the ACL by issuer string before any DID resolution, then
 //!    verified with the shared [`TransportBoundVerifier`]
-//!    (`verify_operational`, `verify_approval`). Every success is signed (step
-//!    1 and step 2 for `assertionMethod`, C5); only errors are unsigned.
+//!    (`verify_operational`, `verify_approval`). Every success is signed:
+//!    replies to the approver's `K_a` (`claim`, `prove`, `respond`, and
+//!    `cancel` from `K_a`) for `assertionMethod` (C5), since the wallet
+//!    checks each one for it; replies to the starter's `K_b` for
+//!    `authentication`. Only errors are unsigned.
 //!
 //! The reply is a `RoutedReply::Sealed`: the router's own sealing would
 //! re-sign it for `authentication`, and the step 2 bytes are bound into the
