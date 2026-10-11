@@ -56,7 +56,9 @@ export function WalletSignIn({
   onUnavailable?: () => void;
 }) {
   const [state, setState] = useState<SignInState>({ status: "idle" });
-  const controller = useRef<SignInController | null>(null);
+  // State, not a ref: creating the controller must re-render, or the
+  // button that needs it stays disabled.
+  const [c, setController] = useState<SignInController | null>(null);
   const tokens = useRef<Tokens | null>(null);
 
   useEffect(() => {
@@ -70,8 +72,11 @@ export function WalletSignIn({
         tokens.current = tokensOf(p);
       },
     });
-    controller.current = c;
-    return () => c.destroy();
+    setController(c);
+    return () => {
+      c.destroy();
+      setController(null);
+    };
   }, [serviceDid]);
 
   useEffect(() => {
@@ -79,7 +84,6 @@ export function WalletSignIn({
   }, [state, onUnavailable]);
 
   if (Platform.OS !== "web") return null;
-  const c = controller.current;
 
   const onContinue = () => {
     const t = tokens.current;
