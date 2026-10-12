@@ -139,7 +139,9 @@ Settings, not files:
 - **Ruleset on `main`:** require a PR, and require `branch rules`.
 - **Ruleset on `nightly`:** block force pushes and deletion; only the
   workflow's identity may update it.
-- **`RELEASE_TOKEN`** (optional, recommended) — a PAT or GitHub App token with
-  contents and pull-requests write and actions read. PRs opened with
-  `GITHUB_TOKEN` trigger no workflows, so without it backport and prep PRs open
-  with no CI: close and reopen them to run it.
+- **`RELEASE_TOKEN`** (required for backports and preps) — a fine-grained PAT
+  or GitHub App token on this repository with contents and pull-requests
+  write and actions read. The enterprise does not allow `GITHUB_TOKEN` to
+  open pull requests, so without it `backport.yml` and `release-prep.yml`
+  fail at the PR step. (A PR opened with `GITHUB_TOKEN` would trigger no CI
+  anyway.) `nightly.yml` and `release-tag.yml` need no secret.

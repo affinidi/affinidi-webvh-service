@@ -41,8 +41,8 @@ jobs:
         run: python3 scripts/prepare-release.py --kind "$KIND" --pr-body "$RUNNER_TEMP/body.md"
       - name: Open the PR
         env:
-          # RELEASE_TOKEN so CI runs on the PR; with GITHUB_TOKEN, close and
-          # reopen it to trigger CI.
+          # RELEASE_TOKEN: the enterprise does not allow GITHUB_TOKEN to open
+          # pull requests, and one it opened would run no CI (RELEASES.md).
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           BASE: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
