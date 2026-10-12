@@ -41,7 +41,7 @@ import {
 
 interface EditState {
   did: string;
-  role: "admin" | "owner" | "service";
+  role: "admin" | "owner" | "service" | "metricsreader";
   label: string;
   maxTotalSize: string;
   maxDidCount: string;
@@ -278,7 +278,7 @@ const AclEntryRow = memo(function AclEntryRow({
   onCancelEdit: () => void;
   onSave: (did: string) => void;
   onDelete: (did: string) => void;
-  onChangeRole: (v: "admin" | "owner" | "service") => void;
+  onChangeRole: (v: "admin" | "owner" | "service" | "metricsreader") => void;
   onChangeLabel: (v: string) => void;
   onChangeMaxTotalSize: (v: string) => void;
   onChangeMaxDidCount: (v: string) => void;
@@ -317,7 +317,8 @@ const AclEntryRow = memo(function AclEntryRow({
         {isEditing ? (
           <View style={styles.editFields}>
             <View style={styles.roleRow}>
-              {(["owner", "admin", "service"] as const).map((r) => (
+              {(["owner", "admin", "service", "metricsreader"] as const).map(
+                (r) => (
                 <Pressable
                   key={r}
                   style={[
@@ -738,7 +739,7 @@ export default function AclManagement() {
   }, []);
 
   const onChangeRole = useCallback(
-    (v: "admin" | "owner" | "service") =>
+    (v: "admin" | "owner" | "service" | "metricsreader") =>
       setEditing((prev) => (prev ? { ...prev, role: v } : prev)),
     [],
   );

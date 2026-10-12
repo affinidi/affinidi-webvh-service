@@ -306,6 +306,17 @@ function role(r: string | undefined): "admin" | "owner" | "service" {
   return r === "admin" || r === "service" ? r : "owner";
 }
 
+/** ACL-entry roles, which include the counters-only `metricsreader`. Kept
+ *  separate from invite roles (`role`): a metrics credential is a did:key
+ *  sidecar, never a passkey enrolment, so invites stay the narrower set.
+ *  Preserving `metricsreader` here is load-bearing — folding it into `owner`
+ *  would make the edit form silently promote a read-only credential on save. */
+function aclRole(
+  r: string | undefined,
+): "admin" | "owner" | "service" | "metricsreader" {
+  return r === "admin" || r === "service" || r === "metricsreader" ? r : "owner";
+}
+
 export function inviteFromWire(i: InviteSummary): InviteListItem {
   return {
     inviteId: i.inviteId,
@@ -346,7 +357,7 @@ export function aclEntryFromWire(spec: WireAclEntry): AclEntry {
   const quota: any = webvh.quota ?? {};
   return {
     did: spec.subject,
-    role: role(spec.role),
+    role: aclRole(spec.role),
     label: spec.label ?? null,
     created_at: epochSeconds(spec.createdAt) ?? 0,
     max_total_size: typeof quota.maxTotalSize === "number" ? quota.maxTotalSize : null,

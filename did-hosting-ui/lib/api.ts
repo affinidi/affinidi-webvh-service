@@ -275,7 +275,7 @@ export interface AgentNameAvailability {
 
 export interface AclEntry {
   did: string;
-  role: "admin" | "owner" | "service";
+  role: "admin" | "owner" | "service" | "metricsreader";
   label: string | null;
   created_at: number;
   max_total_size: number | null;
@@ -601,7 +601,7 @@ export function splitAgentName(input: string): { domain: string; name: string } 
   return { domain, name };
 }
 
-type Role = "admin" | "owner" | "service";
+type Role = "admin" | "owner" | "service" | "metricsreader";
 
 export const api = {
   /** Unauthenticated liveness probe. Plain HTTP by design. */
