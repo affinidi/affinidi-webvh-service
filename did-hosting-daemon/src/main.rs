@@ -142,6 +142,11 @@ enum Command {
     /// running daemon's `POST /api/trust-tasks`. Only `counters` are returned
     /// (gauges require Admin and are omitted). Prints the counters as JSON on
     /// stdout, ready to pipe into any monitoring agent or metrics exporter.
+    ///
+    /// Counter instrumentation is opt-in: the `webvh_*` counters are populated
+    /// only when the daemon is built with the `metrics` feature. Against a
+    /// daemon built without it this prints an empty array `[]` — a genuine
+    /// refusal (an ungranted/revoked key) is reported as an error instead.
     FetchMetrics {
         /// Path to the signer's did:key JSON file — the MetricsReader key,
         /// same format `setup --setup-key-out` writes.
@@ -1695,13 +1700,36 @@ async fn run_fetch_metrics(
         .await
         .map_err(|e| format!("metrics request to {endpoint} failed: {e}"))?;
 
+    // A verified reply is genuine, but it may be the task's `#response` OR a
+    // signed `trust-task-error` (an ungranted/revoked/expired key answers with
+    // `permissionDenied`). Both verify, so we must demand the exact response
+    // type — otherwise a refusal would print `[]` and exit 0, making a failed
+    // scrape indistinguishable from a daemon that has genuinely counted nothing.
+    let expected_type = format!("{METRICS_TYPE_URI}#response");
+    if reply.type_uri.to_string() != expected_type {
+        return Err(format!(
+            "metrics request to {endpoint} was refused or answered unexpectedly \
+             (type {}): {}",
+            reply.type_uri,
+            serde_json::to_string(&reply.payload).unwrap_or_default()
+        )
+        .into());
+    }
+
+    // Require the counters array to be present — a malformed response is an
+    // error, not an empty scrape.
     let counters = reply
         .payload
         .get("snapshot")
         .and_then(|snapshot| snapshot.get("counters"))
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!([]));
-    println!("{}", serde_json::to_string(&counters)?);
+        .filter(|counters| counters.is_array())
+        .ok_or_else(|| {
+            format!(
+                "metrics response from {to} carried no snapshot.counters array: {}",
+                serde_json::to_string(&reply.payload).unwrap_or_default()
+            )
+        })?;
+    println!("{}", serde_json::to_string(counters)?);
     Ok(())
 }
 
