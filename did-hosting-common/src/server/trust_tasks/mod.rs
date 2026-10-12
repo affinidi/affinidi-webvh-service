@@ -63,13 +63,13 @@ pub use bound::{
     BoundError, BoundKeyError, identity_signing_secret, sign_document, verify_bound_key,
     verify_sender_bound, verify_sender_bound_approval,
 };
-pub use transport::{TSP_BINDING_URI, TspTransportHandler};
-pub use verifier::{TransportBoundVerifier, build_verifier, is_unreachable};
 /// The `did:webvh` log host policy a [`TransportBoundVerifier`] reads a signer's
 /// log under. Re-exported so a caller can build a verifier that trusts a
 /// private/loopback-hosted identity (`HostPolicy::AllowPrivate`) without taking
 /// a direct dependency on `didwebvh-rs`.
 pub use didwebvh_rs::host_policy::HostPolicy;
+pub use transport::{TSP_BINDING_URI, TspTransportHandler};
+pub use verifier::{TransportBoundVerifier, build_verifier, is_unreachable};
 
 use chrono::Utc;
 use serde::Serialize;

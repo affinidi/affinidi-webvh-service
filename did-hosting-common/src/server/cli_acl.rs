@@ -17,12 +17,9 @@ pub async fn run_add_acl(
     max_total_size: Option<u64>,
     max_did_count: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let role = Role::from_str(&role_str)
-        .map_err(|_| {
-            format!(
-                "invalid role '{role_str}': use 'admin', 'owner', 'service', or 'metricsreader'"
-            )
-        })?;
+    let role = Role::from_str(&role_str).map_err(|_| {
+        format!("invalid role '{role_str}': use 'admin', 'owner', 'service', or 'metricsreader'")
+    })?;
 
     let store = Store::open(store_config).await?;
     let acl_ks = store.keyspace(KS_ACL)?;
