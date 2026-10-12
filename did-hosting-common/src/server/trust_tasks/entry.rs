@@ -135,14 +135,18 @@ impl SpecAclEntry {
             None => None,
         };
 
-        // For Admin / Service, default `DomainScope::All` when the
-        // ecosystem namespace is absent — role-based access already
-        // constrains the surface and this matches the v0.7 default.
-        // For Owner, we *require* the namespace so the auth path
-        // can't silently fall back to "all domains."
+        // For Admin / Service / MetricsReader, default `DomainScope::All`
+        // when the ecosystem namespace is absent — role-based access already
+        // constrains the surface and this matches the v0.7 default. None of
+        // them manage DIDs, so the `domains` scope is immaterial (a
+        // MetricsReader reads counters only). For Owner, we *require* the
+        // namespace so the auth path can't silently fall back to "all
+        // domains."
         let (max_total_size, max_did_count, domains) = match webvh {
             Some(w) => (w.quota.max_total_size, w.quota.max_did_count, w.domains),
-            None if matches!(role, Role::Admin | Role::Service) => (None, None, DomainScope::All),
+            None if matches!(role, Role::Admin | Role::Service | Role::MetricsReader) => {
+                (None, None, DomainScope::All)
+            }
             None => {
                 return Err(AppError::Validation(format!(
                     "ext.{WEBVH_EXT_KEY} is required on Owner entries (carries `domains` scope)"
@@ -242,6 +246,24 @@ mod tests {
         assert_eq!(local.role, Role::Admin);
         assert!(matches!(local.domains, DomainScope::All));
         assert_eq!(local.created_at, 1_700_000_001);
+    }
+
+    #[test]
+    fn metricsreader_without_webvh_ext_defaults_to_all() {
+        // A grant for the counters-only MetricsReader role must not demand an
+        // irrelevant `domains` extension: it manages no DIDs, so like
+        // Admin/Service it defaults to DomainScope::All when the namespace is
+        // omitted. Without this, an `acl/grant` for the role fails outright.
+        let bare = json!({
+            "subject": "did:web:sidecar.example",
+            "role": "metricsreader"
+        });
+        let parsed: SpecAclEntry = serde_json::from_value(bare).unwrap();
+        let local = parsed.into_local(1_700_000_002).unwrap();
+        assert_eq!(local.role, Role::MetricsReader);
+        assert!(matches!(local.domains, DomainScope::All));
+        assert_eq!(local.max_total_size, None);
+        assert_eq!(local.max_did_count, None);
     }
 
     #[test]
