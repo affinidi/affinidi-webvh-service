@@ -54,8 +54,12 @@ def set_version(root, version):
     only) and the detached fuzz crate's, which records did-hosting-common's
     version and would otherwise turn the nightly Fuzz job red (CLAUDE.md).
     """
-    major, minor, _ = version.split("-")[0].split(".")
-    pin = f"{major}.{minor}"
+    # Validated before it reaches any file: the replacements below insert it
+    # verbatim, but nothing that is not a release version belongs there.
+    m = RELEASE_VERSION.fullmatch(version)
+    if not m:
+        raise SystemExit(f"{version!r} is not major.minor.patch[-rc.N]")
+    pin = f"{m.group(1)}.{m.group(2)}"
     names = [tomllib.loads(m.read_text())["package"]["name"] for m in members(root)]
     pin_re = re.compile(
         r'^(\s*(?:' + "|".join(map(re.escape, names)) + r')\s*=\s*\{\s*version\s*=\s*")[^"]*(")',
@@ -67,12 +71,26 @@ def set_version(root, version):
         head, sep, rest = text.partition("[package]")
         if not sep:
             raise SystemExit(f"{manifest}: no [package] section")
-        rest, n = re.subn(r'^version\s*=\s*"[^"]*"', f'version = "{version}"', rest, count=1, flags=re.M)
+        rest, n = re.subn(r'^version\s*=\s*"[^"]*"', lambda _: f'version = "{version}"', rest, count=1, flags=re.M)
         if n != 1:
             raise SystemExit(f"{manifest}: no [package] version line")
         text = head + sep + rest
-        text = pin_re.sub(rf"\g<1>{pin}\g<2>", text)
+        text = pin_re.sub(lambda m: f"{m.group(1)}{pin}{m.group(2)}", text)
         manifest.write_text(text)
+    # The committed OpenAPI snapshot embeds did-hosting-server's version, and
+    # `openapi_snapshot_in_sync` fails CI on any drift.
+    openapi = root / "docs" / "openapi.json"
+    if openapi.exists():
+        text, n = re.subn(
+            r'^(    "version": ")[^"]*(")',
+            lambda m: f"{m.group(1)}{version}{m.group(2)}",
+            openapi.read_text(),
+            count=1,
+            flags=re.M,
+        )
+        if n != 1:
+            raise SystemExit(f"{openapi}: no info.version line")
+        openapi.write_text(text)
     run("cargo", "update", "-w", cwd=root)
     run("cargo", "update", "--manifest-path", "fuzz/Cargo.toml", "-p", "did-hosting-common", cwd=root)
 
