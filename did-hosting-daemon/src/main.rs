@@ -1634,10 +1634,12 @@ async fn run_fetch_metrics(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use affinidi_did_resolver_cache_sdk::DIDCacheClient;
     use affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder;
+    use affinidi_did_resolver_cache_sdk::network_resolvers::HostPolicy as CacheHostPolicy;
     use affinidi_tdk::secrets_resolver::secrets::Secret;
     use did_hosting_common::server::trust_tasks::send::{
-        build_signed_request, post_trust_task_https,
+        build_signed_request, post_trust_task_https_verified,
     };
+    use did_hosting_common::server::trust_tasks::{HostPolicy, TransportBoundVerifier};
     use vta_sdk::provision_client::EphemeralSetupKey;
 
     const METRICS_TYPE_URI: &str = "https://trusttasks.org/spec/did-management/server/metrics/0.1";
@@ -1672,11 +1674,24 @@ async fn run_fetch_metrics(
 
     // Resolve `to` to verify the daemon's signed reply — proves the counters
     // came from the real server DID, not another process holding the port.
-    let resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
-        .await
-        .map_err(|e| format!("could not build a DID resolver: {e}"))?;
+    //
+    // `AllowPrivate` on both the resolver cache and the verifier's `did:webvh`
+    // log reads: this command dials a loopback/private endpoint by default, and
+    // a daemon provisioned on `localhost` serves its DID log from a private
+    // host that the default `PublicOnly` policy would refuse — reply
+    // verification would then fail for exactly the local scrape this is built
+    // for.
+    let resolver = DIDCacheClient::new(
+        DIDCacheConfigBuilder::default()
+            .with_host_policy(CacheHostPolicy::AllowPrivate)
+            .build(),
+    )
+    .await
+    .map_err(|e| format!("could not build a DID resolver: {e}"))?;
+    let verifier =
+        TransportBoundVerifier::with_did_cache_and_host_policy(resolver, HostPolicy::AllowPrivate);
 
-    let reply = post_trust_task_https(&from, &to, &endpoint, &doc, Some(&resolver))
+    let reply = post_trust_task_https_verified(&from, &to, &endpoint, &doc, &verifier)
         .await
         .map_err(|e| format!("metrics request to {endpoint} failed: {e}"))?;
 
