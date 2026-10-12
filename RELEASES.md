@@ -52,7 +52,8 @@ touch it.
 | Release | Branch | First RC | GA | Latest | Status |
 |---|---|---|---|---|---|
 | ≤ 0.8 | — | — | — | `0.8.x` | tagged from `main` before release branches existed |
-| 0.9 | `release/0.9` | TBD | TBD | — | in development on `main` |
+| 0.9 | `release/0.9` | 2026-10-12 (`v0.9.0-rc.0`, from `5d8cfab`) | TBD | `0.9.0-rc.0` | stabilising |
+| 0.10 | — | TBD | TBD | — | in development on `main` |
 
 Earlier deployments were also tagged with the VTI stack's release names
 (`VTI-Cypress`, `VTI-Dogwood`, `VTI-Eucalyptus`). Those tags stay; new releases

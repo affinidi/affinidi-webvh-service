@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.0 (release/0.9)
+
 ### Breaking — the control plane has no REST management surface
 
 - **Kept:** `POST /api/trust-tasks` (the HTTPS binding of the one Trust Task
