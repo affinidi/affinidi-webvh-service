@@ -73,6 +73,14 @@ def set_version(root, version):
         text = head + sep + rest
         text = pin_re.sub(rf"\g<1>{pin}\g<2>", text)
         manifest.write_text(text)
+    # The committed OpenAPI snapshot embeds did-hosting-server's version, and
+    # `openapi_snapshot_in_sync` fails CI on any drift.
+    openapi = root / "docs" / "openapi.json"
+    if openapi.exists():
+        text, n = re.subn(r'^(    "version": ")[^"]*(")', rf"\g<1>{version}\g<2>", openapi.read_text(), count=1, flags=re.M)
+        if n != 1:
+            raise SystemExit(f"{openapi}: no info.version line")
+        openapi.write_text(text)
     run("cargo", "update", "-w", cwd=root)
     run("cargo", "update", "--manifest-path", "fuzz/Cargo.toml", "-p", "did-hosting-common", cwd=root)
 
