@@ -1635,7 +1635,9 @@ async fn run_fetch_metrics(
     use affinidi_did_resolver_cache_sdk::DIDCacheClient;
     use affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder;
     use affinidi_tdk::secrets_resolver::secrets::Secret;
-    use did_hosting_common::server::trust_tasks::send::{build_signed_request, post_trust_task_https};
+    use did_hosting_common::server::trust_tasks::send::{
+        build_signed_request, post_trust_task_https,
+    };
     use vta_sdk::provision_client::EphemeralSetupKey;
 
     const METRICS_TYPE_URI: &str = "https://trusttasks.org/spec/did-management/server/metrics/0.1";

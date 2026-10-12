@@ -429,7 +429,10 @@ mod tests {
 
     #[test]
     fn role_from_str_metricsreader() {
-        assert_eq!(Role::from_str("metricsreader").unwrap(), Role::MetricsReader);
+        assert_eq!(
+            Role::from_str("metricsreader").unwrap(),
+            Role::MetricsReader
+        );
     }
 
     #[test]

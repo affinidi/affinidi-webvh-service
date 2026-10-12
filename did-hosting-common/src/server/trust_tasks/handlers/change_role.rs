@@ -508,7 +508,10 @@ mod tests {
         assert!(is_strict_promotion(&Role::MetricsReader, &Role::Admin));
         assert!(!is_strict_promotion(&Role::Owner, &Role::Owner));
         assert!(!is_strict_promotion(&Role::Admin, &Role::Owner));
-        assert!(!is_strict_promotion(&Role::MetricsReader, &Role::MetricsReader));
+        assert!(!is_strict_promotion(
+            &Role::MetricsReader,
+            &Role::MetricsReader
+        ));
     }
 
     #[tokio::test]
