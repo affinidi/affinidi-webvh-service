@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 (2026-10-13)
 
 ### Breaking — the control plane has no REST management surface
 
