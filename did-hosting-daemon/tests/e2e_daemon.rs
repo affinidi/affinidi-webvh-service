@@ -40,6 +40,8 @@ use serde_json::json;
 use trust_tasks_rs::Payload;
 use trust_tasks_rs::specs::did_management::did;
 
+use vta_sdk::provision_client::EphemeralSetupKey;
+
 use did_hosting_common::WitnessClient;
 use did_hosting_common::did_ops::extract_did_id;
 use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
@@ -71,6 +73,9 @@ struct Daemon {
     admin_did: String,
     admin_signer: affinidi_tdk::secrets_resolver::secrets::Secret,
     did_resolver: DIDCacheClient,
+    /// The written `config.toml` — carries `server_did` + bind address, which
+    /// the `fetch-metrics` subcommand reads to find the daemon.
+    config_path: std::path::PathBuf,
     _dir: tempfile::TempDir,
     child: tokio::process::Child,
 }
@@ -220,6 +225,7 @@ enable_watcher = false
             admin_did,
             admin_signer,
             did_resolver,
+            config_path,
             _dir: dir,
             child,
         }
@@ -406,6 +412,53 @@ async fn daemon_lifecycle_over_https() {
         daemon.get_log(mnemonic).await.status(),
         reqwest::StatusCode::NOT_FOUND,
         "a deleted DID must stop resolving immediately, not after the cache's TTL"
+    );
+
+    daemon.teardown().await;
+}
+
+/// `fetch-metrics` with a key that is not in the ACL must fail with the ACL
+/// refusal (`permissionDenied`), not an empty successful scrape and not a
+/// signature/proof error.
+///
+/// The refusal is an *unsigned* framework `trust-task-error`, so this drives the
+/// whole chain the maintainer asked after: the daemon's `Cx::metrics_read` ACL
+/// gate, the unsigned-error recognition in `post_trust_task_https_verified`, and
+/// the subcommand surfacing that code rather than exiting 0 with `[]`. Runs the
+/// real `did-hosting-daemon fetch-metrics` subprocess against the live daemon,
+/// signing with a freshly minted did:key that was never granted.
+#[tokio::test]
+async fn fetch_metrics_denied_for_an_ungranted_key() {
+    let daemon = Daemon::spawn().await;
+
+    // A did:key the daemon has never seen, persisted in the same key-file format
+    // `setup --setup-key-out` writes and `fetch-metrics --key` reads.
+    let key_dir = tempfile::tempdir().expect("key temp dir");
+    let key_path = key_dir.path().join("ungranted-key.json");
+    EphemeralSetupKey::generate()
+        .expect("generate an ungranted did:key")
+        .persist_to(&key_path)
+        .expect("persist the ungranted key");
+
+    let bin = env!("CARGO_BIN_EXE_did-hosting-daemon");
+    let out = tokio::process::Command::new(bin)
+        .args(["fetch-metrics", "--config"])
+        .arg(&daemon.config_path)
+        .arg("--key")
+        .arg(&key_path)
+        .output()
+        .await
+        .expect("run did-hosting-daemon fetch-metrics");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "an ungranted key must be refused, not a successful scrape. stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("permissionDenied"),
+        "the operator should see the ACL refusal code, not a signature/proof error. stderr={stderr:?}"
     );
 
     daemon.teardown().await;

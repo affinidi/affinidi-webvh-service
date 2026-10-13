@@ -52,8 +52,17 @@ pub async fn fetch_metrics(
     // writes; for the sidecar this is a dedicated MetricsReader key.
     let key = EphemeralSetupKey::load_from(key_path)?;
     let from = key.did.clone();
-    let signer = Secret::from_multibase(key.private_key_multibase(), None)
+    let mut signer = Secret::from_multibase(key.private_key_multibase(), None)
         .map_err(|e| format!("metrics key is not a usable signing key: {e}"))?;
+    // Pin the signer's verificationMethod to the did:key's own VM
+    // (`did:key:<mb>#<mb>`). `from_multibase` leaves a hash-derived id the
+    // issuer does not control, so the recipient rejects the proof when it
+    // checks the verificationMethod against the document issuer — the signature
+    // would fail before the request ever reaches the server.
+    let public_mb = signer
+        .get_public_keymultibase()
+        .map_err(|e| format!("metrics key has no usable public key: {e}"))?;
+    signer.id = format!("{from}#{public_mb}");
 
     let doc = build_signed_request(
         request_type,
