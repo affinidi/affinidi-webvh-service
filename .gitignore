@@ -31,3 +31,7 @@ did-hosting-control/ui-dist/
 # Secrets and credentials
 .env
 .env.*
+
+# Python bytecode (the release scripts)
+__pycache__/
+*.pyc
