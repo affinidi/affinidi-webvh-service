@@ -419,6 +419,21 @@ pub fn framework_error_type_uri() -> trust_tasks_rs::TypeUri {
         .expect("framework error Type URI parses")
 }
 
+/// The `did-management/server/metrics/0.1` request Type URI, taken from the
+/// generated spec — the same source the control-task router keys on. Exposed
+/// so a binary whose own `trust-tasks-rs` is only a dev-dependency (the
+/// daemon's `fetch-metrics`) can sign against the canonical value rather than
+/// a hand-typed literal that a spec or namespace change could silently desync.
+pub fn metrics_request_type_uri() -> &'static str {
+    <trust_tasks_rs::specs::did_management::server::metrics::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI
+}
+
+/// The `did-management/server/metrics/0.1#response` Type URI — the exact type
+/// a verified metrics reply must carry. See [`metrics_request_type_uri`].
+pub fn metrics_response_type_uri() -> &'static str {
+    <trust_tasks_rs::specs::did_management::server::metrics::v0_1::Response as trust_tasks_rs::Payload>::TYPE_URI
+}
+
 /// Build a framework error document addressed to the request's
 /// `issuer`, carrying a custom `ErrorPayload` — used by handlers that
 /// need to emit spec-defined error shapes that don't fit the

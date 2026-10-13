@@ -316,6 +316,28 @@ enum Command {
         #[arg(long, default_value = "control-secrets.json")]
         secrets_out: PathBuf,
     },
+    /// Scrape this service's counters over the authenticated
+    /// `server/metrics/0.1` Trust Task and print them as JSON.
+    ///
+    /// The counters live in the running service's process memory and are
+    /// reachable only through this signed task — there is no unauthenticated
+    /// scrape endpoint. Signs with the `--key` did:key (granted `MetricsReader`
+    /// in the ACL) and POSTs to the running service's `POST /api/trust-tasks`.
+    /// Only `counters` are returned (gauges require Admin and are omitted).
+    /// Prints the counters as JSON on stdout, ready to pipe into a monitoring
+    /// agent. A genuine refusal (an ungranted/revoked key) is reported as an
+    /// error rather than an empty array.
+    FetchMetrics {
+        /// Path to the signer's did:key JSON file — the MetricsReader key,
+        /// same format `setup --setup-key-out` writes.
+        #[arg(long)]
+        key: PathBuf,
+        /// Base URL of the running service. Defaults to
+        /// `http://<server.host>:<server.port>` from config (a wildcard bind
+        /// such as `0.0.0.0` / `::` is dialled as loopback).
+        #[arg(long)]
+        url: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -377,6 +399,12 @@ async fn main() {
         }
         Some(Command::ListAcl) => {
             if let Err(e) = run_list_acl(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::FetchMetrics { key, url }) => {
+            if let Err(e) = run_fetch_metrics(cli.config, key, url).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -632,6 +660,29 @@ async fn run_add_acl(
 async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load(config_path)?;
     did_hosting_common::server::cli_acl::run_list_acl(&config.store).await
+}
+
+/// Scrape this control plane's counters. A thin wrapper over the shared
+/// [`did_hosting_common::server::cli_metrics::fetch_metrics`] — the same command
+/// the daemon exposes — supplying control's own `server_did` and bind address.
+async fn run_fetch_metrics(
+    config_path: Option<PathBuf>,
+    key_path: PathBuf,
+    url: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    let to = config
+        .server_did
+        .clone()
+        .ok_or("server_did is not configured; this service has not completed provisioning")?;
+    did_hosting_common::server::cli_metrics::fetch_metrics(
+        &to,
+        key_path.as_path(),
+        url,
+        &config.server.host,
+        config.server.port,
+    )
+    .await
 }
 
 async fn run_remove_acl(

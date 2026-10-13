@@ -1626,111 +1626,27 @@ async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::e
 /// Read the daemon's counters over the authenticated `server/metrics/0.1`
 /// Trust Task and print them as JSON (`[{ "name": …, "value": … }]`).
 ///
-/// The counters live in the running daemon's process memory and are reachable
-/// only through this signed localhost task — there is no unauthenticated scrape
-/// endpoint. We sign as the `--key` DID (granted `MetricsReader` in the ACL),
-/// POST to the daemon's `/api/trust-tasks`, and verify the reply is the
-/// server's own signed response before trusting the numbers. Gauges require
-/// Admin and are not returned to a `MetricsReader`, so we never request them.
+/// A thin wrapper over the shared [`did_hosting_common::server::cli_metrics::fetch_metrics`]
+/// — the daemon and standalone control both serve this task and expose the same
+/// command — supplying the daemon's own `server_did` and bind address.
 async fn run_fetch_metrics(
     config_path: Option<PathBuf>,
     key_path: PathBuf,
     url: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use affinidi_did_resolver_cache_sdk::DIDCacheClient;
-    use affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder;
-    use affinidi_did_resolver_cache_sdk::network_resolvers::HostPolicy as CacheHostPolicy;
-    use affinidi_tdk::secrets_resolver::secrets::Secret;
-    use did_hosting_common::server::trust_tasks::send::{
-        build_signed_request, post_trust_task_https_verified,
-    };
-    use did_hosting_common::server::trust_tasks::{HostPolicy, TransportBoundVerifier};
-    use vta_sdk::provision_client::EphemeralSetupKey;
-
-    const METRICS_TYPE_URI: &str = "https://trusttasks.org/spec/did-management/server/metrics/0.1";
-
     let config = DaemonConfig::load(config_path)?;
     let to = config
         .server_did
         .clone()
         .ok_or("server_did is not configured; the daemon has not completed provisioning")?;
-
-    // Default to the configured bind address, dialling 0.0.0.0 as loopback.
-    let base = url.unwrap_or_else(|| {
-        let host = if config.server.host == "0.0.0.0" {
-            "127.0.0.1"
-        } else {
-            config.server.host.as_str()
-        };
-        format!("http://{host}:{}", config.server.port)
-    });
-    let endpoint = format!("{}/api/trust-tasks", base.trim_end_matches('/'));
-
-    // Load the signer DID + key. Same did:key JSON `setup --setup-key-out`
-    // writes; for the sidecar this is a dedicated MetricsReader key.
-    let key = EphemeralSetupKey::load_from(key_path.as_path())?;
-    let from = key.did.clone();
-    let signer = Secret::from_multibase(key.private_key_multibase(), None)
-        .map_err(|e| format!("metrics key is not a usable signing key: {e}"))?;
-
-    let doc = build_signed_request(METRICS_TYPE_URI, &from, &to, serde_json::json!({}), &signer)
-        .await
-        .map_err(|e| format!("failed to sign the metrics request: {e}"))?;
-
-    // Resolve `to` to verify the daemon's signed reply — proves the counters
-    // came from the real server DID, not another process holding the port.
-    //
-    // `AllowPrivate` on both the resolver cache and the verifier's `did:webvh`
-    // log reads: this command dials a loopback/private endpoint by default, and
-    // a daemon provisioned on `localhost` serves its DID log from a private
-    // host that the default `PublicOnly` policy would refuse — reply
-    // verification would then fail for exactly the local scrape this is built
-    // for.
-    let resolver = DIDCacheClient::new(
-        DIDCacheConfigBuilder::default()
-            .with_host_policy(CacheHostPolicy::AllowPrivate)
-            .build(),
+    did_hosting_common::server::cli_metrics::fetch_metrics(
+        &to,
+        key_path.as_path(),
+        url,
+        &config.server.host,
+        config.server.port,
     )
     .await
-    .map_err(|e| format!("could not build a DID resolver: {e}"))?;
-    let verifier =
-        TransportBoundVerifier::with_did_cache_and_host_policy(resolver, HostPolicy::AllowPrivate);
-
-    let reply = post_trust_task_https_verified(&from, &to, &endpoint, &doc, &verifier)
-        .await
-        .map_err(|e| format!("metrics request to {endpoint} failed: {e}"))?;
-
-    // A verified reply is genuine, but it may be the task's `#response` OR a
-    // signed `trust-task-error` (an ungranted/revoked/expired key answers with
-    // `permissionDenied`). Both verify, so we must demand the exact response
-    // type — otherwise a refusal would print `[]` and exit 0, making a failed
-    // scrape indistinguishable from a daemon that has genuinely counted nothing.
-    let expected_type = format!("{METRICS_TYPE_URI}#response");
-    if reply.type_uri.to_string() != expected_type {
-        return Err(format!(
-            "metrics request to {endpoint} was refused or answered unexpectedly \
-             (type {}): {}",
-            reply.type_uri,
-            serde_json::to_string(&reply.payload).unwrap_or_default()
-        )
-        .into());
-    }
-
-    // Require the counters array to be present — a malformed response is an
-    // error, not an empty scrape.
-    let counters = reply
-        .payload
-        .get("snapshot")
-        .and_then(|snapshot| snapshot.get("counters"))
-        .filter(|counters| counters.is_array())
-        .ok_or_else(|| {
-            format!(
-                "metrics response from {to} carried no snapshot.counters array: {}",
-                serde_json::to_string(&reply.payload).unwrap_or_default()
-            )
-        })?;
-    println!("{}", serde_json::to_string(counters)?);
-    Ok(())
 }
 
 async fn run_remove_acl(

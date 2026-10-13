@@ -460,11 +460,19 @@ pub(crate) async fn invite(
                 ));
             }
             let role = p.role.clone().unwrap_or_else(|| DEFAULT_ROLE.to_string());
-            if role.parse::<Role>().is_err() {
-                return Err(TaskError::Declared(
-                    error_codes::ROLE_NOT_PERMITTED,
-                    format!("`{role}` is not a role this service grants"),
-                ));
+            // A `MetricsReader` is a did:key sidecar credential, never a
+            // passkey enrolment: redeeming a session invite mints a login
+            // passkey in `KS_SESSIONS`, which a counters-only credential must
+            // never receive. Refuse it here (and on update + redeem) so it can
+            // never enter the invite flow.
+            match role.parse::<Role>() {
+                Ok(Role::MetricsReader) | Err(_) => {
+                    return Err(TaskError::Declared(
+                        error_codes::ROLE_NOT_PERMITTED,
+                        format!("`{role}` is not a role this service grants"),
+                    ));
+                }
+                Ok(_) => {}
             }
             let enrolled = pk::get_passkey_user_by_did(&state.sessions_ks, &subject)
                 .await?
@@ -679,7 +687,19 @@ pub(crate) async fn redeem_finish(
                 Some(_) => None,
                 None => Some(AclEntry {
                     did: ceremony.subject.clone(),
-                    role: role.parse::<Role>()?,
+                    // Defence in depth: invite create/update already refuse
+                    // `MetricsReader`, but a redeemed invite must never mint a
+                    // counters-only credential here either (it would arrive
+                    // paired with a login passkey, which the role must not hold).
+                    role: match role.parse::<Role>()? {
+                        Role::MetricsReader => {
+                            return Err(TaskError::Standard(
+                                trust_tasks_rs::StandardCode::PermissionDenied,
+                                "a metrics-reader credential cannot be enrolled via invite".into(),
+                            ));
+                        }
+                        other => other,
+                    },
                     label: Some("enrolled via passkey invite".into()),
                     created_at: now_epoch(),
                     max_total_size: None,
@@ -990,11 +1010,15 @@ pub(crate) async fn invite_update(
                     "a stepUp invite confers no role".into(),
                 ));
             }
-            if r.parse::<Role>().is_err() {
-                return Err(TaskError::Declared(
-                    error_codes::ROLE_NOT_ALLOWED,
-                    format!("`{r}` is not a role this service grants"),
-                ));
+            // `MetricsReader` is never a valid invite role (see invite create).
+            match r.parse::<Role>() {
+                Ok(Role::MetricsReader) | Err(_) => {
+                    return Err(TaskError::Declared(
+                        error_codes::ROLE_NOT_ALLOWED,
+                        format!("`{r}` is not a role this service grants"),
+                    ));
+                }
+                Ok(_) => {}
             }
             existing.role = Some(r.to_string());
         }

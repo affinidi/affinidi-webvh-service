@@ -384,7 +384,10 @@ export interface InviteListItem {
   inviteId: string;
   did: string;
   purpose: InvitePurpose;
-  role: "admin" | "owner" | "service";
+  // Includes `metricsreader` so a stale/forged invite carrying it is shown as
+  // itself rather than silently folded into another role — see `role()` in
+  // `wire.ts`. New invites can no longer be created with it (server-refused).
+  role: "admin" | "owner" | "service" | "metricsreader";
   createdAt: number;
   expiresAt: number;
   expired: boolean;

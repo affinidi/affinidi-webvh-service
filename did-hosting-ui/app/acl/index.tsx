@@ -57,6 +57,12 @@ const formatDate = (ts: number) =>
 
 const keyExtractor = (item: AclEntry) => item.did;
 
+/** Human-readable role label. The wire value `metricsreader` is a single
+ *  lowercase token, so naive capitalisation renders "Metricsreader"; spell it
+ *  "Metrics Reader" and capitalise the rest. */
+const roleLabel = (r: string): string =>
+  r === "metricsreader" ? "Metrics Reader" : r.charAt(0).toUpperCase() + r.slice(1);
+
 /** Renders the current scope of an ACL entry as a compact read-only
  * cluster of chips. "All domains" collapses to a single chip; otherwise
  * each allowed domain renders as a chip, with the default marked by a
@@ -333,7 +339,7 @@ const AclEntryRow = memo(function AclEntryRow({
                       editing.role === r && styles.roleTextActive,
                     ]}
                   >
-                    {r.charAt(0).toUpperCase() + r.slice(1)}
+                    {roleLabel(r)}
                   </Text>
                 </Pressable>
               ))}
@@ -479,7 +485,9 @@ export default function AclManagement() {
 
   // New entry form
   const [newDid, setNewDid] = useState("");
-  const [newRole, setNewRole] = useState<"admin" | "owner" | "service">("owner");
+  const [newRole, setNewRole] = useState<
+    "admin" | "owner" | "service" | "metricsreader"
+  >("owner");
   const [newLabel, setNewLabel] = useState("");
   const [newMaxTotalSize, setNewMaxTotalSize] = useState("");
   const [newMaxDidCount, setNewMaxDidCount] = useState("");
@@ -515,7 +523,10 @@ export default function AclManagement() {
   // Pending invites (from server)
   const [pendingInvites, setPendingInvites] = useState<InviteListItem[]>([]);
   const [editingInvite, setEditingInvite] = useState<
-    { inviteId: string; role: "admin" | "owner" | "service" } | null
+    {
+      inviteId: string;
+      role: "admin" | "owner" | "service" | "metricsreader";
+    } | null
   >(null);
   const [invitesBusyId, setInvitesBusyId] = useState<string | null>(null);
 
@@ -941,7 +952,7 @@ export default function AclManagement() {
                       inviteRole === r && styles.roleTextActive,
                     ]}
                   >
-                    {r.charAt(0).toUpperCase() + r.slice(1)}
+                    {roleLabel(r)}
                   </Text>
                 </Pressable>
               ))}
@@ -1020,7 +1031,7 @@ export default function AclManagement() {
                                   styles.roleTextActive,
                               ]}
                             >
-                              {r.charAt(0).toUpperCase() + r.slice(1)}
+                              {roleLabel(r)}
                             </Text>
                           </Pressable>
                         ))}
@@ -1092,7 +1103,7 @@ export default function AclManagement() {
           entry is stored against the DID it points at today.
         </Text>
         <View style={styles.roleRow}>
-          {(["owner", "admin", "service"] as const).map((r) => (
+          {(["owner", "admin", "service", "metricsreader"] as const).map((r) => (
             <Pressable
               key={r}
               style={[
@@ -1107,7 +1118,7 @@ export default function AclManagement() {
                   newRole === r && styles.roleTextActive,
                 ]}
               >
-                {r.charAt(0).toUpperCase() + r.slice(1)}
+                {roleLabel(r)}
               </Text>
             </Pressable>
           ))}

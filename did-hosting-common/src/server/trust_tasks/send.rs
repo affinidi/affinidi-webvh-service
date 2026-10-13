@@ -308,6 +308,23 @@ pub async fn post_trust_task_https_verified(
     let body = read_capped_body(resp, HTTPS_MAX_REPLY_BYTES).await?;
 
     if !status.is_success() {
+        // A task-level refusal (`permissionDenied` for an ungranted/revoked
+        // key, say) comes back as an *unsigned* framework `trust-task-error`
+        // with a non-2xx status — the one reply shape the framework leaves
+        // unsigned. Surface its code so the operator sees the ACL refusal
+        // rather than a bare transport error; we read the code for diagnostics
+        // only and trust nothing else in the document.
+        if let Some((code, message)) = unsigned_error_summary(&body) {
+            return Err(format!(
+                "trust task to {to} ({url}) was refused: {code}{}",
+                if message.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {message}")
+                }
+            )
+            .into());
+        }
         return Err(format!(
             "trust task HTTPS send to {to} ({url}) failed: HTTP {status}: {}",
             String::from_utf8_lossy(&body)
@@ -333,10 +350,54 @@ pub async fn post_trust_task_https_verified(
     }
 
     // Signed by the peer we addressed, and addressed back to us — the same
-    // sender-bound rule every inbound document on any transport is held to.
-    verify_sender_bound(&reply, Some(to), None, from, verifier).await?;
+    // sender-bound rule every inbound document on any transport is held to. A
+    // peer that answers 2xx with an *unsigned* framework error (the one shape
+    // left unsigned) fails here; surface its code so the refusal is legible
+    // rather than reported as a signature failure.
+    if let Err(e) = verify_sender_bound(&reply, Some(to), None, from, verifier).await {
+        if let Some((code, message)) = unsigned_error_summary(&body) {
+            return Err(format!(
+                "trust task to {to} ({url}) was refused: {code}{}",
+                if message.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {message}")
+                }
+            )
+            .into());
+        }
+        return Err(e.into());
+    }
 
     Ok(reply)
+}
+
+/// If `body` is an *unsigned* framework `trust-task-error` document, return its
+/// `payload.code` and `payload.message`.
+///
+/// `trust-task-error` is the one reply shape the framework leaves unsigned
+/// (per the repo's signing rules), so a caller may read the code for a
+/// diagnostic message without trusting anything else in the document. Returns
+/// `None` for any other document, and for an error that carries a `proof` (a
+/// signed document takes the normal verified path).
+fn unsigned_error_summary(body: &[u8]) -> Option<(String, String)> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    let error_type = crate::server::trust_tasks::framework_error_type_uri().to_string();
+    let is_error = v
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| t == error_type);
+    if !is_error || v.get("proof").is_some_and(|p| !p.is_null()) {
+        return None;
+    }
+    let payload = v.get("payload")?;
+    let code = payload.get("code").and_then(Value::as_str)?.to_string();
+    let message = payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Some((code, message))
 }
 
 /// Read `resp`'s body, refusing more than `limit` bytes — from either a
@@ -447,6 +508,41 @@ mod tests {
         assert_eq!(reply.issuer.as_deref(), Some("did:example:server"));
         assert_eq!(reply.recipient.as_deref(), Some("did:example:control"));
         assert_eq!(reply.thread_id.as_deref(), Some(doc.id.as_str()));
+    }
+
+    /// An unsigned framework `trust-task-error` is recognised and its code +
+    /// message surfaced; a signed error (one carrying a `proof`) and a
+    /// non-error document are not — those take the normal verified path.
+    #[test]
+    fn unsigned_error_summary_reads_only_unsigned_framework_errors() {
+        let error_type = crate::server::trust_tasks::framework_error_type_uri().to_string();
+
+        let unsigned = serde_json::json!({
+            "type": error_type,
+            "payload": { "code": "permissionDenied", "message": "no standing" },
+        });
+        assert_eq!(
+            unsigned_error_summary(unsigned.to_string().as_bytes()),
+            Some(("permissionDenied".to_string(), "no standing".to_string()))
+        );
+
+        // A signed error is left to the verified path.
+        let signed = serde_json::json!({
+            "type": error_type,
+            "payload": { "code": "permissionDenied" },
+            "proof": { "proofValue": "zsomething" },
+        });
+        assert_eq!(unsigned_error_summary(signed.to_string().as_bytes()), None);
+
+        // A non-error document is not an error summary.
+        let ordinary = serde_json::json!({
+            "type": "https://trusttasks.org/spec/did-management/server/metrics/0.1#response",
+            "payload": { "snapshot": {} },
+        });
+        assert_eq!(
+            unsigned_error_summary(ordinary.to_string().as_bytes()),
+            None
+        );
     }
 
     /// The non-canonical `TASK_SERVER_HEALTH_*` route-decorator URIs must NOT

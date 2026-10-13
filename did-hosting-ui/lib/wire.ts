@@ -302,8 +302,26 @@ export function identityFromWire(r: IdentityListResponse): {
 // Access
 // ---------------------------------------------------------------------------
 
-function role(r: string | undefined): "admin" | "owner" | "service" {
-  return r === "admin" || r === "service" ? r : "owner";
+function role(
+  r: string | undefined,
+): "admin" | "owner" | "service" | "metricsreader" {
+  // Preserve every recognised role, including the counters-only
+  // `metricsreader` — the same thing `aclRole` does for ACL entries. Folding
+  // it into `owner` would let the edit form silently promote a read-only
+  // credential to Owner on save; folding it into any other role would mislabel
+  // the row. The server now refuses `metricsreader` on invites, so this only
+  // ever surfaces a stale/forged row — shown honestly, and refused server-side
+  // if saved unchanged, never silently rewritten. A genuinely unrecognised
+  // value (a future role this client predates) falls back to the LEAST-
+  // privileged `service`, never the most-powerful role — and a throw is wrong
+  // here because `role()` runs inside `invites.map(...)`, where one bad row
+  // would hide the entire invite list.
+  return r === "admin" ||
+    r === "owner" ||
+    r === "service" ||
+    r === "metricsreader"
+    ? r
+    : "service";
 }
 
 /** ACL-entry roles, which include the counters-only `metricsreader`. Kept
