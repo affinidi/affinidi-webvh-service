@@ -132,6 +132,32 @@ enum Command {
     },
     /// List all ACL entries
     ListAcl,
+    /// Read the service's own counters via the authenticated
+    /// `server/metrics/0.1` Trust Task and print them as JSON.
+    ///
+    /// The counters live in the running daemon's process memory and are
+    /// reachable only through this signed localhost task — there is no
+    /// unauthenticated scrape endpoint. Signs the task with the `--key`
+    /// did:key (granted `MetricsReader` in the ACL) and POSTs it to the
+    /// running daemon's `POST /api/trust-tasks`. Only `counters` are returned
+    /// (gauges require Admin and are omitted). Prints the counters as JSON on
+    /// stdout, ready to pipe into any monitoring agent or metrics exporter.
+    ///
+    /// Counter instrumentation is opt-in: the `webvh_*` counters are populated
+    /// only when the daemon is built with the `metrics` feature. Against a
+    /// daemon built without it this prints an empty array `[]` — a genuine
+    /// refusal (an ungranted/revoked key) is reported as an error instead.
+    FetchMetrics {
+        /// Path to the signer's did:key JSON file — the MetricsReader key,
+        /// same format `setup --setup-key-out` writes.
+        #[arg(long)]
+        key: PathBuf,
+        /// Base URL of the running daemon. Defaults to
+        /// `http://<server.host>:<server.port>` from config (host `0.0.0.0`
+        /// is dialled as `127.0.0.1`).
+        #[arg(long)]
+        url: Option<String>,
+    },
     /// List the service's own identity generations (key material still honoured).
     IdentityList,
     /// List this service's established TSP relationships (offline; stop the
@@ -415,6 +441,12 @@ async fn main() {
         }
         Some(Command::ListAcl) => {
             if let Err(e) = run_list_acl(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::FetchMetrics { key, url }) => {
+            if let Err(e) = run_fetch_metrics(cli.config, key, url).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1589,6 +1621,32 @@ async fn run_add_acl(
 async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let config = DaemonConfig::load(config_path)?;
     did_hosting_common::server::cli_acl::run_list_acl(&config.store).await
+}
+
+/// Read the daemon's counters over the authenticated `server/metrics/0.1`
+/// Trust Task and print them as JSON (`[{ "name": …, "value": … }]`).
+///
+/// A thin wrapper over the shared [`did_hosting_common::server::cli_metrics::fetch_metrics`]
+/// — the daemon and standalone control both serve this task and expose the same
+/// command — supplying the daemon's own `server_did` and bind address.
+async fn run_fetch_metrics(
+    config_path: Option<PathBuf>,
+    key_path: PathBuf,
+    url: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = DaemonConfig::load(config_path)?;
+    let to = config
+        .server_did
+        .clone()
+        .ok_or("server_did is not configured; the daemon has not completed provisioning")?;
+    did_hosting_common::server::cli_metrics::fetch_metrics(
+        &to,
+        key_path.as_path(),
+        url,
+        &config.server.host,
+        config.server.port,
+    )
+    .await
 }
 
 async fn run_remove_acl(

@@ -517,6 +517,20 @@ pub async fn create_authenticated_session(
     session_pubkey_b58btc: Option<String>,
     amr_acr_override: Option<(Vec<String>, String)>,
 ) -> Result<TokenResponse, AppError> {
+    // A `MetricsReader` is a counters-only did:key sidecar, never an
+    // interactive principal: it must never hold a bearer session a step-up
+    // could then raise to aal2. The general task surface (`Cx::auth`) already
+    // refuses it, but every sign-in path (OOB wallet redeem, passkey login)
+    // mints its session here — so this is the single chokepoint that keeps the
+    // role off every session, whatever the sign-in route. See also
+    // `DidHostingControlAuthBackend::check_acl`, which refuses the
+    // challenge/authenticate flow before it reaches a token.
+    if matches!(role, Role::MetricsReader) {
+        return Err(AppError::Unauthorized(
+            "a metrics-reader credential cannot open an interactive session".into(),
+        ));
+    }
+
     let session_id = Uuid::new_v4().to_string();
 
     let (access_token, access_expires_at, refresh_token, refresh_expires_at, token_id) =
@@ -668,6 +682,27 @@ mod refresh_token_invariant {
         let ks = store.keyspace(KS_SESSIONS).unwrap();
         let keys = JwtKeys::from_ed25519_bytes(&[11u8; 32]).unwrap();
         (ks, keys, dir)
+    }
+
+    /// A `MetricsReader` is a counters-only sidecar credential and must never
+    /// obtain an interactive session, whatever sign-in path mints it — every
+    /// one funnels through here. The call is refused and nothing is stored.
+    #[tokio::test]
+    async fn metrics_reader_cannot_open_a_session() {
+        let (ks, keys, _dir) = make_ks().await;
+        let err = create_authenticated_session(
+            &ks,
+            &keys,
+            "did:key:z6MkMetricsReader",
+            &Role::MetricsReader,
+            60,
+            900,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a MetricsReader must not get a session");
+        assert!(matches!(err, AppError::Unauthorized(_)), "got {err:?}");
     }
 
     /// Activity advances the clock the idle timeout is measured against.

@@ -63,6 +63,11 @@ pub use bound::{
     BoundError, BoundKeyError, identity_signing_secret, sign_document, verify_bound_key,
     verify_sender_bound, verify_sender_bound_approval,
 };
+/// The `did:webvh` log host policy a [`TransportBoundVerifier`] reads a signer's
+/// log under. Re-exported so a caller can build a verifier that trusts a
+/// private/loopback-hosted identity (`HostPolicy::AllowPrivate`) without taking
+/// a direct dependency on `didwebvh-rs`.
+pub use didwebvh_rs::host_policy::HostPolicy;
 pub use transport::{TSP_BINDING_URI, TspTransportHandler};
 pub use verifier::{TransportBoundVerifier, build_verifier, is_unreachable};
 
@@ -412,6 +417,15 @@ pub fn framework_error_type_uri() -> trust_tasks_rs::TypeUri {
     "https://trusttasks.org/spec/trust-task-error/0.5"
         .parse()
         .expect("framework error Type URI parses")
+}
+
+/// The `did-management/server/metrics/0.1` request Type URI, taken from the
+/// generated spec — the same source the control-task router keys on. Exposed
+/// so a binary whose own `trust-tasks-rs` is only a dev-dependency (the
+/// daemon's `fetch-metrics`) can sign against the canonical value rather than
+/// a hand-typed literal that a spec or namespace change could silently desync.
+pub fn metrics_request_type_uri() -> &'static str {
+    <trust_tasks_rs::specs::did_management::server::metrics::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI
 }
 
 /// Build a framework error document addressed to the request's

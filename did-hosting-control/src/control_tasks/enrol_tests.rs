@@ -782,6 +782,58 @@ async fn invites_are_refused_as_the_spec_says() {
     );
 }
 
+/// A subject holding `MetricsReader` never gets a passkey: an invite for it,
+/// of either purpose, is refused, and an invite issued before the role was
+/// granted is refused at redemption — before the invite is consumed.
+#[tokio::test]
+async fn a_metrics_reader_is_never_paired_with_a_passkey() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 120, Role::Admin).await;
+    let reader = member(&state, 121, Role::MetricsReader).await;
+    let invitee = stranger(122);
+
+    for purpose in ["session", "stepUp"] {
+        let reply = call(
+            &state,
+            Via::Tsp,
+            &admin,
+            &t(INVITE),
+            json!({ "subject": reader.did, "purpose": purpose }),
+        )
+        .await;
+        assert_eq!(
+            code(&reply),
+            "auth/passkey/enroll/invite:roleNotPermitted",
+            "{purpose}: {reply}"
+        );
+    }
+
+    // Issued while the subject held no role, then granted `MetricsReader`.
+    let later = stranger(123);
+    let issued = issue(&state, &admin, &later.did, "session").await;
+    member(&state, 123, Role::MetricsReader).await;
+    let reply = redeem(
+        &state,
+        Via::Tsp,
+        &invitee,
+        &issued,
+        &mut SoftPasskey::new(),
+        None,
+    )
+    .await;
+    assert_eq!(code(&reply), "permissionDenied", "{reply}");
+    assert!(
+        pk::get_passkey_user_by_did(&state.sessions_ks, &later.did)
+            .await
+            .unwrap()
+            .is_none_or(|u| u.credentials.is_empty()),
+        "no login passkey landed"
+    );
+    // Refused before the take: the invite is still live.
+    let reply = redeem_start(&state, Via::Tsp, &invitee, &issued.token, &issued.code).await;
+    ok(&reply, &t(REDEEM_START));
+}
+
 /// Over HTTPS the source is the client IP, counted before dispatch, and the
 /// refusal is a routed `unavailable` document with a retry time.
 #[tokio::test]

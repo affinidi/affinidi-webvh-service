@@ -72,10 +72,11 @@ export function draftToScope(draft: ScopeDraft): DomainScope | undefined {
  * role-based access already constrains their surface — and so does an
  * Owner grant while no system default domain is configured yet (a fresh
  * deployment with no domains seeded), the same fallback the removed route
- * took.
+ * took. MetricsReader is a counters-only credential that manages no DIDs,
+ * so it too defaults to "All domains" — the scope is immaterial to it.
  */
 export function defaultScopeForRole(
-  role: "admin" | "owner" | "service",
+  role: "admin" | "owner" | "service" | "metricsReader",
   defaultDomain: string | null,
 ): ScopeDraft {
   if (role === "owner" && defaultDomain) {

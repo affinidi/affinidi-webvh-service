@@ -142,12 +142,17 @@ fn without_credentials(url: &str) -> Option<String> {
     Some(parsed.to_string())
 }
 
-/// `server/metrics/0.1`: the service's own counters, authenticated. Admin.
+/// `server/metrics/0.1`: the service's own counters, authenticated.
+///
+/// Open to `Admin` **or** `MetricsReader`. Both get `counters` (the
+/// `webvh_*` aggregate totals); the `gauges` (internal control-plane↔edge
+/// replication health) are `Admin`-only and returned empty to a
+/// `MetricsReader`.
 pub(crate) async fn metrics(
     cx: &Cx<'_>,
     _p: metrics::v0_1::Payload,
 ) -> Result<metrics::v0_1::Response, TaskError> {
-    cx.admin().await?;
+    let auth = cx.metrics_read().await?;
     #[cfg(feature = "metrics")]
     let counters: Vec<Value> = did_hosting_common::server::metrics::counters()
         .into_iter()
@@ -155,7 +160,13 @@ pub(crate) async fn metrics(
         .collect();
     #[cfg(not(feature = "metrics"))]
     let counters: Vec<Value> = Vec::new();
-    let gauges = replication_gauges(cx.state).await?;
+    // Gauges are internal replication-health, not customer-facing: only an
+    // `Admin` sees them; a `MetricsReader` gets an empty list.
+    let gauges = if auth.role == crate::acl::Role::Admin {
+        replication_gauges(cx.state).await?
+    } else {
+        Vec::new()
+    };
     typed(
         json!({
             "snapshot": {
