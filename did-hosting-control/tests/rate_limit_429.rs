@@ -147,6 +147,74 @@ async fn retry_after_of(response: Response, limiter: &str) -> u64 {
         .unwrap()
 }
 
+/// The per-DID cap still refuses when nothing can be evicted — every slot is
+/// a challenge still being minted, with no row to claim — and the 429 names
+/// the limiter and when the oldest slot frees.
+#[tokio::test]
+async fn per_did_cap_answers_429_when_nothing_can_be_evicted() {
+    let mut ts = TestServer::start().await;
+    let now = install_manual_clock(&mut ts, 10_000);
+    let app = ts.router();
+    let did = "did:example:minting";
+
+    // `MAX_PENDING_CHALLENGES_PER_DID` in `routes::auth` is 10.
+    let in_flight: Vec<_> = (0..10)
+        .map(|_| ts.state.pending_challenges.try_issue(did, 10).unwrap())
+        .collect();
+    *now.lock().unwrap() += Duration::from_secs(5);
+
+    let response = app.oneshot(challenge_request(did)).await.unwrap();
+    let retry = retry_after_of(response, "auth-challenge-pending-per-did").await;
+    assert_eq!(retry, AuthConfig::default().challenge_ttl - 5);
+    for r in in_flight {
+        ts.state.pending_challenges.cancel(r);
+    }
+}
+
+/// Presenting an evicted challenge through the canonical authenticate handler
+/// is refused, and the refusal leaves the count where eviction put it.
+#[tokio::test]
+async fn an_evicted_challenge_cannot_authenticate() {
+    use did_hosting_common::server::acl::Role;
+    use vti_common::auth::{AudienceBinding, AuthenticateInput, handlers::handle_authenticate};
+
+    let ts = TestServer::start().await;
+    let did = "did:example:evicted";
+    ts.add_acl(did, Role::Owner).await;
+    let app = ts.router();
+
+    let mut issued = Vec::new();
+    for i in 0..=10 {
+        let response = app.clone().oneshot(challenge_request(did)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "challenge {i}");
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        issued.push((
+            body["sessionId"].as_str().unwrap().to_string(),
+            body["challenge"].as_str().unwrap().to_string(),
+        ));
+    }
+
+    let backend =
+        did_hosting_control::auth::DidHostingControlAuthBackend::from_state(&ts.state).unwrap();
+    let (session_id, challenge) = issued[0].clone();
+    let refused = handle_authenticate(
+        &backend,
+        AuthenticateInput {
+            session_id,
+            challenge,
+            signer_did: did.to_string(),
+            created_time: None,
+            session_pubkey_b58btc: None,
+            audience: AudienceBinding::Transport,
+        },
+    )
+    .await;
+    assert!(refused.is_err(), "the evicted challenge was redeemed");
+    assert_eq!(ts.state.pending_challenges.count_for(did), 10);
+}
+
 /// Regression: challenges nobody redeems must give their slots back when they
 /// expire. The tracker used to free a slot only when its challenge
 /// authenticated, so ten abandoned challenges locked the DID out until

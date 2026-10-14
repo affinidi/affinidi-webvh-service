@@ -4,8 +4,8 @@
 //! endpoint can ask for a challenge for any DID. Two caps bound it:
 //!
 //! 1. **Per DID** (`MAX_PENDING_CHALLENGES_PER_DID` in `routes::auth`): no DID
-//!    holds more than that many live challenges. At the cap the oldest is
-//!    evicted to make room, not the new one refused — see
+//!    holds more than that many live challenges. At the cap the oldest bound
+//!    challenge is evicted to make room, not the new one refused — see
 //!    [`PendingChallengeTracker::try_issue`].
 //! 2. **Global** ([`MAX_GLOBAL_PENDING`]): an attacker sweeping millions of
 //!    distinct DIDs cannot accumulate per-DID-cap × N challenges.
@@ -124,15 +124,47 @@ pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 #[derive(Debug)]
 pub struct Reservation {
     id: u64,
-    evicted: Vec<String>,
+    victims: Vec<Victim>,
 }
 
 impl Reservation {
-    /// Session ids of the challenges evicted to make room for this one. Their
-    /// `ChallengeSent` rows must be deleted, or they stay redeemable without
-    /// being counted.
-    pub fn evicted_sessions(&self) -> &[String] {
-        &self.evicted
+    /// Session ids of the challenges marked for eviction to make room for this
+    /// one. Nothing is evicted yet: see [`Eviction`].
+    pub fn evicting_sessions(&self) -> Vec<&str> {
+        self.victims.iter().map(Victim::session_id).collect()
+    }
+}
+
+/// A challenge marked for eviction. It stays counted until
+/// [`PendingChallengeTracker::complete_eviction`] — called once its row is
+/// claimed, so it can no longer be redeemed — or goes back to being an
+/// ordinary member on [`PendingChallengeTracker::restore_eviction`].
+#[derive(Debug)]
+pub struct Victim {
+    id: u64,
+    session_id: String,
+}
+
+impl Victim {
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+
+/// The evictions a bound reservation still owes, returned by
+/// [`PendingChallengeTracker::bind`]. The caller claims each victim's
+/// `ChallengeSent` row and then completes or restores it. Dropping one
+/// unfinished over-counts — the victims stay counted until their TTL — and
+/// never under-counts.
+#[must_use = "claim each victim's row, then complete or restore its eviction"]
+#[derive(Debug, Default)]
+pub struct Eviction {
+    victims: Vec<Victim>,
+}
+
+impl Eviction {
+    pub fn into_victims(self) -> Vec<Victim> {
+        self.victims
     }
 }
 
@@ -140,6 +172,10 @@ impl Reservation {
 struct Entry {
     did: String,
     session_id: Option<String>,
+    /// Marked for eviction by a reservation whose challenge is not yet
+    /// issued. Still counted (its row is still redeemable) but no longer
+    /// counted *against* the cap, and not offered to another eviction.
+    evicting: bool,
 }
 
 #[derive(Debug, Default)]
@@ -175,6 +211,12 @@ impl Inner {
         true
     }
 
+    fn restore(&mut self, id: u64) {
+        if let Some(entry) = self.entries.get_mut(&id) {
+            entry.evicting = false;
+        }
+    }
+
     /// Drop every entry whose TTL has passed, and any already-released ids at
     /// the front of the expiry queue.
     fn prune(&mut self, now: Instant) {
@@ -201,6 +243,7 @@ impl Inner {
             Entry {
                 did: did.to_string(),
                 session_id,
+                evicting: false,
             },
         );
         insert_sorted(
@@ -304,15 +347,25 @@ impl PendingChallengeTracker {
 
     /// Reserve a slot for a challenge to `did`.
     ///
-    /// At the per-DID cap the DID's oldest issued challenges are evicted to
-    /// make room, and their session ids returned on the reservation
-    /// ([`Reservation::evicted_sessions`]) for the caller to delete. Refusing
-    /// instead let anyone who asked for `per_did_cap` challenges in a DID's
-    /// name lock its owner out of signing in for up to `challenge_ttl`;
-    /// eviction can at worst cancel a login in flight, and only by spending
-    /// the caller's own per-IP budget. Only a challenge already bound to its
-    /// session is evicted — one still being minted would land untracked — so
-    /// a DID whose slots are all mid-mint is still refused.
+    /// At the per-DID cap the DID's oldest *bound* challenges are marked for
+    /// eviction to make room. Refusing instead let anyone who asked for
+    /// `per_did_cap` challenges in a DID's name lock its owner out of signing
+    /// in for up to `challenge_ttl`, at the cost of `per_did_cap` requests per
+    /// TTL. Eviction does not make the DID immune: a caller who keeps asking
+    /// in its name can still evict the owner's challenge before it is signed,
+    /// but has to out-pace the owner's own signing — `per_did_cap` requests
+    /// inside that window, every time, from its own per-IP budget — rather
+    /// than spend `per_did_cap` requests once per TTL.
+    ///
+    /// A victim is not evicted here. It stays counted, marked, until the
+    /// caller has minted the new challenge and claimed the victim's row
+    /// ([`Self::bind`], then [`Self::complete_eviction`]); a failed mint
+    /// ([`Self::cancel`]) or a failed claim ([`Self::restore_eviction`]) puts
+    /// it back. So the tracker never stops counting a row that can still be
+    /// redeemed. Only a challenge already bound to its session can be a
+    /// victim — one still being minted has no row to claim — so a newer bound
+    /// challenge can go before an older one still mid-mint, and a DID whose
+    /// remaining slots are all mid-mint (or already being evicted) is refused.
     ///
     /// Refused with [`AppError::RateLimited`] at the global cap, or per DID
     /// as above. The refusal's `retry_after_secs` is when the oldest counted
@@ -350,19 +403,29 @@ impl PendingChallengeTracker {
                 retry_after_secs,
             });
         }
-        let excess = inner
-            .per_did
-            .get(did)
-            .map_or(0, |q| (q.len() + 1).saturating_sub(per_did_cap));
-        let evictable: Vec<(u64, String)> = inner.per_did.get(did).map_or_else(Vec::new, |q| {
-            q.iter()
-                .filter_map(|(_, id)| {
-                    let sid = inner.entries.get(id)?.session_id.clone()?;
-                    Some((*id, sid))
-                })
-                .take(excess)
-                .collect()
-        });
+        // Members already being evicted are on their way out: they do not
+        // count against the cap, and cannot be chosen twice.
+        let mut counted = 0usize;
+        let mut evictable: Vec<Victim> = Vec::new();
+        if let Some(q) = inner.per_did.get(did) {
+            for (_, id) in q {
+                let Some(entry) = inner.entries.get(id) else {
+                    continue;
+                };
+                if entry.evicting {
+                    continue;
+                }
+                counted += 1;
+                if let Some(sid) = &entry.session_id {
+                    evictable.push(Victim {
+                        id: *id,
+                        session_id: sid.clone(),
+                    });
+                }
+            }
+        }
+        let excess = (counted + 1).saturating_sub(per_did_cap);
+        evictable.truncate(excess);
         if evictable.len() < excess {
             let retry_after_secs = inner
                 .per_did
@@ -377,27 +440,32 @@ impl PendingChallengeTracker {
                 retry_after_secs,
             });
         }
-        let mut evicted = Vec::with_capacity(evictable.len());
-        for (id, sid) in evictable {
-            inner.remove(id);
-            evicted.push(sid);
+        for victim in &evictable {
+            if let Some(entry) = inner.entries.get_mut(&victim.id) {
+                entry.evicting = true;
+            }
         }
-        if !evicted.is_empty() {
+        if !evictable.is_empty() {
             warn!(
                 did,
-                evicted = evicted.len(),
+                evicting = evictable.len(),
                 per_did_cap,
                 "per-DID challenge cap reached; evicting the oldest"
             );
         }
 
         let id = inner.insert(did, now + self.challenge_ttl, None);
-        Ok(Reservation { id, evicted })
+        Ok(Reservation {
+            id,
+            victims: evictable,
+        })
     }
 
     /// Attach the session id the challenge was issued under, so a successful
-    /// authentication can release exactly this slot.
-    pub fn bind(&self, reservation: Reservation, session_id: &str) {
+    /// authentication can release exactly this slot. Returns the evictions
+    /// the reservation still owes: claim each victim's row, then
+    /// [`Self::complete_eviction`] or [`Self::restore_eviction`] it.
+    pub fn bind(&self, reservation: Reservation, session_id: &str) -> Eviction {
         let mut inner = self.lock();
         let Inner {
             entries,
@@ -409,11 +477,31 @@ impl PendingChallengeTracker {
             entry.session_id = Some(session_id.to_string());
             by_session.insert(session_id.to_string(), reservation.id);
         }
+        Eviction {
+            victims: reservation.victims,
+        }
     }
 
-    /// Hand back a slot whose challenge was never issued.
+    /// Hand back a slot whose challenge was never issued. Its victims were
+    /// never claimed, so they go back to being ordinary members.
     pub fn cancel(&self, reservation: Reservation) {
-        self.lock().remove(reservation.id);
+        let mut inner = self.lock();
+        inner.remove(reservation.id);
+        for victim in &reservation.victims {
+            inner.restore(victim.id);
+        }
+    }
+
+    /// Drop a victim whose row has been claimed (or was already gone: it
+    /// authenticated or expired first). Idempotent.
+    pub fn complete_eviction(&self, victim: &Victim) {
+        self.lock().remove(victim.id);
+    }
+
+    /// Put back a victim whose row could not be claimed: it may still be
+    /// redeemable, so it stays counted, and may be chosen again.
+    pub fn restore_eviction(&self, victim: &Victim) {
+        self.lock().restore(victim.id);
     }
 
     /// Release the slot of the challenge issued under `session_id`, because it
@@ -522,9 +610,12 @@ mod tests {
         )
     }
 
+    /// Issue a challenge and settle its evictions as if every claim succeeded.
     fn issue(t: &PendingChallengeTracker, did: &str, cap: usize, sid: &str) {
         let r = t.try_issue(did, cap).expect("under the cap");
-        t.bind(r, sid);
+        for victim in t.bind(r, sid).into_victims() {
+            t.complete_eviction(&victim);
+        }
     }
 
     #[test]
@@ -550,8 +641,14 @@ mod tests {
         let r = t
             .try_issue("did:example:a", 3)
             .expect("evicts, not refuses");
-        assert_eq!(r.evicted_sessions(), ["s0"]);
-        t.bind(r, "s3");
+        assert_eq!(r.evicting_sessions(), ["s0"]);
+        // Until its row is claimed the victim is still counted.
+        assert_eq!(t.count_for("did:example:a"), 4);
+        let victims = t.bind(r, "s3").into_victims();
+        assert_eq!(t.count_for("did:example:a"), 4);
+        for v in &victims {
+            t.complete_eviction(v);
+        }
 
         assert_eq!(t.count_for("did:example:a"), 3);
         assert_eq!(t.global_count(), 3);
@@ -567,9 +664,87 @@ mod tests {
             issue(&t, "did:example:a", 10, &format!("s{i}"));
         }
         let r = t.try_issue("did:example:a", 3).unwrap();
-        assert_eq!(r.evicted_sessions(), ["s0", "s1", "s2"]);
-        t.bind(r, "s5");
+        assert_eq!(r.evicting_sessions(), ["s0", "s1", "s2"]);
+        for v in t.bind(r, "s5").into_victims() {
+            t.complete_eviction(&v);
+        }
         assert_eq!(t.count_for("did:example:a"), 3);
+    }
+
+    /// A challenge that is never minted evicts nothing: its victims go back to
+    /// being ordinary members, still counted and evictable again.
+    #[test]
+    fn cancel_restores_the_victims() {
+        let (t, _) = tracker(100);
+        for i in 0..3 {
+            issue(&t, "did:example:a", 3, &format!("s{i}"));
+        }
+        let r = t.try_issue("did:example:a", 3).unwrap();
+        assert_eq!(r.evicting_sessions(), ["s0"]);
+        t.cancel(r);
+        assert_eq!(t.count_for("did:example:a"), 3);
+
+        let r = t.try_issue("did:example:a", 3).unwrap();
+        assert_eq!(r.evicting_sessions(), ["s0"], "s0 is a candidate again");
+        t.cancel(r);
+    }
+
+    /// A victim whose row could not be claimed may still be redeemable, so it
+    /// stays counted — the DID is over its cap rather than holding a
+    /// redeemable challenge the tracker forgot.
+    #[test]
+    fn a_failed_claim_keeps_the_victim_counted() {
+        let (t, _) = tracker(100);
+        for i in 0..3 {
+            issue(&t, "did:example:a", 3, &format!("s{i}"));
+        }
+        let r = t.try_issue("did:example:a", 3).unwrap();
+        for v in t.bind(r, "s3").into_victims() {
+            t.restore_eviction(&v);
+        }
+        assert_eq!(t.count_for("did:example:a"), 4);
+        assert!(t.release_session("s0"), "s0 is still tracked");
+    }
+
+    /// Two issues racing at the cap pick different victims: one already
+    /// being evicted is neither counted against the cap nor chosen again.
+    #[test]
+    fn concurrent_issues_evict_distinct_victims() {
+        let (t, _) = tracker(100);
+        for i in 0..3 {
+            issue(&t, "did:example:a", 3, &format!("s{i}"));
+        }
+        let a = t.try_issue("did:example:a", 3).unwrap();
+        let b = t.try_issue("did:example:a", 3).unwrap();
+        assert_eq!(a.evicting_sessions(), ["s0"]);
+        assert_eq!(b.evicting_sessions(), ["s1"]);
+        for v in t
+            .bind(a, "s3")
+            .into_victims()
+            .into_iter()
+            .chain(t.bind(b, "s4").into_victims())
+        {
+            t.complete_eviction(&v);
+        }
+        assert_eq!(t.count_for("did:example:a"), 3);
+    }
+
+    /// A victim that authenticated before its row was claimed has already
+    /// released its slot; completing the eviction is then a no-op.
+    #[test]
+    fn completing_an_eviction_after_authentication_is_a_noop() {
+        let (t, _) = tracker(100);
+        for i in 0..3 {
+            issue(&t, "did:example:a", 3, &format!("s{i}"));
+        }
+        let r = t.try_issue("did:example:a", 3).unwrap();
+        let victims = t.bind(r, "s3").into_victims();
+        assert!(t.release_session("s0"));
+        for v in &victims {
+            t.complete_eviction(v);
+        }
+        assert_eq!(t.count_for("did:example:a"), 3);
+        assert!(t.release_session("s1"));
     }
 
     /// A challenge still being minted has no session to delete; evicting it
@@ -760,8 +935,8 @@ mod tests {
         };
         let t = PendingChallengeTracker::for_auth_config(&auth);
         // The per-DID cap is high, so only the global cap can bite.
-        t.bind(t.try_issue("did:example:a", 100).unwrap(), "s0");
-        t.bind(t.try_issue("did:example:b", 100).unwrap(), "s1");
+        let _ = t.bind(t.try_issue("did:example:a", 100).unwrap(), "s0");
+        let _ = t.bind(t.try_issue("did:example:b", 100).unwrap(), "s1");
         let err = t.try_issue("did:example:c", 100).unwrap_err();
         assert!(matches!(
             err,

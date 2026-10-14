@@ -46,9 +46,9 @@ const _: () = assert!(MAX_PENDING_CHALLENGES_PER_DID == 10);
 ///    `server.trusted_proxies` config.
 /// 2. Per-DID + global cap on live challenges (`PendingChallengeTracker`).
 ///    A slot frees when its challenge authenticates or its
-///    `challenge_ttl` runs out. At the per-DID cap the oldest challenge is
-///    evicted to make room; a refusal's `Retry-After` is the moment the
-///    oldest counted challenge expires.
+///    `challenge_ttl` runs out. At the per-DID cap the oldest bound challenge
+///    is evicted to make room, once the new one is minted; a refusal's
+///    `Retry-After` is the moment the oldest counted challenge expires.
 ///
 /// Replaced an earlier O(N) `prefix_iter_raw("session:")` scan with
 /// the O(1) in-memory tracker (review SM3).
@@ -108,25 +108,13 @@ pub(crate) async fn issue_challenge(
         .inspect_err(|e| {
             warn!(did = %did, error = %e, "challenge rate limited");
         })?;
-    // The tracker no longer counts an evicted challenge, so its row must go
-    // too, or it stays redeemable outside the cap (VTI-SES-005).
-    for session_id in reservation.evicted_sessions() {
-        if let Err(e) = did_hosting_common::server::auth::session::delete_session(
-            &state.sessions_ks,
-            session_id,
-        )
-        .await
-        {
-            warn!(did = %did, error = %e, "could not delete an evicted challenge");
-        }
-    }
 
-    let result = match crate::auth::DidHostingControlAuthBackend::from_state(state) {
+    let minted = match crate::auth::DidHostingControlAuthBackend::from_state(state) {
         Ok(backend) => {
             vti_common::auth::handlers::handle_challenge(
                 &backend,
                 vti_common::auth::ChallengeInput {
-                    did,
+                    did: did.clone(),
                     session_pubkey_b58btc: None,
                 },
             )
@@ -134,17 +122,70 @@ pub(crate) async fn issue_challenge(
         }
         Err(e) => Err(e),
     };
-
-    match result {
-        Ok(resp) => {
-            state.pending_challenges.bind(reservation, &resp.session_id);
-            Ok(resp)
-        }
+    let resp = match minted {
+        Ok(resp) => resp,
         Err(e) => {
+            // Nothing was issued, so nothing is evicted either.
             state.pending_challenges.cancel(reservation);
-            Err(e)
+            return Err(e);
+        }
+    };
+
+    let eviction = state.pending_challenges.bind(reservation, &resp.session_id);
+    if let Err(e) = claim_evicted(state, eviction).await {
+        // A victim's row could not be claimed, so it is still counted, and
+        // handing out the new challenge as well would put the DID over its
+        // cap. Take the new one back; if even that fails it stays counted —
+        // over the cap until it expires, but never redeemable uncounted.
+        warn!(did = %did, error = %e, "could not claim an evicted challenge");
+        match did_hosting_common::server::auth::session::take_session(
+            &state.sessions_ks,
+            &resp.session_id,
+        )
+        .await
+        {
+            Ok(_) => {
+                state.pending_challenges.release_session(&resp.session_id);
+            }
+            Err(e) => {
+                warn!(did = %did, error = %e, "could not withdraw the new challenge");
+            }
+        }
+        return Err(e);
+    }
+    Ok(resp)
+}
+
+/// Claim the `ChallengeSent` row of each challenge evicted for a new one,
+/// then drop it from the tracker. The claim is the same atomic take the
+/// authenticate handler consumes a challenge with, so a victim racing its own
+/// authentication is either claimed here (and its authentication refused) or
+/// authenticated (and the claim finds nothing) — never both. On a failed claim
+/// that victim and every unclaimed one stay counted: a row the tracker stops
+/// counting must be one that can no longer be redeemed (VTI-SES-005).
+async fn claim_evicted(
+    state: &AppState,
+    eviction: crate::pending_challenges::Eviction,
+) -> Result<(), AppError> {
+    let mut victims = eviction.into_victims().into_iter();
+    while let Some(victim) = victims.next() {
+        match did_hosting_common::server::auth::session::take_session(
+            &state.sessions_ks,
+            victim.session_id(),
+        )
+        .await
+        {
+            Ok(_) => state.pending_challenges.complete_eviction(&victim),
+            Err(e) => {
+                state.pending_challenges.restore_eviction(&victim);
+                for rest in victims {
+                    state.pending_challenges.restore_eviction(&rest);
+                }
+                return Err(e);
+            }
         }
     }
+    Ok(())
 }
 
 /// Refuse a renewal for a session that has gone quiet longer than
