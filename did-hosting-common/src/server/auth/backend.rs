@@ -61,6 +61,14 @@ impl SessionStore for DidHostingSessionStore {
         session::delete_session(&self.inner, session_id).await
     }
 
+    /// The atomic claim, overriding the trait's get-then-delete default: the
+    /// canonical authenticate handler consumes a challenge with this, and so
+    /// does challenge eviction on the control plane, so of an authentication
+    /// and an eviction racing for one challenge exactly one wins.
+    async fn take_session(&self, session_id: &str) -> Result<Option<Session>, Self::Error> {
+        session::take_session(&self.inner, session_id).await
+    }
+
     async fn store_refresh_index(
         &self,
         refresh_token: &str,
