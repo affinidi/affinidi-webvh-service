@@ -58,8 +58,10 @@ def main():
     main_sha = git("rev-parse", "--verify", "origin/main^{commit}").stdout.strip()
     print(f"cutting {branch} from {args.source} ({source[:12]}); main is {main_sha[:12]}")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        try:
+    # Prune after the temporary directory is gone: pruned inside it, the
+    # worktrees still exist and their records are left behind.
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
             # The release branch.
             rel = worktree(source, tmp, "release")
             set_version(rel, version)
@@ -115,8 +117,8 @@ def main():
                 + ("" if split else "\n\n**CHANGELOG.md needs splitting by hand** — see the cut output."),
             )
             print(f"pushed {branch}; opened the {cut_head} PR. Update the table in RELEASES.md.")
-        finally:
-            git("worktree", "prune")
+    finally:
+        git("worktree", "prune")
     return 0
 
 
