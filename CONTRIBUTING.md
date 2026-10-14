@@ -35,6 +35,17 @@ node_modules/.bin/tsc --noEmit
 npx --no-install expo export --platform web   # only if you touched the UI build path
 ```
 
+## Branches and releases
+
+All work lands on `main` by PR. Releases are `major.minor` (`0.9`) branches
+cut from `nightly` — the last fully green `main` — and patched only there.
+Two rules follow (details in [RELEASES.md](RELEASES.md)):
+
+- **Never edit a `version =`.** The release tooling sets versions; the
+  `branch rules` check fails a PR that changes one.
+- **Need a fix in a supported release?** Merge it to `main`, then label the PR
+  `backport release/<major.minor>`; a bot opens the cherry-pick on that branch.
+
 ## Commit hygiene
 
 Both rules below are enforced **server-side** — pushes that violate

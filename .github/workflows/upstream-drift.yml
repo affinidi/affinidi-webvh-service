@@ -93,5 +93,17 @@ jobs:
       # No `RUSTFLAGS: -D warnings` here, unlike ci.yml. A new upstream
       # deprecation should not page anyone; only a genuine compile failure —
       # the thing that breaks `cargo install` — should turn this red.
+      # did-hosting-control's build script builds the console with npm when
+      # `ui-dist` is missing or older than the UI sources, and the egress block
+      # above rightly refuses registry.npmjs.org (it made this job red from
+      # 2026-09-09 on, hiding any real drift). This job is about the Rust graph:
+      # the UI's npm graph is lockfile-pinned and tested by ci.yml. A
+      # placeholder bundle, written after checkout so it is newer than every
+      # source, makes the build script skip the npm run.
+      - name: Skip the console bundle build
+        run: |
+          mkdir -p did-hosting-control/ui-dist
+          echo '<!doctype html><title>placeholder</title>' > did-hosting-control/ui-dist/index.html
+
       - name: Build workspace against the re-resolved graph
         run: cargo check --workspace --all-targets

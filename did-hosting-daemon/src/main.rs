@@ -1540,6 +1540,7 @@ async fn build_control(
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
         redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),
         cache_invalidate,
+        oob: Default::default(),
         large_document_budget: Arc::new(
             did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
         ),
@@ -1554,6 +1555,10 @@ async fn build_control(
 
     // Seed registry from static config
     did_hosting_control::server::seed_registry(&state).await;
+
+    // Mirrors `did_hosting_control::server`: check in the background that the
+    // daemon's DID lists the services wallet sign-in needs. Never blocks.
+    did_hosting_control::sign_in_readiness::spawn(&state);
 
     // In daemon mode, no outbound ATM is needed — there are no external
     // servers to sync with.  The server_push::notify_servers_* functions

@@ -168,6 +168,7 @@ pub(crate) async fn run_tsp_trust_task(
         state,
         sender,
         None,
+        None,
         &transport,
         doc,
         verifier,
@@ -273,6 +274,7 @@ mod tests {
             ),
             outbox_notify: Arc::new(tokio::sync::Notify::new()),
             cache_invalidate: None,
+            oob: Default::default(),
         };
         (state, dir)
     }

@@ -1026,6 +1026,15 @@ async fn run_self_managed_setup(
     let trust_task_base = format!("{public_url}/api");
     if did_hosting_common::did::is_https_or_loopback(&trust_task_base) {
         did_hosting_common::did::add_trust_task_https_service(&mut doc, &trust_task_base);
+        // The console's login page, for wallet sign-in with a trigger link
+        // (contract C4): the embedded control plane serves the UI at the
+        // origin root. `https` only — a loopback-http dev daemon still gets
+        // TrustTaskHTTPS, but its control plane does not serve wallet sign-in
+        // (an `auth/oob` origin is `https://`), so it advertises no portal.
+        let portal = format!("{}/login", public_url.trim_end_matches('/'));
+        if did_hosting_common::did::is_sign_in_portal_url(&portal) {
+            did_hosting_common::did::add_sign_in_portal_service(&mut doc, &portal);
+        }
     } else {
         eprintln!(
             "  Public URL is not HTTPS (and not loopback) — skipping the TrustTaskHTTPS \

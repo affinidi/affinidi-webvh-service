@@ -166,6 +166,9 @@ pub struct AppState {
     /// cache entry for up to its TTL — there is no sync round-trip within a
     /// single process to invalidate it the way a standalone edge does.
     pub cache_invalidate: Option<Arc<CacheInvalidateFn>>,
+    /// Wallet sign-in with a trigger link (`auth/oob/*`): the open requests
+    /// and their limiters. See [`crate::oob`].
+    pub oob: Arc<crate::oob::OobRuntime>,
 }
 
 impl AppState {
@@ -391,6 +394,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         // Standalone control plane: no content cache of its own to
         // invalidate. See the field doc.
         cache_invalidate: None,
+        oob: Arc::default(),
     };
 
     // Reload challenges issued before a restart, so the caps hold across it.
@@ -589,6 +593,10 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let outbox_handle = tokio::spawn(async move {
         crate::outbox::run_outbox_loop(outbox_state, outbox_notify, outbox_shutdown_rx).await;
     });
+
+    // 7. Check, in the background, that our own DID lists the services
+    // wallet sign-in needs; warn once with the fix if not. Never blocks.
+    crate::sign_in_readiness::spawn(&state);
 
     // Wait for shutdown signal
     init::shutdown_signal().await;

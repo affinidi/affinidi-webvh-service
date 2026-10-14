@@ -1,7 +1,7 @@
 [package]
 name = "did-hosting-daemon"
 description = "DID Hosting Daemon — Unified binary embedding server, witness, watcher, and control plane"
-version = "0.8.3"
+version = "0.10.0"
 edition.workspace = true
 authors.workspace = true
 readme = "README.md"
@@ -120,11 +120,11 @@ name = "did-hosting-daemon"
 path = "src/main.rs"
 
 [dependencies]
-did-hosting-common = { version = "0.8", path = "../did-hosting-common", default-features = false, features = ["server-core", "setup-wizard"] }
-did-hosting-server = { version = "0.8", path = "../did-hosting-server", default-features = false }
-webvh-witness = { version = "0.8", path = "../webvh-witness", default-features = false }
-webvh-watcher = { version = "0.8", path = "../webvh-watcher", default-features = false }
-did-hosting-control = { version = "0.8", path = "../did-hosting-control", default-features = false }
+did-hosting-common = { version = "0.10", path = "../did-hosting-common", default-features = false, features = ["server-core", "setup-wizard"] }
+did-hosting-server = { version = "0.10", path = "../did-hosting-server", default-features = false }
+webvh-witness = { version = "0.10", path = "../webvh-witness", default-features = false }
+webvh-watcher = { version = "0.10", path = "../webvh-watcher", default-features = false }
+did-hosting-control = { version = "0.10", path = "../did-hosting-control", default-features = false }
 # Names the DID cache client handed to the shared Trust Tasks verifier
 # constructor (`did_hosting_common::server::trust_tasks::build_verifier`).
 affinidi-did-resolver-cache-sdk = { workspace = true }
@@ -149,7 +149,7 @@ vta-sdk = { workspace = true }
 tempfile = "3"
 # `test-support` seeds the verifier's deactivation verdicts in the daemon's
 # verifier tests; dev-only, so never part of a release build.
-did-hosting-common = { version = "0.8", path = "../did-hosting-common", default-features = false, features = ["server-core", "test-support"] }
+did-hosting-common = { version = "0.10", path = "../did-hosting-common", default-features = false, features = ["server-core", "test-support"] }
 trust-tasks-rs = { workspace = true }
 # `tests/e2e_*.rs`: real daemon (bin) + distributed-mode (in-process) end to
 # end smoke tests, driven across TSP, DIDComm and HTTPS.
@@ -164,7 +164,7 @@ didwebvh-rs = { workspace = true }
 # file, this workspace's tests drive genuine TSP traffic through it (the
 # admin RPC client's TSP transport), so — unlike every other consumer of this
 # dependency in the workspace — the `tsp` feature is turned on here.
-affinidi-messaging-test-mediator = { version = "0.15.0", features = ["tsp"] }
+affinidi-messaging-test-mediator = { version = "0.20.0", features = ["tsp"] }
 # A hand-rolled capturing `TspHandler` for the e2e admin RPC client (there is
 # no library-provided one — every other TSP-driving test in this workspace
 # dispatches in-process instead of over a real socket).

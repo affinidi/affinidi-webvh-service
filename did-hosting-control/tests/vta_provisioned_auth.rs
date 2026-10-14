@@ -162,6 +162,7 @@ async fn make_harness() -> Harness {
         ),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
         cache_invalidate: None,
+        oob: Default::default(),
     };
 
     Harness { state, _dir: dir }

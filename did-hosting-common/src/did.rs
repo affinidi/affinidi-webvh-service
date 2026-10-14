@@ -147,6 +147,52 @@ pub fn add_trust_task_https_service(doc: &mut serde_json::Value, base_uri: &str)
     }
 }
 
+/// Advertise a `SignInPortal` service at `endpoint` on a document built by
+/// [`build_did_document`]: the page where this service's people sign in with
+/// a wallet (contract C4, VTI-LNK-102).
+///
+/// A wallet reading a sign-in trigger link compares the origin of
+/// `serviceEndpoint` with the page the link was activated from, and refuses
+/// a mismatch (`wrong-origin`, VTI-LNK-105). So `endpoint` must be the
+/// console's login page on the origin that serves it; for a hosting daemon
+/// that is `{origin}/login`. The `auth/oob/*` tasks themselves travel over
+/// the `TrustTaskHTTPS` service ([`add_trust_task_https_service`]).
+///
+/// Callers should gate this on [`is_sign_in_portal_url`] — stricter than the
+/// `TrustTaskHTTPS` entry's [`is_https_or_loopback`]: `https` only.
+pub fn add_sign_in_portal_service(doc: &mut serde_json::Value, endpoint: &str) {
+    let did_id = doc["id"].as_str().unwrap_or_default().to_string();
+    let entry = json!({
+        "id": format!("{did_id}#sign-in-portal"),
+        "type": SERVICE_TYPE_SIGN_IN_PORTAL,
+        "serviceEndpoint": endpoint,
+    });
+    match doc.get_mut("service").and_then(|s| s.as_array_mut()) {
+        Some(services) => services.push(entry),
+        None => doc["service"] = json!([entry]),
+    }
+}
+
+/// Whether `uri` may be advertised as a `SignInPortal` (contract C4), and so
+/// serve wallet sign-in with a trigger link: `https://` with a host, and no
+/// userinfo.
+///
+/// Stricter than [`is_https_or_loopback`] on purpose: the portal's origin is
+/// what `auth/oob/*` binds a sign-in to, and the published `Origin` type
+/// (`trust_tasks_rs::specs::auth::oob`) admits `https://` only, so a plain-
+/// http portal — even on loopback — could never complete a conforming
+/// sign-in (a wallet refuses to approve one). The control plane applies the
+/// same rule to its `public_url` before it serves the family at all
+/// (`did-hosting-control`'s `oob::http::portal_origin`).
+pub fn is_sign_in_portal_url(uri: &str) -> bool {
+    url::Url::parse(uri).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
+}
+
 /// Whether `uri` is safe to advertise as a `TrustTaskHTTPS` endpoint.
 ///
 /// `https://` always qualifies. Plain `http://` qualifies only for loopback
@@ -300,6 +346,9 @@ pub const SERVICE_TYPE_DIDCOMM: &str = "DIDCommMessaging";
 /// Trust-Task HTTPS binding endpoint (`#trust-tasks`), HTTPS binding 0.2 §6.
 /// Kept in sync with `vta-sdk`'s `TRUST_TASK_HTTPS_SERVICE_TYPE`.
 pub const SERVICE_TYPE_TRUST_TASK_HTTPS: &str = "TrustTaskHTTPS";
+/// The page where people sign in with a wallet (`#sign-in-portal`), contract
+/// C4 / VTI-LNK-102.
+pub const SERVICE_TYPE_SIGN_IN_PORTAL: &str = "SignInPortal";
 
 /// True for the services the did:webvh spec *implies* rather than the
 /// operator declaring.
@@ -518,6 +567,35 @@ mod tests {
             services[1]["id"],
             json!(format!("{}#trust-tasks", doc["id"].as_str().unwrap()))
         );
+    }
+
+    /// Contract C4: `{ id: <did>#sign-in-portal, type: SignInPortal,
+    /// serviceEndpoint: <login page URL> }`, a bare string endpoint.
+    #[test]
+    fn sign_in_portal_is_advertised_with_the_login_page_as_endpoint() {
+        let mut doc =
+            build_did_document("example.com", ".well-known", "z6MkKey", &Default::default());
+        add_trust_task_https_service(&mut doc, "https://example.com/api");
+        add_sign_in_portal_service(&mut doc, "https://example.com/login");
+
+        let services = doc["service"].as_array().expect("service array");
+        assert_eq!(services[1]["type"], SERVICE_TYPE_SIGN_IN_PORTAL);
+        assert_eq!(services[1]["serviceEndpoint"], "https://example.com/login");
+        assert_eq!(
+            services[1]["id"],
+            json!(format!("{}#sign-in-portal", doc["id"].as_str().unwrap()))
+        );
+    }
+
+    #[test]
+    fn only_https_qualifies_for_a_sign_in_portal() {
+        assert!(is_sign_in_portal_url("https://example.com/login"));
+        assert!(is_sign_in_portal_url("https://example.com:8443/login"));
+        // Loopback http is fine for TrustTaskHTTPS, never for a portal.
+        assert!(!is_sign_in_portal_url("http://localhost:8534/login"));
+        assert!(!is_sign_in_portal_url("http://127.0.0.1:8534/login"));
+        assert!(!is_sign_in_portal_url("https://user@example.com/login"));
+        assert!(!is_sign_in_portal_url("not a url"));
     }
 
     #[test]

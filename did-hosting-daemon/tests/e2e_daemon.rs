@@ -289,6 +289,25 @@ async fn wait_until_ok(http: &reqwest::Client, url: &str) -> String {
 async fn daemon_lifecycle_over_https() {
     let daemon = Daemon::spawn().await;
     let mnemonic = "e2e-daemon";
+
+    // The daemon mounts the control plane's public sign-in self-check that
+    // the login page reads; before or without a check it answers a state,
+    // never an error.
+    let readiness: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/api/sign-in/readiness", daemon.base_url))
+        .send()
+        .await
+        .expect("GET /api/sign-in/readiness")
+        .json()
+        .await
+        .expect("readiness is JSON");
+    assert!(
+        matches!(
+            readiness["walletSignIn"].as_str(),
+            Some("ready" | "unknown" | "not-set-up")
+        ),
+        "unexpected readiness {readiness}"
+    );
     let (_did_signer_did, did_signer) = did_key_signer(210);
 
     // The daemon's own encoded host — the same string `did/register`

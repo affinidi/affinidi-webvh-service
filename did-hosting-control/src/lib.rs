@@ -20,6 +20,7 @@ pub mod frontend;
 pub mod health;
 pub mod identity_rotation;
 pub mod messaging;
+pub mod oob;
 pub mod outbox;
 pub mod path_locks;
 pub mod pending_challenges;
@@ -35,6 +36,7 @@ pub mod server;
 pub mod server_push;
 pub mod setup;
 pub mod setup_recipe;
+pub mod sign_in_readiness;
 pub mod signing;
 pub mod store;
 #[cfg(feature = "test-support")]

@@ -716,6 +716,7 @@ mod seed_tests {
             amr: vec![],
             acr: String::new(),
             acr_expires_at: None,
+            not_after: None,
         }
     }
 

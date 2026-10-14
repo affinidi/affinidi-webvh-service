@@ -224,9 +224,32 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
   invite's token and claim code — plus discovery and `auth/challenge`),
   `Authentication` (operational), `AssertionMethod` (an
   approver's decision), `SessionKey` (a passkey login, signed by the `did:key`
-  its session is bound to). A new task is a new row; never a hand-built reply.
-  `POST /api/trust-tasks` is the HTTPS binding of the same dispatch: the
-  document's proof authorises, a bearer session is optional context.
+  its session is bound to), `BoundKey(purposes)` (see below). A new task is a
+  new row; never a hand-built reply. `POST /api/trust-tasks` is the HTTPS
+  binding of the same dispatch: the document's proof authorises, a bearer
+  session is optional context.
+- **Bound-key rows: `auth/oob/*`** (wallet sign-in with a trigger link,
+  `did-hosting-control/src/oob`). Its six outer tasks are the
+  `@bound_key(...)` rows of the table, typed with
+  `trust_tasks_rs::specs::auth::oob`. Their issuers are fresh Ed25519
+  `did:key`s the exchange binds (`K_a`, `K_b`), never in the ACL, so
+  `ProofRule::BoundKey` differs from the other rules in exactly these ways,
+  and no others: HTTPS only; any bearer session is ignored; the family's
+  admission (size, per-address and global limits, the portal `Origin` on
+  `request`) runs before any proof work; the proof must be by the issuer's
+  own key for a purpose the row lists, verified locally
+  (`verify_bound_key`); no ACL pre-filter; and no shared replay cache — the
+  state machine keeps its own, recorded only for a live request, because a
+  stranger can mint keys for free and the shared cache fails closed for every
+  task. The row's state machine then checks the key is the one the request
+  recorded, the envelope, and the members' documents (`identify` for
+  `authentication`, `grant` for `assertionMethod`, via
+  `TransportBoundVerifier`, after an ACL check on the issuer string). Its
+  replies are `RoutedReply::Sealed`: signed by the row (step 1 and step 2 for
+  `assertionMethod`, per contract C5; the step 2 bytes are bound into the
+  grant), so the router does not re-sign them. Don't give `BoundKey` to a
+  task whose signer is a DID the service knows; that is what the other rules
+  are for.
 - **Two passkey stores.** Login (`purpose: session`) passkeys live in
   `KS_SESSIONS`; step-up-only passkeys in `KS_PASSKEY_STEP_UP`. The login
   ceremony reads `KS_SESSIONS` only — never make it read both. Enrolment
@@ -246,7 +269,16 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
   service signs, approval *requests* included, is `authentication`. Decisions
   (consent, step-up) are checked with `TransportBoundVerifier::verify_approval`
   — `assertionMethod` purpose *and* relationship, deactivation check — never
-  the bare `ProofVerifier::verify`.
+  the bare `ProofVerifier::verify`. **The one exception** is the `auth/oob/*`
+  replies to the approver's wallet key `K_a`: step 1 (`claim`), step 2
+  (`prove`), `respond`, and `cancel` sent by `K_a`. The cross-repo sign-in
+  contract (C5), as the wallet and the VTC implement it, requires them
+  signed for `assertionMethod`: the wallet checks every reply it receives
+  for that purpose, shows step 1 and step 2 to the member as the service's
+  statement, and binds step 2 into the member's grant via `contextDigest`.
+  Replies to the starter's `K_b` (`request`, `redeem`, `cancel` sent by
+  `K_b`), like every other service reply, are `authentication`. Don't widen
+  the exception further; it goes when the contract does.
 - **An edge never answers a document that failed `verify_control_plane`** —
   no signed refusal (it would settle an op the control plane never sent), no
   unsigned one. Transient failures (unresolvable signer DID, storage/I-O) are
@@ -397,19 +429,22 @@ Also worth knowing before you go looking for them:
   `cargo test -p did-hosting-common` silently skips them — and store-backed
   tests need a `store-*` backend feature or they panic on "no storage backend".
 
-- **Versions are bumped by hand.** No release automation. On a release, bump
-  every workspace crate's `[package] version` **and** the internal path-dep
-  pins (`did-hosting-* = { version = "0.x", path = … }`) — but not external
-  crates that happen to share that number (`tower-http`, `tokio-util`) — update
-  `did-hosting-ui/package.json`, and add a grouped `CHANGELOG.md` entry.
+- **Never edit a `version =` by hand.** Releases are `major.minor`, live on
+  `release/<major.minor>` branches cut from `nightly`, and every crate carries
+  the release's version; patches happen only on the release branch. Versions
+  move only through `scripts/cut-release.py` (the cut; `main` goes to the next
+  minor) and the *Prepare a release* workflow (rc / GA / patch), and the
+  `branch rules` check fails any other PR that changes one. A fix for a
+  supported release lands on `main` first, then gets a `backport
+  release/<major.minor>` label. See `RELEASES.md`.
 
-  **Then regenerate `fuzz/Cargo.lock`** (`cargo generate-lockfile
-  --manifest-path fuzz/Cargo.toml`). The fuzz crate is a detached workspace with
-  its own committed lock that records `did-hosting-common`'s version, so every
-  hand-done bump — and every dependency-requirement bump — invalidates it. The
-  nightly Fuzz job gates on `cargo fetch --locked`, and no PR check exercises
-  that path, so a missed regeneration turns the fuzz job red the next morning
-  with no fuzzing having run.
+  The tooling (`scripts/release_lib.py::set_version`) also moves the internal
+  path-dep pins and refreshes `fuzz/Cargo.lock`. That detached workspace's
+  committed lock records `did-hosting-common`'s version, and the nightly Fuzz
+  job gates on `cargo fetch --locked` with no PR check exercising it — so a
+  **dependency-requirement bump** in a normal PR still needs `cargo
+  generate-lockfile --manifest-path fuzz/Cargo.toml`, or the fuzz job turns red
+  the next morning with no fuzzing having run.
 
 - **Publishing needs `cargo publish --allow-dirty`.** The control plane embeds
   the management UI from `did-hosting-control/ui-dist/` — a gitignored build

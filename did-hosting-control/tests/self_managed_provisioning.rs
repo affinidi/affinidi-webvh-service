@@ -104,6 +104,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         ),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
         cache_invalidate: None,
+        oob: Default::default(),
     };
 
     // 4. ACL the tenant VTA's owner DID (the entity that an external VTA

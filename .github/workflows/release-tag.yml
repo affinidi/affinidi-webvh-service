@@ -1,0 +1,58 @@
+name: Tag a release
+
+# A push to a release branch that moves RELEASE (the cut, or a merged prep PR)
+# tags `v<RELEASE>` and opens its GitHub Release (RELEASES.md). An rc is a
+# prerelease. Its notes are the version's CHANGELOG.md section where it has
+# one, otherwise generated.
+#
+# Crates are published by hand from the tag (RELEASES.md, "Publish").
+on:
+  push:
+    branches: ["release/**"]
+    paths: [RELEASE]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-tag-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Tag v<RELEASE>
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Tag and publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          version=$(tr -d '[:space:]' < RELEASE)
+          tag="v$version"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "::warning::$tag already exists; not moving it"
+            exit 0
+          fi
+          # The version's own CHANGELOG section, heading excluded.
+          awk -v v="$version" '
+            $0 ~ "^## " v "( |$)" { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          args=(--target "$SHA" --title "$tag")
+          case "$version" in *-rc.*) args+=(--prerelease) ;; esac
+          if [ -s "$RUNNER_TEMP/notes.md" ]; then
+            args+=(--notes-file "$RUNNER_TEMP/notes.md")
+          else
+            args+=(--generate-notes)
+          fi
+          gh release create "$tag" "${args[@]}"
