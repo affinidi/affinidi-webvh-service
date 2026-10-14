@@ -4,7 +4,9 @@
 //! endpoint can ask for a challenge for any DID. Two caps bound it:
 //!
 //! 1. **Per DID** (`MAX_PENDING_CHALLENGES_PER_DID` in `routes::auth`): no DID
-//!    holds more than that many live challenges.
+//!    holds more than that many live challenges. At the cap the oldest is
+//!    evicted to make room, not the new one refused — see
+//!    [`PendingChallengeTracker::try_issue`].
 //! 2. **Global** ([`MAX_GLOBAL_PENDING`]): an attacker sweeping millions of
 //!    distinct DIDs cannot accumulate per-DID-cap × N challenges.
 //!
@@ -122,6 +124,16 @@ pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 #[derive(Debug)]
 pub struct Reservation {
     id: u64,
+    evicted: Vec<String>,
+}
+
+impl Reservation {
+    /// Session ids of the challenges evicted to make room for this one. Their
+    /// `ChallengeSent` rows must be deleted, or they stay redeemable without
+    /// being counted.
+    pub fn evicted_sessions(&self) -> &[String] {
+        &self.evicted
+    }
 }
 
 #[derive(Debug)]
@@ -292,11 +304,20 @@ impl PendingChallengeTracker {
 
     /// Reserve a slot for a challenge to `did`.
     ///
-    /// Refused with [`AppError::RateLimited`] when the DID already holds
-    /// `per_did_cap` live challenges or the global cap is reached. The
-    /// refusal's `retry_after_secs` is when the oldest counted challenge
-    /// expires — the earliest moment a retry can succeed. On refusal nothing
-    /// is reserved.
+    /// At the per-DID cap the DID's oldest issued challenges are evicted to
+    /// make room, and their session ids returned on the reservation
+    /// ([`Reservation::evicted_sessions`]) for the caller to delete. Refusing
+    /// instead let anyone who asked for `per_did_cap` challenges in a DID's
+    /// name lock its owner out of signing in for up to `challenge_ttl`;
+    /// eviction can at worst cancel a login in flight, and only by spending
+    /// the caller's own per-IP budget. Only a challenge already bound to its
+    /// session is evicted — one still being minted would land untracked — so
+    /// a DID whose slots are all mid-mint is still refused.
+    ///
+    /// Refused with [`AppError::RateLimited`] at the global cap, or per DID
+    /// as above. The refusal's `retry_after_secs` is when the oldest counted
+    /// challenge expires — the earliest moment a retry can succeed. On refusal
+    /// nothing is reserved or evicted.
     pub fn try_issue(&self, did: &str, per_did_cap: usize) -> Result<Reservation, AppError> {
         let now = (self.clock)();
         let mut inner = self.lock();
@@ -329,11 +350,24 @@ impl PendingChallengeTracker {
                 retry_after_secs,
             });
         }
-        if let Some(q) = inner.per_did.get(did)
-            && q.len() >= per_did_cap
-        {
-            let retry_after_secs = q
-                .front()
+        let excess = inner
+            .per_did
+            .get(did)
+            .map_or(0, |q| (q.len() + 1).saturating_sub(per_did_cap));
+        let evictable: Vec<(u64, String)> = inner.per_did.get(did).map_or_else(Vec::new, |q| {
+            q.iter()
+                .filter_map(|(_, id)| {
+                    let sid = inner.entries.get(id)?.session_id.clone()?;
+                    Some((*id, sid))
+                })
+                .take(excess)
+                .collect()
+        });
+        if evictable.len() < excess {
+            let retry_after_secs = inner
+                .per_did
+                .get(did)
+                .and_then(|q| q.front())
                 .map_or(1, |(expires_at, _)| secs_until(*expires_at, now));
             return Err(AppError::RateLimited {
                 limiter: LIMITER_PENDING_CHALLENGES_PER_DID,
@@ -343,9 +377,22 @@ impl PendingChallengeTracker {
                 retry_after_secs,
             });
         }
+        let mut evicted = Vec::with_capacity(evictable.len());
+        for (id, sid) in evictable {
+            inner.remove(id);
+            evicted.push(sid);
+        }
+        if !evicted.is_empty() {
+            warn!(
+                did,
+                evicted = evicted.len(),
+                per_did_cap,
+                "per-DID challenge cap reached; evicting the oldest"
+            );
+        }
 
         let id = inner.insert(did, now + self.challenge_ttl, None);
-        Ok(Reservation { id })
+        Ok(Reservation { id, evicted })
     }
 
     /// Attach the session id the challenge was issued under, so a successful
@@ -490,35 +537,81 @@ mod tests {
         assert_eq!(t.global_count(), 5);
     }
 
+    /// At the cap the oldest issued challenge makes room; asking again in a
+    /// DID's name cannot lock its owner out.
     #[test]
-    fn per_did_cap_rejects_excess_with_the_time_until_the_oldest_expires() {
+    fn per_did_cap_evicts_the_oldest_issued_challenge() {
         let (t, clock) = tracker(100);
         issue(&t, "did:example:a", 3, "s0");
-        advance(&clock, Duration::from_secs(10));
+        advance(&clock, Duration::from_secs(1));
         issue(&t, "did:example:a", 3, "s1");
         issue(&t, "did:example:a", 3, "s2");
 
+        let r = t
+            .try_issue("did:example:a", 3)
+            .expect("evicts, not refuses");
+        assert_eq!(r.evicted_sessions(), ["s0"]);
+        t.bind(r, "s3");
+
+        assert_eq!(t.count_for("did:example:a"), 3);
+        assert_eq!(t.global_count(), 3);
+        assert!(!t.release_session("s0"), "the evicted slot is gone");
+        assert!(t.release_session("s3"));
+    }
+
+    /// A lowered cap is caught up in one issue: everything over it goes.
+    #[test]
+    fn a_lowered_cap_evicts_down_to_it() {
+        let (t, _) = tracker(100);
+        for i in 0..5 {
+            issue(&t, "did:example:a", 10, &format!("s{i}"));
+        }
+        let r = t.try_issue("did:example:a", 3).unwrap();
+        assert_eq!(r.evicted_sessions(), ["s0", "s1", "s2"]);
+        t.bind(r, "s5");
+        assert_eq!(t.count_for("did:example:a"), 3);
+    }
+
+    /// A challenge still being minted has no session to delete; evicting it
+    /// would let its row land untracked. With nothing bound to evict, the cap
+    /// still refuses — with the time until the oldest expires.
+    #[test]
+    fn per_did_cap_refuses_when_every_slot_is_still_being_minted() {
+        let (t, clock) = tracker(100);
+        let in_flight: Vec<Reservation> = (0..3)
+            .map(|_| {
+                let r = t.try_issue("did:example:a", 3).unwrap();
+                advance(&clock, Duration::from_secs(5));
+                r
+            })
+            .collect();
+
         let err = t.try_issue("did:example:a", 3).unwrap_err();
-        // The oldest was issued 10s ago with a 30s TTL: 20s until a slot frees.
+        // The oldest was reserved 15s ago with a 30s TTL: 15s until a slot frees.
         assert!(matches!(
             err,
             AppError::RateLimited {
                 limiter: LIMITER_PENDING_CHALLENGES_PER_DID,
-                retry_after_secs: 20,
+                retry_after_secs: 15,
                 ..
             }
         ));
+        assert_eq!(t.count_for("did:example:a"), 3, "nothing evicted");
+        for r in in_flight {
+            t.cancel(r);
+        }
     }
 
     /// The regression: challenges that are never redeemed must give their
     /// slots back when they expire. Before, only a successful authentication
-    /// released a slot, so this DID stayed locked out until restart.
+    /// released a slot, so this DID stayed locked out until restart. Shown on
+    /// reservations still being minted, the one case the cap still refuses.
     #[test]
     fn abandoned_challenges_free_their_per_did_slots_on_expiry() {
         let (t, clock) = tracker(100);
-        for i in 0..10 {
-            issue(&t, "did:example:a", 10, &format!("s{i}"));
-        }
+        let abandoned: Vec<Reservation> = (0..10)
+            .map(|_| t.try_issue("did:example:a", 10).unwrap())
+            .collect();
         let err = t.try_issue("did:example:a", 10).unwrap_err();
         let AppError::RateLimited {
             retry_after_secs, ..
@@ -535,6 +628,7 @@ mod tests {
         issue(&t, "did:example:a", 10, "fresh");
         assert_eq!(t.count_for("did:example:a"), 1);
         assert_eq!(t.global_count(), 1);
+        drop(abandoned);
     }
 
     #[test]

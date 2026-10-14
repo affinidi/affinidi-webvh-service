@@ -89,31 +89,44 @@ async fn per_ip_challenge_limit_answers_429_with_retry_after_from_the_window() {
     assert!((1..=WINDOW_SECS).contains(&retry), "retry {retry}");
 }
 
+/// At the per-DID cap the oldest challenge is evicted, not the new one
+/// refused: asking for challenges in a DID's name cannot lock its owner out.
+/// The evicted challenge's row goes with it, so it cannot be redeemed outside
+/// the cap (VTI-SES-005).
 #[tokio::test]
-async fn per_did_pending_challenge_cap_answers_429() {
+async fn per_did_pending_challenge_cap_evicts_the_oldest() {
+    use did_hosting_common::server::acl::Role;
+    use did_hosting_common::server::auth::session::get_session;
+
     let ts = TestServer::start().await;
-    let app = ts.router();
+    // Enrolled, so the canonical handler persists a row per challenge.
     let did = "did:example:pending";
+    ts.add_acl(did, Role::Owner).await;
+    let app = ts.router();
 
     // `MAX_PENDING_CHALLENGES_PER_DID` in `routes::auth` is 10.
-    for i in 0..10 {
+    let mut session_ids = Vec::new();
+    for i in 0..=10 {
         let response = app.clone().oneshot(challenge_request(did)).await.unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "challenge {i} under the cap"
-        );
+        assert_eq!(response.status(), StatusCode::OK, "challenge {i}");
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        session_ids.push(body["sessionId"].as_str().unwrap().to_string());
     }
 
-    let response = app.oneshot(challenge_request(did)).await.unwrap();
-    let body = assert_rate_limited(response, "auth-challenge-pending-per-did").await;
-    // A slot frees when the oldest challenge's TTL runs out, which is at most
-    // one `challenge_ttl` from now.
-    let retry = body["retryAfterSecs"].as_u64().unwrap();
+    assert_eq!(ts.state.pending_challenges.count_for(did), 10);
+    let gone = get_session(&ts.state.sessions_ks, &session_ids[0])
+        .await
+        .unwrap();
     assert!(
-        (1..=AuthConfig::default().challenge_ttl).contains(&retry),
-        "retry {retry}"
+        gone.is_none(),
+        "the evicted challenge can no longer be redeemed"
     );
+    let kept = get_session(&ts.state.sessions_ks, &session_ids[10])
+        .await
+        .unwrap();
+    assert!(kept.is_some(), "the new challenge was issued");
 }
 
 /// A tracker whose clock the test moves, installed on `ts` before routing.
@@ -136,12 +149,11 @@ async fn retry_after_of(response: Response, limiter: &str) -> u64 {
 
 /// Regression: challenges nobody redeems must give their slots back when they
 /// expire. The tracker used to free a slot only when its challenge
-/// authenticated, so ten abandoned challenges locked the DID out until restart
-/// — and the `Retry-After` on that 429 promised a retry that would never
-/// succeed. Now the hint is exact: one second early is still refused, and at
-/// the hinted moment the challenge is issued.
+/// authenticated, so ten abandoned challenges locked the DID out until
+/// restart. Eviction now keeps the DID answerable at the cap, but expiry must
+/// still empty the count — or every new challenge would evict a live one.
 #[tokio::test]
-async fn abandoned_challenges_free_the_per_did_cap_at_the_promised_time() {
+async fn abandoned_challenges_leave_the_per_did_count_on_expiry() {
     let mut ts = TestServer::start().await;
     let now = install_manual_clock(&mut ts, 10_000);
     let app = ts.router();
@@ -151,21 +163,13 @@ async fn abandoned_challenges_free_the_per_did_cap_at_the_promised_time() {
         let response = app.clone().oneshot(challenge_request(did)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK, "challenge {i}");
     }
-    let response = app.clone().oneshot(challenge_request(did)).await.unwrap();
-    let retry = retry_after_of(response, "auth-challenge-pending-per-did").await;
-    assert_eq!(retry, AuthConfig::default().challenge_ttl);
+    assert_eq!(ts.state.pending_challenges.count_for(did), 10);
 
-    *now.lock().unwrap() += Duration::from_secs(retry - 1);
-    let response = app.clone().oneshot(challenge_request(did)).await.unwrap();
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-
-    *now.lock().unwrap() += Duration::from_secs(1);
+    *now.lock().unwrap() += Duration::from_secs(AuthConfig::default().challenge_ttl + 1);
+    assert_eq!(ts.state.pending_challenges.count_for(did), 0);
     let response = app.oneshot(challenge_request(did)).await.unwrap();
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "the slots freed when the Retry-After said they would"
-    );
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(ts.state.pending_challenges.count_for(did), 1);
 }
 
 /// The same for the global cap — the case that took the whole control plane

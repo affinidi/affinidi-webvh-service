@@ -538,10 +538,11 @@ mod tests {
     /// `auth/challenge/0.1` over a messaging binding is held to the same
     /// pending-challenge caps as `POST /api/auth/challenge`. It used to call
     /// the canonical handler directly with its per-DID limit disabled, so
-    /// challenges over DIDComm/TSP were unbounded. A refusal answers
-    /// `permissionDenied` — the arm's mapping for every challenge failure; the
-    /// specification defines no rate-limit code — and the slots free when the
-    /// challenges expire.
+    /// challenges over DIDComm/TSP were unbounded. At the per-DID cap the
+    /// oldest is evicted, so the count holds and the request is answered; a
+    /// refusal (the global cap) answers `permissionDenied` — the arm's mapping
+    /// for every challenge failure; the specification defines no rate-limit
+    /// code. The slots free when the challenges expire.
     #[tokio::test]
     async fn challenge_over_tsp_is_capped_and_frees_on_expiry() {
         use std::sync::Mutex;
@@ -589,10 +590,11 @@ mod tests {
         }
         assert_eq!(state.pending_challenges.count_for(SENDER_DID), 10);
 
-        let refused = send(&state, &challenge(99)).await;
+        // At the cap the oldest is evicted rather than the new one refused.
+        let doc = send(&state, &challenge(99)).await;
         assert_eq!(
-            refused["payload"]["code"], "permissionDenied",
-            "over the cap: {refused}"
+            doc["type"], "https://trusttasks.org/spec/auth/challenge/0.1#response",
+            "at the cap: {doc}"
         );
         assert_eq!(state.pending_challenges.count_for(SENDER_DID), 10);
 

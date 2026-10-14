@@ -46,8 +46,9 @@ const _: () = assert!(MAX_PENDING_CHALLENGES_PER_DID == 10);
 ///    `server.trusted_proxies` config.
 /// 2. Per-DID + global cap on live challenges (`PendingChallengeTracker`).
 ///    A slot frees when its challenge authenticates or its
-///    `challenge_ttl` runs out, and a refusal's `Retry-After` is the
-///    moment the oldest counted challenge expires.
+///    `challenge_ttl` runs out. At the per-DID cap the oldest challenge is
+///    evicted to make room; a refusal's `Retry-After` is the moment the
+///    oldest counted challenge expires.
 ///
 /// Replaced an earlier O(N) `prefix_iter_raw("session:")` scan with
 /// the O(1) in-memory tracker (review SM3).
@@ -107,6 +108,18 @@ pub(crate) async fn issue_challenge(
         .inspect_err(|e| {
             warn!(did = %did, error = %e, "challenge rate limited");
         })?;
+    // The tracker no longer counts an evicted challenge, so its row must go
+    // too, or it stays redeemable outside the cap (VTI-SES-005).
+    for session_id in reservation.evicted_sessions() {
+        if let Err(e) = did_hosting_common::server::auth::session::delete_session(
+            &state.sessions_ks,
+            session_id,
+        )
+        .await
+        {
+            warn!(did = %did, error = %e, "could not delete an evicted challenge");
+        }
+    }
 
     let result = match crate::auth::DidHostingControlAuthBackend::from_state(state) {
         Ok(backend) => {
