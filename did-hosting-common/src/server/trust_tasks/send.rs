@@ -315,15 +315,7 @@ pub async fn post_trust_task_https_verified(
         // rather than a bare transport error; we read the code for diagnostics
         // only and trust nothing else in the document.
         if let Some((code, message)) = unsigned_error_summary(&body) {
-            return Err(format!(
-                "trust task to {to} ({url}) was refused: {code}{}",
-                if message.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {message}")
-                }
-            )
-            .into());
+            return Err(refused(to, url, &code, &message).into());
         }
         return Err(format!(
             "trust task HTTPS send to {to} ({url}) failed: HTTP {status}: {}",
@@ -356,20 +348,26 @@ pub async fn post_trust_task_https_verified(
     // rather than reported as a signature failure.
     if let Err(e) = verify_sender_bound(&reply, Some(to), None, from, verifier).await {
         if let Some((code, message)) = unsigned_error_summary(&body) {
-            return Err(format!(
-                "trust task to {to} ({url}) was refused: {code}{}",
-                if message.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {message}")
-                }
-            )
-            .into());
+            return Err(refused(to, url, &code, &message).into());
         }
         return Err(e.into());
     }
 
     Ok(reply)
+}
+
+/// The diagnostic for a refusal read from an unsigned (so unverified) error.
+/// Both fields came from whoever answered, so they are sanitised and bounded
+/// ([`crate::error::redact_server_message`]) before reaching an operator's
+/// terminal.
+fn refused(to: &str, url: &str, code: &str, message: &str) -> String {
+    let code = crate::error::redact_server_message(code);
+    if message.is_empty() {
+        format!("trust task to {to} ({url}) was refused: {code}")
+    } else {
+        let message = crate::error::redact_server_message(message);
+        format!("trust task to {to} ({url}) was refused: {code}: {message}")
+    }
 }
 
 /// If `body` is an *unsigned* framework `trust-task-error` document, return its
@@ -543,6 +541,20 @@ mod tests {
             unsigned_error_summary(ordinary.to_string().as_bytes()),
             None
         );
+    }
+
+    /// A refusal read from an unverified reply is sanitised: control
+    /// characters (terminal escapes) cannot reach the operator's terminal.
+    #[test]
+    fn refused_sanitises_the_peer_supplied_fields() {
+        let msg = refused(
+            "did:x",
+            "http://h",
+            "permission\u{1b}Denied",
+            "a\u{1b}[2Jb\nc",
+        );
+        assert!(!msg.chars().any(char::is_control), "{msg:?}");
+        assert!(msg.ends_with("permission Denied: a [2Jb c"), "{msg:?}");
     }
 
     /// The non-canonical `TASK_SERVER_HEALTH_*` route-decorator URIs must NOT

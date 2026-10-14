@@ -18,7 +18,7 @@ pub async fn run_add_acl(
     max_did_count: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let role = Role::from_str(&role_str).map_err(|_| {
-        format!("invalid role '{role_str}': use 'admin', 'owner', 'service', or 'metricsreader'")
+        format!("invalid role '{role_str}': use 'admin', 'owner', 'service', or 'metricsReader'")
     })?;
 
     let store = Store::open(store_config).await?;

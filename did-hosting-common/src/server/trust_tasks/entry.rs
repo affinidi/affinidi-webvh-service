@@ -17,7 +17,7 @@
 //! | Spec wire           | Local field                   | Notes                       |
 //! |---------------------|-------------------------------|-----------------------------|
 //! | `subject`           | `did`                         | string-for-string           |
-//! | `role`              | `role` (Admin/Owner/Service)  | lowercase enum on the wire  |
+//! | `role`              | `role` (Admin/Owner/Service/MetricsReader) | camelCase enum on the wire |
 //! | `label`             | `label: Option<String>`       | passthrough                 |
 //! | `createdAt`         | `created_at: u64` (epoch s)   | local epoch → RFC3339       |
 //! | `scopes`            | (unused)                      | webvh has no opaque scopes  |
@@ -256,7 +256,7 @@ mod tests {
         // omitted. Without this, an `acl/grant` for the role fails outright.
         let bare = json!({
             "subject": "did:web:sidecar.example",
-            "role": "metricsreader"
+            "role": "metricsReader"
         });
         let parsed: SpecAclEntry = serde_json::from_value(bare).unwrap();
         let local = parsed.into_local(1_700_000_002).unwrap();

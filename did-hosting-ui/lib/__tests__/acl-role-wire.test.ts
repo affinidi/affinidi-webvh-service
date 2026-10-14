@@ -1,5 +1,5 @@
 /**
- * ACL-entry role parsing from the wire. The counters-only `metricsreader`
+ * ACL-entry role parsing from the wire. The counters-only `metricsReader`
  * role must round-trip: folding it into `owner` (as the generic invite
  * `role` parser does) would make the ACL edit form silently promote a
  * read-only credential to Owner on save.
@@ -26,9 +26,9 @@ const base = {
 };
 
 describe("aclEntryFromWire role mapping", () => {
-  it("preserves metricsreader and never promotes it to owner", () => {
-    const entry = aclEntryFromWire({ ...base, role: "metricsreader" } as never);
-    expect(entry.role).toBe("metricsreader");
+  it("preserves metricsReader and never promotes it to owner", () => {
+    const entry = aclEntryFromWire({ ...base, role: "metricsReader" } as never);
+    expect(entry.role).toBe("metricsReader");
   });
 
   it("keeps admin and service", () => {
@@ -53,14 +53,14 @@ describe("inviteFromWire role mapping", () => {
     }
   });
 
-  it("preserves metricsreader rather than folding it into another role", () => {
-    // Invites can no longer be created as metricsreader (server-refused), but a
+  it("preserves metricsReader rather than folding it into another role", () => {
+    // Invites can no longer be created as metricsReader (server-refused), but a
     // stale/forged row must be shown as itself — not silently promoted to owner
     // nor mislabelled — so an unchanged save is refused server-side, never a
     // silent rewrite. Mirrors `aclRole` for ACL entries.
     expect(
-      inviteFromWire({ ...invite, role: "metricsreader" } as never).role,
-    ).toBe("metricsreader");
+      inviteFromWire({ ...invite, role: "metricsReader" } as never).role,
+    ).toBe("metricsReader");
   });
 
   it("never promotes a genuinely unknown role to owner — falls back to service", () => {

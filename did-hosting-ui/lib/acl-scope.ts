@@ -76,7 +76,7 @@ export function draftToScope(draft: ScopeDraft): DomainScope | undefined {
  * so it too defaults to "All domains" — the scope is immaterial to it.
  */
 export function defaultScopeForRole(
-  role: "admin" | "owner" | "service" | "metricsreader",
+  role: "admin" | "owner" | "service" | "metricsReader",
   defaultDomain: string | null,
 ): ScopeDraft {
   if (role === "owner" && defaultDomain) {

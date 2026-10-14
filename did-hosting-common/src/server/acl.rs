@@ -32,7 +32,7 @@ use super::store::KeyspaceHandle;
 /// `metrics` task gives a `MetricsReader` the `counters` only; the
 /// `gauges` (internal replication health) stay `Admin`-only.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "camelCase")]
 pub enum Role {
     Admin,
     Owner,
@@ -52,7 +52,7 @@ impl fmt::Display for Role {
             Role::Admin => write!(f, "admin"),
             Role::Owner => write!(f, "owner"),
             Role::Service => write!(f, "service"),
-            Role::MetricsReader => write!(f, "metricsreader"),
+            Role::MetricsReader => write!(f, "metricsReader"),
         }
     }
 }
@@ -65,7 +65,7 @@ impl std::str::FromStr for Role {
             "admin" => Ok(Role::Admin),
             "owner" => Ok(Role::Owner),
             "service" => Ok(Role::Service),
-            "metricsreader" => Ok(Role::MetricsReader),
+            "metricsReader" => Ok(Role::MetricsReader),
             _ => Err(AppError::Validation(format!("unknown role: {s}"))),
         }
     }
@@ -430,7 +430,7 @@ mod tests {
     #[test]
     fn role_from_str_metricsreader() {
         assert_eq!(
-            Role::from_str("metricsreader").unwrap(),
+            Role::from_str("metricsReader").unwrap(),
             Role::MetricsReader
         );
     }
@@ -445,17 +445,17 @@ mod tests {
         assert_eq!(Role::Admin.to_string(), "admin");
         assert_eq!(Role::Owner.to_string(), "owner");
         assert_eq!(Role::Service.to_string(), "service");
-        assert_eq!(Role::MetricsReader.to_string(), "metricsreader");
+        assert_eq!(Role::MetricsReader.to_string(), "metricsReader");
     }
 
     /// `Display`, `FromStr`, and serde must agree on the wire string —
     /// the ACL stores the role via serde, so a mismatch would make a
-    /// `metricsreader` entry unparseable by `FromStr` (and vice versa).
+    /// `metricsReader` entry unparseable by `FromStr` (and vice versa).
     #[test]
     fn metricsreader_display_fromstr_serde_agree() {
         let serialized = serde_json::to_string(&Role::MetricsReader).unwrap();
-        assert_eq!(serialized, "\"metricsreader\"");
-        assert_eq!(Role::MetricsReader.to_string(), "metricsreader");
+        assert_eq!(serialized, "\"metricsReader\"");
+        assert_eq!(Role::MetricsReader.to_string(), "metricsReader");
         assert_eq!(
             Role::from_str(&Role::MetricsReader.to_string()).unwrap(),
             Role::MetricsReader

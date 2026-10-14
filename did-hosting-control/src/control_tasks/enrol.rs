@@ -426,6 +426,16 @@ pub(crate) async fn invite(
         .trim_end_matches('/')
         .to_string();
     let subject = acl::validate_did_format(&p.subject)?;
+    // A subject already holding `MetricsReader` is a did:key sidecar: no
+    // invite, of either purpose, may pair it with a passkey. The role an
+    // invite *confers* is checked below; this is the role the subject
+    // already *holds*, which a session invite would otherwise leave in place.
+    if is_metrics_reader(state, &subject).await? {
+        return Err(TaskError::Declared(
+            error_codes::ROLE_NOT_PERMITTED,
+            "a metrics-reader credential cannot be enrolled via invite".into(),
+        ));
+    }
     let purpose = match p.purpose {
         PayloadPurpose::Session => Purpose::Session,
         PayloadPurpose::StepUp => Purpose::StepUp,
@@ -604,6 +614,14 @@ pub(crate) async fn redeem_start(
     typed(body, "redeem start response")
 }
 
+/// Whether `subject` currently holds `MetricsReader` — a counters-only did:key
+/// credential that must never be paired with a passkey of any purpose.
+async fn is_metrics_reader(state: &AppState, subject: &str) -> Result<bool, AppError> {
+    Ok(acl::get_acl_entry(&state.acl_ks, subject)
+        .await?
+        .is_some_and(|e| e.role == Role::MetricsReader))
+}
+
 /// `auth/passkey/enroll/redeem/finish/0.1`: bind the credential to the
 /// invite's subject with the invite's purpose, and consume the invite.
 pub(crate) async fn redeem_finish(
@@ -647,6 +665,18 @@ pub(crate) async fn redeem_finish(
     if !live {
         return Err(not_found());
     }
+    // Refused before the invite is consumed. Invite create and update already
+    // refuse `MetricsReader`, but the subject may have been granted the role
+    // since the invite was issued, and a passkey must never land for it.
+    let confers_metrics_reader = role
+        .as_deref()
+        .is_some_and(|r| matches!(r.parse::<Role>(), Ok(Role::MetricsReader)));
+    if confers_metrics_reader || is_metrics_reader(state, &ceremony.subject).await? {
+        return Err(TaskError::Standard(
+            trust_tasks_rs::StandardCode::PermissionDenied,
+            "a metrics-reader credential cannot be enrolled via invite".into(),
+        ));
+    }
 
     let store = credential_store(state, ceremony.purpose)?;
     // Held from this read through `persist`, so a concurrent revoke can't be
@@ -687,19 +717,8 @@ pub(crate) async fn redeem_finish(
                 Some(_) => None,
                 None => Some(AclEntry {
                     did: ceremony.subject.clone(),
-                    // Defence in depth: invite create/update already refuse
-                    // `MetricsReader`, but a redeemed invite must never mint a
-                    // counters-only credential here either (it would arrive
-                    // paired with a login passkey, which the role must not hold).
-                    role: match role.parse::<Role>()? {
-                        Role::MetricsReader => {
-                            return Err(TaskError::Standard(
-                                trust_tasks_rs::StandardCode::PermissionDenied,
-                                "a metrics-reader credential cannot be enrolled via invite".into(),
-                            ));
-                        }
-                        other => other,
-                    },
+                    // `MetricsReader` was refused above, before the take.
+                    role: role.parse::<Role>()?,
                     label: Some("enrolled via passkey invite".into()),
                     created_at: now_epoch(),
                     max_total_size: None,

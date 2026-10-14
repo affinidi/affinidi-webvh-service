@@ -428,12 +428,6 @@ pub fn metrics_request_type_uri() -> &'static str {
     <trust_tasks_rs::specs::did_management::server::metrics::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI
 }
 
-/// The `did-management/server/metrics/0.1#response` Type URI — the exact type
-/// a verified metrics reply must carry. See [`metrics_request_type_uri`].
-pub fn metrics_response_type_uri() -> &'static str {
-    <trust_tasks_rs::specs::did_management::server::metrics::v0_1::Response as trust_tasks_rs::Payload>::TYPE_URI
-}
-
 /// Build a framework error document addressed to the request's
 /// `issuer`, carrying a custom `ErrorPayload` — used by handlers that
 /// need to emit spec-defined error shapes that don't fit the

@@ -39,7 +39,7 @@ describe("defaultScopeForRole", () => {
     expect(defaultScopeForRole("owner", null)).toEqual(DEFAULT_SCOPE_DRAFT);
   });
 
-  it.each(["admin", "service", "metricsreader"] as const)(
+  it.each(["admin", "service", "metricsReader"] as const)(
     "defaults %s to All domains even with a system default configured",
     (role) => {
       expect(defaultScopeForRole(role, "alpha.example")).toEqual(DEFAULT_SCOPE_DRAFT);

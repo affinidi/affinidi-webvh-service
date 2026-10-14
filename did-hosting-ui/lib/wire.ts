@@ -302,37 +302,34 @@ export function identityFromWire(r: IdentityListResponse): {
 // Access
 // ---------------------------------------------------------------------------
 
-function role(
-  r: string | undefined,
-): "admin" | "owner" | "service" | "metricsreader" {
-  // Preserve every recognised role, including the counters-only
-  // `metricsreader` — the same thing `aclRole` does for ACL entries. Folding
-  // it into `owner` would let the edit form silently promote a read-only
-  // credential to Owner on save; folding it into any other role would mislabel
-  // the row. The server now refuses `metricsreader` on invites, so this only
-  // ever surfaces a stale/forged row — shown honestly, and refused server-side
-  // if saved unchanged, never silently rewritten. A genuinely unrecognised
-  // value (a future role this client predates) falls back to the LEAST-
-  // privileged `service`, never the most-powerful role — and a throw is wrong
-  // here because `role()` runs inside `invites.map(...)`, where one bad row
-  // would hide the entire invite list.
+type WireRole = "admin" | "owner" | "service" | "metricsReader";
+
+/** A recognised role, preserved exactly — including the counters-only
+ *  `metricsReader`. Folding that into `owner` would let an edit form silently
+ *  promote a read-only credential on save; folding it into any other role
+ *  would mislabel the row. `undefined` for a value this client predates. */
+function knownRole(r: string | undefined): WireRole | undefined {
   return r === "admin" ||
     r === "owner" ||
     r === "service" ||
-    r === "metricsreader"
+    r === "metricsReader"
     ? r
-    : "service";
+    : undefined;
 }
 
-/** ACL-entry roles, which include the counters-only `metricsreader`. Kept
- *  separate from invite roles (`role`): a metrics credential is a did:key
- *  sidecar, never a passkey enrolment, so invites stay the narrower set.
- *  Preserving `metricsreader` here is load-bearing — folding it into `owner`
- *  would make the edit form silently promote a read-only credential on save. */
-function aclRole(
-  r: string | undefined,
-): "admin" | "owner" | "service" | "metricsreader" {
-  return r === "admin" || r === "service" || r === "metricsreader" ? r : "owner";
+/** Invite roles. The server refuses `metricsReader` on invites, so it only
+ *  ever surfaces on a stale/forged row — shown honestly, never rewritten. An
+ *  unrecognised value falls back to the LEAST-privileged `service`; a throw
+ *  is wrong here because this runs inside `invites.map(...)`, where one bad
+ *  row would hide the entire invite list. */
+function role(r: string | undefined): WireRole {
+  return knownRole(r) ?? "service";
+}
+
+/** ACL-entry roles. Same recognised set as invites; an entry with no or an
+ *  unrecognised role keeps its historical `owner` reading. */
+function aclRole(r: string | undefined): WireRole {
+  return knownRole(r) ?? "owner";
 }
 
 export function inviteFromWire(i: InviteSummary): InviteListItem {

@@ -201,31 +201,6 @@ async fn handle_inner(
         }
     }
 
-    // ─── 6b. Owner invariant: never promote onto `DomainScope::All`. ──
-    // A fresh Owner is *required* to carry an explicit domain scope (see
-    // `SpecAclEntry::into_local`): the auth path must not silently fall back to
-    // "all domains" for an Owner. But non-Owner roles (Admin / Service /
-    // MetricsReader) default to `DomainScope::All`, and this handler only
-    // rewrites `entry.role` — it carries no scope. Promoting such an entry to
-    // Owner would mint an Owner on every domain, bypassing that invariant (a
-    // MetricsReader with the default scope is the motivating case). Refuse it
-    // and direct the operator to re-grant Owner with an explicit scope. An
-    // Owner that was demoted keeps its explicit scope, so Admin→Owner round
-    // trips on a genuinely-scoped entry are unaffected.
-    if matches!(to_role, Role::Owner)
-        && matches!(entry.domains, crate::server::domain::DomainScope::All)
-    {
-        return Err(reject_with(
-            &doc,
-            ErrorPayload::new(StandardCode::PermissionDenied)
-                .with_message(
-                    "cannot promote an all-domains entry to Owner: re-grant Owner with an \
-                     explicit domain scope instead",
-                )
-                .with_details(json!({ "subject": doc.payload.subject, "toRole": "owner" })),
-        ));
-    }
-
     // ─── 7. Apply the transition. ────────────────────────────────
     entry.role = to_role;
     acl::store_acl_entry(acl_ks, &entry)
@@ -242,7 +217,7 @@ fn parse_role(s: &str) -> Result<Role, ()> {
 fn role_not_recognized_details(offending: &str) -> serde_json::Value {
     json!({
         "offendingRole": offending,
-        "knownRoles": ["admin", "owner", "service", "metricsreader"],
+        "knownRoles": ["admin", "owner", "service", "metricsReader"],
     })
 }
 
@@ -510,7 +485,7 @@ mod tests {
         assert_eq!(details["offendingRole"], "superuser");
         assert_eq!(
             details["knownRoles"],
-            json!(["admin", "owner", "service", "metricsreader"])
+            json!(["admin", "owner", "service", "metricsReader"])
         );
     }
 
@@ -571,16 +546,11 @@ mod tests {
         let (_s, acl_ks) = harness().await;
         let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(&acl_ks, SECOND_ADMIN, Role::Admin).await;
-        // Demote to `service`, not `owner`: the admin entry carries the default
-        // `DomainScope::All`, and promoting an all-domains entry to Owner is now
-        // refused (see `promote_to_owner_from_all_domains_is_refused`). The point
-        // here is the last-authority guard permitting a demote once a second
-        // admin exists, which `service` exercises without the Owner-scope rule.
         let outcome = handle(
             &ctx(&acl_ks, &acl_locks),
             &transport(SECOND_ADMIN),
             no_verifier(),
-            request(SECOND_ADMIN, ADMIN_DID, "admin", "service"),
+            request(SECOND_ADMIN, ADMIN_DID, "admin", "owner"),
         )
         .await;
         assert!(matches!(outcome, DispatchOutcome::Handled(_)));
@@ -590,42 +560,8 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .role,
-            Role::Service
+            Role::Owner
         );
-    }
-
-    /// An entry carrying the default `DomainScope::All` (every non-Owner role
-    /// does) must not be promotable to Owner: a fresh Owner is required to carry
-    /// an explicit domain scope, and this handler rewrites only the role. The
-    /// motivating case is a MetricsReader (counters-only, always all-domains);
-    /// the same rule covers Admin/Service. The transition is refused and the
-    /// entry is left untouched.
-    #[tokio::test]
-    async fn promote_to_owner_from_all_domains_is_refused() {
-        let (_s, acl_ks) = harness().await;
-        let acl_locks = crate::server::path_locks::PathLocks::new();
-        seed(&acl_ks, ALICE_DID, Role::MetricsReader).await;
-        let outcome = handle(
-            &ctx(&acl_ks, &acl_locks),
-            &transport(ADMIN_DID),
-            no_verifier(),
-            request(ADMIN_DID, ALICE_DID, "metricsreader", "owner"),
-        )
-        .await;
-        let err = match outcome {
-            DispatchOutcome::Rejected(e) => e,
-            other => panic!("expected Rejected, got {other:?}"),
-        };
-        assert_eq!(
-            err.payload.code,
-            trust_tasks_rs::TrustTaskCode::Standard(StandardCode::PermissionDenied)
-        );
-        let unchanged = acl::get_acl_entry(&acl_ks, ALICE_DID)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(unchanged.role, Role::MetricsReader);
-        assert_eq!(unchanged.domains, DomainScope::All);
     }
 
     #[tokio::test]

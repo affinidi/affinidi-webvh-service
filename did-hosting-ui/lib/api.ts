@@ -275,7 +275,7 @@ export interface AgentNameAvailability {
 
 export interface AclEntry {
   did: string;
-  role: "admin" | "owner" | "service" | "metricsreader";
+  role: "admin" | "owner" | "service" | "metricsReader";
   label: string | null;
   created_at: number;
   max_total_size: number | null;
@@ -384,10 +384,10 @@ export interface InviteListItem {
   inviteId: string;
   did: string;
   purpose: InvitePurpose;
-  // Includes `metricsreader` so a stale/forged invite carrying it is shown as
+  // Includes `metricsReader` so a stale/forged invite carrying it is shown as
   // itself rather than silently folded into another role — see `role()` in
   // `wire.ts`. New invites can no longer be created with it (server-refused).
-  role: "admin" | "owner" | "service" | "metricsreader";
+  role: "admin" | "owner" | "service" | "metricsReader";
   createdAt: number;
   expiresAt: number;
   expired: boolean;
@@ -604,7 +604,7 @@ export function splitAgentName(input: string): { domain: string; name: string } 
   return { domain, name };
 }
 
-type Role = "admin" | "owner" | "service" | "metricsreader";
+type Role = "admin" | "owner" | "service" | "metricsReader";
 
 export const api = {
   /** Unauthenticated liveness probe. Plain HTTP by design. */

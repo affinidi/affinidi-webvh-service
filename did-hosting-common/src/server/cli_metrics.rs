@@ -16,9 +16,7 @@ use affinidi_tdk::secrets_resolver::secrets::Secret;
 use vta_sdk::provision_client::EphemeralSetupKey;
 
 use super::trust_tasks::send::{build_signed_request, post_trust_task_https_verified};
-use super::trust_tasks::{
-    HostPolicy, TransportBoundVerifier, metrics_request_type_uri, metrics_response_type_uri,
-};
+use super::trust_tasks::{HostPolicy, TransportBoundVerifier, metrics_request_type_uri};
 
 /// Read `server_did`'s counters over the authenticated `server/metrics/0.1`
 /// Trust Task and print them as JSON (`[{ "name": …, "value": … }]`) on stdout.
@@ -40,10 +38,9 @@ pub async fn fetch_metrics(
     default_host: &str,
     default_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // The request and `#response` types come from the generated spec (the same
-    // source the control-task router keys on), never a hand-typed literal.
+    // The request type comes from the generated spec (the same source the
+    // control-task router keys on), never a hand-typed literal.
     let request_type = metrics_request_type_uri();
-    let response_type = metrics_response_type_uri();
 
     let base = url.unwrap_or_else(|| loopback_base_url(default_host, default_port));
     let endpoint = format!("{}/api/trust-tasks", base.trim_end_matches('/'));
@@ -97,33 +94,26 @@ pub async fn fetch_metrics(
         .await
         .map_err(|e| format!("metrics request to {endpoint} failed: {e}"))?;
 
-    // `post_trust_task_https_verified` already surfaces a refusal: an
-    // ungranted/revoked/expired key answers with an unsigned `trust-task-error`
-    // (`permissionDenied`), which that helper reports by its code rather than
-    // returning here. A reply that reaches this point is a verified document
-    // from the real server DID, so it should be the task's `#response` — demand
-    // exactly that type, so a wrong-typed but verified reply can't print `[]`
-    // and exit 0, making a failed scrape look like a service that counted nothing.
-    if reply.type_uri.to_string() != response_type {
-        return Err(format!(
-            "metrics request to {endpoint} answered with an unexpected type {}: {}",
-            reply.type_uri,
-            serde_json::to_string(&reply.payload).unwrap_or_default()
-        )
-        .into());
-    }
+    // A reply that reaches this point is a verified document from the real
+    // server DID. `read_reply` demands it be the task's `#response` (so a
+    // wrong-typed but verified reply can't print `[]` and exit 0, making a failed
+    // scrape look like a service that counted nothing), and reports a signed
+    // `trust-task-error` by its code — the same reading every other client of a
+    // signed Trust Task reply uses. An unsigned refusal never gets here:
+    // `post_trust_task_https_verified` reports it by its code.
+    let payload: serde_json::Value = crate::witness_client::read_reply(request_type, reply)
+        .map_err(|e| format!("metrics request to {endpoint}: {e}"))?;
 
     // Require the counters array to be present — a malformed response is an
     // error, not an empty scrape.
-    let counters = reply
-        .payload
+    let counters = payload
         .get("snapshot")
         .and_then(|snapshot| snapshot.get("counters"))
         .filter(|counters| counters.is_array())
         .ok_or_else(|| {
             format!(
                 "metrics response from {server_did} carried no snapshot.counters array: {}",
-                serde_json::to_string(&reply.payload).unwrap_or_default()
+                serde_json::to_string(&payload).unwrap_or_default()
             )
         })?;
     println!("{}", serde_json::to_string(counters)?);
@@ -160,6 +150,18 @@ fn loopback_base_url(host: &str, port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::loopback_base_url;
+
+    /// `read_reply` expects `{request}#response`; the generated spec must agree,
+    /// or every verified scrape would be reported as the wrong type.
+    #[test]
+    fn the_metrics_response_type_is_the_request_type_with_a_response_fragment() {
+        use trust_tasks_rs::Payload;
+        use trust_tasks_rs::specs::did_management::server::metrics::v0_1;
+        assert_eq!(
+            format!("{}#response", super::metrics_request_type_uri()),
+            <v0_1::Response as Payload>::TYPE_URI
+        );
+    }
 
     #[test]
     fn maps_wildcard_binds_to_loopback() {
