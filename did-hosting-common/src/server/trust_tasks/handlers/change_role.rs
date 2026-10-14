@@ -202,6 +202,17 @@ async fn handle_inner(
     }
 
     // ─── 7. Apply the transition. ────────────────────────────────
+    // A `MetricsReader`'s domain scope is never consulted (it reads counters
+    // only), so it is `All` by default — and carrying that over would make the
+    // promoted entry, an Owner say, an Owner on every domain. Leaving the role
+    // resets the scope to no domains instead; the operator grants the scope
+    // the new role should have with `acl/grant` (the console's role edit does
+    // exactly that, right after this task). Other roles keep their scope: for
+    // Admin and Service `All` is a real grant, and changing role widens
+    // nothing.
+    if entry.role == Role::MetricsReader {
+        entry.domains = crate::server::domain::DomainScope::Allowed { domains: vec![] };
+    }
     entry.role = to_role;
     acl::store_acl_entry(acl_ks, &entry)
         .await
@@ -487,6 +498,31 @@ mod tests {
             details["knownRoles"],
             json!(["admin", "owner", "service", "metricsReader"])
         );
+    }
+
+    /// A MetricsReader's unused all-domains scope does not survive a role
+    /// change: promoted to Owner, it holds no domain until a grant gives it
+    /// one, rather than every domain.
+    #[tokio::test]
+    async fn leaving_metrics_reader_resets_the_scope_to_no_domains() {
+        let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        seed(&acl_ks, ALICE_DID, Role::MetricsReader).await;
+        let outcome = handle(
+            &ctx(&acl_ks, &acl_locks),
+            &transport(ADMIN_DID),
+            no_verifier(),
+            request(ADMIN_DID, ALICE_DID, "metricsReader", "owner"),
+        )
+        .await;
+        assert!(matches!(outcome, DispatchOutcome::Handled(_)));
+        let entry = acl::get_acl_entry(&acl_ks, ALICE_DID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.role, Role::Owner);
+        assert_eq!(entry.domains, DomainScope::Allowed { domains: vec![] });
+        assert!(!entry.domains.allows("example.com"));
     }
 
     /// `is_strict_promotion` is the gate for the self-promotion
