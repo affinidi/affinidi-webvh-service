@@ -174,18 +174,21 @@ pub async fn disable_domain(
     entry.disabled_at = Some(now_epoch);
     entry.purge_at = Some(now_epoch.saturating_add(grace_seconds));
     let ks = domains_ks(store)?;
-    ks.insert(canonical.as_bytes().to_vec(), &entry).await?;
 
-    pending_purge::schedule(
+    // One atomic write: a crash between a separate status write and the
+    // schedule would leave the domain disabled with no purge ever coming.
+    let mut batch = store.batch();
+    batch.insert(&ks, canonical.as_bytes().to_vec(), &entry)?;
+    pending_purge::stage_schedule(
         store,
+        &mut batch,
         &canonical,
         now_epoch,
         grace_seconds,
         DISABLE_PURGE_REASON,
         scheduled_by,
-    )
-    .await?;
-    Ok(())
+    )?;
+    batch.commit().await
 }
 
 /// Enable a previously-disabled domain. Cancels the pending purge if
@@ -201,15 +204,63 @@ pub async fn enable_domain(store: &Store, name: &str) -> Result<(), AppError> {
     entry.disabled_at = None;
     entry.purge_at = None;
     let ks = domains_ks(store)?;
-    ks.insert(canonical.as_bytes().to_vec(), &entry).await?;
 
-    // Best-effort cancel. A `Missing` outcome is fine — it means this
-    // domain was disabled before the soft-delete feature shipped and
-    // never had a pending row, or the sweep already cleared it (the
-    // sweep would only do that AFTER deleting the domain record, in
-    // which case `get_domain` above would have returned NotFound).
-    let _ = pending_purge::cancel(store, &canonical).await?;
-    Ok(())
+    // The status flip and the cancel are one atomic write. Written
+    // separately, a crash after the domain went Active but before the
+    // cancel left a ripe purge queued against a live domain, which the
+    // sweep would carry out. Removing an absent row is a no-op (a domain
+    // disabled before the soft-delete feature shipped never had one).
+    let mut batch = store.batch();
+    batch.insert(&ks, canonical.as_bytes().to_vec(), &entry)?;
+    pending_purge::stage_cancel(store, &mut batch, &canonical)?;
+    batch.commit().await
+}
+
+/// Write a domain entry replicated from the control plane
+/// (`replica/domain/upsert`) together with what its status implies for the
+/// pending purge — cancelled when `Active`, scheduled at the entry's
+/// `purge_at` when `Disabled` with both timestamps — in one atomic write,
+/// for the same crash reasons as [`enable_domain`] / [`disable_domain`].
+///
+/// Returns whether the domain already existed, and the schedule written
+/// (if any). A `Disabled` entry missing either timestamp is written with
+/// the pending row left as it is.
+pub async fn apply_replicated_domain(
+    store: &Store,
+    entry: &DomainEntry,
+    scheduled_by: &str,
+) -> Result<(bool, Option<pending_purge::PendingPurge>), AppError> {
+    let canonical = normalize_domain_name(&entry.name)?;
+    if canonical != entry.name {
+        return Err(AppError::Validation(format!(
+            "domain name not in canonical form — use '{canonical}'"
+        )));
+    }
+    let ks = domains_ks(store)?;
+    let existed = ks.contains_key(canonical.as_bytes().to_vec()).await?;
+
+    let mut batch = store.batch();
+    batch.insert(&ks, canonical.as_bytes().to_vec(), entry)?;
+    let scheduled = match (entry.status, entry.disabled_at, entry.purge_at) {
+        (DomainStatus::Active, _, _) => {
+            pending_purge::stage_cancel(store, &mut batch, &canonical)?;
+            None
+        }
+        (DomainStatus::Disabled, Some(disabled_at), Some(purge_at)) => {
+            Some(pending_purge::stage_schedule(
+                store,
+                &mut batch,
+                &canonical,
+                disabled_at,
+                purge_at.saturating_sub(disabled_at),
+                DISABLE_PURGE_REASON,
+                scheduled_by,
+            )?)
+        }
+        (DomainStatus::Disabled, _, _) => None,
+    };
+    batch.commit().await?;
+    Ok((existed, scheduled))
 }
 
 /// Hard-delete a domain record. Does **not** purge DIDs hosted under
@@ -267,24 +318,23 @@ pub async fn set_default_domain(store: &Store, name: &str) -> Result<(), AppErro
     let pointer = DefaultDomainPointer {
         domain: canonical.clone(),
     };
-    ks.insert(META_DEFAULT_DOMAIN_KEY.as_bytes().to_vec(), &pointer)
-        .await?;
 
     // Refresh the `default_domain` boolean on every entry: set it on
     // the new default, clear it everywhere else. The pointer in
     // `meta` is the truth; this denormalised flag is what we serve
-    // in API responses, so keep them in sync.
+    // in API responses, so the pointer and every flag change in one
+    // atomic write — never two entries both flagged default.
     let domains_ks = domains_ks(store)?;
-    let all = list_domains(store).await?;
-    for mut e in all {
+    let mut batch = store.batch();
+    batch.insert(&ks, META_DEFAULT_DOMAIN_KEY.as_bytes().to_vec(), &pointer)?;
+    for mut e in list_domains(store).await? {
         let is_default = e.name == canonical;
         if e.default_domain != is_default {
             e.default_domain = is_default;
-            domains_ks.insert(e.name.as_bytes().to_vec(), &e).await?;
+            batch.insert(&domains_ks, e.name.as_bytes().to_vec(), &e)?;
         }
     }
-
-    Ok(())
+    batch.commit().await
 }
 
 #[cfg(test)]
@@ -530,5 +580,124 @@ mod tests {
         let b2 = get_domain(&store, "b.example").await.unwrap().unwrap();
         assert!(!a2.default_domain);
         assert!(b2.default_domain);
+    }
+
+    const RACE_DOMAINS: usize = 150;
+
+    fn race_name(i: usize) -> String {
+        format!("d{i}.example")
+    }
+
+    /// Crash-ordering guard for `enable_domain`. The state a crash between
+    /// two separate writes would freeze — the domain Active while its ripe
+    /// purge is still queued — must never be observable: the sweep would
+    /// wipe the live domain. Read in the order status-then-purge so an
+    /// atomic flip can never produce a false positive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn enable_never_leaves_an_active_domain_with_a_queued_purge() {
+        use crate::server::store::test_support::assert_never_observed;
+        let store = fjall_store().await;
+        for i in 0..RACE_DOMAINS {
+            create_domain(&store, &entry(&race_name(i))).await.unwrap();
+            disable_domain(&store, &race_name(i), 1, 60, "did:example:admin")
+                .await
+                .unwrap();
+        }
+        let check_store = store.clone();
+        assert_never_observed(
+            RACE_DOMAINS,
+            |i| {
+                let store = store.clone();
+                async move { enable_domain(&store, &race_name(i)).await.unwrap() }
+            },
+            move |i| {
+                let store = check_store.clone();
+                async move {
+                    let entry = get_domain(&store, &race_name(i)).await.unwrap()?;
+                    if !entry.status.is_active() {
+                        return None;
+                    }
+                    pending_purge::get(&store, &race_name(i))
+                        .await
+                        .unwrap()
+                        .map(|_| format!("{} active with a purge queued", race_name(i)))
+                }
+            },
+        )
+        .await;
+    }
+
+    /// Crash-ordering guard for `disable_domain`: a Disabled domain must
+    /// always have its purge scheduled — never "disabled, nothing coming"
+    /// after the caller was told it was scheduled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn disable_never_leaves_a_disabled_domain_unscheduled() {
+        use crate::server::store::test_support::assert_never_observed;
+        let store = fjall_store().await;
+        for i in 0..RACE_DOMAINS {
+            create_domain(&store, &entry(&race_name(i))).await.unwrap();
+        }
+        let check_store = store.clone();
+        assert_never_observed(
+            RACE_DOMAINS,
+            |i| {
+                let store = store.clone();
+                async move {
+                    disable_domain(&store, &race_name(i), 1, 60, "did:example:admin")
+                        .await
+                        .unwrap()
+                }
+            },
+            move |i| {
+                let store = check_store.clone();
+                async move {
+                    let entry = get_domain(&store, &race_name(i)).await.unwrap()?;
+                    if entry.status.is_active() {
+                        return None;
+                    }
+                    match pending_purge::get(&store, &race_name(i)).await.unwrap() {
+                        Some(_) => None,
+                        None => Some(format!("{} disabled with no purge", race_name(i))),
+                    }
+                }
+            },
+        )
+        .await;
+    }
+
+    /// A replicated Active entry cancels the queued purge in the same write.
+    #[tokio::test]
+    async fn apply_replicated_active_entry_cancels_purge() {
+        let store = fjall_store().await;
+        create_domain(&store, &entry("a.example")).await.unwrap();
+        disable_domain(&store, "a.example", 1, 60, "did:example:admin")
+            .await
+            .unwrap();
+        let (existed, scheduled) = apply_replicated_domain(&store, &entry("a.example"), "did:c")
+            .await
+            .unwrap();
+        assert!(existed);
+        assert!(scheduled.is_none());
+        assert!(
+            pending_purge::get(&store, "a.example")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let mut disabled = entry("b.example");
+        disabled.status = DomainStatus::Disabled;
+        disabled.disabled_at = Some(10);
+        disabled.purge_at = Some(70);
+        let (existed, scheduled) = apply_replicated_domain(&store, &disabled, "did:c")
+            .await
+            .unwrap();
+        assert!(!existed);
+        let scheduled = scheduled.expect("disabled entry schedules");
+        assert_eq!((scheduled.scheduled_at, scheduled.grace_seconds), (10, 60));
+        assert_eq!(
+            pending_purge::get(&store, "b.example").await.unwrap(),
+            Some(scheduled)
+        );
     }
 }

@@ -22,7 +22,7 @@
 use std::time::Duration;
 
 use did_hosting_common::server::domain::{self, DISABLE_PURGE_REASON};
-use did_hosting_common::server::pending_purge;
+use did_hosting_common::server::pending_purge::{self, PurgeCheck};
 use did_hosting_common::server::store::Store;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
@@ -61,6 +61,28 @@ pub async fn run_sweep_once(store: &Store) -> u64 {
             // they own the DID records. Leave the row alone; the
             // server-side sweep will clear it on the relevant peer.
             continue;
+        }
+        // Re-check immediately before deleting: the row must be the one
+        // listed and the domain still disabled. A ripe row left behind for a
+        // re-enabled domain is a leftover, never an instruction.
+        match pending_purge::check_still_due(store, &entry).await {
+            Ok(PurgeCheck::Due) => {}
+            Ok(PurgeCheck::Superseded) => continue,
+            Ok(PurgeCheck::Stale(why)) => {
+                warn!(
+                    domain = %entry.domain,
+                    why,
+                    "control purge sweep: ripe entry for a live domain — NOT deleting; clearing the leftover"
+                );
+                if let Err(e) = pending_purge::cancel_if_unchanged(store, &entry).await {
+                    warn!(domain = %entry.domain, error = %e, "control purge sweep: failed to clear stale entry");
+                }
+                continue;
+            }
+            Err(e) => {
+                warn!(domain = %entry.domain, error = %e, "control purge sweep: re-check failed; retrying next tick");
+                continue;
+            }
         }
         match domain::delete_domain_record(store, &entry.domain).await {
             Ok(()) => {
@@ -258,6 +280,32 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// A ripe `disable-grace` row left behind for a domain that is Active
+    /// again (a crash between the re-enable and its cancel, on a store
+    /// written before they were one write) must not delete the domain.
+    #[tokio::test]
+    async fn sweep_never_deletes_a_re_enabled_domain() {
+        let store = fjall_store().await;
+        create_domain(
+            &store,
+            &entry("live.example", DomainStatus::Active, None, None),
+        )
+        .await
+        .unwrap();
+        schedule(&store, "live.example", 0, 1, DISABLE_PURGE_REASON, "did:c")
+            .await
+            .unwrap();
+
+        assert_eq!(run_sweep_once(&store).await, 0);
+        assert!(get_domain(&store, "live.example").await.unwrap().is_some());
+        assert!(
+            pending_purge::get(&store, "live.example")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }

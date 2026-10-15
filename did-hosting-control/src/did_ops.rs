@@ -264,33 +264,33 @@ async fn check_total_size_limit(
 
 /// Resolve a custom path during create, applying force-replace semantics.
 ///
-/// If the path is free, returns it unchanged. If taken and `force` is false,
+/// The caller must hold `state.path_locks.guard(custom_path)`, so the slot
+/// read here is still the slot when the caller commits.
+///
+/// If the path is free, returns `None`. If taken and `force` is false,
 /// returns `Conflict(conflict_msg)`. If taken and `force` is true, the caller
-/// must be an admin or the current owner of that path; the existing log
-/// content, witness, and owner-index are removed so the slot can be
-/// reused. Stats are left intact (separate keyspace).
+/// must be an admin or the current owner of that path, and the existing
+/// record is returned: the caller removes its log content, witness and (for
+/// another owner) owner-index **in the same batch** that writes the new
+/// record. Committed separately, a failure or crash in between left the
+/// slot's old record pointing at content that was already gone. Stats are
+/// left intact (separate keyspace).
 async fn resolve_path_for_create(
     state: &AppState,
     custom_path: &str,
     auth: &AuthClaims,
     force: bool,
     conflict_msg: &str,
-) -> Result<String, AppError> {
+) -> Result<Option<DidRecord>, AppError> {
     use crate::acl::Role;
 
-    if is_path_available(&state.dids_ks, custom_path).await? {
-        return Ok(custom_path.to_string());
-    }
+    let Some(existing) = state.dids_ks.get::<DidRecord>(did_key(custom_path)).await? else {
+        return Ok(None);
+    };
 
     if !force {
         return Err(AppError::Conflict(conflict_msg.to_string()));
     }
-
-    let existing: DidRecord = state
-        .dids_ks
-        .get(did_key(custom_path))
-        .await?
-        .ok_or_else(|| AppError::Internal("path conflict but record missing".into()))?;
 
     if existing.owner != auth.did && auth.role != Role::Admin {
         warn!(
@@ -304,22 +304,7 @@ async fn resolve_path_for_create(
         ));
     }
 
-    let mut batch = state.store.batch();
-    batch.remove(&state.dids_ks, content_log_key(custom_path));
-    batch.remove(&state.dids_ks, content_witness_key(custom_path));
-    if existing.owner != auth.did {
-        batch.remove(&state.dids_ks, owner_key(&existing.owner, custom_path));
-    }
-    batch.commit().await?;
-
-    info!(
-        caller = %auth.did,
-        prev_owner = %existing.owner,
-        mnemonic = %custom_path,
-        "force-replacing existing DID"
-    );
-
-    Ok(custom_path.to_string())
+    Ok(Some(existing))
 }
 
 // ---------------------------------------------------------------------------
@@ -347,28 +332,45 @@ pub async fn create_did(
     use crate::acl::Role;
     use crate::auth::session::now_epoch;
 
-    let mnemonic = match path {
-        Some(custom_path) if custom_path == ".well-known" => {
-            if auth.role != Role::Admin {
-                return Err(AppError::Forbidden(
-                    "only admins can create the root DID".into(),
-                ));
-            }
-            resolve_path_for_create(
-                state,
-                custom_path,
-                auth,
-                force,
-                "root DID (.well-known) already exists",
-            )
-            .await?
-        }
+    // Every branch returns holding the slot's per-path write lock — the same
+    // one `register_did_atomic` and `publish_did` take — so the availability
+    // check (or the force-replace read) and the commit below are one step.
+    // Without it, two creates of one free path both saw it free and both
+    // committed: the later silently replaced the earlier caller's slot and
+    // left the earlier owner's index entry pointing at a DID it no longer
+    // owned.
+    let (mnemonic, _path_guard, replaced) = match path {
         Some(custom_path) => {
-            validate_custom_path(custom_path)?;
-            let conflict_msg = format!("path '{custom_path}' is already taken");
-            resolve_path_for_create(state, custom_path, auth, force, &conflict_msg).await?
+            let conflict_msg = if custom_path == ".well-known" {
+                if auth.role != Role::Admin {
+                    return Err(AppError::Forbidden(
+                        "only admins can create the root DID".into(),
+                    ));
+                }
+                "root DID (.well-known) already exists".to_string()
+            } else {
+                validate_custom_path(custom_path)?;
+                format!("path '{custom_path}' is already taken")
+            };
+            let guard = state.path_locks.guard(custom_path).await;
+            let replaced =
+                resolve_path_for_create(state, custom_path, auth, force, &conflict_msg).await?;
+            (custom_path.to_string(), guard, replaced)
         }
-        None => generate_unique_mnemonic(&state.dids_ks).await?,
+        None => {
+            let mut claimed = None;
+            for _ in 0..8 {
+                let candidate = generate_unique_mnemonic(&state.dids_ks).await?;
+                let guard = state.path_locks.guard(&candidate).await;
+                // Re-checked under the lock: another create may have taken
+                // the random name between generation and locking.
+                if is_path_available(&state.dids_ks, &candidate).await? {
+                    claimed = Some((candidate, guard, None));
+                    break;
+                }
+            }
+            claimed.ok_or_else(|| AppError::Internal("failed to claim a unique mnemonic".into()))?
+        }
     };
 
     let now = now_epoch();
@@ -401,15 +403,23 @@ pub async fn create_did(
     // Per-account DID-count quota (SEC-4045 W3). Only a slot this owner does not
     // already hold counts against the cap — a force-replace of the caller's own
     // slot is not a net-new DID, so it must not be refused at the cap.
-    let adds_slot = match state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
-        Some(existing) => existing.owner != auth.did,
-        None => true,
-    };
+    let adds_slot = replaced
+        .as_ref()
+        .is_none_or(|existing| existing.owner != auth.did);
     if adds_slot {
         check_did_count_limit(auth, state).await?;
     }
 
+    // The force-replace's removal of the old slot's content and the new
+    // record are one atomic write.
     let mut batch = state.store.batch();
+    if let Some(existing) = replaced.as_ref() {
+        batch.remove(&state.dids_ks, content_log_key(&mnemonic));
+        batch.remove(&state.dids_ks, content_witness_key(&mnemonic));
+        if existing.owner != auth.did {
+            batch.remove(&state.dids_ks, owner_key(&existing.owner, &mnemonic));
+        }
+    }
     batch.insert(&state.dids_ks, did_key(&mnemonic), &record)?;
     batch.insert_raw(
         &state.dids_ks,
@@ -417,6 +427,15 @@ pub async fn create_did(
         mnemonic.as_bytes().to_vec(),
     );
     batch.commit().await?;
+    if let Some(existing) = replaced.as_ref() {
+        invalidate_cached_content(state, &mnemonic);
+        info!(
+            caller = %auth.did,
+            prev_owner = %existing.owner,
+            mnemonic = %mnemonic,
+            "force-replaced existing DID"
+        );
+    }
 
     // Build the DID URL using the did_hosting_url if configured, else public_url
     let base_url = state
@@ -1822,6 +1841,10 @@ pub async fn delete_did(
     request_domain: Option<&str>,
 ) -> Result<Option<String>, AppError> {
     validate_mnemonic(mnemonic)?;
+    // The per-path write lock, held from the read through the commit: the
+    // record is re-read under it, so the owner-index entry removed is the
+    // current owner's even if a transfer committed just before.
+    let _path_guard = state.path_locks.guard(mnemonic).await;
     let record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
     let did_id = record.did_id.clone();
@@ -1938,6 +1961,10 @@ pub async fn set_did_disabled(
     disabled: bool,
 ) -> Result<(), AppError> {
     validate_mnemonic(mnemonic)?;
+    // This writes the whole record back, so it must be read under the same
+    // per-path lock every other record writer holds — otherwise a publish
+    // committing in between is silently reverted to the stale copy.
+    let _path_guard = state.path_locks.guard(mnemonic).await;
     let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
     // Re-check DomainScope at time-of-use (SEC-4045 W7).
     if let Some(did_id) = record.did_id.as_deref() {
@@ -1978,6 +2005,10 @@ pub async fn rollback_did_to(
     use crate::auth::session::now_epoch;
 
     validate_mnemonic(mnemonic)?;
+    // Held from the record and log reads through the commit: a publish
+    // landing in between would otherwise be overwritten by a truncation of
+    // the log as it stood before it.
+    let _path_guard = state.path_locks.guard(mnemonic).await;
     let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
     // Re-check DomainScope at time-of-use (SEC-4045 W7).
@@ -2675,6 +2706,175 @@ mod tests_atomic {
                 .all(|k| *k == expected_log_key || *k == expected_witness_key),
             "every call must invalidate this mnemonic's own content keys"
         );
+    }
+
+    /// Two creates of one free path must not both succeed: the check that
+    /// the path is free and the write are one step under the per-path lock.
+    /// Unlocked, every racer saw the path free, each overwrote the last, and
+    /// the losers' owner-index entries were left pointing at a slot they no
+    /// longer owned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_creates_of_one_path_admit_exactly_one() {
+        let (state, _dir) = test_state().await;
+        let state = Arc::new(state);
+        const RACERS: usize = 16;
+        let mut handles = Vec::new();
+        for i in 0..RACERS {
+            let state = state.clone();
+            handles.push(tokio::spawn(async move {
+                let owner = format!("did:example:racer-{i}");
+                create_did(&owner_auth(&owner), &state, Some("contested"), false, None).await
+            }));
+        }
+        let mut created = 0;
+        for h in handles {
+            match h.await.unwrap() {
+                Ok(_) => created += 1,
+                Err(AppError::Conflict(_)) => {}
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert_eq!(created, 1, "exactly one create may claim the path");
+        let owner_entries = state
+            .dids_ks
+            .prefix_iter_raw(b"owner:".to_vec())
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|(k, _)| k.ends_with(b":contested"))
+            .count();
+        assert_eq!(owner_entries, 1, "no orphaned owner-index entries");
+    }
+
+    /// A force-replace commits the old slot's removal and the new record
+    /// in one write: after it, the slot has the new owner, no old content,
+    /// and only the new owner's index entry.
+    #[tokio::test]
+    async fn force_replace_is_a_single_write() {
+        let (state, _dir) = test_state().await;
+        let path = "replaced";
+        let log = build_test_did_log("scid-replaced", "control.test", path).await;
+        register_did_atomic(
+            &owner_auth("did:example:old"),
+            &state,
+            path,
+            &log,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        create_did(
+            &admin_auth("did:example:admin"),
+            &state,
+            Some(path),
+            true,
+            None,
+        )
+        .await
+        .expect("admin force-replace");
+
+        let record: DidRecord = state.dids_ks.get(did_key(path)).await.unwrap().unwrap();
+        assert_eq!(record.owner, "did:example:admin");
+        assert_eq!(record.version_count, 0);
+        assert!(
+            state
+                .dids_ks
+                .get_raw(content_log_key(path))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .dids_ks
+                .get_raw(owner_key("did:example:old", path))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .dids_ks
+                .get_raw(owner_key("did:example:admin", path))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// `set_did_disabled` writes the whole record back, so it must read it
+    /// under the per-path lock. Here a publish-like writer holds the lock,
+    /// has read the record, and commits a new version after the disable
+    /// request arrives: the disable must apply on top of that version, not
+    /// revert it — and the publish must not revert the disable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn set_did_disabled_never_writes_back_a_stale_record() {
+        let (state, _dir) = test_state().await;
+        let state = Arc::new(state);
+        let owner = "did:example:owner";
+        let path = "stale-disable";
+        create_did(&owner_auth(owner), &state, Some(path), false, None)
+            .await
+            .unwrap();
+
+        let guard = state.path_locks.guard(path).await;
+        let mut read: DidRecord = state.dids_ks.get(did_key(path)).await.unwrap().unwrap();
+        let disabler = {
+            let state = state.clone();
+            tokio::spawn(
+                async move { set_did_disabled(&owner_auth(owner), &state, path, true).await },
+            )
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        read.version_count = 7;
+        state.dids_ks.insert(did_key(path), &read).await.unwrap();
+        drop(guard);
+        disabler.await.unwrap().unwrap();
+
+        let record: DidRecord = state.dids_ks.get(did_key(path)).await.unwrap().unwrap();
+        assert!(record.disabled, "the disable was lost");
+        assert_eq!(
+            record.version_count, 7,
+            "the concurrent publish was reverted"
+        );
+    }
+
+    /// `delete_did` and `rollback_did_to` wait for the per-path lock before
+    /// reading the record they act on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_and_rollback_wait_for_the_path_lock() {
+        let (state, _dir) = test_state().await;
+        let state = Arc::new(state);
+        let owner = "did:example:owner";
+        let path = "locked";
+        create_did(&owner_auth(owner), &state, Some(path), false, None)
+            .await
+            .unwrap();
+
+        let guard = state.path_locks.guard(path).await;
+        let rollback = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                rollback_did_to(&owner_auth(owner), &state, path, None)
+                    .await
+                    .map(|_| ())
+            })
+        };
+        let delete = {
+            let state = state.clone();
+            tokio::spawn(async move { delete_did(&owner_auth(owner), &state, path, None).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !rollback.is_finished(),
+            "rollback ran without the path lock"
+        );
+        assert!(!delete.is_finished(), "delete ran without the path lock");
+        drop(guard);
+        let _ = rollback.await.unwrap();
+        let _ = delete.await.unwrap();
     }
 
     /// Same owner re-registering: idempotent path. Slot stays owned by the

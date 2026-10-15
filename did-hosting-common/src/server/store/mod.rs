@@ -9,6 +9,8 @@ mod fjall;
 pub mod keyspaces;
 #[cfg(feature = "store-redis")]
 mod redis;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use keyspaces::{
     KS_ACL, KS_ASSIGNMENTS, KS_DIDS, KS_DOMAINS, KS_IDENTITY, KS_META, KS_OUTBOUND_QUEUE,
@@ -140,6 +142,9 @@ pub struct Store {
 pub struct KeyspaceHandle {
     pub name: String,
     inner: Arc<dyn KeyspaceOps>,
+    /// The backend this keyspace belongs to, so helpers handed only a
+    /// keyspace can still make a multi-row change atomic ([`Self::batch`]).
+    backend: Arc<dyn StorageBackend>,
 }
 
 /// An atomic write batch that collects operations and commits them in a single call.
@@ -181,6 +186,7 @@ impl Store {
         Ok(KeyspaceHandle {
             name: ks_name,
             inner: ops,
+            backend: self.inner.clone(),
         })
     }
 
@@ -239,6 +245,15 @@ impl WriteBatch {
 // ---------------------------------------------------------------------------
 
 impl KeyspaceHandle {
+    /// A new atomic write batch on the store this keyspace belongs to —
+    /// [`Store::batch`] for code that holds only a keyspace handle. The
+    /// batch may span keyspaces like any other.
+    pub fn batch(&self) -> WriteBatch {
+        WriteBatch {
+            inner: self.backend.batch(),
+        }
+    }
+
     pub async fn insert<V: Serialize>(
         &self,
         key: impl Into<Vec<u8>>,

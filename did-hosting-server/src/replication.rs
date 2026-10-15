@@ -403,7 +403,7 @@ async fn apply_listing(
             report.behind.push(mnemonic.clone());
         }
     }
-    for mut record in held {
+    for record in held {
         let Some(want) = listed.get(&record.mnemonic) else {
             report.extra.push(record.mnemonic.clone());
             continue;
@@ -418,10 +418,28 @@ async fn apply_listing(
             // control plane has said the DID must not resolve.
         }
         if want.disabled != record.disabled {
-            record.disabled = want.disabled;
+            // The repair writes the whole record back, so it is made under
+            // `sync_lock` on a fresh read, like every other record writer on
+            // an edge. The snapshot above may be minutes old by now (the
+            // listing is paged over the network); writing it back would
+            // revert a `sync/update` applied since, or resurrect a slot a
+            // `sync/delete` removed.
+            let _guard = state.sync_lock.lock().await;
+            let Some(mut current) = state
+                .dids_ks
+                .get::<DidRecord>(did_key(&record.mnemonic))
+                .await
+                .map_err(|e| e.to_string())?
+            else {
+                continue;
+            };
+            if current.disabled == want.disabled {
+                continue;
+            }
+            current.disabled = want.disabled;
             state
                 .dids_ks
-                .insert(did_key(&record.mnemonic), &record)
+                .insert(did_key(&record.mnemonic), &current)
                 .await
                 .map_err(|e| e.to_string())?;
             state
@@ -462,5 +480,110 @@ pub async fn run_reconcile_loop(
             Ok(_) => crate::control_register::register_via_didcomm(&state, &svc).await,
             Err(e) => warn!(error = %e, "reconcile with the control plane failed"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AppConfig, LimitsConfig, StatsConfig};
+    use crate::server::AppState;
+    use did_hosting_common::server::config::{
+        AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
+    };
+    use did_hosting_common::server::store::Store;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    async fn edge() -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store_config = StoreConfig {
+            data_dir: PathBuf::from(dir.path()),
+            ..StoreConfig::default()
+        };
+        let store = Store::open(&store_config).await.unwrap();
+        let config = AppConfig {
+            fjall: Default::default(),
+            features: FeaturesConfig::default(),
+            server_did: None,
+            mediator_did: None,
+            public_url: None,
+            server: ServerConfig::default(),
+            log: LogConfig::default(),
+            store: store_config,
+            auth: AuthConfig::default(),
+            hosting: Default::default(),
+            secrets: SecretsConfig::default(),
+            limits: LimitsConfig::default(),
+            replication: Default::default(),
+            stats: StatsConfig::default(),
+            control_did: None,
+            vta: VtaConfig::default(),
+            identity: Default::default(),
+            config_path: PathBuf::new(),
+        };
+        (AppState::new(store, config).unwrap(), dir)
+    }
+
+    fn record(version_count: u64, disabled: bool) -> DidRecord {
+        DidRecord {
+            owner: "did:example:owner".into(),
+            mnemonic: "slot".into(),
+            created_at: 1,
+            updated_at: 1,
+            version_count,
+            did_id: Some("did:webvh:Q1:example.com:slot".into()),
+            content_size: 0,
+            disabled,
+            deleted_at: None,
+            method: "webvh".into(),
+            domain: "example.com".into(),
+            services: None,
+            agent_names: Vec::new(),
+        }
+    }
+
+    /// A reconcile's disabled-state repair must not write back the snapshot
+    /// it listed: a `sync/update` holding `sync_lock` commits version 2 after
+    /// the reconcile read version 1. The repair must land on version 2, and
+    /// version 2 must survive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_repair_never_reverts_a_concurrent_sync() {
+        let (state, _dir) = edge().await;
+        let state = Arc::new(state);
+        state
+            .dids_ks
+            .insert(did_key("slot"), &record(1, false))
+            .await
+            .unwrap();
+        let listed = HashMap::from([(
+            "slot".to_string(),
+            Listed {
+                did_id: Some("did:webvh:Q1:example.com:slot".into()),
+                version_count: 1,
+                disabled: true,
+            },
+        )]);
+
+        let sync_guard = state.sync_lock.lock().await;
+        let reconcile = {
+            let state = state.clone();
+            tokio::spawn(async move { apply_listing(&state, &listed).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The concurrent sync commits the version it built before the
+        // reconcile's repair arrived.
+        state
+            .dids_ks
+            .insert(did_key("slot"), &record(2, false))
+            .await
+            .unwrap();
+        drop(sync_guard);
+        let report = reconcile.await.unwrap().unwrap();
+        assert_eq!(report.repaired, vec!["slot".to_string()]);
+
+        let stored: DidRecord = state.dids_ks.get(did_key("slot")).await.unwrap().unwrap();
+        assert_eq!(stored.version_count, 2, "the concurrent sync was reverted");
+        assert!(stored.disabled, "the repair was lost");
     }
 }

@@ -313,6 +313,66 @@ async fn a_session_invite_redeems_once_on_every_transport() {
     }
 }
 
+/// A role-conferring redemption decides whether to create the subject's ACL
+/// entry from a read of the ACL, so it waits for the ACL write lock the
+/// `acl/*` handlers hold — and, once it has it, keeps an entry an admin
+/// granted meanwhile rather than overwriting it with the invite's role.
+#[tokio::test]
+async fn a_redemption_waits_for_the_acl_write_lock() {
+    use did_hosting_common::server::acl::{AclEntry, store_acl_entry};
+    use did_hosting_common::server::domain::DomainScope;
+
+    let (state, _dir) = state().await;
+    let admin = member(&state, 3, Role::Admin).await;
+    let subject = "did:example:raced-grant";
+    let invitee = stranger(90);
+    let issued = issue(&state, &admin, subject, "session").await;
+    let reply = redeem_start(&state, Via::Tsp, &invitee, &issued.token, &issued.code).await;
+    let start = ok(&reply, &t(REDEEM_START));
+    let mut passkey = SoftPasskey::new();
+    let payload = json!({
+        "enrollmentId": start["enrollmentId"],
+        "credential": passkey.attest(&start["options"]),
+    });
+
+    let acl_lock = state
+        .acl_locks
+        .guard(did_hosting_common::server::trust_tasks::ACL_WRITE_LOCK_KEY)
+        .await;
+    let mut finish = Box::pin(unsigned(&state, Via::Tsp, &invitee, REDEEM_FINISH, payload));
+    tokio::select! {
+        reply = &mut finish => panic!("the redemption wrote the ACL without its lock: {reply}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(150)) => {}
+    }
+    // An admin's grant, committed while the redemption waits.
+    store_acl_entry(
+        &state.acl_ks,
+        &AclEntry {
+            did: subject.into(),
+            role: Role::Admin,
+            label: None,
+            created_at: 1,
+            max_total_size: None,
+            max_did_count: None,
+            domains: DomainScope::All,
+        },
+    )
+    .await
+    .unwrap();
+    drop(acl_lock);
+    let reply = finish.await;
+    ok(&reply, &t(REDEEM_FINISH));
+    assert_eq!(
+        get_acl_entry(&state.acl_ks, subject)
+            .await
+            .unwrap()
+            .unwrap()
+            .role,
+        Role::Admin,
+        "the redemption overwrote an admin's grant"
+    );
+}
+
 /// An expired invite redeems nothing, nor does a ceremony past its expiry,
 /// nor one a newer start has superseded.
 #[tokio::test]

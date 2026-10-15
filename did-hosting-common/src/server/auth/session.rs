@@ -3,7 +3,7 @@ use uuid::Uuid;
 use crate::server::acl::Role;
 use crate::server::auth::jwt::JwtKeys;
 use crate::server::error::AppError;
-use crate::server::store::KeyspaceHandle;
+use crate::server::store::{KeyspaceHandle, WriteBatch};
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
@@ -43,17 +43,77 @@ fn session_did_prefix(did: &str) -> String {
     format!("session-did:{did}:")
 }
 
-/// Store a new session in the `sessions` keyspace.
+/// Serialises read-modify-writes of one session row in this process.
+///
+/// A row is rewritten by activity touches, step-up elevation and passkey
+/// demotion, and removed by refresh rotation and logout. Each of those that
+/// reads the row first must hold its stripe across the read and the write,
+/// or a touch that read the row at request start writes back a copy that
+/// undoes a demotion or resurrects a rotated-away session. Striped rather
+/// than per-id so the table stays bounded however many sessions come and go.
+const SESSION_LOCK_STRIPES: usize = 64;
+static SESSION_LOCKS: std::sync::LazyLock<Vec<tokio::sync::Mutex<()>>> =
+    std::sync::LazyLock::new(|| {
+        (0..SESSION_LOCK_STRIPES)
+            .map(|_| tokio::sync::Mutex::new(()))
+            .collect()
+    });
+
+async fn lock_session(session_id: &str) -> tokio::sync::MutexGuard<'static, ()> {
+    use std::hash::BuildHasher;
+    static HASHER: std::sync::LazyLock<std::collections::hash_map::RandomState> =
+        std::sync::LazyLock::new(std::collections::hash_map::RandomState::new);
+    SESSION_LOCKS[(HASHER.hash_one(session_id) as usize) % SESSION_LOCK_STRIPES]
+        .lock()
+        .await
+}
+
+/// Stage `session`'s row and its per-DID index into `batch`.
+fn stage_session(
+    sessions: &KeyspaceHandle,
+    batch: &mut WriteBatch,
+    session: &Session,
+) -> Result<(), AppError> {
+    batch.insert(sessions, session_key(&session.session_id), session)?;
+    batch.insert_raw(
+        sessions,
+        session_did_key(&session.did, &session.session_id),
+        session.session_id.as_bytes().to_vec(),
+    );
+    Ok(())
+}
+
+/// Store a new session in the `sessions` keyspace — the row and its
+/// per-DID index in one atomic write, so neither exists without the other.
 pub async fn store_session(sessions: &KeyspaceHandle, session: &Session) -> Result<(), AppError> {
-    sessions
-        .insert(session_key(&session.session_id), session)
-        .await?;
-    sessions
-        .insert_raw(
-            session_did_key(&session.did, &session.session_id),
-            session.session_id.as_bytes().to_vec(),
-        )
-        .await?;
+    let mut batch = sessions.batch();
+    stage_session(sessions, &mut batch, session)?;
+    batch.commit().await?;
+    debug!(session_id = %session.session_id, did = %session.did, "session stored");
+    Ok(())
+}
+
+/// Store `session` with its refresh index (`refresh` → session id), and
+/// drop `retired_refresh`'s index if given, in one atomic write — a session
+/// is never left without the index its client will present, and a rotated
+/// refresh token's index never outlives the rotation.
+async fn store_session_with_refresh(
+    sessions: &KeyspaceHandle,
+    session: &Session,
+    refresh: &str,
+    retired_refresh: Option<&str>,
+) -> Result<(), AppError> {
+    let mut batch = sessions.batch();
+    stage_session(sessions, &mut batch, session)?;
+    if let Some(old) = retired_refresh.filter(|old| *old != refresh) {
+        batch.remove(sessions, refresh_key(old));
+    }
+    batch.insert_raw(
+        sessions,
+        refresh_key(refresh),
+        session.session_id.as_bytes().to_vec(),
+    );
+    batch.commit().await?;
     debug!(session_id = %session.session_id, did = %session.did, "session stored");
     Ok(())
 }
@@ -164,6 +224,13 @@ pub const LAST_SEEN_GRANULARITY_SECS: u64 = 60;
 /// timeout is measured against, so anything firing on a timer — a token
 /// renewal above all — would, by touching it, hold the session open for as
 /// long as the client ran and put the timeout permanently out of reach.
+///
+/// `session` is the copy the request loaded; only its id and `last_seen`
+/// are used. The row is re-read under the session's lock and only its
+/// `last_seen` advances: writing the request's copy back would undo
+/// whatever changed the row since the request began (a refresh rotation
+/// that removed it, a demotion that lowered its `acr`). A row that has
+/// gone is left gone — `Ok(false)`.
 pub async fn touch_last_seen(
     sessions: &KeyspaceHandle,
     session: &Session,
@@ -172,23 +239,33 @@ pub async fn touch_last_seen(
     if now < session.last_seen.saturating_add(LAST_SEEN_GRANULARITY_SECS) {
         return Ok(false);
     }
-    let mut updated = session.clone();
-    updated.last_seen = now;
-    store_session(sessions, &updated).await?;
+    let _row = lock_session(&session.session_id).await;
+    let Some(mut current) = get_session(sessions, &session.session_id).await? else {
+        return Ok(false);
+    };
+    if now < current.last_seen.saturating_add(LAST_SEEN_GRANULARITY_SECS) {
+        return Ok(false);
+    }
+    current.last_seen = now;
+    sessions
+        .insert(session_key(&current.session_id), &current)
+        .await?;
     Ok(true)
 }
 
-/// Delete a single session and its refresh index.
+/// Delete a single session and its refresh and per-DID indexes, in one
+/// atomic write.
 pub async fn delete_session(sessions: &KeyspaceHandle, session_id: &str) -> Result<(), AppError> {
+    let _row = lock_session(session_id).await;
     let session: Option<Session> = sessions.get(session_key(session_id)).await?;
     if let Some(session) = session {
+        let mut batch = sessions.batch();
         if let Some(ref token) = session.refresh_token {
-            sessions.remove(refresh_key(token)).await?;
+            batch.remove(sessions, refresh_key(token));
         }
-        sessions.remove(session_key(session_id)).await?;
-        sessions
-            .remove(session_did_key(&session.did, session_id))
-            .await?;
+        batch.remove(sessions, session_key(session_id));
+        batch.remove(sessions, session_did_key(&session.did, session_id));
+        batch.commit().await?;
         debug!(session_id, "session deleted");
     }
     Ok(())
@@ -204,14 +281,18 @@ pub async fn take_session(
     sessions: &KeyspaceHandle,
     session_id: &str,
 ) -> Result<Option<Session>, AppError> {
+    let _row = lock_session(session_id).await;
     let session: Option<Session> = sessions.take(session_key(session_id)).await?;
     if let Some(ref session) = session {
+        // The claim must stay the store's atomic take (it is what makes one
+        // caller the winner across replicas), so the indexes follow it in a
+        // single batch rather than one remove each.
+        let mut batch = sessions.batch();
         if let Some(ref token) = session.refresh_token {
-            sessions.remove(refresh_key(token)).await?;
+            batch.remove(sessions, refresh_key(token));
         }
-        sessions
-            .remove(session_did_key(&session.did, session_id))
-            .await?;
+        batch.remove(sessions, session_did_key(&session.did, session_id));
+        batch.commit().await?;
         debug!(session_id, "session claimed");
     }
     Ok(session)
@@ -249,6 +330,7 @@ pub async fn demote_non_passkey_step_up_sessions(
         let Ok(session_id) = String::from_utf8(value) else {
             continue;
         };
+        let _row = lock_session(&session_id).await;
         let Some(mut session) = get_session(sessions, &session_id).await? else {
             continue;
         };
@@ -468,9 +550,7 @@ pub async fn finalize_challenge_session(
     session.token_id = Some(token_id);
     session.amr = vec!["did".to_string()];
     session.acr = "aal1".to_string();
-    store_session(sessions, session).await?;
-
-    store_refresh_index(sessions, &refresh_token, &session.session_id).await?;
+    store_session_with_refresh(sessions, session, &refresh_token, None).await?;
 
     Ok(TokenResponse {
         session_id: session.session_id.clone(),
@@ -567,8 +647,7 @@ pub async fn create_authenticated_session(
         not_after: None,
     };
 
-    store_session(sessions, &session).await?;
-    store_refresh_index(sessions, &refresh_token, &session_id).await?;
+    store_session_with_refresh(sessions, &session, &refresh_token, None).await?;
 
     Ok(TokenResponse {
         session_id,
@@ -599,6 +678,7 @@ pub async fn elevate_session(
     access_expiry: u64,
     refresh_expiry: u64,
 ) -> Result<TokenResponse, AppError> {
+    let _row = lock_session(session_id).await;
     let mut session = get_session(sessions, session_id)
         .await?
         .ok_or_else(|| AppError::Authentication("session not found".into()))?;
@@ -624,13 +704,23 @@ pub async fn elevate_session(
     // Persist the elevated AAL on the session row so subsequent
     // refreshes preserve aal2 (instead of silently dropping back to
     // the pre-step-up aal1).
+    //
+    // The elevated row, its new refresh index and the removal of the old
+    // refresh token's index are one write: the pre-elevation refresh token
+    // must stop working the moment the elevated one is issued, or it could
+    // be rotated into a parallel session.
+    let retired_refresh = session.refresh_token.replace(refresh_token.clone());
     session.token_id = Some(token_id);
-    session.refresh_token = Some(refresh_token.clone());
     session.refresh_expires_at = Some(refresh_expires_at);
     session.amr = amr.clone();
     session.acr = acr.to_string();
-    store_session(sessions, &session).await?;
-    store_refresh_index(sessions, &refresh_token, session_id).await?;
+    store_session_with_refresh(
+        sessions,
+        &session,
+        &refresh_token,
+        retired_refresh.as_deref(),
+    )
+    .await?;
 
     Ok(TokenResponse {
         session_id: session_id.to_string(),
@@ -948,6 +1038,104 @@ mod demotion_index_tests {
 
     /// `take_session` is a claim: the first caller gets the row (and its
     /// did-index entry goes with it); every later one gets `None`.
+    /// A request loads its session, a refresh rotation then claims (removes)
+    /// the row, and the request's activity touch runs last. The touch must
+    /// not write the request's copy back — that would resurrect a session
+    /// the rotation retired.
+    #[tokio::test]
+    async fn touch_never_resurrects_a_rotated_session() {
+        let (ks, _dir) = make_ks().await;
+        let s = session("did:example:frank", "s-frank-1", "aal1", vec!["did".into()]);
+        store_session(&ks, &s).await.unwrap();
+
+        let loaded = get_session(&ks, &s.session_id).await.unwrap().unwrap();
+        take_session(&ks, &s.session_id).await.unwrap().unwrap();
+
+        let touched = touch_last_seen(&ks, &loaded, loaded.last_seen + 3600)
+            .await
+            .unwrap();
+        assert!(!touched);
+        assert!(
+            get_session(&ks, &s.session_id).await.unwrap().is_none(),
+            "a rotated-away session came back"
+        );
+        assert!(
+            !ks.contains_key(session_did_key(&s.did, &s.session_id))
+                .await
+                .unwrap()
+        );
+    }
+
+    /// A request loads an elevated session, a passkey enrolment then demotes
+    /// it, and the request's touch runs last. The demotion must stand; only
+    /// `last_seen` moves.
+    #[tokio::test]
+    async fn touch_never_undoes_a_demotion() {
+        let (ks, _dir) = make_ks().await;
+        let s = session("did:example:gina", "s-gina-1", "aal2", vec!["did".into()]);
+        store_session(&ks, &s).await.unwrap();
+
+        let loaded = get_session(&ks, &s.session_id).await.unwrap().unwrap();
+        assert_eq!(
+            demote_non_passkey_step_up_sessions(&ks, &s.did)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let later = loaded.last_seen + 3600;
+        assert!(touch_last_seen(&ks, &loaded, later).await.unwrap());
+        let row = get_session(&ks, &s.session_id).await.unwrap().unwrap();
+        assert_eq!(row.acr, "aal1", "the touch reverted the demotion");
+        assert_eq!(row.last_seen, later);
+    }
+
+    /// Step-up rotates the refresh token, and the pre-elevation token's index
+    /// goes in the same write: it must not stay redeemable alongside the new
+    /// one.
+    #[tokio::test]
+    async fn elevation_retires_the_previous_refresh_index() {
+        let (ks, _dir) = make_ks().await;
+        let keys = JwtKeys::from_ed25519_bytes(&[12u8; 32]).unwrap();
+        let created = create_authenticated_session(
+            &ks,
+            &keys,
+            "did:example:hank",
+            &Role::Owner,
+            60,
+            900,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let elevated = elevate_session(
+            &ks,
+            &keys,
+            &created.session_id,
+            &Role::Owner,
+            vec!["did".into(), "passkey".into()],
+            "aal2",
+            60,
+            900,
+        )
+        .await
+        .unwrap();
+        assert!(
+            get_session_by_refresh(&ks, &created.refresh_token)
+                .await
+                .unwrap()
+                .is_none(),
+            "the pre-elevation refresh token still maps to the session"
+        );
+        assert_eq!(
+            get_session_by_refresh(&ks, &elevated.refresh_token)
+                .await
+                .unwrap(),
+            Some(created.session_id.clone())
+        );
+    }
+
     #[tokio::test]
     async fn take_session_claims_the_row_exactly_once() {
         let (ks, _dir) = make_ks().await;

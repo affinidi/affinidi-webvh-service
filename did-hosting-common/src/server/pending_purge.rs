@@ -33,7 +33,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::error::AppError;
-use super::store::{KS_PENDING_PURGES, Store};
+use super::store::{KS_PENDING_PURGES, Store, WriteBatch};
 
 /// One row in the per-server pending-purge queue.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,6 +126,94 @@ pub async fn cancel(store: &Store, domain: &str) -> Result<CancelOutcome, AppErr
     };
     ks.remove(key).await?;
     Ok(CancelOutcome::Removed(existing))
+}
+
+/// Stage a schedule into `batch`, so it commits atomically with the change
+/// that motivates it (the domain's disable, the server's unassignment). The
+/// two must land together: a crash between them would leave the domain
+/// disabled or unassigned with nothing scheduled, after the caller had
+/// answered "scheduled".
+pub fn stage_schedule(
+    store: &Store,
+    batch: &mut WriteBatch,
+    domain: &str,
+    scheduled_at: u64,
+    grace_seconds: u64,
+    reason: &str,
+    scheduled_by: &str,
+) -> Result<PendingPurge, AppError> {
+    let ks = store.keyspace(KS_PENDING_PURGES)?;
+    let new = PendingPurge {
+        domain: domain.to_string(),
+        scheduled_at,
+        grace_seconds,
+        reason: reason.to_string(),
+        scheduled_by: scheduled_by.to_string(),
+    };
+    batch.insert(&ks, pending_key(domain), &new)?;
+    Ok(new)
+}
+
+/// Stage a cancel into `batch`, so it commits atomically with the change
+/// that motivates it (a re-enable, a re-assignment). Were the cancel a
+/// separate write, a crash after the domain went active but before the
+/// cancel would leave a ripe purge queued against a live domain.
+pub fn stage_cancel(store: &Store, batch: &mut WriteBatch, domain: &str) -> Result<(), AppError> {
+    let ks = store.keyspace(KS_PENDING_PURGES)?;
+    batch.remove(&ks, pending_key(domain));
+    Ok(())
+}
+
+/// Whether a pending purge the sweep listed may still be carried out.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PurgeCheck {
+    /// The row is unchanged and the domain is still disabled / unassigned.
+    Due,
+    /// The row was cancelled or rescheduled since it was listed; leave it.
+    Superseded,
+    /// The row is unchanged but the domain is live again (re-enabled or
+    /// re-assigned) — a leftover the cancel never reached. Never act on it.
+    Stale(&'static str),
+}
+
+/// Re-check, immediately before deleting anything, that `listed` — a row
+/// the sweep read earlier — still stands and still describes a domain that
+/// should go. Defence in depth: the enable / assign paths cancel the row in
+/// the same atomic write that revives the domain, but a store written by an
+/// older build (or another backend's weaker batch) may still hold a ripe
+/// row for a live domain, and acting on it would wipe that domain.
+pub async fn check_still_due(store: &Store, listed: &PendingPurge) -> Result<PurgeCheck, AppError> {
+    if get(store, &listed.domain).await?.as_ref() != Some(listed) {
+        return Ok(PurgeCheck::Superseded);
+    }
+    if listed.reason == super::domain::DISABLE_PURGE_REASON {
+        if let Some(entry) = super::domain::get_domain(store, &listed.domain).await?
+            && entry.status.is_active()
+        {
+            return Ok(PurgeCheck::Stale("the domain is active again"));
+        }
+    } else if super::assignment::get(store, &listed.domain)
+        .await?
+        .is_some()
+    {
+        return Ok(PurgeCheck::Stale(
+            "the domain is assigned to this server again",
+        ));
+    }
+    Ok(PurgeCheck::Due)
+}
+
+/// Remove `listed` only if it is still exactly the stored row, so clearing a
+/// stale leftover can never swallow a schedule written after it was read.
+pub async fn cancel_if_unchanged(store: &Store, listed: &PendingPurge) -> Result<bool, AppError> {
+    if get(store, &listed.domain).await?.as_ref() != Some(listed) {
+        return Ok(false);
+    }
+    store
+        .keyspace(KS_PENDING_PURGES)?
+        .remove(pending_key(&listed.domain))
+        .await?;
+    Ok(true)
 }
 
 /// Look up a single pending purge.
