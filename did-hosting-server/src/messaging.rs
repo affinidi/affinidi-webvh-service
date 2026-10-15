@@ -889,24 +889,24 @@ async fn do_domain_assign(
     state: &AppState,
     body: &Value,
 ) -> Result<(String, Value), OpError> {
-    use did_hosting_common::server::assignment::record_assignment;
-    use did_hosting_common::server::pending_purge::{self, CancelOutcome};
+    use did_hosting_common::server::assignment::record_assignment_cancelling_purge;
 
     let directive: replica_assign::Payload = payload(body, "replica/domain/assign")?;
     let domain = canonical_domain(&directive.domain, "replica/domain/assign")?;
 
     let now = did_hosting_common::server::auth::session::now_epoch();
-    record_assignment(&state.store, &domain, &control.did, now)
-        .await
-        .map_err(OpError::from)?;
+    // The assignment and the cancel of any pending purge are one atomic write:
+    // apart, a crash between them left a ripe purge queued against a domain
+    // this server had just been told to serve.
+    let (_, cancelled) =
+        record_assignment_cancelling_purge(&state.store, &domain, &control.did, now)
+            .await
+            .map_err(OpError::from)?;
 
     // A re-assign within the grace window cancels the pending purge. Logged so
     // an operator can answer "did my data survive the unassign / re-assign
     // round trip?".
-    if let CancelOutcome::Removed(prev) = pending_purge::cancel(&state.store, &domain)
-        .await
-        .map_err(OpError::from)?
-    {
+    if let Some(prev) = cancelled {
         info!(
             did = %control.did,
             domain = %domain,
@@ -950,32 +950,30 @@ async fn do_domain_unassign(
     state: &AppState,
     body: &Value,
 ) -> Result<(String, Value), OpError> {
-    use did_hosting_common::server::assignment::{UnassignOutcome, unassign};
+    use did_hosting_common::server::assignment::{UnassignOutcome, unassign_scheduling_purge};
     use did_hosting_common::server::pending_purge;
 
     let directive: replica_unassign::Payload = payload(body, "replica/domain/unassign")?;
     let domain = canonical_domain(&directive.domain, "replica/domain/unassign")?;
 
     let now = did_hosting_common::server::auth::session::now_epoch();
-    let outcome = unassign(&state.store, &domain)
-        .await
-        .map_err(OpError::from)?;
+    let grace_seconds = unassign_grace_seconds(state);
+    // The unassignment and its schedule are one atomic write: a failure writes
+    // neither and is retried, and a crash can never leave the domain
+    // unassigned with nothing scheduled after answering `scheduled`.
+    let (outcome, _) = unassign_scheduling_purge(
+        &state.store,
+        &domain,
+        now,
+        grace_seconds,
+        "grace-expired",
+        &control.did,
+    )
+    .await
+    .map_err(OpError::from)?;
 
     let purge_at = match outcome {
         UnassignOutcome::Removed(_) => {
-            let grace_seconds = unassign_grace_seconds(state);
-            // A failed schedule is retried: answering `scheduled` would settle a
-            // directive whose deletion was never arranged.
-            pending_purge::schedule(
-                &state.store,
-                &domain,
-                now,
-                grace_seconds,
-                "grace-expired",
-                &control.did,
-            )
-            .await
-            .map_err(OpError::from)?;
             info!(did = %control.did, domain = %domain, grace_seconds, "domain unassigned; purge scheduled");
             now.saturating_add(grace_seconds)
         }
@@ -1082,10 +1080,8 @@ async fn do_domain_upsert(
     body: &Value,
 ) -> Result<(String, Value), OpError> {
     use did_hosting_common::server::domain::{
-        DISABLE_PURGE_REASON, DomainStatus, create_domain, get_domain, normalize_domain_name,
-        update_domain, wire,
+        DomainStatus, apply_replicated_domain, normalize_domain_name, wire,
     };
-    use did_hosting_common::server::pending_purge;
 
     let directive: replica_upsert::Payload = payload(body, "replica/domain/upsert")?;
     let name = directive.entry.name.clone();
@@ -1106,46 +1102,20 @@ async fn do_domain_upsert(
     let entry = wire::from_spec(&entry_value)
         .map_err(|e| OpError::Refused(format!("replica/domain/upsert: {e}")))?;
 
-    let existed = get_domain(&state.store, &canonical)
+    if entry.status == DomainStatus::Disabled
+        && (entry.disabled_at.is_none() || entry.purge_at.is_none())
+    {
+        warn!(
+            domain = %canonical,
+            "replica/domain/upsert: status=disabled without disabledAt/purgeAt — no purge scheduled"
+        );
+    }
+    // The entry and its purge schedule (cancelled on Active, written on
+    // Disabled) are one atomic write, so a crash can never leave a re-enabled
+    // domain with a ripe purge still queued.
+    let (existed, _) = apply_replicated_domain(&state.store, &entry, &control.did)
         .await
-        .map_err(OpError::from)?
-        .is_some();
-    if existed {
-        update_domain(&state.store, &canonical, &entry)
-            .await
-            .map_err(OpError::from)?;
-    } else {
-        create_domain(&state.store, &entry)
-            .await
-            .map_err(OpError::from)?;
-    }
-
-    match entry.status {
-        DomainStatus::Active => {
-            // Re-enable cancels any in-flight grace timer.
-            pending_purge::cancel(&state.store, &canonical)
-                .await
-                .map_err(OpError::from)?;
-        }
-        DomainStatus::Disabled => match (entry.disabled_at, entry.purge_at) {
-            (Some(disabled_at), Some(purge_at)) => {
-                pending_purge::schedule(
-                    &state.store,
-                    &canonical,
-                    disabled_at,
-                    purge_at.saturating_sub(disabled_at),
-                    DISABLE_PURGE_REASON,
-                    &control.did,
-                )
-                .await
-                .map_err(OpError::from)?;
-            }
-            _ => warn!(
-                domain = %canonical,
-                "replica/domain/upsert: status=disabled without disabledAt/purgeAt — no purge scheduled"
-            ),
-        },
-    }
+        .map_err(OpError::from)?;
 
     info!(
         did = %control.did,
