@@ -1,6 +1,7 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 
-use fjall::{KeyspaceCreateOptions, PersistMode};
+use fjall::{KeyspaceCreateOptions, PersistMode, Readable};
 use tokio::sync::Mutex;
 use tracing::info;
 
@@ -15,6 +16,40 @@ use super::{BatchOps, BoxFuture, KeyspaceOps, RawKvPair, StorageBackend};
 
 pub struct FjallBackend {
     db: fjall::Database,
+    /// The `take_raw_atomic` / `incr_raw` mutexes, one pair per keyspace
+    /// *name*. [`StorageBackend::keyspace`] mints a fresh `FjallKeyspace`
+    /// on every call, so a mutex owned by that instance would only exclude
+    /// callers that happened to share one handle — two handlers that each
+    /// opened `sessions` would race the get-then-remove freely. Keying the
+    /// locks on the name makes every handle to a keyspace share them.
+    locks: StdMutex<HashMap<String, Arc<KeyspaceLocks>>>,
+}
+
+/// The read-modify-write locks shared by every handle to one keyspace.
+#[derive(Default)]
+struct KeyspaceLocks {
+    /// Held across the get-then-remove of `take_raw_atomic`. fjall is a
+    /// single-process embedded store so process-local mutual exclusion is
+    /// sufficient — no cross-replica coordination is required.
+    take: Mutex<()>,
+    /// Held across the get-then-write of `incr_raw`. Same single-process
+    /// rationale as `take`.
+    incr: Mutex<()>,
+}
+
+/// fjall's own rule (`fjall::keyspace::name::is_valid_keyspace_name`) —
+/// non-empty, at most 255 bytes. `Database::keyspace` *asserts* it, so it
+/// is checked here first to turn a bad name into an error, not a panic.
+fn is_valid_keyspace_name(name: &str) -> bool {
+    !name.is_empty() && u8::try_from(name.len()).is_ok()
+}
+
+fn open_keyspace(db: &fjall::Database, name: &str) -> Result<fjall::Keyspace, AppError> {
+    if !is_valid_keyspace_name(name) {
+        return Err(AppError::Store(format!("invalid keyspace name {name:?}")));
+    }
+    db.keyspace(name, KeyspaceCreateOptions::default)
+        .map_err(|e| AppError::Store(e.to_string()))
 }
 
 impl FjallBackend {
@@ -76,22 +111,27 @@ impl FjallBackend {
 
         let db = builder.open().map_err(|e| AppError::Store(e.to_string()))?;
 
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            locks: StdMutex::new(HashMap::new()),
+        })
+    }
+
+    fn locks_for(&self, name: &str) -> Arc<KeyspaceLocks> {
+        let mut locks = self.locks.lock().expect("keyspace lock table poisoned");
+        locks.entry(name.to_string()).or_default().clone()
     }
 }
 
 impl StorageBackend for FjallBackend {
     fn keyspace(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
-        let ks = self
-            .db
-            .keyspace(name, KeyspaceCreateOptions::default)
-            .map_err(|e| AppError::Store(e.to_string()))?;
+        let ks = open_keyspace(&self.db, name)?;
         Ok((
             name.to_string(),
             Arc::new(FjallKeyspace {
+                db: self.db.clone(),
                 keyspace: ks,
-                take_lock: Mutex::new(()),
-                incr_lock: Mutex::new(()),
+                locks: self.locks_for(name),
             }),
         ))
     }
@@ -100,6 +140,7 @@ impl StorageBackend for FjallBackend {
         Box::new(FjallBatch {
             db: self.db.clone(),
             batch: self.db.batch(),
+            error: None,
         })
     }
 
@@ -120,15 +161,18 @@ impl StorageBackend for FjallBackend {
 // ---------------------------------------------------------------------------
 
 struct FjallKeyspace {
+    /// Reads go through `db.snapshot()`, never `Keyspace::get` directly.
+    /// fjall's direct reads look at `SeqNo::MAX` — every item already in a
+    /// memtable — and a `WriteBatch` lands in the memtables item by item
+    /// before its sequence number is published, so a direct read can see
+    /// half a batch. A snapshot reads at the last *published* sequence
+    /// number: a committed batch is seen whole or not at all, and every
+    /// completed write (single ops publish too) is visible to the next read.
+    db: fjall::Database,
     keyspace: fjall::Keyspace,
-    /// Per-keyspace mutex held across the get-then-remove of
-    /// `take_raw_atomic`. fjall is a single-process embedded store so
-    /// process-local mutual exclusion is sufficient — no cross-replica
-    /// coordination is required.
-    take_lock: Mutex<()>,
-    /// Per-keyspace mutex held across the get-then-write of `incr_raw`. Same
-    /// single-process rationale as `take_lock`.
-    incr_lock: Mutex<()>,
+    /// Shared with every other handle to the same keyspace name — see
+    /// [`FjallBackend::locks`].
+    locks: Arc<KeyspaceLocks>,
 }
 
 impl KeyspaceOps for FjallKeyspace {
@@ -144,9 +188,9 @@ impl KeyspaceOps for FjallKeyspace {
     }
 
     fn get_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
-        let ks = self.keyspace.clone();
+        let (db, ks) = (self.db.clone(), self.keyspace.clone());
         Box::pin(async move {
-            let result = tokio::task::spawn_blocking(move || ks.get(key))
+            let result = tokio::task::spawn_blocking(move || db.snapshot().get(&ks, key))
                 .await
                 .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
                 .map_err(|e| AppError::Store(e.to_string()))?;
@@ -166,9 +210,9 @@ impl KeyspaceOps for FjallKeyspace {
     }
 
     fn contains_key(&self, key: Vec<u8>) -> BoxFuture<'_, Result<bool, AppError>> {
-        let ks = self.keyspace.clone();
+        let (db, ks) = (self.db.clone(), self.keyspace.clone());
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || ks.contains_key(key))
+            tokio::task::spawn_blocking(move || db.snapshot().contains_key(&ks, key))
                 .await
                 .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
                 .map_err(|e| AppError::Store(e.to_string()))
@@ -176,11 +220,11 @@ impl KeyspaceOps for FjallKeyspace {
     }
 
     fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
-        let ks = self.keyspace.clone();
+        let (db, ks) = (self.db.clone(), self.keyspace.clone());
         Box::pin(async move {
             tokio::task::spawn_blocking(move || -> Result<Vec<RawKvPair>, AppError> {
                 let mut results = Vec::new();
-                for guard in ks.prefix(&prefix) {
+                for guard in db.snapshot().prefix(&ks, &prefix) {
                     let (key, value) = guard
                         .into_inner()
                         .map_err(|e| AppError::Store(e.to_string()))?;
@@ -199,10 +243,10 @@ impl KeyspaceOps for FjallKeyspace {
             // concurrent callers cannot both observe the value before
             // one of them removes it. fjall is single-process, so
             // process-local mutual exclusion is the correct primitive.
-            let _guard = self.take_lock.lock().await;
-            let ks = self.keyspace.clone();
+            let _guard = self.locks.take.lock().await;
+            let (db, ks) = (self.db.clone(), self.keyspace.clone());
             let key2 = key.clone();
-            let value = tokio::task::spawn_blocking(move || ks.get(key2))
+            let value = tokio::task::spawn_blocking(move || db.snapshot().get(&ks, key2))
                 .await
                 .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
                 .map_err(|e| AppError::Store(e.to_string()))?
@@ -224,10 +268,10 @@ impl KeyspaceOps for FjallKeyspace {
             // concurrent callers cannot both read the same count and both
             // write back the same next value. fjall is single-process, so
             // process-local mutual exclusion is the correct primitive.
-            let _guard = self.incr_lock.lock().await;
-            let ks = self.keyspace.clone();
+            let _guard = self.locks.incr.lock().await;
+            let (db, ks) = (self.db.clone(), self.keyspace.clone());
             let key2 = key.clone();
-            let current = tokio::task::spawn_blocking(move || ks.get(key2))
+            let current = tokio::task::spawn_blocking(move || db.snapshot().get(&ks, key2))
                 .await
                 .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
                 .map_err(|e| AppError::Store(e.to_string()))?
@@ -264,25 +308,50 @@ fn encode_counter(n: u64) -> Vec<u8> {
 struct FjallBatch {
     db: fjall::Database,
     batch: fjall::OwnedWriteBatch,
+    /// The first operation that could not be staged. A batch is all or
+    /// nothing: once one op is lost, committing the rest would write a
+    /// partial update the caller believes was atomic, so `commit` returns
+    /// this instead and writes nothing.
+    error: Option<AppError>,
+}
+
+impl FjallBatch {
+    fn stage(&mut self, op: &str, keyspace: &str) -> Option<fjall::Keyspace> {
+        if self.error.is_some() {
+            return None;
+        }
+        match open_keyspace(&self.db, keyspace) {
+            Ok(ks) => Some(ks),
+            Err(e) => {
+                tracing::error!(keyspace, error = %e, "batch {op}: keyspace lookup failed");
+                self.error = Some(AppError::Store(format!(
+                    "batch {op} on keyspace {keyspace:?}: {e}"
+                )));
+                None
+            }
+        }
+    }
 }
 
 impl BatchOps for FjallBatch {
     fn insert_raw(&mut self, keyspace: &str, key: Vec<u8>, value: Vec<u8>) {
-        match self.db.keyspace(keyspace, KeyspaceCreateOptions::default) {
-            Ok(ks) => self.batch.insert(&ks, key, value),
-            Err(e) => tracing::error!(keyspace, error = %e, "batch insert: keyspace lookup failed"),
+        if let Some(ks) = self.stage("insert", keyspace) {
+            self.batch.insert(&ks, key, value);
         }
     }
 
     fn remove(&mut self, keyspace: &str, key: Vec<u8>) {
-        match self.db.keyspace(keyspace, KeyspaceCreateOptions::default) {
-            Ok(ks) => self.batch.remove(&ks, key),
-            Err(e) => tracing::error!(keyspace, error = %e, "batch remove: keyspace lookup failed"),
+        if let Some(ks) = self.stage("remove", keyspace) {
+            self.batch.remove(&ks, key);
         }
     }
 
     fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>> {
         Box::pin(async move {
+            if let Some(e) = self.error {
+                // Dropping the uncommitted batch discards every staged op.
+                return Err(e);
+            }
             let batch = self.batch;
             tokio::task::spawn_blocking(move || {
                 batch.commit().map_err(|e| AppError::Store(e.to_string()))
@@ -376,6 +445,148 @@ mod tests {
             results,
             (1..=N).collect::<Vec<_>>(),
             "lost or duplicate increment"
+        );
+    }
+
+    /// The serialisation must hold across *separately obtained* handles —
+    /// every request handler calls `store.keyspace(..)` for itself, and
+    /// each call mints a new `FjallKeyspace`. A lock owned by the instance
+    /// would let these callers interleave their get-then-write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn incr_raw_serialises_across_separate_handles() {
+        let (store, _dir) = temp_store().await;
+
+        const N: u64 = 200;
+        let mut handles = Vec::new();
+        for _ in 0..N {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                let ks = store.keyspace("test").unwrap();
+                ks.incr_raw(b"counter:x".to_vec()).await.unwrap()
+            }));
+        }
+        let mut results: Vec<u64> = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+        results.sort_unstable();
+        assert_eq!(
+            results,
+            (1..=N).collect::<Vec<_>>(),
+            "lost or duplicate increment across handles"
+        );
+    }
+
+    /// `take_raw` across separately obtained handles: exactly one winner
+    /// per key, however many callers race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn take_raw_atomic_serialises_across_separate_handles() {
+        let (store, _dir) = temp_store().await;
+        const KEYS: usize = 40;
+        const RACERS: usize = 16;
+        let seed = store.keyspace("test").unwrap();
+        for k in 0..KEYS {
+            seed.insert_raw(format!("refresh:{k}"), b"session".to_vec())
+                .await
+                .unwrap();
+        }
+
+        let mut handles = Vec::new();
+        for k in 0..KEYS {
+            for _ in 0..RACERS {
+                let store = store.clone();
+                handles.push(tokio::spawn(async move {
+                    let ks = store.keyspace("test").unwrap();
+                    (
+                        k,
+                        ks.take_raw(format!("refresh:{k}")).await.unwrap().is_some(),
+                    )
+                }));
+            }
+        }
+        let mut winners = vec![0usize; KEYS];
+        for h in handles {
+            let (k, won) = h.await.unwrap();
+            if won {
+                winners[k] += 1;
+            }
+        }
+        assert!(
+            winners.iter().all(|w| *w == 1),
+            "every key must be claimed exactly once, got {winners:?}"
+        );
+    }
+
+    /// A committed batch is seen whole or not at all. fjall applies a batch
+    /// to its memtables item by item before publishing it, so a direct
+    /// `Keyspace::get` (which reads at `SeqNo::MAX`) could see `a` from a
+    /// batch whose `b` was not applied yet. Reading `a` then `b`, `b` must
+    /// never be behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn a_batch_is_never_seen_half_applied() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace("test").unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let read = |ks: KeyspaceHandle, key: &'static str| async move {
+            ks.get_raw(key)
+                .await
+                .unwrap()
+                .map_or(0, |v| super::decode_counter(&v))
+        };
+        let mut observers = Vec::new();
+        for _ in 0..4 {
+            let (ks, done) = (ks.clone(), done.clone());
+            observers.push(tokio::spawn(async move {
+                while !done.load(Ordering::Acquire) {
+                    let a = read(ks.clone(), "a").await;
+                    let b = read(ks.clone(), "b").await;
+                    if b < a {
+                        return Some((a, b));
+                    }
+                }
+                None
+            }));
+        }
+        for n in 1..=2000u64 {
+            let mut batch = store.batch();
+            batch.insert_raw(&ks, "a", super::encode_counter(n));
+            batch.insert_raw(&ks, "b", super::encode_counter(n));
+            batch.commit().await.unwrap();
+        }
+        done.store(true, Ordering::Release);
+        for o in observers {
+            assert_eq!(o.await.unwrap(), None, "saw a batch half-applied (a, b)");
+        }
+    }
+
+    /// A batch op that cannot be staged must fail the whole batch: the
+    /// committed state is all of it or none of it, never "everything but
+    /// the op that was logged and dropped".
+    #[tokio::test]
+    async fn batch_with_an_unstageable_op_commits_nothing() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace("test").unwrap();
+        ks.insert_raw("existing", b"keep".to_vec()).await.unwrap();
+
+        let mut bad = ks.clone();
+        bad.name = String::new(); // fjall refuses an empty keyspace name
+
+        let mut batch = store.batch();
+        batch.insert_raw(&ks, "first", b"1".to_vec());
+        batch.insert_raw(&bad, "lost", b"x".to_vec());
+        batch.remove(&ks, "existing");
+        batch.insert_raw(&ks, "last", b"2".to_vec());
+        let err = batch.commit().await.expect_err("partial batch must fail");
+        assert!(err.to_string().contains("keyspace"), "got: {err}");
+
+        assert!(ks.get_raw("first").await.unwrap().is_none());
+        assert!(ks.get_raw("last").await.unwrap().is_none());
+        assert_eq!(
+            ks.get_raw("existing").await.unwrap(),
+            Some(b"keep".to_vec())
         );
     }
 
