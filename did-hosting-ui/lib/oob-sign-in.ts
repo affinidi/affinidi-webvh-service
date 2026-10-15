@@ -267,12 +267,47 @@ export interface SignInOptions {
    * conflict, see the control plane's `oob::http`).
    */
   onRedeemed?: (payload: Record<string, unknown>) => void;
+  /**
+   * Skip "Continue as …?" for the identity this browser last confirmed: a
+   * redeem for that subject goes straight to `signedIn`, and `confirm()`
+   * remembers the subject it confirms. Any other subject is still asked, so
+   * someone signing this browser in as themselves is still caught. Default:
+   * always ask. Mirrors `@openvtc/rp-sdk`'s option of the same name.
+   */
+  knownSubject?: KnownSubjectStore;
   requestTimeoutMs?: number;
   pollTimeoutMs?: number;
   fetch?: typeof fetch;
   document?: Document;
   pageHost?: string;
   keys?: StarterKeys;
+}
+
+/** Where the identity this browser last confirmed is kept. */
+export interface KnownSubjectStore {
+  get(): string | null;
+  set(subject: string): void;
+}
+
+/** A {@link KnownSubjectStore} in `localStorage` under `key`. Storage that is
+ *  missing, blocked or cleared reads as no subject, so the page asks again. */
+export function localStorageKnownSubject(key: string): KnownSubjectStore {
+  return {
+    get() {
+      try {
+        return globalThis.localStorage?.getItem(key) ?? null;
+      } catch {
+        return null;
+      }
+    },
+    set(subject) {
+      try {
+        globalThis.localStorage?.setItem(key, subject);
+      } catch {
+        // The next sign-in asks again.
+      }
+    },
+  };
 }
 
 export class SignInError extends Error {
@@ -384,6 +419,7 @@ export class SignInController {
   confirm(): void {
     if (this.current.status !== "confirm") return;
     const { subject, displayName, notAfter } = this.current;
+    this.opts.knownSubject?.set(subject);
     this.set({ status: "signedIn", subject, displayName, notAfter });
   }
 
@@ -432,8 +468,9 @@ export class SignInController {
         this.clearTimers();
         this.requestId = null;
         this.opts.onRedeemed?.(body);
+        const known = this.opts.knownSubject?.get();
         this.set({
-          status: "confirm",
+          status: known && known === body.subject ? "signedIn" : "confirm",
           subject: body.subject,
           displayName: typeof body.displayName === "string" ? body.displayName : undefined,
           notAfter: typeof body.notAfter === "number" ? new Date(body.notAfter * 1000) : undefined,

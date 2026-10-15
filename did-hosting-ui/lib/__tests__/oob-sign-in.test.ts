@@ -187,6 +187,46 @@ describe("sign-in controller", () => {
     s.destroy();
   });
 
+  it("lets the identity it last confirmed straight in, and asks for any other", async () => {
+    let stored: string | null = null;
+    const knownSubject = { get: () => stored, set: (v: string) => void (stored = v) };
+    const signIn = (subject: string) =>
+      createSignIn({
+        endpoint: "/api/trust-tasks",
+        serviceDid: DID,
+        fetch: service([ok({ subject, displayName: "X", notAfter: 1_900_000_000 })]).f,
+        keys: keys(),
+        document: new FakeDocument() as unknown as Document,
+        pageHost: "dids.example.org",
+        knownSubject,
+      });
+
+    // First time: asked; Continue remembers.
+    const first = signIn("did:example:alice");
+    await first.start();
+    await until(() => first.state, "confirm");
+    first.confirm();
+    expect(stored).toBe("did:example:alice");
+    first.destroy();
+
+    // Same identity: straight to signedIn.
+    const again = signIn("did:example:alice");
+    const seen: string[] = [];
+    again.subscribe((st) => seen.push(st.status));
+    await again.start();
+    await until(() => again.state, "signedIn");
+    expect(seen).not.toContain("confirm");
+    again.destroy();
+
+    // Another identity: asked, and Not me leaves the remembered one alone.
+    const other = signIn("did:example:mallory");
+    await other.start();
+    await until(() => other.state, "confirm");
+    await other.notMe();
+    expect(stored).toBe("did:example:alice");
+    other.destroy();
+  });
+
   it("hides the code when the tab is hidden, but keeps the request and polls on (C9)", async () => {
     const doc = new FakeDocument();
     const svc = service([
