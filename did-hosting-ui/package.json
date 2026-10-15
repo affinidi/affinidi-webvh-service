@@ -26,7 +26,7 @@
     "qrcode-generator": "2.0.4",
     "react": "19.3.0",
     "react-dom": "19.3.0",
-    "react-native": "0.86.2",
+    "react-native": "0.87.1",
     "react-native-safe-area-context": "~5.8.0",
     "react-native-screens": "~4.26.0",
     "react-native-web": "^0.21.0",
