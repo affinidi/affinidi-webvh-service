@@ -378,12 +378,16 @@ pub async fn issue(ks: &KeyspaceHandle, req: InviteRequest) -> Result<IssuedInvi
 /// invite goes through [`update`], so it cannot bring back one that was taken
 /// meanwhile.
 pub async fn save(ks: &KeyspaceHandle, invite: &Invite) -> Result<(), AppError> {
-    ks.insert(invite_key(&invite.token_hash), invite).await?;
-    ks.insert_raw(
+    // The invite and its id index in one write: neither is ever stored
+    // without the other.
+    let mut batch = ks.batch();
+    batch.insert(ks, invite_key(&invite.token_hash), invite)?;
+    batch.insert_raw(
+        ks,
         invite_id_key(&invite.invite_id),
         invite.token_hash.as_bytes().to_vec(),
-    )
-    .await
+    );
+    batch.commit().await
 }
 
 /// The invite stored under `token_hash`.
@@ -431,8 +435,12 @@ pub async fn take(ks: &KeyspaceHandle, token_hash: &str) -> Result<Option<Invite
 async fn take_locked(ks: &KeyspaceHandle, token_hash: &str) -> Result<Option<Invite>, AppError> {
     let taken: Option<Invite> = ks.take(invite_key(token_hash)).await?;
     if let Some(ref invite) = taken {
-        ks.remove(invite_id_key(&invite.invite_id)).await?;
-        ks.remove(wrong_codes_key(token_hash)).await?;
+        // The claim must stay the store's atomic take; what hangs off the
+        // invite follows in one batch, not one remove each.
+        let mut batch = ks.batch();
+        batch.remove(ks, invite_id_key(&invite.invite_id));
+        batch.remove(ks, wrong_codes_key(token_hash));
+        batch.commit().await?;
     }
     Ok(taken)
 }
