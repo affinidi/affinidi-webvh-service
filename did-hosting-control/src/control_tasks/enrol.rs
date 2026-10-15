@@ -711,6 +711,23 @@ pub(crate) async fn redeem_finish(
     {
         return Err(not_found());
     }
+    // An invite that confers a role decides whether to create the subject's
+    // ACL entry from a read of the ACL, so — like `acl/grant`,
+    // `acl/change-role` and `acl/revoke` — it holds the ACL write lock from
+    // that read through `persist`'s commit. Unlocked, an admin's grant (or
+    // role change) landing in between was silently overwritten by the
+    // invite's role. Taken after `credentials_guard`; the ACL handlers never
+    // take a credentials guard, so the order cannot deadlock.
+    let _acl_guard = if ceremony.purpose == Purpose::Session && role.is_some() {
+        Some(
+            state
+                .acl_locks
+                .guard(did_hosting_common::server::trust_tasks::ACL_WRITE_LOCK_KEY)
+                .await,
+        )
+    } else {
+        None
+    };
     let acl_entry = match (ceremony.purpose, role) {
         (Purpose::Session, Some(role)) => {
             match acl::get_acl_entry(&state.acl_ks, &ceremony.subject).await? {
