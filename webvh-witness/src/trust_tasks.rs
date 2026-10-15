@@ -369,7 +369,7 @@ async fn key_delete_task(state: &AppState, doc: &TrustTask<Value>) -> Result<Val
         return Err(ErrorPayload::from(key_delete::error_codes::NOT_FOUND)
             .with_message(format!("no witness identity {witness_id}")));
     }
-    witness_ops::delete_witness(&state.witnesses_ks, witness_id)
+    witness_ops::delete_witness(&state.store, &state.witnesses_ks, witness_id)
         .await
         .map_err(internal)?;
     info!(audit = true, witness_id, "witness identity deleted");
@@ -466,30 +466,26 @@ async fn sign_task(
         }
     }
 
+    // The mark only ever moves forward; re-witnessing an entry already
+    // witnessed leaves it as it is. It is recorded — and made durable —
+    // inside `sign_witness_proof`, before the proof can leave this function.
+    let advance = mark
+        .as_ref()
+        .is_none_or(|m| version_number > m.version_number)
+        .then(|| witness_ops::WitnessedMark {
+            version_number,
+            version_id: version_id.to_string(),
+        });
     let (version_id, proof) = witness_ops::sign_witness_proof(
+        &state.store,
         &state.witnesses_ks,
         state.signer.as_ref(),
         witness_id,
         version_id,
+        advance.as_ref().map(|m| (witnessed.scid.as_str(), m)),
     )
     .await
     .map_err(internal)?;
-    if mark
-        .as_ref()
-        .is_none_or(|m| version_number > m.version_number)
-    {
-        witness_ops::set_witnessed_mark(
-            &state.witnesses_ks,
-            witness_id,
-            &witnessed.scid,
-            &witness_ops::WitnessedMark {
-                version_number,
-                version_id: version_id.clone(),
-            },
-        )
-        .await
-        .map_err(internal)?;
-    }
     drop(_guard);
     let did = did_hosting_common::did_ops::extract_did_id(&p.log_content).unwrap_or_default();
     info!(
