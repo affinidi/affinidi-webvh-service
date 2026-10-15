@@ -50,14 +50,15 @@ pub async fn cleanup_empty_dids(
             || record.deleted_at.is_some_and(|d| now.saturating_sub(d) > SOFT_DELETE_RETENTION);
 
         if should_remove {
-            dids_ks.remove(did_key(&record.mnemonic)).await?;
-            dids_ks.remove(content_log_key(&record.mnemonic)).await?;
-            dids_ks
-                .remove(content_witness_key(&record.mnemonic))
-                .await?;
-            dids_ks
-                .remove(owner_key(&record.owner, &record.mnemonic))
-                .await?;
+            // One atomic write per DID: a crash part-way can no longer leave
+            // a record without its content, or an owner index without its
+            // record.
+            let mut batch = dids_ks.batch();
+            batch.remove(dids_ks, did_key(&record.mnemonic));
+            batch.remove(dids_ks, content_log_key(&record.mnemonic));
+            batch.remove(dids_ks, content_witness_key(&record.mnemonic));
+            batch.remove(dids_ks, owner_key(&record.owner, &record.mnemonic));
+            batch.commit().await?;
             removed += 1;
         }
     }
