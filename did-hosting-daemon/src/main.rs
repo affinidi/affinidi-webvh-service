@@ -163,8 +163,13 @@ enum Command {
     /// unauthenticated scrape endpoint. Signs the task with the `--key`
     /// did:key (granted `MetricsReader` in the ACL) and POSTs it to the
     /// running daemon's `POST /api/trust-tasks`. Only `counters` are returned
-    /// (gauges require Admin and are omitted). Built for an on-box metrics
-    /// sidecar: `did-hosting-daemon fetch-metrics --key … | aws cloudwatch put-metric-data …`.
+    /// (gauges require Admin and are omitted). Prints the counters as JSON on
+    /// stdout, ready to pipe into any monitoring agent or metrics exporter.
+    ///
+    /// Counter instrumentation is opt-in: the `webvh_*` counters are populated
+    /// only when the daemon is built with the `metrics` feature. Against a
+    /// daemon built without it this prints an empty array `[]` — a genuine
+    /// refusal (an ungranted/revoked key) is reported as an error instead.
     FetchMetrics {
         /// Path to the signer's did:key JSON file — the MetricsReader key,
         /// same format `setup --setup-key-out` writes.
@@ -1692,71 +1697,27 @@ async fn run_list_acl(
 /// Read the daemon's counters over the authenticated `server/metrics/0.1`
 /// Trust Task and print them as JSON (`[{ "name": …, "value": … }]`).
 ///
-/// The counters live in the running daemon's process memory and are reachable
-/// only through this signed localhost task — there is no unauthenticated scrape
-/// endpoint. We sign as the `--key` DID (granted `MetricsReader` in the ACL),
-/// POST to the daemon's `/api/trust-tasks`, and verify the reply is the
-/// server's own signed response before trusting the numbers. Gauges require
-/// Admin and are not returned to a `MetricsReader`, so we never request them.
+/// A thin wrapper over the shared [`did_hosting_common::server::cli_metrics::fetch_metrics`]
+/// — the daemon and standalone control both serve this task and expose the same
+/// command — supplying the daemon's own `server_did` and bind address.
 async fn run_fetch_metrics(
     config_path: Option<PathBuf>,
     key_path: PathBuf,
     url: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use affinidi_did_resolver_cache_sdk::DIDCacheClient;
-    use affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder;
-    use affinidi_tdk::secrets_resolver::secrets::Secret;
-    use did_hosting_common::server::trust_tasks::send::{build_signed_request, post_trust_task_https};
-    use vta_sdk::provision_client::EphemeralSetupKey;
-
-    const METRICS_TYPE_URI: &str = "https://trusttasks.org/spec/did-management/server/metrics/0.1";
-
     let config = DaemonConfig::load(config_path)?;
     let to = config
         .server_did
         .clone()
         .ok_or("server_did is not configured; the daemon has not completed provisioning")?;
-
-    // Default to the configured bind address, dialling 0.0.0.0 as loopback.
-    let base = url.unwrap_or_else(|| {
-        let host = if config.server.host == "0.0.0.0" {
-            "127.0.0.1"
-        } else {
-            config.server.host.as_str()
-        };
-        format!("http://{host}:{}", config.server.port)
-    });
-    let endpoint = format!("{}/api/trust-tasks", base.trim_end_matches('/'));
-
-    // Load the signer DID + key. Same did:key JSON `setup --setup-key-out`
-    // writes; for the sidecar this is a dedicated MetricsReader key.
-    let key = EphemeralSetupKey::load_from(key_path.as_path())?;
-    let from = key.did.clone();
-    let signer = Secret::from_multibase(key.private_key_multibase(), None)
-        .map_err(|e| format!("metrics key is not a usable signing key: {e}"))?;
-
-    let doc = build_signed_request(METRICS_TYPE_URI, &from, &to, serde_json::json!({}), &signer)
-        .await
-        .map_err(|e| format!("failed to sign the metrics request: {e}"))?;
-
-    // Resolve `to` to verify the daemon's signed reply — proves the counters
-    // came from the real server DID, not another process holding the port.
-    let resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
-        .await
-        .map_err(|e| format!("could not build a DID resolver: {e}"))?;
-
-    let reply = post_trust_task_https(&from, &to, &endpoint, &doc, Some(&resolver))
-        .await
-        .map_err(|e| format!("metrics request to {endpoint} failed: {e}"))?;
-
-    let counters = reply
-        .payload
-        .get("snapshot")
-        .and_then(|snapshot| snapshot.get("counters"))
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!([]));
-    println!("{}", serde_json::to_string(&counters)?);
-    Ok(())
+    did_hosting_common::server::cli_metrics::fetch_metrics(
+        &to,
+        key_path.as_path(),
+        url,
+        &config.server.host,
+        config.server.port,
+    )
+    .await
 }
 
 async fn run_remove_acl(

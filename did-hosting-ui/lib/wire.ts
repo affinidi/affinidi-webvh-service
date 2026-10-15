@@ -302,8 +302,34 @@ export function identityFromWire(r: IdentityListResponse): {
 // Access
 // ---------------------------------------------------------------------------
 
-function role(r: string | undefined): "admin" | "owner" | "service" {
-  return r === "admin" || r === "service" ? r : "owner";
+type WireRole = "admin" | "owner" | "service" | "metricsReader";
+
+/** A recognised role, preserved exactly — including the counters-only
+ *  `metricsReader`. Folding that into `owner` would let an edit form silently
+ *  promote a read-only credential on save; folding it into any other role
+ *  would mislabel the row. `undefined` for a value this client predates. */
+function knownRole(r: string | undefined): WireRole | undefined {
+  return r === "admin" ||
+    r === "owner" ||
+    r === "service" ||
+    r === "metricsReader"
+    ? r
+    : undefined;
+}
+
+/** Invite roles. The server refuses `metricsReader` on invites, so it only
+ *  ever surfaces on a stale/forged row — shown honestly, never rewritten. An
+ *  unrecognised value falls back to the LEAST-privileged `service`; a throw
+ *  is wrong here because this runs inside `invites.map(...)`, where one bad
+ *  row would hide the entire invite list. */
+function role(r: string | undefined): WireRole {
+  return knownRole(r) ?? "service";
+}
+
+/** ACL-entry roles. Same recognised set as invites; an entry with no or an
+ *  unrecognised role keeps its historical `owner` reading. */
+function aclRole(r: string | undefined): WireRole {
+  return knownRole(r) ?? "owner";
 }
 
 export function inviteFromWire(i: InviteSummary): InviteListItem {
@@ -346,7 +372,7 @@ export function aclEntryFromWire(spec: WireAclEntry): AclEntry {
   const quota: any = webvh.quota ?? {};
   return {
     did: spec.subject,
-    role: role(spec.role),
+    role: aclRole(spec.role),
     label: spec.label ?? null,
     created_at: epochSeconds(spec.createdAt) ?? 0,
     max_total_size: typeof quota.maxTotalSize === "number" ? quota.maxTotalSize : null,

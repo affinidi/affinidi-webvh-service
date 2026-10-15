@@ -1947,6 +1947,49 @@ async fn the_service_describes_itself_to_administrators_only() {
     assert_eq!(code(&reply), "permissionDenied");
 }
 
+/// `MetricsReader` is a counters-only credential. It reads `server/metrics/0.1`
+/// — counters present, gauges empty, since replication gauges stay Admin-only —
+/// and is refused by the ordinary authenticated task surface, including a
+/// slot-claiming `did/check-name` reservation. Its ACL entry carries
+/// `DomainScope::All` (what `member`/`add-acl` store), so this proves the
+/// central `Cx::auth` boundary, not the stored scope, is what keeps a metrics
+/// key off DID-management, enrolment, and admin tasks.
+#[tokio::test]
+async fn metrics_reader_reads_counters_only_and_is_denied_elsewhere() {
+    let (state, _dir) = state().await;
+    let reader = member(&state, 71, Role::MetricsReader).await;
+
+    // Reads the aggregate counters; gauges are Admin-only and come back empty.
+    let metrics = t("did-management/server/metrics/0.1");
+    let reply = call(&state, Via::Tsp, &reader, &metrics, json!({})).await;
+    conforms(&reply);
+    let snapshot = ok(&reply, &metrics)["snapshot"].clone();
+    assert!(snapshot["counters"].is_array(), "counters present: {reply}");
+    assert_eq!(
+        snapshot["gauges"].as_array().map(Vec::len),
+        Some(0),
+        "a MetricsReader must not see replication gauges: {reply}"
+    );
+
+    // Denied everywhere else — a slot-claiming reservation an owner could make,
+    // an admin config read, and the identity listing — despite the
+    // `DomainScope::All` its ACL entry carries.
+    let reserve = call(
+        &state,
+        Via::Tsp,
+        &reader,
+        &t("did-management/did/check-name/0.1"),
+        json!({ "reserve": true }),
+    )
+    .await;
+    assert_eq!(code(&reserve), "permissionDenied", "check-name: {reserve}");
+    for slug in ["server/config/0.1", "identity/list/0.1"] {
+        let uri = t(&format!("did-management/{slug}"));
+        let reply = call(&state, Via::Tsp, &reader, &uri, json!({})).await;
+        assert_eq!(code(&reply), "permissionDenied", "{slug}: {reply}");
+    }
+}
+
 /// Seed the slot at `mnemonic` holding `did_id`, with these agent names.
 async fn seed_named(state: &AppState, mnemonic: &str, did_id: &str, names: &[(&str, bool)]) {
     let mut record = seed_did(state, "did:example:operator", mnemonic).await;

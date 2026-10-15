@@ -98,6 +98,16 @@ impl AuthBackend for DidHostingControlAuthBackend {
 
     async fn check_acl(&self, did: &str) -> Result<RoleResolution<Self::Role>, Self::Error> {
         let role = crate::acl::check_acl(&self.state.acl_ks, did).await?;
+        // A `MetricsReader` is a counters-only sidecar credential and must
+        // never obtain an interactive session. The challenge/authenticate
+        // (AwsSigV4/WebAuthn) flow mints its token through this backend rather
+        // than `create_authenticated_session`, so the refusal lives here too —
+        // the two together keep the role off every sign-in path.
+        if matches!(role, Role::MetricsReader) {
+            return Err(AppError::Unauthorized(
+                "a metrics-reader credential cannot authenticate an interactive session".into(),
+            ));
+        }
         // did-hosting's ACL is flat (no per-context scoping); leave
         // contexts empty so the JWT carries no scope claim.
         Ok(RoleResolution::new(role))

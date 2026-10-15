@@ -194,6 +194,29 @@ pub async fn delete_session(sessions: &KeyspaceHandle, session_id: &str) -> Resu
     Ok(())
 }
 
+/// Claim a session row: atomically remove it and return what it held, then
+/// drop its refresh and per-DID indexes. Exactly one concurrent caller observes
+/// `Some` for a given session id — the claim is the store's atomic
+/// get-and-remove ([`KeyspaceHandle::take`]), so it holds across replicas
+/// sharing a store. A caller that sees `None` lost the race (or the row was
+/// never there) and must not act as if it held the row.
+pub async fn take_session(
+    sessions: &KeyspaceHandle,
+    session_id: &str,
+) -> Result<Option<Session>, AppError> {
+    let session: Option<Session> = sessions.take(session_key(session_id)).await?;
+    if let Some(ref session) = session {
+        if let Some(ref token) = session.refresh_token {
+            sessions.remove(refresh_key(token)).await?;
+        }
+        sessions
+            .remove(session_did_key(&session.did, session_id))
+            .await?;
+        debug!(session_id, "session claimed");
+    }
+    Ok(session)
+}
+
 /// Demote every live session of `subject` that is currently elevated
 /// (`acr == "aal2"`) without a passkey factor in `amr` — the wallet/VTA-signed
 /// `didSigned` step-up route this relying party no longer honours for a
@@ -494,6 +517,20 @@ pub async fn create_authenticated_session(
     session_pubkey_b58btc: Option<String>,
     amr_acr_override: Option<(Vec<String>, String)>,
 ) -> Result<TokenResponse, AppError> {
+    // A `MetricsReader` is a counters-only did:key sidecar, never an
+    // interactive principal: it must never hold a bearer session a step-up
+    // could then raise to aal2. The general task surface (`Cx::auth`) already
+    // refuses it, but every sign-in path (OOB wallet redeem, passkey login)
+    // mints its session here — so this is the single chokepoint that keeps the
+    // role off every session, whatever the sign-in route. See also
+    // `DidHostingControlAuthBackend::check_acl`, which refuses the
+    // challenge/authenticate flow before it reaches a token.
+    if matches!(role, Role::MetricsReader) {
+        return Err(AppError::Unauthorized(
+            "a metrics-reader credential cannot open an interactive session".into(),
+        ));
+    }
+
     let session_id = Uuid::new_v4().to_string();
 
     let (access_token, access_expires_at, refresh_token, refresh_expires_at, token_id) =
@@ -645,6 +682,27 @@ mod refresh_token_invariant {
         let ks = store.keyspace(KS_SESSIONS).unwrap();
         let keys = JwtKeys::from_ed25519_bytes(&[11u8; 32]).unwrap();
         (ks, keys, dir)
+    }
+
+    /// A `MetricsReader` is a counters-only sidecar credential and must never
+    /// obtain an interactive session, whatever sign-in path mints it — every
+    /// one funnels through here. The call is refused and nothing is stored.
+    #[tokio::test]
+    async fn metrics_reader_cannot_open_a_session() {
+        let (ks, keys, _dir) = make_ks().await;
+        let err = create_authenticated_session(
+            &ks,
+            &keys,
+            "did:key:z6MkMetricsReader",
+            &Role::MetricsReader,
+            60,
+            900,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a MetricsReader must not get a session");
+        assert!(matches!(err, AppError::Unauthorized(_)), "got {err:?}");
     }
 
     /// Activity advances the clock the idle timeout is measured against.
@@ -886,6 +944,27 @@ mod demotion_index_tests {
             bob1.acr, "aal2",
             "another subject's session is never touched"
         );
+    }
+
+    /// `take_session` is a claim: the first caller gets the row (and its
+    /// did-index entry goes with it); every later one gets `None`.
+    #[tokio::test]
+    async fn take_session_claims_the_row_exactly_once() {
+        let (ks, _dir) = make_ks().await;
+
+        let s = session("did:example:erin", "s-erin-1", "aal1", vec!["did".into()]);
+        store_session(&ks, &s).await.unwrap();
+
+        let taken = take_session(&ks, &s.session_id).await.unwrap();
+        assert_eq!(taken.map(|t| t.session_id), Some(s.session_id.clone()));
+        assert!(get_session(&ks, &s.session_id).await.unwrap().is_none());
+        assert!(
+            !ks.contains_key(session_did_key(&s.did, &s.session_id))
+                .await
+                .unwrap(),
+            "take_session must remove the did-index entry too"
+        );
+        assert!(take_session(&ks, &s.session_id).await.unwrap().is_none());
     }
 
     /// The `session-did:` index entry is removed exactly when the session

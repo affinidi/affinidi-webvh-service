@@ -40,6 +40,8 @@ use serde_json::json;
 use trust_tasks_rs::Payload;
 use trust_tasks_rs::specs::did_management::did;
 
+use vta_sdk::provision_client::EphemeralSetupKey;
+
 use did_hosting_common::WitnessClient;
 use did_hosting_common::did_ops::extract_did_id;
 use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
@@ -71,6 +73,9 @@ struct Daemon {
     admin_did: String,
     admin_signer: affinidi_tdk::secrets_resolver::secrets::Secret,
     did_resolver: DIDCacheClient,
+    /// The written `config.toml` — carries `server_did` + bind address, which
+    /// the `fetch-metrics` subcommand reads to find the daemon.
+    config_path: std::path::PathBuf,
     _dir: tempfile::TempDir,
     child: tokio::process::Child,
 }
@@ -79,6 +84,17 @@ impl Daemon {
     /// Non-interactively set up a self-managed daemon in a fresh temp dir,
     /// then spawn it and wait until it serves its own root DID.
     async fn spawn() -> Self {
+        Self::spawn_with_acl(&[]).await
+    }
+
+    /// Like [`Self::spawn`], but also seeds `extra_main_acl` (DID + role) into
+    /// the main store's ACL before the daemon starts — the same window and
+    /// mechanism the witness-ACL seed below uses, since the service routes no
+    /// online `acl/grant` task. Used to grant a MetricsReader whose did:key is
+    /// minted by the test.
+    async fn spawn_with_acl(
+        extra_main_acl: &[(String, did_hosting_common::server::acl::Role)],
+    ) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let port = reserve_port().await;
         // `localhost`, not `127.0.0.1`: first-boot domain seeding refuses an
@@ -175,6 +191,43 @@ enable_watcher = false
             // and the daemon must be the only opener of it.
         }
 
+        // Seed any caller-supplied entries into the *main* store's ACL, in the
+        // same post-setup / pre-spawn window (the store is unlocked once the
+        // setup subprocess exits, and must be dropped before the daemon opens
+        // it). There is no online `acl/grant` task to do this over the wire.
+        if !extra_main_acl.is_empty() {
+            use did_hosting_common::server::acl::{AclEntry, store_acl_entry};
+            use did_hosting_common::server::config::StoreConfig;
+            use did_hosting_common::server::domain::DomainScope;
+            use did_hosting_common::server::store::{KS_ACL, Store};
+
+            // Setup roots the main store at `<server.data_dir>/store` (and the
+            // witness at `<server.data_dir>/witness`); seed the former.
+            let main_store = Store::open(&StoreConfig {
+                data_dir: data_dir.join("store"),
+                ..StoreConfig::default()
+            })
+            .await
+            .expect("open main store");
+            let acl_ks = main_store.keyspace(KS_ACL).expect("main acl keyspace");
+            for (did, role) in extra_main_acl {
+                store_acl_entry(
+                    &acl_ks,
+                    &AclEntry {
+                        did: did.clone(),
+                        role: role.clone(),
+                        label: Some("e2e extra".into()),
+                        created_at: 1,
+                        max_total_size: None,
+                        max_did_count: None,
+                        domains: DomainScope::All,
+                    },
+                )
+                .await
+                .expect("seed main ACL entry");
+            }
+        }
+
         let child = tokio::process::Command::new(bin)
             .arg("--config")
             .arg(&config_path)
@@ -220,6 +273,7 @@ enable_watcher = false
             admin_did,
             admin_signer,
             did_resolver,
+            config_path,
             _dir: dir,
             child,
         }
@@ -406,6 +460,108 @@ async fn daemon_lifecycle_over_https() {
         daemon.get_log(mnemonic).await.status(),
         reqwest::StatusCode::NOT_FOUND,
         "a deleted DID must stop resolving immediately, not after the cache's TTL"
+    );
+
+    daemon.teardown().await;
+}
+
+/// `fetch-metrics` with a key that is not in the ACL must fail with the ACL
+/// refusal (`permissionDenied`), not an empty successful scrape and not a
+/// signature/proof error.
+///
+/// The refusal is an *unsigned* framework `trust-task-error`, so this drives the
+/// whole chain the maintainer asked after: the daemon's `Cx::metrics_read` ACL
+/// gate, the unsigned-error recognition in `post_trust_task_https_verified`, and
+/// the subcommand surfacing that code rather than exiting 0 with `[]`. Runs the
+/// real `did-hosting-daemon fetch-metrics` subprocess against the live daemon,
+/// signing with a freshly minted did:key that was never granted.
+#[tokio::test]
+async fn fetch_metrics_denied_for_an_ungranted_key() {
+    let daemon = Daemon::spawn().await;
+
+    // A did:key the daemon has never seen, persisted in the same key-file format
+    // `setup --setup-key-out` writes and `fetch-metrics --key` reads.
+    let key_dir = tempfile::tempdir().expect("key temp dir");
+    let key_path = key_dir.path().join("ungranted-key.json");
+    EphemeralSetupKey::generate()
+        .expect("generate an ungranted did:key")
+        .persist_to(&key_path)
+        .expect("persist the ungranted key");
+
+    let bin = env!("CARGO_BIN_EXE_did-hosting-daemon");
+    let out = tokio::process::Command::new(bin)
+        .args(["fetch-metrics", "--config"])
+        .arg(&daemon.config_path)
+        .arg("--key")
+        .arg(&key_path)
+        .output()
+        .await
+        .expect("run did-hosting-daemon fetch-metrics");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "an ungranted key must be refused, not a successful scrape. stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("permissionDenied"),
+        "the operator should see the ACL refusal code, not a signature/proof error. stderr={stderr:?}"
+    );
+
+    daemon.teardown().await;
+}
+
+/// `fetch-metrics` with a key granted `MetricsReader` succeeds: it signs,
+/// verifies the daemon's signed reply, confirms the reply is the metrics
+/// `#response`, and prints the counters as a JSON array (exit 0).
+///
+/// Counters are only populated when the daemon is built with the `metrics`
+/// feature; without it the snapshot's `counters` array is present but empty.
+/// So this asserts the whole success path — valid output, clean exit — rather
+/// than a specific counter value: stdout must parse as a JSON array.
+#[tokio::test]
+async fn fetch_metrics_succeeds_for_a_granted_key() {
+    // Mint the MetricsReader did:key first so its DID can be granted before the
+    // daemon starts, and persist it in the format `fetch-metrics --key` reads.
+    let key_dir = tempfile::tempdir().expect("key temp dir");
+    let key_path = key_dir.path().join("metrics-reader-key.json");
+    let key = EphemeralSetupKey::generate().expect("generate a MetricsReader did:key");
+    let reader_did = key.did.clone();
+    key.persist_to(&key_path)
+        .expect("persist the MetricsReader key");
+
+    let daemon = Daemon::spawn_with_acl(&[(
+        reader_did,
+        did_hosting_common::server::acl::Role::MetricsReader,
+    )])
+    .await;
+
+    let bin = env!("CARGO_BIN_EXE_did-hosting-daemon");
+    let out = tokio::process::Command::new(bin)
+        .args(["fetch-metrics", "--config"])
+        .arg(&daemon.config_path)
+        .arg("--key")
+        .arg(&key_path)
+        .output()
+        .await
+        .expect("run did-hosting-daemon fetch-metrics");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a granted MetricsReader key must scrape successfully. stdout={stdout:?} stderr={stderr:?}"
+    );
+    // The last stdout line is the counters JSON (the daemon prints a banner to
+    // stderr, not stdout). It must be a JSON array — possibly empty when the
+    // daemon was built without the `metrics` feature.
+    let last = stdout.lines().last().unwrap_or_default();
+    let parsed: serde_json::Value = serde_json::from_str(last)
+        .unwrap_or_else(|e| panic!("counters output is not JSON: {e}; stdout={stdout:?}"));
+    assert!(
+        parsed.is_array(),
+        "counters output must be a JSON array, got {parsed:?}"
     );
 
     daemon.teardown().await;

@@ -432,14 +432,18 @@ impl Cx<'_> {
         Ok(auth)
     }
 
-    /// [`Cx::auth`], refused with `permissionDenied` unless the caller is an
-    /// administrator **or** a `MetricsReader`. The returned claims carry the
+    /// Admits a counters-only `MetricsReader` (or an `Admin`), refused with
+    /// `permissionDenied` for anything else. The returned claims carry the
     /// caller's role so a handler can still narrow what it exposes (the
     /// `metrics` task gives a `MetricsReader` the counters only, gauges
     /// `Admin`-only).
+    ///
+    /// This is the ONLY entry point that lets a `MetricsReader` through — the
+    /// general task surface ([`Cx::auth`]) rejects it — so it reads the claims
+    /// via the unrestricted [`Cx::authenticated_claims`] rather than `auth`.
     pub async fn metrics_read(&self) -> Result<AuthClaims, TaskError> {
         use crate::acl::Role;
-        let auth = self.auth().await?;
+        let auth = self.authenticated_claims().await?;
         if !matches!(auth.role, Role::Admin | Role::MetricsReader) {
             return Err(TaskError::Standard(
                 StandardCode::PermissionDenied,
@@ -449,12 +453,37 @@ impl Cx<'_> {
         Ok(auth)
     }
 
-    /// The caller's authority: the proven issuer and the role its ACL entry
-    /// grants now. A document is a single signed request, not a session, so
-    /// its assurance level is the base one — unless it arrived with a bearer
-    /// session whose subject is that same caller, whose level (and session)
-    /// it then carries.
+    /// The caller's authority for the ordinary authenticated task surface,
+    /// refused with `permissionDenied` for a `MetricsReader`.
+    ///
+    /// `MetricsReader` is a counters-only credential (see [`Cx::metrics_read`]):
+    /// it must never reach a DID-management, enrolment, domain, passkey, or any
+    /// other general task — several of which (`did/register`) make the caller
+    /// the owner of a fresh slot — so this central boundary rejects it. The ACL
+    /// read itself does not scope the role down (an offline `add-acl` stores it
+    /// with `DomainScope::All`), which is exactly why the gate lives here, on
+    /// every authenticated task, and not in the store.
     pub async fn auth(&self) -> Result<AuthClaims, TaskError> {
+        let auth = self.authenticated_claims().await?;
+        if auth.role == crate::acl::Role::MetricsReader {
+            return Err(TaskError::Standard(
+                StandardCode::PermissionDenied,
+                "a metrics-reader credential is not valid for this task".into(),
+            ));
+        }
+        Ok(auth)
+    }
+
+    /// The caller's authority with NO role restriction: the proven issuer and
+    /// the role its ACL entry grants now. A document is a single signed
+    /// request, not a session, so its assurance level is the base one — unless
+    /// it arrived with a bearer session whose subject is that same caller,
+    /// whose level (and session) it then carries.
+    ///
+    /// Private on purpose: the role gates ([`Cx::auth`], [`Cx::admin`],
+    /// [`Cx::metrics_read`]) are the authorization boundary. A new caller goes
+    /// through one of them, never this directly.
+    async fn authenticated_claims(&self) -> Result<AuthClaims, TaskError> {
         let did = self.caller.as_deref().ok_or_else(|| {
             TaskError::Standard(
                 StandardCode::PermissionDenied,
