@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+### Fixed — multi-row writes are atomic, and the witness's memory is durable
+
+- **A batch is all or nothing on Fjall.** An operation whose keyspace could
+  not be opened was logged and dropped while the rest of the batch committed;
+  the batch now fails and writes nothing. `take`/`incr` (refresh-token
+  rotation, the invite wrong-code lockout) now exclude every handle to a
+  keyspace, not only callers sharing one handle.
+- **A live domain is never purged.** Re-enabling or re-assigning a domain and
+  cancelling its pending purge are one write, as are disabling or unassigning
+  it and scheduling the purge (and a replicated `replica/domain/upsert`). A
+  crash between the two used to leave a ripe purge queued against a live
+  domain, or a domain disabled with no purge coming. Both purge sweeps also
+  re-check, just before deleting, that the row is unchanged and the domain is
+  still disabled or unassigned; a leftover row for a live domain is cleared
+  instead of acted on.
+- **The witness records what it signed before the proof leaves.** The proof
+  counter and the anti-equivocation mark are one write, fsynced before
+  `webvh/witness/sign` answers, so a power loss can no longer make the witness
+  forget an entry it vouched for and sign a fork of it.
+- **DID writes on the control plane hold the per-path lock.** `did/create`
+  (two creates of a free path both succeeded), `did/delete`,
+  `did/set-disabled` (wrote back a stale record) and rollback now read and
+  write under it; a force-replace is a single write.
+- **An edge's reconcile repair** takes `sync_lock` and re-reads the record, so
+  it cannot revert a sync applied while the listing was fetched.
+- **Sessions:** an activity touch updates `last_seen` on the current row only,
+  so it can no longer resurrect a rotated-away session or undo a passkey
+  demotion; session rows, their indexes and refresh indexes change together;
+  step-up retires the previous refresh token.
+- **Passkey invite redemption** that confers a role holds the ACL write lock,
+  so an administrator's concurrent grant is not overwritten.
+- Removing a witness identity with its marks, setting the default domain,
+  invite indexes and empty-DID cleanup are each one write.
+
 ## 0.9.0 (release/0.9)
 
 ### Breaking — the control plane has no REST management surface
