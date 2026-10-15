@@ -5,7 +5,8 @@
  * The page shows a trigger link as a code that is also a link: a phone
  * scans it, and a wallet on this device (the browser plugin, or a phone's
  * wallet app when this page is on the phone) opens it by click or tap. The
- * person approves in the wallet; this page then asks "Continue as …?".
+ * person approves in the wallet; this page then asks "Continue as …?" —
+ * unless this browser last continued as that same identity.
  *
  * Web only: the starter key is a WebCrypto key and the code is a DOM link.
  * The QR encoder (`qrcode-generator`) sits behind `lib/qr-encoder.ts`.
@@ -21,6 +22,7 @@ import {
   createSignIn,
   isUnavailable,
   layoutQr,
+  localStorageKnownSubject,
   QR_DARK,
   QR_LIGHT,
   type SignInController,
@@ -31,6 +33,9 @@ import { colors, fonts, radii, spacing } from "../lib/theme";
 
 /** The `ext` namespace the control plane puts this console's tokens under. */
 const SESSION_EXT = "com.affinidi.did-hosting";
+
+/** Where the identity this browser last continued as is kept. */
+const KNOWN_SUBJECT_KEY = "did-hosting-wallet-signin-known";
 
 interface Tokens {
   accessToken: string;
@@ -67,6 +72,7 @@ export function WalletSignIn({
       endpoint: `${getApiBase()}/trust-tasks`,
       serviceDid,
       linkHost: configuredLinkHost(),
+      knownSubject: localStorageKnownSubject(KNOWN_SUBJECT_KEY),
       onStateChange: setState,
       onRedeemed: (p) => {
         tokens.current = tokensOf(p);
@@ -83,15 +89,22 @@ export function WalletSignIn({
     if (isUnavailable(state)) onUnavailable?.();
   }, [state, onUnavailable]);
 
-  if (Platform.OS !== "web") return null;
-
-  const onContinue = () => {
+  // Signed in, by "Continue" or straight from the redeem for a known
+  // identity: hand the tokens over once.
+  useEffect(() => {
+    if (state.status !== "signedIn") return;
     const t = tokens.current;
-    if (!c || !t) return;
-    c.confirm();
+    if (!t) return;
+    tokens.current = null;
     setAuthMethod("wallet");
     setRefreshToken(t.refreshToken ?? null);
     onSignedIn(t.accessToken);
+  }, [state, onSignedIn]);
+
+  if (Platform.OS !== "web") return null;
+
+  const onContinue = () => {
+    if (tokens.current) c?.confirm();
   };
 
   // "Not me": end the session at once. `api.logout` revokes it with the
