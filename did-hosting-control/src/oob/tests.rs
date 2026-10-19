@@ -379,7 +379,12 @@ async fn step2_at(w: &World, rid: &str, prove_type: &str) -> Value {
     let n = w.number(rid).await;
     let id = w.identify(&w.member, rid, &n, "authentication").await;
     let d = w
-        .doc(&w.approver, prove_type, json!({"identify": id}), "authentication")
+        .doc(
+            &w.approver,
+            prove_type,
+            json!({"identify": id}),
+            "authentication",
+        )
         .await;
     let (status, step2) = w.send(d).await;
     assert_eq!(status, 200, "{step2}");
@@ -400,12 +405,18 @@ async fn grant_at(w: &World, rid: &str, step2: &Value, grant_type: &str, extra: 
     for (k, v) in extra.as_object().unwrap() {
         payload[k] = v.clone();
     }
-    w.doc(&w.member, grant_type, payload, "assertionMethod").await
+    w.doc(&w.member, grant_type, payload, "assertionMethod")
+        .await
 }
 
 async fn respond_at(w: &World, respond_type: &str, grant: Value) -> (u16, Value) {
     let d = w
-        .doc(&w.approver, respond_type, json!({"grant": grant}), "authentication")
+        .doc(
+            &w.approver,
+            respond_type,
+            json!({"grant": grant}),
+            "authentication",
+        )
         .await;
     w.send(d).await
 }
@@ -474,7 +485,11 @@ async fn respond_and_grant_versions_must_agree() {
         let step2 = step2_at(&w, &rid, TYPE_PROVE_V0_2).await;
         let grant = grant_at(&w, &rid, &step2, grant_type, json!({})).await;
         let (_, body) = respond_at(&w, respond, grant).await;
-        assert_eq!(code(&body), "notAuthorized", "{respond} + {grant_type}: {body}");
+        assert_eq!(
+            code(&body),
+            "notAuthorized",
+            "{respond} + {grant_type}: {body}"
+        );
         assert_eq!(w.state(&rid), OobState::Declined);
     }
 }

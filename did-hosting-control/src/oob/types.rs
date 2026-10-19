@@ -32,16 +32,14 @@ use trust_tasks_rs::specs::auth::oob as spec;
 pub use spec::cancel::v0_1::{Payload as CancelPayload, Response as CancelResponse};
 pub use spec::claim::v0_1::{Payload as ClaimPayload, Response as Step1Response};
 pub use spec::grant::v0_1::{Payload as GrantPayload, PayloadDecision as GrantDecision};
+pub use spec::grant::v0_2::Payload as GrantPayloadV0_2;
 pub use spec::identify::v0_1::Payload as IdentifyPayload;
 pub use spec::prove::v0_1::{Payload as ProvePayload, Response as Step2Response};
+pub use spec::prove::v0_2::{Payload as ProvePayloadV0_2, Response as Step2ResponseV0_2};
 pub use spec::redeem::v0_1::{Payload as RedeemPayload, Response as RedeemResponse};
 pub use spec::request::v0_1::{Payload as RequestPayload, Response as RequestResponse};
 pub use spec::respond::v0_1::{Payload as RespondPayload, Response as RespondResponse};
-pub use spec::grant::v0_2::Payload as GrantPayloadV0_2;
-pub use spec::prove::v0_2::{Payload as ProvePayloadV0_2, Response as Step2ResponseV0_2};
-pub use spec::respond::v0_2::{
-    Payload as RespondPayloadV0_2, Response as RespondResponseV0_2,
-};
+pub use spec::respond::v0_2::{Payload as RespondPayloadV0_2, Response as RespondResponseV0_2};
 
 pub const TYPE_REQUEST: &str = RequestPayload::TYPE_URI;
 pub const TYPE_CLAIM: &str = ClaimPayload::TYPE_URI;

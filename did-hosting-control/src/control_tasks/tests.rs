@@ -2528,7 +2528,10 @@ async fn an_unserved_prove_version_is_unsupported_so_a_wallet_falls_back() {
             signed(doc, &approver.key).await
         }
     };
-    for served in [crate::oob::types::TYPE_PROVE, crate::oob::types::TYPE_PROVE_V0_2] {
+    for served in [
+        crate::oob::types::TYPE_PROVE,
+        crate::oob::types::TYPE_PROVE_V0_2,
+    ] {
         let reply = https(&state, None, prove(served).await).await;
         assert_ne!(code(&reply), "unsupportedType", "{served}: {reply}");
     }
