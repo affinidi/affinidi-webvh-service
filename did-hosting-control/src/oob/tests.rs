@@ -372,6 +372,113 @@ async fn sign_in_end_to_end() {
     assert_eq!(code(&again), "requestExpired");
 }
 
+// ---- 0.2 (signingScope) ----------------------------------------------------
+
+/// A step 2 at `version`, through prove at that version.
+async fn step2_at(w: &World, rid: &str, prove_type: &str) -> Value {
+    let n = w.number(rid).await;
+    let id = w.identify(&w.member, rid, &n, "authentication").await;
+    let d = w
+        .doc(&w.approver, prove_type, json!({"identify": id}), "authentication")
+        .await;
+    let (status, step2) = w.send(d).await;
+    assert_eq!(status, 200, "{step2}");
+    step2
+}
+
+/// A grant at `grant_type`, with `extra` merged into its payload.
+async fn grant_at(w: &World, rid: &str, step2: &Value, grant_type: &str, extra: Value) -> Value {
+    let mut payload = json!({
+        "requestId": rid,
+        "decision": "approve",
+        "sessionKey": w.starter.did,
+        "approverKey": w.approver.did,
+        "origin": ORIGIN,
+        "contextDigest": context_digest(step2),
+        "notAfter": w.env.now() + 3600,
+    });
+    for (k, v) in extra.as_object().unwrap() {
+        payload[k] = v.clone();
+    }
+    w.doc(&w.member, grant_type, payload, "assertionMethod").await
+}
+
+async fn respond_at(w: &World, respond_type: &str, grant: Value) -> (u16, Value) {
+    let d = w
+        .doc(&w.approver, respond_type, json!({"grant": grant}), "authentication")
+        .await;
+    w.send(d).await
+}
+
+/// A wallet tries `prove/0.2` first. It is served, offers no signing scope
+/// (this service delegates none), and the sign-in completes at 0.2.
+#[tokio::test]
+async fn sign_in_end_to_end_at_0_2() {
+    let w = world();
+    let rid = w.request().await;
+    w.claim(&rid).await;
+
+    let step2 = step2_at(&w, &rid, TYPE_PROVE_V0_2).await;
+    assert_signed(&step2, "assertionMethod").await;
+    assert_eq!(step2["type"], format!("{TYPE_PROVE_V0_2}#response"));
+    assert!(
+        step2["payload"].get("signingScope").is_none(),
+        "nothing is offered for delegation: {step2}"
+    );
+    assert_eq!(step2["payload"]["identifiedAs"], w.member.did);
+
+    let grant = grant_at(&w, &rid, &step2, TYPE_GRANT_V0_2, json!({})).await;
+    let (status, ok) = respond_at(&w, TYPE_RESPOND_V0_2, grant).await;
+    assert_eq!(status, 200, "{ok}");
+    assert_eq!(ok["type"], format!("{TYPE_RESPOND_V0_2}#response"));
+    assert_eq!(ok["payload"], json!({"status": "approved"}));
+    assert_signed(&ok, "assertionMethod").await;
+
+    let (status, session) = w.redeem(&rid).await;
+    assert_eq!(status, 200, "{session}");
+    assert_eq!(session["approved"], w.member.did);
+}
+
+/// A 0.2 grant may only copy step 2's scope; claiming one nobody offered is
+/// a context mismatch, and declines the request.
+#[tokio::test]
+async fn a_0_2_grant_claiming_an_unoffered_signing_scope_is_refused() {
+    let w = world();
+    let rid = w.request().await;
+    w.claim(&rid).await;
+    let step2 = step2_at(&w, &rid, TYPE_PROVE_V0_2).await;
+    let grant = grant_at(
+        &w,
+        &rid,
+        &step2,
+        TYPE_GRANT_V0_2,
+        json!({"signingScope": ["did-management"]}),
+    )
+    .await;
+    let (status, body) = respond_at(&w, TYPE_RESPOND_V0_2, grant).await;
+    assert_eq!(code(&body), "contextMismatch", "{status} {body}");
+    assert_eq!(w.state(&rid), OobState::Declined);
+}
+
+/// A `respond` carries the `grant` of its own version: 0.2 with a 0.1 grant,
+/// or 0.1 with a 0.2 grant, is refused.
+#[tokio::test]
+async fn respond_and_grant_versions_must_agree() {
+    for (respond, grant_type) in [
+        (TYPE_RESPOND_V0_2, TYPE_GRANT),
+        (TYPE_RESPOND, TYPE_GRANT_V0_2),
+    ] {
+        let w = world();
+        let rid = w.request().await;
+        w.claim(&rid).await;
+        let step2 = step2_at(&w, &rid, TYPE_PROVE_V0_2).await;
+        let grant = grant_at(&w, &rid, &step2, grant_type, json!({})).await;
+        let (_, body) = respond_at(&w, respond, grant).await;
+        assert_eq!(code(&body), "notAuthorized", "{respond} + {grant_type}: {body}");
+        assert_eq!(w.state(&rid), OobState::Declined);
+    }
+}
+
 #[tokio::test]
 async fn redeem_long_poll_wakes_on_approval() {
     let mut w = world();

@@ -1,6 +1,13 @@
 //! The `auth/oob/*` wire types: the generated bindings in
-//! `trust_tasks_rs::specs::auth::oob::*::v0_1` (dtgwg-trust-tasks-tf #738),
-//! plus the request states and error codes this service keeps.
+//! `trust_tasks_rs::specs::auth::oob::*::v0_1` (dtgwg-trust-tasks-tf #738)
+//! and the `prove` / `respond` / `grant` 0.2 beside them (#820), plus the
+//! request states and error codes this service keeps.
+//!
+//! 0.2 differs from 0.1 only by `signingScope`: step 2 may offer to let the
+//! starter's key sign some task families as the member for the session, and
+//! the grant copies the offer. This service delegates nothing, so its step 2
+//! never carries one and a 0.2 grant that does is a context mismatch. It
+//! serves 0.2 because a wallet tries `prove/0.2` first ([`OobVersion`]).
 //!
 //! Every payload this service reads and every response it writes goes
 //! through a generated type, so a member the schema does not allow, a missing
@@ -30,6 +37,11 @@ pub use spec::prove::v0_1::{Payload as ProvePayload, Response as Step2Response};
 pub use spec::redeem::v0_1::{Payload as RedeemPayload, Response as RedeemResponse};
 pub use spec::request::v0_1::{Payload as RequestPayload, Response as RequestResponse};
 pub use spec::respond::v0_1::{Payload as RespondPayload, Response as RespondResponse};
+pub use spec::grant::v0_2::Payload as GrantPayloadV0_2;
+pub use spec::prove::v0_2::{Payload as ProvePayloadV0_2, Response as Step2ResponseV0_2};
+pub use spec::respond::v0_2::{
+    Payload as RespondPayloadV0_2, Response as RespondResponseV0_2,
+};
 
 pub const TYPE_REQUEST: &str = RequestPayload::TYPE_URI;
 pub const TYPE_CLAIM: &str = ClaimPayload::TYPE_URI;
@@ -39,6 +51,40 @@ pub const TYPE_RESPOND: &str = RespondPayload::TYPE_URI;
 pub const TYPE_GRANT: &str = GrantPayload::TYPE_URI;
 pub const TYPE_REDEEM: &str = RedeemPayload::TYPE_URI;
 pub const TYPE_CANCEL: &str = CancelPayload::TYPE_URI;
+pub const TYPE_PROVE_V0_2: &str = ProvePayloadV0_2::TYPE_URI;
+pub const TYPE_RESPOND_V0_2: &str = RespondPayloadV0_2::TYPE_URI;
+pub const TYPE_GRANT_V0_2: &str = GrantPayloadV0_2::TYPE_URI;
+
+/// The version a `prove` or `respond` arrives at. A `respond` carries the
+/// `grant` of its own version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OobVersion {
+    V0_1,
+    V0_2,
+}
+
+impl OobVersion {
+    pub fn prove_type(self) -> &'static str {
+        match self {
+            OobVersion::V0_1 => TYPE_PROVE,
+            OobVersion::V0_2 => TYPE_PROVE_V0_2,
+        }
+    }
+
+    pub fn respond_type(self) -> &'static str {
+        match self {
+            OobVersion::V0_1 => TYPE_RESPOND,
+            OobVersion::V0_2 => TYPE_RESPOND_V0_2,
+        }
+    }
+
+    pub fn grant_type(self) -> &'static str {
+        match self {
+            OobVersion::V0_1 => TYPE_GRANT,
+            OobVersion::V0_2 => TYPE_GRANT_V0_2,
+        }
+    }
+}
 
 /// Read `value` into a generated type.
 pub fn read<T: DeserializeOwned>(value: &Value) -> Result<T, String> {

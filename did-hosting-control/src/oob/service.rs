@@ -219,8 +219,10 @@ impl OobService {
         let result = match type_uri.as_str() {
             TYPE_REQUEST => self.request(env, &raw, conn).await,
             TYPE_CLAIM => self.claim(env, &raw).await,
-            TYPE_PROVE => self.prove(env, &raw, conn).await,
-            TYPE_RESPOND => self.respond(env, &raw).await,
+            TYPE_PROVE => self.prove(env, &raw, conn, OobVersion::V0_1).await,
+            TYPE_PROVE_V0_2 => self.prove(env, &raw, conn, OobVersion::V0_2).await,
+            TYPE_RESPOND => self.respond(env, &raw, OobVersion::V0_1).await,
+            TYPE_RESPOND_V0_2 => self.respond(env, &raw, OobVersion::V0_2).await,
             TYPE_REDEEM => match self.redeem(env, &raw, conn).await {
                 Ok((request, session)) => {
                     return OobReply::Approved {
@@ -386,9 +388,21 @@ impl OobService {
         env: &dyn OobEnv,
         raw: &Value,
         conn: &Connection,
+        version: OobVersion,
     ) -> Result<Value, OobError> {
-        let (doc, payload) = self.key_doc::<ProvePayload>(env, raw, TYPE_PROVE).await?;
-        let identify_raw = Value::Object(payload.identify);
+        let (doc, identify) = match version {
+            OobVersion::V0_1 => {
+                let (doc, p) = self.key_doc::<ProvePayload>(env, raw, TYPE_PROVE).await?;
+                (doc, p.identify)
+            }
+            OobVersion::V0_2 => {
+                let (doc, p) = self
+                    .key_doc::<ProvePayloadV0_2>(env, raw, TYPE_PROVE_V0_2)
+                    .await?;
+                (doc, p.identify)
+            }
+        };
+        let identify_raw = Value::Object(identify);
         let request_id = carried_request_id(&identify_raw)?;
         same_thread(&doc, &request_id)?;
         // 1. The outer issuer holds the lock; the request is claimed and in
@@ -433,7 +447,11 @@ impl OobService {
             "sameNetwork": same_network,
         });
         step2["identifiedAs"] = json!(identify_did);
-        let step2 = response::<Step2Response>(step2)?;
+        // No `signingScope` at 0.2 either: this service delegates no signing.
+        let step2 = match version {
+            OobVersion::V0_1 => response::<Step2Response>(step2)?,
+            OobVersion::V0_2 => response::<Step2ResponseV0_2>(step2)?,
+        };
         let signed = self.signed(env, &doc, &issuer, step2, ATTESTATION).await?;
         let now = env.now();
         let mut next = rec.next(OobState::Identified, now);
@@ -493,11 +511,27 @@ impl OobService {
 
     // ---- respond (7.5) ------------------------------------------------------
 
-    async fn respond(&self, env: &dyn OobEnv, raw: &Value) -> Result<Value, OobError> {
-        let (doc, payload) = self
-            .key_doc::<RespondPayload>(env, raw, TYPE_RESPOND)
-            .await?;
-        let grant_raw = Value::Object(payload.grant);
+    async fn respond(
+        &self,
+        env: &dyn OobEnv,
+        raw: &Value,
+        version: OobVersion,
+    ) -> Result<Value, OobError> {
+        let (doc, grant) = match version {
+            OobVersion::V0_1 => {
+                let (doc, p) = self
+                    .key_doc::<RespondPayload>(env, raw, TYPE_RESPOND)
+                    .await?;
+                (doc, p.grant)
+            }
+            OobVersion::V0_2 => {
+                let (doc, p) = self
+                    .key_doc::<RespondPayloadV0_2>(env, raw, TYPE_RESPOND_V0_2)
+                    .await?;
+                (doc, p.grant)
+            }
+        };
+        let grant_raw = Value::Object(grant);
         let request_id = carried_request_id(&grant_raw)?;
         same_thread(&doc, &request_id)?;
         let issuer = doc.issuer.clone().unwrap_or_default();
@@ -505,7 +539,7 @@ impl OobService {
         let rec = self.lock_holder_record(env, &request_id, &issuer, OobState::Identified)?;
         self.fresh(env, &doc)?;
 
-        let (approve, not_after) = match self.grant_checks(env, &rec, &grant_raw).await {
+        let (approve, not_after) = match self.grant_checks(env, &rec, &grant_raw, version).await {
             Ok(v) => v,
             Err(err) => return Err(self.decline(env, &rec, err, "auth/oob/respond")),
         };
@@ -533,7 +567,10 @@ impl OobService {
         }
         tracing::info!(audit = true, op = "auth/oob/respond", request_id = %rec.request_id, decision = %decision, "sign-in request decided");
         let status = if approve { "approved" } else { "declined" };
-        let body = response::<RespondResponse>(json!({ "status": status }))?;
+        let body = match version {
+            OobVersion::V0_1 => response::<RespondResponse>(json!({ "status": status }))?,
+            OobVersion::V0_2 => response::<RespondResponseV0_2>(json!({ "status": status }))?,
+        };
         // The wallet checks every reply it receives for `assertionMethod` (C5),
         // as the VTC signs them.
         self.signed(env, &doc, &issuer, body, ATTESTATION).await
@@ -545,6 +582,7 @@ impl OobService {
         env: &dyn OobEnv,
         rec: &OobRecord,
         grant_raw: &Value,
+        version: OobVersion,
     ) -> Result<(bool, u64), OobError> {
         let grant: TrustTask<Value> =
             serde_json::from_value(grant_raw.clone()).map_err(|_| OobError::not_authorized())?;
@@ -553,7 +591,8 @@ impl OobService {
         if grant.issuer.as_deref() != Some(did.as_str()) {
             return Err(OobError::not_authorized());
         }
-        self.envelope(env, &grant, TYPE_GRANT)
+        // A `respond` carries the `grant` of its own version.
+        self.envelope(env, &grant, version.grant_type())
             .map_err(|_| OobError::not_authorized())?;
         let verifier = env.member_verifier().ok_or_else(OobError::not_authorized)?;
         if let Err(e) = verifier.verify_approval(&grant).await {
@@ -567,7 +606,26 @@ impl OobService {
         {
             return Err(OobError::not_authorized());
         }
-        let p = read::<GrantPayload>(&grant.payload).map_err(|_| OobError::not_authorized())?;
+        let p = match version {
+            OobVersion::V0_1 => {
+                read::<GrantPayload>(&grant.payload).map_err(|_| OobError::not_authorized())?
+            }
+            OobVersion::V0_2 => {
+                let p = read::<GrantPayloadV0_2>(&grant.payload)
+                    .map_err(|_| OobError::not_authorized())?;
+                // 0.2 item 3: the grant's `signingScope` is step 2's. Step 2
+                // here never offers one, so a grant that claims one asks for
+                // a delegation nobody offered.
+                if p.signing_scope.is_some() {
+                    return Err(OobError::new(
+                        OobErrorCode::ContextMismatch,
+                        "the grant delegates signing this service did not offer",
+                    ));
+                }
+                // Without a scope a 0.2 grant has exactly 0.1's members.
+                read::<GrantPayload>(&grant.payload).map_err(|_| OobError::not_authorized())?
+            }
+        };
         let approve = p.decision == GrantDecision::Approve;
         let not_after = p.not_after;
         // 3. and 4. The bindings.

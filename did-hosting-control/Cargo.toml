@@ -92,7 +92,7 @@ did-hosting-common = { version = "0.10", path = "../did-hosting-common", feature
 # declarations (did-hosting-common/-server, webvh-witness) and to
 # the workspace `vta-sdk = "0.38"` — see the lockstep note in
 # did-hosting-common/Cargo.toml.
-vti-common = { version = "0.41", default-features = false }
+vti-common = { version = "0.48", default-features = false }
 async-trait = "0.1"
 # Trust Tasks framework — used by routes/trust_tasks.rs (the
 # /api/trust-tasks endpoint introduced in v0.7.1).
@@ -136,7 +136,7 @@ fjall = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true }
 multibase = { workspace = true }
 rand = { workspace = true }
-bip39 = "2"
+bip39 = "3"
 reqwest = { workspace = true }
 url = { workspace = true }
 rust-embed = { workspace = true, optional = true }
@@ -169,9 +169,9 @@ google-cloud-auth = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
 redis = { version = "1.0", features = ["tokio-comp", "aio"], optional = true }
 aws-sdk-dynamodb = { version = "1", optional = true }
-firestore = { version = "0.54", optional = true }
+firestore = { version = "0.59", optional = true }
 futures = { version = "0.3", optional = true }
-azure_data_cosmos = { version = "0.38", features = [
+azure_data_cosmos = { version = "1", features = [
   "key_auth",
 ], optional = true }
 azure_core = { version = "1.0", optional = true }
@@ -204,9 +204,9 @@ openssl = "0.10"
 # graph on trust-tasks 0.17 puts a second copy of both in the dev graph. See the
 # dev-graph note beside `vta-sdk` in the workspace Cargo.toml.
 #
-# 0.20.0 is the line built on affinidi-tdk 0.24 / trust-tasks-rs 0.28, the same
+# 0.43.0 is the line built on affinidi-tdk 0.27 / trust-tasks-rs 0.32, the same
 # the root manifest now pins.
-affinidi-messaging-test-mediator = "0.20.0"
+affinidi-messaging-test-mediator = "0.43.0"
 # Self-dependency with `test-support` on, so this crate's own integration
 # tests compile the `test_support` module (and get `tempfile`) exactly as a
 # downstream consumer would via `features = ["test-support"]`.
