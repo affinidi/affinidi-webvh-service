@@ -23,6 +23,7 @@ import { showAlert } from "../../lib/alert";
 import type { DidRecord } from "../../lib/api";
 import { matchesDomain } from "../../lib/domain";
 import { DidQrButton } from "../../components/DidQrButton";
+import { TableRow } from "../../components/TableRow";
 import {
   matchesSearch,
   nextSort,
@@ -446,11 +447,11 @@ export default function DidList() {
                     const names = servedNames(item.agentNames);
                     return (
                       <Link href={`/dids/${item.mnemonic}`} asChild>
-                        <Pressable
-                          style={({ hovered }: any) => [
+                        <TableRow
+                          hoverStyle={styles.rowHover}
+                          style={[
                             styles.row,
                             index % 2 === 1 && styles.rowAlt,
-                            hovered && styles.rowHover,
                             showOwnerInfo &&
                               (isOwn ? styles.rowOwn : styles.rowOther),
                           ]}
@@ -551,7 +552,7 @@ export default function DidList() {
                               {item.totalResolves.toLocaleString()}
                             </Text>
                           </View>
-                        </Pressable>
+                        </TableRow>
                       </Link>
                     );
                   }}
