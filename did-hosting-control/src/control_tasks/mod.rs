@@ -282,12 +282,16 @@ control_tasks! {
     // carries the member's `identify` and `grant` (verified inside the row,
     // after the ACL check on their issuer, with `TransportBoundVerifier`).
     // `identify` and `grant` are not rows: they are only ever carried, and
-    // one sent by itself is refused as an unsupported type.
+    // one sent by itself is refused as an unsupported type. `prove` and
+    // `respond` are served at 0.2 as well: a wallet tries 0.2 first, and only
+    // an `unsupportedType` refusal sends it back to 0.1 (`oob::types`).
     @bound_key(crate::oob::http) {
         tt_oob::request::v0_1 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
         tt_oob::claim::v0_1 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
         tt_oob::prove::v0_1 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
+        tt_oob::prove::v0_2 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
         tt_oob::respond::v0_1 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
+        tt_oob::respond::v0_2 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
         tt_oob::redeem::v0_1 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
         tt_oob::cancel::v0_1 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
     }

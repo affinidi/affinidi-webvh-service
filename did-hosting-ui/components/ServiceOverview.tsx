@@ -201,7 +201,7 @@ function ServiceCard({
 /**
  * An empty registry means different things per deployment.
  *
- * On a standalone control plane it means nothing has connected yet \u2014 the
+ * On a standalone control plane it means nothing has connected yet — the
  * operator has work to do. On a daemon it is the normal, self-contained
  * state (see CLAUDE.md), so saying "no services connected" would read as a
  * fault rather than the expected shape.
@@ -213,8 +213,8 @@ function EmptyState({ isDaemon }: { isDaemon: boolean }) {
         <Text style={styles.emptyIcon}>{"\u2713"}</Text>
         <Text style={styles.emptyTitle}>Self-contained daemon</Text>
         <Text style={styles.emptyHint}>
-          Server, witness, and watcher run in this process \u2014 there are no
-          remote instances to register. Registering one is supported but
+          Server, witness, and watcher run in this process — there are
+          no remote instances to register. Registering one is supported but
           unusual; use a standalone control plane to manage remote services.
         </Text>
       </View>

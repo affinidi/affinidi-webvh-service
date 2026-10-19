@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Fixed — wallet sign-in works with the current browser wallet
+
+- **`auth/oob/prove` and `respond` are served at 0.2** beside 0.1. The wallet
+  now tries `prove/0.2` first and falls back to 0.1 only on `unsupportedType`;
+  this service refused the unserved type as `permissionDenied` instead, so
+  every wallet sign-in failed. 0.2's step 2 offers no `signingScope` (this
+  service delegates no signing), and a 0.2 grant that claims one is refused as
+  `contextMismatch`. A `respond` must carry the `grant` of its own version.
+- **An unserved `auth/oob/*` version answers `unsupportedType`** rather than
+  the ACL refusal, so a later wallet version falls back too.
+- `secrets.backend = "encrypted_file"` (new in vti-secrets) is refused as
+  unsupported at startup rather than half-configured.
+
+### Changed — dependencies and the management UI
+
+- vta-sdk 0.72 / vti-common 0.48 / vti-secrets 0.21, trust-tasks 0.32,
+  affinidi-tdk 0.27, affinidi-messaging-sdk 0.37, `-didcomm-service` 0.22,
+  bip39 3, utoipa 6, firestore 0.59, azure_data_cosmos 1.0; the UI on Expo SDK
+  58 / react-native 0.88.
+- **Usage chart:** the tooltip shows each series' rate per second beside its
+  count (one decimal below 10/s, `<0.1/s` for a trickle).
+- **All DIDs** is a compact table: search by name, DID, method, domain or
+  agent name, and sort by any column (name, DID, versions, created, updated,
+  resolves). Each DID has a QR code.
+- The "Self-contained daemon" note shows an em dash instead of `—`.
+
 ### Fixed — multi-row writes are atomic, and the witness's memory is durable
 
 - **A batch is all or nothing on Fjall.** An operation whose keyspace could

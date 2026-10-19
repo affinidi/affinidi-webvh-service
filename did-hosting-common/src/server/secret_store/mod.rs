@@ -342,6 +342,9 @@ pub fn backend_label(secrets: &SecretsConfig) -> &'static str {
         SecretBackend::Kubernetes => "Kubernetes Secret",
         SecretBackend::Plaintext => "Plaintext file",
         SecretBackend::ConfigSeed => "config_seed (unsupported)",
+        // `vti_secrets::SecretBackend` is `#[non_exhaustive]`; a backend added
+        // there (`encrypted_file`, so far) has no `[secrets]` surface here.
+        _ => "unsupported backend",
     }
 }
 
@@ -445,6 +448,15 @@ pub fn to_vti_config(secrets: &SecretsConfig) -> Result<vti_secrets::SecretsConf
                  service's private keys in config.toml. Choose a secure backend."
                     .into(),
             ));
+        }
+        // `encrypted_file`, and anything `vti_secrets` adds later: there is no
+        // `[secrets]` field to configure it from, so refuse rather than hand
+        // the store a backend with none of its settings.
+        other => {
+            return Err(AppError::Config(format!(
+                "secrets.backend = {other:?} is not supported by this service. Choose one of \
+                 keyring, aws, gcp, azure, vault, kubernetes."
+            )));
         }
     }
     Ok(out)

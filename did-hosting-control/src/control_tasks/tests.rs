@@ -2413,9 +2413,9 @@ fn existing_rows_keep_their_proof_rules() {
     assert_eq!(now, BEFORE);
 }
 
-/// The bound-key rows are exactly wallet sign-in's six outer tasks, each
-/// accepting the two proof purposes its clients sign for. `identify` and
-/// `grant` are carried, never rows.
+/// The bound-key rows are exactly wallet sign-in's six outer tasks (`prove`
+/// and `respond` at 0.1 and 0.2), each accepting the two proof purposes its
+/// clients sign for. `identify` and `grant` are carried, never rows.
 #[test]
 fn bound_key_rows_are_wallet_sign_in_and_nothing_else() {
     use crate::oob::types::*;
@@ -2433,13 +2433,15 @@ fn bound_key_rows_are_wallet_sign_in_and_nothing_else() {
             TYPE_REQUEST,
             TYPE_CLAIM,
             TYPE_PROVE,
+            TYPE_PROVE_V0_2,
             TYPE_RESPOND,
+            TYPE_RESPOND_V0_2,
             TYPE_REDEEM,
             TYPE_CANCEL
         ]
         .map(|uri| (uri, purposes))
     );
-    for carried in [TYPE_IDENTIFY, TYPE_GRANT] {
+    for carried in [TYPE_IDENTIFY, TYPE_GRANT, TYPE_GRANT_V0_2] {
         assert_eq!(super::proof_rule(carried), None, "{carried} is not a row");
     }
     // Only a bound-key row sets the bearer session and the shared replay
@@ -2506,6 +2508,40 @@ async fn bound_key_rows_are_served_over_https_only() {
             }
         }
     }
+}
+
+/// A wallet sends `prove` at the newest version it knows and falls back only
+/// on an `unsupportedType` refusal (pnm-browser-plugin `sign-in-flows`). Both
+/// versions this service serves reach the state machine over HTTPS, and a
+/// version it does not serve, signed by a stranger's `did:key`, must be
+/// refused with exactly that code, or the wallet gives up instead of falling
+/// back.
+#[tokio::test]
+async fn an_unserved_prove_version_is_unsupported_so_a_wallet_falls_back() {
+    let (state, _dir) = state().await;
+    let approver = stranger(64);
+    let prove = |type_uri: &'static str| {
+        let approver = &approver;
+        async move {
+            let mut doc = request(type_uri, &approver.did, json!({ "identify": {} }));
+            doc["parentThreadId"] = json!(NO_SUCH_REQUEST);
+            signed(doc, &approver.key).await
+        }
+    };
+    for served in [
+        crate::oob::types::TYPE_PROVE,
+        crate::oob::types::TYPE_PROVE_V0_2,
+    ] {
+        let reply = https(&state, None, prove(served).await).await;
+        assert_ne!(code(&reply), "unsupportedType", "{served}: {reply}");
+    }
+    let reply = https(
+        &state,
+        None,
+        prove("https://trusttasks.org/spec/auth/oob/prove/0.99").await,
+    )
+    .await;
+    assert!(code(&reply).ends_with("unsupportedType"), "{reply}");
 }
 
 /// A bearer session sent with a bound-key document is ignored. Were it

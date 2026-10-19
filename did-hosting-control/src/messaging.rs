@@ -1552,6 +1552,14 @@ async fn route_trust_task_doc(
 /// login is what establishes control of is circular. Every other task — ACL
 /// reads included — is privileged, including a Type URI nobody serves, which
 /// is then refused as unsupported only once it has been proven.
+///
+/// The one exception is an `auth/oob/*` version the table does not serve.
+/// That family's callers are fresh `did:key`s that are never in the ACL, and a
+/// wallet negotiates the version by trying its newest and falling back only on
+/// `unsupportedType` (it sent `prove/0.2` before this service served it, and
+/// got `permissionDenied` from the pre-filter, which ended the sign-in). So it
+/// is `Optional`, and reaches the framework's `unsupportedType`. That says
+/// only which versions of an already-public family are served.
 pub(crate) fn proof_rule(type_uri: &str) -> ProofRule {
     use trust_tasks_rs::Payload;
     if let Some(rule) = crate::control_tasks::proof_rule(type_uri) {
@@ -1559,11 +1567,15 @@ pub(crate) fn proof_rule(type_uri: &str) -> ProofRule {
     }
     if type_uri == trust_tasks_rs::specs::trust_task_discovery::v0_1::Payload::TYPE_URI
         || crate::trust_tasks_auth::owns(type_uri)
+        || type_uri.starts_with(OOB_FAMILY_PREFIX)
     {
         return ProofRule::Optional;
     }
     ProofRule::Authentication
 }
+
+/// The `auth/oob/*` family's Type URIs (see [`proof_rule`]).
+const OOB_FAMILY_PREFIX: &str = "https://trusttasks.org/spec/auth/oob/";
 
 /// Whether a session key bound at login (`auth/authenticate/0.2`, or a passkey
 /// login's browser key) may sign `type_uri` for its session's subject.
