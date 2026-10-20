@@ -28,30 +28,36 @@ import {
   matchesSearch,
   nextSort,
   sortDids,
-  truncateDid,
+  compactDid,
   type DidSort,
   type DidSortKey,
 } from "../../lib/did-table";
 
+/** Wide enough for a compact `did:webvh` (see `compactDid`) and its Copy and
+ *  QR buttons, which sit at the column's right edge so they line up. */
+const DID_COLUMN_WIDTH = 440;
+
 /** The table's columns: header, sort key, and fixed width (`flex` for the
- *  two that take the remaining space). */
+ *  name, which takes the remaining space). */
 const COLUMNS: {
   key: DidSortKey;
   label: string;
   width?: number;
   flex?: number;
   align?: "right";
+  /** Extra room after a right-aligned number, before the dates. */
+  gapAfter?: boolean;
 }[] = [
-  { key: "mnemonic", label: "Name", flex: 2 },
-  { key: "didId", label: "DID", flex: 3 },
-  { key: "versions", label: "Versions", width: 84, align: "right" },
+  { key: "mnemonic", label: "Name", flex: 1 },
+  { key: "didId", label: "DID", width: DID_COLUMN_WIDTH },
+  { key: "versions", label: "Versions", width: 100, align: "right", gapAfter: true },
   { key: "created", label: "Created", width: 150 },
   { key: "updated", label: "Updated", width: 150 },
   { key: "resolves", label: "Resolves", width: 100, align: "right" },
 ];
 
 /** Below this the table scrolls sideways rather than squeezing the DID. */
-const TABLE_MIN_WIDTH = 980;
+const TABLE_MIN_WIDTH = 1180;
 
 type PathStatus = null | "checking" | "available" | "taken" | "error";
 
@@ -229,6 +235,13 @@ export default function DidList() {
     sort,
   );
   const showOwnerInfo = role === "admin" && !owner;
+  // A badge on every row says nothing. Show the method only when the list
+  // mixes methods (otherwise the DID's own prefix says it), and mark owners
+  // only when the list mixes them.
+  const showMethod =
+    new Set(visibleDids.map((d) => d.method ?? "")).size > 1;
+  const markOwners =
+    showOwnerInfo && visibleDids.some((d) => d.owner !== myDid);
 
   return (
     <View style={styles.container}>
@@ -423,6 +436,7 @@ export default function DidList() {
                         styles.cell,
                         c.flex ? { flex: c.flex } : { width: c.width },
                         c.align === "right" && styles.cellRight,
+                        c.gapAfter && styles.cellGapAfter,
                       ]}
                     >
                       <Text
@@ -454,23 +468,23 @@ export default function DidList() {
                           style={StyleSheet.flatten([
                             styles.row,
                             index % 2 === 1 && styles.rowAlt,
-                            showOwnerInfo &&
+                            markOwners &&
                               (isOwn ? styles.rowOwn : styles.rowOther),
                           ])}
                         >
-                          <View style={[styles.cell, { flex: 2 }]}>
+                          <View style={[styles.cell, { flex: 1 }]}>
                             <View style={styles.nameRow}>
                               <Text style={styles.mnemonic} numberOfLines={1}>
                                 {item.mnemonic}
                               </Text>
-                              {item.method && (
+                              {showMethod && item.method && (
                                 <View style={styles.methodBadge}>
                                   <Text style={styles.methodBadgeText}>
                                     did:{item.method}
                                   </Text>
                                 </View>
                               )}
-                              {showOwnerInfo && isOwn && (
+                              {markOwners && isOwn && (
                                 <View style={styles.youBadge}>
                                   <Text style={styles.youBadgeText}>You</Text>
                                 </View>
@@ -495,16 +509,17 @@ export default function DidList() {
                                   domain={item.domain}
                                   didId={item.didId}
                                   size="sm"
+                                  showHost={false}
                                 />
                               </View>
                             )}
-                            {showOwnerInfo && !isOwn && (
+                            {markOwners && !isOwn && (
                               <Text style={styles.subText} numberOfLines={1}>
                                 Owner: {item.owner}
                               </Text>
                             )}
                           </View>
-                          <View style={[styles.cell, { flex: 3 }]}>
+                          <View style={[styles.cell, { width: DID_COLUMN_WIDTH }]}>
                             {item.versionCount === 0 ? (
                               <Text style={styles.statusPending}>Pending upload</Text>
                             ) : item.didId ? (
@@ -516,7 +531,7 @@ export default function DidList() {
                                   // Full DID on hover (web).
                                   {...({ title: item.didId } as any)}
                                 >
-                                  {truncateDid(item.didId)}
+                                  {compactDid(item.didId)}
                                 </Text>
                                 <Pressable
                                   accessibilityRole="button"
@@ -538,7 +553,14 @@ export default function DidList() {
                               <Text style={styles.subText}>Uploaded</Text>
                             )}
                           </View>
-                          <View style={[styles.cell, styles.cellRight, { width: 84 }]}>
+                          <View
+                            style={[
+                              styles.cell,
+                              styles.cellRight,
+                              styles.cellGapAfter,
+                              { width: 100 },
+                            ]}
+                          >
                             <Text style={styles.numText}>
                               {item.versionCount.toLocaleString()}
                             </Text>
@@ -547,7 +569,13 @@ export default function DidList() {
                             <Text style={styles.dateText}>{formatDate(item.createdAt)}</Text>
                           </View>
                           <View style={[styles.cell, { width: 150 }]}>
-                            <Text style={styles.dateText}>{formatDate(item.updatedAt)}</Text>
+                            {/* One version has never been updated: a dash
+                                lets the DIDs that have changed stand out. */}
+                            {item.versionCount <= 1 ? (
+                              <Text style={styles.dateTextMuted}>—</Text>
+                            ) : (
+                              <Text style={styles.dateText}>{formatDate(item.updatedAt)}</Text>
+                            )}
                           </View>
                           <View style={[styles.cell, styles.cellRight, { width: 100 }]}>
                             <Text style={styles.numText}>
@@ -728,6 +756,9 @@ const styles = StyleSheet.create({
   cellRight: {
     alignItems: "flex-end",
   },
+  cellGapAfter: {
+    paddingRight: spacing.xl,
+  },
   nameRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -741,10 +772,10 @@ const styles = StyleSheet.create({
     color: colors.textTertiary,
   },
   didText: {
+    flex: 1,
     fontSize: 12,
     fontFamily: fonts.mono,
     color: colors.success,
-    flexShrink: 1,
   },
   numText: {
     fontSize: 13,
@@ -756,6 +787,11 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontFamily: fonts.regular,
     color: colors.textSecondary,
+  },
+  dateTextMuted: {
+    fontSize: 12,
+    fontFamily: fonts.regular,
+    color: colors.textTertiary,
   },
   disabledBadge: {
     backgroundColor: colors.errorBg,

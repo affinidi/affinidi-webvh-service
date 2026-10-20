@@ -25,7 +25,9 @@
   count (one decimal below 10/s, `<0.1/s` for a trickle).
 - **All DIDs** is a compact table: search by name, DID, method, domain or
   agent name, and sort by any column (name, DID, versions, created, updated,
-  resolves). Each DID has a QR code.
+  resolves). Each DID has a QR code. The DID is shown compactly (method, SCID
+  head, slot; full on hover), the method and "You" badges appear only when
+  the list mixes them, and Updated reads "—" for a DID never updated.
 - The "Self-contained daemon" note shows an em dash instead of `—`.
 
 ### Fixed — multi-row writes are atomic, and the witness's memory is durable
