@@ -20,7 +20,8 @@
 - **The landing page goes straight to Login** when signed out, and Login shows
   the sign-in code at once: no "Login" or "Show sign-in code" click. An
   unclaimed code is renewed when its claim window closes; a hidden tab opens
-  no request until it is visible again.
+  no request until it is visible again, and a code hidden with its tab shows
+  again when the tab does.
 - **The number is handed to a wallet on this device (contract C11):** while a
   request is claimed, the element showing the number carries
   `data-oob-request-id` and `data-oob-match-number`. The browser plugin reads

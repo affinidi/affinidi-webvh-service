@@ -155,7 +155,8 @@ export function WalletSignIn({
           {state.codeVisible ? (
             <TriggerLinkCode link={state.link} />
           ) : (
-            // C9: hidden, not cancelled; the request is still being polled.
+            // C9: hidden, not cancelled; the request is still being polled,
+            // and the code shows again when the tab does.
             <Text style={styles.hint}>The code is hidden while this tab is in the background.</Text>
           )}
           <Text style={styles.hint}>

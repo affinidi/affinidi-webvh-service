@@ -249,6 +249,22 @@ describe("sign-in controller", () => {
     s.destroy();
   });
 
+  it("shows a still-unclaimed code again when the tab is visible again", async () => {
+    const doc = new FakeDocument();
+    const svc = service([]);
+    const s = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: svc.f, keys: keys(), document: doc as unknown as Document, pageHost: "dids.example.org" });
+    await s.start();
+    const first = await until(() => s.state, "waiting");
+    doc.hide();
+    expect(s.state).toMatchObject({ status: "waiting", codeVisible: false });
+    doc.show();
+    // The same request, shown again: no new request, nothing cancelled.
+    expect(s.state).toMatchObject({ status: "waiting", codeVisible: true, requestId: (first as { requestId: string }).requestId });
+    expect(svc.sent.filter((d) => String(d.type).endsWith("/request/0.1"))).toHaveLength(1);
+    expect(svc.sent.some((d) => String(d.type).endsWith("/cancel/0.1"))).toBe(false);
+    s.destroy();
+  });
+
   it("maps a cancelled request to cancelled and drops the key", async () => {
     const k = keys();
     const svc = service([err(409, "auth/oob/redeem:declined", { state: "cancelled" })]);

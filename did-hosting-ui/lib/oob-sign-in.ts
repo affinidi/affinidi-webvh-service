@@ -565,17 +565,19 @@ export class SignInController {
   /**
    * C9: on `visibilitychange` to hidden, hide the code but keep the request
    * and keep polling. On a phone, tapping the code opens the wallet and hides
-   * this tab, and that sign-in must still complete. On visible, open the
-   * request {@link startWhenVisible} put off.
+   * this tab, and that sign-in must still complete. On visible, show the
+   * still-unclaimed code again, or open the request {@link startWhenVisible}
+   * put off (a renewal of a code that expired while hidden).
    */
   private visibilityChanged(): void {
-    if (this.startOnVisible && this.doc?.visibilityState !== "hidden") {
+    const visible = this.doc?.visibilityState !== "hidden";
+    if (this.startOnVisible && visible) {
       void this.start();
       return;
     }
     if (this.current.status !== "waiting") return;
-    if (this.doc?.visibilityState === "hidden" && this.current.codeVisible) {
-      this.set({ ...this.current, codeVisible: false });
+    if (this.current.codeVisible !== visible) {
+      this.set({ ...this.current, codeVisible: visible });
     }
   }
 
