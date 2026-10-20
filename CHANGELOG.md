@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.10.0 (release/0.10)
+
 ### Fixed — wallet sign-in works with the current browser wallet
 
 - **`auth/oob/prove` and `respond` are served at 0.2** beside 0.1. The wallet

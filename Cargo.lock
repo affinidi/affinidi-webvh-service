@@ -3061,7 +3061,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-common"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
@@ -3128,7 +3128,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-control"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
@@ -3205,7 +3205,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-daemon"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
@@ -3245,7 +3245,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-server"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
@@ -9762,7 +9762,7 @@ dependencies = [
 
 [[package]]
 name = "webvh-watcher"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
@@ -9799,7 +9799,7 @@ dependencies = [
 
 [[package]]
 name = "webvh-witness"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
