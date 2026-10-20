@@ -449,12 +449,14 @@ export default function DidList() {
                       <Link href={`/dids/${item.mnemonic}`} asChild>
                         <TableRow
                           hoverStyle={styles.rowHover}
-                          style={[
+                          // Flattened: Link's Slot merges a child's style by
+                          // object spread, which breaks an array (see TableRow).
+                          style={StyleSheet.flatten([
                             styles.row,
                             index % 2 === 1 && styles.rowAlt,
                             showOwnerInfo &&
                               (isOwn ? styles.rowOwn : styles.rowOther),
-                          ]}
+                          ])}
                         >
                           <View style={[styles.cell, { flex: 2 }]}>
                             <View style={styles.nameRow}>
