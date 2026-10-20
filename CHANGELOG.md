@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 (2026-10-20)
 
 ### Fixed — wallet sign-in works with the current browser wallet
 
