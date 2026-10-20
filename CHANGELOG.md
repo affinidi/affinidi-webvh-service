@@ -27,7 +27,8 @@
   agent name, and sort by any column (name, DID, versions, created, updated,
   resolves). Each DID has a QR code. The DID is shown compactly (method, SCID
   head, slot; full on hover), the method and "You" badges appear only when
-  the list mixes them, and Updated reads "—" for a DID never updated.
+  the list mixes them, and Updated reads "—" for a DID never updated. The
+  name and DID columns size to the longest entry; the others share the rest.
 - The "Self-contained daemon" note shows an em dash instead of `—`.
 
 ### Fixed — multi-row writes are atomic, and the witness's memory is durable

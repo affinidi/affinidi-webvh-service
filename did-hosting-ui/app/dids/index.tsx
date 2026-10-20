@@ -29,35 +29,35 @@ import {
   nextSort,
   sortDids,
   compactDid,
+  didTextWidth,
+  nameColumnWidth,
   type DidSort,
   type DidSortKey,
 } from "../../lib/did-table";
 
-/** Wide enough for a compact `did:webvh` (see `compactDid`) and its Copy and
- *  QR buttons, which sit at the column's right edge so they line up. */
-const DID_COLUMN_WIDTH = 440;
+/** Copy and QR, with the gaps around them. */
+const DID_ACTIONS_WIDTH = 104;
 
-/** The table's columns: header, sort key, and fixed width (`flex` for the
- *  name, which takes the remaining space). */
+/** The table's columns: header, sort key, and width. The name and DID
+ *  widths come from the listed DIDs (`nameColumnWidth`, `didTextWidth`);
+ *  the rest are fixed. The name column is exactly its width; the others
+ *  share any spare width equally, so a wide window doesn't strand it in
+ *  one column. */
 const COLUMNS: {
   key: DidSortKey;
   label: string;
   width?: number;
-  flex?: number;
   align?: "right";
   /** Extra room after a right-aligned number, before the dates. */
   gapAfter?: boolean;
 }[] = [
-  { key: "mnemonic", label: "Name", flex: 1 },
-  { key: "didId", label: "DID", width: DID_COLUMN_WIDTH },
+  { key: "mnemonic", label: "Name" },
+  { key: "didId", label: "DID" },
   { key: "versions", label: "Versions", width: 100, align: "right", gapAfter: true },
   { key: "created", label: "Created", width: 150 },
   { key: "updated", label: "Updated", width: 150 },
   { key: "resolves", label: "Resolves", width: 100, align: "right" },
 ];
-
-/** Below this the table scrolls sideways rather than squeezing the DID. */
-const TABLE_MIN_WIDTH = 1180;
 
 type PathStatus = null | "checking" | "available" | "taken" | "error";
 
@@ -242,6 +242,38 @@ export default function DidList() {
     new Set(visibleDids.map((d) => d.method ?? "")).size > 1;
   const markOwners =
     showOwnerInfo && visibleDids.some((d) => d.owner !== myDid);
+  // Sized from the domain's DIDs, not the search results, so the columns
+  // hold still while typing.
+  const nameWidth = nameColumnWidth(
+    visibleDids.map((d) => ({
+      name: d.mnemonic,
+      badges: [
+        ...(showMethod && d.method ? [`did:${d.method}`] : []),
+        ...(markOwners && d.owner === myDid ? ["You"] : []),
+        ...(d.disabled ? ["Suspended"] : []),
+      ],
+      chips: servedNames(d.agentNames).map((n) => `@${n}`),
+    })),
+  );
+  const didWidth = didTextWidth(visibleDids.map((d) => d.didId));
+  const columnWidth = (key: DidSortKey, fixed?: number) =>
+    key === "mnemonic"
+      ? nameWidth
+      : key === "didId"
+        ? didWidth + DID_ACTIONS_WIDTH
+        : fixed!;
+  /** A column's width. The name fits its longest name; the others are
+   *  minimums that share any spare width equally. */
+  const columnStyle = (key: DidSortKey, fixed?: number) => ({
+    flexGrow: key === "mnemonic" ? 0 : 1,
+    flexShrink: 0,
+    flexBasis: columnWidth(key, fixed),
+  });
+  // Below the columns' sum the table scrolls sideways instead of squeezing.
+  const tableMinWidth =
+    COLUMNS.reduce((w, c) => w + columnWidth(c.key, c.width), 0) +
+    2 * spacing.sm +
+    3;
 
   return (
     <View style={styles.container}>
@@ -422,7 +454,7 @@ export default function DidList() {
             </Text>
           </View>
           <ScrollView horizontal contentContainerStyle={styles.tableScroll}>
-            <View style={styles.table}>
+            <View style={[styles.table, { minWidth: tableMinWidth }]}>
               <View style={styles.headRow} accessibilityRole="header">
                 {COLUMNS.map((c) => {
                   const active = sort.key === c.key;
@@ -434,7 +466,7 @@ export default function DidList() {
                       onPress={() => setSort(nextSort(sort, c.key))}
                       style={[
                         styles.cell,
-                        c.flex ? { flex: c.flex } : { width: c.width },
+                        columnStyle(c.key, c.width),
                         c.align === "right" && styles.cellRight,
                         c.gapAfter && styles.cellGapAfter,
                       ]}
@@ -472,7 +504,7 @@ export default function DidList() {
                               (isOwn ? styles.rowOwn : styles.rowOther),
                           ])}
                         >
-                          <View style={[styles.cell, { flex: 1 }]}>
+                          <View style={[styles.cell, columnStyle("mnemonic")]}>
                             <View style={styles.nameRow}>
                               <Text style={styles.mnemonic} numberOfLines={1}>
                                 {item.mnemonic}
@@ -519,13 +551,13 @@ export default function DidList() {
                               </Text>
                             )}
                           </View>
-                          <View style={[styles.cell, { width: DID_COLUMN_WIDTH }]}>
+                          <View style={[styles.cell, columnStyle("didId")]}>
                             {item.versionCount === 0 ? (
                               <Text style={styles.statusPending}>Pending upload</Text>
                             ) : item.didId ? (
                               <View style={styles.didIdRow}>
                                 <Text
-                                  style={styles.didText}
+                                  style={[styles.didText, { width: didWidth }]}
                                   numberOfLines={1}
                                   accessibilityLabel={item.didId}
                                   // Full DID on hover (web).
@@ -558,17 +590,17 @@ export default function DidList() {
                               styles.cell,
                               styles.cellRight,
                               styles.cellGapAfter,
-                              { width: 100 },
+                              columnStyle("versions", 100),
                             ]}
                           >
                             <Text style={styles.numText}>
                               {item.versionCount.toLocaleString()}
                             </Text>
                           </View>
-                          <View style={[styles.cell, { width: 150 }]}>
+                          <View style={[styles.cell, columnStyle("created", 150)]}>
                             <Text style={styles.dateText}>{formatDate(item.createdAt)}</Text>
                           </View>
-                          <View style={[styles.cell, { width: 150 }]}>
+                          <View style={[styles.cell, columnStyle("updated", 150)]}>
                             {/* One version has never been updated: a dash
                                 lets the DIDs that have changed stand out. */}
                             {item.versionCount <= 1 ? (
@@ -577,7 +609,7 @@ export default function DidList() {
                               <Text style={styles.dateText}>{formatDate(item.updatedAt)}</Text>
                             )}
                           </View>
-                          <View style={[styles.cell, styles.cellRight, { width: 100 }]}>
+                          <View style={[styles.cell, styles.cellRight, columnStyle("resolves", 100)]}>
                             <Text style={styles.numText}>
                               {item.totalResolves.toLocaleString()}
                             </Text>
@@ -701,7 +733,6 @@ const styles = StyleSheet.create({
   },
   table: {
     flex: 1,
-    minWidth: TABLE_MIN_WIDTH,
     backgroundColor: colors.bgSecondary,
     borderRadius: radii.lg,
     borderWidth: 1,
@@ -772,7 +803,6 @@ const styles = StyleSheet.create({
     color: colors.textTertiary,
   },
   didText: {
-    flex: 1,
     fontSize: 12,
     fontFamily: fonts.mono,
     color: colors.success,
