@@ -103,3 +103,54 @@ export function truncateDid(did: string, max = 48): string {
   const head = Math.ceil(keep * 0.45);
   return `${did.slice(0, head)}…${did.slice(did.length - (keep - head))}`;
 }
+
+/** Monospace advance per em, a little generous: most faces are 0.6. */
+const MONO_EM = 0.62;
+/** Proportional text (badges), per character at its font size. */
+const SANS_EM = 0.6;
+
+/** What a name cell shows on one line each, so its width can be sized. */
+export interface NameCellContent {
+  /** The slot name, in the 14px monospace of the table. */
+  name: string;
+  /** Badges beside the name (`did:webvh`, `You`, `Suspended`). */
+  badges?: string[];
+  /** Agent names under it, each a `@name` chip with a Copy button. */
+  chips?: string[];
+}
+
+/** The name column's width: wide enough for the longest name with its
+ *  badges, or its widest agent-name chip, and no wider. Estimated from
+ *  character counts (the name and chips are monospace), so it doesn't
+ *  depend on rendered rows — the list is virtualised. Clamped so a short
+ *  list keeps its header readable and one long name can't take the table. */
+export function nameColumnWidth(
+  cells: NameCellContent[],
+  { min = 140, max = 360 }: { min?: number; max?: number } = {},
+): number {
+  const CELL_PADDING = 16;
+  const BADGE_CHROME = 16 + 4; // padding + gap
+  const CHIP_CHROME = 16 + 8 + 44; // padding + gap + Copy button
+  let widest = 0;
+  for (const c of cells) {
+    const line =
+      c.name.length * 14 * MONO_EM +
+      (c.badges ?? []).reduce((w, b) => w + b.length * 11 * SANS_EM + BADGE_CHROME, 0);
+    const chip = Math.max(
+      0,
+      ...(c.chips ?? []).map((n) => (n.length + 1) * 12 * MONO_EM + CHIP_CHROME),
+    );
+    widest = Math.max(widest, line, chip);
+  }
+  return Math.round(Math.min(max, Math.max(min, widest + CELL_PADDING)));
+}
+
+/** The width of the longest compact DID (see [`compactDid`]) in the table's
+ *  12px monospace, so Copy and QR sit just after it on every row. */
+export function didTextWidth(
+  dids: (string | null)[],
+  { min = 160, max = 400 }: { min?: number; max?: number } = {},
+): number {
+  const longest = Math.max(0, ...dids.map((d) => (d ? compactDid(d).length : 0)));
+  return Math.round(Math.min(max, Math.max(min, longest * 12 * MONO_EM)));
+}

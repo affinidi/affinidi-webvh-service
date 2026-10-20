@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { DidRecord } from "../api";
-import { compactDid, matchesSearch, nextSort, sortDids, truncateDid } from "../did-table";
+import {
+  compactDid,
+  didTextWidth,
+  matchesSearch,
+  nameColumnWidth,
+  nextSort,
+  sortDids,
+  truncateDid,
+} from "../did-table";
 
 function rec(over: Partial<DidRecord>): DidRecord {
   return {
@@ -88,5 +96,32 @@ describe("truncateDid", () => {
     expect(t.length).toBe(40);
     expect(t.startsWith("did:webvh:Qm")).toBe(true);
     expect(t.endsWith("angry-derive")).toBe(true);
+  });
+});
+
+describe("nameColumnWidth", () => {
+  it("grows with the longest name and stays within its bounds", () => {
+    const short = nameColumnWidth([{ name: "glenn" }]);
+    const long = nameColumnWidth([{ name: "glenn" }, { name: "arrange-possible" }]);
+    expect(short).toBe(140);
+    expect(long).toBeGreaterThan(short);
+    expect(nameColumnWidth([{ name: "x".repeat(200) }])).toBe(360);
+  });
+
+  it("counts badges and agent-name chips", () => {
+    const bare = nameColumnWidth([{ name: "arrange-possible" }]);
+    expect(nameColumnWidth([{ name: "arrange-possible", badges: ["did:webvh", "You"] }])).toBeGreaterThan(bare);
+    expect(nameColumnWidth([{ name: "a", chips: ["a-much-longer-agent-name"] }])).toBeGreaterThan(
+      nameColumnWidth([{ name: "a" }]),
+    );
+  });
+});
+
+describe("didTextWidth", () => {
+  it("fits the longest compact DID", () => {
+    const a = "did:webvh:QmYaiNjfYLYDabcdefghijklmnop:webvh.storm.ws:glenn";
+    const b = "did:webvh:QmYaiNjfYLYDabcdefghijklmnop:webvh.storm.ws:arrange-possible";
+    expect(didTextWidth([a, b, null])).toBeGreaterThan(didTextWidth([a]));
+    expect(didTextWidth([])).toBe(160);
   });
 });
