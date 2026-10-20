@@ -268,6 +268,14 @@ export interface SignInOptions {
    */
   onRedeemed?: (payload: Record<string, unknown>) => void;
   /**
+   * Renew an unclaimed code when its claim window closes, instead of ending
+   * on `expired`: a fresh `K_b` and request while the page is visible, or as
+   * soon as it is visible again — never from a hidden tab, which nobody is
+   * looking at. A claimed request that expires still ends on `expired`.
+   * Default: off. Addition to the reference API.
+   */
+  renew?: boolean;
+  /**
    * Skip "Continue as …?" for the identity this browser last confirmed: a
    * redeem for that subject goes straight to `signedIn`, and `confirm()`
    * remembers the subject it confirms. Any other subject is still asked, so
@@ -346,6 +354,8 @@ export class SignInController {
   private readonly keys: StarterKeys;
   private readonly doc: Document | undefined;
   private readonly onVisibility = () => this.visibilityChanged();
+  /** A start put off until the page is visible ({@link startWhenVisible}). */
+  private startOnVisible = false;
 
   constructor(private readonly opts: SignInOptions) {
     this.keys = opts.keys ?? sessionKeys;
@@ -363,8 +373,22 @@ export class SignInController {
     return () => this.listeners.delete(listener);
   }
 
-  /** "Show sign-in code": a fresh `K_b`, `auth/oob/request`, then the code. */
+  /**
+   * {@link start} now if the page is visible, else as soon as it becomes
+   * visible: the page shows its code without a click, and a hidden tab opens
+   * no request. Addition to the reference API.
+   */
+  startWhenVisible(): void {
+    if (this.doc?.visibilityState === "hidden") {
+      this.startOnVisible = true;
+      return;
+    }
+    void this.start();
+  }
+
+  /** A fresh `K_b`, `auth/oob/request`, then the code. */
   async start(): Promise<void> {
+    this.startOnVisible = false;
     await this.abandon();
     const run = ++this.run;
     this.set({ status: "starting" });
@@ -396,7 +420,9 @@ export class SignInController {
       });
       this.expiryTimer = setTimeout(
         () => {
-          if (run === this.run && this.current.status === "waiting") void this.finish("expired");
+          if (run !== this.run || this.current.status !== "waiting") return;
+          if (this.opts.renew) void this.renew();
+          else void this.finish("expired");
         },
         Math.max(0, claimDeadline * 1000 - Date.now()),
       );
@@ -431,6 +457,7 @@ export class SignInController {
   /** Forget `K_b` and return to idle. The page ends its own session. */
   async signOut(): Promise<void> {
     this.run++;
+    this.startOnVisible = false;
     this.stopPolling();
     this.dropKey();
     this.requestId = null;
@@ -439,6 +466,7 @@ export class SignInController {
 
   destroy(): void {
     this.run++;
+    this.startOnVisible = false;
     this.stopPolling();
     this.doc?.removeEventListener("visibilitychange", this.onVisibility);
     this.listeners.clear();
@@ -500,6 +528,17 @@ export class SignInController {
     }
   }
 
+  /** The unclaimed code's claim window closed: drop it and show a new one
+   *  (see {@link SignInOptions.renew}). Nothing to cancel: it has expired. */
+  private renew(): void {
+    this.run++;
+    this.stopPolling();
+    this.requestId = null;
+    this.dropKey();
+    this.set({ status: "idle" });
+    this.startWhenVisible();
+  }
+
   private async finish(status: "declined" | "cancelled" | "expired"): Promise<void> {
     this.run++;
     this.stopPolling();
@@ -526,9 +565,14 @@ export class SignInController {
   /**
    * C9: on `visibilitychange` to hidden, hide the code but keep the request
    * and keep polling. On a phone, tapping the code opens the wallet and hides
-   * this tab, and that sign-in must still complete.
+   * this tab, and that sign-in must still complete. On visible, open the
+   * request {@link startWhenVisible} put off.
    */
   private visibilityChanged(): void {
+    if (this.startOnVisible && this.doc?.visibilityState !== "hidden") {
+      void this.start();
+      return;
+    }
     if (this.current.status !== "waiting") return;
     if (this.doc?.visibilityState === "hidden" && this.current.codeVisible) {
       this.set({ ...this.current, codeVisible: false });
@@ -613,6 +657,23 @@ export class SignInController {
       signal?.removeEventListener("abort", onAbort);
     }
   }
+}
+
+// ---- the number, for a wallet on this device (contract C11) ----------------------
+
+/**
+ * The attributes the element showing the match number carries while the
+ * request is claimed (contract C11), and only then: `data-oob-request-id` and
+ * `data-oob-match-number`. The browser plugin reads them — only on the page
+ * where the person clicked that request's code — and types the number for
+ * them. The page posts nothing and reads nothing back; a phone wallet reads
+ * the number off the screen as before. `undefined` in every other state.
+ */
+export function matchNumberHandOff(
+  state: SignInState,
+): { "data-oob-request-id": string; "data-oob-match-number": string } | undefined {
+  if (state.status !== "claimed") return undefined;
+  return { "data-oob-request-id": state.requestId, "data-oob-match-number": state.matchNumber };
 }
 
 function sleep(ms: number): Promise<void> {

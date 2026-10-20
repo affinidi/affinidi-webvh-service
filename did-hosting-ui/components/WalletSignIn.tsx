@@ -8,6 +8,15 @@
  * person approves in the wallet; this page then asks "Continue as …?" —
  * unless this browser last continued as that same identity.
  *
+ * The code is shown without a click, once the page is visible, and an
+ * unclaimed code is renewed when its claim window closes — never from a
+ * hidden tab. Whoever scans first holds it, and still needs to be a member
+ * and to know the number, so a code on screen is cheap to show.
+ *
+ * Once claimed, the element showing the number carries it as
+ * `data-oob-match-number` beside `data-oob-request-id` (contract C11), for
+ * the browser plugin to type it in for the person who clicked the code here.
+ *
  * Web only: the starter key is a WebCrypto key and the code is a DOM link.
  * The QR encoder (`qrcode-generator`) sits behind `lib/qr-encoder.ts`.
  */
@@ -23,6 +32,7 @@ import {
   isUnavailable,
   layoutQr,
   localStorageKnownSubject,
+  matchNumberHandOff,
   QR_DARK,
   QR_LIGHT,
   type SignInController,
@@ -62,7 +72,7 @@ export function WalletSignIn({
 }) {
   const [state, setState] = useState<SignInState>({ status: "idle" });
   // State, not a ref: creating the controller must re-render, or the
-  // button that needs it stays disabled.
+  // buttons that need it stay disabled.
   const [c, setController] = useState<SignInController | null>(null);
   const tokens = useRef<Tokens | null>(null);
 
@@ -77,8 +87,10 @@ export function WalletSignIn({
       onRedeemed: (p) => {
         tokens.current = tokensOf(p);
       },
+      renew: true,
     });
     setController(c);
+    c.startWhenVisible();
     return () => {
       c.destroy();
       setController(null);
@@ -118,9 +130,10 @@ export function WalletSignIn({
       await api.logout();
     }
     await c?.notMe();
+    c?.startWhenVisible();
   };
 
-  const newCode = (label = "Show sign-in code") => (
+  const newCode = (label: string) => (
     <Pressable
       style={[styles.button, (!c || !serviceDid) && styles.disabled]}
       onPress={() => void c?.start()}
@@ -131,15 +144,9 @@ export function WalletSignIn({
   );
 
   switch (state.status) {
+    // Idle only until the code is asked for: on mount, or while a hidden tab
+    // waits to be visible before it opens a request.
     case "idle":
-      return (
-        <View>
-          <Text style={styles.hint}>
-            Scan a code with your wallet app, or click it if your wallet is on this device.
-          </Text>
-          {newCode()}
-        </View>
-      );
     case "starting":
       return <Text style={styles.hint}>Getting a sign-in code…</Text>;
     case "waiting":
@@ -164,9 +171,12 @@ export function WalletSignIn({
       return (
         <View style={styles.center}>
           <Text style={styles.hint}>Approve on your phone. Your number is</Text>
-          <Text style={styles.number} accessibilityLabel={`Your number is ${state.matchNumber}`}>
-            {state.matchNumber}
-          </Text>
+          {/* C11: the number for the browser plugin, on this element only. */}
+          <div {...matchNumberHandOff(state)}>
+            <Text style={styles.number} accessibilityLabel={`Your number is ${state.matchNumber}`}>
+              {state.matchNumber}
+            </Text>
+          </div>
           <Pressable style={styles.linkButton} onPress={() => void c?.cancel()}>
             <Text style={styles.linkButtonText}>Cancel</Text>
           </Pressable>
@@ -204,7 +214,7 @@ export function WalletSignIn({
       return (
         <View>
           <Text style={styles.hint}>{msg}</Text>
-          {newCode("Show a new code")}
+          {newCode("Get a new code")}
         </View>
       );
     }

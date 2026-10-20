@@ -15,6 +15,18 @@
 - `secrets.backend = "encrypted_file"` (new in vti-secrets) is refused as
   unsupported at startup rather than half-configured.
 
+### Changed — fewer clicks to sign in with a wallet
+
+- **The landing page goes straight to Login** when signed out, and Login shows
+  the sign-in code at once: no "Login" or "Show sign-in code" click. An
+  unclaimed code is renewed when its claim window closes; a hidden tab opens
+  no request until it is visible again.
+- **The number is handed to a wallet on this device (contract C11):** while a
+  request is claimed, the element showing the number carries
+  `data-oob-request-id` and `data-oob-match-number`. The browser plugin reads
+  them on the page where the code was clicked and types the number in; a
+  phone wallet reads it off the screen as before.
+
 ### Changed — dependencies and the management UI
 
 - vta-sdk 0.72 / vti-common 0.48 / vti-secrets 0.21, trust-tasks 0.32,
