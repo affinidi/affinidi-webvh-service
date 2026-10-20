@@ -11,6 +11,7 @@ import {
   encodeFromParam,
   isHostNamedServiceContact,
   isUnavailable,
+  matchNumberHandOff,
   renderQrSvg,
   shortCode,
   TRIGGER_LINK_MAX_BYTES,
@@ -102,6 +103,10 @@ class FakeDocument extends EventTarget {
     this.visibilityState = "hidden";
     this.dispatchEvent(new Event("visibilitychange"));
   }
+  show() {
+    this.visibilityState = "visible";
+    this.dispatchEvent(new Event("visibilitychange"));
+  }
 }
 
 const keys = (): StarterKeys & { cleared: number } => {
@@ -124,14 +129,14 @@ const err = (status: number, code: string, details?: unknown): Reply => ({
 });
 
 /** A service that answers `request`, then each redeem from a script. */
-function service(redeems: Reply[]) {
+function service(redeems: Reply[], claimWindowSecs = 120) {
   const sent: Array<Record<string, unknown>> = [];
   const f = (async (_url: string, init: RequestInit) => {
     const doc = JSON.parse(String(init.body)) as Record<string, unknown>;
     sent.push(doc);
     let r: Reply;
     if (String(doc.type).endsWith("/request/0.1")) {
-      r = ok({ requestId: RID, claimDeadline: Math.floor(Date.now() / 1000) + 120 });
+      r = ok({ requestId: RID, claimDeadline: Math.floor(Date.now() / 1000) + claimWindowSecs });
     } else if (String(doc.type).endsWith("/cancel/0.1")) {
       r = ok({ status: "cancelled" });
     } else {
@@ -244,6 +249,22 @@ describe("sign-in controller", () => {
     s.destroy();
   });
 
+  it("shows a still-unclaimed code again when the tab is visible again", async () => {
+    const doc = new FakeDocument();
+    const svc = service([]);
+    const s = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: svc.f, keys: keys(), document: doc as unknown as Document, pageHost: "dids.example.org" });
+    await s.start();
+    const first = await until(() => s.state, "waiting");
+    doc.hide();
+    expect(s.state).toMatchObject({ status: "waiting", codeVisible: false });
+    doc.show();
+    // The same request, shown again: no new request, nothing cancelled.
+    expect(s.state).toMatchObject({ status: "waiting", codeVisible: true, requestId: (first as { requestId: string }).requestId });
+    expect(svc.sent.filter((d) => String(d.type).endsWith("/request/0.1"))).toHaveLength(1);
+    expect(svc.sent.some((d) => String(d.type).endsWith("/cancel/0.1"))).toBe(false);
+    s.destroy();
+  });
+
   it("maps a cancelled request to cancelled and drops the key", async () => {
     const k = keys();
     const svc = service([err(409, "auth/oob/redeem:declined", { state: "cancelled" })]);
@@ -277,6 +298,87 @@ describe("sign-in controller", () => {
     await s.start();
     const st = await until(() => s.state, "error");
     expect(isUnavailable(st)).toBe(true);
+  });
+
+  it("starts at once on a visible page, and only once a hidden one is visible", async () => {
+    const svc = service([]);
+    const visible = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: svc.f, keys: keys(), document: new FakeDocument() as unknown as Document, pageHost: "dids.example.org" });
+    visible.startWhenVisible();
+    await until(() => visible.state, "waiting");
+    visible.destroy();
+
+    const doc = new FakeDocument();
+    doc.visibilityState = "hidden";
+    const hiddenSvc = service([]);
+    const hidden = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: hiddenSvc.f, keys: keys(), document: doc as unknown as Document, pageHost: "dids.example.org" });
+    hidden.startWhenVisible();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(hidden.state.status).toBe("idle");
+    expect(hiddenSvc.sent).toHaveLength(0);
+    doc.show();
+    const st = await until(() => hidden.state, "waiting");
+    expect(st).toMatchObject({ codeVisible: true });
+    hidden.destroy();
+  });
+
+  it("renews an unclaimed code when its claim window closes, on a visible page", async () => {
+    // A claim window already closed: the expiry fires at once.
+    const svc = service([], 0);
+    const s = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: svc.f, keys: keys(), document: new FakeDocument() as unknown as Document, pageHost: "dids.example.org", renew: true });
+    const seen: string[] = [];
+    s.subscribe((st) => seen.push(st.status));
+    s.startWhenVisible();
+    for (let i = 0; i < 200 && svc.sent.filter((d) => String(d.type).endsWith("/request/0.1")).length < 3; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(svc.sent.filter((d) => String(d.type).endsWith("/request/0.1")).length).toBeGreaterThanOrEqual(3);
+    expect(seen).not.toContain("expired");
+    s.destroy();
+  });
+
+  it("puts a renewal off while the tab is hidden, and renews once it is visible", async () => {
+    const doc = new FakeDocument();
+    const svc = service([], 0);
+    const requests = () => svc.sent.filter((d) => String(d.type).endsWith("/request/0.1")).length;
+    const s = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: svc.f, keys: keys(), document: doc as unknown as Document, pageHost: "dids.example.org", renew: true });
+    doc.hide();
+    // Opened by hand while hidden: its window closes, and nothing is renewed.
+    await s.start();
+    await until(() => s.state, "idle");
+    await new Promise((r) => setTimeout(r, 30));
+    expect(requests()).toBe(1);
+    doc.show();
+    for (let i = 0; i < 200 && requests() < 2; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(requests()).toBeGreaterThanOrEqual(2);
+    s.destroy();
+  });
+
+  it("still ends a claimed request that expires on expired, with renew on", async () => {
+    const svc = service([
+      err(409, "auth/oob/redeem:pending", { state: "claimed", matchNumber: "47" }),
+      err(409, "auth/oob:requestExpired", { state: "expired" }),
+    ]);
+    const s = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: svc.f, keys: keys(), document: new FakeDocument() as unknown as Document, pageHost: "dids.example.org", renew: true });
+    s.startWhenVisible();
+    await until(() => s.state, "expired");
+    expect(svc.sent.filter((d) => String(d.type).endsWith("/request/0.1"))).toHaveLength(1);
+    s.destroy();
+  });
+
+  it("hands the number to a wallet on this device only while claimed (C11)", () => {
+    expect(matchNumberHandOff({ status: "claimed", requestId: RID, matchNumber: "07" })).toEqual({
+      "data-oob-request-id": RID,
+      "data-oob-match-number": "07",
+    });
+    for (const st of [
+      { status: "idle" },
+      { status: "starting" },
+      { status: "waiting", requestId: RID, link: "https://x/t", expiresAt: new Date(), codeVisible: true },
+      { status: "confirm", subject: "did:example:alice" },
+      { status: "expired" },
+    ] as SignInState[]) {
+      expect(matchNumberHandOff(st)).toBeUndefined();
+    }
   });
 
   it("does not treat an ordinary refusal as unavailable", () => {

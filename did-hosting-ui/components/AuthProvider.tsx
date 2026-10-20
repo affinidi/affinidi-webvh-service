@@ -6,6 +6,9 @@ interface AuthState {
   role: "admin" | "owner" | null;
   did: string | null;
   isAuthenticated: boolean;
+  /** The saved session has been looked for, so `isAuthenticated: false`
+   *  means signed out rather than not known yet. */
+  restored: boolean;
   login: (token: string) => void;
   logout: () => void;
 }
@@ -29,22 +32,29 @@ const AuthContext = createContext<AuthState>({
   role: null,
   did: null,
   isAuthenticated: false,
+  restored: false,
   login: () => {},
   logout: () => {},
 });
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [token, setTokenState] = useState<string | null>(null);
+  const [restored, setRestored] = useState(false);
 
   useEffect(() => {
     // The token cache lives in memory, restored from IndexedDB — on a fresh
     // page load nothing has populated it yet.
     let cancelled = false;
     void (async () => {
-      await restoreSession();
-      if (cancelled) return;
-      const saved = getToken();
-      if (saved) setTokenState(saved);
+      try {
+        await restoreSession();
+      } finally {
+        if (!cancelled) {
+          const saved = getToken();
+          if (saved) setTokenState(saved);
+          setRestored(true);
+        }
+      }
     })();
 
     // Clear React state when the API client detects an expired/invalid token
@@ -74,6 +84,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         token,
         ...( token ? decodeJwtClaims(token) : { role: null, did: null }),
         isAuthenticated: !!token,
+        restored,
         login,
         logout,
       }}
