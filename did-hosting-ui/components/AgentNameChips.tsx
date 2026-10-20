@@ -82,6 +82,7 @@ export function AgentNameChips({
   domain,
   didId,
   size = "md",
+  showHost = true,
 }: {
   /** Names that resolve, local part only (`alice`). See [`servedNames`]. */
   names?: string[];
@@ -89,6 +90,9 @@ export function AgentNameChips({
   didId?: string | null;
   /** `sm` for list rows, `md` for the detail header. */
   size?: "sm" | "md";
+  /** `false` shows just `@name` (a table whose rows share the domain). The
+   *  copied value is always the full `host/@name`. */
+  showHost?: boolean;
 }) {
   const [copied, setCopied] = useState<string | null>(null);
 
@@ -121,7 +125,7 @@ export function AgentNameChips({
             >
               {/* The `@` carries the meaning; give it the accent so the eye
                   finds the handle without reading the domain first. */}
-              <Text style={styles.chipHost}>{host}/</Text>
+              {showHost && <Text style={styles.chipHost}>{host}/</Text>}
               <Text style={styles.chipAt}>@</Text>
               {name}
             </Text>

@@ -80,6 +80,21 @@ export function sortDids(dids: DidRecord[], sort: DidSort): DidRecord[] {
   });
 }
 
+/** A `did:webvh` for a table cell: the method, the SCID's first 12
+ *  characters, and the last segment (the slot's name, or the host for a
+ *  root DID). The domain between them is the same on every row of a
+ *  filtered list, so it is dropped; the full DID is on hover, Copy and QR.
+ *  Other methods fall back to [`truncateDid`]. */
+export function compactDid(did: string): string {
+  const parts = did.split(":");
+  if (parts[0] !== "did" || parts[1] !== "webvh" || parts.length < 4) {
+    return truncateDid(did);
+  }
+  const scid = parts[2];
+  const head = scid.length > 12 ? `${scid.slice(0, 12)}…` : scid;
+  return `did:webvh:${head}:${parts[parts.length - 1]}`;
+}
+
 /** Shorten a long DID for a table cell, keeping both ends: the method and
  *  SCID prefix, and the host/path that tell slots apart. */
 export function truncateDid(did: string, max = 48): string {

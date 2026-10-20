@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { DidRecord } from "../api";
-import { matchesSearch, nextSort, sortDids, truncateDid } from "../did-table";
+import { compactDid, matchesSearch, nextSort, sortDids, truncateDid } from "../did-table";
 
 function rec(over: Partial<DidRecord>): DidRecord {
   return {
@@ -59,6 +59,24 @@ describe("nextSort", () => {
     expect(nextSort({ key: "resolves", dir: "desc" }, "resolves")).toEqual({ key: "resolves", dir: "asc" });
     expect(nextSort({ key: "resolves", dir: "asc" }, "mnemonic")).toEqual({ key: "mnemonic", dir: "asc" });
     expect(nextSort({ key: "mnemonic", dir: "asc" }, "updated")).toEqual({ key: "updated", dir: "desc" });
+  });
+});
+
+describe("compactDid", () => {
+  it("keeps a webvh DID's method, SCID head and slot", () => {
+    expect(
+      compactDid("did:webvh:QmYaiNjfYLYDabcdefghijklmnop:webvh.storm.ws:bottom-clay"),
+    ).toBe("did:webvh:QmYaiNjfYLYD…:bottom-clay");
+  });
+
+  it("ends a root DID with its host", () => {
+    expect(compactDid("did:webvh:QmSNo2TJRq5xabcdef:webvh.storm.ws")).toBe(
+      "did:webvh:QmSNo2TJRq5x…:webvh.storm.ws",
+    );
+  });
+
+  it("truncates other methods from both ends", () => {
+    expect(compactDid("did:web:example.com:alice")).toBe("did:web:example.com:alice");
   });
 });
 
