@@ -11,6 +11,13 @@ ignore = [
   { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 — transitive via AWS SDK's hyper-rustls 0.24.2 only; not directly depended on or bumpable by us." },
   { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 — transitive via AWS SDK's hyper-rustls 0.24.2 only; not directly depended on or bumpable by us." },
   { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 — transitive via AWS SDK's hyper-rustls 0.24.2 only; not directly depended on or bumpable by us." },
+  # Fourth advisory on the same legacy copy: distrusted emSign intermediates.
+  # The fixed release is 0.103.16 only — no patched 0.101.x — and our own
+  # 0.103 copy is pinned at 0.103.16 in the lockfile. As with the others, the
+  # ignore is by ID and so also covers the 0.103 line; a regression there would
+  # need an explicit downgrade. Exposure on 0.101.7: the AWS SDK's legacy
+  # client talking to AWS endpoints, whose chains do not run through emSign.
+  { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.101.7 — transitive via AWS SDK's hyper-rustls 0.24.2 only; no patched 0.101.x. Our 0.103 copy is on the fixed 0.103.16." },
   # Same root cause as the three above: the AWS SDK still rides hyper 0.14,
   # which pins `h2 0.3`. The advisory's only stated fix is ">= 0.4.16" — there
   # is no patched 0.3.x — so this cannot be resolved from here.
@@ -32,8 +39,8 @@ ignore = [
   # (aws-smithy-http-client -> hyper-rustls 0.24, reached through
   # vti-secrets' aws-config). The only fixed version is 0.23.46, which the copy
   # we control is on; there is no patched 0.21.x, and aws-smithy-http-client
-  # 1.5.0 still carries 0.21 and needs aws-smithy-types >= 1.8, which this
-  # workspace holds below 1.7 (Cargo.toml). As for RUSTSEC-2026-0258, the
+  # 1.5.0 (the newest vti-secrets' `aws-smithy-types < 1.9` bound admits) still
+  # carries 0.21. As for RUSTSEC-2026-0258, the
   # ignore is by ID and so also covers the 0.23 line — it is pinned at the
   # fixed 0.23.46 in the lockfile.
   #
