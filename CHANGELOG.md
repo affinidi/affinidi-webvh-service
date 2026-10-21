@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.1 (2026-10-21)
+
+- feat: configurable Cache-Control for DID resolution (#292) (#301)
+- fix(did-hosting-server): read shared env overrides under DID_HOSTING_ (#293) (#299)
+- fix(deps): patch rustls-webpki / webpki-root-certs advisories; update dependencies (#297)
+
 ## 0.10.0 (2026-10-20)
 
 ### Fixed — wallet sign-in works with the current browser wallet
