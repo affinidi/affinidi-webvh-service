@@ -125,6 +125,86 @@ impl Default for EnableConfig {
     }
 }
 
+/// Tests that set process-wide `DAEMON_*` environment variables hold this lock,
+/// so they cannot see each other's values.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Key namespace the daemon gives its witness store when both its stores share
+/// one DynamoDB single table and neither names a namespace.
+#[cfg(feature = "store-dynamodb-single")]
+const DEFAULT_WITNESS_KEY_NAMESPACE: &str = "witness";
+
+/// Whether two store configs can resolve to the same DynamoDB table: the same
+/// table name, in regions that are not provably different. An unset region
+/// means "whatever the environment says", which may be the other store's
+/// region, so it is treated as possibly the same (fail closed).
+#[cfg(feature = "store-dynamodb-single")]
+fn same_single_table(a: &StoreConfig, b: &StoreConfig) -> bool {
+    let (Some(x), Some(y)) = (&a.dynamodb_table_name, &b.dynamodb_table_name) else {
+        return false;
+    };
+    x == y
+        && !matches!(
+            (&a.dynamodb_region, &b.dynamodb_region),
+            (Some(r1), Some(r2)) if r1 != r2
+        )
+}
+
+/// Keep the daemon's main store and witness store on separate rows of a shared
+/// DynamoDB single table.
+///
+/// Both stores open keyspaces with the same names (`acl`, `witnesses`), so on
+/// one table they would be the same rows: a revoke made through the witness
+/// would edit the control plane's ACL. When the stores share a table and
+/// neither names a key namespace, the witness store gets
+/// [`DEFAULT_WITNESS_KEY_NAMESPACE`]; the main store keeps bare keyspace names,
+/// so its existing rows stay where they are. Stores on different tables are left
+/// alone. If they still resolve to the same partitions (an explicit, equal
+/// namespace), the daemon refuses to start rather than merge them.
+#[cfg(feature = "store-dynamodb-single")]
+fn separate_witness_store(config: &mut DaemonConfig) -> Result<(), AppError> {
+    if !same_single_table(&config.store, &config.witness_store) {
+        return Ok(());
+    }
+    if config.store.dynamodb_key_namespace.is_none()
+        && config.witness_store.dynamodb_key_namespace.is_none()
+    {
+        config.witness_store.dynamodb_key_namespace =
+            Some(DEFAULT_WITNESS_KEY_NAMESPACE.to_string());
+        tracing::info!(
+            table = config
+                .store
+                .dynamodb_table_name
+                .as_deref()
+                .unwrap_or_default(),
+            namespace = DEFAULT_WITNESS_KEY_NAMESPACE,
+            "the witness store shares a DynamoDB table with the main store; \
+             giving it its own key namespace so they do not share rows"
+        );
+    }
+    if config.store.dynamodb_key_namespace == config.witness_store.dynamodb_key_namespace {
+        return Err(AppError::Config(format!(
+            "the daemon's `store` and `witness_store` resolve to the same DynamoDB table \
+             (`{}`) and key namespace ({}); they use the same keyspace names (`acl`, \
+             `witnesses`), so they would share rows. Give the witness store its own table \
+             (DAEMON_WITNESS_STORE_DYNAMODB_TABLE_NAME) or a distinct key namespace \
+             (DAEMON_WITNESS_STORE_DYNAMODB_KEY_NAMESPACE)",
+            config
+                .store
+                .dynamodb_table_name
+                .as_deref()
+                .unwrap_or_default(),
+            config
+                .store
+                .dynamodb_key_namespace
+                .as_deref()
+                .map_or("none".to_string(), |ns| format!("`{ns}`")),
+        )));
+    }
+    Ok(())
+}
+
 impl DaemonConfig {
     pub fn load(config_path: Option<PathBuf>) -> Result<Self, AppError> {
         let path = config_path
@@ -181,6 +261,17 @@ impl DaemonConfig {
         if let Ok(v) = std::env::var("DAEMON_LOG_LEVEL") {
             config.log.level = v;
         }
+
+        did_hosting_common::server::config::apply_store_env_overrides(
+            "DAEMON_STORE",
+            &mut config.store,
+        );
+        did_hosting_common::server::config::apply_store_env_overrides(
+            "DAEMON_WITNESS_STORE",
+            &mut config.witness_store,
+        );
+        #[cfg(feature = "store-dynamodb-single")]
+        separate_witness_store(&mut config)?;
 
         // Fjall memory settings (STORAGE_FJALL_BLOCK_CACHE / _WRITE_BUFFER /
         // _MAX_JOURNAL) — shared, unprefixed names; see
@@ -416,4 +507,165 @@ context_id = "webvh"
     // against parallel tests in the same process (env vars are
     // process-wide), and the daemon's override code is just a 3-arm
     // match — not worth a serialised mutex harness.
+
+    /// The two stores of one daemon, as a deployment that runs both on the
+    /// single-table backend would configure them.
+    #[cfg(feature = "store-dynamodb-single")]
+    mod single_table {
+        use super::*;
+        use did_hosting_common::server::config::StoreConfig;
+
+        fn stores(
+            main: (Option<&str>, Option<&str>, Option<&str>),
+            witness: (Option<&str>, Option<&str>, Option<&str>),
+        ) -> DaemonConfig {
+            // Each tuple is (table, region, namespace).
+            let to_store =
+                |(table, region, ns): (Option<&str>, Option<&str>, Option<&str>)| StoreConfig {
+                    dynamodb_table_name: table.map(str::to_string),
+                    dynamodb_region: region.map(str::to_string),
+                    dynamodb_key_namespace: ns.map(str::to_string),
+                    ..StoreConfig::default()
+                };
+            let mut config: DaemonConfig = toml::from_str(SELF_MANAGED_TOML).expect("parse");
+            config.store = to_store(main);
+            config.witness_store = to_store(witness);
+            config
+        }
+
+        const T: Option<&str> = Some("webvh");
+
+        #[test]
+        fn a_shared_table_gives_the_witness_store_its_own_namespace() {
+            let mut c = stores((T, None, None), (T, None, None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(
+                c.witness_store.dynamodb_key_namespace.as_deref(),
+                Some("witness")
+            );
+            assert_eq!(
+                c.store.dynamodb_key_namespace, None,
+                "the main store's rows must not move"
+            );
+        }
+
+        #[test]
+        fn separate_tables_are_left_alone() {
+            // An operator already on separate tables must not have their witness
+            // rows re-addressed.
+            let mut c = stores((T, None, None), (Some("webvh-witness"), None, None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(c.witness_store.dynamodb_key_namespace, None);
+        }
+
+        #[test]
+        fn an_explicit_witness_namespace_is_kept() {
+            let mut c = stores((T, None, None), (T, None, Some("w2")));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(
+                c.witness_store.dynamodb_key_namespace.as_deref(),
+                Some("w2")
+            );
+        }
+
+        #[test]
+        fn a_namespace_on_the_main_store_alone_already_separates_them() {
+            let mut c = stores((T, None, Some("main")), (T, None, None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(
+                c.witness_store.dynamodb_key_namespace, None,
+                "nothing to add"
+            );
+        }
+
+        #[test]
+        fn identical_explicit_namespaces_are_refused_naming_the_fix() {
+            let mut c = stores((T, None, Some("x")), (T, None, Some("x")));
+            let err = separate_witness_store(&mut c).expect_err("same table and namespace");
+            let msg = err.to_string();
+            assert!(matches!(err, AppError::Config(_)));
+            assert!(
+                msg.contains("DAEMON_WITNESS_STORE_DYNAMODB_KEY_NAMESPACE"),
+                "{msg}"
+            );
+            assert!(
+                msg.contains("DAEMON_WITNESS_STORE_DYNAMODB_TABLE_NAME"),
+                "{msg}"
+            );
+        }
+
+        #[test]
+        fn a_main_store_namespaced_witness_is_never_silently_merged_with_the_witness_store() {
+            // Main named "witness" and witness unset: distinct partitions (bare vs
+            // namespaced), nothing to add.
+            let mut c = stores((T, None, Some("witness")), (T, None, None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(c.witness_store.dynamodb_key_namespace, None);
+            // Both explicitly "witness": the same partitions, so it is refused.
+            let mut c = stores((T, None, Some("witness")), (T, None, Some("witness")));
+            assert!(separate_witness_store(&mut c).is_err());
+        }
+
+        #[test]
+        fn different_regions_are_different_tables() {
+            let mut c = stores((T, Some("us-east-1"), None), (T, Some("eu-west-1"), None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(c.witness_store.dynamodb_key_namespace, None);
+        }
+
+        #[test]
+        fn an_unknown_region_is_treated_as_possibly_the_same_table() {
+            // `None` means "whatever the environment says", which may be the other
+            // store's region: fail closed.
+            let mut c = stores((T, None, None), (T, Some("us-east-1"), None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(
+                c.witness_store.dynamodb_key_namespace.as_deref(),
+                Some("witness")
+            );
+        }
+
+        #[test]
+        fn stores_without_a_table_name_are_not_checked() {
+            let mut c = stores((None, None, None), (None, None, None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(c.witness_store.dynamodb_key_namespace, None);
+        }
+
+        #[test]
+        fn load_separates_the_stores_when_both_use_the_same_env_table() {
+            // The usual single-table deployment: both stores get
+            // the same table through the environment.
+            let _guard = crate::config::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let (_dir, path) = write_temp_config(SELF_MANAGED_TOML);
+            // SAFETY: serialised by ENV_LOCK; no other thread reads these names.
+            unsafe {
+                std::env::set_var("DAEMON_STORE_DYNAMODB_TABLE_NAME", "shared");
+                std::env::set_var("DAEMON_WITNESS_STORE_DYNAMODB_TABLE_NAME", "shared");
+            }
+            let loaded = DaemonConfig::load(Some(path));
+            unsafe {
+                std::env::remove_var("DAEMON_STORE_DYNAMODB_TABLE_NAME");
+                std::env::remove_var("DAEMON_WITNESS_STORE_DYNAMODB_TABLE_NAME");
+            }
+            let config = loaded.expect("loads");
+            assert_eq!(config.store.dynamodb_table_name.as_deref(), Some("shared"));
+            assert_eq!(config.store.dynamodb_key_namespace, None);
+            assert_eq!(
+                config.witness_store.dynamodb_key_namespace.as_deref(),
+                Some("witness")
+            );
+            // The embedded witness is built from this store config.
+            assert_eq!(
+                config
+                    .witness_config()
+                    .store
+                    .dynamodb_key_namespace
+                    .as_deref(),
+                Some("witness")
+            );
+        }
+    }
 }

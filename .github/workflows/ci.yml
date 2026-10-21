@@ -101,6 +101,7 @@ jobs:
         run: |
           for feat in keyring aws-secrets gcp-secrets azure-secrets \
                      store-fjall store-redis store-dynamodb \
+                     store-dynamodb-single \
                      store-firestore store-cosmosdb passkey \
                      setup-wizard metrics \
                      method-webvh method-web method-webs; do
@@ -135,6 +136,9 @@ jobs:
             run_tests: false
           - store: store-dynamodb
             features: "server-core,store-dynamodb,method-webvh,method-web"
+            run_tests: false
+          - store: store-dynamodb-single
+            features: "server-core,store-dynamodb-single,method-webvh,method-web"
             run_tests: false
           - store: store-firestore
             features: "server-core,store-firestore,method-webvh,method-web"
@@ -171,6 +175,53 @@ jobs:
         run: >
           cargo test -p did-hosting-common --lib --no-default-features
           --features "${{ matrix.features }}"
+
+  test-dynamodb-single:
+    name: cargo test (store-dynamodb-single integration)
+    runs-on: ubuntu-latest
+    services:
+      dynamodb-local:
+        image: amazon/dynamodb-local
+        ports:
+          - 8000:8000
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Build did-hosting-common with store-dynamodb-single
+        run: >
+          cargo build -p did-hosting-common --no-default-features
+          --features "server-core,store-dynamodb-single,method-webvh,method-web"
+      - name: Run single-table DynamoDB integration tests
+        env:
+          DYNAMODB_SINGLE_TEST_ENDPOINT: http://localhost:8000
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_ENDPOINT_URL: http://localhost:8000
+        run: >
+          cargo test -p did-hosting-common --no-default-features
+          --features "server-core,store-dynamodb-single,method-webvh,method-web"
+          --test dynamodb_single_table
+          -- --test-threads=1
+      # The backend's own unit tests (batch limits, key namespace, consistent
+      # reads, startup probe) compile only with this feature, so no other job
+      # runs them. Scoped to the backend module: the rest of the lib suite
+      # needs the fjall store.
+      - name: Run single-table backend unit tests
+        run: >
+          cargo test -p did-hosting-common --lib --no-default-features
+          --features "server-core,store-dynamodb-single,method-webvh,method-web"
+          -- dynamodb_single
+      # The daemon keeps its witness store off the main store's rows when both
+      # share a table; that logic exists only with this feature.
+      - name: Run daemon single-table configuration tests
+        run: >
+          cargo test -p did-hosting-daemon --no-default-features
+          --features store-dynamodb-single --bin did-hosting-daemon
+          -- single_table
 
   test-default:
     name: cargo test (default features)

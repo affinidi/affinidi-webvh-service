@@ -1562,7 +1562,7 @@ async fn daemon_fallback(
     #[cfg(not(feature = "ui"))]
     {
         let _ = uri;
-        StatusCode::NOT_FOUND.into_response()
+        axum::response::IntoResponse::into_response(StatusCode::NOT_FOUND)
     }
 }
 

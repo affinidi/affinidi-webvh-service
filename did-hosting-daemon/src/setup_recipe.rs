@@ -41,6 +41,30 @@ pub async fn run_from_recipe(
     apply_recipe(recipe, setup_key_file, force_reprovision).await
 }
 
+/// The main and witness store configs a recipe-driven setup records in
+/// `config.toml`: the given data directories, with `DAEMON_STORE_*` and
+/// `DAEMON_WITNESS_STORE_*` applied so setup opens (and records) the same backend
+/// the runtime will use, e.g. a pre-provisioned DynamoDB single table.
+fn store_configs(
+    store_path: std::path::PathBuf,
+    witness_store_path: std::path::PathBuf,
+) -> (StoreConfig, StoreConfig) {
+    let mut store = StoreConfig {
+        data_dir: store_path,
+        ..StoreConfig::default()
+    };
+    did_hosting_common::server::config::apply_store_env_overrides("DAEMON_STORE", &mut store);
+    let mut witness_store = StoreConfig {
+        data_dir: witness_store_path,
+        ..StoreConfig::default()
+    };
+    did_hosting_common::server::config::apply_store_env_overrides(
+        "DAEMON_WITNESS_STORE",
+        &mut witness_store,
+    );
+    (store, witness_store)
+}
+
 pub async fn apply_recipe(
     mut recipe: SetupRecipe,
     setup_key_file: Option<PathBuf>,
@@ -205,6 +229,7 @@ pub async fn apply_recipe(
         .unwrap_or_else(|| SetupRecipe::default_data_dir(ServiceKind::Daemon));
     let store_path = data_dir_root.join("store");
     let witness_store_path = data_dir_root.join("witness");
+    let (store_config, witness_store_config) = store_configs(store_path, witness_store_path);
 
     let enable = EnableConfig {
         control: recipe.daemon.enable_control.unwrap_or(true),
@@ -241,14 +266,8 @@ pub async fn apply_recipe(
         mediator_did: recipe.identity.mediator_did.clone(),
         public_url: Some(public_url.clone()),
         did_hosting_url: Some(public_url.clone()),
-        store: StoreConfig {
-            data_dir: store_path,
-            ..StoreConfig::default()
-        },
-        witness_store: StoreConfig {
-            data_dir: witness_store_path,
-            ..StoreConfig::default()
-        },
+        store: store_config,
+        witness_store: witness_store_config,
         fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
         vta: VtaConfig {
@@ -393,6 +412,7 @@ pub async fn apply_recipe(
     eprintln!();
     eprintln!("  [setup-recipe] setup complete");
     eprintln!();
+
     eprintln!(
         "  Next: did-hosting-daemon --config {}",
         recipe.output.config_path.display()
@@ -670,5 +690,76 @@ mod force_reprovision_tests {
             )
             .await
         );
+    }
+
+    /// Every variable `store_configs` reads, so a test starts from a clean slate.
+    const STORE_ENV: [&str; 8] = [
+        "DAEMON_STORE_DYNAMODB_TABLE_NAME",
+        "DAEMON_STORE_DYNAMODB_REGION",
+        "DAEMON_STORE_DYNAMODB_KEY_NAMESPACE",
+        "DAEMON_STORE_DYNAMODB_CONSISTENT_READS",
+        "DAEMON_WITNESS_STORE_DYNAMODB_TABLE_NAME",
+        "DAEMON_WITNESS_STORE_DYNAMODB_REGION",
+        "DAEMON_WITNESS_STORE_DYNAMODB_KEY_NAMESPACE",
+        "DAEMON_WITNESS_STORE_DYNAMODB_CONSISTENT_READS",
+    ];
+
+    fn clear_store_env() {
+        for name in STORE_ENV {
+            // SAFETY: callers hold `crate::config::ENV_LOCK`.
+            unsafe { std::env::remove_var(name) };
+        }
+    }
+
+    #[test]
+    fn store_configs_default_to_the_data_directories_alone() {
+        let _guard = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_store_env();
+
+        let (store, witness) = store_configs("/d/store".into(), "/d/witness".into());
+
+        assert_eq!(store.data_dir, std::path::PathBuf::from("/d/store"));
+        assert_eq!(witness.data_dir, std::path::PathBuf::from("/d/witness"));
+        for s in [&store, &witness] {
+            assert_eq!(s.dynamodb_table_name, None);
+            assert_eq!(s.dynamodb_key_namespace, None);
+            assert_eq!(s.dynamodb_consistent_reads, None);
+        }
+    }
+
+    #[test]
+    fn store_configs_honour_the_daemon_store_environment_independently() {
+        let _guard = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_store_env();
+        // SAFETY: serialised by ENV_LOCK; cleared again below.
+        unsafe {
+            std::env::set_var("DAEMON_STORE_DYNAMODB_TABLE_NAME", "main-table");
+            std::env::set_var("DAEMON_STORE_DYNAMODB_REGION", "ap-southeast-1");
+            std::env::set_var("DAEMON_WITNESS_STORE_DYNAMODB_TABLE_NAME", "witness-table");
+            std::env::set_var("DAEMON_WITNESS_STORE_DYNAMODB_KEY_NAMESPACE", "w");
+            std::env::set_var("DAEMON_WITNESS_STORE_DYNAMODB_CONSISTENT_READS", "false");
+        }
+
+        let (store, witness) = store_configs("/d/store".into(), "/d/witness".into());
+        clear_store_env();
+
+        assert_eq!(store.dynamodb_table_name.as_deref(), Some("main-table"));
+        assert_eq!(store.dynamodb_region.as_deref(), Some("ap-southeast-1"));
+        assert_eq!(
+            store.dynamodb_key_namespace, None,
+            "witness variables do not leak"
+        );
+        assert_eq!(store.dynamodb_consistent_reads, None);
+        assert_eq!(
+            witness.dynamodb_table_name.as_deref(),
+            Some("witness-table")
+        );
+        assert_eq!(witness.dynamodb_region, None, "main variables do not leak");
+        assert_eq!(witness.dynamodb_key_namespace.as_deref(), Some("w"));
+        assert_eq!(witness.dynamodb_consistent_reads, Some(false));
     }
 }

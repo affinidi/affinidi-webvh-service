@@ -29,6 +29,47 @@
   names were silently ignored. `WEBVH_` still works but is deprecated; when
   both are set, `DID_HOSTING_` wins.
 
+### Added — `store-dynamodb-single`, one externally provisioned DynamoDB table
+
+- **A DynamoDB store that uses a single table you create yourself**
+  (`pk` string partition key, `sk` string sort key) instead of one table per
+  keyspace. Prefix listings are a partition-scoped `Query`, not a `Scan`, and the
+  backend never creates or describes the table, so its credentials need only
+  `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem` and `Query`. Table definition,
+  permissions, configuration and limits are in
+  [`docs/store-dynamodb-single.md`](docs/store-dynamodb-single.md). Select it with
+  the `store-dynamodb-single` feature (exclusive with the other storage
+  features); configure it with `store.dynamodb_table_name`.
+- **Reads are strongly consistent by default**, so a read sees every write that
+  completed before it (sessions, refresh tokens, lockout counters).
+  `dynamodb_consistent_reads = false` halves the read capacity used, at the cost
+  of reads that may miss a recent write.
+- **A write batch is one atomic transaction or it is refused.** More than 100
+  operations, more than 4 MB, the same key twice, or a key that is not UTF-8 now
+  fails before anything is written; nothing is split across transactions or
+  altered to fit. `Store::batch_limits()` reports the ceiling and the server's
+  backup restore chunks to it.
+- **An optional key namespace** (`store.dynamodb_key_namespace`) prefixes every
+  partition key so several stores can share one table without sharing rows;
+  unset, rows are addressed exactly as without it. **The daemon gives its witness
+  store the namespace `witness`** when both its stores share a table (their
+  keyspaces `acl` and `witnesses` would otherwise be the same rows, so a revoke
+  made through the witness would remove the entry from the control plane's ACL),
+  and
+  refuses to start if they still resolve to the same partitions. Stores on
+  separate tables are unaffected.
+- **A missing table or wrong key schema stops startup** with a message saying
+  what to fix, instead of failing on the first request.
+- The daemon's `setup` and runtime now read `DAEMON_STORE_*` and
+  `DAEMON_WITNESS_STORE_*` for every backend (it read no store variables before).
+  `StoreConfig` gains the public fields `dynamodb_table_name`,
+  `dynamodb_key_namespace` and `dynamodb_consistent_reads`.
+
+### Fixed — the daemon builds without the `ui` feature
+
+- `did-hosting-daemon` failed to compile with `--no-default-features` (E0599 on
+  `StatusCode::into_response`). It builds again.
+
 ## 0.10.0 (release/0.10)
 
 ### Fixed — wallet sign-in works with the current browser wallet

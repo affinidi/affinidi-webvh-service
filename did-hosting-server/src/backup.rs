@@ -1,6 +1,6 @@
 use crate::config::AppConfig;
 use crate::error::AppError;
-use crate::store::{RawKvPair, Store};
+use crate::store::{RawKvPair, Store, chunk_ranges};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use did_hosting_common::server::store::{
@@ -300,15 +300,33 @@ async fn restore_keyspace(
 ) -> Result<usize, AppError> {
     const BATCH_SIZE: usize = 1000;
 
-    for chunk in entries.chunks(BATCH_SIZE) {
+    let mut decoded = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let key = BASE64
+            .decode(&entry.key)
+            .map_err(|e| AppError::Config(format!("invalid base64url key: {e}")))?;
+        let value = BASE64
+            .decode(&entry.value)
+            .map_err(|e| AppError::Config(format!("invalid base64url value: {e}")))?;
+        decoded.push((key, value));
+    }
+
+    // A restore does not need atomicity across the whole dump, so each chunk is
+    // its own batch, sized to what the backend can hold in one atomic write
+    // (some backends refuse a larger batch rather than split it).
+    let sizes: Vec<usize> = decoded
+        .iter()
+        .map(|(key, value)| {
+            ks.name
+                .len()
+                .saturating_add(key.len())
+                .saturating_add(value.len())
+        })
+        .collect();
+    let mut decoded = decoded.into_iter();
+    for range in chunk_ranges(store.batch_limits(), BATCH_SIZE, &sizes) {
         let mut batch = store.batch();
-        for entry in chunk {
-            let key = BASE64
-                .decode(&entry.key)
-                .map_err(|e| AppError::Config(format!("invalid base64url key: {e}")))?;
-            let value = BASE64
-                .decode(&entry.value)
-                .map_err(|e| AppError::Config(format!("invalid base64url value: {e}")))?;
+        for (key, value) in decoded.by_ref().take(range.len()) {
             batch.insert_raw(ks, key, value);
         }
         batch.commit().await?;
@@ -424,5 +442,75 @@ mod tests {
         assert_eq!(decoded, bytes);
         // base64url-no-pad never emits `=`.
         assert!(!encoded.contains('='));
+    }
+
+    async fn temp_store() -> (Store, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = did_hosting_common::server::config::StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        (Store::open(&config).await.expect("open store"), dir)
+    }
+
+    fn entry(key: &str, value: &[u8]) -> KvEntry {
+        KvEntry {
+            key: BASE64.encode(key),
+            value: BASE64.encode(value),
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_keyspace_writes_every_entry_across_chunks() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace(KS_DIDS).expect("keyspace");
+        // More than one chunk of the default size (1000), so the planner's
+        // chunk boundaries are exercised, not only the single-chunk case.
+        let entries: Vec<KvEntry> = (0..2500)
+            .map(|i| entry(&format!("did:{i:04}"), format!("v{i}").as_bytes()))
+            .collect();
+
+        let n = restore_keyspace(&store, &ks, &entries)
+            .await
+            .expect("restore");
+
+        assert_eq!(n, 2500);
+        assert_eq!(ks.iter_all().await.expect("iter").len(), 2500);
+        assert_eq!(
+            ks.get_raw("did:2499").await.expect("get"),
+            Some(b"v2499".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_keyspace_of_nothing_writes_nothing() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace(KS_DIDS).expect("keyspace");
+        assert_eq!(
+            restore_keyspace(&store, &ks, &[]).await.expect("restore"),
+            0
+        );
+        assert!(ks.iter_all().await.expect("iter").is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_keyspace_rejects_a_bad_entry_before_writing_anything() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace(KS_DIDS).expect("keyspace");
+        let mut entries = vec![entry("did:good", b"ok")];
+        entries.push(KvEntry {
+            key: "!!not base64!!".into(),
+            value: BASE64.encode(b"x"),
+        });
+
+        let err = restore_keyspace(&store, &ks, &entries)
+            .await
+            .expect_err("a malformed entry is refused");
+
+        assert!(matches!(err, AppError::Config(_)), "{err:?}");
+        assert!(
+            ks.iter_all().await.expect("iter").is_empty(),
+            "the valid entry before the bad one must not have been written"
+        );
     }
 }
