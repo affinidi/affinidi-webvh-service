@@ -20,6 +20,15 @@
   the AWS subtree back. `vti-secrets` 0.21 now bounds it below 1.9 itself,
   which is what keeps `aws-config` at 1.12.
 
+### Fixed — the server's documented env overrides work
+
+- **`did-hosting-server` reads the shared env overrides under `DID_HOSTING_`**
+  as its README documents (`DID_HOSTING_SERVER_HOST`, `_SERVER_PORT`,
+  `_LOG_LEVEL`, `_STORE_*`, `_AUTH_*`, `_SECRETS_*`, `_FEATURES_*`, …). They
+  were read only under an undocumented `WEBVH_` prefix, so the documented
+  names were silently ignored. `WEBVH_` still works but is deprecated; when
+  both are set, `DID_HOSTING_` wins.
+
 ## 0.10.0 (release/0.10)
 
 ### Fixed — wallet sign-in works with the current browser wallet
