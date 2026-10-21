@@ -67,6 +67,7 @@ impl Default for AppConfig {
                 port: 8533,
                 trusted_proxies: Vec::new(),
                 trusted_proxy_cidrs: Vec::new(),
+                resolve_cache: Default::default(),
             },
             log: LogConfig::default(),
             store: StoreConfig {
@@ -121,6 +122,8 @@ impl AppConfig {
             &mut AuthConfig::default(),
             &mut config.secrets,
         )?;
+        // WATCHER_SERVER_RESOLVE_CACHE_* — Cache-Control on DID resolution.
+        config.server.resolve_cache.apply_env_overrides("WATCHER")?;
         if let Ok(v) = std::env::var("WATCHER_SERVER_DID") {
             config.server_did = Some(v);
         }

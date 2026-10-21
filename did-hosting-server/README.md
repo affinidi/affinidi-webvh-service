@@ -134,6 +134,11 @@ didcomm = true
 host = "0.0.0.0"    # Bind address
 port = 8530          # Bind port
 
+[server.resolve_cache]                      # Cache-Control on DID resolution
+max_age_secs = 300                          # max-age; 0 sends no-cache (default 300)
+# shared_max_age_secs = 3600                # s-maxage for CDNs/proxies only
+# stale_while_revalidate_secs = 60          # serve stale while refetching
+
 [log]
 level = "info"       # trace, debug, info, warn, error
 format = "text"      # text or json
@@ -364,6 +369,9 @@ with the `DID_HOSTING_` prefix:
 | `DID_HOSTING_LIMITS_UPLOAD_BODY_LIMIT`      | Max upload body size (bytes)       |
 | `DID_HOSTING_LIMITS_DEFAULT_MAX_TOTAL_SIZE` | Per-account total DID size (bytes) |
 | `DID_HOSTING_LIMITS_DEFAULT_MAX_DID_COUNT`  | Per-account max DID count          |
+| `DID_HOSTING_SERVER_RESOLVE_CACHE_MAX_AGE_SECS` | Resolve `max-age` (0 = `no-cache`) |
+| `DID_HOSTING_SERVER_RESOLVE_CACHE_SHARED_MAX_AGE_SECS` | Resolve `s-maxage` (empty clears) |
+| `DID_HOSTING_SERVER_RESOLVE_CACHE_STALE_WHILE_REVALIDATE_SECS` | Resolve `stale-while-revalidate` (empty clears) |
 
 ## Building
 

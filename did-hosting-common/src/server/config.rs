@@ -152,6 +152,130 @@ pub struct ServerConfig {
     /// proxy. CIDRs accept `1.2.3.0/24` or `2001:db8::/32`.
     #[serde(default)]
     pub trusted_proxy_cidrs: Vec<String>,
+    /// `Cache-Control` policy for public DID-resolution responses
+    /// (`[server.resolve_cache]`). Read only by the binaries that serve
+    /// resolution — the server, the watcher and the daemon.
+    #[serde(default)]
+    pub resolve_cache: ResolveCacheConfig,
+}
+
+/// The `Cache-Control` header sent with successful DID-resolution responses
+/// (`did.jsonl`, `did-witness.json`, `did.json`, `keri.cesr`, and the
+/// `/@name` redirect).
+///
+/// Every value is in seconds. The trade-off is staleness: a resolver or CDN
+/// holding a cached copy will not see an update, key rotation or deactivation
+/// until its copy expires. Lower `max_age_secs` when that window matters more
+/// than origin load.
+///
+/// Error responses are unaffected: they keep the global `no-store`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveCacheConfig {
+    /// `max-age` — how long any cache (browser, resolver, CDN) may reuse a
+    /// response. `0` sends `no-cache`: caches must revalidate every time.
+    /// Default 300.
+    #[serde(default = "default_resolve_max_age_secs")]
+    pub max_age_secs: u32,
+    /// `s-maxage` — overrides `max_age_secs` for shared caches (CDNs,
+    /// proxies) only. Unset (default) omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_max_age_secs: Option<u32>,
+    /// `stale-while-revalidate` — how long a cache may keep serving an
+    /// expired copy while it refetches in the background. Unset (default)
+    /// omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_while_revalidate_secs: Option<u32>,
+}
+
+fn default_resolve_max_age_secs() -> u32 {
+    300
+}
+
+/// The longest any resolve-cache duration may be: one year, the ceiling
+/// RFC 9111 suggests for "never expires".
+const RESOLVE_CACHE_MAX_SECS: u32 = 31_536_000;
+
+impl Default for ResolveCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_age_secs: default_resolve_max_age_secs(),
+            shared_max_age_secs: None,
+            stale_while_revalidate_secs: None,
+        }
+    }
+}
+
+impl ResolveCacheConfig {
+    /// The `Cache-Control` header value for a successful resolve.
+    pub fn header_value(&self) -> String {
+        if self.max_age_secs == 0 && self.shared_max_age_secs.is_none() {
+            return "no-cache".to_string();
+        }
+        let mut value = format!("public, max-age={}", self.max_age_secs);
+        if let Some(s) = self.shared_max_age_secs {
+            value.push_str(&format!(", s-maxage={s}"));
+        }
+        if let Some(s) = self.stale_while_revalidate_secs {
+            value.push_str(&format!(", stale-while-revalidate={s}"));
+        }
+        value
+    }
+
+    /// Refuse durations past one year.
+    pub fn validate(&self) -> Result<(), AppError> {
+        let fields = [
+            ("max_age_secs", Some(self.max_age_secs)),
+            ("shared_max_age_secs", self.shared_max_age_secs),
+            (
+                "stale_while_revalidate_secs",
+                self.stale_while_revalidate_secs,
+            ),
+        ];
+        for (name, value) in fields {
+            if let Some(v) = value
+                && v > RESOLVE_CACHE_MAX_SECS
+            {
+                return Err(AppError::Config(format!(
+                    "server.resolve_cache.{name} ({v}) must be at most \
+                     {RESOLVE_CACHE_MAX_SECS} (one year)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply `{prefix}_SERVER_RESOLVE_CACHE_*` env overrides, then validate.
+    ///
+    /// For the optional fields an empty value clears the setting.
+    pub fn apply_env_overrides(&mut self, prefix: &str) -> Result<(), AppError> {
+        fn parse(var: &str, v: &str) -> Result<u32, AppError> {
+            v.trim()
+                .parse()
+                .map_err(|e| AppError::Config(format!("invalid {var}: {e}")))
+        }
+        let var = format!("{prefix}_SERVER_RESOLVE_CACHE_MAX_AGE_SECS");
+        if let Ok(v) = std::env::var(&var) {
+            self.max_age_secs = parse(&var, &v)?;
+        }
+        for (suffix, field) in [
+            ("SHARED_MAX_AGE_SECS", &mut self.shared_max_age_secs),
+            (
+                "STALE_WHILE_REVALIDATE_SECS",
+                &mut self.stale_while_revalidate_secs,
+            ),
+        ] {
+            let var = format!("{prefix}_SERVER_RESOLVE_CACHE_{suffix}");
+            if let Ok(v) = std::env::var(&var) {
+                *field = if v.trim().is_empty() {
+                    None
+                } else {
+                    Some(parse(&var, &v)?)
+                };
+            }
+        }
+        self.validate()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -753,6 +877,7 @@ impl Default for ServerConfig {
             port: default_port(),
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
+            resolve_cache: Default::default(),
         }
     }
 }
@@ -1824,5 +1949,109 @@ mod fjall_config_tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(64 * 1024 * 1024), "64.00 MiB");
         assert_eq!(human_bytes(1024 * 1024 * 1024), "1.00 GiB");
+    }
+}
+
+#[cfg(test)]
+mod resolve_cache_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_five_minutes_public() {
+        let c = ResolveCacheConfig::default();
+        assert_eq!(c.header_value(), "public, max-age=300");
+    }
+
+    #[test]
+    fn optional_directives_are_appended() {
+        let c = ResolveCacheConfig {
+            max_age_secs: 60,
+            shared_max_age_secs: Some(600),
+            stale_while_revalidate_secs: Some(30),
+        };
+        assert_eq!(
+            c.header_value(),
+            "public, max-age=60, s-maxage=600, stale-while-revalidate=30"
+        );
+    }
+
+    #[test]
+    fn zero_max_age_means_no_cache() {
+        let c = ResolveCacheConfig {
+            max_age_secs: 0,
+            ..Default::default()
+        };
+        assert_eq!(c.header_value(), "no-cache");
+        // A CDN-only policy still caches at the edge, not in clients.
+        let c = ResolveCacheConfig {
+            max_age_secs: 0,
+            shared_max_age_secs: Some(120),
+            stale_while_revalidate_secs: None,
+        };
+        assert_eq!(c.header_value(), "public, max-age=0, s-maxage=120");
+    }
+
+    #[test]
+    fn durations_past_a_year_are_refused() {
+        let c = ResolveCacheConfig {
+            stale_while_revalidate_secs: Some(RESOLVE_CACHE_MAX_SECS + 1),
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+        let c = ResolveCacheConfig {
+            max_age_secs: RESOLVE_CACHE_MAX_SECS,
+            ..Default::default()
+        };
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn toml_table_parses_and_defaults_when_absent() {
+        let s: ServerConfig = toml::from_str("host = \"0.0.0.0\"").unwrap();
+        assert_eq!(s.resolve_cache, ResolveCacheConfig::default());
+
+        let s: ServerConfig = toml::from_str(
+            "[resolve_cache]\nmax_age_secs = 30\nstale_while_revalidate_secs = 60\n",
+        )
+        .unwrap();
+        assert_eq!(s.resolve_cache.max_age_secs, 30);
+        assert_eq!(s.resolve_cache.stale_while_revalidate_secs, Some(60));
+        assert_eq!(s.resolve_cache.shared_max_age_secs, None);
+
+        // A typo is an error, not a silently ignored setting.
+        assert!(toml::from_str::<ServerConfig>("[resolve_cache]\nmax_age = 30\n").is_err());
+    }
+
+    #[test]
+    fn env_overrides_set_clear_and_validate() {
+        // A prefix no other test uses, so this test owns these vars.
+        const MAX: &str = "RCTEST_SERVER_RESOLVE_CACHE_MAX_AGE_SECS";
+        const SHARED: &str = "RCTEST_SERVER_RESOLVE_CACHE_SHARED_MAX_AGE_SECS";
+        const SWR: &str = "RCTEST_SERVER_RESOLVE_CACHE_STALE_WHILE_REVALIDATE_SECS";
+        // SAFETY: only this test reads or writes the `RCTEST_*` names.
+        unsafe {
+            std::env::set_var(MAX, "45");
+            std::env::set_var(SHARED, "900");
+            std::env::set_var(SWR, "");
+        }
+        let mut c = ResolveCacheConfig {
+            stale_while_revalidate_secs: Some(10),
+            ..Default::default()
+        };
+        c.apply_env_overrides("RCTEST").unwrap();
+        assert_eq!(c.max_age_secs, 45);
+        assert_eq!(c.shared_max_age_secs, Some(900));
+        assert_eq!(c.stale_while_revalidate_secs, None, "empty clears");
+
+        unsafe { std::env::set_var(MAX, "soon") };
+        assert!(c.apply_env_overrides("RCTEST").is_err());
+        unsafe { std::env::set_var(MAX, "99999999") };
+        assert!(c.apply_env_overrides("RCTEST").is_err(), "past a year");
+
+        unsafe {
+            std::env::remove_var(MAX);
+            std::env::remove_var(SHARED);
+            std::env::remove_var(SWR);
+        }
     }
 }

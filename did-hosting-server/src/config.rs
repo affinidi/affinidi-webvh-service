@@ -290,6 +290,13 @@ impl AppConfig {
             config.stats.sync_interval_secs
         );
 
+        // DID_HOSTING_SERVER_RESOLVE_CACHE_* — Cache-Control on DID
+        // resolution. Also validates `[server.resolve_cache]`.
+        config
+            .server
+            .resolve_cache
+            .apply_env_overrides("DID_HOSTING")?;
+
         // Validate configuration
         config.auth.validate()?;
         if let Some(ref did) = config.server_did
