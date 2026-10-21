@@ -215,16 +215,21 @@ impl AppConfig {
 
         config.config_path = path.clone();
 
-        // Apply shared env overrides for common config fields
-        did_hosting_common::server::config::apply_env_overrides(
-            "WEBVH",
-            &mut config.features,
-            &mut config.server,
-            &mut config.log,
-            &mut config.store,
-            &mut config.auth,
-            &mut config.secrets,
-        )?;
+        // Shared env overrides (features, server, log, store, auth, secrets).
+        // `DID_HOSTING_` is the documented prefix. `WEBVH_` is what these were
+        // read under before, applied first so a set `DID_HOSTING_` name wins.
+        // Deprecated: drop it once deployments have moved.
+        for prefix in ["WEBVH", "DID_HOSTING"] {
+            did_hosting_common::server::config::apply_env_overrides(
+                prefix,
+                &mut config.features,
+                &mut config.server,
+                &mut config.log,
+                &mut config.store,
+                &mut config.auth,
+                &mut config.secrets,
+            )?;
+        }
         // Fjall memory settings (STORAGE_FJALL_BLOCK_CACHE / _WRITE_BUFFER /
         // _MAX_JOURNAL) — shared, unprefixed names; see
         // `did_hosting_common::server::config::apply_fjall_env_overrides`.
@@ -315,5 +320,39 @@ impl AppConfig {
         }
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The documented `DID_HOSTING_` names reach the shared settings, the
+    /// legacy `WEBVH_` names still work, and the documented name wins.
+    #[test]
+    fn shared_env_overrides_read_did_hosting_then_legacy_webvh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+
+        // SAFETY: no other test in this crate loads config or reads these
+        // names, so nothing races these writes.
+        unsafe {
+            std::env::set_var("DID_HOSTING_SERVER_PORT", "9999");
+            std::env::set_var("WEBVH_LOG_LEVEL", "warn");
+        }
+        let config = AppConfig::load(Some(path.clone())).unwrap();
+        assert_eq!(config.server.port, 9999, "documented name applies");
+        assert_eq!(config.log.level, "warn", "legacy name still applies");
+
+        unsafe { std::env::set_var("DID_HOSTING_LOG_LEVEL", "debug") };
+        let config = AppConfig::load(Some(path)).unwrap();
+        assert_eq!(config.log.level, "debug", "documented name wins");
+
+        unsafe {
+            std::env::remove_var("DID_HOSTING_SERVER_PORT");
+            std::env::remove_var("WEBVH_LOG_LEVEL");
+            std::env::remove_var("DID_HOSTING_LOG_LEVEL");
+        }
     }
 }
