@@ -57,7 +57,8 @@ HTTP client for communicating with webvh-witness instances.
 | `passkey` | off | WebAuthn passkey enrolment + login (requires `server-core`). |
 | `store-fjall` | off | Fjall embedded key-value store. |
 | `store-redis` | off | Redis store backend. |
-| `store-dynamodb` | off | AWS DynamoDB store backend. |
+| `store-dynamodb` | off | AWS DynamoDB store backend (auto-provisions 12 keyspace-per-table layout). |
+| `store-dynamodb-single` | off | AWS DynamoDB store backend using **one externally-provisioned** composite-key (`pk`+`sk`) table. Requires `store.dynamodb_table_name`. Optional `store.dynamodb_key_namespace`; strongly consistent reads by default. See `docs/store-dynamodb-single.md`. No `CreateTable`/`DescribeTable`/`Scan` at runtime. |
 | `store-firestore` | off | Google Cloud Firestore store backend. |
 | `store-cosmosdb` | off | Azure Cosmos DB (`key_auth`) store backend. |
 | `keyring` | off | OS keyring secret backend (`keyring-core` 1.x). Supported targets: macOS, Windows, Linux. |
@@ -66,9 +67,9 @@ HTTP client for communicating with webvh-witness instances.
 | `azure-secrets` | off | Azure Key Vault secret backend. |
 
 > **Storage backends are mutually exclusive.** Only one of `store-fjall`,
-> `store-redis`, `store-dynamodb`, `store-firestore`, `store-cosmosdb`
-> may be active at a time — the binaries' `build.rs` panics at compile
-> time if more than one is selected.
+> `store-redis`, `store-dynamodb`, `store-dynamodb-single`, `store-firestore`,
+> `store-cosmosdb` may be active at a time — the binaries' `build.rs` panics
+> at compile time if more than one is selected.
 
 ## Usage
 

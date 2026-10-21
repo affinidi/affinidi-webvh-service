@@ -2,6 +2,8 @@
 mod cosmosdb;
 #[cfg(feature = "store-dynamodb")]
 mod dynamodb;
+#[cfg(feature = "store-dynamodb-single")]
+mod dynamodb_single;
 #[cfg(feature = "store-firestore")]
 mod firestore;
 #[cfg(feature = "store-fjall")]
@@ -122,11 +124,70 @@ pub trait BatchOps: Send {
     fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>>;
 }
 
+/// What one atomic [`WriteBatch`] can hold on a backend.
+///
+/// A backend whose atomic write has a ceiling reports it here and refuses a
+/// larger batch at `commit()` (before writing anything) rather than splitting
+/// it, because a split batch is not atomic. A caller that writes in bulk and
+/// does not need cross-chunk atomicity (a restore, say) chunks to this limit
+/// itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchLimits {
+    /// Most operations (inserts plus removes) in one batch.
+    pub max_ops: usize,
+    /// Most bytes in one batch, counted as the sum over its operations of
+    /// the keyspace name, key and value lengths (a remove counts no value).
+    pub max_bytes: usize,
+}
+
+/// Split a bulk write into consecutive chunks that each fit one atomic batch.
+///
+/// `sizes[i]` is operation `i`'s byte count by the [`BatchLimits::max_bytes`]
+/// rule. A chunk holds at most `cap_ops` operations and, when the backend
+/// reports `limits`, at most `limits.max_ops` operations and `limits.max_bytes`
+/// bytes. An entry that alone exceeds the byte limit still gets a chunk of its
+/// own, so the backend refuses it visibly instead of it being dropped or
+/// merged. Chunks are contiguous, in order, and cover every entry exactly once.
+///
+/// Only for callers that do not need atomicity across the whole write: each
+/// chunk is its own atomic batch.
+pub fn chunk_ranges(
+    limits: Option<BatchLimits>,
+    cap_ops: usize,
+    sizes: &[usize],
+) -> Vec<std::ops::Range<usize>> {
+    let max_ops = limits.map_or(cap_ops, |l| l.max_ops.min(cap_ops)).max(1);
+    let max_bytes = limits.map_or(usize::MAX, |l| l.max_bytes);
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0usize;
+    for (i, &size) in sizes.iter().enumerate() {
+        let ops = i - start;
+        if ops > 0 && (ops >= max_ops || bytes.saturating_add(size) > max_bytes) {
+            chunks.push(start..i);
+            start = i;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(size);
+    }
+    if start < sizes.len() {
+        chunks.push(start..sizes.len());
+    }
+    chunks
+}
+
 /// Factory: create keyspaces, create batches, persist/flush.
 pub trait StorageBackend: Send + Sync {
     fn keyspace(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError>;
     fn batch(&self) -> Box<dyn BatchOps>;
     fn persist(&self) -> BoxFuture<'_, Result<(), AppError>>;
+
+    /// The ceiling of one atomic batch, or `None` when the backend imposes
+    /// none (the default).
+    fn batch_limits(&self) -> Option<BatchLimits> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +256,12 @@ impl Store {
         WriteBatch {
             inner: self.inner.batch(),
         }
+    }
+
+    /// The ceiling of one atomic batch on this backend, or `None` when it has
+    /// none. See [`BatchLimits`].
+    pub fn batch_limits(&self) -> Option<BatchLimits> {
+        self.inner.batch_limits()
     }
 
     pub async fn persist(&self) -> Result<(), AppError> {
@@ -396,6 +463,11 @@ async fn create_backend(
         return dynamodb::DynamoDbBackend::open(config).await;
     }
 
+    #[cfg(feature = "store-dynamodb-single")]
+    {
+        return dynamodb_single::SingleTableDynamoDbBackend::open(config).await;
+    }
+
     #[cfg(feature = "store-firestore")]
     {
         return firestore::FirestoreBackend::open(config).await;
@@ -411,4 +483,81 @@ async fn create_backend(
     Err(AppError::Config(
         "no storage backend compiled — enable a store-* feature".into(),
     ))
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::{BatchLimits, chunk_ranges};
+
+    const LIMITS: BatchLimits = BatchLimits {
+        max_ops: 3,
+        max_bytes: 100,
+    };
+
+    #[test]
+    fn no_limits_chunks_only_by_the_callers_cap() {
+        let sizes = [10; 7];
+        assert_eq!(chunk_ranges(None, 3, &sizes), vec![0..3, 3..6, 6..7]);
+    }
+
+    #[test]
+    fn empty_input_plans_no_chunks() {
+        assert!(chunk_ranges(Some(LIMITS), 1000, &[]).is_empty());
+    }
+
+    #[test]
+    fn the_smaller_of_the_cap_and_the_limit_wins_on_op_count() {
+        let sizes = [1; 7];
+        assert_eq!(
+            chunk_ranges(Some(LIMITS), 1000, &sizes),
+            vec![0..3, 3..6, 6..7]
+        );
+        assert_eq!(
+            chunk_ranges(Some(LIMITS), 2, &sizes),
+            vec![0..2, 2..4, 4..6, 6..7]
+        );
+    }
+
+    #[test]
+    fn a_chunk_closes_before_it_would_exceed_the_byte_limit() {
+        // 60 + 60 > 100 closes the first chunk; 60 + 30 = 90 fits but another
+        // 30 would make 120, so the second closes; the last two (60) fit.
+        assert_eq!(
+            chunk_ranges(Some(LIMITS), 1000, &[60, 60, 30, 30, 30]),
+            vec![0..1, 1..3, 3..5]
+        );
+    }
+
+    #[test]
+    fn a_chunk_may_fill_the_byte_limit_exactly() {
+        assert_eq!(
+            chunk_ranges(Some(LIMITS), 1000, &[50, 50, 50]),
+            vec![0..2, 2..3]
+        );
+    }
+
+    #[test]
+    fn an_oversized_single_entry_gets_its_own_chunk_for_the_backend_to_refuse() {
+        // Never silently dropped or merged: the backend reports the refusal.
+        assert_eq!(
+            chunk_ranges(Some(LIMITS), 1000, &[500, 10]),
+            vec![0..1, 1..2]
+        );
+    }
+
+    #[test]
+    fn every_entry_lands_in_exactly_one_chunk_in_order() {
+        let sizes: Vec<usize> = (0..257).map(|i| (i * 7) % 41 + 1).collect();
+        let chunks = chunk_ranges(Some(LIMITS), 1000, &sizes);
+        let mut next = 0;
+        for range in &chunks {
+            assert_eq!(range.start, next, "chunks are contiguous");
+            assert!(range.end > range.start && range.len() <= LIMITS.max_ops);
+            assert!(
+                sizes[range.clone()].iter().sum::<usize>() <= LIMITS.max_bytes || range.len() == 1
+            );
+            next = range.end;
+        }
+        assert_eq!(next, sizes.len(), "nothing dropped");
+    }
 }
