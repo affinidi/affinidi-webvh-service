@@ -36,6 +36,10 @@ use std::time::Duration;
 use tower::ServiceExt; // for `oneshot`
 
 async fn make_state() -> (AppState, tempfile::TempDir) {
+    make_state_with(ServerConfig::default()).await
+}
+
+async fn make_state_with(server: ServerConfig) -> (AppState, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("temp dir");
     let store_config = StoreConfig {
         data_dir: PathBuf::from(dir.path()),
@@ -49,7 +53,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         server_did: Some("did:webvh:test:server.example.com".into()),
         mediator_did: None,
         public_url: Some("http://localhost:8530".into()),
-        server: ServerConfig::default(),
+        server,
         log: LogConfig::default(),
         store: store_config.clone(),
         fjall: Default::default(),
@@ -734,4 +738,48 @@ async fn first_boot_init_seeds_domain_and_backfills_legacy_records() {
         .await
         .expect("list domains after replay");
     assert_eq!(domains.len(), 1, "second run must be a no-op");
+}
+
+/// `[server.resolve_cache]` reaches the wire: an operator's policy replaces
+/// the default on a successful resolve, and a 404 still says `no-store`.
+#[tokio::test]
+async fn resolve_cache_policy_is_configurable() {
+    let server = ServerConfig {
+        resolve_cache: did_hosting_common::server::config::ResolveCacheConfig {
+            max_age_secs: 30,
+            shared_max_age_secs: Some(600),
+            stale_while_revalidate_secs: Some(60),
+        },
+        ..ServerConfig::default()
+    };
+    let (state, _dir) = make_state_with(server).await;
+    let did_id = "did:webvh:test:server.example.com:alice";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, "alice", did_id, &body).await;
+
+    let app = did_hosting_server::routes::router(1024 * 1024)
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn(
+            did_hosting_common::server::security_headers,
+        ));
+
+    let get = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+    };
+
+    let response = get("/alice/did.jsonl").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["cache-control"],
+        "public, max-age=30, s-maxage=600, stale-while-revalidate=60"
+    );
+
+    let response = get("/ghost/did.jsonl").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.headers()["cache-control"], "no-store");
 }

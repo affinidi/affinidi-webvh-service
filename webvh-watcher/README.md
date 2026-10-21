@@ -107,6 +107,12 @@ different path with the `--config` flag or the
 | `WATCHER_SERVER_DID`   | The watcher's DID   |
 | `WATCHER_MEDIATOR_DID` | Its mediator        |
 | `WATCHER_SOURCE_DIDS`  | Comma-separated source DIDs |
+| `WATCHER_SERVER_RESOLVE_CACHE_MAX_AGE_SECS` | DID-resolution `max-age` (0 = `no-cache`; default 300) |
+| `WATCHER_SERVER_RESOLVE_CACHE_SHARED_MAX_AGE_SECS` | DID-resolution `s-maxage` (empty clears) |
+| `WATCHER_SERVER_RESOLVE_CACHE_STALE_WHILE_REVALIDATE_SECS` | DID-resolution `stale-while-revalidate` (empty clears) |
+
+The same settings live in `[server.resolve_cache]` (`max_age_secs`,
+`shared_max_age_secs`, `stale_while_revalidate_secs`).
 
 ## CLI Commands
 

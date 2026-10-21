@@ -29,6 +29,23 @@
   names were silently ignored. `WEBVH_` still works but is deprecated; when
   both are set, `DID_HOSTING_` wins.
 
+### Added — configurable caching for DID resolution
+
+- **`[server.resolve_cache]`** sets the `Cache-Control` sent with every
+  successful resolve (`did.jsonl`, `did-witness.json`, `did.json`,
+  `keri.cesr`, the `/@name` redirect) on the server, watcher and daemon:
+  `max_age_secs` (default 300, as before; `0` sends `no-cache`),
+  `shared_max_age_secs` (`s-maxage`) and `stale_while_revalidate_secs`.
+  Each has a `{DID_HOSTING,WATCHER,DAEMON}_SERVER_RESOLVE_CACHE_*` env
+  override. Durations past one year are refused at startup. Errors keep
+  `no-store`.
+
+### Fixed
+
+- **did:web `did.json` is cacheable.** It carried no `Cache-Control`, so the
+  global default stamped it `no-store`; it now follows `[server.resolve_cache]`
+  like the other resolve paths.
+
 ## 0.10.0 (release/0.10)
 
 ### Fixed — wallet sign-in works with the current browser wallet
