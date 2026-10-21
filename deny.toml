@@ -11,6 +11,13 @@ ignore = [
   { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 — transitive via AWS SDK's hyper-rustls 0.24.2 only; not directly depended on or bumpable by us." },
   { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 — transitive via AWS SDK's hyper-rustls 0.24.2 only; not directly depended on or bumpable by us." },
   { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 — transitive via AWS SDK's hyper-rustls 0.24.2 only; not directly depended on or bumpable by us." },
+  # Fourth advisory on the same legacy copy: distrusted emSign intermediates.
+  # The fixed release is 0.103.16 only — no patched 0.101.x — and our own
+  # 0.103 copy is pinned at 0.103.16 in the lockfile. As with the others, the
+  # ignore is by ID and so also covers the 0.103 line; a regression there would
+  # need an explicit downgrade. Exposure on 0.101.7: the AWS SDK's legacy
+  # client talking to AWS endpoints, whose chains do not run through emSign.
+  { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.101.7 — transitive via AWS SDK's hyper-rustls 0.24.2 only; no patched 0.101.x. Our 0.103 copy is on the fixed 0.103.16." },
   # Same root cause as the three above: the AWS SDK still rides hyper 0.14,
   # which pins `h2 0.3`. The advisory's only stated fix is ">= 0.4.16" — there
   # is no patched 0.3.x — so this cannot be resolved from here.
