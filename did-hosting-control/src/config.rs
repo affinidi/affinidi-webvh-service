@@ -89,6 +89,7 @@ fn default_server() -> ServerConfig {
         port: 8532,
         trusted_proxies: Vec::new(),
         trusted_proxy_cidrs: Vec::new(),
+        resolve_cache: Default::default(),
     }
 }
 

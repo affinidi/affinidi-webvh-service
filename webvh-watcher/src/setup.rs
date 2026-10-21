@@ -318,6 +318,7 @@ pub async fn apply_recipe(
                 .unwrap_or_else(|| SetupRecipe::default_port(ServiceKind::Watcher)),
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
+            resolve_cache: Default::default(),
         },
         log: LogConfig {
             level: recipe

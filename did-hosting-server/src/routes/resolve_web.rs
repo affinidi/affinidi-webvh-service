@@ -74,9 +74,15 @@ async fn serve_did_web(
 
     debug!(mnemonic = %mnemonic, size = doc_bytes.len(), "did:web document resolved");
 
+    // Without an explicit header the global middleware would stamp
+    // `no-store`, leaving every did:web resolve to hit the origin.
+    let cache_control = state.config.server.resolve_cache.header_value();
     Ok((
         StatusCode::OK,
-        [("content-type", "application/did+json")],
+        [
+            ("content-type", "application/did+json"),
+            ("cache-control", cache_control.as_str()),
+        ],
         doc_bytes,
     )
         .into_response())
