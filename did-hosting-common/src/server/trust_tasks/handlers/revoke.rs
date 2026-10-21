@@ -98,7 +98,7 @@ async fn handle_inner(
                 .with_message("inbound document has no in-band or transport-derived issuer"),
         )
     })?;
-    let self_revoke = caller == subject;
+    let self_revoke = crate::scid::same_reference(caller, &subject);
 
     // Authorise: admin (any target) OR self-revoker (own target).
     if !self_revoke {

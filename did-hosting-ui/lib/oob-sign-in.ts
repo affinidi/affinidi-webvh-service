@@ -23,6 +23,7 @@
  */
 
 import { clearSessionKeypair, generateSessionKeypair, signEnvelope } from "./session-key";
+import { scidHost } from "./did-scid";
 
 // ---- trigger links (VTI spec 07a, contract C1) --------------------------------
 
@@ -103,6 +104,9 @@ export interface ContactMethodCapabilities {
 export const CONTACT_METHOD_CAPABILITIES: Readonly<Record<string, ContactMethodCapabilities>> = {
   "did:webvh": { namesHost: true, listsServices: true, verified: true },
   "did:web": { namesHost: true, listsServices: true, verified: true },
+  // Names its host only as a DID URL with `src` (VTI-LNK-119): a bare
+  // did:scid is refused below, whatever this row says.
+  "did:scid": { namesHost: true, listsServices: true, verified: true },
   // Self-certifying, and named after no host: no domain to show, and nothing
   // ties a portal origin in the document to anyone the person recognises.
   "did:key": { namesHost: false, listsServices: false, verified: true },
@@ -121,6 +125,7 @@ function didMethodOf(did: string): string {
  */
 export function isHostNamedServiceContact(did: string): boolean {
   const method = didMethodOf(did);
+  if (method === "did:scid" && scidHost(did) === null) return false;
   // Own properties only: `did:constructor` must not find Object.prototype.
   const caps = Object.prototype.hasOwnProperty.call(CONTACT_METHOD_CAPABILITIES, method)
     ? CONTACT_METHOD_CAPABILITIES[method]

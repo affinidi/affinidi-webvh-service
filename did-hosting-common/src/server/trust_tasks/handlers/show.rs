@@ -53,7 +53,7 @@ async fn handle_inner(
                 .with_message("inbound document has no in-band or transport-derived issuer"),
         )
     })?;
-    let self_lookup = caller == subject;
+    let self_lookup = crate::scid::same_reference(caller, &subject);
 
     // Authorise: Admin may look up anyone; everyone else only
     // themselves.

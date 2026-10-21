@@ -169,6 +169,8 @@ agent-names = "0.1.3"
 # 0.7 because `affinidi-did-resolver-cache-sdk` 0.8.39 (pulled by affinidi-tdk
 # 0.21) is on it; staying on 0.6 put two copies in the shipped graph.
 didwebvh-rs = "0.8"
+# DID URL helpers, including the `src` locator of a did:scid (`scid`).
+affinidi-did-common = "0.4"
 
 # DID webs — `did:web` discovery with KERI-verified key state.
 #

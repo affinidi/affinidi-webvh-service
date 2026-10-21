@@ -3,6 +3,7 @@
  */
 
 import type { DidRecord } from "./api";
+import { parseScid } from "./did-scid";
 
 export type DidSortKey =
   | "mnemonic"
@@ -86,6 +87,15 @@ export function sortDids(dids: DidRecord[], sort: DidSort): DidRecord[] {
  *  filtered list, so it is dropped; the full DID is on hover, Copy and QR.
  *  Other methods fall back to [`truncateDid`]. */
 export function compactDid(did: string): string {
+  // did:scid: the SCID's first 12 characters, then the last segment of the
+  // `src` locator where there is one. A bare did:scid is the SCID alone.
+  const scidParts = parseScid(did);
+  if (scidParts) {
+    const { scid: id, src } = scidParts;
+    const head = id.length > 12 ? `${id.slice(0, 12)}…` : id;
+    const last = src?.replace(/\/+$/, "").split("/").pop();
+    return last ? `did:scid:vh:1:${head}?src=…${last}` : `did:scid:vh:1:${head}`;
+  }
   const parts = did.split(":");
   if (parts[0] !== "did" || parts[1] !== "webvh" || parts.length < 4) {
     return truncateDid(did);

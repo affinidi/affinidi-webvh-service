@@ -1776,6 +1776,7 @@ async fn run_bootstrap_did(
             config.features.tsp,
             public_url,
             &mnemonic,
+            config.hosting.scid_also_known_as,
         )
         .await?;
 
@@ -1904,6 +1905,7 @@ async fn run_recreate_did(
         config.features.tsp,
         public_url,
         &mnemonic,
+        config.hosting.scid_also_known_as,
     )
     .await?;
 

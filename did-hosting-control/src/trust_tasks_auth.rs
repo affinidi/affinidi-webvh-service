@@ -249,15 +249,19 @@ fn serialise<T: serde::Serialize>(doc: &T) -> Value {
 // serialise the error onto the wire anyway.
 #[allow(clippy::result_large_err)]
 fn caller<P>(doc: &TrustTask<P>, parties: &ResolvedParties) -> Result<String, ErrorResponse> {
-    parties.issuer.clone().ok_or_else(|| {
-        doc.reject_with(
-            format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-            ErrorPayload::new(StandardCode::PermissionDenied).with_message(
-                "inbound document has no in-band or transport-derived issuer, so there is \
+    parties
+        .issuer
+        .as_deref()
+        .map(did_hosting_common::scid::identity)
+        .ok_or_else(|| {
+            doc.reject_with(
+                format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                ErrorPayload::new(StandardCode::PermissionDenied).with_message(
+                    "inbound document has no in-band or transport-derived issuer, so there is \
                  no verified identity to authenticate",
-            ),
-        )
-    })
+                ),
+            )
+        })
 }
 
 /// Map a backend auth failure onto a framework rejection.
@@ -523,7 +527,11 @@ async fn verify_delegation_evidence(
             if mandate.type_uri.to_string() != MANDATE_EVIDENCE_TYPE_URI {
                 return Err("credential is not a did-hosting-auth-mandate document".into());
             }
-            if mandate.issuer.as_deref() != Some(principal) {
+            if !mandate
+                .issuer
+                .as_deref()
+                .is_some_and(|i| did_hosting_common::scid::same_reference(i, principal))
+            {
                 return Err("credential.issuer does not name the principal".into());
             }
             if mandate.recipient.as_deref() != state.config.server_did.as_deref() {
@@ -570,7 +578,7 @@ async fn verify_delegation_evidence(
             )
             .await
             .map_err(|e| format!("id_token failed verification: {e}"))?;
-            if verified.issuer != principal {
+            if !did_hosting_common::scid::same_reference(&verified.issuer, principal) {
                 return Err("id_token iss/sub does not name the principal".into());
             }
             let own_vid = state

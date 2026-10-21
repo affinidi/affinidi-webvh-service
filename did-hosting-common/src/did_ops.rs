@@ -177,7 +177,7 @@ pub fn content_witness_key(mnemonic: &str) -> String {
 }
 
 pub fn owner_key(did: &str, mnemonic: &str) -> String {
-    format!("owner:{did}:{mnemonic}")
+    format!("owner:{}:{mnemonic}", crate::scid::strip_scid_src(did))
 }
 
 /// Reverse index: an agent name resolves to the mnemonic that owns it.
@@ -1188,6 +1188,42 @@ pub fn parse_log_entries(jsonl_content: &str) -> Vec<LogEntryInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The did:web bridge rewrites the did:webvh id only: a did:scid alias
+    /// the document lists survives into the did:web document unchanged.
+    #[test]
+    fn the_did_web_bridge_keeps_the_scid_alias() {
+        let line = serde_json::json!({
+            "versionId": "1-Qm",
+            "state": {
+                "id": "did:webvh:Qm1:a.example:alice",
+                "alsoKnownAs": ["did:web:a.example:alice", "did:scid:vh:1:Qm1?src=a.example/alice"]
+            }
+        })
+        .to_string();
+        let doc = extract_did_web_document(&line, "did:web:a.example:alice").expect("bridged");
+        let doc: serde_json::Value = serde_json::from_slice(&doc).unwrap();
+        assert_eq!(doc["id"], "did:web:a.example:alice");
+        assert_eq!(
+            doc["alsoKnownAs"],
+            serde_json::json!([
+                "did:web:a.example:alice",
+                "did:scid:vh:1:Qm1?src=a.example/alice"
+            ])
+        );
+    }
+
+    /// A did:scid alias is not an agent name, and claims none.
+    #[test]
+    fn a_scid_alias_claims_no_agent_name() {
+        let doc = serde_json::json!({
+            "alsoKnownAs": ["did:scid:vh:1:Qm1?src=a.example/alice", "https://a.example/@alice"]
+        });
+        assert_eq!(
+            agent_names_from_document(&doc, "a.example"),
+            vec!["alice".to_string()]
+        );
+    }
 
     // ---- T12: DidRecord new fields backwards-compat ----
 

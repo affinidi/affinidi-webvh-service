@@ -160,7 +160,9 @@ impl SpecAclEntry {
             .unwrap_or(created_at_fallback);
 
         Ok(LocalAclEntry {
-            did: self.subject,
+            // Recorded under the identity: a did:scid subject without the
+            // `src` locator a request may carry (VTI-KEY-160).
+            did: crate::scid::identity(&self.subject),
             role,
             label: self.label,
             created_at,

@@ -13,11 +13,14 @@
 // per-domain view.
 
 import type { DidRecord } from "./api";
+import { scidHost } from "./did-scid";
 
 /** Extract the canonical host (resolution authority) from a DID. */
 //
 // `did:webvh:<scid>:<host>:<...path...>`  → index 3
 // `did:web:<host>:<...path...>`           → index 2
+// `did:scid:vh:1:<scid>?src=<host>/<path>` → the host of `src`; a bare
+//                                           did:scid names no host
 //
 // Hosts with non-default ports are percent-encoded (e.g.
 // `localhost%3A8534`); the caller compares against
@@ -26,6 +29,7 @@ import type { DidRecord } from "./api";
 // malformed input — callers treat that as "no host known".
 export function extractDidHost(didId: string | undefined | null): string | null {
   if (!didId) return null;
+  if (didId.startsWith("did:scid:")) return scidHost(didId);
   const parts = didId.split(":");
   let host: string | undefined;
   if (parts[1] === "webvh") {

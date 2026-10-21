@@ -189,7 +189,7 @@ impl<S: AuthState> FromRequestParts<S> for AuthClaims {
         debug!(did = %claims.sub, role = %claims.role, session_id = %claims.session_id, "request authenticated");
 
         Ok(AuthClaims {
-            did: claims.sub,
+            did: crate::scid::identity(&claims.sub),
             role,
             session_id: claims.session_id,
             session_pubkey_b58btc: session.session_pubkey_b58btc,

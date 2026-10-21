@@ -116,7 +116,9 @@ async fn handle_inner(
     })?;
 
     // ─── 3. Self-promotion guard. ─────────────────────────────────
-    if caller == doc.payload.subject && is_strict_promotion(&from_role, &to_role) {
+    if crate::scid::same_reference(caller, &doc.payload.subject)
+        && is_strict_promotion(&from_role, &to_role)
+    {
         return Err(reject_with(
             &doc,
             ErrorPayload::new(StandardCode::PermissionDenied)

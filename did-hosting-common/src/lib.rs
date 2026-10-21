@@ -7,6 +7,7 @@ mod error;
 #[cfg(feature = "server-core")]
 mod http;
 pub mod method;
+pub mod scid;
 mod types;
 #[cfg(feature = "server-core")]
 mod witness_client;
