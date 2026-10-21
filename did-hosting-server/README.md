@@ -336,7 +336,7 @@ cargo install did-hosting-server --locked
 ### Environment Variable Overrides
 
 Every config field can be overridden via environment variables
-with the `DID_HOSTING_` prefix. Before 0.11 the shared settings below
+with the `DID_HOSTING_` prefix. Before 0.10.1 the shared settings below
 (`FEATURES_*`, `SERVER_*`, `LOG_*`, `STORE_*`, `AUTH_*`, `SECRETS_*`,
 `CLEANUP_TTL_MINUTES`) were read only under `WEBVH_`. Those names still
 work but are deprecated, and the `DID_HOSTING_` name wins when both are set.
