@@ -71,10 +71,13 @@ released. Features never are.
 
 **Fix on `main` first, then backport.** Label the merged PR
 `backport release/<major.minor>` (one label per target branch); `backport.yml`
-opens the cherry-pick as a PR on that branch, as a draft carrying the conflict
-if it does not apply cleanly. A conflict in `CHANGELOG.md` is expected — main's
-`## Unreleased` is not on a GA'd branch — drop that hunk: a patch's changelog is
-generated from the commit subjects it ships.
+opens the cherry-pick as a PR on that branch. `CHANGELOG.md` never conflicts: the workflow
+keeps the release branch's copy (main's `## Unreleased` is not on a GA'd branch,
+and a patch's changelog is generated from the commit subjects it ships). Any
+other conflict currently fails the backport — the action's conflict commit
+(`BACKPORT-CONFLICT`) is rejected by the commit-message rule — so cherry-pick it
+by hand onto a branch named `backport-<pr>-to-release/<major.minor>` and open
+that PR against the release branch.
 
 Only fix on the release branch directly when the code there no longer exists on
 `main`: a maintainer adds the `release-direct` label to that PR, and its
