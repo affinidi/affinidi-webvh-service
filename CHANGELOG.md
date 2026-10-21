@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Security — TLS certificate trust (RUSTSEC-2026-0382, RUSTSEC-2026-0383)
+
+- **`rustls-webpki` 0.103.16 and `webpki-root-certs` 1.0.10.** Earlier
+  versions could accept certificate chains through distrusted emSign
+  intermediates whose private keys are now public. Lockfile only; the fuzz
+  workspace's lock is updated too.
+
+### Changed — dependencies
+
+- Workspace-wide `cargo update`: `tokio` 1.54, `trust-tasks-*` 0.32.10, and
+  the AWS SDK moves forward (`aws-sdk-dynamodb` 1.131,
+  `aws-sdk-secretsmanager` 1.120). `firestore` 0.61, `serde_json_canonicalizer`
+  0.4 (canonical output unchanged; duplicate object keys are now an error).
+- **The `aws-smithy-types < 1.7` pin is gone.** `aws-smithy-json` 0.63.1
+  compiles against the newer line, so the workspace no longer needs to hold
+  the AWS subtree back. `vti-secrets` 0.21 now bounds it below 1.9 itself,
+  which is what keeps `aws-config` at 1.12.
+
 ## 0.10.0 (release/0.10)
 
 ### Fixed — wallet sign-in works with the current browser wallet
