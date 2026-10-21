@@ -32,8 +32,8 @@ ignore = [
   # (aws-smithy-http-client -> hyper-rustls 0.24, reached through
   # vti-secrets' aws-config). The only fixed version is 0.23.46, which the copy
   # we control is on; there is no patched 0.21.x, and aws-smithy-http-client
-  # 1.5.0 still carries 0.21 and needs aws-smithy-types >= 1.8, which this
-  # workspace holds below 1.7 (Cargo.toml). As for RUSTSEC-2026-0258, the
+  # 1.5.0 (the newest vti-secrets' `aws-smithy-types < 1.9` bound admits) still
+  # carries 0.21. As for RUSTSEC-2026-0258, the
   # ignore is by ID and so also covers the 0.23 line — it is pinned at the
   # fixed 0.23.46 in the lockfile.
   #
