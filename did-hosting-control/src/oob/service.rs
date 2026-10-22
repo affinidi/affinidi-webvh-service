@@ -455,7 +455,9 @@ impl OobService {
         let signed = self.signed(env, &doc, &issuer, step2, ATTESTATION).await?;
         let now = env.now();
         let mut next = rec.next(OobState::Identified, now);
-        next.identified_did = Some(identify_did.clone());
+        // Recorded as the identity; `identifiedAs` above echoes the DID as the
+        // member presented it, `src` included where it carried one.
+        next.identified_did = Some(did_hosting_common::scid::identity(&identify_did));
         next.step2_digest = Some(context_digest(&signed));
         if !self.store.compare_and_set(rec.version, next) {
             return Err(OobError::new(
@@ -501,7 +503,12 @@ impl OobService {
         }
         if self
             .store
-            .remember_document(&did, &identify.id, env.now() + SEEN_ID_TTL_SECS, env.now())
+            .remember_document(
+                &did_hosting_common::scid::identity(&did),
+                &identify.id,
+                env.now() + SEEN_ID_TTL_SECS,
+                env.now(),
+            )
             .is_err()
         {
             return Err(OobError::not_authorized());
@@ -588,7 +595,11 @@ impl OobService {
             serde_json::from_value(grant_raw.clone()).map_err(|_| OobError::not_authorized())?;
         // 2. Issued by the DID that proved, against `assertionMethod`.
         let did = rec.identified_did.clone().unwrap_or_default();
-        if grant.issuer.as_deref() != Some(did.as_str()) {
+        if !grant
+            .issuer
+            .as_deref()
+            .is_some_and(|issuer| did_hosting_common::scid::same_reference(issuer, &did))
+        {
             return Err(OobError::not_authorized());
         }
         // A `respond` carries the `grant` of its own version.

@@ -46,6 +46,35 @@
   global default stamped it `no-store`; it now follows `[server.resolve_cache]`
   like the other resolve paths.
 
+### Added — did:scid identities
+
+A `did:scid:vh:1` DID is verified by the same did:webvh log as its did:webvh
+form, but is a DID in its own right: `did:scid:vh:1:<scid>`, with
+`?src=<host>/<path>` only a locator for the log (VTI-KEY-160 to VTI-KEY-166
+of the VTI specification). Hosted logs are always did:webvh logs and are
+served exactly as before; a did:scid resolver fetches the same `did.jsonl`.
+
+- **Callers may present a did:scid.** An owner, ACL subject or proof signer
+  is recorded and compared as the bare did:scid DID: ACL and ownership keys,
+  validated DIDs, the dispatch caller and session subjects drop the `src`
+  locator, and issuer, sender, recipient and verification-method bindings
+  compare by DID, ignoring it. A proof whose `verificationMethod` carries
+  `src` is resolved through it and dereferenced by DID and fragment. A
+  did:scid signer whose did:webvh log is deactivated signs nothing. The
+  did:webvh and did:scid forms remain distinct identities.
+- **Self-created DIDs list their did:scid alias.** A DID this service mints
+  for itself (server bootstrap, daemon setup, self-managed recipe,
+  `WebVHClient::create_did`) lists `did:scid:vh:1:<scid>?src=…` in
+  `alsoKnownAs`, linking the two forms. `hosting.scid_also_known_as = false`
+  (env `<PREFIX>_HOSTING_SCID_ALSO_KNOWN_AS`, recipe
+  `identity.scid_also_known_as`) leaves it out. An existing DID keeps what it
+  published. `DidDocumentOptions` gains `omit_scid_alias`, so a struct literal
+  of it no longer compiles without it.
+- **The console shows did:scid.** The DID detail page lists a hosted DID's
+  did:scid alias with a Copy button; the DID table, domain matching and the
+  sign-in contact rule understand did:scid (a contact must carry `src`,
+  VTI-LNK-119).
+
 ## 0.10.0 (release/0.10)
 
 ### Fixed — wallet sign-in works with the current browser wallet

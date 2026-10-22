@@ -369,7 +369,8 @@ where
         |doc: TrustTask<P>, parties: ResolvedParties| async move {
             let cx = Cx {
                 state,
-                caller: parties.issuer.clone(),
+                // The identity: a did:scid issuer without its `src` locator.
+                caller: parties.issuer.as_deref().map(did_hosting_common::scid::identity),
                 bearer,
                 proof_vm: doc.proof.as_ref().map(|p| p.verification_method.clone()),
                 proof_created: doc.proof.as_ref().map(|p| p.created),

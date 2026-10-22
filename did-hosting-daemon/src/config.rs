@@ -158,6 +158,10 @@ impl DaemonConfig {
         env_opt!("DAEMON_MEDIATOR_DID", config.mediator_did);
         env_opt!("DAEMON_PUBLIC_URL", config.public_url);
         env_opt!("DAEMON_DID_HOSTING_URL", config.did_hosting_url);
+        did_hosting_common::server::config::apply_hosting_env_overrides(
+            "DAEMON",
+            &mut config.hosting,
+        );
 
         if let Ok(v) = std::env::var("DID_HOSTING_IDENTITY_MODE") {
             config.identity.mode = match v.to_ascii_lowercase().as_str() {

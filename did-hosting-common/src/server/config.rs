@@ -922,6 +922,14 @@ pub struct HostingConfig {
     /// short enough that abandoned domains don't accumulate forever.
     #[serde(default = "default_disable_purge_grace")]
     pub disable_purge_grace: String,
+
+    /// Whether a DID this service creates for itself lists its
+    /// `did:scid:vh:1:<scid>?src=…` alias in `alsoKnownAs`, linking its
+    /// did:webvh and did:scid forms as one subject (VTI-KEY-166 of the VTI
+    /// specification). Applies when the log is created; an existing DID keeps
+    /// what it published. Default: `true`. Env: `<PREFIX>_HOSTING_SCID_ALSO_KNOWN_AS`.
+    #[serde(default = "default_true")]
+    pub scid_also_known_as: bool,
 }
 
 fn default_unassigned_purge_grace() -> String {
@@ -938,7 +946,24 @@ impl Default for HostingConfig {
             bootstrap_domains: Vec::new(),
             unassigned_purge_grace: default_unassigned_purge_grace(),
             disable_purge_grace: default_disable_purge_grace(),
+            scid_also_known_as: true,
         }
+    }
+}
+
+/// Apply environment variable overrides to [`HostingConfig`]. `prefix` is the
+/// same namespace [`apply_env_overrides`] takes.
+pub fn apply_hosting_env_overrides(prefix: &str, hosting: &mut HostingConfig) {
+    hosting.scid_also_known_as = scid_also_known_as_from_env(prefix, hosting.scid_also_known_as);
+}
+
+/// `<PREFIX>_HOSTING_SCID_ALSO_KNOWN_AS` when set (`1`/`true` or anything
+/// else for false), `default` otherwise. For setup paths that mint the
+/// service's DID before any config file exists.
+pub fn scid_also_known_as_from_env(prefix: &str, default: bool) -> bool {
+    match std::env::var(format!("{prefix}_HOSTING_SCID_ALSO_KNOWN_AS")) {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => default,
     }
 }
 
@@ -1518,6 +1543,17 @@ pub fn init_tracing(log: &LogConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The did:scid alias is listed unless an operator turns it off; a config
+    /// written before the setting existed reads as on.
+    #[test]
+    fn hosting_lists_the_scid_alias_by_default() {
+        assert!(HostingConfig::default().scid_also_known_as);
+        let parsed: HostingConfig = toml::from_str("bootstrap_domains = []").unwrap();
+        assert!(parsed.scid_also_known_as);
+        let parsed: HostingConfig = toml::from_str("scid_also_known_as = false").unwrap();
+        assert!(!parsed.scid_also_known_as);
+    }
 
     #[test]
     fn agent_names_default_on_for_absent_and_empty_config() {

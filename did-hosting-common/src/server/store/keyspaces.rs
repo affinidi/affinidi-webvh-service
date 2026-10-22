@@ -118,3 +118,10 @@ pub const KS_OUTBOUND_QUEUE: &str = "outbox";
 /// node from forgetting every peer and silently dropping their application
 /// traffic until a re-handshake.
 pub const KS_TSP_RELATIONSHIPS: &str = "tsp_relationships";
+/// `scid_floor:<bare did:scid>` — the did:scid sources and latest verified
+/// log version (`ScidSourceRecord`) of every did:scid identity this service
+/// authorises (ACL subjects, DID owners, a configured control plane), so the
+/// resolver's rollback floor survives a restart (VTI-KEY-162). Seeded into
+/// the service identity's resolver at boot; see
+/// [`crate::server::scid_floors`].
+pub const KS_SCID_FLOORS: &str = "scid_floors";

@@ -16,6 +16,7 @@ import { AgentNameChips } from "../../components/AgentNameChips";
 import { useAgentNames } from "../../lib/use-agent-names";
 import { hasLogMovedPast } from "../../lib/pinned-edit";
 import { extractDidHost } from "../../lib/domain";
+import { scidAliasesOf } from "../../lib/did-scid";
 import { ChipInput } from "../../components/ChipInput";
 import { UsageChart } from "../../components/UsageChart";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
@@ -229,6 +230,10 @@ export default function DidDetail() {
         // root DID that serves `domain/@` reading as "No names bound yet".
         .filter((n): n is string => n !== null)
     : [];
+
+  // The did:scid alias the live document lists for itself, if any: the same
+  // log under its did:scid DID, linked as one subject by the listing.
+  const scidAliases = scidAliasesOf(didDetail?.didId, currentState?.alsoKnownAs);
 
   // Parked names come from the host's authoritative registry — they are
   // deliberately absent from the document, so they cannot be derived like the
@@ -849,6 +854,19 @@ export default function DidDetail() {
             <Text style={styles.pendingText}>Pending upload</Text>
           )
         )}
+        {scidAliases.map((alias) => (
+          <View key={alias} style={styles.didIdRow}>
+            <Text style={styles.didIdText} numberOfLines={1}>
+              {alias}
+            </Text>
+            <Pressable
+              style={styles.copyButton}
+              onPress={() => Clipboard.setStringAsync(alias)}
+            >
+              <Text style={styles.copyButtonText}>Copy</Text>
+            </Pressable>
+          </View>
+        ))}
         {/* Agent names, directly under the DID they redirect to.
 
             Copy-only here; binding and parking stay in the Agent Names card

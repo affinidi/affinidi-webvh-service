@@ -2480,6 +2480,7 @@ mod tests_atomic {
                 key_agreement_multibase: None,
                 mediator_endpoint: didcomm.then_some(MED),
                 tsp_endpoint: tsp.then_some(MED),
+                omit_scid_alias: false,
             },
         );
         let (_scid, jsonl) = create_log_entry(&doc, &signing)

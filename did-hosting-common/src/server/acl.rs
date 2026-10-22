@@ -171,8 +171,10 @@ impl AclEntry {
     }
 }
 
+/// Keyed on the identity, so a did:scid presented with its `src` locator finds
+/// the entry recorded for the bare DID (VTI-KEY-160).
 fn acl_key(did: &str) -> String {
-    format!("acl:{did}")
+    format!("acl:{}", crate::scid::strip_scid_src(did))
 }
 
 /// Maximum DID-string length we accept anywhere a DID is written by a
@@ -189,7 +191,8 @@ pub const MAX_DID_LEN: usize = 2048;
 /// `MAX_DID_LEN`, starts with `did:`, contains no ASCII control chars.
 /// Returns the trimmed string on success so the caller stores the
 /// canonical form (a typo-trailing-space DID would otherwise silently
-/// mismatch all later `check_acl` lookups).
+/// mismatch all later `check_acl` lookups). A did:scid is returned without its
+/// `src` locator: the identity is the bare DID (VTI-KEY-160).
 ///
 /// Used by ACL create/update routes and by the ownership-transfer path
 /// in `did_ops::change_did_owner` to guarantee the same shape of DIDs
@@ -214,7 +217,7 @@ pub fn validate_did_format(did: &str) -> Result<String, AppError> {
             "DID must not contain ASCII control characters".into(),
         ));
     }
-    Ok(trimmed.to_string())
+    Ok(crate::scid::identity(trimmed))
 }
 
 /// Retrieve an ACL entry by DID.
@@ -623,6 +626,51 @@ mod tests {
             max_did_count: None,
             domains,
         }
+    }
+
+    /// A did:scid is recorded and found by its identity, the bare DID: an
+    /// admin who wrote the locator, or a caller whose issuer carries it, reaches
+    /// the same entry (VTI-KEY-160).
+    #[tokio::test]
+    async fn a_did_scid_entry_is_keyed_on_the_bare_did() {
+        let store = fjall_store().await;
+        let ks = store.keyspace(KS_ACL).unwrap();
+        let presented = "did:scid:vh:1:Qm1?src=dids.example.org/alice";
+        let did = validate_did_format(presented).unwrap();
+        assert_eq!(did, "did:scid:vh:1:Qm1");
+        store_acl_entry(&ks, &entry(&did, Role::Owner, DomainScope::All))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            check_acl(&ks, "did:scid:vh:1:Qm1").await.unwrap(),
+            Role::Owner
+        );
+        assert_eq!(check_acl(&ks, presented).await.unwrap(), Role::Owner);
+        assert_eq!(
+            check_acl(&ks, "did:scid:vh:1:Qm1?src=elsewhere.example")
+                .await
+                .unwrap(),
+            Role::Owner
+        );
+        // The did:webvh form is a different identity (VTI-KEY-164).
+        assert!(
+            check_acl(&ks, "did:webvh:Qm1:dids.example.org:alice")
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_did_format_leaves_other_methods_alone() {
+        assert_eq!(
+            validate_did_format(" did:webvh:Qm1:a.example ").unwrap(),
+            "did:webvh:Qm1:a.example"
+        );
+        assert_eq!(
+            validate_did_format("did:example:1?src=x").unwrap(),
+            "did:example:1?src=x"
+        );
     }
 
     #[tokio::test]

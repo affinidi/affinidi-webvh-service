@@ -244,9 +244,12 @@ pub async fn dispatch_trust_task(
         .filter(|_| crate::messaging::session_key_may_sign(&doc.type_uri.to_string()))
         .map(|pk| format!("did:key:{pk}#{pk}"));
     if let (Some(auth), Some(proof)) = (auth.as_ref(), doc.proof.as_ref()) {
-        let own_key = did_hosting_common::server::trust_tasks::verifier::controller_did(
-            &proof.verification_method,
-        ) == auth.did;
+        let own_key = did_hosting_common::scid::same_reference(
+            did_hosting_common::server::trust_tasks::verifier::controller_did(
+                &proof.verification_method,
+            ),
+            &auth.did,
+        );
         let session_key = session_key_vm.as_deref() == Some(proof.verification_method.as_str());
         if !own_key && !session_key {
             tracing::warn!(
