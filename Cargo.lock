@@ -169,9 +169,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-did-common"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55e6b1abc03abdb8d46df4492f2accd75ac94a6d789822b9e5c0603bf2407419"
+checksum = "e6c90c9876106ef6138fb858ec3b77354eda1d14b37a06441f28f4fd8838594d"
 dependencies = [
  "affinidi-crypto",
  "affinidi-encoding",
@@ -186,9 +186,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-did-resolver-cache-sdk"
-version = "0.8.41"
+version = "0.8.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "094243a0e7eb63c15982da638e1bc5fed91493d42cd20d325391a0ff9a883e46"
+checksum = "27c6932d624670cc7ae960b015416ae83019ed9160121814222a5a4d4cbb7a35"
 dependencies = [
  "affinidi-did-common",
  "affinidi-did-resolver-traits",
@@ -3056,6 +3056,7 @@ name = "did-hosting-common"
 version = "0.11.0"
 dependencies = [
  "affinidi-data-integrity",
+ "affinidi-did-common",
  "affinidi-did-resolver-cache-sdk",
  "affinidi-did-webs",
  "affinidi-messaging-didcomm",
@@ -3305,9 +3306,9 @@ dependencies = [
 
 [[package]]
 name = "did-scid"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a5831431ec1890277e48a90ce25e5093644ca6f5390e715357c1d948110a6f3"
+checksum = "afa21cb488ff54668bb6adf8c206ef4e144baac7213c3da157d407ced805280e"
 dependencies = [
  "affinidi-did-common",
  "didwebvh-rs",
@@ -3319,9 +3320,9 @@ dependencies = [
 
 [[package]]
 name = "didwebvh-rs"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f02bdbaaffc5b0bec1e3f8049e5e415476cfd56d23bc6bf692419e674ded93f9"
+checksum = "346ad3a3c4f10c0c8dc8c710c2511375cd14ffb5e5bc5b6e6f03617ce2dabb87"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-common",
@@ -3335,7 +3336,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "serde_json_canonicalizer 0.3.2",
+ "serde_json_canonicalizer 0.4.1",
  "serde_with",
  "sha2 0.11.1",
  "thiserror 2.0.21",
