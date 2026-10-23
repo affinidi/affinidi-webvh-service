@@ -6,6 +6,7 @@ use affinidi_messaging_didcomm_service::{
     DIDCommService, DIDCommServiceConfig, ListenerConfig, ListenerEvent, Protocols, RestartPolicy,
     RetryConfig,
 };
+use affinidi_tdk::messaging::protocols::mediator::acls::AccessListModeType;
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use axum::routing::get;
 use did_hosting_common::server::domain::parse_trusted_cidrs;
@@ -671,6 +672,13 @@ pub async fn start_didcomm_service(
         },
         auto_delete: true,
         protocols,
+        // See the identical comment in did-hosting-control's `start_didcomm_service`:
+        // a DID's mediator account starts deny-by-default (empty `ExplicitAllow`
+        // access list), and nothing here ever opened this listener's own account
+        // for forwarded delivery. `ExplicitDeny` flips it to deny-list semantics —
+        // nothing explicitly denied, so every sender is allowed — matching what
+        // `vta-sdk::acl_setup` already does for VTA and pnm.
+        acl_mode: Some(AccessListModeType::ExplicitDeny),
         ..Default::default()
     };
     // Persist this listener's TSP relationships (Rev 3 §7.2.2) across restarts.
