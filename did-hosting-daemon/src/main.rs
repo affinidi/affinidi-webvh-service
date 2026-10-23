@@ -1,5 +1,6 @@
 mod config;
 mod setup;
+mod setup_key_erase;
 mod setup_recipe;
 
 use std::path::PathBuf;
