@@ -136,20 +136,56 @@ pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(feature = "store-dynamodb-single")]
 const DEFAULT_WITNESS_KEY_NAMESPACE: &str = "witness";
 
+/// A DynamoDB table as a store config names it: the table name, and the region
+/// and account when the config says which (an ARN carries both; a bare name
+/// takes its region from `dynamodb_region` and has no account of its own).
+#[cfg(feature = "store-dynamodb-single")]
+struct TableRef<'a> {
+    name: &'a str,
+    region: Option<&'a str>,
+    account: Option<&'a str>,
+}
+
+/// DynamoDB accepts a table's ARN (`arn:aws:dynamodb:<region>:<account>:table/<name>`)
+/// wherever it accepts its name, so `webvh` and the ARN of `webvh` are one table.
+/// Anything that is not a table ARN is taken as a bare name.
+#[cfg(feature = "store-dynamodb-single")]
+fn table_ref(config: &StoreConfig) -> Option<TableRef<'_>> {
+    let raw = config.dynamodb_table_name.as_deref()?;
+    let arn = raw.splitn(6, ':').collect::<Vec<_>>();
+    if let [prefix, _partition, "dynamodb", region, account, resource] = arn[..]
+        && prefix == "arn"
+        && let Some(rest) = resource.strip_prefix("table/")
+    {
+        let name = rest.split('/').next().unwrap_or(rest);
+        return Some(TableRef {
+            name,
+            region: Some(region).filter(|r| !r.is_empty()),
+            account: Some(account).filter(|a| !a.is_empty()),
+        });
+    }
+    Some(TableRef {
+        name: raw,
+        region: config.dynamodb_region.as_deref(),
+        account: None,
+    })
+}
+
 /// Whether two store configs can resolve to the same DynamoDB table: the same
-/// table name, in regions that are not provably different. An unset region
-/// means "whatever the environment says", which may be the other store's
-/// region, so it is treated as possibly the same (fail closed).
+/// table (a name and an ARN of it count as the same), in regions and accounts
+/// that are not provably different. An unset region or account means "whatever
+/// the environment says", which may be the other store's, so it is treated as
+/// possibly the same (fail closed).
 #[cfg(feature = "store-dynamodb-single")]
 fn same_single_table(a: &StoreConfig, b: &StoreConfig) -> bool {
-    let (Some(x), Some(y)) = (&a.dynamodb_table_name, &b.dynamodb_table_name) else {
+    let (Some(x), Some(y)) = (table_ref(a), table_ref(b)) else {
         return false;
     };
-    x == y
-        && !matches!(
-            (&a.dynamodb_region, &b.dynamodb_region),
-            (Some(r1), Some(r2)) if r1 != r2
-        )
+    let provably_different =
+        |p: Option<&str>, q: Option<&str>| matches!((p, q), (Some(p), Some(q)) if p != q);
+    x.name == y.name
+        && !provably_different(x.region, y.region)
+        && !provably_different(x.account, y.account)
 }
 
 /// Keep the daemon's main store and witness store on separate rows of a shared
@@ -630,6 +666,71 @@ context_id = "webvh"
                 c.witness_store.dynamodb_key_namespace.as_deref(),
                 Some("witness")
             );
+        }
+
+        const ARN: Option<&str> = Some("arn:aws:dynamodb:us-east-1:111122223333:table/webvh");
+
+        #[test]
+        fn a_name_and_the_arn_of_that_table_are_the_same_table() {
+            // DynamoDB accepts either for one table; comparing the raw strings
+            // would let the witness store share the main store's rows unseen.
+            for (main, witness) in [(T, ARN), (ARN, T), (ARN, ARN)] {
+                let mut c = stores((main, None, None), (witness, None, None));
+                separate_witness_store(&mut c).expect("ok");
+                assert_eq!(
+                    c.witness_store.dynamodb_key_namespace.as_deref(),
+                    Some("witness"),
+                    "{main:?} vs {witness:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn an_arn_and_a_name_in_a_different_region_are_different_tables() {
+            let mut c = stores((ARN, None, None), (T, Some("eu-west-1"), None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(c.witness_store.dynamodb_key_namespace, None);
+
+            // The same name in the ARN's own region is the same table.
+            let mut c = stores((ARN, None, None), (T, Some("us-east-1"), None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(
+                c.witness_store.dynamodb_key_namespace.as_deref(),
+                Some("witness")
+            );
+        }
+
+        #[test]
+        fn arns_of_different_accounts_regions_or_tables_are_different_tables() {
+            for other in [
+                "arn:aws:dynamodb:us-east-1:999999999999:table/webvh",
+                "arn:aws:dynamodb:eu-west-1:111122223333:table/webvh",
+                "arn:aws:dynamodb:us-east-1:111122223333:table/webvh-witness",
+            ] {
+                let mut c = stores((ARN, None, None), (Some(other), None, None));
+                separate_witness_store(&mut c).expect("ok");
+                assert_eq!(c.witness_store.dynamodb_key_namespace, None, "{other}");
+            }
+        }
+
+        #[test]
+        fn an_arn_naming_the_same_table_with_a_stream_or_index_suffix_resolves_to_the_table() {
+            let with_index = Some("arn:aws:dynamodb:us-east-1:111122223333:table/webvh/index/gsi");
+            let mut c = stores((T, None, None), (with_index, None, None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(
+                c.witness_store.dynamodb_key_namespace.as_deref(),
+                Some("witness")
+            );
+        }
+
+        #[test]
+        fn a_name_that_merely_starts_like_an_arn_is_a_plain_name() {
+            // Not a dynamodb table ARN: compared as a literal name.
+            let other = Some("arn:aws:s3:::webvh");
+            let mut c = stores((T, None, None), (other, None, None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(c.witness_store.dynamodb_key_namespace, None);
         }
 
         #[test]
