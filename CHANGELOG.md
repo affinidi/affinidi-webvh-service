@@ -29,46 +29,51 @@
   names were silently ignored. `WEBVH_` still works but is deprecated; when
   both are set, `DID_HOSTING_` wins.
 
-### Added — `store-dynamodb-single`, one externally provisioned DynamoDB table
+### Added — configurable caching for DID resolution
 
-- **A DynamoDB store that uses a single table you create yourself**
-  (`pk` string partition key, `sk` string sort key) instead of one table per
-  keyspace. Prefix listings are a partition-scoped `Query`, not a `Scan`, and the
-  backend never creates or describes the table, so its credentials need only
-  `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem` and `Query`. Table definition,
-  permissions, configuration and limits are in
-  [`docs/store-dynamodb-single.md`](docs/store-dynamodb-single.md). Select it with
-  the `store-dynamodb-single` feature (exclusive with the other storage
-  features); configure it with `store.dynamodb_table_name`.
-- **Reads are strongly consistent by default**, so a read sees every write that
-  completed before it (sessions, refresh tokens, lockout counters).
-  `dynamodb_consistent_reads = false` halves the read capacity used, at the cost
-  of reads that may miss a recent write.
-- **A write batch is one atomic transaction or it is refused.** More than 100
-  operations, more than 4 MB, the same key twice, or a key that is not UTF-8 now
-  fails before anything is written; nothing is split across transactions or
-  altered to fit. `Store::batch_limits()` reports the ceiling and the server's
-  backup restore chunks to it.
-- **An optional key namespace** (`store.dynamodb_key_namespace`) prefixes every
-  partition key so several stores can share one table without sharing rows;
-  unset, rows are addressed exactly as without it. **The daemon gives its witness
-  store the namespace `witness`** when both its stores share a table (their
-  keyspaces `acl` and `witnesses` would otherwise be the same rows, so a revoke
-  made through the witness would remove the entry from the control plane's ACL),
-  and
-  refuses to start if they still resolve to the same partitions. Stores on
-  separate tables are unaffected.
-- **A missing table or wrong key schema stops startup** with a message saying
-  what to fix, instead of failing on the first request.
-- The daemon's `setup` and runtime now read `DAEMON_STORE_*` and
-  `DAEMON_WITNESS_STORE_*` for every backend (it read no store variables before).
-  `StoreConfig` gains the public fields `dynamodb_table_name`,
-  `dynamodb_key_namespace` and `dynamodb_consistent_reads`.
+- **`[server.resolve_cache]`** sets the `Cache-Control` sent with every
+  successful resolve (`did.jsonl`, `did-witness.json`, `did.json`,
+  `keri.cesr`, the `/@name` redirect) on the server, watcher and daemon:
+  `max_age_secs` (default 300, as before; `0` sends `no-cache`),
+  `shared_max_age_secs` (`s-maxage`) and `stale_while_revalidate_secs`.
+  Each has a `{DID_HOSTING,WATCHER,DAEMON}_SERVER_RESOLVE_CACHE_*` env
+  override. Durations past one year are refused at startup. Errors keep
+  `no-store`.
 
-### Fixed — the daemon builds without the `ui` feature
+### Fixed
 
-- `did-hosting-daemon` failed to compile with `--no-default-features` (E0599 on
-  `StatusCode::into_response`). It builds again.
+- **did:web `did.json` is cacheable.** It carried no `Cache-Control`, so the
+  global default stamped it `no-store`; it now follows `[server.resolve_cache]`
+  like the other resolve paths.
+
+### Added — did:scid identities
+
+A `did:scid:vh:1` DID is verified by the same did:webvh log as its did:webvh
+form, but is a DID in its own right: `did:scid:vh:1:<scid>`, with
+`?src=<host>/<path>` only a locator for the log (VTI-KEY-160 to VTI-KEY-166
+of the VTI specification). Hosted logs are always did:webvh logs and are
+served exactly as before; a did:scid resolver fetches the same `did.jsonl`.
+
+- **Callers may present a did:scid.** An owner, ACL subject or proof signer
+  is recorded and compared as the bare did:scid DID: ACL and ownership keys,
+  validated DIDs, the dispatch caller and session subjects drop the `src`
+  locator, and issuer, sender, recipient and verification-method bindings
+  compare by DID, ignoring it. A proof whose `verificationMethod` carries
+  `src` is resolved through it and dereferenced by DID and fragment. A
+  did:scid signer whose did:webvh log is deactivated signs nothing. The
+  did:webvh and did:scid forms remain distinct identities.
+- **Self-created DIDs list their did:scid alias.** A DID this service mints
+  for itself (server bootstrap, daemon setup, self-managed recipe,
+  `WebVHClient::create_did`) lists `did:scid:vh:1:<scid>?src=…` in
+  `alsoKnownAs`, linking the two forms. `hosting.scid_also_known_as = false`
+  (env `<PREFIX>_HOSTING_SCID_ALSO_KNOWN_AS`, recipe
+  `identity.scid_also_known_as`) leaves it out. An existing DID keeps what it
+  published. `DidDocumentOptions` gains `omit_scid_alias`, so a struct literal
+  of it no longer compiles without it.
+- **The console shows did:scid.** The DID detail page lists a hosted DID's
+  did:scid alias with a Copy button; the DID table, domain matching and the
+  sign-in contact rule understand did:scid (a contact must carry `src`,
+  VTI-LNK-119).
 
 ## 0.10.0 (release/0.10)
 

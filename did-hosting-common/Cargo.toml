@@ -87,6 +87,7 @@ affinidi-secrets-resolver = { workspace = true }
 affinidi-did-resolver-cache-sdk = { workspace = true }
 agent-names = { workspace = true }
 didwebvh-rs = { workspace = true }
+affinidi-did-common = { workspace = true }
 # `method-webs` only. Resolution-side only (no `create` feature) — see the
 # workspace manifest for why the hosting service never holds KERI keys.
 affinidi-did-webs = { workspace = true, optional = true }

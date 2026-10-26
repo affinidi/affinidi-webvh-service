@@ -41,6 +41,7 @@ use serde_json::Value;
 use trust_tasks_rs::{RejectReason, TrustTask, VerificationError};
 
 use super::verifier::{TransportBoundVerifier, controller_did};
+use crate::scid::same_reference;
 use crate::server::didcomm_unpack::{FRESHNESS_WINDOW_SECS, FUTURE_SKEW_SECS};
 
 /// Why a document failed [`verify_sender_bound`].
@@ -217,7 +218,7 @@ where
     }
     let issuer = doc.issuer.as_deref().ok_or(BoundError::MissingIssuer)?;
     if let Some(expected) = expected_issuer
-        && issuer != expected
+        && !same_reference(issuer, expected)
     {
         return Err(BoundError::UnexpectedIssuer {
             issuer: issuer.to_string(),
@@ -225,7 +226,7 @@ where
         });
     }
     if let Some(sender) = transport_sender
-        && controller_did(sender) != issuer
+        && !same_reference(controller_did(sender), issuer)
     {
         return Err(BoundError::SenderMismatch {
             issuer: issuer.to_string(),
@@ -236,7 +237,7 @@ where
         .recipient
         .as_deref()
         .ok_or(BoundError::MissingRecipient)?;
-    if recipient != my_vid {
+    if !same_reference(recipient, my_vid) {
         return Err(BoundError::WrongRecipient {
             recipient: recipient.to_string(),
             expected: my_vid.to_string(),
@@ -257,7 +258,9 @@ where
         Relationship::Authentication => verifier.verify_operational(doc).await?,
         Relationship::AssertionMethod => verifier.verify_approval(doc).await?,
     }
-    Ok(issuer.to_string())
+    // The identity, not the reference: a did:scid issuer may carry the `src`
+    // its recipient needed to resolve it, which is not part of who it is.
+    Ok(crate::scid::identity(issuer))
 }
 
 /// Why a document failed [`verify_bound_key`].
@@ -496,6 +499,24 @@ mod tests {
             .await
             .expect("verifies");
         assert_eq!(proven, did);
+    }
+
+    /// A service presenting a did:scid identity is addressed by it, with or
+    /// without the `src` locator a sender used to resolve it.
+    #[tokio::test]
+    async fn a_did_scid_recipient_matches_with_or_without_src() {
+        const ME_SCID: &str = "did:scid:vh:1:QmService";
+        let (did, doc) = signed_by(1, "did:scid:vh:1:QmService?src=hosting.example").await;
+        let proven = verify_sender_bound(&doc, None, Some(&did), ME_SCID, &verifier())
+            .await
+            .expect("the locator is not part of the recipient's identity");
+        assert_eq!(proven, did);
+        // Another SCID is another recipient.
+        let (_, doc) = signed_by(1, "did:scid:vh:1:QmOther?src=hosting.example").await;
+        assert!(matches!(
+            verify_sender_bound(&doc, None, None, ME_SCID, &verifier()).await,
+            Err(BoundError::WrongRecipient { .. })
+        ));
     }
 
     #[tokio::test]

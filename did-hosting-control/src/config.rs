@@ -89,6 +89,7 @@ fn default_server() -> ServerConfig {
         port: 8532,
         trusted_proxies: Vec::new(),
         trusted_proxy_cidrs: Vec::new(),
+        resolve_cache: Default::default(),
     }
 }
 
@@ -202,6 +203,10 @@ impl AppConfig {
         // _MAX_JOURNAL) — shared, unprefixed names; see
         // `did_hosting_common::server::config::apply_fjall_env_overrides`.
         did_hosting_common::server::config::apply_fjall_env_overrides(&mut config.fjall)?;
+        did_hosting_common::server::config::apply_hosting_env_overrides(
+            "CONTROL",
+            &mut config.hosting,
+        );
 
         // Control-specific env vars
         macro_rules! env_opt {

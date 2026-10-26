@@ -37,12 +37,14 @@ async fn serve_content(
     // Public DID resolution is cacheable (content-addressed via the SCID).
     // Setting Cache-Control here overrides the global `no-store` security
     // middleware so CDNs / browsers can serve mirrored DIDs without
-    // hitting the watcher origin every time.
+    // hitting the watcher origin every time. The policy is
+    // `[server.resolve_cache]`.
+    let cache_control = state.config.server.resolve_cache.header_value();
     Ok((
         StatusCode::OK,
         [
             ("content-type", content_type),
-            ("cache-control", "public, max-age=300"),
+            ("cache-control", cache_control.as_str()),
         ],
         content,
     )

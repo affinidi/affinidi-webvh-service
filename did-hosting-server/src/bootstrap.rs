@@ -103,6 +103,7 @@ pub async fn bootstrap_root_did(
         true,
         public_url,
         ".well-known",
+        true,
     )
     .await
 }
@@ -128,6 +129,7 @@ pub async fn bootstrap_did(
     advertise_tsp: bool,
     public_url: &str,
     mnemonic: &str,
+    scid_also_known_as: bool,
 ) -> Result<BootstrapResult, AppError> {
     // Guard: must not already exist
     if dids_ks.contains_key(did_key(mnemonic)).await? {
@@ -162,6 +164,7 @@ pub async fn bootstrap_did(
                 None
             },
             tsp_endpoint: if advertise_tsp { mediator_did } else { None },
+            omit_scid_alias: !scid_also_known_as,
         },
     );
 

@@ -182,7 +182,11 @@ where
     // surface a resolve-then-check order left open: without it, any address
     // could make this server resolve an arbitrary claimed issuer's DID once
     // per request just by naming it here.
-    if doc.issuer.as_deref() != Some(control_did) {
+    if !doc
+        .issuer
+        .as_deref()
+        .is_some_and(|issuer| did_hosting_common::scid::same_reference(issuer, control_did))
+    {
         return Err(Refusal::Unverified(RejectReason::PermissionDenied {
             reason: "issuer is not this server's configured control plane".into(),
         }));

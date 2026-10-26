@@ -210,6 +210,14 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         &store,
     )
     .await;
+    // The control plane is authorised here by configuration, not by an ACL
+    // entry, so its did:scid floor is kept on that ground (VTI-KEY-162).
+    if let (Some(keeper), Some(control_did)) = (
+        identity.as_ref().and_then(|i| i.scid_floors.as_ref()),
+        config.control_did.as_deref(),
+    ) {
+        keeper.authorise(control_did);
+    }
     // Bind TCP before anything else: public resolution and the Trust Task
     // listener's HTTPS binding are served from it.
     let addr = format!("{}:{}", config.server.host, config.server.port);

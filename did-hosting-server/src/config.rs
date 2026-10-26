@@ -234,6 +234,10 @@ impl AppConfig {
         // _MAX_JOURNAL) — shared, unprefixed names; see
         // `did_hosting_common::server::config::apply_fjall_env_overrides`.
         did_hosting_common::server::config::apply_fjall_env_overrides(&mut config.fjall)?;
+        did_hosting_common::server::config::apply_hosting_env_overrides(
+            "WEBVH",
+            &mut config.hosting,
+        );
 
         // Server identity (did-hosting-server specific env vars)
         macro_rules! env_opt {
@@ -294,6 +298,13 @@ impl AppConfig {
             "DID_HOSTING_STATS_SYNC_INTERVAL_SECS",
             config.stats.sync_interval_secs
         );
+
+        // DID_HOSTING_SERVER_RESOLVE_CACHE_* — Cache-Control on DID
+        // resolution. Also validates `[server.resolve_cache]`.
+        config
+            .server
+            .resolve_cache
+            .apply_env_overrides("DID_HOSTING")?;
 
         // Validate configuration
         config.auth.validate()?;

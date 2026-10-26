@@ -212,6 +212,12 @@ Environment variables use the `DAEMON_` prefix:
 | `DAEMON_SERVER_HOST`  | Bind host               |
 | `DAEMON_SERVER_PORT`  | Bind port               |
 | `DAEMON_LOG_LEVEL`    | Log level               |
+| `DAEMON_SERVER_RESOLVE_CACHE_MAX_AGE_SECS` | DID-resolution `max-age` (0 = `no-cache`; default 300) |
+| `DAEMON_SERVER_RESOLVE_CACHE_SHARED_MAX_AGE_SECS` | DID-resolution `s-maxage` (empty clears) |
+| `DAEMON_SERVER_RESOLVE_CACHE_STALE_WHILE_REVALIDATE_SECS` | DID-resolution `stale-while-revalidate` (empty clears) |
+
+The same settings live in `[server.resolve_cache]` (`max_age_secs`,
+`shared_max_age_secs`, `stale_while_revalidate_secs`).
 
 ## CLI Commands
 

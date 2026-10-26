@@ -80,6 +80,11 @@ pub struct DidDocumentOptions<'a> {
     /// webvh templates' canonical preference order (TSP over DIDComm) —
     /// see `resolve_transport` / `didcomm_profile::resolve_mediator_did`.
     pub tsp_endpoint: Option<&'a str>,
+    /// Leave the `did:scid:vh:1:<scid>?src=…` alias out of `alsoKnownAs`.
+    /// By default the document lists it, linking the DID's did:webvh and
+    /// did:scid forms as one subject (VTI-KEY-166 of the VTI specification);
+    /// a service sets this from `hosting.scid_also_known_as = false`.
+    pub omit_scid_alias: bool,
 }
 
 /// Advertise a `WebVHHosting` service at `uri` on a document built by
@@ -327,6 +332,12 @@ pub fn build_did_document(
         doc["service"] = json!(services);
     }
 
+    // `{SCID}` is still a placeholder here; signing the first log entry fills
+    // it in, in the alias as everywhere else in the document.
+    if !opts.omit_scid_alias {
+        doc["alsoKnownAs"] = json!([DIDWebVHState::convert_webvh_id_to_scid_id(&did_id)]);
+    }
+
     doc
 }
 
@@ -490,6 +501,48 @@ pub async fn create_log_entry(
 mod tests {
     use super::*;
 
+    /// A self-created DID lists its did:scid alias by default (VTI-KEY-166),
+    /// and signing the first entry fills the SCID into it.
+    #[tokio::test]
+    async fn a_new_document_lists_its_scid_alias_by_default() {
+        let doc = build_did_document(
+            "example.com",
+            "services/control",
+            "z6MkKey",
+            &Default::default(),
+        );
+        assert_eq!(
+            doc["alsoKnownAs"],
+            json!(["did:scid:vh:1:{SCID}?src=example.com/services/control"])
+        );
+
+        let secret = Secret::generate_ed25519(None, None);
+        let pk = secret.get_public_keymultibase().unwrap();
+        let doc = build_did_document("example.com", "services/control", &pk, &Default::default());
+        let (scid, jsonl) = create_log_entry(&doc, &secret).await.unwrap();
+        let entry: serde_json::Value = serde_json::from_str(jsonl.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            entry["state"]["alsoKnownAs"],
+            json!([format!(
+                "did:scid:vh:1:{scid}?src=example.com/services/control"
+            )])
+        );
+    }
+
+    #[test]
+    fn the_scid_alias_can_be_left_out() {
+        let doc = build_did_document(
+            "example.com",
+            ".well-known",
+            "z6MkKey",
+            &DidDocumentOptions {
+                omit_scid_alias: true,
+                ..Default::default()
+            },
+        );
+        assert!(doc.get("alsoKnownAs").is_none());
+    }
+
     /// Keyring VTI-18: a self-managed daemon with no mediator used to mint a
     /// document with no `service` member at all. The hosting entry alone must
     /// be enough to create one.
@@ -533,6 +586,7 @@ mod tests {
                 key_agreement_multibase: Some("z6LSKa"),
                 mediator_endpoint: Some("did:web:mediator.example"),
                 tsp_endpoint: Some("did:web:mediator.example"),
+                omit_scid_alias: false,
             },
         );
         add_webvh_hosting_service(&mut doc, "https://example.com");
@@ -816,6 +870,7 @@ mod tests {
                 key_agreement_multibase: Some("z6LSKA"),
                 mediator_endpoint: Some("did:webvh:QmMED:mediator.example.com"),
                 tsp_endpoint: Some("did:webvh:QmMED:mediator.example.com"),
+                omit_scid_alias: false,
             },
         );
         let did_id = doc["id"].as_str().unwrap();
@@ -906,6 +961,7 @@ mod tests {
                 key_agreement_multibase: None,
                 mediator_endpoint: Some("did:webvh:QmMED:mediator.example.com"),
                 tsp_endpoint: Some("did:webvh:QmMED:mediator.example.com"),
+                omit_scid_alias: false,
             },
         );
         let types = service_types_from_doc(&doc);
@@ -1013,6 +1069,7 @@ mod tests {
                 key_agreement_multibase: None,
                 mediator_endpoint: None,
                 tsp_endpoint: None,
+                omit_scid_alias: false,
             },
         );
         assert!(service_types_from_doc(&doc).is_empty());

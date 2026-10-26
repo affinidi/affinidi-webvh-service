@@ -123,14 +123,15 @@ async fn serve_keri_cesr(
 
     debug!(mnemonic = %mnemonic, size = content.len(), "keri.cesr resolved");
 
+    // Same reasoning as the webvh log: a key event log is append-only and
+    // self-verifying, so a stale-but-signed copy cannot be forged into
+    // something else. Cache it per `[server.resolve_cache]`.
+    let cache_control = state.config.server.resolve_cache.header_value();
     Ok((
         StatusCode::OK,
         [
             ("content-type", CESR_CONTENT_TYPE),
-            // Same reasoning as the webvh log: a key event log is
-            // append-only and self-verifying, so a stale-but-signed
-            // copy cannot be forged into something else. Cache it.
-            ("cache-control", "public, max-age=300"),
+            ("cache-control", cache_control.as_str()),
         ],
         content,
     )
@@ -176,11 +177,12 @@ async fn serve_did_json(state: &AppState, record: &DidRecord) -> Result<Response
 
     debug!(mnemonic = %mnemonic, size = doc.len(), "did:webs document derived");
 
+    let cache_control = state.config.server.resolve_cache.header_value();
     Ok((
         StatusCode::OK,
         [
             ("content-type", "application/did+json"),
-            ("cache-control", "public, max-age=300"),
+            ("cache-control", cache_control.as_str()),
         ],
         doc,
     )
