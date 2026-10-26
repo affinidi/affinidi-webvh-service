@@ -596,13 +596,25 @@ async fn main() {
             }
         }
         Some(Command::Backup { output }) => {
-            if let Err(e) = did_hosting_server::backup::run_backup(cli.config, output).await {
+            if let Err(e) = did_hosting_server::backup::run_backup_with(
+                cli.config,
+                output,
+                DaemonConfig::load_server_config,
+            )
+            .await
+            {
                 eprintln!("Backup error: {e}");
                 std::process::exit(1);
             }
         }
         Some(Command::Restore { input }) => {
-            if let Err(e) = did_hosting_server::backup::run_restore(cli.config, input).await {
+            if let Err(e) = did_hosting_server::backup::run_restore_with(
+                cli.config,
+                input,
+                DaemonConfig::load_server_config,
+            )
+            .await
+            {
                 eprintln!("Restore error: {e}");
                 std::process::exit(1);
             }

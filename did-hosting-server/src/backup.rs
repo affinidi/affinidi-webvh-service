@@ -78,8 +78,25 @@ fn encode_pairs(pairs: Vec<RawKvPair>) -> Vec<KvEntry> {
         .collect()
 }
 
+/// How a backup or restore obtains the config it works on: the config file's
+/// path in, the effective [`AppConfig`] out. The server's own is
+/// [`AppConfig::load`]. A host that runs the server inside another binary passes
+/// its own, so the store it backs up or restores is the one that binary opens at
+/// runtime (the daemon applies `DAEMON_STORE_*`, which `AppConfig::load` does not
+/// read).
+pub type ConfigLoader = fn(Option<PathBuf>) -> Result<AppConfig, AppError>;
+
 pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<(), AppError> {
-    let config = AppConfig::load(config_path)?;
+    run_backup_with(config_path, output, AppConfig::load).await
+}
+
+/// [`run_backup`] over the config `load` produces.
+pub async fn run_backup_with(
+    config_path: Option<PathBuf>,
+    output: String,
+    load: ConfigLoader,
+) -> Result<(), AppError> {
+    let config = load(config_path)?;
 
     let config_json = serde_json::to_string_pretty(&config)
         .map_err(|e| AppError::Config(format!("failed to serialize config: {e}")))?;
@@ -183,6 +200,16 @@ pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<
 }
 
 pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<(), AppError> {
+    run_restore_with(config_path, input, AppConfig::load).await
+}
+
+/// [`run_restore`] over the config `load` produces, read after the backup's own
+/// config has been written to the config file.
+pub async fn run_restore_with(
+    config_path: Option<PathBuf>,
+    input: String,
+    load: ConfigLoader,
+) -> Result<(), AppError> {
     let json = std::fs::read_to_string(&input)
         .map_err(|e| AppError::Config(format!("failed to read backup file {input}: {e}")))?;
 
@@ -238,7 +265,7 @@ pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<
     })?;
     eprintln!("  Config restored to: {}", config_file_path.display());
 
-    let config = AppConfig::load(config_path)?;
+    let config = load(config_path)?;
     let store = Store::open(&config.store).await?;
 
     let dids_ks = store.keyspace(KS_DIDS)?;

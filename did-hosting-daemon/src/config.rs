@@ -332,6 +332,15 @@ impl DaemonConfig {
         Ok(config)
     }
 
+    /// The server config a backup or restore works on: this daemon's, so its
+    /// `store` is the one the daemon opens at runtime, `DAEMON_STORE_*` overrides
+    /// included. `did_hosting_server::backup` takes this as its config loader.
+    pub fn load_server_config(
+        config_path: Option<PathBuf>,
+    ) -> Result<did_hosting_server::config::AppConfig, AppError> {
+        Self::load(config_path).map(|config| config.server_config())
+    }
+
     /// Build a did-hosting-server AppConfig from the daemon config.
     pub fn server_config(&self) -> did_hosting_server::config::AppConfig {
         did_hosting_server::config::AppConfig {
@@ -525,6 +534,140 @@ context_id = "webvh"
         assert_eq!(
             cfg.public_url.as_deref(),
             Some("https://daemon.example.com")
+        );
+    }
+
+    /// A daemon config whose `store.data_dir` is `store` (and witness store
+    /// `witness`), written to a temp dir.
+    fn write_daemon_config(
+        dir: &std::path::Path,
+        store: &std::path::Path,
+        witness: &std::path::Path,
+    ) -> PathBuf {
+        let toml = SELF_MANAGED_TOML
+            .replace("data/daemon/store", &store.display().to_string())
+            .replace("data/daemon/witness", &witness.display().to_string());
+        let path = dir.join("config.toml");
+        std::fs::write(&path, toml).expect("write config");
+        path
+    }
+
+    async fn seed(data_dir: &std::path::Path, key: &str) {
+        let store = did_hosting_common::server::store::Store::open(&StoreConfig {
+            data_dir: data_dir.to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open store");
+        let dids = store
+            .keyspace(did_hosting_common::server::store::KS_DIDS)
+            .expect("dids");
+        dids.insert_raw(key, b"v".to_vec()).await.expect("seed");
+        store.persist().await.expect("persist");
+    }
+
+    async fn did_keys(data_dir: &std::path::Path) -> Vec<String> {
+        let store = did_hosting_common::server::store::Store::open(&StoreConfig {
+            data_dir: data_dir.to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open store");
+        let dids = store
+            .keyspace(did_hosting_common::server::store::KS_DIDS)
+            .expect("dids");
+        let mut keys: Vec<String> = dids
+            .iter_all()
+            .await
+            .expect("scan")
+            .into_iter()
+            .map(|(k, _)| String::from_utf8(k).expect("utf8"))
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn the_server_config_for_backup_carries_the_daemons_store_environment() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_daemon_config(dir.path(), &dir.path().join("a"), &dir.path().join("w"));
+        // SAFETY: serialised by ENV_LOCK; cleared again below.
+        unsafe { std::env::set_var("DAEMON_STORE_DATA_DIR", dir.path().join("b")) };
+
+        let loaded = DaemonConfig::load_server_config(Some(path));
+        unsafe { std::env::remove_var("DAEMON_STORE_DATA_DIR") };
+
+        assert_eq!(loaded.expect("load").store.data_dir, dir.path().join("b"));
+    }
+
+    #[tokio::test]
+    async fn backup_exports_the_store_the_daemon_opens_not_the_one_in_the_file() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        // The file's store holds two DIDs and the env's one, so the count says
+        // which was exported.
+        seed(&a, "did:in-file").await;
+        seed(&a, "did:in-file-too").await;
+        seed(&b, "did:in-env").await;
+        let path = write_daemon_config(dir.path(), &a, &dir.path().join("w"));
+        let out = dir.path().join("backup.json");
+        // SAFETY: serialised by ENV_LOCK; cleared again below.
+        unsafe { std::env::set_var("DAEMON_STORE_DATA_DIR", &b) };
+
+        let result = did_hosting_server::backup::run_backup_with(
+            Some(path),
+            out.display().to_string(),
+            DaemonConfig::load_server_config,
+        )
+        .await;
+        unsafe { std::env::remove_var("DAEMON_STORE_DATA_DIR") };
+
+        result.expect("backup");
+        let backup: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).expect("read")).expect("json");
+        let dids = backup["keyspaces"]["dids"].as_array().expect("dids");
+        assert_eq!(dids.len(), 1, "{dids:?}");
+    }
+
+    #[tokio::test]
+    async fn restore_writes_into_the_store_the_daemon_opens_and_leaves_a_loadable_config() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        seed(&a, "did:in-file").await;
+        seed(&b, "did:in-env").await;
+        let path = write_daemon_config(dir.path(), &a, &dir.path().join("w"));
+        let out = dir.path().join("backup.json");
+        // SAFETY: serialised by ENV_LOCK; cleared again below.
+        unsafe { std::env::set_var("DAEMON_STORE_DATA_DIR", &b) };
+        did_hosting_server::backup::run_backup_with(
+            Some(path.clone()),
+            out.display().to_string(),
+            DaemonConfig::load_server_config,
+        )
+        .await
+        .expect("backup");
+        // Lose the env store's data, then restore the backup.
+        std::fs::remove_dir_all(&b).expect("wipe");
+
+        let result = did_hosting_server::backup::run_restore_with(
+            Some(path.clone()),
+            out.display().to_string(),
+            DaemonConfig::load_server_config,
+        )
+        .await;
+        let reloaded = DaemonConfig::load(Some(path));
+        unsafe { std::env::remove_var("DAEMON_STORE_DATA_DIR") };
+
+        result.expect("restore");
+        assert!(reloaded.is_ok(), "the restored config file still loads");
+        assert_eq!(did_keys(&b).await, vec!["did:in-env".to_string()]);
+        assert_eq!(
+            did_keys(&a).await,
+            vec!["did:in-file".to_string()],
+            "the store named only in the file is untouched"
         );
     }
 
