@@ -1255,3 +1255,165 @@ pub async fn run_health_checks(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod flush_stats_tests {
+    use super::*;
+    use did_hosting_common::DidStats;
+    use did_hosting_common::server::config::StoreConfig;
+    use did_hosting_common::server::stats_collector::StatsCollector;
+
+    struct Fixture {
+        store: Store,
+        stats: KeyspaceHandle,
+        timeseries: KeyspaceHandle,
+        dids: KeyspaceHandle,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open store");
+        Fixture {
+            stats: store.keyspace(KS_STATS).expect("stats"),
+            timeseries: store.keyspace(KS_TIMESERIES).expect("timeseries"),
+            dids: store.keyspace(KS_DIDS).expect("dids"),
+            store,
+            _dir: dir,
+        }
+    }
+
+    async fn flush(f: &Fixture, collector: &StatsCollector) -> Result<(), AppError> {
+        flush_stats_to_store(collector, &f.stats, &f.timeseries, &f.dids, &f.store).await
+    }
+
+    async fn stored_stats(f: &Fixture, mnemonic: &str) -> Option<DidStats> {
+        f.stats
+            .get(format!("stats:{mnemonic}"))
+            .await
+            .expect("read stats")
+    }
+
+    /// Sum of `(resolves, updates)` over every time-series bucket whose key
+    /// starts with `prefix`. The 5-minute bucket a flush lands in depends on the
+    /// clock, so a test sums across buckets instead of naming one.
+    async fn bucket_totals(f: &Fixture, prefix: &str) -> (u64, u64) {
+        let mut totals = (0, 0);
+        for (_, raw) in f.timeseries.prefix_iter_raw(prefix).await.expect("scan") {
+            let v: serde_json::Value = serde_json::from_slice(&raw).expect("bucket json");
+            totals.0 += v["r"].as_u64().expect("r");
+            totals.1 += v["u"].as_u64().expect("u");
+        }
+        totals
+    }
+
+    #[tokio::test]
+    async fn a_flush_with_nothing_to_write_only_refreshes_the_did_count() {
+        let f = fixture().await;
+        f.dids
+            .insert_raw("did:a", b"1".to_vec())
+            .await
+            .expect("seed");
+        f.dids
+            .insert_raw("did:b", b"2".to_vec())
+            .await
+            .expect("seed");
+        let collector = StatsCollector::new();
+
+        flush(&f, &collector).await.expect("flush");
+
+        assert_eq!(collector.get_aggregate().total_dids, 2);
+        assert!(f.stats.iter_all().await.expect("scan").is_empty());
+        assert!(f.timeseries.iter_all().await.expect("scan").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_flush_adds_the_deltas_to_the_stored_totals_and_drains_the_collector() {
+        let f = fixture().await;
+        f.stats
+            .insert(
+                "stats:a",
+                &DidStats {
+                    total_resolves: 10,
+                    total_updates: 1,
+                    last_resolved_at: Some(500),
+                    last_updated_at: Some(50),
+                },
+            )
+            .await
+            .expect("seed");
+        let collector = StatsCollector::new();
+        // `last_resolved_at` is older than the stored one and must not win;
+        // `last_updated_at` is newer and must.
+        collector.record_deltas("a", 3, 2, Some(400), Some(90));
+        collector.record_deltas("b", 1, 0, Some(70), None);
+
+        flush(&f, &collector).await.expect("flush");
+
+        let a = stored_stats(&f, "a").await.expect("a");
+        assert_eq!((a.total_resolves, a.total_updates), (13, 3));
+        assert_eq!(
+            (a.last_resolved_at, a.last_updated_at),
+            (Some(500), Some(90))
+        );
+        let b = stored_stats(&f, "b").await.expect("b");
+        assert_eq!((b.total_resolves, b.total_updates), (1, 0));
+        assert_eq!((b.last_resolved_at, b.last_updated_at), (Some(70), None));
+        assert!(
+            collector.drain_for_sync().is_empty(),
+            "a successful flush drains every delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flush_writes_per_did_and_server_wide_time_series_buckets() {
+        let f = fixture().await;
+        let collector = StatsCollector::new();
+        collector.record_deltas("a", 3, 2, None, None);
+        collector.record_deltas("b", 4, 0, None, None);
+
+        flush(&f, &collector).await.expect("flush");
+
+        assert_eq!(bucket_totals(&f, "ts:a:").await, (3, 2));
+        assert_eq!(bucket_totals(&f, "ts:b:").await, (4, 0));
+        assert_eq!(bucket_totals(&f, "ts:_all:").await, (7, 2));
+    }
+
+    #[tokio::test]
+    async fn successive_flushes_accumulate_rather_than_overwrite() {
+        let f = fixture().await;
+        let collector = StatsCollector::new();
+
+        collector.record_deltas("a", 2, 1, None, None);
+        flush(&f, &collector).await.expect("first flush");
+        collector.record_deltas("a", 5, 0, None, None);
+        flush(&f, &collector).await.expect("second flush");
+
+        let a = stored_stats(&f, "a").await.expect("a");
+        assert_eq!((a.total_resolves, a.total_updates), (7, 1));
+        assert_eq!(bucket_totals(&f, "ts:a:").await, (7, 1));
+        assert_eq!(bucket_totals(&f, "ts:_all:").await, (7, 1));
+    }
+
+    #[tokio::test]
+    async fn a_flush_of_many_dids_commits_every_one() {
+        // More DIDs than fit in one 100-operation atomic write (two writes per
+        // DID plus `_all`), which is what a bounded backend would refuse.
+        let f = fixture().await;
+        let collector = StatsCollector::new();
+        for i in 0..120 {
+            collector.record_deltas(&format!("did{i:03}"), 1, 1, None, None);
+        }
+
+        flush(&f, &collector).await.expect("flush");
+
+        assert_eq!(f.stats.iter_all().await.expect("scan").len(), 120);
+        assert_eq!(bucket_totals(&f, "ts:_all:").await, (120, 120));
+        assert!(collector.drain_for_sync().is_empty());
+    }
+}

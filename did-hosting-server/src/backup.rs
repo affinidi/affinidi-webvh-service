@@ -513,4 +513,123 @@ mod tests {
             "the valid entry before the bad one must not have been written"
         );
     }
+    /// A `config.toml` that points the store at `data_dir` and leaves
+    /// everything else at its default.
+    fn write_config(dir: &std::path::Path, data_dir: &std::path::Path) -> PathBuf {
+        let path = dir.join("config.toml");
+        let toml = format!("[store]\ndata_dir = {:?}\n", data_dir.display().to_string());
+        std::fs::write(&path, toml).expect("write config");
+        path
+    }
+
+    async fn open_store_at(data_dir: &std::path::Path) -> Store {
+        let config = did_hosting_common::server::config::StoreConfig {
+            data_dir: data_dir.to_path_buf(),
+            ..Default::default()
+        };
+        Store::open(&config).await.expect("open store")
+    }
+
+    #[tokio::test]
+    async fn run_backup_exports_the_store_named_by_the_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        {
+            let store = open_store_at(&data).await;
+            let dids = store.keyspace(KS_DIDS).expect("dids");
+            dids.insert_raw("did:one", b"v1".to_vec())
+                .await
+                .expect("seed");
+            let stats = store.keyspace(KS_STATS).expect("stats");
+            stats
+                .insert_raw("stats:one", b"s1".to_vec())
+                .await
+                .expect("seed");
+            store.persist().await.expect("persist");
+        }
+        let config = write_config(dir.path(), &data);
+        let out = dir.path().join("backup.json");
+
+        run_backup(Some(config), out.display().to_string())
+            .await
+            .expect("backup");
+
+        let backup: Backup =
+            serde_json::from_str(&std::fs::read_to_string(&out).expect("read")).expect("parse");
+        assert_eq!(backup.version, BACKUP_VERSION);
+        assert_eq!(backup.keyspaces.dids.len(), 1);
+        assert_eq!(backup.keyspaces.stats.len(), 1);
+        assert_eq!(
+            BASE64.decode(&backup.keyspaces.dids[0].key).expect("key"),
+            b"did:one"
+        );
+        assert!(backup.keyspaces.domains.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_restore_writes_the_backup_back_into_the_store_and_rewrites_the_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        let config = write_config(dir.path(), &data);
+        {
+            let store = open_store_at(&data).await;
+            let dids = store.keyspace(KS_DIDS).expect("dids");
+            dids.insert_raw("did:one", b"v1".to_vec())
+                .await
+                .expect("seed");
+            dids.insert_raw("did:two", b"v2".to_vec())
+                .await
+                .expect("seed");
+            store.persist().await.expect("persist");
+        }
+        let out = dir.path().join("backup.json");
+        run_backup(Some(config.clone()), out.display().to_string())
+            .await
+            .expect("backup");
+        {
+            let store = open_store_at(&data).await;
+            let dids = store.keyspace(KS_DIDS).expect("dids");
+            dids.remove("did:one").await.expect("wipe");
+            dids.remove("did:two").await.expect("wipe");
+            store.persist().await.expect("persist");
+        }
+        std::fs::remove_file(&config).expect("remove config");
+
+        run_restore(Some(config.clone()), out.display().to_string())
+            .await
+            .expect("restore");
+
+        assert!(config.exists(), "the config in the backup is written back");
+        let store = open_store_at(&data).await;
+        let dids = store.keyspace(KS_DIDS).expect("dids");
+        assert_eq!(
+            dids.get_raw("did:one").await.expect("get"),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            dids.get_raw("did:two").await.expect("get"),
+            Some(b"v2".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn run_restore_refuses_a_backup_from_a_newer_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write_config(dir.path(), &dir.path().join("data"));
+        let out = dir.path().join("backup.json");
+        let newer = v1_backup_json().replace(
+            "\"version\": 1",
+            &format!("\"version\": {}", BACKUP_VERSION + 1),
+        );
+        std::fs::write(&out, newer).expect("write");
+
+        let err = run_restore(Some(config), out.display().to_string())
+            .await
+            .expect_err("a newer backup is refused");
+
+        assert!(
+            matches!(&err, AppError::Config(m) if m.contains("newer")),
+            "{err:?}"
+        );
+    }
 }
