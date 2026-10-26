@@ -68,6 +68,17 @@ pub async fn run_sweep_once(store: &Store) -> u64 {
             continue;
         }
         match purge_domain_dids(store, &entry.domain, &entry.reason).await {
+            Ok(report) if report.failed > 0 => {
+                // Some DIDs are still held. Clearing the entry would strand
+                // them with nothing left to retry the purge.
+                warn!(
+                    domain = %entry.domain,
+                    reason = %entry.reason,
+                    deleted = report.deleted,
+                    failed = report.failed,
+                    "purge sweep: some DIDs could not be deleted; entry retained for next tick"
+                );
+            }
             Ok(report) => {
                 info!(
                     domain = %entry.domain,
@@ -519,6 +530,48 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// A DID whose purge the backend refuses (its batch is over the limit) is
+    /// still held, so the pending row must stay for the next tick instead of
+    /// being cleared with the DID undeleted.
+    #[tokio::test]
+    async fn sweep_keeps_the_pending_row_while_a_did_could_not_be_deleted() {
+        use did_hosting_common::did_ops::AgentNameEntry;
+        use did_hosting_common::server::store::bounded_memory::BoundedMemory;
+
+        let store = BoundedMemory::new(100).store();
+        let ks = store.keyspace(KS_DIDS).unwrap();
+        let mut rec = record("heavy", "stuck.example");
+        // Five fixed deletes plus 96 names: 101 operations, one over the limit.
+        rec.agent_names = (0..96)
+            .map(|i| AgentNameEntry {
+                name: format!("n{i:02}"),
+                enabled: false,
+                created_at: 1,
+            })
+            .collect();
+        ks.insert(did_key("heavy"), &rec).await.unwrap();
+        schedule(&store, "stuck.example", 0, 1, "grace-expired", "did:c")
+            .await
+            .unwrap();
+
+        assert_eq!(run_sweep_once(&store).await, 0);
+
+        assert!(
+            ks.get::<DidRecord>(did_key("heavy"))
+                .await
+                .unwrap()
+                .is_some(),
+            "the DID is still held"
+        );
+        assert!(
+            pending_purge::get(&store, "stuck.example")
+                .await
+                .unwrap()
+                .is_some(),
+            "the purge stays queued"
         );
     }
 }

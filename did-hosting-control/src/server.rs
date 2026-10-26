@@ -1014,7 +1014,10 @@ fn run_storage_thread(
 /// handed back to the collector for the next flush, if the backend's commit is
 /// all-or-nothing ([`Store::commits_atomically`]); the chunks already committed
 /// are not. On a backend that can commit part of a batch they are dropped
-/// instead, since a retry would count the committed part twice.
+/// instead, since a retry would count the committed part twice. A chunk whose
+/// commit failed with an unknown outcome ([`AppError::StoreOutcomeUnknown`]) may
+/// have been applied, so it is dropped too; the chunks after it were never sent
+/// and are handed back.
 pub async fn flush_stats_to_store(
     collector: &did_hosting_common::server::stats_collector::StatsCollector,
     stats_ks: &KeyspaceHandle,
@@ -1043,19 +1046,30 @@ pub async fn flush_stats_to_store(
         if let Err(e) =
             write_stats_chunk(&chunks[done], bucket_epoch, stats_ks, timeseries_ks, store).await
         {
-            let unwritten = chunks.drain(done..).flatten();
-            if store.commits_atomically() {
-                collector.restore_deltas(unwritten);
-            } else {
+            let mut unwritten = chunks.drain(done..);
+            if !store.commits_atomically() {
                 // A backend that can commit part of a batch and then fail may
                 // already hold some of these deltas, and a retry would count
                 // them twice. Dropping is the safe side: the same loss as before
                 // the flush was chunked.
                 warn!(
-                    dropped = unwritten.count(),
+                    dropped = unwritten.flatten().count(),
                     "stats flush failed on a backend whose batches are not all-or-nothing; \
                      not retrying the deltas, to avoid counting them twice"
                 );
+            } else if matches!(e, AppError::StoreOutcomeUnknown(_)) {
+                // The failed chunk may have been committed with its reply lost,
+                // and a retry would count it twice. The chunks after it were
+                // never sent, so they go back.
+                let failed = unwritten.next().map_or(0, |c| c.len());
+                warn!(
+                    dropped = failed,
+                    "stats flush: the outcome of a write is unknown; not retrying that \
+                     chunk, to avoid counting it twice"
+                );
+                collector.restore_deltas(unwritten.flatten());
+            } else {
+                collector.restore_deltas(unwritten.flatten());
             }
             return Err(e);
         }
@@ -1694,6 +1708,24 @@ mod flush_stats_tests {
         assert!(f.store.commits_atomically(), "fjall: one journalled batch");
         assert!(bounded(100, None).store.commits_atomically());
         assert!(!bounded_non_atomic(100, None).store.commits_atomically());
+    }
+
+    #[tokio::test]
+    async fn a_chunk_with_an_unknown_outcome_is_not_retried_but_the_ones_after_it_are() {
+        // Chunks of 4, 4, 2. The second commit is applied and its reply is lost,
+        // so its deltas may already be stored: retrying them would count them
+        // twice. The third chunk was never sent and goes back.
+        let f = fixture_on(BoundedMemory::new(9).lose_reply(1));
+        let collector = StatsCollector::new();
+        for i in 0..10 {
+            collector.record_deltas(&format!("did{i:02}"), 1, 0, None, None);
+        }
+
+        let err = flush_bounded(&f, &collector).await.expect_err("reply lost");
+        assert!(matches!(err, AppError::StoreOutcomeUnknown(_)), "{err:?}");
+
+        assert_eq!(collector.drain_for_sync().len(), 2);
+        assert_eq!(f.stats.iter_all().await.unwrap().len(), 8);
     }
 
     #[tokio::test]

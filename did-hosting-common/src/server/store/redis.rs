@@ -246,9 +246,16 @@ impl BatchOps for RedisBatch {
                 }
             }
 
-            pipe.query_async::<()>(&mut conn)
-                .await
-                .map_err(|e| AppError::Store(format!("redis pipeline: {e}")))?;
+            pipe.query_async::<()>(&mut conn).await.map_err(|e| {
+                // A dropped connection or a timeout can lose the reply to an
+                // `EXEC` that already ran; any other error is the server
+                // refusing the transaction.
+                if e.is_io_error() || e.is_timeout() || e.is_connection_dropped() {
+                    AppError::StoreOutcomeUnknown(format!("redis pipeline: {e}"))
+                } else {
+                    AppError::Store(format!("redis pipeline: {e}"))
+                }
+            })?;
 
             Ok(())
         })

@@ -39,6 +39,13 @@ pub enum AppError {
     #[error("store error: {0}")]
     Store(String),
 
+    /// A write was sent but the backend's answer was lost (a timeout, a dropped
+    /// connection), so it may or may not have been applied. Distinct from
+    /// [`AppError::Store`], where the write definitely was not: a caller that
+    /// retries additive work must not retry on this one.
+    #[error("store write outcome unknown: {0}")]
+    StoreOutcomeUnknown(String),
+
     #[error("secret store error: {0}")]
     SecretStore(String),
 
@@ -417,6 +424,7 @@ impl IntoResponse for AppError {
             AppError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::StoreOutcomeUnknown(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::SecretStore(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Serialization(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,

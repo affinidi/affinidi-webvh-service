@@ -758,9 +758,43 @@ impl BatchOps for SingleTableBatch {
                 .set_transact_items(Some(items))
                 .send()
                 .await
-                .map_err(|e| AppError::Store(format!("dynamodb-single transact: {e}")))?;
+                .map_err(|e| {
+                    let msg = format!("dynamodb-single transact: {e}");
+                    if transact_outcome_known(&e) {
+                        AppError::Store(msg)
+                    } else {
+                        AppError::StoreOutcomeUnknown(msg)
+                    }
+                })?;
             Ok(())
         })
+    }
+}
+
+/// Whether a failed `TransactWriteItems` is known not to have been applied.
+///
+/// DynamoDB answered with a refusal (cancelled, throttled, invalid) or the
+/// request was never built: nothing was written. A timeout, a dropped
+/// connection, an unreadable response or an internal error can follow a
+/// commit, so the outcome there is unknown.
+fn transact_outcome_known(
+    e: &aws_sdk_dynamodb::error::SdkError<
+        aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError,
+    >,
+) -> bool {
+    use aws_sdk_dynamodb::error::SdkError;
+    match e {
+        SdkError::ConstructionFailure(_) => true,
+        SdkError::ServiceError(se) => {
+            let err = se.err();
+            err.is_transaction_canceled_exception()
+                || err.is_provisioned_throughput_exceeded_exception()
+                || err.is_request_limit_exceeded()
+                || err.is_resource_not_found_exception()
+                || err.is_transaction_in_progress_exception()
+                || err.is_idempotent_parameter_mismatch_exception()
+        }
+        _ => false,
     }
 }
 

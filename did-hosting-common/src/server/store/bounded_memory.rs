@@ -24,6 +24,7 @@ pub struct BoundedMemory {
     rows: Rows,
     limits: BatchLimits,
     fail_commit: Option<usize>,
+    lose_reply: Option<usize>,
     commits: Arc<Mutex<Vec<usize>>>,
     atomic: bool,
 }
@@ -38,6 +39,7 @@ impl BoundedMemory {
                 max_bytes: 4 * 1024 * 1024,
             },
             fail_commit: None,
+            lose_reply: None,
             commits: Arc::default(),
             atomic: true,
         }
@@ -46,6 +48,13 @@ impl BoundedMemory {
     /// Make the `n`-th commit (0-based) fail without writing anything.
     pub fn fail_commit(mut self, n: usize) -> Self {
         self.fail_commit = Some(n);
+        self
+    }
+
+    /// Make the `n`-th commit (0-based) apply its batch and then report
+    /// [`AppError::StoreOutcomeUnknown`], as a lost reply would.
+    pub fn lose_reply(mut self, n: usize) -> Self {
+        self.lose_reply = Some(n);
         self
     }
 
@@ -184,7 +193,11 @@ impl BatchOps for Batch {
                         None => m.remove(&key),
                     };
                 }
-                Ok(())
+                if b.backend.lose_reply == Some(attempt) {
+                    Err(AppError::StoreOutcomeUnknown("injected lost reply".into()))
+                } else {
+                    Ok(())
+                }
             }
         };
         Box::pin(async move { result })

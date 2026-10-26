@@ -962,6 +962,25 @@ fn check_agent_name_count(state: &AppState, claimed: usize) -> Result<(), AppErr
     }
 }
 
+/// Refuse a registry that holds more agent names than one atomic batch can
+/// carry.
+///
+/// [`check_agent_name_count`] bounds what a document claims, but the registry
+/// also holds parked names the document does not, and an `activate` leaves the
+/// DID's other names enabled. Publishing or purging a DID rewrites or removes an
+/// index row for every entry, so the whole registry must stay within the same
+/// bound or a later publish (or the purge of its domain) is refused by the
+/// backend. Check the registry as it will be after the change.
+fn check_agent_name_registry(state: &AppState, held: usize) -> Result<(), AppError> {
+    match state.store.max_agent_names() {
+        Some(max) if held > max => Err(AppError::Validation(format!(
+            "this DID would hold {held} agent names, including parked ones; \
+             this store holds at most {max} per DID. Remove a name first"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Publish (upload) a did.jsonl log for an existing DID slot.
 /// Reconcile the authoritative agent-name registry against a just-published
 /// document, returning the index changes to fold into the commit batch:
@@ -1154,6 +1173,7 @@ pub async fn publish_did(
         now,
     )
     .await?;
+    check_agent_name_registry(state, record.agent_names.len())?;
 
     let mut batch = state.store.batch();
     batch.insert_raw(
@@ -1371,6 +1391,7 @@ async fn apply_agent_name_op(
                 return Err(AgentNameError::Taken.into());
             }
             upsert_agent_name(&mut record.agent_names, &name, now_epoch());
+            check_agent_name_registry(state, record.agent_names.len())?;
             IndexWrite::Insert
         }
         AgentNameOp::Park => {
@@ -4067,6 +4088,41 @@ mod tests_atomic {
             .expect_err("the document claims too many names");
 
         assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn activating_names_one_by_one_cannot_grow_the_registry_past_the_cap() {
+        // Each `activate` carries a one-name document, so the document cap never
+        // trips, but the earlier names stay enabled in the registry.
+        let backend = BoundedMemory::new(100);
+        let (state, _dir) = test_state_on(Some(backend.store())).await;
+        let owner = "did:example:o";
+        let path = "slot-grow";
+        register_owned(&state, owner, path).await;
+
+        for i in 0..47 {
+            let log = log_claiming(path, &[format!("n{i:02}")]).await;
+            set_agent_name(
+                &owner_auth(owner),
+                &state,
+                path,
+                &format!("n{i:02}"),
+                &log,
+                None,
+            )
+            .await
+            .expect("within the cap");
+        }
+        let log = log_claiming(path, &["n47".to_string()]).await;
+        let err = set_agent_name(&owner_auth(owner), &state, path, "n47", &log, None)
+            .await
+            .expect_err("the 48th entry does not fit");
+
+        assert!(
+            matches!(&err, AppError::Validation(m) if m.contains("48") && m.contains("47")),
+            "{err:?}"
+        );
+        assert_eq!(get_record(&state, path).await.agent_names.len(), 47);
     }
 
     #[tokio::test]
