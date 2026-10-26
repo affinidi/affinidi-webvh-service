@@ -563,8 +563,14 @@ mod force_reprovision_tests {
     /// leaving both the failed setup AND the old identity behind (Keyring
     /// VTI-17). The store ends up with exactly the new DID, servable, and
     /// the local-resolution health check agrees.
+    // Holds `ENV_LOCK` across the awaits on purpose: setup reads `DAEMON_STORE_*`, which
+    // other tests set, and a store opened at the wrong path collides on its lock.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn reprovision_to_a_new_url_replaces_the_stale_did() {
+        let _guard = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let data_dir = dir.path().join("data");
@@ -641,8 +647,14 @@ mod force_reprovision_tests {
     /// The same `public_url` reprovisioned still succeeds (a credential
     /// rotation with no host change) — `.well-known` ends up matching
     /// whatever `server_did` the reprovision recorded, and health agrees.
+    // Holds `ENV_LOCK` across the awaits on purpose: setup reads `DAEMON_STORE_*`, which
+    // other tests set, and a store opened at the wrong path collides on its lock.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn reprovision_to_the_same_url_still_succeeds_and_stays_healthy() {
+        let _guard = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let data_dir = dir.path().join("data");

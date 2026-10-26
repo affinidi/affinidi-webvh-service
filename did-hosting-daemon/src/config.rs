@@ -601,6 +601,8 @@ context_id = "webvh"
         assert_eq!(loaded.expect("load").store.data_dir, dir.path().join("b"));
     }
 
+    // The env var must stay set across the awaits, so `ENV_LOCK` is held across them.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn backup_exports_the_store_the_daemon_opens_not_the_one_in_the_file() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -631,6 +633,8 @@ context_id = "webvh"
         assert_eq!(dids.len(), 1, "{dids:?}");
     }
 
+    // The env var must stay set across the awaits, so `ENV_LOCK` is held across them.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn restore_writes_into_the_store_the_daemon_opens_and_leaves_a_loadable_config() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
