@@ -45,24 +45,15 @@ pub async fn run_from_recipe(
 /// `config.toml`: the given data directories, with `DAEMON_STORE_*` and
 /// `DAEMON_WITNESS_STORE_*` applied so setup opens (and records) the same backend
 /// the runtime will use, e.g. a pre-provisioned DynamoDB single table.
-fn store_configs(
+pub(crate) fn store_configs(
     store_path: std::path::PathBuf,
     witness_store_path: std::path::PathBuf,
 ) -> (StoreConfig, StoreConfig) {
-    let mut store = StoreConfig {
-        data_dir: store_path,
-        ..StoreConfig::default()
-    };
-    did_hosting_common::server::config::apply_store_env_overrides("DAEMON_STORE", &mut store);
-    let mut witness_store = StoreConfig {
-        data_dir: witness_store_path,
-        ..StoreConfig::default()
-    };
-    did_hosting_common::server::config::apply_store_env_overrides(
-        "DAEMON_WITNESS_STORE",
-        &mut witness_store,
-    );
-    (store, witness_store)
+    use did_hosting_common::server::config::store_config_with_env;
+    (
+        store_config_with_env(store_path, &["DAEMON_STORE"]),
+        store_config_with_env(witness_store_path, &["DAEMON_WITNESS_STORE"]),
+    )
 }
 
 pub async fn apply_recipe(

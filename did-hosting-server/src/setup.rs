@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, LimitsConfig, LogConfig, LogFormat, SecretsConfig,
-    ServerConfig, StoreConfig, TransportSelection, VtaConfig,
+    ServerConfig, TransportSelection, VtaConfig,
 };
 use crate::secret_store::{ServerSecrets, create_secret_store};
 use did_hosting_common::server::store::KS_DIDS;
@@ -227,10 +227,7 @@ pub async fn run_wizard(
             level: log_level,
             format: log_format,
         },
-        store: StoreConfig {
-            data_dir: PathBuf::from(&data_dir),
-            ..StoreConfig::default()
-        },
+        store: crate::config::setup_store_config(PathBuf::from(&data_dir)),
         fjall: Default::default(),
         auth: AuthConfig::default(),
         hosting: crate::config::HostingConfig::default(),
@@ -821,10 +818,7 @@ pub async fn run_setup_offline_complete(
             level: state.log_level.clone(),
             format: state.log_format.clone(),
         },
-        store: StoreConfig {
-            data_dir: PathBuf::from(&state.data_dir),
-            ..StoreConfig::default()
-        },
+        store: crate::config::setup_store_config(PathBuf::from(&state.data_dir)),
         fjall: Default::default(),
         auth: AuthConfig::default(),
         hosting: crate::config::HostingConfig::default(),

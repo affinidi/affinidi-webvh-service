@@ -1300,6 +1300,26 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+/// A [`StoreConfig`] for `data_dir` with the store environment overrides
+/// applied, the way a service's `load()` would apply them at runtime.
+///
+/// Setup builds a fresh config (it has no config file yet), so without this it
+/// would open, and record, a store that ignores the same variables the running
+/// service honours: a backend that needs its table or project name from the
+/// environment would fail setup before the service ever starts. Each of
+/// `var_prefixes` is a full prefix as [`apply_store_env_overrides`] takes it,
+/// applied in order so a later one wins.
+pub fn store_config_with_env(data_dir: PathBuf, var_prefixes: &[&str]) -> StoreConfig {
+    let mut store = StoreConfig {
+        data_dir,
+        ..StoreConfig::default()
+    };
+    for prefix in var_prefixes {
+        apply_store_env_overrides(prefix, &mut store);
+    }
+    store
+}
+
 /// Apply `<var_prefix>_*` environment overrides to a [`StoreConfig`].
 ///
 /// `var_prefix` is the full variable prefix including the store namespace, e.g.
@@ -1673,6 +1693,34 @@ mod tests {
             std::env::remove_var(format!("{p}_DYNAMODB_KEY_NAMESPACE"));
             std::env::remove_var(format!("{p}_DYNAMODB_CONSISTENT_READS"));
         }
+    }
+
+    #[test]
+    fn store_config_with_env_is_the_data_dir_alone_when_nothing_is_set() {
+        let store = store_config_with_env(PathBuf::from("/d"), &["TEST_STORE_ENV_NONE"]);
+        assert_eq!(store.data_dir, PathBuf::from("/d"));
+        assert_eq!(store.dynamodb_table_name, None);
+        assert_eq!(store.dynamodb_key_namespace, None);
+    }
+
+    #[test]
+    fn store_config_with_env_applies_the_prefixes_in_order() {
+        let (first, second) = ("TEST_STORE_ENV_FIRST", "TEST_STORE_ENV_SECOND");
+        // SAFETY: unique prefixes, only this test touches these vars.
+        unsafe {
+            std::env::set_var(format!("{first}_DYNAMODB_TABLE_NAME"), "from-first");
+            std::env::set_var(format!("{first}_DYNAMODB_REGION"), "eu-west-1");
+            std::env::set_var(format!("{second}_DYNAMODB_TABLE_NAME"), "from-second");
+        }
+        let store = store_config_with_env(PathBuf::from("/d"), &[first, second]);
+        unsafe {
+            std::env::remove_var(format!("{first}_DYNAMODB_TABLE_NAME"));
+            std::env::remove_var(format!("{first}_DYNAMODB_REGION"));
+            std::env::remove_var(format!("{second}_DYNAMODB_TABLE_NAME"));
+        }
+        assert_eq!(store.dynamodb_table_name.as_deref(), Some("from-second"));
+        assert_eq!(store.dynamodb_region.as_deref(), Some("eu-west-1"));
+        assert_eq!(store.data_dir, PathBuf::from("/d"));
     }
 
     #[test]
