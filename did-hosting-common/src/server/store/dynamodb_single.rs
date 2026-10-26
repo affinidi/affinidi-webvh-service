@@ -198,39 +198,68 @@ impl SingleTableDynamoDbBackend {
     /// missing or has the wrong key schema, instead of on the first request deep
     /// in the service.
     ///
-    /// One strongly consistent `GetItem` on a reserved key: the only permission
-    /// the backend already needs (no `DescribeTable`). Only a *definitive*
-    /// answer stops startup; throttling, a timeout, or an access error is
-    /// logged and startup continues, so a transient blip never keeps a working
-    /// service from starting.
+    /// A strongly consistent `GetItem` on a reserved key, then a one-row `Query`
+    /// on the same partition: the only permissions the backend already needs (no
+    /// `DescribeTable`). Only a *definitive* answer stops startup; throttling, a
+    /// timeout, or an access error is logged and startup continues, so a
+    /// transient blip never keeps a working service from starting.
+    ///
+    /// The `GetItem` alone is not enough: it names `pk` and `sk` without saying
+    /// which is the partition key, so a table keyed the other way round (`sk`
+    /// HASH, `pk` RANGE) answers it and starts fine, then fails every prefix
+    /// `Query`. The `Query` conditions on `pk` for equality and `sk` with
+    /// `begins_with`, which DynamoDB only accepts when the roles are right.
     async fn probe(&self) -> Result<(), AppError> {
-        let result = self
+        let pk = pk_for(self.namespace.as_deref(), PROBE_KEYSPACE);
+        let got = self
             .client
             .get_item()
             .table_name(&self.table_name)
-            .key(
-                PK_ATTR,
-                AttributeValue::S(pk_for(self.namespace.as_deref(), PROBE_KEYSPACE)),
-            )
+            .key(PK_ATTR, AttributeValue::S(pk.clone()))
             .key(SK_ATTR, AttributeValue::S(PROBE_KEY.to_string()))
             .projection_expression(PK_ATTR)
             .consistent_read(true)
             .send()
             .await;
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let outcome = probe_outcome(e.code(), e.message(), &self.table_name);
-                if outcome.is_ok() {
-                    warn!(
-                        table = %self.table_name,
-                        error = %e,
-                        "could not confirm the DynamoDB table at startup; continuing"
-                    );
-                }
-                outcome
-            }
+        if let Err(e) = &got {
+            self.probe_failed(e)?;
         }
+
+        let queried = self
+            .client
+            .query()
+            .table_name(&self.table_name)
+            .key_condition_expression("#pk = :ks AND begins_with(#sk, :pfx)")
+            .expression_attribute_names("#pk", PK_ATTR)
+            .expression_attribute_names("#sk", SK_ATTR)
+            .expression_attribute_values(":ks", AttributeValue::S(pk))
+            .expression_attribute_values(":pfx", AttributeValue::S(PROBE_KEY.to_string()))
+            .projection_expression("#pk")
+            .consistent_read(true)
+            .limit(1)
+            .send()
+            .await;
+        if let Err(e) = &queried {
+            self.probe_failed(e)?;
+        }
+        Ok(())
+    }
+
+    /// What a failed probe call means for startup: a definitive configuration
+    /// error stops it, anything else is logged and let through.
+    fn probe_failed<E: ProvideErrorMetadata + std::fmt::Display>(
+        &self,
+        e: &E,
+    ) -> Result<(), AppError> {
+        let outcome = probe_outcome(e.code(), e.message(), &self.table_name);
+        if outcome.is_ok() {
+            warn!(
+                table = %self.table_name,
+                error = %e,
+                "could not confirm the DynamoDB table at startup; continuing"
+            );
+        }
+        outcome
     }
 
     fn new(client: Client, settings: Settings) -> Self {
@@ -1223,22 +1252,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_probe_is_one_consistent_get_item_on_a_reserved_key() {
+    async fn the_probe_is_a_consistent_get_item_then_a_one_row_query_on_a_reserved_key() {
         let (backend, capture) = capturing_backend(None);
-        // The captured request is aborted before the network: inconclusive, so Ok.
+        // The captured requests are aborted before the network: inconclusive, so Ok.
         backend
             .probe()
             .await
             .expect("an inconclusive probe must not fail startup");
 
         let sent = capture.0.lock().expect("capture lock").clone();
-        assert_eq!(sent.len(), 1, "exactly one request: {sent:?}");
+        assert_eq!(sent.len(), 2, "exactly two requests: {sent:?}");
         let (op, body) = &sent[0];
         assert_eq!(
             op, "GetItem",
             "the only permission the backend already needs"
         );
         assert_eq!(body["Key"]["pk"]["S"], "_probe");
+        assert_eq!(consistent(body), Some(true));
+
+        // The query tells the partition key from the sort key: equality on `pk`,
+        // `begins_with` on `sk`, as every prefix listing does.
+        let (op, body) = &sent[1];
+        assert_eq!(op, "Query");
+        assert_eq!(
+            body["KeyConditionExpression"],
+            "#pk = :ks AND begins_with(#sk, :pfx)"
+        );
+        assert_eq!(body["ExpressionAttributeNames"]["#pk"], "pk");
+        assert_eq!(body["ExpressionAttributeNames"]["#sk"], "sk");
+        assert_eq!(body["ExpressionAttributeValues"][":ks"]["S"], "_probe");
+        assert_eq!(body["ExpressionAttributeValues"][":pfx"]["S"], "_probe");
+        assert_eq!(body["Limit"], 1, "one row is enough to prove the schema");
         assert_eq!(consistent(body), Some(true));
     }
 
@@ -1261,6 +1305,10 @@ mod tests {
         backend.probe().await.expect("probe");
         let sent = capture.0.lock().expect("capture lock").clone();
         assert_eq!(sent[0].1["Key"]["pk"]["S"], "witness#_probe");
+        assert_eq!(
+            sent[1].1["ExpressionAttributeValues"][":ks"]["S"],
+            "witness#_probe"
+        );
     }
 
     #[test]

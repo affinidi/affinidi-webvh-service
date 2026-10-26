@@ -2698,6 +2698,77 @@ async fn open_fails_clearly_when_the_table_has_the_wrong_key_schema() {
 }
 
 #[tokio::test]
+async fn open_fails_clearly_when_the_key_roles_are_reversed() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    // Both attributes are the right names and types, but `sk` is the partition
+    // key and `pk` the sort key. A `GetItem` names both and succeeds; only a
+    // `Query` on `pk` shows the roles are wrong.
+    let name = format!("reversed_roles_{}", std::process::id());
+    delete_test_table(&client, &name).await;
+    client
+        .create_table()
+        .table_name(&name)
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("sk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Range)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("sk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .provisioned_throughput(
+            ProvisionedThroughput::builder()
+                .read_capacity_units(1)
+                .write_capacity_units(1)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("create reversed-roles table");
+
+    unsafe {
+        std::env::set_var("AWS_ENDPOINT_URL", &endpoint);
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+    }
+    let config = StoreConfig {
+        data_dir: PathBuf::from("/tmp"),
+        dynamodb_table_name: Some(name.clone()),
+        dynamodb_region: Some("us-east-1".into()),
+        ..StoreConfig::default()
+    };
+    let result = Store::open(&config).await;
+    delete_test_table(&client, &name).await;
+    match result {
+        Err(AppError::Config(msg)) => assert!(msg.contains("key schema"), "{msg}"),
+        Err(other) => panic!("expected a Config error, got {other:?}"),
+        Ok(_) => panic!("a table with reversed key roles must fail at open"),
+    }
+}
+
+#[tokio::test]
 async fn open_refuses_a_blank_table_name() {
     for blank in ["", "   "] {
         let config = StoreConfig {
