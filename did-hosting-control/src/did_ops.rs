@@ -712,6 +712,7 @@ pub async fn register_did_atomic(
     // submitted document may claim.
     let reg_domain =
         did_hosting_common::server::domain::extract_did_host(&did_id).unwrap_or_default();
+    check_agent_name_count(state, publication.agent_names(&reg_domain).len())?;
     let (claimed, released) = reconcile_agent_names(
         state,
         &mut new_record,
@@ -936,7 +937,29 @@ async fn prepare_republish(
             .unwrap_or_default()
     };
 
+    check_agent_name_count(state, publication.agent_names(&domain).len())?;
+
     Ok((record, domain, publication))
+}
+
+/// Refuse a document that claims more agent names than every write its
+/// publication causes can carry in one atomic batch.
+///
+/// Publishing writes an index row per claimed name, and an edge it is synced to
+/// writes the record, log, owner, witness and high-water rows alongside them,
+/// all in one batch that must stay atomic. A backend with a batch ceiling
+/// (DynamoDB single table: 100) cannot take a document with more names than
+/// [`did_hosting_common::server::store::BatchLimits::max_agent_names`]
+/// allows: it could be registered here and then never synced, an edge refusing it
+/// on every attempt. Refuse it up front, where the publisher can act on it. A
+/// backend without a ceiling has no cap.
+fn check_agent_name_count(state: &AppState, claimed: usize) -> Result<(), AppError> {
+    match state.store.max_agent_names() {
+        Some(max) if claimed > max => Err(AppError::Validation(format!(
+            "the document claims {claimed} agent names; this store holds at most {max} per DID"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Publish (upload) a did.jsonl log for an existing DID slot.
@@ -2408,6 +2431,7 @@ pub async fn resolve_agent_names(
 #[cfg(test)]
 mod tests_atomic {
     use super::*;
+    use did_hosting_common::server::store::bounded_memory::BoundedMemory;
     use did_hosting_common::server::store::{
         KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
     };
@@ -2500,12 +2524,20 @@ mod tests_atomic {
     }
 
     async fn test_state() -> (AppState, tempfile::TempDir) {
+        test_state_on(None).await
+    }
+
+    /// [`test_state`] over `store` when given, else a fresh fjall one.
+    async fn test_state_on(store: Option<Store>) -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("temp dir");
         let store_config = StoreConfig {
             data_dir: PathBuf::from(dir.path()),
             ..StoreConfig::default()
         };
-        let store = Store::open(&store_config).await.expect("open store");
+        let store = match store {
+            Some(store) => store,
+            None => Store::open(&store_config).await.expect("open store"),
+        };
         let sessions_ks = store.keyspace(KS_SESSIONS).expect("sessions ks");
         let acl_ks = store.keyspace(KS_ACL).expect("acl ks");
         let registry_ks = store.keyspace(KS_REGISTRY).expect("registry ks");
@@ -3917,6 +3949,143 @@ mod tests_atomic {
             .await
             .expect("create_log_entry");
         jsonl
+    }
+
+    fn name_list(prefix: &str, n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{prefix}{i:02}")).collect()
+    }
+
+    async fn log_claiming(path: &str, names: &[String]) -> String {
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        build_test_did_log_with_names("control.test", path, &names).await
+    }
+
+    /// On a store whose atomic write holds 100 operations a document may claim
+    /// 47 agent names, so that publishing it, and syncing it to an edge that
+    /// also writes the record, log, owner, witness and high-water rows and
+    /// removes the names it replaces, always fits one batch.
+    #[tokio::test]
+    async fn a_document_over_the_agent_name_cap_is_refused_on_a_bounded_store() {
+        let backend = BoundedMemory::new(100);
+        let (state, _dir) = test_state_on(Some(backend.store())).await;
+        let log = log_claiming("slot-over", &name_list("n", 48)).await;
+
+        let err = register_did_atomic(
+            &owner_auth("did:example:o"),
+            &state,
+            "slot-over",
+            &log,
+            false,
+            None,
+        )
+        .await
+        .expect_err("48 names do not fit");
+
+        assert!(
+            matches!(&err, AppError::Validation(m) if m.contains("48") && m.contains("47")),
+            "{err:?}"
+        );
+        assert!(
+            state
+                .dids_ks
+                .get_raw(did_key("slot-over"))
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing is committed"
+        );
+        assert!(backend.committed_batch_sizes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_document_at_the_agent_name_cap_registers_and_republishes_with_every_name_replaced() {
+        let backend = BoundedMemory::new(100);
+        let (state, _dir) = test_state_on(Some(backend.store())).await;
+        let owner = "did:example:o";
+        let path = "slot-at";
+
+        let first = log_claiming(path, &name_list("old", 47)).await;
+        register_did_atomic(&owner_auth(owner), &state, path, &first, false, None)
+            .await
+            .expect("47 names register");
+        assert_eq!(get_record(&state, path).await.agent_names.len(), 47);
+
+        // Every name dropped and 47 others claimed: the control plane's own
+        // batch is the log, the record, 47 inserts and 47 removals.
+        let second = log_claiming(path, &name_list("new", 47)).await;
+        publish_did(&owner_auth(owner), &state, path, &second, None)
+            .await
+            .expect("replacing all 47 names publishes");
+
+        let record = get_record(&state, path).await;
+        assert!(record.agent_names.iter().all(|e| e.name.starts_with("new")));
+        assert_eq!(record.agent_names.len(), 47);
+        assert!(
+            index_target(&state, "control.test", "old00")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            index_target(&state, "control.test", "new46")
+                .await
+                .as_deref(),
+            Some(path)
+        );
+        assert!(backend.committed_batch_sizes().iter().all(|n| *n <= 100));
+    }
+
+    #[tokio::test]
+    async fn publishing_over_the_agent_name_cap_is_refused_and_changes_nothing() {
+        let backend = BoundedMemory::new(100);
+        let (state, _dir) = test_state_on(Some(backend.store())).await;
+        let owner = "did:example:o";
+        let path = "slot-pub";
+        register_owned(&state, owner, path).await;
+        let before = get_record(&state, path).await.version_count;
+
+        let log = log_claiming(path, &name_list("n", 48)).await;
+        let err = publish_did(&owner_auth(owner), &state, path, &log, None)
+            .await
+            .expect_err("48 names do not fit");
+
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        assert_eq!(get_record(&state, path).await.version_count, before);
+    }
+
+    #[tokio::test]
+    async fn the_agent_name_verbs_also_refuse_a_document_over_the_cap() {
+        let backend = BoundedMemory::new(100);
+        let (state, _dir) = test_state_on(Some(backend.store())).await;
+        let owner = "did:example:o";
+        let path = "slot-verb";
+        register_owned(&state, owner, path).await;
+
+        let names = name_list("n", 48);
+        let log = log_claiming(path, &names).await;
+        let err = set_agent_name(&owner_auth(owner), &state, path, "n00", &log, None)
+            .await
+            .expect_err("the document claims too many names");
+
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_store_without_a_batch_ceiling_has_no_agent_name_cap() {
+        let (state, _dir) = test_state().await;
+        let log = log_claiming("slot-free", &name_list("n", 60)).await;
+
+        register_did_atomic(
+            &owner_auth("did:example:o"),
+            &state,
+            "slot-free",
+            &log,
+            false,
+            None,
+        )
+        .await
+        .expect("fjall takes as many names as the document claims");
+
+        assert_eq!(get_record(&state, "slot-free").await.agent_names.len(), 60);
     }
 
     async fn get_record(state: &AppState, path: &str) -> DidRecord {

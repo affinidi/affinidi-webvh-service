@@ -306,6 +306,11 @@ impl StorageBackend for SingleTableDynamoDbBackend {
         Some(BATCH_LIMITS)
     }
 
+    fn commits_atomically(&self) -> bool {
+        // `TransactWriteItems`: all of the batch or none of it.
+        true
+    }
+
     fn persist(&self) -> BoxFuture<'_, Result<(), AppError>> {
         // DynamoDB is fully managed; no-op.
         Box::pin(async { Ok(()) })

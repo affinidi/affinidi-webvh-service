@@ -1011,8 +1011,10 @@ fn run_storage_thread(
 /// backend (a backend without a ceiling, like fjall, gets one chunk). The
 /// deltas are additive, so each chunk commits on its own and carries its own
 /// share of the `_all` bucket. When a chunk fails, it and every later chunk are
-/// handed back to the collector for the next flush; the chunks already
-/// committed are not.
+/// handed back to the collector for the next flush, if the backend's commit is
+/// all-or-nothing ([`Store::commits_atomically`]); the chunks already committed
+/// are not. On a backend that can commit part of a batch they are dropped
+/// instead, since a retry would count the committed part twice.
 pub async fn flush_stats_to_store(
     collector: &did_hosting_common::server::stats_collector::StatsCollector,
     stats_ks: &KeyspaceHandle,
@@ -1041,7 +1043,20 @@ pub async fn flush_stats_to_store(
         if let Err(e) =
             write_stats_chunk(&chunks[done], bucket_epoch, stats_ks, timeseries_ks, store).await
         {
-            collector.restore_deltas(chunks.drain(done..).flatten());
+            let unwritten = chunks.drain(done..).flatten();
+            if store.commits_atomically() {
+                collector.restore_deltas(unwritten);
+            } else {
+                // A backend that can commit part of a batch and then fail may
+                // already hold some of these deltas, and a retry would count
+                // them twice. Dropping is the safe side: the same loss as before
+                // the flush was chunked.
+                warn!(
+                    dropped = unwritten.count(),
+                    "stats flush failed on a backend whose batches are not all-or-nothing; \
+                     not retrying the deltas, to avoid counting them twice"
+                );
+            }
             return Err(e);
         }
     }
@@ -1485,194 +1500,17 @@ mod flush_stats_tests {
     }
     // -- a bounded backend --------------------------------------------------
 
-    use std::collections::{BTreeMap, HashMap};
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::sync::{Arc, Mutex};
-
-    use did_hosting_common::server::store::{
-        BatchLimits, BatchOps, KeyspaceOps, RawKvPair, StorageBackend,
-    };
-
-    type Fut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-    type Rows = Arc<Mutex<HashMap<String, BTreeMap<Vec<u8>, Vec<u8>>>>>;
-
-    /// An in-memory backend with the batch ceiling of a transactional store: a
-    /// batch over `limits.max_ops` is refused whole, and `fail_commit` makes the
-    /// n-th commit (0-based) fail without writing anything.
-    #[derive(Clone)]
-    struct Bounded {
-        rows: Rows,
-        limits: BatchLimits,
-        fail_commit: Option<usize>,
-        commits: Arc<Mutex<Vec<usize>>>,
-    }
-
-    impl Bounded {
-        fn new(max_ops: usize, fail_commit: Option<usize>) -> Self {
-            Self {
-                rows: Rows::default(),
-                limits: BatchLimits {
-                    max_ops,
-                    max_bytes: 4 * 1024 * 1024,
-                },
-                fail_commit,
-                commits: Arc::default(),
-            }
-        }
-        fn store(&self) -> Store {
-            Store::from_backend(Arc::new(self.clone()))
-        }
-        /// Operation counts of the commits that went through, in order.
-        fn committed_batch_sizes(&self) -> Vec<usize> {
-            self.commits.lock().unwrap().clone()
-        }
-    }
-
-    struct BoundedKeyspace {
-        name: String,
-        rows: Rows,
-    }
-
-    impl KeyspaceOps for BoundedKeyspace {
-        fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> Fut<Result<(), AppError>> {
-            self.rows
-                .lock()
-                .unwrap()
-                .entry(self.name.clone())
-                .or_default()
-                .insert(key, value);
-            Box::pin(async { Ok(()) })
-        }
-        fn get_raw(&self, key: Vec<u8>) -> Fut<Result<Option<Vec<u8>>, AppError>> {
-            let v = self
-                .rows
-                .lock()
-                .unwrap()
-                .get(&self.name)
-                .and_then(|m| m.get(&key).cloned());
-            Box::pin(async move { Ok(v) })
-        }
-        fn remove(&self, key: Vec<u8>) -> Fut<Result<(), AppError>> {
-            if let Some(m) = self.rows.lock().unwrap().get_mut(&self.name) {
-                m.remove(&key);
-            }
-            Box::pin(async { Ok(()) })
-        }
-        fn contains_key(&self, key: Vec<u8>) -> Fut<Result<bool, AppError>> {
-            let v = self
-                .rows
-                .lock()
-                .unwrap()
-                .get(&self.name)
-                .is_some_and(|m| m.contains_key(&key));
-            Box::pin(async move { Ok(v) })
-        }
-        fn prefix_iter_raw(&self, prefix: Vec<u8>) -> Fut<Result<Vec<RawKvPair>, AppError>> {
-            let v = self
-                .rows
-                .lock()
-                .unwrap()
-                .get(&self.name)
-                .map(|m| {
-                    m.iter()
-                        .filter(|(k, _)| k.starts_with(&prefix))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            Box::pin(async move { Ok(v) })
-        }
-        fn take_raw_atomic(&self, key: Vec<u8>) -> Fut<Result<Option<Vec<u8>>, AppError>> {
-            let v = self
-                .rows
-                .lock()
-                .unwrap()
-                .get_mut(&self.name)
-                .and_then(|m| m.remove(&key));
-            Box::pin(async move { Ok(v) })
-        }
-        fn incr_raw(&self, _key: Vec<u8>) -> Fut<Result<u64, AppError>> {
-            Box::pin(async { Ok(0) })
-        }
-    }
-
-    struct BoundedBatch {
-        backend: Bounded,
-        ops: Vec<(String, Vec<u8>, Option<Vec<u8>>)>,
-    }
-
-    impl BatchOps for BoundedBatch {
-        fn insert_raw(&mut self, keyspace: &str, key: Vec<u8>, value: Vec<u8>) {
-            self.ops.push((keyspace.to_string(), key, Some(value)));
-        }
-        fn remove(&mut self, keyspace: &str, key: Vec<u8>) {
-            self.ops.push((keyspace.to_string(), key, None));
-        }
-        fn commit(self: Box<Self>) -> Fut<Result<(), AppError>> {
-            let b = *self;
-            let result = {
-                let mut commits = b.backend.commits.lock().unwrap();
-                let attempt = commits.len();
-                if b.ops.len() > b.backend.limits.max_ops {
-                    Err(AppError::Validation(format!(
-                        "batch of {} operations is over the limit",
-                        b.ops.len()
-                    )))
-                } else if b.backend.fail_commit == Some(attempt) {
-                    commits.push(usize::MAX); // marks the failed attempt
-                    Err(AppError::Internal("injected commit failure".into()))
-                } else {
-                    commits.push(b.ops.len());
-                    let mut rows = b.backend.rows.lock().unwrap();
-                    for (ks, key, value) in b.ops {
-                        let m = rows.entry(ks).or_default();
-                        match value {
-                            Some(v) => m.insert(key, v),
-                            None => m.remove(&key),
-                        };
-                    }
-                    Ok(())
-                }
-            };
-            Box::pin(async move { result })
-        }
-    }
-
-    impl StorageBackend for Bounded {
-        fn keyspace(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
-            Ok((
-                name.to_string(),
-                Arc::new(BoundedKeyspace {
-                    name: name.to_string(),
-                    rows: self.rows.clone(),
-                }),
-            ))
-        }
-        fn batch(&self) -> Box<dyn BatchOps> {
-            Box::new(BoundedBatch {
-                backend: self.clone(),
-                ops: Vec::new(),
-            })
-        }
-        fn persist(&self) -> Fut<Result<(), AppError>> {
-            Box::pin(async { Ok(()) })
-        }
-        fn batch_limits(&self) -> Option<BatchLimits> {
-            Some(self.limits)
-        }
-    }
+    use did_hosting_common::server::store::bounded_memory::BoundedMemory;
 
     struct BoundedFixture {
-        backend: Bounded,
+        backend: BoundedMemory,
         store: Store,
         stats: KeyspaceHandle,
         timeseries: KeyspaceHandle,
         dids: KeyspaceHandle,
     }
 
-    fn bounded(max_ops: usize, fail_commit: Option<usize>) -> BoundedFixture {
-        let backend = Bounded::new(max_ops, fail_commit);
+    fn fixture_on(backend: BoundedMemory) -> BoundedFixture {
         let store = backend.store();
         BoundedFixture {
             stats: store.keyspace(KS_STATS).unwrap(),
@@ -1681,6 +1519,23 @@ mod flush_stats_tests {
             store,
             backend,
         }
+    }
+
+    fn bounded(max_ops: usize, fail_commit: Option<usize>) -> BoundedFixture {
+        let backend = BoundedMemory::new(max_ops);
+        fixture_on(match fail_commit {
+            Some(n) => backend.fail_commit(n),
+            None => backend,
+        })
+    }
+
+    /// A bounded backend whose commit may write part of a batch before failing.
+    fn bounded_non_atomic(max_ops: usize, fail_commit: Option<usize>) -> BoundedFixture {
+        let backend = BoundedMemory::new(max_ops).non_atomic();
+        fixture_on(match fail_commit {
+            Some(n) => backend.fail_commit(n),
+            None => backend,
+        })
     }
 
     async fn flush_bounded(f: &BoundedFixture, c: &StatsCollector) -> Result<(), AppError> {
@@ -1787,6 +1642,58 @@ mod flush_stats_tests {
                 "{d:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_on_a_backend_that_can_partly_commit_is_not_retried() {
+        // Such a backend may already hold part of the failed chunk, so keeping its
+        // deltas would count that part twice on the retry. The flush still
+        // reports the error, and the collector holds nothing to retry.
+        let f = bounded_non_atomic(9, Some(1));
+        let collector = StatsCollector::new();
+        for i in 0..10 {
+            collector.record_deltas(&format!("did{i:02}"), 1, 0, None, None);
+        }
+
+        let err = flush_bounded(&f, &collector)
+            .await
+            .expect_err("chunk fails");
+
+        assert!(matches!(err, AppError::Internal(_)), "{err:?}");
+        assert!(collector.drain_for_sync().is_empty());
+        // Which DIDs got in is up to the drain order, so ask the store. A DID that
+        // committed is counted once, and new traffic adds to that without
+        // re-adding the failed flush; one that did not is simply absent.
+        let mut committed = None;
+        let mut missing = None;
+        for i in 0..10 {
+            let m = format!("did{i:02}");
+            match f.stats.get::<DidStats>(format!("stats:{m}")).await.unwrap() {
+                Some(_) => committed = Some(m),
+                None => missing = Some(m),
+            }
+        }
+        let (committed, missing) = (
+            committed.expect("one chunk committed"),
+            missing.expect("one did not"),
+        );
+        collector.record_deltas(&committed, 2, 0, None, None);
+        collector.record_deltas(&missing, 2, 0, None, None);
+        flush_bounded(&f, &collector).await.expect("next flush");
+        assert_eq!(stored_stats_in(&f, &committed).await.total_resolves, 3);
+        assert_eq!(
+            stored_stats_in(&f, &missing).await.total_resolves,
+            2,
+            "the dropped delta is not resurrected"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_backends_that_commit_all_or_nothing_say_so() {
+        let f = fixture().await;
+        assert!(f.store.commits_atomically(), "fjall: one journalled batch");
+        assert!(bounded(100, None).store.commits_atomically());
+        assert!(!bounded_non_atomic(100, None).store.commits_atomically());
     }
 
     #[tokio::test]

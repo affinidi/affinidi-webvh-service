@@ -1,3 +1,5 @@
+#[cfg(any(test, feature = "test-support"))]
+pub mod bounded_memory;
 #[cfg(feature = "store-cosmosdb")]
 mod cosmosdb;
 #[cfg(feature = "store-dynamodb")]
@@ -140,6 +142,29 @@ pub struct BatchLimits {
     pub max_bytes: usize,
 }
 
+/// Writes besides one name-index row per agent name that the largest write
+/// caused by publishing a DID makes: an edge's `apply_single_update` stores the
+/// record, the log, the owner row, the witness row and two high-water marks. The
+/// control plane's own publish batches are never bigger than that (record, log,
+/// owner row and, on a takeover, two removals).
+pub const PUBLISH_FIXED_WRITES: usize = 6;
+
+impl BatchLimits {
+    /// The most agent names a DID's document may claim for every write its
+    /// publication causes to fit one atomic batch, or any number on a backend
+    /// with no batch limit (see [`Store::max_agent_names`]).
+    ///
+    /// A publication writes an index row for each name it claims and removes the
+    /// rows of the names it drops. Both sets are at most the cap, so the batch
+    /// holds at most `2 * cap + PUBLISH_FIXED_WRITES` operations. Refusing a
+    /// document over the cap up front keeps every accepted publication
+    /// committable, here and on every edge it is synced to, without splitting a
+    /// batch that must stay atomic.
+    pub fn max_agent_names(&self) -> usize {
+        self.max_ops.saturating_sub(PUBLISH_FIXED_WRITES) / 2
+    }
+}
+
 /// Split a bulk write into consecutive chunks that each fit one atomic batch.
 ///
 /// `sizes[i]` is operation `i`'s byte count by the [`BatchLimits::max_bytes`]
@@ -187,6 +212,19 @@ pub trait StorageBackend: Send + Sync {
     /// none (the default).
     fn batch_limits(&self) -> Option<BatchLimits> {
         None
+    }
+
+    /// Whether a failed `commit()` of a batch wrote none of it.
+    ///
+    /// A caller that drains work before it commits and wants to retry it after a
+    /// failure may only do so when this is `true`: on a backend that can commit
+    /// part of a batch and then fail, retrying the whole batch writes the
+    /// committed part twice. `false` is the default, so a backend must opt in,
+    /// and only does so when its commit is one all-or-nothing operation (a
+    /// journalled batch, `MULTI`/`EXEC`, a transaction), not a sequence of writes
+    /// or of smaller batches.
+    fn commits_atomically(&self) -> bool {
+        false
     }
 }
 
@@ -270,6 +308,18 @@ impl Store {
     /// none. See [`BatchLimits`].
     pub fn batch_limits(&self) -> Option<BatchLimits> {
         self.inner.batch_limits()
+    }
+
+    /// The most agent names one DID may claim on this backend, or `None` when its
+    /// batches have no ceiling. See [`BatchLimits::max_agent_names`].
+    pub fn max_agent_names(&self) -> Option<usize> {
+        self.batch_limits().map(|l| l.max_agent_names())
+    }
+
+    /// Whether a failed batch commit on this backend wrote none of it. See
+    /// [`StorageBackend::commits_atomically`].
+    pub fn commits_atomically(&self) -> bool {
+        self.inner.commits_atomically()
     }
 
     pub async fn persist(&self) -> Result<(), AppError> {
@@ -501,6 +551,20 @@ mod chunk_tests {
         max_ops: 3,
         max_bytes: 100,
     };
+
+    #[test]
+    fn the_agent_name_cap_leaves_room_for_the_names_dropped_and_the_fixed_writes() {
+        let l = |max_ops| BatchLimits {
+            max_ops,
+            max_bytes: usize::MAX,
+        };
+        // 100 operations: 47 inserts + 47 removals + 6 fixed = 100.
+        assert_eq!(l(100).max_agent_names(), 47);
+        assert_eq!(2 * 47 + super::PUBLISH_FIXED_WRITES, 100);
+        assert_eq!(l(101).max_agent_names(), 47, "rounds down");
+        assert_eq!(l(6).max_agent_names(), 0);
+        assert_eq!(l(2).max_agent_names(), 0, "never underflows");
+    }
 
     #[test]
     fn no_limits_chunks_only_by_the_callers_cap() {

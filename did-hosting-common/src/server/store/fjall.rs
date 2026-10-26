@@ -144,6 +144,11 @@ impl StorageBackend for FjallBackend {
         })
     }
 
+    fn commits_atomically(&self) -> bool {
+        // One journalled batch: all of it or none.
+        true
+    }
+
     fn persist(&self) -> BoxFuture<'_, Result<(), AppError>> {
         let db = self.db.clone();
         Box::pin(async move {

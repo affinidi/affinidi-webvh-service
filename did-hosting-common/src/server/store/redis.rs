@@ -56,6 +56,11 @@ impl StorageBackend for RedisBackend {
         })
     }
 
+    fn commits_atomically(&self) -> bool {
+        // One `MULTI`/`EXEC` pipeline.
+        true
+    }
+
     fn persist(&self) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async { Ok(()) })
     }

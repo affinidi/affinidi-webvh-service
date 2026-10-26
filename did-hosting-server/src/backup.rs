@@ -200,15 +200,35 @@ pub async fn run_backup_with(
 }
 
 pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<(), AppError> {
-    run_restore_with(config_path, input, AppConfig::load).await
+    run_restore_with(
+        config_path,
+        input,
+        AppConfig::load,
+        ConfigRestore::Overwrite,
+    )
+    .await
 }
 
-/// [`run_restore`] over the config `load` produces, read after the backup's own
-/// config has been written to the config file.
+/// What a restore does with the config file the backup carries a copy of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigRestore {
+    /// Write the backup's config over the config file. The server's own restore:
+    /// the backup's config is the whole of the server's config.
+    Overwrite,
+    /// Leave a config file that already exists alone, and write the backup's only
+    /// when there is none. For a host whose config holds more than the server's
+    /// share of it: the backup carries just that share, so writing it over the
+    /// host's file would drop the rest (the daemon's witness store, for one).
+    KeepExisting,
+}
+
+/// [`run_restore`] over the config `load` produces, read after the config file
+/// has been dealt with as `config_restore` says.
 pub async fn run_restore_with(
     config_path: Option<PathBuf>,
     input: String,
     load: ConfigLoader,
+    config_restore: ConfigRestore,
 ) -> Result<(), AppError> {
     let json = std::fs::read_to_string(&input)
         .map_err(|e| AppError::Config(format!("failed to read backup file {input}: {e}")))?;
@@ -255,15 +275,28 @@ pub async fn run_restore_with(
         })
         .unwrap_or_else(|| PathBuf::from("config.toml"));
 
-    let config_toml = toml::to_string_pretty(&backup_config)
-        .map_err(|e| AppError::Config(format!("failed to serialize config as TOML: {e}")))?;
-    std::fs::write(&config_file_path, &config_toml).map_err(|e| {
-        AppError::Config(format!(
-            "failed to write config to {}: {e}",
+    if config_restore == ConfigRestore::KeepExisting && config_file_path.exists() {
+        eprintln!(
+            "  Config kept: {} (the config in the backup was not applied)",
             config_file_path.display()
-        ))
-    })?;
-    eprintln!("  Config restored to: {}", config_file_path.display());
+        );
+    } else {
+        let config_toml = toml::to_string_pretty(&backup_config)
+            .map_err(|e| AppError::Config(format!("failed to serialize config as TOML: {e}")))?;
+        std::fs::write(&config_file_path, &config_toml).map_err(|e| {
+            AppError::Config(format!(
+                "failed to write config to {}: {e}",
+                config_file_path.display()
+            ))
+        })?;
+        eprintln!("  Config restored to: {}", config_file_path.display());
+        if config_restore == ConfigRestore::KeepExisting {
+            eprintln!(
+                "  Note: the backup carries only the server's share of the config; settings \
+                 it does not hold (another service's store, for one) must be set again."
+            );
+        }
+    }
 
     let config = load(config_path)?;
     let store = Store::open(&config.store).await?;
@@ -657,6 +690,79 @@ mod tests {
         assert!(
             matches!(&err, AppError::Config(m) if m.contains("newer")),
             "{err:?}"
+        );
+    }
+    #[tokio::test]
+    async fn run_restore_keeping_the_config_leaves_an_existing_file_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        let config = write_config(dir.path(), &data);
+        {
+            let store = open_store_at(&data).await;
+            let dids = store.keyspace(KS_DIDS).expect("dids");
+            dids.insert_raw("did:one", b"v1".to_vec())
+                .await
+                .expect("seed");
+            store.persist().await.expect("persist");
+        }
+        let out = dir.path().join("backup.json");
+        run_backup(Some(config.clone()), out.display().to_string())
+            .await
+            .expect("backup");
+        // The host's own config has more in it than the backup carries.
+        let hosts = format!(
+            "{}\n[witness_store]\ndata_dir = \"/elsewhere\"\n",
+            std::fs::read_to_string(&config).expect("read")
+        );
+        std::fs::write(&config, &hosts).expect("write");
+        {
+            let store = open_store_at(&data).await;
+            let dids = store.keyspace(KS_DIDS).expect("dids");
+            dids.remove("did:one").await.expect("wipe");
+            store.persist().await.expect("persist");
+        }
+
+        run_restore_with(
+            Some(config.clone()),
+            out.display().to_string(),
+            AppConfig::load,
+            ConfigRestore::KeepExisting,
+        )
+        .await
+        .expect("restore");
+
+        assert_eq!(std::fs::read_to_string(&config).expect("read"), hosts);
+        let store = open_store_at(&data).await;
+        let dids = store.keyspace(KS_DIDS).expect("dids");
+        assert_eq!(
+            dids.get_raw("did:one").await.expect("get"),
+            Some(b"v1".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn run_restore_keeping_the_config_still_writes_one_when_there_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        let config = write_config(dir.path(), &data);
+        let out = dir.path().join("backup.json");
+        run_backup(Some(config.clone()), out.display().to_string())
+            .await
+            .expect("backup");
+        std::fs::remove_file(&config).expect("lose the config");
+
+        run_restore_with(
+            Some(config.clone()),
+            out.display().to_string(),
+            AppConfig::load,
+            ConfigRestore::KeepExisting,
+        )
+        .await
+        .expect("restore");
+
+        assert!(
+            config.exists(),
+            "a missing config is recovered from the backup"
         );
     }
 }

@@ -21,6 +21,7 @@ use did_hosting_common::didcomm_types::{
 use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
 };
+use did_hosting_common::server::store::bounded_memory::BoundedMemory;
 use did_hosting_common::server::store::{KS_DIDS, Store};
 use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
 use did_hosting_common::server::trust_tasks::send::{build_request, build_signed_request};
@@ -53,13 +54,21 @@ fn verifier() -> TransportBoundVerifier {
 /// Server `AppState` with the control plane configured, so
 /// `verify_control_plane` expects documents signed by `control()`.
 async fn make_state() -> (AppState, tempfile::TempDir) {
+    make_state_on(None).await
+}
+
+/// [`make_state`] over `store` when given, else a fresh fjall one.
+async fn make_state_on(store: Option<Store>) -> (AppState, tempfile::TempDir) {
     let (control_did, _) = control();
     let dir = tempfile::tempdir().expect("temp dir");
     let store_config = StoreConfig {
         data_dir: PathBuf::from(dir.path()),
         ..StoreConfig::default()
     };
-    let store = Store::open(&store_config).await.expect("open store");
+    let store = match store {
+        Some(store) => store,
+        None => Store::open(&store_config).await.expect("open store"),
+    };
     let config = AppConfig {
         features: FeaturesConfig {
             tsp: true,
@@ -243,6 +252,133 @@ async fn signed_sync_update_from_control_plane_is_applied() {
     assert_eq!(
         stored(&state, "alice").await.expect("stored").version_count,
         1
+    );
+}
+
+/// `n` agent names, `{prefix}00` .. , as `alsoKnownAs` entries on this edge's host.
+fn name_claims(prefix: &str, n: usize) -> Vec<String> {
+    (0..n)
+        .map(|i| format!("server.example.com/@{prefix}{i:02}"))
+        .collect()
+}
+
+/// A first log for `mnemonic` claiming `names`, and a later version replacing
+/// them with `replacement`, as `(first jsonl, extended jsonl)`.
+async fn log_replacing_names(
+    mnemonic: &str,
+    names: &[String],
+    replacement: &[String],
+) -> (String, String) {
+    let secret = Secret::generate_ed25519(None, Some(&[7u8; 32]));
+    let pk_mb = secret.get_public_keymultibase().expect("pubkey multibase");
+    let mut signing = secret.clone();
+    signing.id = format!("did:key:{pk_mb}#{pk_mb}");
+    let mut doc = build_did_document(
+        "server.example.com",
+        mnemonic,
+        &pk_mb,
+        &DidDocumentOptions::default(),
+    );
+    doc["alsoKnownAs"] = json!(names);
+    let mut state = didwebvh_rs::DIDWebVHState::default();
+    state
+        .create_log_entry(Some(hours_ago(3)), &doc, &params(&signing), &signing)
+        .await
+        .expect("create webvh log entry");
+    let first = jsonl(&state);
+
+    let last = first.lines().last().unwrap().to_string();
+    let mut current: Value = serde_json::from_str::<Value>(&last).unwrap()["state"].clone();
+    current["alsoKnownAs"] = json!(replacement);
+    state
+        .create_log_entry(Some(hours_ago(2)), &current, &params(&signing), &signing)
+        .await
+        .expect("append webvh log entry");
+    (first, jsonl(&state))
+}
+
+/// The most agent names a store with a 100-operation atomic write allows
+/// (`BatchLimits::max_agent_names`): 47. A document claiming that many, replaced
+/// by one claiming 47 others, is the largest write an edge makes for a sync —
+/// every old name's row removed, every new one inserted, plus the fixed rows —
+/// and it must fit the batch exactly.
+#[tokio::test]
+async fn an_edge_on_a_bounded_store_takes_the_largest_name_replacement_the_cap_allows() {
+    let backend = BoundedMemory::new(100);
+    let cap = backend.store().max_agent_names().expect("bounded");
+    assert_eq!(cap, 47);
+    let (state, _dir) = make_state_on(Some(backend.store())).await;
+    let (first, extended) =
+        log_replacing_names("alice", &name_claims("old", cap), &name_claims("new", cap)).await;
+    let did_id = did_id(&first);
+
+    for log in [&first, &extended] {
+        let reply = apply(
+            &state,
+            signed_op(
+                MSG_SYNC_UPDATE,
+                &control(),
+                update_body("alice", &did_id, log),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(reply.type_uri.to_string(), MSG_SYNC_UPDATE_ACK, "{reply:?}");
+        assert_eq!(reply.payload["status"], "applied");
+    }
+
+    let record = stored(&state, "alice").await.expect("stored");
+    assert_eq!(record.version_count, 2);
+    assert_eq!(record.agent_names.len(), cap);
+    let committed = backend.committed_batch_sizes();
+    assert_eq!(
+        committed.iter().max(),
+        Some(&100),
+        "the replacement fills the atomic write exactly: {committed:?}"
+    );
+}
+
+/// One name over the cap is the reason it exists: replacing 48 names with 48
+/// others needs 102 writes, which a 100-operation store refuses whole, so the
+/// edge never serves the new version.
+#[tokio::test]
+async fn one_name_over_the_cap_cannot_be_replaced_on_a_bounded_edge() {
+    let backend = BoundedMemory::new(100);
+    let (state, _dir) = make_state_on(Some(backend.store())).await;
+    let (first, extended) =
+        log_replacing_names("alice", &name_claims("old", 48), &name_claims("new", 48)).await;
+    let did_id = did_id(&first);
+    let applied = apply(
+        &state,
+        signed_op(
+            MSG_SYNC_UPDATE,
+            &control(),
+            update_body("alice", &did_id, &first),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(applied.payload["status"], "applied", "{applied:?}");
+
+    let reply = apply(
+        &state,
+        signed_op(
+            MSG_SYNC_UPDATE,
+            &control(),
+            update_body("alice", &did_id, &extended),
+        )
+        .await,
+    )
+    .await;
+
+    assert!(
+        is_error(&reply) || reply.payload["status"] != "applied",
+        "{reply:?}"
+    );
+    assert_eq!(
+        stored(&state, "alice").await.expect("stored").version_count,
+        1,
+        "the refused version wrote nothing"
     );
 }
 

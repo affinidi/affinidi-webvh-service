@@ -153,7 +153,23 @@ read capacity of eventually consistent ones. To trade that guarantee for cost, s
   operations and 4 MB. A batch larger than that is **refused before anything is
   written** with a validation error, rather than split (a split batch is not atomic).
   Code that writes in bulk chunks to `Store::batch_limits()` itself; the server's
-  backup restore does.
+  backup restore and the control plane's stats flush do.
+- **A DID may claim at most 47 agent names** (`alsoKnownAs`). Publishing a DID writes
+  one name-index row per name and removes the rows of names it drops, and an edge
+  syncing it adds the record, log, owner, witness and two high-water rows, all in one
+  atomic batch: `2 × 47 + 6 = 100`. The control plane refuses a document over that up
+  front with a validation error naming the limit, so nothing is accepted that an edge
+  could not then store. A control plane on a store without a batch ceiling (fjall,
+  Redis) has no such cap: if its edges run on this backend, keep documents within 47
+  names, or an edge will refuse the sync.
+- **Deleting a witness identity that has witnessed 100 or more DIDs** cannot be one
+  atomic write (the record plus one mark per DID). The identity is removed first, in
+  one atomic write that leaves a `deleting:<id>` marker in the `witnesses` keyspace;
+  its marks are then removed in batches within the limit, the last also clearing the
+  marker. From the first write the identity can sign nothing and is no longer listed.
+  If the process stops part-way, the next start finishes the cleanup (the marker is
+  what it looks for). A smaller identity is still deleted in one write, as on every
+  other backend.
 - A batch that touches the same key twice is refused.
 - An item is limited by DynamoDB to 400 KB.
 - **Keys must be valid UTF-8** (every key the services write is). A key that is not

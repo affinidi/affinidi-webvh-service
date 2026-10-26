@@ -243,10 +243,19 @@ fn separate_witness_store(config: &mut DaemonConfig) -> Result<(), AppError> {
 }
 
 impl DaemonConfig {
-    pub fn load(config_path: Option<PathBuf>) -> Result<Self, AppError> {
-        let path = config_path
+    /// The daemon's config file: `--config`, else `DAEMON_CONFIG_PATH`, else
+    /// `config.toml`. [`Self::load`] resolves it this way; a caller that hands the
+    /// path to code with a different default (the server's backup and restore
+    /// fall back to `DID_HOSTING_CONFIG_PATH`) resolves it here first, so the
+    /// file written and the file read are the same one.
+    pub fn resolve_config_path(config_path: Option<PathBuf>) -> PathBuf {
+        config_path
             .or_else(|| std::env::var("DAEMON_CONFIG_PATH").ok().map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("config.toml"));
+            .unwrap_or_else(|| PathBuf::from("config.toml"))
+    }
+
+    pub fn load(config_path: Option<PathBuf>) -> Result<Self, AppError> {
+        let path = Self::resolve_config_path(config_path);
 
         if !path.exists() {
             return Err(AppError::Config(format!(
@@ -448,6 +457,7 @@ impl DaemonConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use did_hosting_server::backup::ConfigRestore;
     use std::io::Write;
 
     /// Minimal self-managed config: `[identity] mode = "self-managed"`,
@@ -587,6 +597,108 @@ context_id = "webvh"
         keys
     }
 
+    // Holds `ENV_LOCK` across the awaits on purpose; see the tests above.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn restore_with_only_daemon_config_path_set_writes_and_reloads_that_file() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        let path = write_daemon_config(dir.path(), &data, &dir.path().join("w"));
+        let out = dir.path().join("backup.json");
+        // SAFETY: serialised by ENV_LOCK; cleared again below.
+        unsafe { std::env::set_var("DAEMON_CONFIG_PATH", &path) };
+        // No `--config`, and a decoy where the server's restore would write by
+        // default if handed `None`.
+        let decoy = dir.path().join("decoy.toml");
+        unsafe { std::env::set_var("DID_HOSTING_CONFIG_PATH", &decoy) };
+        let resolved = DaemonConfig::resolve_config_path(None);
+        seed(&data, "did:one").await;
+        did_hosting_server::backup::run_backup_with(
+            Some(resolved.clone()),
+            out.display().to_string(),
+            DaemonConfig::load_server_config,
+        )
+        .await
+        .expect("backup");
+        std::fs::remove_file(&path).expect("lose the config");
+
+        let result = did_hosting_server::backup::run_restore_with(
+            Some(resolved.clone()),
+            out.display().to_string(),
+            DaemonConfig::load_server_config,
+            ConfigRestore::KeepExisting,
+        )
+        .await;
+        unsafe {
+            std::env::remove_var("DAEMON_CONFIG_PATH");
+            std::env::remove_var("DID_HOSTING_CONFIG_PATH");
+        }
+
+        result.expect("restore recovers from a missing config");
+        assert_eq!(resolved, path);
+        assert!(path.exists(), "the daemon's own config file is restored");
+        assert!(
+            !decoy.exists(),
+            "nothing is written to the server's default"
+        );
+    }
+
+    // Holds `ENV_LOCK` across the awaits on purpose; see the tests above.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn restore_keeps_the_daemons_own_config_including_the_witness_store() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        let witness = dir.path().join("witness-elsewhere");
+        let path = write_daemon_config(dir.path(), &data, &witness);
+        let original = std::fs::read_to_string(&path).expect("read");
+        let out = dir.path().join("backup.json");
+        seed(&data, "did:one").await;
+        did_hosting_server::backup::run_backup_with(
+            Some(path.clone()),
+            out.display().to_string(),
+            DaemonConfig::load_server_config,
+        )
+        .await
+        .expect("backup");
+        std::fs::remove_dir_all(&data).expect("lose the store");
+
+        did_hosting_server::backup::run_restore_with(
+            Some(path.clone()),
+            out.display().to_string(),
+            DaemonConfig::load_server_config,
+            ConfigRestore::KeepExisting,
+        )
+        .await
+        .expect("restore");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            original,
+            "the daemon's config is untouched"
+        );
+        let reloaded = DaemonConfig::load(Some(path)).expect("still loads");
+        assert_eq!(reloaded.witness_store.data_dir, witness);
+        assert_eq!(did_keys(&data).await, vec!["did:one".to_string()]);
+    }
+
+    #[test]
+    fn the_config_path_is_the_flag_then_daemon_config_path_then_config_toml() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialised by ENV_LOCK; cleared again below.
+        unsafe { std::env::set_var("DAEMON_CONFIG_PATH", "/env/daemon.toml") };
+        let flag = DaemonConfig::resolve_config_path(Some(PathBuf::from("/flag.toml")));
+        let env = DaemonConfig::resolve_config_path(None);
+        unsafe { std::env::remove_var("DAEMON_CONFIG_PATH") };
+        let default = DaemonConfig::resolve_config_path(None);
+
+        assert_eq!(flag, PathBuf::from("/flag.toml"));
+        assert_eq!(env, PathBuf::from("/env/daemon.toml"));
+        assert_eq!(default, PathBuf::from("config.toml"));
+    }
+
     #[test]
     fn the_server_config_for_backup_carries_the_daemons_store_environment() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -660,6 +772,7 @@ context_id = "webvh"
             Some(path.clone()),
             out.display().to_string(),
             DaemonConfig::load_server_config,
+            ConfigRestore::KeepExisting,
         )
         .await;
         let reloaded = DaemonConfig::load(Some(path));

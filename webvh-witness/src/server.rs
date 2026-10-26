@@ -100,6 +100,22 @@ impl AppState {
             ),
         })
     }
+
+    /// Finish any identity deletion a previous run began and did not complete
+    /// (see [`crate::witness_ops::delete_witness`]). Run once at startup, before the
+    /// service takes requests. A failure is logged, not fatal: the leftover is
+    /// only marks of an identity that no longer exists, and the next start tries
+    /// again.
+    pub async fn resume_pending_deletions(&self) {
+        match crate::witness_ops::finish_pending_deletions(&self.store, &self.witnesses_ks).await {
+            Ok(0) => {}
+            Ok(n) => info!(
+                finished = n,
+                "finished interrupted witness identity deletions"
+            ),
+            Err(e) => warn!(error = %e, "could not finish interrupted witness identity deletions"),
+        }
+    }
 }
 
 pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
@@ -130,6 +146,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     };
 
     let state = AppState::new(store.clone(), config, identity, Arc::new(LocalSigner))?;
+    state.resume_pending_deletions().await;
 
     // Log startup configuration
     info!("--- enabled services ---");
