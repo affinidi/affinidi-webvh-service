@@ -242,6 +242,14 @@ impl Store {
         })
     }
 
+    /// A store over a caller-supplied backend, so a test can exercise code that
+    /// takes a [`Store`] against a backend with a batch ceiling, or one that
+    /// fails a commit, without a real database.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_backend(backend: Arc<dyn StorageBackend>) -> Self {
+        Self { inner: backend }
+    }
+
     pub fn keyspace(&self, name: &str) -> Result<KeyspaceHandle, AppError> {
         let (ks_name, ops) = self.inner.keyspace(name)?;
         Ok(KeyspaceHandle {

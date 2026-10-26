@@ -252,6 +252,30 @@ impl StatsCollector {
             .collect()
     }
 
+    /// Put drained deltas back, merged into whatever has accumulated since, so
+    /// a flush that failed can retry them on its next tick instead of losing
+    /// them.
+    ///
+    /// Touches only the per-DID map [`Self::drain_for_sync`] empties. The
+    /// aggregate counters and time-series buckets were bumped when the events
+    /// were recorded and are not undone by a drain, so re-applying them here
+    /// would count the events twice.
+    pub fn restore_deltas(&self, drained: impl IntoIterator<Item = DidStatsDelta>) {
+        let mut deltas = self.deltas.lock().unwrap();
+        for d in drained {
+            let entry = deltas.entry(d.mnemonic).or_default();
+            entry.resolves += d.resolve_delta;
+            entry.updates += d.update_delta;
+            if let Some(ts) = d.last_resolved_at {
+                entry.last_resolved_at =
+                    Some(entry.last_resolved_at.map_or(ts, |prev| prev.max(ts)));
+            }
+            if let Some(ts) = d.last_updated_at {
+                entry.last_updated_at = Some(entry.last_updated_at.map_or(ts, |prev| prev.max(ts)));
+            }
+        }
+    }
+
     /// Drain all accumulated time-series bucket deltas.
     pub fn drain_buckets(&self) -> Vec<DrainedBucket> {
         let mut buckets = self.buckets.lock().unwrap();
@@ -292,5 +316,76 @@ impl StatsCollector {
 impl Default for StatsCollector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drained(c: &StatsCollector) -> HashMap<String, DidStatsDelta> {
+        c.drain_for_sync()
+            .into_iter()
+            .map(|d| (d.mnemonic.clone(), d))
+            .collect()
+    }
+
+    #[test]
+    fn restored_deltas_come_back_from_the_next_drain() {
+        let c = StatsCollector::new();
+        c.record_deltas("a", 3, 2, Some(10), Some(20));
+        let first = c.drain_for_sync();
+        assert!(c.drain_for_sync().is_empty());
+
+        c.restore_deltas(first);
+
+        let d = &drained(&c)["a"];
+        assert_eq!((d.resolve_delta, d.update_delta), (3, 2));
+        assert_eq!(
+            (d.last_resolved_at, d.last_updated_at),
+            (Some(10), Some(20))
+        );
+    }
+
+    #[test]
+    fn restored_deltas_merge_with_what_accumulated_since_the_drain() {
+        let c = StatsCollector::new();
+        c.record_deltas("a", 3, 0, Some(10), None);
+        let first = c.drain_for_sync();
+        c.record_deltas("a", 4, 1, Some(5), Some(7));
+        c.record_deltas("b", 1, 0, None, None);
+
+        c.restore_deltas(first);
+
+        let all = drained(&c);
+        let a = &all["a"];
+        assert_eq!((a.resolve_delta, a.update_delta), (7, 1));
+        // The newest timestamp wins, whichever side it came from.
+        assert_eq!((a.last_resolved_at, a.last_updated_at), (Some(10), Some(7)));
+        assert_eq!(all["b"].resolve_delta, 1);
+    }
+
+    #[test]
+    fn restoring_does_not_count_the_events_a_second_time() {
+        let c = StatsCollector::new();
+        c.record_deltas("a", 3, 2, Some(10), None);
+        let before = c.get_aggregate();
+        let own_bucket: u64 = c
+            .drain_buckets()
+            .iter()
+            .filter(|b| b.mnemonic == "a")
+            .map(|b| b.resolves)
+            .sum();
+        assert_eq!(own_bucket, 3, "recording filled the bucket once");
+
+        c.restore_deltas(c.drain_for_sync());
+
+        let after = c.get_aggregate();
+        assert_eq!(after.total_resolves, before.total_resolves);
+        assert_eq!(after.total_updates, before.total_updates);
+        assert!(
+            c.drain_buckets().is_empty(),
+            "restoring puts nothing back into the time-series buckets"
+        );
     }
 }

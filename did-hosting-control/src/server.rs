@@ -6,6 +6,7 @@ use affinidi_messaging_didcomm_service::{
     DIDCommService, DIDCommServiceConfig, ListenerConfig, Protocols, RestartPolicy, RetryConfig,
 };
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
+use did_hosting_common::DidStatsDelta;
 use did_hosting_common::server::auth::extractor::AuthState;
 use did_hosting_common::server::didcomm_profile::{
     advertised_protocols, build_tdk_profile_for_identity, reconcile_listener_protocols,
@@ -14,7 +15,7 @@ use did_hosting_common::server::didcomm_profile::{
 use did_hosting_common::server::identity::{self, ServiceIdentity};
 use did_hosting_common::server::init;
 use did_hosting_common::server::store::{
-    KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
+    BatchLimits, KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES, chunk_ranges,
 };
 use tokio_util::sync::CancellationToken;
 use webauthn_rs::prelude::Webauthn;
@@ -1005,6 +1006,13 @@ fn run_storage_thread(
 /// `ts:_all:{bucket}` time-series rows. The split came in v0.7 so a
 /// future scan over either keyspace returns homogeneous-shaped values.
 /// fjall batches span keyspaces, so atomicity is preserved.
+///
+/// The deltas are written in chunks that each fit one atomic batch on the
+/// backend (a backend without a ceiling, like fjall, gets one chunk). The
+/// deltas are additive, so each chunk commits on its own and carries its own
+/// share of the `_all` bucket. When a chunk fails, it and every later chunk are
+/// handed back to the collector for the next flush; the chunks already
+/// committed are not.
 pub async fn flush_stats_to_store(
     collector: &did_hosting_common::server::stats_collector::StatsCollector,
     stats_ks: &KeyspaceHandle,
@@ -1028,12 +1036,82 @@ pub async fn flush_stats_to_store(
         .as_secs();
     let bucket_epoch = now / 300 * 300;
 
+    let mut chunks = stats_chunks(deltas, store.batch_limits(), stats_ks, timeseries_ks);
+    for done in 0..chunks.len() {
+        if let Err(e) =
+            write_stats_chunk(&chunks[done], bucket_epoch, stats_ks, timeseries_ks, store).await
+        {
+            collector.restore_deltas(chunks.drain(done..).flatten());
+            return Err(e);
+        }
+    }
+
+    // Update total DID count (periodic reconciliation)
+    if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
+        collector.set_total_dids(dids.len() as u64);
+    }
+    // Note: control plane still does the full scan because DIDs are managed
+    // from external sources (REST API, sync) making incremental tracking complex.
+    // This runs every 10s and is acceptable at 10K DIDs.
+
+    debug!(chunks = chunks.len(), "flushed stats deltas to store");
+    Ok(())
+}
+
+/// Upper bound on one stored stats or bucket row's JSON value, for sizing a
+/// chunk against a backend's byte ceiling.
+const STATS_ROW_VALUE_BYTES: usize = 256;
+/// Upper bound on a stats or bucket row's key beyond the mnemonic
+/// (`stats:` / `ts:` prefix, the epoch, separators).
+const STATS_ROW_KEY_OVERHEAD: usize = 32;
+
+/// Split `deltas` into chunks whose writes fit one atomic batch.
+///
+/// A delta writes up to two rows (its totals and its bucket) and every chunk
+/// adds the `_all` bucket row, so the backend's operation ceiling is halved
+/// after reserving the `_all` row, and the byte ceiling is sized from a
+/// generous bound on each row.
+fn stats_chunks(
+    deltas: Vec<DidStatsDelta>,
+    limits: Option<BatchLimits>,
+    stats_ks: &KeyspaceHandle,
+    timeseries_ks: &KeyspaceHandle,
+) -> Vec<Vec<DidStatsDelta>> {
+    let row = |ks: &KeyspaceHandle, mnemonic_len: usize| {
+        ks.name.len() + mnemonic_len + STATS_ROW_KEY_OVERHEAD + STATS_ROW_VALUE_BYTES
+    };
+    let all_row = row(timeseries_ks, "_all".len());
+    let per_delta = limits.map(|l| BatchLimits {
+        max_ops: (l.max_ops.saturating_sub(1) / 2).max(1),
+        max_bytes: l.max_bytes.saturating_sub(all_row),
+    });
+    let sizes: Vec<usize> = deltas
+        .iter()
+        .map(|d| row(stats_ks, d.mnemonic.len()) + row(timeseries_ks, d.mnemonic.len()))
+        .collect();
+
+    let mut deltas = deltas.into_iter();
+    chunk_ranges(per_delta, usize::MAX, &sizes)
+        .into_iter()
+        .map(|range| deltas.by_ref().take(range.len()).collect())
+        .collect()
+}
+
+/// Write one chunk of deltas, with the chunk's share of the `_all` bucket, as a
+/// single atomic batch.
+async fn write_stats_chunk(
+    chunk: &[DidStatsDelta],
+    bucket_epoch: u64,
+    stats_ks: &KeyspaceHandle,
+    timeseries_ks: &KeyspaceHandle,
+    store: &Store,
+) -> Result<(), AppError> {
     // Aggregate totals for the server-wide (_all) time-series bucket
     let mut all_resolve_delta = 0u64;
     let mut all_update_delta = 0u64;
 
     let mut batch = store.batch();
-    for d in &deltas {
+    for d in chunk {
         // Aggregate stats (totals) — stats_ks
         let key = format!("stats:{}", d.mnemonic);
         let mut stats: did_hosting_common::DidStats =
@@ -1076,18 +1154,7 @@ pub async fn flush_stats_to_store(
         batch.insert(timeseries_ks, all_key, &serde_json::json!({"r": r, "u": u}))?;
     }
 
-    batch.commit().await?;
-
-    // Update total DID count (periodic reconciliation)
-    if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
-        collector.set_total_dids(dids.len() as u64);
-    }
-    // Note: control plane still does the full scan because DIDs are managed
-    // from external sources (REST API, sync) making incremental tracking complex.
-    // This runs every 10s and is acceptable at 10K DIDs.
-
-    debug!(count = deltas.len(), "flushed stats deltas to store");
-    Ok(())
+    batch.commit().await
 }
 
 /// Ping one trust-task-capable instance, letting its DID document choose the
@@ -1415,5 +1482,333 @@ mod flush_stats_tests {
         assert_eq!(f.stats.iter_all().await.expect("scan").len(), 120);
         assert_eq!(bucket_totals(&f, "ts:_all:").await, (120, 120));
         assert!(collector.drain_for_sync().is_empty());
+    }
+    // -- a bounded backend --------------------------------------------------
+
+    use std::collections::{BTreeMap, HashMap};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+
+    use did_hosting_common::server::store::{
+        BatchLimits, BatchOps, KeyspaceOps, RawKvPair, StorageBackend,
+    };
+
+    type Fut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+    type Rows = Arc<Mutex<HashMap<String, BTreeMap<Vec<u8>, Vec<u8>>>>>;
+
+    /// An in-memory backend with the batch ceiling of a transactional store: a
+    /// batch over `limits.max_ops` is refused whole, and `fail_commit` makes the
+    /// n-th commit (0-based) fail without writing anything.
+    #[derive(Clone)]
+    struct Bounded {
+        rows: Rows,
+        limits: BatchLimits,
+        fail_commit: Option<usize>,
+        commits: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Bounded {
+        fn new(max_ops: usize, fail_commit: Option<usize>) -> Self {
+            Self {
+                rows: Rows::default(),
+                limits: BatchLimits {
+                    max_ops,
+                    max_bytes: 4 * 1024 * 1024,
+                },
+                fail_commit,
+                commits: Arc::default(),
+            }
+        }
+        fn store(&self) -> Store {
+            Store::from_backend(Arc::new(self.clone()))
+        }
+        /// Operation counts of the commits that went through, in order.
+        fn committed_batch_sizes(&self) -> Vec<usize> {
+            self.commits.lock().unwrap().clone()
+        }
+    }
+
+    struct BoundedKeyspace {
+        name: String,
+        rows: Rows,
+    }
+
+    impl KeyspaceOps for BoundedKeyspace {
+        fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> Fut<Result<(), AppError>> {
+            self.rows
+                .lock()
+                .unwrap()
+                .entry(self.name.clone())
+                .or_default()
+                .insert(key, value);
+            Box::pin(async { Ok(()) })
+        }
+        fn get_raw(&self, key: Vec<u8>) -> Fut<Result<Option<Vec<u8>>, AppError>> {
+            let v = self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&self.name)
+                .and_then(|m| m.get(&key).cloned());
+            Box::pin(async move { Ok(v) })
+        }
+        fn remove(&self, key: Vec<u8>) -> Fut<Result<(), AppError>> {
+            if let Some(m) = self.rows.lock().unwrap().get_mut(&self.name) {
+                m.remove(&key);
+            }
+            Box::pin(async { Ok(()) })
+        }
+        fn contains_key(&self, key: Vec<u8>) -> Fut<Result<bool, AppError>> {
+            let v = self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&self.name)
+                .is_some_and(|m| m.contains_key(&key));
+            Box::pin(async move { Ok(v) })
+        }
+        fn prefix_iter_raw(&self, prefix: Vec<u8>) -> Fut<Result<Vec<RawKvPair>, AppError>> {
+            let v = self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&self.name)
+                .map(|m| {
+                    m.iter()
+                        .filter(|(k, _)| k.starts_with(&prefix))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Box::pin(async move { Ok(v) })
+        }
+        fn take_raw_atomic(&self, key: Vec<u8>) -> Fut<Result<Option<Vec<u8>>, AppError>> {
+            let v = self
+                .rows
+                .lock()
+                .unwrap()
+                .get_mut(&self.name)
+                .and_then(|m| m.remove(&key));
+            Box::pin(async move { Ok(v) })
+        }
+        fn incr_raw(&self, _key: Vec<u8>) -> Fut<Result<u64, AppError>> {
+            Box::pin(async { Ok(0) })
+        }
+    }
+
+    struct BoundedBatch {
+        backend: Bounded,
+        ops: Vec<(String, Vec<u8>, Option<Vec<u8>>)>,
+    }
+
+    impl BatchOps for BoundedBatch {
+        fn insert_raw(&mut self, keyspace: &str, key: Vec<u8>, value: Vec<u8>) {
+            self.ops.push((keyspace.to_string(), key, Some(value)));
+        }
+        fn remove(&mut self, keyspace: &str, key: Vec<u8>) {
+            self.ops.push((keyspace.to_string(), key, None));
+        }
+        fn commit(self: Box<Self>) -> Fut<Result<(), AppError>> {
+            let b = *self;
+            let result = {
+                let mut commits = b.backend.commits.lock().unwrap();
+                let attempt = commits.len();
+                if b.ops.len() > b.backend.limits.max_ops {
+                    Err(AppError::Validation(format!(
+                        "batch of {} operations is over the limit",
+                        b.ops.len()
+                    )))
+                } else if b.backend.fail_commit == Some(attempt) {
+                    commits.push(usize::MAX); // marks the failed attempt
+                    Err(AppError::Internal("injected commit failure".into()))
+                } else {
+                    commits.push(b.ops.len());
+                    let mut rows = b.backend.rows.lock().unwrap();
+                    for (ks, key, value) in b.ops {
+                        let m = rows.entry(ks).or_default();
+                        match value {
+                            Some(v) => m.insert(key, v),
+                            None => m.remove(&key),
+                        };
+                    }
+                    Ok(())
+                }
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    impl StorageBackend for Bounded {
+        fn keyspace(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
+            Ok((
+                name.to_string(),
+                Arc::new(BoundedKeyspace {
+                    name: name.to_string(),
+                    rows: self.rows.clone(),
+                }),
+            ))
+        }
+        fn batch(&self) -> Box<dyn BatchOps> {
+            Box::new(BoundedBatch {
+                backend: self.clone(),
+                ops: Vec::new(),
+            })
+        }
+        fn persist(&self) -> Fut<Result<(), AppError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn batch_limits(&self) -> Option<BatchLimits> {
+            Some(self.limits)
+        }
+    }
+
+    struct BoundedFixture {
+        backend: Bounded,
+        store: Store,
+        stats: KeyspaceHandle,
+        timeseries: KeyspaceHandle,
+        dids: KeyspaceHandle,
+    }
+
+    fn bounded(max_ops: usize, fail_commit: Option<usize>) -> BoundedFixture {
+        let backend = Bounded::new(max_ops, fail_commit);
+        let store = backend.store();
+        BoundedFixture {
+            stats: store.keyspace(KS_STATS).unwrap(),
+            timeseries: store.keyspace(KS_TIMESERIES).unwrap(),
+            dids: store.keyspace(KS_DIDS).unwrap(),
+            store,
+            backend,
+        }
+    }
+
+    async fn flush_bounded(f: &BoundedFixture, c: &StatsCollector) -> Result<(), AppError> {
+        flush_stats_to_store(c, &f.stats, &f.timeseries, &f.dids, &f.store).await
+    }
+
+    async fn bounded_total(f: &BoundedFixture, prefix: &str) -> (u64, u64) {
+        let mut totals = (0, 0);
+        for (_, raw) in f.timeseries.prefix_iter_raw(prefix).await.unwrap() {
+            let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            totals.0 += v["r"].as_u64().unwrap();
+            totals.1 += v["u"].as_u64().unwrap();
+        }
+        totals
+    }
+
+    #[tokio::test]
+    async fn fifty_active_dids_flush_on_a_backend_that_refuses_more_than_100_operations() {
+        // 50 DIDs stage 100 rows, plus `_all`: 101 in one batch, which a
+        // 100-operation transactional backend refuses outright.
+        let f = bounded(100, None);
+        let collector = StatsCollector::new();
+        for i in 0..50 {
+            collector.record_deltas(&format!("did{i:02}"), 1, 1, None, None);
+        }
+
+        flush_bounded(&f, &collector).await.expect("flush");
+
+        assert_eq!(f.stats.iter_all().await.unwrap().len(), 50);
+        assert_eq!(bounded_total(&f, "ts:_all:").await, (50, 50));
+        assert!(
+            f.backend.committed_batch_sizes().iter().all(|n| *n <= 100),
+            "{:?}",
+            f.backend.committed_batch_sizes()
+        );
+        assert!(collector.drain_for_sync().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_large_flush_is_split_into_batches_and_loses_nothing() {
+        let f = bounded(10, None);
+        let collector = StatsCollector::new();
+        for i in 0..40 {
+            collector.record_deltas(&format!("did{i:02}"), 2, 1, Some(100 + i), None);
+        }
+
+        flush_bounded(&f, &collector).await.expect("flush");
+
+        assert!(f.backend.committed_batch_sizes().len() > 1);
+        assert!(f.backend.committed_batch_sizes().iter().all(|n| *n <= 10));
+        for i in 0..40 {
+            let s = stored_stats_in(&f, &format!("did{i:02}")).await;
+            assert_eq!((s.total_resolves, s.total_updates), (2, 1));
+            assert_eq!(s.last_resolved_at, Some(100 + i));
+        }
+        assert_eq!(bounded_total(&f, "ts:_all:").await, (80, 40));
+        assert_eq!(bounded_total(&f, "ts:did07:").await, (2, 1));
+    }
+
+    async fn stored_stats_in(f: &BoundedFixture, mnemonic: &str) -> DidStats {
+        f.stats
+            .get(format!("stats:{mnemonic}"))
+            .await
+            .unwrap()
+            .expect("stats row")
+    }
+
+    #[tokio::test]
+    async fn a_failed_chunk_and_the_ones_after_it_are_kept_for_the_next_flush() {
+        // 10 DIDs at 4 per chunk (max_ops 9 => (9 - 1) / 2): chunks of 4, 4, 2.
+        // The second commit fails.
+        let f = bounded(9, Some(1));
+        let collector = StatsCollector::new();
+        for i in 0..10 {
+            collector.record_deltas(&format!("did{i:02}"), 1, 0, Some(10), None);
+        }
+
+        let err = flush_bounded(&f, &collector)
+            .await
+            .expect_err("second chunk fails");
+        assert!(matches!(err, AppError::Internal(_)), "{err:?}");
+
+        // The first chunk went through; the other six are back in the collector.
+        assert_eq!(f.stats.iter_all().await.unwrap().len(), 4);
+        let mut kept = collector.drain_for_sync();
+        assert_eq!(kept.len(), 6, "{kept:?}");
+        kept.sort_by(|a, b| a.mnemonic.cmp(&b.mnemonic));
+        assert!(
+            kept.iter()
+                .all(|d| d.resolve_delta == 1 && d.last_resolved_at == Some(10))
+        );
+        // The totals are not double-counted: the committed chunk is not restored.
+        let committed: Vec<_> = f
+            .stats
+            .iter_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| String::from_utf8(k).unwrap())
+            .collect();
+        for d in &kept {
+            assert!(
+                !committed.contains(&format!("stats:{}", d.mnemonic)),
+                "{d:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deltas_kept_after_a_failure_are_written_by_the_next_flush() {
+        let f = bounded(9, Some(0)); // the very first commit fails
+        let collector = StatsCollector::new();
+        for i in 0..6 {
+            collector.record_deltas(&format!("did{i}"), 3, 1, None, None);
+        }
+        flush_bounded(&f, &collector)
+            .await
+            .expect_err("first commit fails");
+        assert!(f.stats.iter_all().await.unwrap().is_empty());
+
+        // New traffic lands on top of the kept deltas, then the retry succeeds.
+        collector.record_deltas("did0", 2, 0, None, None);
+        flush_bounded(&f, &collector).await.expect("retry");
+
+        let did0 = stored_stats_in(&f, "did0").await;
+        assert_eq!((did0.total_resolves, did0.total_updates), (5, 1));
+        let did5 = stored_stats_in(&f, "did5").await;
+        assert_eq!((did5.total_resolves, did5.total_updates), (3, 1));
+        assert_eq!(bounded_total(&f, "ts:_all:").await, (20, 6));
     }
 }
