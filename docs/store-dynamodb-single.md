@@ -72,6 +72,48 @@ of its own):
 No `Scan`, `DescribeTable` or `CreateTable`. Credentials come from the standard AWS
 provider chain.
 
+### Least privilege when services share a table
+
+The [key namespace](#4-key-namespace) keeps two services' rows from colliding. It is
+**not an access boundary**: it is a prefix the service adds itself, so a credential
+that is stolen from one service can read and write every row in the table, whatever
+that service's namespace is. Only IAM can enforce the boundary.
+
+The simplest safe layout is **one table per trust boundary**. If services must share
+a table, give each its own namespace and scope its role to that namespace's partition
+keys with `dynamodb:LeadingKeys`:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "dynamodb:GetItem",
+    "dynamodb:PutItem",
+    "dynamodb:UpdateItem",
+    "dynamodb:DeleteItem",
+    "dynamodb:Query"
+  ],
+  "Resource": "arn:aws:dynamodb:<region>:<account>:table/webvh",
+  "Condition": {
+    "ForAllValues:StringLike": { "dynamodb:LeadingKeys": ["control#*"] }
+  }
+}
+```
+
+Use the value that matches the service's `dynamodb_key_namespace` (`control#*`,
+`server#*`, `witness#*` …). The startup probe reads `<namespace>#_probe`, so it stays
+inside the allowed prefix.
+
+- A store with **no namespace** uses bare keyspace names (`acl`, `dids` …), which a
+  prefix pattern cannot describe. Set a namespace on every service that shares a
+  table.
+- Setting a namespace on an existing deployment **moves its rows** (the partition key
+  changes), so choose it before first use.
+- **The daemon** opens two stores. When they share a table its witness store already
+  gets the namespace `witness`; set `DAEMON_STORE_DYNAMODB_KEY_NAMESPACE` as well
+  (for example `main`) on a new deployment, and allow both prefixes:
+  `["main#*", "witness#*"]`. Otherwise give the daemon a table of its own.
+
 ## 3. Configure
 
 | `config.toml` (`[store]`) | Environment | Meaning |
