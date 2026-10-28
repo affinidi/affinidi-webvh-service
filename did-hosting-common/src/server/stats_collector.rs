@@ -113,7 +113,7 @@ impl StatsCollector {
     pub fn decrement_total_dids(&self) {
         let _ = self
             .agg_total_dids
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
     }
 
     /// Increment aggregate counters by the given deltas.
