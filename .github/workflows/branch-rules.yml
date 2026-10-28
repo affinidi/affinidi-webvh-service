@@ -22,5 +22,5 @@ jobs:
     steps:
       - uses: affinidi/pipeline-rust/.github/actions/release-branch-rules@feat/release-branch-actions
         with:
-          # Transitional: maintainers still cut locally; drop once cuts use the release-cut workflow.
-          maintainer-cuts: "true"
+          # Transitional: maintainers may still cut or prep locally; drop once both use the release workflows.
+          maintainer-releases: "true"
