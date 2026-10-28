@@ -1072,7 +1072,13 @@ pub async fn flush_stats_to_store(
     let deltas: Vec<_> = deltas.collect();
     let buckets: Vec<_> = buckets.collect();
     let deferred = deltas.len() + buckets.len();
-    collector.requeue_deltas(deltas);
+    let dropped = collector.requeue_deltas(deltas);
+    if dropped > 0 {
+        warn!(
+            dropped,
+            "stats backlog full; dropped unwritten per-DID totals for DIDs not already pending"
+        );
+    }
     collector.requeue_buckets(buckets);
 
     match failure {

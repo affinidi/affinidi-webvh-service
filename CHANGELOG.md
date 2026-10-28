@@ -128,7 +128,13 @@ browser-extension releases.
   within an hour are dropped with a warning, so a long outage cannot grow
   the backlog without bound; per-DID totals are always kept. The flush at
   shutdown still loses what it cannot write, and now logs an error saying
-  how many rows.
+  how many rows. A failed flush keeps unwritten totals for at most 100,000
+  DIDs.
+- **A server's stats sync can no longer write rows outside its DIDs'
+  series.** The control plane used each synced delta's path verbatim in
+  its `stats:` and `ts:` keys, so a path of `_all` added to the server-wide
+  series. A delta whose path is not a hosted path's shape, or is `_all`, is
+  now skipped with a warning.
 - **The control plane and the daemon no longer keep every time-series
   bucket in memory.** The collector's per-DID 5-minute buckets were never
   drained, so they grew for as long as the process ran. The flush now

@@ -16,6 +16,16 @@ use crate::DidStatsDelta;
 
 const BUCKET_SECS: u64 = 300; // 5-minute buckets
 
+/// Series name of the server-wide time-series (`ts:_all:{epoch}`). Not a
+/// valid DID path, so no DID's series can collide with it.
+pub const ALL_SERIES: &str = "_all";
+
+/// Most DIDs whose unwritten deltas a failed flush keeps. Far above the DIDs
+/// any one service hosts; it bounds memory only against deltas for paths
+/// that are not hosted here, which a peer's stats sync could otherwise
+/// grow without limit while the store is failing.
+pub const MAX_PENDING_DIDS: usize = 100_000;
+
 /// Per-DID counter deltas accumulated since the last drain.
 #[derive(Debug, Default)]
 struct MnemonicDeltas {
@@ -156,7 +166,9 @@ impl StatsCollector {
                 .entry((mnemonic.to_string(), epoch))
                 .or_insert((0, 0));
             b.0 += 1;
-            let g = buckets.entry(("_all".to_string(), epoch)).or_insert((0, 0));
+            let g = buckets
+                .entry((ALL_SERIES.to_string(), epoch))
+                .or_insert((0, 0));
             g.0 += 1;
         }
 
@@ -182,7 +194,9 @@ impl StatsCollector {
                 .entry((mnemonic.to_string(), epoch))
                 .or_insert((0, 0));
             b.1 += 1;
-            let g = buckets.entry(("_all".to_string(), epoch)).or_insert((0, 0));
+            let g = buckets
+                .entry((ALL_SERIES.to_string(), epoch))
+                .or_insert((0, 0));
             g.1 += 1;
         }
 
@@ -229,7 +243,9 @@ impl StatsCollector {
                 .or_insert((0, 0));
             b.0 += resolve_delta;
             b.1 += update_delta;
-            let g = buckets.entry(("_all".to_string(), epoch)).or_insert((0, 0));
+            let g = buckets
+                .entry((ALL_SERIES.to_string(), epoch))
+                .or_insert((0, 0));
             g.0 += resolve_delta;
             g.1 += update_delta;
         }
@@ -265,15 +281,24 @@ impl StatsCollector {
     /// Return drained per-DID deltas that could not be written, so the next
     /// drain carries them again. Aggregates are not touched: they already
     /// counted these events when they were recorded.
-    pub fn requeue_deltas(&self, failed: Vec<DidStatsDelta>) {
+    ///
+    /// Deltas for a DID not already pending are dropped once
+    /// [`MAX_PENDING_DIDS`] DIDs are; returns how many were dropped.
+    pub fn requeue_deltas(&self, failed: Vec<DidStatsDelta>) -> usize {
         let mut deltas = self.deltas.lock().unwrap();
+        let mut dropped = 0;
         for d in failed {
+            if deltas.len() >= MAX_PENDING_DIDS && !deltas.contains_key(&d.mnemonic) {
+                dropped += 1;
+                continue;
+            }
             let entry = deltas.entry(d.mnemonic).or_default();
             entry.resolves += d.resolve_delta;
             entry.updates += d.update_delta;
             entry.last_resolved_at = entry.last_resolved_at.max(d.last_resolved_at);
             entry.last_updated_at = entry.last_updated_at.max(d.last_updated_at);
         }
+        dropped
     }
 
     /// Return drained time-series buckets that could not be written, so the
@@ -351,6 +376,33 @@ mod tests {
             2,
             "requeueing must not count the events again"
         );
+    }
+
+    #[test]
+    fn requeue_stops_taking_new_dids_at_the_cap() {
+        let collector = StatsCollector::new();
+        let delta = |m: String| DidStatsDelta {
+            mnemonic: m,
+            resolve_delta: 1,
+            update_delta: 0,
+            last_resolved_at: None,
+            last_updated_at: None,
+        };
+        let full: Vec<_> = (0..MAX_PENDING_DIDS)
+            .map(|i| delta(format!("did-{i}")))
+            .collect();
+        assert_eq!(collector.requeue_deltas(full), 0);
+
+        let dropped = collector.requeue_deltas(vec![delta("new".into()), delta("did-0".into())]);
+
+        assert_eq!(
+            dropped, 1,
+            "a new DID is dropped, a pending one still merges"
+        );
+        let deltas = collector.drain_for_sync();
+        assert_eq!(deltas.len(), MAX_PENDING_DIDS);
+        let did_0 = deltas.iter().find(|d| d.mnemonic == "did-0");
+        assert_eq!(did_0.map(|d| d.resolve_delta), Some(2));
     }
 
     #[test]

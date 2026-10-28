@@ -347,7 +347,12 @@ pub(crate) async fn timeseries(
         }
         (None, None) => {
             cx.admin().await?;
-            super::queries::query_timeseries(&state.timeseries_ks, "_all", range).await?
+            super::queries::query_timeseries(
+                &state.timeseries_ks,
+                did_hosting_common::server::stats_collector::ALL_SERIES,
+                range,
+            )
+            .await?
         }
     };
     let points: Vec<Value> = points

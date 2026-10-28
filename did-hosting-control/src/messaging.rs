@@ -249,9 +249,13 @@ pub(crate) async fn do_stats_sync(
             "too many deltas in one sync",
         ));
     }
+    let mut invalid = 0usize;
     for d in deltas {
         let mnemonic = d.get("mnemonic").and_then(|v| v.as_str()).unwrap_or("");
-        if mnemonic.is_empty() {
+        // The path keys `stats:` and `ts:` rows: only a hosted-path shape is
+        // accepted, and never the server-wide series name.
+        if !is_stats_mnemonic(mnemonic) {
+            invalid += 1;
             continue;
         }
         let resolve_delta = d.get("resolve_delta").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -268,6 +272,12 @@ pub(crate) async fn do_stats_sync(
         );
     }
 
+    if invalid > 0 {
+        warn!(
+            server_did,
+            invalid, "stats sync: skipped deltas with an invalid DID path"
+        );
+    }
     debug!(
         server_did,
         seq,
@@ -276,6 +286,17 @@ pub(crate) async fn do_stats_sync(
     );
 
     Ok(json!({ "status": "accepted" }))
+}
+
+/// Whether a stats-sync delta's path can key a stats row: a hosted path's
+/// shape (`did:webs` slots end in a case-sensitive AID), never the
+/// server-wide series name.
+fn is_stats_mnemonic(mnemonic: &str) -> bool {
+    use did_hosting_common::server::mnemonic::{validate_mnemonic, validate_webs_mnemonic};
+    use did_hosting_common::server::stats_collector::ALL_SERIES;
+
+    mnemonic != ALL_SERIES
+        && (validate_mnemonic(mnemonic).is_ok() || validate_webs_mnemonic(mnemonic).is_ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -1654,6 +1675,21 @@ mod tests {
     use crate::server::AppState;
 
     use super::*;
+
+    #[test]
+    fn stats_sync_accepts_only_hosted_path_shapes() {
+        for ok in [
+            "alice",
+            "org/team",
+            ".well-known",
+            "ENro7uf0ePmiK3jdTo2YCdXLqW7z7xoP6qhhBou6gBLe",
+        ] {
+            assert!(is_stats_mnemonic(ok), "{ok} should be accepted");
+        }
+        for bad in ["", "_all", "a:b", "ts:_all:300", "/alice", "Alice/bob"] {
+            assert!(!is_stats_mnemonic(bad), "{bad} should be refused");
+        }
+    }
 
     /// Build a minimal `AppState` backed by a tempdir-rooted fjall store. The
     /// returned `_dir` guard must outlive `state` — when it drops, fjall
