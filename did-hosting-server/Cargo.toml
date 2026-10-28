@@ -109,7 +109,7 @@ tower-http = { version = "0.7", features = ["trace"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
-aws-sdk-secretsmanager = { version = "1", optional = true }
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 aws-config = { version = "1", features = [
   "behavior-version-latest",
 ], optional = true }
@@ -118,7 +118,7 @@ google-cloud-secretmanager-v1 = { version = "1", optional = true }
 google-cloud-auth = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
 redis = { version = "1.0", features = ["tokio-comp", "aio"], optional = true }
-aws-sdk-dynamodb = { version = "1", optional = true }
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 firestore = { version = "0.61", optional = true }
 futures = { version = "0.3", optional = true }
 azure_data_cosmos = { version = "1", features = [

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Security — rustls 0.21 removed from the AWS backends
+
+The DynamoDB store and AWS secret backends no longer build the AWS SDK's
+legacy HTTPS client, which used rustls 0.21 (GHSA-c8m5-c952-6cm4,
+GHSA-w44r-93j7-qv28, GHSA-h2v8-394m-p7vv). They now use the SDK's current
+client on rustls 0.23.46, so the lockfile carries a single rustls.
+
 ### Changed — trust-tasks 0.36
 
 The workspace moves to trust-tasks-rs 0.36, with vta-sdk 0.75, vti-common
