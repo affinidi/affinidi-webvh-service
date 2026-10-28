@@ -962,6 +962,9 @@ fn run_storage_thread(
 
         let mut session_timer = tokio::time::interval(session_interval);
         let mut flush_timer = tokio::time::interval(flush_interval);
+        // A flush that overruns its interval is followed by a full interval,
+        // not an immediate catch-up flush.
+        flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut did_count_timer = tokio::time::interval(DID_COUNT_RECONCILE_INTERVAL);
 
         // Skip first tick (immediate)
@@ -978,7 +981,7 @@ fn run_storage_thread(
                 }
                 _ = flush_timer.tick() => {
                     // Flush accumulated per-DID stats deltas to persistent store
-                    if let Err(e) = flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, &store).await {
+                    if let Err(e) = flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, STATS_FLUSH_MAX_ROWS).await {
                         warn!("stats flush error: {e}");
                     }
                 }
@@ -995,7 +998,7 @@ fn run_storage_thread(
         }
 
         // Final flush before shutdown
-        let _ = flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, &store).await;
+        flush_remaining_stats(&collector, &stats_ks, &timeseries_ks).await;
 
         if let Err(e) = store.persist().await {
             error!("failed to persist store on shutdown: {e}");
@@ -1005,83 +1008,157 @@ fn run_storage_thread(
     });
 }
 
-/// Flush accumulated stats deltas from the in-memory collector to the store.
+/// Most rows one periodic stats flush writes, about 20 a second at the
+/// 10-second flush interval. Each row is a read and a write, so this bounds
+/// the flush's share of the store's capacity and how long it holds the
+/// storage task; rows beyond it wait for the next flush. Per-DID totals come
+/// first, then time-series buckets newest first, so under sustained load the
+/// oldest buckets are the ones that age out (see [`STATS_BUCKET_MAX_AGE`]).
+pub const STATS_FLUSH_MAX_ROWS: usize = 200;
+
+/// Oldest time-series bucket a flush still writes. Older buckets are counts
+/// the store has refused or the flush could not reach for this long; they
+/// are dropped with a warning so a long outage cannot grow the backlog
+/// without bound. Per-DID totals are never dropped: there is one row per DID.
+pub const STATS_BUCKET_MAX_AGE: Duration = Duration::from_secs(3600);
+
+/// Flush accumulated stats deltas from the in-memory collector to the store,
+/// writing at most `max_rows` rows.
 ///
 /// `stats_ks` receives `stats:{mnemonic}` aggregate rows;
 /// `timeseries_ks` receives `ts:{mnemonic}:{bucket}` and
 /// `ts:_all:{bucket}` time-series rows. The split came in v0.7 so a
 /// future scan over either keyspace returns homogeneous-shaped values.
-/// fjall batches span keyspaces, so atomicity is preserved.
+///
+/// Each row is its own read-modify-write, not one transaction over the
+/// whole flush: on a metered store a transaction costs twice the write
+/// units, and one throttled row would fail every row with it. The cost is
+/// one write request per row. The first failed row ends the flush; that row
+/// and every row not yet written go back to the collector, as do rows past
+/// `max_rows`, so a failed flush loses no counts while the process runs. A
+/// write that fails after the store applied it (a timeout) is counted again
+/// on the retry.
 pub async fn flush_stats_to_store(
     collector: &did_hosting_common::server::stats_collector::StatsCollector,
     stats_ks: &KeyspaceHandle,
     timeseries_ks: &KeyspaceHandle,
-    store: &Store,
+    max_rows: usize,
 ) -> Result<(), AppError> {
-    let deltas = collector.drain_for_sync();
-    if deltas.is_empty() {
-        return Ok(());
+    let mut deltas = collector.drain_for_sync().into_iter().peekable();
+    let mut buckets = recent_buckets(collector.drain_buckets())
+        .into_iter()
+        .peekable();
+    let mut written = 0usize;
+    let mut failure = None;
+
+    while written < max_rows {
+        let result = if let Some(d) = deltas.peek() {
+            write_did_stats(stats_ks, d).await
+        } else if let Some(b) = buckets.peek() {
+            write_timeseries_bucket(timeseries_ks, b).await
+        } else {
+            break;
+        };
+        if let Err(e) = result {
+            failure = Some(e);
+            break;
+        }
+        if deltas.next().is_none() {
+            buckets.next();
+        }
+        written += 1;
     }
 
-    // Current 5-minute time-series bucket
+    let deltas: Vec<_> = deltas.collect();
+    let buckets: Vec<_> = buckets.collect();
+    let deferred = deltas.len() + buckets.len();
+    collector.requeue_deltas(deltas);
+    collector.requeue_buckets(buckets);
+
+    match failure {
+        Some(e) => {
+            warn!(
+                written,
+                deferred, "stats flush stopped; unwritten rows requeued"
+            );
+            Err(e)
+        }
+        None => {
+            if written > 0 || deferred > 0 {
+                debug!(written, deferred, "flushed stats rows to store");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Flush every pending stats row, for shutdown. Rows that cannot be
+/// written now are lost with the process, so a failure is an error.
+pub async fn flush_remaining_stats(
+    collector: &did_hosting_common::server::stats_collector::StatsCollector,
+    stats_ks: &KeyspaceHandle,
+    timeseries_ks: &KeyspaceHandle,
+) {
+    if let Err(e) = flush_stats_to_store(collector, stats_ks, timeseries_ks, usize::MAX).await {
+        error!(
+            lost = collector.pending_rows(),
+            "final stats flush failed; unwritten statistics are lost: {e}"
+        );
+    }
+}
+
+/// Drop drained buckets older than [`STATS_BUCKET_MAX_AGE`] and order the
+/// rest newest first.
+fn recent_buckets(
+    buckets: Vec<did_hosting_common::server::stats_collector::DrainedBucket>,
+) -> Vec<did_hosting_common::server::stats_collector::DrainedBucket> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let bucket_epoch = now / 300 * 300;
-
-    // Aggregate totals for the server-wide (_all) time-series bucket
-    let mut all_resolve_delta = 0u64;
-    let mut all_update_delta = 0u64;
-
-    let mut batch = store.batch();
-    for d in &deltas {
-        // Aggregate stats (totals) — stats_ks
-        let key = format!("stats:{}", d.mnemonic);
-        let mut stats: did_hosting_common::DidStats =
-            stats_ks.get(key.as_str()).await?.unwrap_or_default();
-        stats.total_resolves += d.resolve_delta;
-        stats.total_updates += d.update_delta;
-        if let Some(t) = d.last_resolved_at {
-            stats.last_resolved_at = Some(stats.last_resolved_at.map_or(t, |prev| prev.max(t)));
-        }
-        if let Some(t) = d.last_updated_at {
-            stats.last_updated_at = Some(stats.last_updated_at.map_or(t, |prev| prev.max(t)));
-        }
-        batch.insert(stats_ks, key, &stats)?;
-
-        // Time-series bucket (per-DID) — timeseries_ks
-        if d.resolve_delta > 0 || d.update_delta > 0 {
-            let ts_key = format!("ts:{}:{bucket_epoch}", d.mnemonic);
-            let existing: serde_json::Value = timeseries_ks
-                .get(ts_key.as_str())
-                .await?
-                .unwrap_or(serde_json::json!({"r": 0, "u": 0}));
-            let r = existing.get("r").and_then(|v| v.as_u64()).unwrap_or(0) + d.resolve_delta;
-            let u = existing.get("u").and_then(|v| v.as_u64()).unwrap_or(0) + d.update_delta;
-            batch.insert(timeseries_ks, ts_key, &serde_json::json!({"r": r, "u": u}))?;
-
-            all_resolve_delta += d.resolve_delta;
-            all_update_delta += d.update_delta;
-        }
+    let cutoff = now.saturating_sub(STATS_BUCKET_MAX_AGE.as_secs());
+    let (mut recent, old): (Vec<_>, Vec<_>) = buckets.into_iter().partition(|b| b.epoch >= cutoff);
+    if !old.is_empty() {
+        warn!(
+            rows = old.len(),
+            "dropping time-series buckets that could not be written within the maximum age"
+        );
     }
+    recent.sort_by_key(|b| std::cmp::Reverse(b.epoch));
+    recent
+}
 
-    // Server-wide time-series bucket (_all) — timeseries_ks
-    if all_resolve_delta > 0 || all_update_delta > 0 {
-        let all_key = format!("ts:_all:{bucket_epoch}");
-        let existing: serde_json::Value = timeseries_ks
-            .get(all_key.as_str())
-            .await?
-            .unwrap_or(serde_json::json!({"r": 0, "u": 0}));
-        let r = existing.get("r").and_then(|v| v.as_u64()).unwrap_or(0) + all_resolve_delta;
-        let u = existing.get("u").and_then(|v| v.as_u64()).unwrap_or(0) + all_update_delta;
-        batch.insert(timeseries_ks, all_key, &serde_json::json!({"r": r, "u": u}))?;
-    }
+/// Add one DID's deltas to its `stats:{mnemonic}` row.
+async fn write_did_stats(
+    stats_ks: &KeyspaceHandle,
+    d: &did_hosting_common::DidStatsDelta,
+) -> Result<(), AppError> {
+    let key = format!("stats:{}", d.mnemonic);
+    let mut stats: did_hosting_common::DidStats =
+        stats_ks.get(key.as_str()).await?.unwrap_or_default();
+    stats.total_resolves += d.resolve_delta;
+    stats.total_updates += d.update_delta;
+    stats.last_resolved_at = stats.last_resolved_at.max(d.last_resolved_at);
+    stats.last_updated_at = stats.last_updated_at.max(d.last_updated_at);
+    stats_ks.insert(key, &stats).await
+}
 
-    batch.commit().await?;
-
-    debug!(count = deltas.len(), "flushed stats deltas to store");
-    Ok(())
+/// Add one bucket's counts to its `ts:{mnemonic}:{epoch}` row (`_all` for
+/// the server-wide series).
+async fn write_timeseries_bucket(
+    timeseries_ks: &KeyspaceHandle,
+    b: &did_hosting_common::server::stats_collector::DrainedBucket,
+) -> Result<(), AppError> {
+    let key = format!("ts:{}:{}", b.mnemonic, b.epoch);
+    let existing: serde_json::Value = timeseries_ks
+        .get(key.as_str())
+        .await?
+        .unwrap_or(serde_json::json!({"r": 0, "u": 0}));
+    let r = existing.get("r").and_then(|v| v.as_u64()).unwrap_or(0) + b.resolves;
+    let u = existing.get("u").and_then(|v| v.as_u64()).unwrap_or(0) + b.updates;
+    timeseries_ks
+        .insert(key, &serde_json::json!({"r": r, "u": u}))
+        .await
 }
 
 /// How often the standalone control plane recounts its DIDs from the store.
@@ -1270,4 +1347,155 @@ pub async fn run_health_checks(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use did_hosting_common::DidStats;
+    use did_hosting_common::server::config::StoreConfig;
+    use did_hosting_common::server::stats_collector::StatsCollector;
+
+    use super::*;
+
+    /// A flush whose writes start failing part-way keeps every row it did
+    /// not write, and the next flush writes them without counting any
+    /// event twice.
+    #[tokio::test]
+    async fn failed_stats_flush_loses_no_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open fjall");
+        let allowed = Arc::new(AtomicUsize::new(1));
+        let stats_ks = store
+            .keyspace("stats")
+            .unwrap()
+            .failing_writes_after(allowed.clone());
+        let timeseries_ks = store
+            .keyspace("timeseries")
+            .unwrap()
+            .failing_writes_after(allowed.clone());
+
+        let collector = StatsCollector::new();
+        for mnemonic in ["alice", "bob", "carol"] {
+            collector.record_resolve(mnemonic);
+        }
+        collector.record_resolve("alice");
+
+        flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, usize::MAX)
+            .await
+            .expect_err("writes fail after the first");
+
+        // Events recorded between the failed flush and the retry merge with
+        // the retained rows.
+        collector.record_update("bob");
+        allowed.store(usize::MAX, Ordering::SeqCst);
+        flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, usize::MAX)
+            .await
+            .expect("retry flushes everything");
+
+        let stats = |m: &str| {
+            let ks = stats_ks.clone();
+            let key = format!("stats:{m}");
+            async move {
+                let s: DidStats = ks.get(key.as_str()).await.unwrap().unwrap();
+                (s.total_resolves, s.total_updates)
+            }
+        };
+        assert_eq!(stats("alice").await, (2, 0));
+        assert_eq!(stats("bob").await, (1, 1));
+        assert_eq!(stats("carol").await, (1, 0));
+
+        let rows = timeseries_ks.prefix_iter_raw("ts:_all:").await.unwrap();
+        let (r, u) = rows
+            .iter()
+            .map(|(_, v)| serde_json::from_slice::<serde_json::Value>(v).unwrap())
+            .fold((0, 0), |(r, u), v| {
+                (r + v["r"].as_u64().unwrap(), u + v["u"].as_u64().unwrap())
+            });
+        assert_eq!((r, u), (4, 1), "server-wide series counts each event once");
+    }
+
+    async fn fjall_keyspaces() -> (tempfile::TempDir, KeyspaceHandle, KeyspaceHandle) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open fjall");
+        let stats_ks = store.keyspace("stats").unwrap();
+        let timeseries_ks = store.keyspace("timeseries").unwrap();
+        (dir, stats_ks, timeseries_ks)
+    }
+
+    /// Rows past the flush's budget wait for the next flush; per-DID totals
+    /// go first.
+    #[tokio::test]
+    async fn stats_flush_defers_rows_past_its_budget() {
+        let (_dir, stats_ks, timeseries_ks) = fjall_keyspaces().await;
+        let collector = StatsCollector::new();
+        for mnemonic in ["alice", "bob"] {
+            collector.record_resolve(mnemonic);
+        }
+        // Two totals, two per-DID buckets and one `_all` bucket.
+        assert_eq!(collector.pending_rows(), 5);
+
+        flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, 2)
+            .await
+            .unwrap();
+        assert_eq!(collector.pending_rows(), 3, "only the budget is written");
+        assert_eq!(stats_ks.prefix_iter_raw("stats:").await.unwrap().len(), 2);
+        assert!(
+            timeseries_ks
+                .prefix_iter_raw("ts:")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, 2)
+            .await
+            .unwrap();
+        flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, 2)
+            .await
+            .unwrap();
+        assert_eq!(collector.pending_rows(), 0);
+        assert_eq!(timeseries_ks.prefix_iter_raw("ts:").await.unwrap().len(), 3);
+    }
+
+    /// A bucket older than the maximum age is dropped, not written or kept.
+    #[tokio::test]
+    async fn stats_flush_drops_buckets_past_the_maximum_age() {
+        use did_hosting_common::server::stats_collector::DrainedBucket;
+
+        let (_dir, stats_ks, timeseries_ks) = fjall_keyspaces().await;
+        let collector = StatsCollector::new();
+        collector.requeue_buckets(vec![DrainedBucket {
+            mnemonic: "alice".into(),
+            epoch: 300,
+            resolves: 1,
+            updates: 0,
+        }]);
+        collector.record_resolve("bob");
+
+        flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(collector.pending_rows(), 0);
+        assert!(
+            timeseries_ks
+                .get_raw("ts:alice:300")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(timeseries_ks.prefix_iter_raw("ts:").await.unwrap().len(), 2);
+    }
 }

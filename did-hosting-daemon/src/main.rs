@@ -1216,6 +1216,9 @@ async fn run_daemon_storage_task(
     let mut session_timer = tokio::time::interval(session_interval);
     let mut did_timer = tokio::time::interval(did_interval);
     let mut flush_timer = tokio::time::interval(flush_interval);
+    // A flush that overruns its interval is followed by a full interval, not
+    // an immediate catch-up flush.
+    flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // T30 background purge sweep — 60s tick, processes ripe pending
     // entries (unassign-then-wait-grace) by deleting matching DID
     // records and clearing the pending entry.
@@ -1272,7 +1275,7 @@ async fn run_daemon_storage_task(
                     &params.collector,
                     &params.stats_ks,
                     &params.timeseries_ks,
-                    &params.store,
+                    did_hosting_control::server::STATS_FLUSH_MAX_ROWS,
                 ).await {
                     warn!("stats flush error: {e}");
                 }
@@ -1306,11 +1309,10 @@ async fn run_daemon_storage_task(
     }
 
     // Final flush before exit
-    let _ = did_hosting_control::server::flush_stats_to_store(
+    did_hosting_control::server::flush_remaining_stats(
         &params.collector,
         &params.stats_ks,
         &params.timeseries_ks,
-        &params.store,
     )
     .await;
 

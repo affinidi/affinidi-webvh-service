@@ -4,8 +4,9 @@
 //! for sync to the control plane (on did-hosting-server) or flush to storage
 //! (on did-hosting-control). This eliminates I/O from the hot path.
 //!
-//! Time-series buckets (5-minute resolution) are also tracked in memory
-//! and drained alongside per-DID deltas for atomic batch writes.
+//! Time-series buckets (5-minute resolution) are also tracked in memory,
+//! keyed by the time of the event, and drained alongside per-DID deltas.
+//! A writer that fails to store drained deltas or buckets requeues them.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -256,6 +257,36 @@ impl StatsCollector {
             .collect()
     }
 
+    /// Rows waiting to be written: per-DID deltas plus time-series buckets.
+    pub fn pending_rows(&self) -> usize {
+        self.deltas.lock().unwrap().len() + self.buckets.lock().unwrap().len()
+    }
+
+    /// Return drained per-DID deltas that could not be written, so the next
+    /// drain carries them again. Aggregates are not touched: they already
+    /// counted these events when they were recorded.
+    pub fn requeue_deltas(&self, failed: Vec<DidStatsDelta>) {
+        let mut deltas = self.deltas.lock().unwrap();
+        for d in failed {
+            let entry = deltas.entry(d.mnemonic).or_default();
+            entry.resolves += d.resolve_delta;
+            entry.updates += d.update_delta;
+            entry.last_resolved_at = entry.last_resolved_at.max(d.last_resolved_at);
+            entry.last_updated_at = entry.last_updated_at.max(d.last_updated_at);
+        }
+    }
+
+    /// Return drained time-series buckets that could not be written, so the
+    /// next drain carries them again.
+    pub fn requeue_buckets(&self, failed: Vec<DrainedBucket>) {
+        let mut buckets = self.buckets.lock().unwrap();
+        for b in failed {
+            let entry = buckets.entry((b.mnemonic, b.epoch)).or_insert((0, 0));
+            entry.0 += b.resolves;
+            entry.1 += b.updates;
+        }
+    }
+
     /// Drain all accumulated time-series bucket deltas.
     pub fn drain_buckets(&self) -> Vec<DrainedBucket> {
         let mut buckets = self.buckets.lock().unwrap();
@@ -302,6 +333,47 @@ impl Default for StatsCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requeued_deltas_merge_with_new_events() {
+        let collector = StatsCollector::new();
+        collector.record_resolve("alice");
+        let drained = collector.drain_for_sync();
+        collector.record_resolve("alice");
+
+        collector.requeue_deltas(drained);
+
+        let deltas = collector.drain_for_sync();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].resolve_delta, 2);
+        assert_eq!(
+            collector.get_aggregate().total_resolves,
+            2,
+            "requeueing must not count the events again"
+        );
+    }
+
+    #[test]
+    fn requeued_buckets_merge_with_new_events() {
+        let collector = StatsCollector::new();
+        collector.record_update("alice");
+        let drained = collector.drain_buckets();
+        collector.record_update("alice");
+
+        collector.requeue_buckets(drained);
+
+        let mut buckets = collector.drain_buckets();
+        buckets.sort_by(|a, b| a.mnemonic.cmp(&b.mnemonic));
+        let counts: Vec<_> = buckets
+            .iter()
+            .map(|b| (b.mnemonic.as_str(), b.updates))
+            .collect();
+        assert_eq!(counts, [("_all", 2), ("alice", 2)]);
+        assert!(
+            collector.drain_buckets().is_empty(),
+            "a drain empties the map"
+        );
+    }
 
     #[test]
     fn decrement_total_dids_stops_at_zero() {

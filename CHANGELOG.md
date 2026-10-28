@@ -116,6 +116,24 @@ browser-extension releases.
   plane recounts hourly to correct paths that bypass them; the daemon takes
   the count from its empty-DID cleanup (hourly by default), which already
   reads every record.
+- **A failed stats flush no longer loses that window's statistics.** The
+  control plane and the daemon wrote every stats and time-series row of a
+  flush in one transaction, and dropped the drained counts when any read or
+  write failed, as under store throttling. Each row is now its own write;
+  the first failure ends the flush and the unwritten rows are retried on the
+  next one. On DynamoDB, plain writes use half the write units of a
+  transaction, at the cost of one request per row. A flush writes at most
+  200 rows, so its load on the store is spread across flushes; rows beyond
+  that wait for the next one. Time-series buckets that cannot be written
+  within an hour are dropped with a warning, so a long outage cannot grow
+  the backlog without bound; per-DID totals are always kept. The flush at
+  shutdown still loses what it cannot write, and now logs an error saying
+  how many rows.
+- **The control plane and the daemon no longer keep every time-series
+  bucket in memory.** The collector's per-DID 5-minute buckets were never
+  drained, so they grew for as long as the process ran. The flush now
+  writes them, which also puts each event in the bucket of the time it
+  happened rather than the time it was flushed.
 
 ### Added — did:scid identities
 
