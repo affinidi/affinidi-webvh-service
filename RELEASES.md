@@ -120,7 +120,7 @@ Cuts are moving to the release bot: Actions → **Cut a release** on `main` does
 the same with the bot's token (dry run by default), and adds a commit carrying
 the new version into `docs/openapi.json` and `fuzz/Cargo.lock`. Once cuts use
 it, `scripts/cut-release.py` and `scripts/release_lib.py` go, and so does
-`maintainer-cuts` in `branch-rules.yml`.
+`maintainer-releases` in `branch-rules.yml`.
 
 ### Release candidate, GA, patch
 
