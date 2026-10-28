@@ -31,6 +31,12 @@ env:
   # Bumping one without the other causes silent drift.
   MSRV: "1.95.0"
 
+# Runners: only the four long jobs (clippy, MSRV, default-features tests,
+# did:webs tests) use `vars.CI_RUNNER_LARGE`. Larger runners run few jobs at
+# once, so the short store / method / cloud-secret matrix jobs stay on
+# ubuntu-latest, where they start immediately; PR #307 spent most of its hour
+# queued with every heavy job on the large runner. Every Rust job still runs
+# ./.github/actions/prepare-runner for swap and disk.
 jobs:
   fmt:
     name: cargo fmt
@@ -135,7 +141,7 @@ jobs:
 
   test:
     name: cargo test (${{ matrix.store }})
-    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -293,7 +299,7 @@ jobs:
 
   methods:
     name: cargo build (DID method ${{ matrix.case }})
-    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -411,7 +417,7 @@ jobs:
 
   cloud-secrets-build:
     name: cargo build (cloud secret backends)
-    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
