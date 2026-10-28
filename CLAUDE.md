@@ -445,16 +445,18 @@ Also worth knowing before you go looking for them:
 - **Never edit a `version =` by hand.** Releases are `major.minor`, live on
   `release/<major.minor>` branches cut from `nightly`, and every crate carries
   the release's version; patches happen only on the release branch. Versions
-  move only through `scripts/cut-release.py` (the cut; `main` goes to the next
-  minor) and the *Prepare a release* workflow (rc / GA / patch), and the
+  move only through the *Cut a release* workflow (the cut; `main` goes to the
+  next minor) and the *Prepare a release* workflow (rc / GA / patch), and the
   `branch rules` check fails any other PR that changes one. A fix for a
   supported release lands on `main` first, then gets a `backport
   release/<major.minor>` label. See `RELEASES.md`.
 
-  The tooling (`scripts/release_lib.py::set_version`) also moves the internal
-  path-dep pins and refreshes `fuzz/Cargo.lock`. That detached workspace's
-  committed lock records `did-hosting-common`'s version, and the nightly Fuzz
-  job gates on `cargo fetch --locked` with no PR check exercising it — so a
+  The version is `[workspace.package] version`, inherited by every crate; the
+  shared tooling also moves the internal path-dep pins, and
+  `scripts/sync-version-files.py` refreshes `docs/openapi.json` and
+  `fuzz/Cargo.lock`. That detached workspace's committed lock records
+  `did-hosting-common`'s version, and the nightly Fuzz job gates on `cargo
+  fetch --locked` with no PR check exercising it — so a
   **dependency-requirement bump** in a normal PR still needs `cargo
   generate-lockfile --manifest-path fuzz/Cargo.toml`, or the fuzz job turns red
   the next morning with no fuzzing having run.

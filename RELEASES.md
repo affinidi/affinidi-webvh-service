@@ -29,7 +29,8 @@ feature/*  ──PR──▶  main  ──(nightly.yml: last fully green commit)
 
 Every workspace crate has the same version on a release branch, and it is the
 release's: `release/0.9` publishes `0.9.0`, then `0.9.1`, … for all six crates
-at once. The branch's current version is its `RELEASE` file; the tag is `v` +
+at once. It is set once, as `[workspace.package] version`; every crate inherits
+it and every internal dependency requires exactly it. The branch's current version is its `RELEASE` file; the tag is `v` +
 that.
 
 | Step | `RELEASE` | Tag | Crates |
@@ -83,28 +84,33 @@ Only fix on the release branch directly when the code there no longer exists on
 `main`: a maintainer adds the `release-direct` label to that PR, and its
 description says why.
 
-The `branch rules` check (`scripts/check-branch-rules.py`) holds all of this: a
-PR into `release/**` is a bot backport, a prep PR or labelled `release-direct`;
-only the release tooling changes versions or `RELEASE`, on any branch.
+The `branch rules` check (the shared `release-branch-rules` action from
+affinidi/pipeline-rust) holds all of this: a PR into `release/**` is a backport
+or prep PR the release bot opened, or is labelled `release-direct`; only the
+release tooling changes versions or `RELEASE`, on any branch.
+
+The release workflows here are thin callers of the shared `release-*` actions
+in affinidi/pipeline-rust. What is specific to this repository stays here:
+`backport.yml`'s CHANGELOG.md merge driver, and
+`scripts/sync-version-files.py`, which carries a version change into
+`docs/openapi.json` and `fuzz/Cargo.lock`.
 
 ## Procedures
 
 ### Cut
 
-```sh
-python3 scripts/cut-release.py 0.9 --dry-run   # builds both commits, pushes nothing
-python3 scripts/cut-release.py 0.9
-```
+Actions → **Cut a release** on `main` → name `0.9`. Run it first with
+`dry-run` on (the default): it builds both commits and pushes nothing. Then run
+it again with `dry-run` off. It pushes `release/0.9` (every crate at `0.9.0`,
+`RELEASE` = `0.9.0-rc.0`, which `release-tag.yml` tags), creates the
+`backport release/0.9` label, and opens the `release-cut/0.9` PR that moves
+`main` to `0.10.0` and closes `main`'s `## Unreleased` changelog section under
+`## 0.9.0`; a second commit on that PR carries `0.10.0` into
+`docs/openapi.json` and `fuzz/Cargo.lock`. Merge it, then update the schedule
+table above.
 
-From a clean checkout with push access and `gh` authenticated. It pushes
-`release/0.9` (every crate at `0.9.0`, `RELEASE` = `0.9.0-rc.0`, which
-`release-tag.yml` tags), creates the `backport release/0.9` label, and opens
-the `release-cut/0.9` PR that moves `main` to `0.10.0` and closes `main`'s
-`## Unreleased` changelog section under `## 0.9.0`. Merge it, then update the
-schedule table above.
-
-`--from <rev>` cuts from something other than `origin/nightly` — the first cut,
-before `nightly` exists, is `--from origin/main`.
+`from` cuts from something other than `origin/nightly` — the first cut,
+before `nightly` exists, is `origin/main`.
 
 ### Release candidate, GA, patch
 
@@ -112,7 +118,8 @@ Actions → **Prepare a release** → choose the release branch as the ref and
 `rc`, `ga` or `patch`. It moves `RELEASE`, writes the changelog (GA: the
 `## Unreleased` section becomes `## 0.9.0 (date)`; patch: a new section listing
 the commits since the last tag), bumps every crate for a patch, and opens a
-`chore(release): v…` PR. **Merging it tags the release** (`release-tag.yml`:
+`chore(release): v…` PR. For a patch, a second commit carries the version into
+`docs/openapi.json` and `fuzz/Cargo.lock`. **Merging it tags the release** (`release-tag.yml`:
 the tag and a GitHub Release whose notes are that version's changelog section).
 
 ### Publish
@@ -144,9 +151,12 @@ Settings, not files:
 - **Ruleset on `main`:** require a PR, and require `branch rules`.
 - **Ruleset on `nightly`:** block force pushes and deletion; only the
   workflow's identity may update it.
-- **`RELEASE_TOKEN`** (required for backports and preps) — a fine-grained PAT
-  or GitHub App token on this repository with contents and pull-requests
-  write and actions read. The enterprise does not allow `GITHUB_TOKEN` to
-  open pull requests, so without it `backport.yml` and `release-prep.yml`
-  fail at the PR step. (A PR opened with `GITHUB_TOKEN` would trigger no CI
-  anyway.) `nightly.yml` and `release-tag.yml` need no secret.
+- **The release bot app** (required for cuts, backports and preps) —
+  `affinidi-semantic-release`, installed on this repository with contents and
+  pull-requests write. `RELEASE_BOT_APP_ID` and `RELEASE_BOT_PRIVATE_KEY` must
+  reach the `release` environment. `branch rules` accepts a cut, prep or
+  backport PR only when this app opened it, and the enterprise does not allow
+  `GITHUB_TOKEN` to open pull requests (one it opened would trigger no CI
+  anyway).
+- **`RELEASE_TOKEN`** (optional) — moves `nightly` when set; `GITHUB_TOKEN`
+  otherwise. `release-tag.yml` needs no secret.
