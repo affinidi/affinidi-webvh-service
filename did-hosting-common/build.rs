@@ -5,19 +5,19 @@
 // directory, and commit the toml, the lock and the bundles together.
 //
 // Only `server-core` builds use Trust Tasks; other builds skip generation.
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=build.rs");
     if std::env::var_os("CARGO_FEATURE_SERVER_CORE").is_none() {
-        return;
+        return Ok(());
     }
     #[cfg(feature = "server-core")]
     {
-        let generated = match trust_tasks_build::Config::new().compile() {
-            Ok(path) => path,
-            Err(e) => panic!("trust-tasks-build: {e}"),
-        };
-        write_schema_index(&generated);
+        let generated = trust_tasks_build::Config::new()
+            .compile()
+            .map_err(|e| format!("trust-tasks-build: {e}"))?;
+        write_schema_index(&generated)?;
     }
+    Ok(())
 }
 
 /// Writes `trust_tasks_schema_index.rs` next to the generated types: a
@@ -25,40 +25,48 @@ fn main() {
 /// the same shape as `trust_tasks_rs::schema_index::schema_for` but for the
 /// versions this workspace pins rather than the runtime's prebuilt specs.
 ///
-/// The Type URIs are read from the generated `impl Payload` blocks, and each
-/// one's module path follows from the URI (`acl/change-role/0.2` →
-/// `acl::change_role::v0_2`). A path that does not exist fails the build.
+/// The entries come from `trust-tasks.lock` and its bundles — the same inputs
+/// the types were generated from (`compile()` has already verified each
+/// bundle against its locked digest). Each one names the generated type's
+/// `PAYLOAD_SCHEMA`, so a module path that does not exist fails the build.
 #[cfg(feature = "server-core")]
-fn write_schema_index(generated: &std::path::Path) {
-    const PREFIX: &str = "https://trusttasks.org/spec/";
-    let src = std::fs::read_to_string(generated).expect("read generated trust tasks");
+fn write_schema_index(generated: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    use std::fmt::Write as _;
+
+    let lock = trust_tasks_build::Lockfile::read("trust-tasks.lock")
+        .map_err(|e| format!("trust-tasks.lock: {e}"))?;
+    let bundle_dir = std::path::Path::new("trust-tasks");
     let mut arms = String::new();
-    let mut lines = src.lines();
-    while let Some(line) = lines.next() {
-        let ty = match line.trim() {
-            "impl ::trust_tasks_rs::Payload for Payload {" => "Payload",
-            "impl ::trust_tasks_rs::Payload for Response {" => "Response",
-            _ => continue,
-        };
-        let uri = lines
-            .next()
-            .and_then(|l| l.trim().strip_prefix("const TYPE_URI: &'static str = \""))
-            .and_then(|l| l.strip_suffix("\";"))
-            .expect("a generated Payload impl starts with its TYPE_URI");
-        let bare = uri.strip_suffix("#response").unwrap_or(uri);
-        let Some(rest) = bare.strip_prefix(PREFIX) else {
-            continue;
-        };
-        let (slug, version) = rest.rsplit_once('/').expect("Type URI ends in /M.N");
-        let module: Vec<String> = slug.split('/').map(|s| s.replace('-', "_")).collect();
-        let path = format!(
-            "self::{}::v{}::{ty}",
-            module.join("::"),
-            version.replace('.', "_")
+    for task in &lock.tasks {
+        if task.source.is_some() {
+            return Err(format!(
+                "{}: third-party sources are not indexed; extend build.rs first",
+                task.display_id()
+            )
+            .into());
+        }
+        let bundle = task
+            .read_bundle(bundle_dir)
+            .map_err(|e| format!("{}: {e}", task.display_id()))?;
+        // `acl/change-role` 0.2 → `acl::change_role::v0_2`, the generator's
+        // module layout.
+        let module = format!(
+            "self::{}::v{}",
+            task.slug.replace('-', "_").replace('/', "::"),
+            task.version.replace('.', "_")
         );
-        arms.push_str(&format!(
-            "        {uri:?} => <{path} as ::trust_tasks_rs::Payload>::PAYLOAD_SCHEMA,\n"
-        ));
+        let uri = &task.type_uri;
+        writeln!(
+            arms,
+            "        {uri:?} => <{module}::Payload as ::trust_tasks_rs::Payload>::PAYLOAD_SCHEMA,"
+        )?;
+        if bundle.response_schema.is_some() {
+            let response = format!("{uri}#response");
+            writeln!(
+                arms,
+                "        {response:?} => <{module}::Response as ::trust_tasks_rs::Payload>::PAYLOAD_SCHEMA,"
+            )?;
+        }
     }
     let out = format!(
         "/// The payload schema for a pinned Type URI (bare for the request,\n\
@@ -68,5 +76,6 @@ fn write_schema_index(generated: &std::path::Path) {
          \x20   match type_uri {{\n{arms}        _ => None,\n    }}\n}}\n"
     );
     let dest = generated.with_file_name("trust_tasks_schema_index.rs");
-    std::fs::write(dest, out).expect("write schema index");
+    std::fs::write(&dest, out).map_err(|e| format!("{}: {e}", dest.display()))?;
+    Ok(())
 }
