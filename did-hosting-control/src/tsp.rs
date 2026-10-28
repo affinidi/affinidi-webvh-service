@@ -416,7 +416,7 @@ mod tests {
         let error_doc = json!({
             "id": "urn:uuid:33333333-3333-3333-3333-333333333333",
             "threadId": "urn:uuid:11111111-1111-1111-1111-111111111111",
-            "type": "https://trusttasks.org/spec/trust-task-error/0.5",
+            "type": "https://trusttasks.org/spec/trust-task-error/0.6",
             "recipient": SERVICE_DID,
             "issuedAt": "2026-07-06T00:00:00Z",
             "payload": {"code": "e.p.did.validation-error", "message": "nope"},

@@ -208,7 +208,7 @@ mod tests {
         let err = read_reply::<key_delete::Response>(
             key_delete::Payload::TYPE_URI,
             reply(
-                "https://trusttasks.org/spec/trust-task-error/0.5",
+                "https://trusttasks.org/spec/trust-task-error/0.6",
                 json!({
                     "code": "webvh/witness/key/delete:notFound",
                     "message": "no such key",
