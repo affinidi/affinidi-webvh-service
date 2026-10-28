@@ -446,7 +446,7 @@ impl FailingWrites {
     fn take_write(&self) -> Result<(), AppError> {
         use std::sync::atomic::Ordering;
         self.allowed
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .map(|_| ())
             .map_err(|_| AppError::Store("injected write failure".into()))
     }
