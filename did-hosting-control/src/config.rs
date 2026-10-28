@@ -162,6 +162,13 @@ pub struct InstanceConfig {
     pub url: String,
 }
 
+/// The store config setup starts from: `data_dir`, with the same `*_STORE_*`
+/// environment overrides [`AppConfig::load`] applies at runtime, so setup opens
+/// the backend the service will use.
+pub fn setup_store_config(data_dir: PathBuf) -> StoreConfig {
+    did_hosting_common::server::config::store_config_with_env(data_dir, &["CONTROL_STORE"])
+}
+
 impl AppConfig {
     pub fn load(config_path: Option<PathBuf>) -> Result<Self, AppError> {
         let path = config_path
@@ -251,5 +258,27 @@ impl AppConfig {
         }
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod setup_store_tests {
+    use super::*;
+
+    #[test]
+    fn setup_starts_from_the_store_environment_the_service_reads_at_runtime() {
+        // SAFETY: the only test in this crate that touches these variables.
+        unsafe {
+            std::env::set_var("CONTROL_STORE_DYNAMODB_TABLE_NAME", "control_store-table");
+        }
+        let store = setup_store_config(PathBuf::from("/data"));
+        unsafe {
+            std::env::remove_var("CONTROL_STORE_DYNAMODB_TABLE_NAME");
+        }
+        assert_eq!(
+            store.dynamodb_table_name.as_deref(),
+            Some("control_store-table")
+        );
+        assert_eq!(store.data_dir, PathBuf::from("/data"));
     }
 }

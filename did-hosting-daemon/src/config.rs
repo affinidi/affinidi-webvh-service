@@ -126,11 +126,136 @@ impl Default for EnableConfig {
     }
 }
 
+/// Tests that set process-wide `DAEMON_*` environment variables hold this lock,
+/// so they cannot see each other's values.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Key namespace the daemon gives its witness store when both its stores share
+/// one DynamoDB single table and neither names a namespace.
+#[cfg(feature = "store-dynamodb-single")]
+const DEFAULT_WITNESS_KEY_NAMESPACE: &str = "witness";
+
+/// A DynamoDB table as a store config names it: the table name, and the region
+/// and account when the config says which (an ARN carries both; a bare name
+/// takes its region from `dynamodb_region` and has no account of its own).
+#[cfg(feature = "store-dynamodb-single")]
+struct TableRef<'a> {
+    name: &'a str,
+    region: Option<&'a str>,
+    account: Option<&'a str>,
+}
+
+/// DynamoDB accepts a table's ARN (`arn:aws:dynamodb:<region>:<account>:table/<name>`)
+/// wherever it accepts its name, so `webvh` and the ARN of `webvh` are one table.
+/// Anything that is not a table ARN is taken as a bare name.
+#[cfg(feature = "store-dynamodb-single")]
+fn table_ref(config: &StoreConfig) -> Option<TableRef<'_>> {
+    let raw = config.dynamodb_table_name.as_deref()?;
+    let arn = raw.splitn(6, ':').collect::<Vec<_>>();
+    if let [prefix, _partition, "dynamodb", region, account, resource] = arn[..]
+        && prefix == "arn"
+        && let Some(rest) = resource.strip_prefix("table/")
+    {
+        let name = rest.split('/').next().unwrap_or(rest);
+        return Some(TableRef {
+            name,
+            region: Some(region).filter(|r| !r.is_empty()),
+            account: Some(account).filter(|a| !a.is_empty()),
+        });
+    }
+    Some(TableRef {
+        name: raw,
+        region: config.dynamodb_region.as_deref(),
+        account: None,
+    })
+}
+
+/// Whether two store configs can resolve to the same DynamoDB table: the same
+/// table (a name and an ARN of it count as the same), in regions and accounts
+/// that are not provably different. An unset region or account means "whatever
+/// the environment says", which may be the other store's, so it is treated as
+/// possibly the same (fail closed).
+#[cfg(feature = "store-dynamodb-single")]
+fn same_single_table(a: &StoreConfig, b: &StoreConfig) -> bool {
+    let (Some(x), Some(y)) = (table_ref(a), table_ref(b)) else {
+        return false;
+    };
+    let provably_different =
+        |p: Option<&str>, q: Option<&str>| matches!((p, q), (Some(p), Some(q)) if p != q);
+    x.name == y.name
+        && !provably_different(x.region, y.region)
+        && !provably_different(x.account, y.account)
+}
+
+/// Keep the daemon's main store and witness store on separate rows of a shared
+/// DynamoDB single table.
+///
+/// Both stores open keyspaces with the same names (`acl`, `witnesses`), so on
+/// one table they would be the same rows: a revoke made through the witness
+/// would edit the control plane's ACL. When the stores share a table and
+/// neither names a key namespace, the witness store gets
+/// [`DEFAULT_WITNESS_KEY_NAMESPACE`]; the main store keeps bare keyspace names,
+/// so its existing rows stay where they are. Stores on different tables are left
+/// alone. If they still resolve to the same partitions (an explicit, equal
+/// namespace), the daemon refuses to start rather than merge them.
+#[cfg(feature = "store-dynamodb-single")]
+fn separate_witness_store(config: &mut DaemonConfig) -> Result<(), AppError> {
+    if !same_single_table(&config.store, &config.witness_store) {
+        return Ok(());
+    }
+    if config.store.dynamodb_key_namespace.is_none()
+        && config.witness_store.dynamodb_key_namespace.is_none()
+    {
+        config.witness_store.dynamodb_key_namespace =
+            Some(DEFAULT_WITNESS_KEY_NAMESPACE.to_string());
+        tracing::info!(
+            table = config
+                .store
+                .dynamodb_table_name
+                .as_deref()
+                .unwrap_or_default(),
+            namespace = DEFAULT_WITNESS_KEY_NAMESPACE,
+            "the witness store shares a DynamoDB table with the main store; \
+             giving it its own key namespace so they do not share rows"
+        );
+    }
+    if config.store.dynamodb_key_namespace == config.witness_store.dynamodb_key_namespace {
+        return Err(AppError::Config(format!(
+            "the daemon's `store` and `witness_store` resolve to the same DynamoDB table \
+             (`{}`) and key namespace ({}); they use the same keyspace names (`acl`, \
+             `witnesses`), so they would share rows. Give the witness store its own table \
+             (DAEMON_WITNESS_STORE_DYNAMODB_TABLE_NAME) or a distinct key namespace \
+             (DAEMON_WITNESS_STORE_DYNAMODB_KEY_NAMESPACE)",
+            config
+                .store
+                .dynamodb_table_name
+                .as_deref()
+                .unwrap_or_default(),
+            config
+                .store
+                .dynamodb_key_namespace
+                .as_deref()
+                .map_or("none".to_string(), |ns| format!("`{ns}`")),
+        )));
+    }
+    Ok(())
+}
+
 impl DaemonConfig {
-    pub fn load(config_path: Option<PathBuf>) -> Result<Self, AppError> {
-        let path = config_path
+    /// The daemon's config file: `--config`, else `DAEMON_CONFIG_PATH`, else
+    /// `config.toml`. [`Self::load`] resolves it this way; a caller that hands the
+    /// path to code with a different default (the server's backup and restore
+    /// fall back to `DID_HOSTING_CONFIG_PATH`) resolves it here first, so the
+    /// file written and the file read are the same one.
+    pub fn resolve_config_path(config_path: Option<PathBuf>) -> PathBuf {
+        config_path
             .or_else(|| std::env::var("DAEMON_CONFIG_PATH").ok().map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("config.toml"));
+            .unwrap_or_else(|| PathBuf::from("config.toml"))
+    }
+
+    pub fn load(config_path: Option<PathBuf>) -> Result<Self, AppError> {
+        let path = Self::resolve_config_path(config_path);
 
         if !path.exists() {
             return Err(AppError::Config(format!(
@@ -189,6 +314,17 @@ impl DaemonConfig {
         // DAEMON_SERVER_RESOLVE_CACHE_* — Cache-Control on DID resolution.
         config.server.resolve_cache.apply_env_overrides("DAEMON")?;
 
+        did_hosting_common::server::config::apply_store_env_overrides(
+            "DAEMON_STORE",
+            &mut config.store,
+        );
+        did_hosting_common::server::config::apply_store_env_overrides(
+            "DAEMON_WITNESS_STORE",
+            &mut config.witness_store,
+        );
+        #[cfg(feature = "store-dynamodb-single")]
+        separate_witness_store(&mut config)?;
+
         // Fjall memory settings (STORAGE_FJALL_BLOCK_CACHE / _WRITE_BUFFER /
         // _MAX_JOURNAL) — shared, unprefixed names; see
         // `did_hosting_common::server::config::apply_fjall_env_overrides`.
@@ -203,6 +339,15 @@ impl DaemonConfig {
         }
 
         Ok(config)
+    }
+
+    /// The server config a backup or restore works on: this daemon's, so its
+    /// `store` is the one the daemon opens at runtime, `DAEMON_STORE_*` overrides
+    /// included. `did_hosting_server::backup` takes this as its config loader.
+    pub fn load_server_config(
+        config_path: Option<PathBuf>,
+    ) -> Result<did_hosting_server::config::AppConfig, AppError> {
+        Self::load(config_path).map(|config| config.server_config())
     }
 
     /// Build a did-hosting-server AppConfig from the daemon config.
@@ -312,6 +457,7 @@ impl DaemonConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use did_hosting_server::backup::ConfigRestore;
     use std::io::Write;
 
     /// Minimal self-managed config: `[identity] mode = "self-managed"`,
@@ -401,6 +547,247 @@ context_id = "webvh"
         );
     }
 
+    /// A daemon config whose `store.data_dir` is `store` (and witness store
+    /// `witness`), written to a temp dir.
+    fn write_daemon_config(
+        dir: &std::path::Path,
+        store: &std::path::Path,
+        witness: &std::path::Path,
+    ) -> PathBuf {
+        let toml = SELF_MANAGED_TOML
+            .replace("data/daemon/store", &store.display().to_string())
+            .replace("data/daemon/witness", &witness.display().to_string());
+        let path = dir.join("config.toml");
+        std::fs::write(&path, toml).expect("write config");
+        path
+    }
+
+    async fn seed(data_dir: &std::path::Path, key: &str) {
+        let store = did_hosting_common::server::store::Store::open(&StoreConfig {
+            data_dir: data_dir.to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open store");
+        let dids = store
+            .keyspace(did_hosting_common::server::store::KS_DIDS)
+            .expect("dids");
+        dids.insert_raw(key, b"v".to_vec()).await.expect("seed");
+        store.persist().await.expect("persist");
+    }
+
+    async fn did_keys(data_dir: &std::path::Path) -> Vec<String> {
+        let store = did_hosting_common::server::store::Store::open(&StoreConfig {
+            data_dir: data_dir.to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open store");
+        let dids = store
+            .keyspace(did_hosting_common::server::store::KS_DIDS)
+            .expect("dids");
+        let mut keys: Vec<String> = dids
+            .iter_all()
+            .await
+            .expect("scan")
+            .into_iter()
+            .map(|(k, _)| String::from_utf8(k).expect("utf8"))
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    // Holds `ENV_LOCK` across the awaits on purpose; see the tests above.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn restore_with_only_daemon_config_path_set_writes_and_reloads_that_file() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        let path = write_daemon_config(dir.path(), &data, &dir.path().join("w"));
+        let out = dir.path().join("backup.json");
+        // SAFETY: serialised by ENV_LOCK; cleared again below.
+        unsafe { std::env::set_var("DAEMON_CONFIG_PATH", &path) };
+        // No `--config`, and a decoy where the server's restore would write by
+        // default if handed `None`.
+        let decoy = dir.path().join("decoy.toml");
+        unsafe { std::env::set_var("DID_HOSTING_CONFIG_PATH", &decoy) };
+        let resolved = DaemonConfig::resolve_config_path(None);
+        seed(&data, "did:one").await;
+        did_hosting_server::backup::run_backup_with(
+            Some(resolved.clone()),
+            out.display().to_string(),
+            DaemonConfig::load_server_config,
+        )
+        .await
+        .expect("backup");
+        std::fs::remove_file(&path).expect("lose the config");
+
+        let result = did_hosting_server::backup::run_restore_with(
+            Some(resolved.clone()),
+            out.display().to_string(),
+            DaemonConfig::load_server_config,
+            ConfigRestore::KeepExisting,
+        )
+        .await;
+        unsafe {
+            std::env::remove_var("DAEMON_CONFIG_PATH");
+            std::env::remove_var("DID_HOSTING_CONFIG_PATH");
+        }
+
+        result.expect("restore recovers from a missing config");
+        assert_eq!(resolved, path);
+        assert!(path.exists(), "the daemon's own config file is restored");
+        assert!(
+            !decoy.exists(),
+            "nothing is written to the server's default"
+        );
+    }
+
+    // Holds `ENV_LOCK` across the awaits on purpose; see the tests above.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn restore_keeps_the_daemons_own_config_including_the_witness_store() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        let witness = dir.path().join("witness-elsewhere");
+        let path = write_daemon_config(dir.path(), &data, &witness);
+        let original = std::fs::read_to_string(&path).expect("read");
+        let out = dir.path().join("backup.json");
+        seed(&data, "did:one").await;
+        did_hosting_server::backup::run_backup_with(
+            Some(path.clone()),
+            out.display().to_string(),
+            DaemonConfig::load_server_config,
+        )
+        .await
+        .expect("backup");
+        std::fs::remove_dir_all(&data).expect("lose the store");
+
+        did_hosting_server::backup::run_restore_with(
+            Some(path.clone()),
+            out.display().to_string(),
+            DaemonConfig::load_server_config,
+            ConfigRestore::KeepExisting,
+        )
+        .await
+        .expect("restore");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            original,
+            "the daemon's config is untouched"
+        );
+        let reloaded = DaemonConfig::load(Some(path)).expect("still loads");
+        assert_eq!(reloaded.witness_store.data_dir, witness);
+        assert_eq!(did_keys(&data).await, vec!["did:one".to_string()]);
+    }
+
+    #[test]
+    fn the_config_path_is_the_flag_then_daemon_config_path_then_config_toml() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialised by ENV_LOCK; cleared again below.
+        unsafe { std::env::set_var("DAEMON_CONFIG_PATH", "/env/daemon.toml") };
+        let flag = DaemonConfig::resolve_config_path(Some(PathBuf::from("/flag.toml")));
+        let env = DaemonConfig::resolve_config_path(None);
+        unsafe { std::env::remove_var("DAEMON_CONFIG_PATH") };
+        let default = DaemonConfig::resolve_config_path(None);
+
+        assert_eq!(flag, PathBuf::from("/flag.toml"));
+        assert_eq!(env, PathBuf::from("/env/daemon.toml"));
+        assert_eq!(default, PathBuf::from("config.toml"));
+    }
+
+    #[test]
+    fn the_server_config_for_backup_carries_the_daemons_store_environment() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_daemon_config(dir.path(), &dir.path().join("a"), &dir.path().join("w"));
+        // SAFETY: serialised by ENV_LOCK; cleared again below.
+        unsafe { std::env::set_var("DAEMON_STORE_DATA_DIR", dir.path().join("b")) };
+
+        let loaded = DaemonConfig::load_server_config(Some(path));
+        unsafe { std::env::remove_var("DAEMON_STORE_DATA_DIR") };
+
+        assert_eq!(loaded.expect("load").store.data_dir, dir.path().join("b"));
+    }
+
+    // The env var must stay set across the awaits, so `ENV_LOCK` is held across them.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn backup_exports_the_store_the_daemon_opens_not_the_one_in_the_file() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        // The file's store holds two DIDs and the env's one, so the count says
+        // which was exported.
+        seed(&a, "did:in-file").await;
+        seed(&a, "did:in-file-too").await;
+        seed(&b, "did:in-env").await;
+        let path = write_daemon_config(dir.path(), &a, &dir.path().join("w"));
+        let out = dir.path().join("backup.json");
+        // SAFETY: serialised by ENV_LOCK; cleared again below.
+        unsafe { std::env::set_var("DAEMON_STORE_DATA_DIR", &b) };
+
+        let result = did_hosting_server::backup::run_backup_with(
+            Some(path),
+            out.display().to_string(),
+            DaemonConfig::load_server_config,
+        )
+        .await;
+        unsafe { std::env::remove_var("DAEMON_STORE_DATA_DIR") };
+
+        result.expect("backup");
+        let backup: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).expect("read")).expect("json");
+        let dids = backup["keyspaces"]["dids"].as_array().expect("dids");
+        assert_eq!(dids.len(), 1, "{dids:?}");
+    }
+
+    // The env var must stay set across the awaits, so `ENV_LOCK` is held across them.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn restore_writes_into_the_store_the_daemon_opens_and_leaves_a_loadable_config() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        seed(&a, "did:in-file").await;
+        seed(&b, "did:in-env").await;
+        let path = write_daemon_config(dir.path(), &a, &dir.path().join("w"));
+        let out = dir.path().join("backup.json");
+        // SAFETY: serialised by ENV_LOCK; cleared again below.
+        unsafe { std::env::set_var("DAEMON_STORE_DATA_DIR", &b) };
+        did_hosting_server::backup::run_backup_with(
+            Some(path.clone()),
+            out.display().to_string(),
+            DaemonConfig::load_server_config,
+        )
+        .await
+        .expect("backup");
+        // Lose the env store's data, then restore the backup.
+        std::fs::remove_dir_all(&b).expect("wipe");
+
+        let result = did_hosting_server::backup::run_restore_with(
+            Some(path.clone()),
+            out.display().to_string(),
+            DaemonConfig::load_server_config,
+            ConfigRestore::KeepExisting,
+        )
+        .await;
+        let reloaded = DaemonConfig::load(Some(path));
+        unsafe { std::env::remove_var("DAEMON_STORE_DATA_DIR") };
+
+        result.expect("restore");
+        assert!(reloaded.is_ok(), "the restored config file still loads");
+        assert_eq!(did_keys(&b).await, vec!["did:in-env".to_string()]);
+        assert_eq!(
+            did_keys(&a).await,
+            vec!["did:in-file".to_string()],
+            "the store named only in the file is untouched"
+        );
+    }
+
     #[test]
     fn loads_vta_config_without_identity_block_defaults_to_vta() {
         // Back-compat: existing VTA-mode configs don't have an `[identity]`
@@ -423,4 +810,230 @@ context_id = "webvh"
     // against parallel tests in the same process (env vars are
     // process-wide), and the daemon's override code is just a 3-arm
     // match — not worth a serialised mutex harness.
+
+    /// The two stores of one daemon, as a deployment that runs both on the
+    /// single-table backend would configure them.
+    #[cfg(feature = "store-dynamodb-single")]
+    mod single_table {
+        use super::*;
+        use did_hosting_common::server::config::StoreConfig;
+
+        fn stores(
+            main: (Option<&str>, Option<&str>, Option<&str>),
+            witness: (Option<&str>, Option<&str>, Option<&str>),
+        ) -> DaemonConfig {
+            // Each tuple is (table, region, namespace).
+            let to_store =
+                |(table, region, ns): (Option<&str>, Option<&str>, Option<&str>)| StoreConfig {
+                    dynamodb_table_name: table.map(str::to_string),
+                    dynamodb_region: region.map(str::to_string),
+                    dynamodb_key_namespace: ns.map(str::to_string),
+                    ..StoreConfig::default()
+                };
+            let mut config: DaemonConfig = toml::from_str(SELF_MANAGED_TOML).expect("parse");
+            config.store = to_store(main);
+            config.witness_store = to_store(witness);
+            config
+        }
+
+        const T: Option<&str> = Some("webvh");
+
+        #[test]
+        fn a_shared_table_gives_the_witness_store_its_own_namespace() {
+            let mut c = stores((T, None, None), (T, None, None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(
+                c.witness_store.dynamodb_key_namespace.as_deref(),
+                Some("witness")
+            );
+            assert_eq!(
+                c.store.dynamodb_key_namespace, None,
+                "the main store's rows must not move"
+            );
+        }
+
+        #[test]
+        fn separate_tables_are_left_alone() {
+            // An operator already on separate tables must not have their witness
+            // rows re-addressed.
+            let mut c = stores((T, None, None), (Some("webvh-witness"), None, None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(c.witness_store.dynamodb_key_namespace, None);
+        }
+
+        #[test]
+        fn an_explicit_witness_namespace_is_kept() {
+            let mut c = stores((T, None, None), (T, None, Some("w2")));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(
+                c.witness_store.dynamodb_key_namespace.as_deref(),
+                Some("w2")
+            );
+        }
+
+        #[test]
+        fn a_namespace_on_the_main_store_alone_already_separates_them() {
+            let mut c = stores((T, None, Some("main")), (T, None, None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(
+                c.witness_store.dynamodb_key_namespace, None,
+                "nothing to add"
+            );
+        }
+
+        #[test]
+        fn identical_explicit_namespaces_are_refused_naming_the_fix() {
+            let mut c = stores((T, None, Some("x")), (T, None, Some("x")));
+            let err = separate_witness_store(&mut c).expect_err("same table and namespace");
+            let msg = err.to_string();
+            assert!(matches!(err, AppError::Config(_)));
+            assert!(
+                msg.contains("DAEMON_WITNESS_STORE_DYNAMODB_KEY_NAMESPACE"),
+                "{msg}"
+            );
+            assert!(
+                msg.contains("DAEMON_WITNESS_STORE_DYNAMODB_TABLE_NAME"),
+                "{msg}"
+            );
+        }
+
+        #[test]
+        fn a_main_store_namespaced_witness_is_never_silently_merged_with_the_witness_store() {
+            // Main named "witness" and witness unset: distinct partitions (bare vs
+            // namespaced), nothing to add.
+            let mut c = stores((T, None, Some("witness")), (T, None, None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(c.witness_store.dynamodb_key_namespace, None);
+            // Both explicitly "witness": the same partitions, so it is refused.
+            let mut c = stores((T, None, Some("witness")), (T, None, Some("witness")));
+            assert!(separate_witness_store(&mut c).is_err());
+        }
+
+        #[test]
+        fn different_regions_are_different_tables() {
+            let mut c = stores((T, Some("us-east-1"), None), (T, Some("eu-west-1"), None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(c.witness_store.dynamodb_key_namespace, None);
+        }
+
+        #[test]
+        fn an_unknown_region_is_treated_as_possibly_the_same_table() {
+            // `None` means "whatever the environment says", which may be the other
+            // store's region: fail closed.
+            let mut c = stores((T, None, None), (T, Some("us-east-1"), None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(
+                c.witness_store.dynamodb_key_namespace.as_deref(),
+                Some("witness")
+            );
+        }
+
+        const ARN: Option<&str> = Some("arn:aws:dynamodb:us-east-1:111122223333:table/webvh");
+
+        #[test]
+        fn a_name_and_the_arn_of_that_table_are_the_same_table() {
+            // DynamoDB accepts either for one table; comparing the raw strings
+            // would let the witness store share the main store's rows unseen.
+            for (main, witness) in [(T, ARN), (ARN, T), (ARN, ARN)] {
+                let mut c = stores((main, None, None), (witness, None, None));
+                separate_witness_store(&mut c).expect("ok");
+                assert_eq!(
+                    c.witness_store.dynamodb_key_namespace.as_deref(),
+                    Some("witness"),
+                    "{main:?} vs {witness:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn an_arn_and_a_name_in_a_different_region_are_different_tables() {
+            let mut c = stores((ARN, None, None), (T, Some("eu-west-1"), None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(c.witness_store.dynamodb_key_namespace, None);
+
+            // The same name in the ARN's own region is the same table.
+            let mut c = stores((ARN, None, None), (T, Some("us-east-1"), None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(
+                c.witness_store.dynamodb_key_namespace.as_deref(),
+                Some("witness")
+            );
+        }
+
+        #[test]
+        fn arns_of_different_accounts_regions_or_tables_are_different_tables() {
+            for other in [
+                "arn:aws:dynamodb:us-east-1:999999999999:table/webvh",
+                "arn:aws:dynamodb:eu-west-1:111122223333:table/webvh",
+                "arn:aws:dynamodb:us-east-1:111122223333:table/webvh-witness",
+            ] {
+                let mut c = stores((ARN, None, None), (Some(other), None, None));
+                separate_witness_store(&mut c).expect("ok");
+                assert_eq!(c.witness_store.dynamodb_key_namespace, None, "{other}");
+            }
+        }
+
+        #[test]
+        fn an_arn_naming_the_same_table_with_a_stream_or_index_suffix_resolves_to_the_table() {
+            let with_index = Some("arn:aws:dynamodb:us-east-1:111122223333:table/webvh/index/gsi");
+            let mut c = stores((T, None, None), (with_index, None, None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(
+                c.witness_store.dynamodb_key_namespace.as_deref(),
+                Some("witness")
+            );
+        }
+
+        #[test]
+        fn a_name_that_merely_starts_like_an_arn_is_a_plain_name() {
+            // Not a dynamodb table ARN: compared as a literal name.
+            let other = Some("arn:aws:s3:::webvh");
+            let mut c = stores((T, None, None), (other, None, None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(c.witness_store.dynamodb_key_namespace, None);
+        }
+
+        #[test]
+        fn stores_without_a_table_name_are_not_checked() {
+            let mut c = stores((None, None, None), (None, None, None));
+            separate_witness_store(&mut c).expect("ok");
+            assert_eq!(c.witness_store.dynamodb_key_namespace, None);
+        }
+
+        #[test]
+        fn load_separates_the_stores_when_both_use_the_same_env_table() {
+            // The usual single-table deployment: both stores get
+            // the same table through the environment.
+            let _guard = crate::config::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let (_dir, path) = write_temp_config(SELF_MANAGED_TOML);
+            // SAFETY: serialised by ENV_LOCK; no other thread reads these names.
+            unsafe {
+                std::env::set_var("DAEMON_STORE_DYNAMODB_TABLE_NAME", "shared");
+                std::env::set_var("DAEMON_WITNESS_STORE_DYNAMODB_TABLE_NAME", "shared");
+            }
+            let loaded = DaemonConfig::load(Some(path));
+            unsafe {
+                std::env::remove_var("DAEMON_STORE_DYNAMODB_TABLE_NAME");
+                std::env::remove_var("DAEMON_WITNESS_STORE_DYNAMODB_TABLE_NAME");
+            }
+            let config = loaded.expect("loads");
+            assert_eq!(config.store.dynamodb_table_name.as_deref(), Some("shared"));
+            assert_eq!(config.store.dynamodb_key_namespace, None);
+            assert_eq!(
+                config.witness_store.dynamodb_key_namespace.as_deref(),
+                Some("witness")
+            );
+            // The embedded witness is built from this store config.
+            assert_eq!(
+                config
+                    .witness_config()
+                    .store
+                    .dynamodb_key_namespace
+                    .as_deref(),
+                Some("witness")
+            );
+        }
+    }
 }

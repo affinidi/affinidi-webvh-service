@@ -89,7 +89,9 @@ keyring_service = "did-hosting-daemon"
 [store]
 data_dir = "data/daemon/store"
 
-# Witness store (separate to avoid keyspace collisions)
+# Witness store (separate to avoid keyspace collisions). On a DynamoDB single
+# table shared by both stores the daemon gives this one the key namespace
+# "witness"; see docs/store-dynamodb-single.md.
 [witness_store]
 data_dir = "data/daemon/witness"
 

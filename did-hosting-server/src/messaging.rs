@@ -307,6 +307,7 @@ impl From<crate::error::AppError> for OpError {
         match e {
             AppError::Io(_)
             | AppError::Store(_)
+            | AppError::StoreOutcomeUnknown(_)
             | AppError::SecretStore(_)
             | AppError::Internal(_) => OpError::Transient(e.to_string()),
             other => OpError::Refused(other.to_string()),

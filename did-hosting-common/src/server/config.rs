@@ -294,8 +294,21 @@ pub struct StoreConfig {
     pub redis_url: Option<String>,
     /// DynamoDB table name prefix (default: `"webvh"`). Used by `store-dynamodb` backend.
     pub dynamodb_table_prefix: Option<String>,
-    /// AWS region for DynamoDB. Used by `store-dynamodb` backend.
+    /// AWS region for DynamoDB. Used by `store-dynamodb` and `store-dynamodb-single` backends.
     pub dynamodb_region: Option<String>,
+    /// Full DynamoDB table name for the externally-provisioned single-table backend.
+    /// Required when the `store-dynamodb-single` feature is enabled. The table must exist —
+    /// the backend does not call `CreateTable` / `DescribeTable`.
+    pub dynamodb_table_name: Option<String>,
+    /// Optional namespace for `store-dynamodb-single`. When set, every row's
+    /// partition key is `"{namespace}#{keyspace}"`, so several stores can share
+    /// one table without sharing rows. When unset the partition key is the bare
+    /// keyspace name. Letters, digits, `_`, `-` and `.`; at most 32 characters.
+    pub dynamodb_key_namespace: Option<String>,
+    /// Strongly consistent reads for `store-dynamodb-single`. Unset means
+    /// `true`; `false` opts into eventually consistent reads (half the read
+    /// capacity, but a read may miss a write that just completed).
+    pub dynamodb_consistent_reads: Option<bool>,
     /// GCP project ID for Firestore. Used by `store-firestore` backend.
     pub firestore_project: Option<String>,
     /// Firestore database name (default: `"(default)"`). Used by `store-firestore` backend.
@@ -321,6 +334,9 @@ impl std::fmt::Debug for StoreConfig {
             .field("redis_url", &self.redis_url.as_ref().map(|_| "<redacted>"))
             .field("dynamodb_table_prefix", &self.dynamodb_table_prefix)
             .field("dynamodb_region", &self.dynamodb_region)
+            .field("dynamodb_table_name", &self.dynamodb_table_name)
+            .field("dynamodb_key_namespace", &self.dynamodb_key_namespace)
+            .field("dynamodb_consistent_reads", &self.dynamodb_consistent_reads)
             .field("firestore_project", &self.firestore_project)
             .field("firestore_database", &self.firestore_database)
             .field(
@@ -983,6 +999,9 @@ impl Default for StoreConfig {
             redis_url: None,
             dynamodb_table_prefix: None,
             dynamodb_region: None,
+            dynamodb_table_name: None,
+            dynamodb_key_namespace: None,
+            dynamodb_consistent_reads: None,
             firestore_project: None,
             firestore_database: None,
             cosmosdb_connection_string: None,
@@ -1271,6 +1290,108 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Parse an environment boolean: `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off`
+/// (case-insensitive, no surrounding whitespace). Anything else is `None`.
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// A [`StoreConfig`] for `data_dir` with the store environment overrides
+/// applied, the way a service's `load()` would apply them at runtime.
+///
+/// Setup builds a fresh config (it has no config file yet), so without this it
+/// would open, and record, a store that ignores the same variables the running
+/// service honours: a backend that needs its table or project name from the
+/// environment would fail setup before the service ever starts. Each of
+/// `var_prefixes` is a full prefix as [`apply_store_env_overrides`] takes it,
+/// applied in order so a later one wins.
+pub fn store_config_with_env(data_dir: PathBuf, var_prefixes: &[&str]) -> StoreConfig {
+    let mut store = StoreConfig {
+        data_dir,
+        ..StoreConfig::default()
+    };
+    for prefix in var_prefixes {
+        apply_store_env_overrides(prefix, &mut store);
+    }
+    store
+}
+
+/// Apply `<var_prefix>_*` environment overrides to a [`StoreConfig`].
+///
+/// `var_prefix` is the full variable prefix including the store namespace, e.g.
+/// `"WEBVH_STORE"` for the main store or `"DAEMON_WITNESS_STORE"` for the
+/// daemon's witness store. Recognised suffixes: `DATA_DIR`, `REDIS_URL`,
+/// `DYNAMODB_TABLE_PREFIX`, `DYNAMODB_REGION`, `DYNAMODB_TABLE_NAME`,
+/// `DYNAMODB_KEY_NAMESPACE`, `DYNAMODB_CONSISTENT_READS`,
+/// `FIRESTORE_PROJECT`, `FIRESTORE_DATABASE`, `COSMOSDB_CONNECTION_STRING`,
+/// `COSMOSDB_DATABASE`, `COSMOSDB_REGION`.
+pub fn apply_store_env_overrides(var_prefix: &str, store: &mut StoreConfig) {
+    macro_rules! env_opt {
+        ($var:expr, $field:expr) => {
+            if let Ok(v) = std::env::var($var) {
+                $field = Some(v);
+            }
+        };
+    }
+
+    if let Ok(data_dir) = std::env::var(format!("{var_prefix}_DATA_DIR")) {
+        store.data_dir = PathBuf::from(data_dir);
+    }
+    env_opt!(format!("{var_prefix}_REDIS_URL"), store.redis_url);
+    env_opt!(
+        format!("{var_prefix}_DYNAMODB_TABLE_PREFIX"),
+        store.dynamodb_table_prefix
+    );
+    env_opt!(
+        format!("{var_prefix}_DYNAMODB_REGION"),
+        store.dynamodb_region
+    );
+    env_opt!(
+        format!("{var_prefix}_DYNAMODB_TABLE_NAME"),
+        store.dynamodb_table_name
+    );
+    env_opt!(
+        format!("{var_prefix}_DYNAMODB_KEY_NAMESPACE"),
+        store.dynamodb_key_namespace
+    );
+    let reads_var = format!("{var_prefix}_DYNAMODB_CONSISTENT_READS");
+    if let Ok(v) = std::env::var(&reads_var) {
+        match parse_bool(&v) {
+            Some(b) => store.dynamodb_consistent_reads = Some(b),
+            // A typo must not silently weaken consistency: leave the field
+            // unset (strongly consistent) and say so.
+            None => tracing::warn!(
+                var = %reads_var,
+                "ignoring unparseable boolean; reads stay strongly consistent"
+            ),
+        }
+    }
+    env_opt!(
+        format!("{var_prefix}_FIRESTORE_PROJECT"),
+        store.firestore_project
+    );
+    env_opt!(
+        format!("{var_prefix}_FIRESTORE_DATABASE"),
+        store.firestore_database
+    );
+    env_opt!(
+        format!("{var_prefix}_COSMOSDB_CONNECTION_STRING"),
+        store.cosmosdb_connection_string
+    );
+    env_opt!(
+        format!("{var_prefix}_COSMOSDB_DATABASE"),
+        store.cosmosdb_database
+    );
+    env_opt!(
+        format!("{var_prefix}_COSMOSDB_REGION"),
+        store.cosmosdb_region
+    );
+}
+
 /// Apply environment variable overrides to shared config fields.
 ///
 /// Call this from your application's `AppConfig::load()` after deserializing the
@@ -1345,39 +1466,7 @@ pub fn apply_env_overrides(
     }
 
     // Store
-    let store_data_dir_var = format!("{prefix}_STORE_DATA_DIR");
-    if let Ok(data_dir) = std::env::var(&store_data_dir_var) {
-        store.data_dir = PathBuf::from(data_dir);
-    }
-    env_opt!(&format!("{prefix}_STORE_REDIS_URL"), store.redis_url);
-    env_opt!(
-        &format!("{prefix}_STORE_DYNAMODB_TABLE_PREFIX"),
-        store.dynamodb_table_prefix
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_DYNAMODB_REGION"),
-        store.dynamodb_region
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_FIRESTORE_PROJECT"),
-        store.firestore_project
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_FIRESTORE_DATABASE"),
-        store.firestore_database
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_COSMOSDB_CONNECTION_STRING"),
-        store.cosmosdb_connection_string
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_COSMOSDB_DATABASE"),
-        store.cosmosdb_database
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_COSMOSDB_REGION"),
-        store.cosmosdb_region
-    );
+    apply_store_env_overrides(&format!("{prefix}_STORE"), store);
 
     // Auth
     env_parse!(
@@ -1553,6 +1642,135 @@ mod tests {
         assert!(parsed.scid_also_known_as);
         let parsed: HostingConfig = toml::from_str("scid_also_known_as = false").unwrap();
         assert!(!parsed.scid_also_known_as);
+    }
+
+    #[test]
+    fn store_env_overrides_apply_dynamodb_single_fields() {
+        // Unique prefix so parallel tests never observe these vars.
+        let p = "TEST_STORE_ENV_A";
+        // SAFETY: unique prefix, only this test touches these vars.
+        unsafe {
+            std::env::set_var(format!("{p}_DYNAMODB_TABLE_NAME"), "tbl");
+            std::env::set_var(format!("{p}_DYNAMODB_REGION"), "eu-west-1");
+            std::env::set_var(format!("{p}_DATA_DIR"), "/tmp/x");
+        }
+        let mut store = StoreConfig::default();
+        apply_store_env_overrides(p, &mut store);
+        assert_eq!(store.dynamodb_table_name.as_deref(), Some("tbl"));
+        assert_eq!(store.dynamodb_region.as_deref(), Some("eu-west-1"));
+        assert_eq!(store.data_dir, PathBuf::from("/tmp/x"));
+        assert!(store.redis_url.is_none());
+        unsafe {
+            std::env::remove_var(format!("{p}_DYNAMODB_TABLE_NAME"));
+            std::env::remove_var(format!("{p}_DYNAMODB_REGION"));
+            std::env::remove_var(format!("{p}_DATA_DIR"));
+        }
+    }
+
+    #[test]
+    fn store_env_overrides_leave_config_untouched_when_unset() {
+        let mut store = StoreConfig {
+            dynamodb_table_name: Some("keep".into()),
+            ..StoreConfig::default()
+        };
+        apply_store_env_overrides("TEST_STORE_ENV_UNSET", &mut store);
+        assert_eq!(store.dynamodb_table_name.as_deref(), Some("keep"));
+    }
+
+    #[test]
+    fn store_env_overrides_apply_namespace_and_consistent_reads() {
+        let p = "TEST_STORE_ENV_B";
+        // SAFETY: unique prefix, only this test touches these vars.
+        unsafe {
+            std::env::set_var(format!("{p}_DYNAMODB_KEY_NAMESPACE"), "witness");
+            std::env::set_var(format!("{p}_DYNAMODB_CONSISTENT_READS"), "false");
+        }
+        let mut store = StoreConfig::default();
+        apply_store_env_overrides(p, &mut store);
+        assert_eq!(store.dynamodb_key_namespace.as_deref(), Some("witness"));
+        assert_eq!(store.dynamodb_consistent_reads, Some(false));
+        unsafe {
+            std::env::remove_var(format!("{p}_DYNAMODB_KEY_NAMESPACE"));
+            std::env::remove_var(format!("{p}_DYNAMODB_CONSISTENT_READS"));
+        }
+    }
+
+    #[test]
+    fn store_config_with_env_is_the_data_dir_alone_when_nothing_is_set() {
+        let store = store_config_with_env(PathBuf::from("/d"), &["TEST_STORE_ENV_NONE"]);
+        assert_eq!(store.data_dir, PathBuf::from("/d"));
+        assert_eq!(store.dynamodb_table_name, None);
+        assert_eq!(store.dynamodb_key_namespace, None);
+    }
+
+    #[test]
+    fn store_config_with_env_applies_the_prefixes_in_order() {
+        let (first, second) = ("TEST_STORE_ENV_FIRST", "TEST_STORE_ENV_SECOND");
+        // SAFETY: unique prefixes, only this test touches these vars.
+        unsafe {
+            std::env::set_var(format!("{first}_DYNAMODB_TABLE_NAME"), "from-first");
+            std::env::set_var(format!("{first}_DYNAMODB_REGION"), "eu-west-1");
+            std::env::set_var(format!("{second}_DYNAMODB_TABLE_NAME"), "from-second");
+        }
+        let store = store_config_with_env(PathBuf::from("/d"), &[first, second]);
+        unsafe {
+            std::env::remove_var(format!("{first}_DYNAMODB_TABLE_NAME"));
+            std::env::remove_var(format!("{first}_DYNAMODB_REGION"));
+            std::env::remove_var(format!("{second}_DYNAMODB_TABLE_NAME"));
+        }
+        assert_eq!(store.dynamodb_table_name.as_deref(), Some("from-second"));
+        assert_eq!(store.dynamodb_region.as_deref(), Some("eu-west-1"));
+        assert_eq!(store.data_dir, PathBuf::from("/d"));
+    }
+
+    #[test]
+    fn parse_bool_accepts_the_usual_spellings_and_nothing_else() {
+        for yes in ["true", "TRUE", "True", "1", "yes", "on"] {
+            assert_eq!(parse_bool(yes), Some(true), "{yes}");
+        }
+        for no in ["false", "FALSE", "0", "no", "off"] {
+            assert_eq!(parse_bool(no), Some(false), "{no}");
+        }
+        for bad in ["", "flase", "2", "maybe", " true"] {
+            assert_eq!(parse_bool(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_unparseable_consistent_reads_env_var_keeps_the_safe_default() {
+        let p = "TEST_STORE_ENV_C";
+        // SAFETY: unique prefix, only this test touches this var.
+        unsafe { std::env::set_var(format!("{p}_DYNAMODB_CONSISTENT_READS"), "flase") };
+        let mut store = StoreConfig::default();
+        apply_store_env_overrides(p, &mut store);
+        // None means "unset", which the backend treats as strongly consistent:
+        // a typo must never silently weaken consistency.
+        assert_eq!(store.dynamodb_consistent_reads, None);
+        unsafe { std::env::remove_var(format!("{p}_DYNAMODB_CONSISTENT_READS")) };
+    }
+
+    #[test]
+    fn store_config_reads_the_single_table_fields_from_toml() {
+        let store: StoreConfig = toml::from_str(
+            r#"
+            dynamodb_table_name = "webvh"
+            dynamodb_region = "ap-southeast-1"
+            dynamodb_key_namespace = "witness"
+            dynamodb_consistent_reads = false
+            "#,
+        )
+        .expect("parse");
+        assert_eq!(store.dynamodb_table_name.as_deref(), Some("webvh"));
+        assert_eq!(store.dynamodb_key_namespace.as_deref(), Some("witness"));
+        assert_eq!(store.dynamodb_consistent_reads, Some(false));
+    }
+
+    #[test]
+    fn store_config_without_the_new_fields_still_parses_as_unset() {
+        // An existing deployment's config.toml has neither field.
+        let store: StoreConfig = toml::from_str(r#"dynamodb_table_name = "webvh""#).expect("parse");
+        assert_eq!(store.dynamodb_key_namespace, None);
+        assert_eq!(store.dynamodb_consistent_reads, None);
     }
 
     #[test]

@@ -6,6 +6,7 @@ use affinidi_messaging_didcomm_service::{
     DIDCommService, DIDCommServiceConfig, ListenerConfig, Protocols, RestartPolicy, RetryConfig,
 };
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
+use did_hosting_common::DidStatsDelta;
 use did_hosting_common::server::auth::extractor::AuthState;
 use did_hosting_common::server::didcomm_profile::{
     advertised_protocols, build_tdk_profile_for_identity, reconcile_listener_protocols,
@@ -14,7 +15,7 @@ use did_hosting_common::server::didcomm_profile::{
 use did_hosting_common::server::identity::{self, ServiceIdentity};
 use did_hosting_common::server::init;
 use did_hosting_common::server::store::{
-    KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
+    BatchLimits, KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES, chunk_ranges,
 };
 use tokio_util::sync::CancellationToken;
 use webauthn_rs::prelude::Webauthn;
@@ -1005,6 +1006,18 @@ fn run_storage_thread(
 /// `ts:_all:{bucket}` time-series rows. The split came in v0.7 so a
 /// future scan over either keyspace returns homogeneous-shaped values.
 /// fjall batches span keyspaces, so atomicity is preserved.
+///
+/// The deltas are written in chunks that each fit one atomic batch on the
+/// backend (a backend without a ceiling, like fjall, gets one chunk). The
+/// deltas are additive, so each chunk commits on its own and carries its own
+/// share of the `_all` bucket. When a chunk fails, it and every later chunk are
+/// handed back to the collector for the next flush, if the backend's commit is
+/// all-or-nothing ([`Store::commits_atomically`]); the chunks already committed
+/// are not. On a backend that can commit part of a batch they are dropped
+/// instead, since a retry would count the committed part twice. A chunk whose
+/// commit failed with an unknown outcome ([`AppError::StoreOutcomeUnknown`]) may
+/// have been applied, so it is dropped too; the chunks after it were never sent
+/// and are handed back.
 pub async fn flush_stats_to_store(
     collector: &did_hosting_common::server::stats_collector::StatsCollector,
     stats_ks: &KeyspaceHandle,
@@ -1028,12 +1041,106 @@ pub async fn flush_stats_to_store(
         .as_secs();
     let bucket_epoch = now / 300 * 300;
 
+    let mut chunks = stats_chunks(deltas, store.batch_limits(), stats_ks, timeseries_ks);
+    for done in 0..chunks.len() {
+        if let Err(e) =
+            write_stats_chunk(&chunks[done], bucket_epoch, stats_ks, timeseries_ks, store).await
+        {
+            let mut unwritten = chunks.drain(done..);
+            if !store.commits_atomically() {
+                // A backend that can commit part of a batch and then fail may
+                // already hold some of these deltas, and a retry would count
+                // them twice. Dropping is the safe side: the same loss as before
+                // the flush was chunked.
+                warn!(
+                    dropped = unwritten.flatten().count(),
+                    "stats flush failed on a backend whose batches are not all-or-nothing; \
+                     not retrying the deltas, to avoid counting them twice"
+                );
+            } else if matches!(e, AppError::StoreOutcomeUnknown(_)) {
+                // The failed chunk may have been committed with its reply lost,
+                // and a retry would count it twice. The chunks after it were
+                // never sent, so they go back.
+                let failed = unwritten.next().map_or(0, |c| c.len());
+                warn!(
+                    dropped = failed,
+                    "stats flush: the outcome of a write is unknown; not retrying that \
+                     chunk, to avoid counting it twice"
+                );
+                collector.restore_deltas(unwritten.flatten());
+            } else {
+                collector.restore_deltas(unwritten.flatten());
+            }
+            return Err(e);
+        }
+    }
+
+    // Update total DID count (periodic reconciliation)
+    if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
+        collector.set_total_dids(dids.len() as u64);
+    }
+    // Note: control plane still does the full scan because DIDs are managed
+    // from external sources (REST API, sync) making incremental tracking complex.
+    // This runs every 10s and is acceptable at 10K DIDs.
+
+    debug!(chunks = chunks.len(), "flushed stats deltas to store");
+    Ok(())
+}
+
+/// Upper bound on one stored stats or bucket row's JSON value, for sizing a
+/// chunk against a backend's byte ceiling.
+const STATS_ROW_VALUE_BYTES: usize = 256;
+/// Upper bound on a stats or bucket row's key beyond the mnemonic
+/// (`stats:` / `ts:` prefix, the epoch, separators).
+const STATS_ROW_KEY_OVERHEAD: usize = 32;
+
+/// Split `deltas` into chunks whose writes fit one atomic batch.
+///
+/// A delta writes up to two rows (its totals and its bucket) and every chunk
+/// adds the `_all` bucket row, so the backend's operation ceiling is halved
+/// after reserving the `_all` row, and the byte ceiling is sized from a
+/// generous bound on each row.
+fn stats_chunks(
+    deltas: Vec<DidStatsDelta>,
+    limits: Option<BatchLimits>,
+    stats_ks: &KeyspaceHandle,
+    timeseries_ks: &KeyspaceHandle,
+) -> Vec<Vec<DidStatsDelta>> {
+    let row = |ks: &KeyspaceHandle, mnemonic_len: usize| {
+        ks.name.len() + mnemonic_len + STATS_ROW_KEY_OVERHEAD + STATS_ROW_VALUE_BYTES
+    };
+    let all_row = row(timeseries_ks, "_all".len());
+    let per_delta = limits.map(|l| BatchLimits {
+        max_ops: (l.max_ops.saturating_sub(1) / 2).max(1),
+        max_bytes: l.max_bytes.saturating_sub(all_row),
+    });
+    let sizes: Vec<usize> = deltas
+        .iter()
+        .map(|d| row(stats_ks, d.mnemonic.len()) + row(timeseries_ks, d.mnemonic.len()))
+        .collect();
+
+    let mut deltas = deltas.into_iter();
+    chunk_ranges(per_delta, usize::MAX, &sizes)
+        .into_iter()
+        .map(|range| deltas.by_ref().take(range.len()).collect())
+        .collect()
+}
+
+/// Write one chunk of deltas, with the chunk's share of the `_all` bucket, as a
+/// single atomic batch.
+async fn write_stats_chunk(
+    chunk: &[DidStatsDelta],
+    bucket_epoch: u64,
+    stats_ks: &KeyspaceHandle,
+    timeseries_ks: &KeyspaceHandle,
+    store: &Store,
+) -> Result<(), AppError> {
     // Aggregate totals for the server-wide (_all) time-series bucket
     let mut all_resolve_delta = 0u64;
     let mut all_update_delta = 0u64;
 
     let mut batch = store.batch();
-    for d in &deltas {
+    for d in chunk {
         // Aggregate stats (totals) — stats_ks
         let key = format!("stats:{}", d.mnemonic);
         let mut stats: did_hosting_common::DidStats =
@@ -1076,18 +1183,7 @@ pub async fn flush_stats_to_store(
         batch.insert(timeseries_ks, all_key, &serde_json::json!({"r": r, "u": u}))?;
     }
 
-    batch.commit().await?;
-
-    // Update total DID count (periodic reconciliation)
-    if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
-        collector.set_total_dids(dids.len() as u64);
-    }
-    // Note: control plane still does the full scan because DIDs are managed
-    // from external sources (REST API, sync) making incremental tracking complex.
-    // This runs every 10s and is acceptable at 10K DIDs.
-
-    debug!(count = deltas.len(), "flushed stats deltas to store");
-    Ok(())
+    batch.commit().await
 }
 
 /// Ping one trust-task-capable instance, letting its DID document choose the
@@ -1254,4 +1350,404 @@ pub async fn run_health_checks(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod flush_stats_tests {
+    use super::*;
+    use did_hosting_common::DidStats;
+    use did_hosting_common::server::config::StoreConfig;
+    use did_hosting_common::server::stats_collector::StatsCollector;
+
+    struct Fixture {
+        store: Store,
+        stats: KeyspaceHandle,
+        timeseries: KeyspaceHandle,
+        dids: KeyspaceHandle,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open store");
+        Fixture {
+            stats: store.keyspace(KS_STATS).expect("stats"),
+            timeseries: store.keyspace(KS_TIMESERIES).expect("timeseries"),
+            dids: store.keyspace(KS_DIDS).expect("dids"),
+            store,
+            _dir: dir,
+        }
+    }
+
+    async fn flush(f: &Fixture, collector: &StatsCollector) -> Result<(), AppError> {
+        flush_stats_to_store(collector, &f.stats, &f.timeseries, &f.dids, &f.store).await
+    }
+
+    async fn stored_stats(f: &Fixture, mnemonic: &str) -> Option<DidStats> {
+        f.stats
+            .get(format!("stats:{mnemonic}"))
+            .await
+            .expect("read stats")
+    }
+
+    /// Sum of `(resolves, updates)` over every time-series bucket whose key
+    /// starts with `prefix`. The 5-minute bucket a flush lands in depends on the
+    /// clock, so a test sums across buckets instead of naming one.
+    async fn bucket_totals(f: &Fixture, prefix: &str) -> (u64, u64) {
+        let mut totals = (0, 0);
+        for (_, raw) in f.timeseries.prefix_iter_raw(prefix).await.expect("scan") {
+            let v: serde_json::Value = serde_json::from_slice(&raw).expect("bucket json");
+            totals.0 += v["r"].as_u64().expect("r");
+            totals.1 += v["u"].as_u64().expect("u");
+        }
+        totals
+    }
+
+    #[tokio::test]
+    async fn a_flush_with_nothing_to_write_only_refreshes_the_did_count() {
+        let f = fixture().await;
+        f.dids
+            .insert_raw("did:a", b"1".to_vec())
+            .await
+            .expect("seed");
+        f.dids
+            .insert_raw("did:b", b"2".to_vec())
+            .await
+            .expect("seed");
+        let collector = StatsCollector::new();
+
+        flush(&f, &collector).await.expect("flush");
+
+        assert_eq!(collector.get_aggregate().total_dids, 2);
+        assert!(f.stats.iter_all().await.expect("scan").is_empty());
+        assert!(f.timeseries.iter_all().await.expect("scan").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_flush_adds_the_deltas_to_the_stored_totals_and_drains_the_collector() {
+        let f = fixture().await;
+        f.stats
+            .insert(
+                "stats:a",
+                &DidStats {
+                    total_resolves: 10,
+                    total_updates: 1,
+                    last_resolved_at: Some(500),
+                    last_updated_at: Some(50),
+                },
+            )
+            .await
+            .expect("seed");
+        let collector = StatsCollector::new();
+        // `last_resolved_at` is older than the stored one and must not win;
+        // `last_updated_at` is newer and must.
+        collector.record_deltas("a", 3, 2, Some(400), Some(90));
+        collector.record_deltas("b", 1, 0, Some(70), None);
+
+        flush(&f, &collector).await.expect("flush");
+
+        let a = stored_stats(&f, "a").await.expect("a");
+        assert_eq!((a.total_resolves, a.total_updates), (13, 3));
+        assert_eq!(
+            (a.last_resolved_at, a.last_updated_at),
+            (Some(500), Some(90))
+        );
+        let b = stored_stats(&f, "b").await.expect("b");
+        assert_eq!((b.total_resolves, b.total_updates), (1, 0));
+        assert_eq!((b.last_resolved_at, b.last_updated_at), (Some(70), None));
+        assert!(
+            collector.drain_for_sync().is_empty(),
+            "a successful flush drains every delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flush_writes_per_did_and_server_wide_time_series_buckets() {
+        let f = fixture().await;
+        let collector = StatsCollector::new();
+        collector.record_deltas("a", 3, 2, None, None);
+        collector.record_deltas("b", 4, 0, None, None);
+
+        flush(&f, &collector).await.expect("flush");
+
+        assert_eq!(bucket_totals(&f, "ts:a:").await, (3, 2));
+        assert_eq!(bucket_totals(&f, "ts:b:").await, (4, 0));
+        assert_eq!(bucket_totals(&f, "ts:_all:").await, (7, 2));
+    }
+
+    #[tokio::test]
+    async fn successive_flushes_accumulate_rather_than_overwrite() {
+        let f = fixture().await;
+        let collector = StatsCollector::new();
+
+        collector.record_deltas("a", 2, 1, None, None);
+        flush(&f, &collector).await.expect("first flush");
+        collector.record_deltas("a", 5, 0, None, None);
+        flush(&f, &collector).await.expect("second flush");
+
+        let a = stored_stats(&f, "a").await.expect("a");
+        assert_eq!((a.total_resolves, a.total_updates), (7, 1));
+        assert_eq!(bucket_totals(&f, "ts:a:").await, (7, 1));
+        assert_eq!(bucket_totals(&f, "ts:_all:").await, (7, 1));
+    }
+
+    #[tokio::test]
+    async fn a_flush_of_many_dids_commits_every_one() {
+        // More DIDs than fit in one 100-operation atomic write (two writes per
+        // DID plus `_all`), which is what a bounded backend would refuse.
+        let f = fixture().await;
+        let collector = StatsCollector::new();
+        for i in 0..120 {
+            collector.record_deltas(&format!("did{i:03}"), 1, 1, None, None);
+        }
+
+        flush(&f, &collector).await.expect("flush");
+
+        assert_eq!(f.stats.iter_all().await.expect("scan").len(), 120);
+        assert_eq!(bucket_totals(&f, "ts:_all:").await, (120, 120));
+        assert!(collector.drain_for_sync().is_empty());
+    }
+    // -- a bounded backend --------------------------------------------------
+
+    use did_hosting_common::server::store::bounded_memory::BoundedMemory;
+
+    struct BoundedFixture {
+        backend: BoundedMemory,
+        store: Store,
+        stats: KeyspaceHandle,
+        timeseries: KeyspaceHandle,
+        dids: KeyspaceHandle,
+    }
+
+    fn fixture_on(backend: BoundedMemory) -> BoundedFixture {
+        let store = backend.store();
+        BoundedFixture {
+            stats: store.keyspace(KS_STATS).unwrap(),
+            timeseries: store.keyspace(KS_TIMESERIES).unwrap(),
+            dids: store.keyspace(KS_DIDS).unwrap(),
+            store,
+            backend,
+        }
+    }
+
+    fn bounded(max_ops: usize, fail_commit: Option<usize>) -> BoundedFixture {
+        let backend = BoundedMemory::new(max_ops);
+        fixture_on(match fail_commit {
+            Some(n) => backend.fail_commit(n),
+            None => backend,
+        })
+    }
+
+    /// A bounded backend whose commit may write part of a batch before failing.
+    fn bounded_non_atomic(max_ops: usize, fail_commit: Option<usize>) -> BoundedFixture {
+        let backend = BoundedMemory::new(max_ops).non_atomic();
+        fixture_on(match fail_commit {
+            Some(n) => backend.fail_commit(n),
+            None => backend,
+        })
+    }
+
+    async fn flush_bounded(f: &BoundedFixture, c: &StatsCollector) -> Result<(), AppError> {
+        flush_stats_to_store(c, &f.stats, &f.timeseries, &f.dids, &f.store).await
+    }
+
+    async fn bounded_total(f: &BoundedFixture, prefix: &str) -> (u64, u64) {
+        let mut totals = (0, 0);
+        for (_, raw) in f.timeseries.prefix_iter_raw(prefix).await.unwrap() {
+            let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            totals.0 += v["r"].as_u64().unwrap();
+            totals.1 += v["u"].as_u64().unwrap();
+        }
+        totals
+    }
+
+    #[tokio::test]
+    async fn fifty_active_dids_flush_on_a_backend_that_refuses_more_than_100_operations() {
+        // 50 DIDs stage 100 rows, plus `_all`: 101 in one batch, which a
+        // 100-operation transactional backend refuses outright.
+        let f = bounded(100, None);
+        let collector = StatsCollector::new();
+        for i in 0..50 {
+            collector.record_deltas(&format!("did{i:02}"), 1, 1, None, None);
+        }
+
+        flush_bounded(&f, &collector).await.expect("flush");
+
+        assert_eq!(f.stats.iter_all().await.unwrap().len(), 50);
+        assert_eq!(bounded_total(&f, "ts:_all:").await, (50, 50));
+        assert!(
+            f.backend.committed_batch_sizes().iter().all(|n| *n <= 100),
+            "{:?}",
+            f.backend.committed_batch_sizes()
+        );
+        assert!(collector.drain_for_sync().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_large_flush_is_split_into_batches_and_loses_nothing() {
+        let f = bounded(10, None);
+        let collector = StatsCollector::new();
+        for i in 0..40 {
+            collector.record_deltas(&format!("did{i:02}"), 2, 1, Some(100 + i), None);
+        }
+
+        flush_bounded(&f, &collector).await.expect("flush");
+
+        assert!(f.backend.committed_batch_sizes().len() > 1);
+        assert!(f.backend.committed_batch_sizes().iter().all(|n| *n <= 10));
+        for i in 0..40 {
+            let s = stored_stats_in(&f, &format!("did{i:02}")).await;
+            assert_eq!((s.total_resolves, s.total_updates), (2, 1));
+            assert_eq!(s.last_resolved_at, Some(100 + i));
+        }
+        assert_eq!(bounded_total(&f, "ts:_all:").await, (80, 40));
+        assert_eq!(bounded_total(&f, "ts:did07:").await, (2, 1));
+    }
+
+    async fn stored_stats_in(f: &BoundedFixture, mnemonic: &str) -> DidStats {
+        f.stats
+            .get(format!("stats:{mnemonic}"))
+            .await
+            .unwrap()
+            .expect("stats row")
+    }
+
+    #[tokio::test]
+    async fn a_failed_chunk_and_the_ones_after_it_are_kept_for_the_next_flush() {
+        // 10 DIDs at 4 per chunk (max_ops 9 => (9 - 1) / 2): chunks of 4, 4, 2.
+        // The second commit fails.
+        let f = bounded(9, Some(1));
+        let collector = StatsCollector::new();
+        for i in 0..10 {
+            collector.record_deltas(&format!("did{i:02}"), 1, 0, Some(10), None);
+        }
+
+        let err = flush_bounded(&f, &collector)
+            .await
+            .expect_err("second chunk fails");
+        assert!(matches!(err, AppError::Internal(_)), "{err:?}");
+
+        // The first chunk went through; the other six are back in the collector.
+        assert_eq!(f.stats.iter_all().await.unwrap().len(), 4);
+        let mut kept = collector.drain_for_sync();
+        assert_eq!(kept.len(), 6, "{kept:?}");
+        kept.sort_by(|a, b| a.mnemonic.cmp(&b.mnemonic));
+        assert!(
+            kept.iter()
+                .all(|d| d.resolve_delta == 1 && d.last_resolved_at == Some(10))
+        );
+        // The totals are not double-counted: the committed chunk is not restored.
+        let committed: Vec<_> = f
+            .stats
+            .iter_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| String::from_utf8(k).unwrap())
+            .collect();
+        for d in &kept {
+            assert!(
+                !committed.contains(&format!("stats:{}", d.mnemonic)),
+                "{d:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_on_a_backend_that_can_partly_commit_is_not_retried() {
+        // Such a backend may already hold part of the failed chunk, so keeping its
+        // deltas would count that part twice on the retry. The flush still
+        // reports the error, and the collector holds nothing to retry.
+        let f = bounded_non_atomic(9, Some(1));
+        let collector = StatsCollector::new();
+        for i in 0..10 {
+            collector.record_deltas(&format!("did{i:02}"), 1, 0, None, None);
+        }
+
+        let err = flush_bounded(&f, &collector)
+            .await
+            .expect_err("chunk fails");
+
+        assert!(matches!(err, AppError::Internal(_)), "{err:?}");
+        assert!(collector.drain_for_sync().is_empty());
+        // Which DIDs got in is up to the drain order, so ask the store. A DID that
+        // committed is counted once, and new traffic adds to that without
+        // re-adding the failed flush; one that did not is simply absent.
+        let mut committed = None;
+        let mut missing = None;
+        for i in 0..10 {
+            let m = format!("did{i:02}");
+            match f.stats.get::<DidStats>(format!("stats:{m}")).await.unwrap() {
+                Some(_) => committed = Some(m),
+                None => missing = Some(m),
+            }
+        }
+        let (committed, missing) = (
+            committed.expect("one chunk committed"),
+            missing.expect("one did not"),
+        );
+        collector.record_deltas(&committed, 2, 0, None, None);
+        collector.record_deltas(&missing, 2, 0, None, None);
+        flush_bounded(&f, &collector).await.expect("next flush");
+        assert_eq!(stored_stats_in(&f, &committed).await.total_resolves, 3);
+        assert_eq!(
+            stored_stats_in(&f, &missing).await.total_resolves,
+            2,
+            "the dropped delta is not resurrected"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_backends_that_commit_all_or_nothing_say_so() {
+        let f = fixture().await;
+        assert!(f.store.commits_atomically(), "fjall: one journalled batch");
+        assert!(bounded(100, None).store.commits_atomically());
+        assert!(!bounded_non_atomic(100, None).store.commits_atomically());
+    }
+
+    #[tokio::test]
+    async fn a_chunk_with_an_unknown_outcome_is_not_retried_but_the_ones_after_it_are() {
+        // Chunks of 4, 4, 2. The second commit is applied and its reply is lost,
+        // so its deltas may already be stored: retrying them would count them
+        // twice. The third chunk was never sent and goes back.
+        let f = fixture_on(BoundedMemory::new(9).lose_reply(1));
+        let collector = StatsCollector::new();
+        for i in 0..10 {
+            collector.record_deltas(&format!("did{i:02}"), 1, 0, None, None);
+        }
+
+        let err = flush_bounded(&f, &collector).await.expect_err("reply lost");
+        assert!(matches!(err, AppError::StoreOutcomeUnknown(_)), "{err:?}");
+
+        assert_eq!(collector.drain_for_sync().len(), 2);
+        assert_eq!(f.stats.iter_all().await.unwrap().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn deltas_kept_after_a_failure_are_written_by_the_next_flush() {
+        let f = bounded(9, Some(0)); // the very first commit fails
+        let collector = StatsCollector::new();
+        for i in 0..6 {
+            collector.record_deltas(&format!("did{i}"), 3, 1, None, None);
+        }
+        flush_bounded(&f, &collector)
+            .await
+            .expect_err("first commit fails");
+        assert!(f.stats.iter_all().await.unwrap().is_empty());
+
+        // New traffic lands on top of the kept deltas, then the retry succeeds.
+        collector.record_deltas("did0", 2, 0, None, None);
+        flush_bounded(&f, &collector).await.expect("retry");
+
+        let did0 = stored_stats_in(&f, "did0").await;
+        assert_eq!((did0.total_resolves, did0.total_updates), (5, 1));
+        let did5 = stored_stats_in(&f, "did5").await;
+        assert_eq!((did5.total_resolves, did5.total_updates), (3, 1));
+        assert_eq!(bounded_total(&f, "ts:_all:").await, (20, 6));
+    }
 }

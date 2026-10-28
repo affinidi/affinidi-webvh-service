@@ -15,7 +15,7 @@ use dialoguer::{Confirm, Input, MultiSelect, Select};
 use did_hosting_common::did::{DidDocumentOptions, build_did_document, create_log_entry};
 use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, IdentityConfig, IdentityMode, LogConfig, LogFormat, ServerConfig,
-    StoreConfig, TransportSelection, VtaConfig,
+    TransportSelection, VtaConfig,
 };
 use did_hosting_common::server::operator_messages::WebvhDaemonMessages;
 use did_hosting_common::server::secret_store::{ServerSecrets, create_secret_store};
@@ -187,6 +187,8 @@ pub async fn run_wizard(
     eprintln!("  Generated JWT signing key.");
 
     // 9. Build + write config
+    let (store, witness_store) =
+        crate::setup_recipe::store_configs(store_path.clone(), witness_store_path.clone());
     let config = DaemonConfig {
         server: ServerConfig {
             host: host.clone(),
@@ -205,14 +207,8 @@ pub async fn run_wizard(
         mediator_did: mediator_did.clone(),
         public_url: Some(public_url.clone()),
         did_hosting_url: Some(public_url.clone()),
-        store: StoreConfig {
-            data_dir: store_path,
-            ..StoreConfig::default()
-        },
-        witness_store: StoreConfig {
-            data_dir: witness_store_path,
-            ..StoreConfig::default()
-        },
+        store,
+        witness_store,
         fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
         vta: VtaConfig {
@@ -1046,6 +1042,8 @@ async fn run_self_managed_setup(
         .map_err(|e| format!("failed to create DID log entry: {e}"))?;
 
     // 8. Build DaemonConfig with self-managed identity + empty VTA.
+    let (store, witness_store) =
+        crate::setup_recipe::store_configs(store_path.clone(), witness_store_path.clone());
     let config = DaemonConfig {
         server: ServerConfig {
             host: host.clone(),
@@ -1065,14 +1063,8 @@ async fn run_self_managed_setup(
         mediator_did: mediator_did.clone(),
         public_url: Some(public_url.clone()),
         did_hosting_url: Some(public_url.clone()),
-        store: StoreConfig {
-            data_dir: store_path,
-            ..StoreConfig::default()
-        },
-        witness_store: StoreConfig {
-            data_dir: witness_store_path,
-            ..StoreConfig::default()
-        },
+        store,
+        witness_store,
         fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
         vta: VtaConfig::default(),
@@ -1417,6 +1409,8 @@ pub async fn run_setup_offline_complete(
     let store_path = PathBuf::from(&state.data_dir).join("store");
     let witness_store_path = PathBuf::from(&state.data_dir).join("witness");
 
+    let (store, witness_store) =
+        crate::setup_recipe::store_configs(store_path.clone(), witness_store_path.clone());
     let config = DaemonConfig {
         server: ServerConfig {
             host: state.host.clone(),
@@ -1435,14 +1429,8 @@ pub async fn run_setup_offline_complete(
         mediator_did: state.mediator_did.clone(),
         public_url: Some(state.public_url.clone()),
         did_hosting_url: Some(state.public_url.clone()),
-        store: StoreConfig {
-            data_dir: store_path,
-            ..StoreConfig::default()
-        },
-        witness_store: StoreConfig {
-            data_dir: witness_store_path,
-            ..StoreConfig::default()
-        },
+        store,
+        witness_store,
         fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
         vta: VtaConfig {

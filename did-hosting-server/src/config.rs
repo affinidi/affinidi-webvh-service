@@ -185,6 +185,16 @@ impl Default for StatsConfig {
     }
 }
 
+/// The store config setup starts from: `data_dir`, with the same `*_STORE_*`
+/// environment overrides [`AppConfig::load`] applies at runtime, so setup opens
+/// the backend the service will use.
+pub fn setup_store_config(data_dir: PathBuf) -> StoreConfig {
+    did_hosting_common::server::config::store_config_with_env(
+        data_dir,
+        &["WEBVH_STORE", "DID_HOSTING_STORE"],
+    )
+}
+
 impl AppConfig {
     /// Return the public-facing base URL for this server.
     pub fn public_base_url(&self) -> String {
@@ -336,6 +346,29 @@ impl AppConfig {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn setup_starts_from_the_store_environment_the_service_reads_at_runtime() {
+        // SAFETY: the only test in this crate that touches these variables.
+        unsafe {
+            std::env::set_var("WEBVH_STORE_DYNAMODB_TABLE_NAME", "webvh_store-table");
+            std::env::set_var(
+                "DID_HOSTING_STORE_DYNAMODB_TABLE_NAME",
+                "did_hosting_store-table",
+            );
+        }
+        let store = setup_store_config(PathBuf::from("/data"));
+        unsafe {
+            std::env::remove_var("WEBVH_STORE_DYNAMODB_TABLE_NAME");
+            std::env::remove_var("DID_HOSTING_STORE_DYNAMODB_TABLE_NAME");
+        }
+        assert_eq!(
+            store.dynamodb_table_name.as_deref(),
+            Some("did_hosting_store-table")
+        );
+        assert_eq!(store.data_dir, PathBuf::from("/data"));
+    }
+
     use super::*;
 
     /// The documented `DID_HOSTING_` names reach the shared settings, the

@@ -24,6 +24,7 @@ k8s-secrets = ["did-hosting-common/k8s-secrets"]
 store-fjall = ["did-hosting-common/store-fjall"]
 store-redis = ["did-hosting-common/store-redis"]
 store-dynamodb = ["did-hosting-common/store-dynamodb"]
+store-dynamodb-single = ["did-hosting-common/store-dynamodb-single"]
 store-firestore = ["did-hosting-common/store-firestore"]
 store-cosmosdb = ["did-hosting-common/store-cosmosdb"]
 
@@ -71,6 +72,10 @@ uuid = { workspace = true }
 # The Trust Task tests drive each transport entry point over a fjall store in
 # a temp dir.
 tempfile = "3"
+# `witness_ops`' tests delete an identity on a store with a batch ceiling
+# (`store::bounded_memory`). `did-hosting-common` is already a regular
+# dependency; this only adds `test-support`.
+did-hosting-common = { path = "../did-hosting-common", features = ["server-core", "test-support"] }
 trust-tasks-rs = { workspace = true, features = ["validate"] }
 trust-tasks-proof = { workspace = true }
 http-body-util = "0.1"

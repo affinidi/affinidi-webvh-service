@@ -1,7 +1,11 @@
+#[cfg(any(test, feature = "test-support"))]
+pub mod bounded_memory;
 #[cfg(feature = "store-cosmosdb")]
 mod cosmosdb;
 #[cfg(feature = "store-dynamodb")]
 mod dynamodb;
+#[cfg(feature = "store-dynamodb-single")]
+mod dynamodb_single;
 #[cfg(feature = "store-firestore")]
 mod firestore;
 #[cfg(feature = "store-fjall")]
@@ -122,11 +126,106 @@ pub trait BatchOps: Send {
     fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>>;
 }
 
+/// What one atomic [`WriteBatch`] can hold on a backend.
+///
+/// A backend whose atomic write has a ceiling reports it here and refuses a
+/// larger batch at `commit()` (before writing anything) rather than splitting
+/// it, because a split batch is not atomic. A caller that writes in bulk and
+/// does not need cross-chunk atomicity (a restore, say) chunks to this limit
+/// itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchLimits {
+    /// Most operations (inserts plus removes) in one batch.
+    pub max_ops: usize,
+    /// Most bytes in one batch, counted as the sum over its operations of
+    /// the keyspace name, key and value lengths (a remove counts no value).
+    pub max_bytes: usize,
+}
+
+/// Writes besides one name-index row per agent name that the largest write
+/// caused by publishing a DID makes: an edge's `apply_single_update` stores the
+/// record, the log, the owner row, the witness row and two high-water marks. The
+/// control plane's own publish batches are never bigger than that (record, log,
+/// owner row and, on a takeover, two removals).
+pub const PUBLISH_FIXED_WRITES: usize = 6;
+
+impl BatchLimits {
+    /// The most agent names a DID's document may claim for every write its
+    /// publication causes to fit one atomic batch, or any number on a backend
+    /// with no batch limit (see [`Store::max_agent_names`]).
+    ///
+    /// A publication writes an index row for each name it claims and removes the
+    /// rows of the names it drops. Both sets are at most the cap, so the batch
+    /// holds at most `2 * cap + PUBLISH_FIXED_WRITES` operations. Refusing a
+    /// document over the cap up front keeps every accepted publication
+    /// committable, here and on every edge it is synced to, without splitting a
+    /// batch that must stay atomic.
+    pub fn max_agent_names(&self) -> usize {
+        self.max_ops.saturating_sub(PUBLISH_FIXED_WRITES) / 2
+    }
+}
+
+/// Split a bulk write into consecutive chunks that each fit one atomic batch.
+///
+/// `sizes[i]` is operation `i`'s byte count by the [`BatchLimits::max_bytes`]
+/// rule. A chunk holds at most `cap_ops` operations and, when the backend
+/// reports `limits`, at most `limits.max_ops` operations and `limits.max_bytes`
+/// bytes. An entry that alone exceeds the byte limit still gets a chunk of its
+/// own, so the backend refuses it visibly instead of it being dropped or
+/// merged. Chunks are contiguous, in order, and cover every entry exactly once.
+///
+/// Only for callers that do not need atomicity across the whole write: each
+/// chunk is its own atomic batch.
+pub fn chunk_ranges(
+    limits: Option<BatchLimits>,
+    cap_ops: usize,
+    sizes: &[usize],
+) -> Vec<std::ops::Range<usize>> {
+    let max_ops = limits.map_or(cap_ops, |l| l.max_ops.min(cap_ops)).max(1);
+    let max_bytes = limits.map_or(usize::MAX, |l| l.max_bytes);
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0usize;
+    for (i, &size) in sizes.iter().enumerate() {
+        let ops = i - start;
+        if ops > 0 && (ops >= max_ops || bytes.saturating_add(size) > max_bytes) {
+            chunks.push(start..i);
+            start = i;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(size);
+    }
+    if start < sizes.len() {
+        chunks.push(start..sizes.len());
+    }
+    chunks
+}
+
 /// Factory: create keyspaces, create batches, persist/flush.
 pub trait StorageBackend: Send + Sync {
     fn keyspace(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError>;
     fn batch(&self) -> Box<dyn BatchOps>;
     fn persist(&self) -> BoxFuture<'_, Result<(), AppError>>;
+
+    /// The ceiling of one atomic batch, or `None` when the backend imposes
+    /// none (the default).
+    fn batch_limits(&self) -> Option<BatchLimits> {
+        None
+    }
+
+    /// Whether a failed `commit()` of a batch wrote none of it.
+    ///
+    /// A caller that drains work before it commits and wants to retry it after a
+    /// failure may only do so when this is `true`: on a backend that can commit
+    /// part of a batch and then fail, retrying the whole batch writes the
+    /// committed part twice. `false` is the default, so a backend must opt in,
+    /// and only does so when its commit is one all-or-nothing operation (a
+    /// journalled batch, `MULTI`/`EXEC`, a transaction), not a sequence of writes
+    /// or of smaller batches.
+    fn commits_atomically(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +280,14 @@ impl Store {
         })
     }
 
+    /// A store over a caller-supplied backend, so a test can exercise code that
+    /// takes a [`Store`] against a backend with a batch ceiling, or one that
+    /// fails a commit, without a real database.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_backend(backend: Arc<dyn StorageBackend>) -> Self {
+        Self { inner: backend }
+    }
+
     pub fn keyspace(&self, name: &str) -> Result<KeyspaceHandle, AppError> {
         let (ks_name, ops) = self.inner.keyspace(name)?;
         Ok(KeyspaceHandle {
@@ -195,6 +302,24 @@ impl Store {
         WriteBatch {
             inner: self.inner.batch(),
         }
+    }
+
+    /// The ceiling of one atomic batch on this backend, or `None` when it has
+    /// none. See [`BatchLimits`].
+    pub fn batch_limits(&self) -> Option<BatchLimits> {
+        self.inner.batch_limits()
+    }
+
+    /// The most agent names one DID may claim on this backend, or `None` when its
+    /// batches have no ceiling. See [`BatchLimits::max_agent_names`].
+    pub fn max_agent_names(&self) -> Option<usize> {
+        self.batch_limits().map(|l| l.max_agent_names())
+    }
+
+    /// Whether a failed batch commit on this backend wrote none of it. See
+    /// [`StorageBackend::commits_atomically`].
+    pub fn commits_atomically(&self) -> bool {
+        self.inner.commits_atomically()
     }
 
     pub async fn persist(&self) -> Result<(), AppError> {
@@ -396,6 +521,11 @@ async fn create_backend(
         return dynamodb::DynamoDbBackend::open(config).await;
     }
 
+    #[cfg(feature = "store-dynamodb-single")]
+    {
+        return dynamodb_single::SingleTableDynamoDbBackend::open(config).await;
+    }
+
     #[cfg(feature = "store-firestore")]
     {
         return firestore::FirestoreBackend::open(config).await;
@@ -411,4 +541,95 @@ async fn create_backend(
     Err(AppError::Config(
         "no storage backend compiled — enable a store-* feature".into(),
     ))
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::{BatchLimits, chunk_ranges};
+
+    const LIMITS: BatchLimits = BatchLimits {
+        max_ops: 3,
+        max_bytes: 100,
+    };
+
+    #[test]
+    fn the_agent_name_cap_leaves_room_for_the_names_dropped_and_the_fixed_writes() {
+        let l = |max_ops| BatchLimits {
+            max_ops,
+            max_bytes: usize::MAX,
+        };
+        // 100 operations: 47 inserts + 47 removals + 6 fixed = 100.
+        assert_eq!(l(100).max_agent_names(), 47);
+        assert_eq!(2 * 47 + super::PUBLISH_FIXED_WRITES, 100);
+        assert_eq!(l(101).max_agent_names(), 47, "rounds down");
+        assert_eq!(l(6).max_agent_names(), 0);
+        assert_eq!(l(2).max_agent_names(), 0, "never underflows");
+    }
+
+    #[test]
+    fn no_limits_chunks_only_by_the_callers_cap() {
+        let sizes = [10; 7];
+        assert_eq!(chunk_ranges(None, 3, &sizes), vec![0..3, 3..6, 6..7]);
+    }
+
+    #[test]
+    fn empty_input_plans_no_chunks() {
+        assert!(chunk_ranges(Some(LIMITS), 1000, &[]).is_empty());
+    }
+
+    #[test]
+    fn the_smaller_of_the_cap_and_the_limit_wins_on_op_count() {
+        let sizes = [1; 7];
+        assert_eq!(
+            chunk_ranges(Some(LIMITS), 1000, &sizes),
+            vec![0..3, 3..6, 6..7]
+        );
+        assert_eq!(
+            chunk_ranges(Some(LIMITS), 2, &sizes),
+            vec![0..2, 2..4, 4..6, 6..7]
+        );
+    }
+
+    #[test]
+    fn a_chunk_closes_before_it_would_exceed_the_byte_limit() {
+        // 60 + 60 > 100 closes the first chunk; 60 + 30 = 90 fits but another
+        // 30 would make 120, so the second closes; the last two (60) fit.
+        assert_eq!(
+            chunk_ranges(Some(LIMITS), 1000, &[60, 60, 30, 30, 30]),
+            vec![0..1, 1..3, 3..5]
+        );
+    }
+
+    #[test]
+    fn a_chunk_may_fill_the_byte_limit_exactly() {
+        assert_eq!(
+            chunk_ranges(Some(LIMITS), 1000, &[50, 50, 50]),
+            vec![0..2, 2..3]
+        );
+    }
+
+    #[test]
+    fn an_oversized_single_entry_gets_its_own_chunk_for_the_backend_to_refuse() {
+        // Never silently dropped or merged: the backend reports the refusal.
+        assert_eq!(
+            chunk_ranges(Some(LIMITS), 1000, &[500, 10]),
+            vec![0..1, 1..2]
+        );
+    }
+
+    #[test]
+    fn every_entry_lands_in_exactly_one_chunk_in_order() {
+        let sizes: Vec<usize> = (0..257).map(|i| (i * 7) % 41 + 1).collect();
+        let chunks = chunk_ranges(Some(LIMITS), 1000, &sizes);
+        let mut next = 0;
+        for range in &chunks {
+            assert_eq!(range.start, next, "chunks are contiguous");
+            assert!(range.end > range.start && range.len() <= LIMITS.max_ops);
+            assert!(
+                sizes[range.clone()].iter().sum::<usize>() <= LIMITS.max_bytes || range.len() == 1
+            );
+            next = range.end;
+        }
+        assert_eq!(next, sizes.len(), "nothing dropped");
+    }
 }

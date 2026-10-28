@@ -596,13 +596,32 @@ async fn main() {
             }
         }
         Some(Command::Backup { output }) => {
-            if let Err(e) = did_hosting_server::backup::run_backup(cli.config, output).await {
+            if let Err(e) = did_hosting_server::backup::run_backup_with(
+                // Resolved here: the server's backup falls back to its own
+                // `DID_HOSTING_CONFIG_PATH`, not the daemon's `DAEMON_CONFIG_PATH`.
+                Some(DaemonConfig::resolve_config_path(cli.config)),
+                output,
+                DaemonConfig::load_server_config,
+            )
+            .await
+            {
                 eprintln!("Backup error: {e}");
                 std::process::exit(1);
             }
         }
         Some(Command::Restore { input }) => {
-            if let Err(e) = did_hosting_server::backup::run_restore(cli.config, input).await {
+            if let Err(e) = did_hosting_server::backup::run_restore_with(
+                // Resolved here: the server's backup falls back to its own
+                // `DID_HOSTING_CONFIG_PATH`, not the daemon's `DAEMON_CONFIG_PATH`.
+                Some(DaemonConfig::resolve_config_path(cli.config)),
+                input,
+                DaemonConfig::load_server_config,
+                // The backup carries only the server's share of the daemon's
+                // config; writing it over the file would drop `witness_store`.
+                did_hosting_server::backup::ConfigRestore::KeepExisting,
+            )
+            .await
+            {
                 eprintln!("Restore error: {e}");
                 std::process::exit(1);
             }
@@ -1372,6 +1391,7 @@ async fn build_witness(
         identity,
         Arc::new(LocalSigner),
     )?;
+    state.resume_pending_deletions().await;
 
     let router = webvh_witness::routes::router().with_state(state);
     info!("witness service initialized");
@@ -1562,7 +1582,7 @@ async fn daemon_fallback(
     #[cfg(not(feature = "ui"))]
     {
         let _ = uri;
-        StatusCode::NOT_FOUND.into_response()
+        axum::response::IntoResponse::into_response(StatusCode::NOT_FOUND)
     }
 }
 

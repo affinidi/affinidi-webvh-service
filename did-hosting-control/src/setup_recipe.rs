@@ -21,7 +21,7 @@ use crate::acl::{AclEntry, Role, store_acl_entry};
 use crate::auth::session::now_epoch;
 use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, HostingConfig, LogConfig, LogFormat, RegistryConfig,
-    ServerConfig, StoreConfig, VtaConfig,
+    ServerConfig, VtaConfig,
 };
 use crate::error::AppError;
 use crate::secret_store::{ServerSecrets, create_secret_store};
@@ -224,10 +224,7 @@ pub async fn apply_recipe(
             level: log_level,
             format: log_format,
         },
-        store: StoreConfig {
-            data_dir,
-            ..StoreConfig::default()
-        },
+        store: crate::config::setup_store_config(data_dir),
         fjall: Default::default(),
         auth: AuthConfig::default(),
         secrets: secrets_config.clone(),

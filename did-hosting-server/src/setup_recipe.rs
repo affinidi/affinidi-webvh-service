@@ -20,7 +20,7 @@ use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages};
 
 use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, LimitsConfig, LogConfig, LogFormat, ServerConfig,
-    StatsConfig, StoreConfig, VtaConfig,
+    StatsConfig, VtaConfig,
 };
 use crate::error::AppError;
 use crate::secret_store::{ServerSecrets, create_secret_store};
@@ -259,10 +259,7 @@ pub async fn apply_recipe(
             level: log_level,
             format: log_format,
         },
-        store: StoreConfig {
-            data_dir,
-            ..StoreConfig::default()
-        },
+        store: crate::config::setup_store_config(data_dir),
         fjall: Default::default(),
         auth: AuthConfig::default(),
         hosting: crate::config::HostingConfig::default(),

@@ -1,6 +1,6 @@
 use crate::config::AppConfig;
 use crate::error::AppError;
-use crate::store::{RawKvPair, Store};
+use crate::store::{RawKvPair, Store, chunk_ranges};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use did_hosting_common::server::store::{
@@ -78,8 +78,25 @@ fn encode_pairs(pairs: Vec<RawKvPair>) -> Vec<KvEntry> {
         .collect()
 }
 
+/// How a backup or restore obtains the config it works on: the config file's
+/// path in, the effective [`AppConfig`] out. The server's own is
+/// [`AppConfig::load`]. A host that runs the server inside another binary passes
+/// its own, so the store it backs up or restores is the one that binary opens at
+/// runtime (the daemon applies `DAEMON_STORE_*`, which `AppConfig::load` does not
+/// read).
+pub type ConfigLoader = fn(Option<PathBuf>) -> Result<AppConfig, AppError>;
+
 pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<(), AppError> {
-    let config = AppConfig::load(config_path)?;
+    run_backup_with(config_path, output, AppConfig::load).await
+}
+
+/// [`run_backup`] over the config `load` produces.
+pub async fn run_backup_with(
+    config_path: Option<PathBuf>,
+    output: String,
+    load: ConfigLoader,
+) -> Result<(), AppError> {
+    let config = load(config_path)?;
 
     let config_json = serde_json::to_string_pretty(&config)
         .map_err(|e| AppError::Config(format!("failed to serialize config: {e}")))?;
@@ -183,6 +200,36 @@ pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<
 }
 
 pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<(), AppError> {
+    run_restore_with(
+        config_path,
+        input,
+        AppConfig::load,
+        ConfigRestore::Overwrite,
+    )
+    .await
+}
+
+/// What a restore does with the config file the backup carries a copy of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigRestore {
+    /// Write the backup's config over the config file. The server's own restore:
+    /// the backup's config is the whole of the server's config.
+    Overwrite,
+    /// Leave a config file that already exists alone, and write the backup's only
+    /// when there is none. For a host whose config holds more than the server's
+    /// share of it: the backup carries just that share, so writing it over the
+    /// host's file would drop the rest (the daemon's witness store, for one).
+    KeepExisting,
+}
+
+/// [`run_restore`] over the config `load` produces, read after the config file
+/// has been dealt with as `config_restore` says.
+pub async fn run_restore_with(
+    config_path: Option<PathBuf>,
+    input: String,
+    load: ConfigLoader,
+    config_restore: ConfigRestore,
+) -> Result<(), AppError> {
     let json = std::fs::read_to_string(&input)
         .map_err(|e| AppError::Config(format!("failed to read backup file {input}: {e}")))?;
 
@@ -228,17 +275,30 @@ pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<
         })
         .unwrap_or_else(|| PathBuf::from("config.toml"));
 
-    let config_toml = toml::to_string_pretty(&backup_config)
-        .map_err(|e| AppError::Config(format!("failed to serialize config as TOML: {e}")))?;
-    std::fs::write(&config_file_path, &config_toml).map_err(|e| {
-        AppError::Config(format!(
-            "failed to write config to {}: {e}",
+    if config_restore == ConfigRestore::KeepExisting && config_file_path.exists() {
+        eprintln!(
+            "  Config kept: {} (the config in the backup was not applied)",
             config_file_path.display()
-        ))
-    })?;
-    eprintln!("  Config restored to: {}", config_file_path.display());
+        );
+    } else {
+        let config_toml = toml::to_string_pretty(&backup_config)
+            .map_err(|e| AppError::Config(format!("failed to serialize config as TOML: {e}")))?;
+        std::fs::write(&config_file_path, &config_toml).map_err(|e| {
+            AppError::Config(format!(
+                "failed to write config to {}: {e}",
+                config_file_path.display()
+            ))
+        })?;
+        eprintln!("  Config restored to: {}", config_file_path.display());
+        if config_restore == ConfigRestore::KeepExisting {
+            eprintln!(
+                "  Note: the backup carries only the server's share of the config; settings \
+                 it does not hold (another service's store, for one) must be set again."
+            );
+        }
+    }
 
-    let config = AppConfig::load(config_path)?;
+    let config = load(config_path)?;
     let store = Store::open(&config.store).await?;
 
     let dids_ks = store.keyspace(KS_DIDS)?;
@@ -300,15 +360,33 @@ async fn restore_keyspace(
 ) -> Result<usize, AppError> {
     const BATCH_SIZE: usize = 1000;
 
-    for chunk in entries.chunks(BATCH_SIZE) {
+    let mut decoded = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let key = BASE64
+            .decode(&entry.key)
+            .map_err(|e| AppError::Config(format!("invalid base64url key: {e}")))?;
+        let value = BASE64
+            .decode(&entry.value)
+            .map_err(|e| AppError::Config(format!("invalid base64url value: {e}")))?;
+        decoded.push((key, value));
+    }
+
+    // A restore does not need atomicity across the whole dump, so each chunk is
+    // its own batch, sized to what the backend can hold in one atomic write
+    // (some backends refuse a larger batch rather than split it).
+    let sizes: Vec<usize> = decoded
+        .iter()
+        .map(|(key, value)| {
+            ks.name
+                .len()
+                .saturating_add(key.len())
+                .saturating_add(value.len())
+        })
+        .collect();
+    let mut decoded = decoded.into_iter();
+    for range in chunk_ranges(store.batch_limits(), BATCH_SIZE, &sizes) {
         let mut batch = store.batch();
-        for entry in chunk {
-            let key = BASE64
-                .decode(&entry.key)
-                .map_err(|e| AppError::Config(format!("invalid base64url key: {e}")))?;
-            let value = BASE64
-                .decode(&entry.value)
-                .map_err(|e| AppError::Config(format!("invalid base64url value: {e}")))?;
+        for (key, value) in decoded.by_ref().take(range.len()) {
             batch.insert_raw(ks, key, value);
         }
         batch.commit().await?;
@@ -424,5 +502,267 @@ mod tests {
         assert_eq!(decoded, bytes);
         // base64url-no-pad never emits `=`.
         assert!(!encoded.contains('='));
+    }
+
+    async fn temp_store() -> (Store, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = did_hosting_common::server::config::StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        (Store::open(&config).await.expect("open store"), dir)
+    }
+
+    fn entry(key: &str, value: &[u8]) -> KvEntry {
+        KvEntry {
+            key: BASE64.encode(key),
+            value: BASE64.encode(value),
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_keyspace_writes_every_entry_across_chunks() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace(KS_DIDS).expect("keyspace");
+        // More than one chunk of the default size (1000), so the planner's
+        // chunk boundaries are exercised, not only the single-chunk case.
+        let entries: Vec<KvEntry> = (0..2500)
+            .map(|i| entry(&format!("did:{i:04}"), format!("v{i}").as_bytes()))
+            .collect();
+
+        let n = restore_keyspace(&store, &ks, &entries)
+            .await
+            .expect("restore");
+
+        assert_eq!(n, 2500);
+        assert_eq!(ks.iter_all().await.expect("iter").len(), 2500);
+        assert_eq!(
+            ks.get_raw("did:2499").await.expect("get"),
+            Some(b"v2499".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_keyspace_of_nothing_writes_nothing() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace(KS_DIDS).expect("keyspace");
+        assert_eq!(
+            restore_keyspace(&store, &ks, &[]).await.expect("restore"),
+            0
+        );
+        assert!(ks.iter_all().await.expect("iter").is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_keyspace_rejects_a_bad_entry_before_writing_anything() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace(KS_DIDS).expect("keyspace");
+        let mut entries = vec![entry("did:good", b"ok")];
+        entries.push(KvEntry {
+            key: "!!not base64!!".into(),
+            value: BASE64.encode(b"x"),
+        });
+
+        let err = restore_keyspace(&store, &ks, &entries)
+            .await
+            .expect_err("a malformed entry is refused");
+
+        assert!(matches!(err, AppError::Config(_)), "{err:?}");
+        assert!(
+            ks.iter_all().await.expect("iter").is_empty(),
+            "the valid entry before the bad one must not have been written"
+        );
+    }
+    /// A `config.toml` that points the store at `data_dir` and leaves
+    /// everything else at its default.
+    fn write_config(dir: &std::path::Path, data_dir: &std::path::Path) -> PathBuf {
+        let path = dir.join("config.toml");
+        let toml = format!("[store]\ndata_dir = {:?}\n", data_dir.display().to_string());
+        std::fs::write(&path, toml).expect("write config");
+        path
+    }
+
+    async fn open_store_at(data_dir: &std::path::Path) -> Store {
+        let config = did_hosting_common::server::config::StoreConfig {
+            data_dir: data_dir.to_path_buf(),
+            ..Default::default()
+        };
+        Store::open(&config).await.expect("open store")
+    }
+
+    #[tokio::test]
+    async fn run_backup_exports_the_store_named_by_the_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        {
+            let store = open_store_at(&data).await;
+            let dids = store.keyspace(KS_DIDS).expect("dids");
+            dids.insert_raw("did:one", b"v1".to_vec())
+                .await
+                .expect("seed");
+            let stats = store.keyspace(KS_STATS).expect("stats");
+            stats
+                .insert_raw("stats:one", b"s1".to_vec())
+                .await
+                .expect("seed");
+            store.persist().await.expect("persist");
+        }
+        let config = write_config(dir.path(), &data);
+        let out = dir.path().join("backup.json");
+
+        run_backup(Some(config), out.display().to_string())
+            .await
+            .expect("backup");
+
+        let backup: Backup =
+            serde_json::from_str(&std::fs::read_to_string(&out).expect("read")).expect("parse");
+        assert_eq!(backup.version, BACKUP_VERSION);
+        assert_eq!(backup.keyspaces.dids.len(), 1);
+        assert_eq!(backup.keyspaces.stats.len(), 1);
+        assert_eq!(
+            BASE64.decode(&backup.keyspaces.dids[0].key).expect("key"),
+            b"did:one"
+        );
+        assert!(backup.keyspaces.domains.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_restore_writes_the_backup_back_into_the_store_and_rewrites_the_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        let config = write_config(dir.path(), &data);
+        {
+            let store = open_store_at(&data).await;
+            let dids = store.keyspace(KS_DIDS).expect("dids");
+            dids.insert_raw("did:one", b"v1".to_vec())
+                .await
+                .expect("seed");
+            dids.insert_raw("did:two", b"v2".to_vec())
+                .await
+                .expect("seed");
+            store.persist().await.expect("persist");
+        }
+        let out = dir.path().join("backup.json");
+        run_backup(Some(config.clone()), out.display().to_string())
+            .await
+            .expect("backup");
+        {
+            let store = open_store_at(&data).await;
+            let dids = store.keyspace(KS_DIDS).expect("dids");
+            dids.remove("did:one").await.expect("wipe");
+            dids.remove("did:two").await.expect("wipe");
+            store.persist().await.expect("persist");
+        }
+        std::fs::remove_file(&config).expect("remove config");
+
+        run_restore(Some(config.clone()), out.display().to_string())
+            .await
+            .expect("restore");
+
+        assert!(config.exists(), "the config in the backup is written back");
+        let store = open_store_at(&data).await;
+        let dids = store.keyspace(KS_DIDS).expect("dids");
+        assert_eq!(
+            dids.get_raw("did:one").await.expect("get"),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            dids.get_raw("did:two").await.expect("get"),
+            Some(b"v2".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn run_restore_refuses_a_backup_from_a_newer_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write_config(dir.path(), &dir.path().join("data"));
+        let out = dir.path().join("backup.json");
+        let newer = v1_backup_json().replace(
+            "\"version\": 1",
+            &format!("\"version\": {}", BACKUP_VERSION + 1),
+        );
+        std::fs::write(&out, newer).expect("write");
+
+        let err = run_restore(Some(config), out.display().to_string())
+            .await
+            .expect_err("a newer backup is refused");
+
+        assert!(
+            matches!(&err, AppError::Config(m) if m.contains("newer")),
+            "{err:?}"
+        );
+    }
+    #[tokio::test]
+    async fn run_restore_keeping_the_config_leaves_an_existing_file_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        let config = write_config(dir.path(), &data);
+        {
+            let store = open_store_at(&data).await;
+            let dids = store.keyspace(KS_DIDS).expect("dids");
+            dids.insert_raw("did:one", b"v1".to_vec())
+                .await
+                .expect("seed");
+            store.persist().await.expect("persist");
+        }
+        let out = dir.path().join("backup.json");
+        run_backup(Some(config.clone()), out.display().to_string())
+            .await
+            .expect("backup");
+        // The host's own config has more in it than the backup carries.
+        let hosts = format!(
+            "{}\n[witness_store]\ndata_dir = \"/elsewhere\"\n",
+            std::fs::read_to_string(&config).expect("read")
+        );
+        std::fs::write(&config, &hosts).expect("write");
+        {
+            let store = open_store_at(&data).await;
+            let dids = store.keyspace(KS_DIDS).expect("dids");
+            dids.remove("did:one").await.expect("wipe");
+            store.persist().await.expect("persist");
+        }
+
+        run_restore_with(
+            Some(config.clone()),
+            out.display().to_string(),
+            AppConfig::load,
+            ConfigRestore::KeepExisting,
+        )
+        .await
+        .expect("restore");
+
+        assert_eq!(std::fs::read_to_string(&config).expect("read"), hosts);
+        let store = open_store_at(&data).await;
+        let dids = store.keyspace(KS_DIDS).expect("dids");
+        assert_eq!(
+            dids.get_raw("did:one").await.expect("get"),
+            Some(b"v1".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn run_restore_keeping_the_config_still_writes_one_when_there_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        let config = write_config(dir.path(), &data);
+        let out = dir.path().join("backup.json");
+        run_backup(Some(config.clone()), out.display().to_string())
+            .await
+            .expect("backup");
+        std::fs::remove_file(&config).expect("lose the config");
+
+        run_restore_with(
+            Some(config.clone()),
+            out.display().to_string(),
+            AppConfig::load,
+            ConfigRestore::KeepExisting,
+        )
+        .await
+        .expect("restore");
+
+        assert!(
+            config.exists(),
+            "a missing config is recovered from the backup"
+        );
     }
 }
