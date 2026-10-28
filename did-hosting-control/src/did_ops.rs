@@ -427,6 +427,9 @@ pub async fn create_did(
         mnemonic.as_bytes().to_vec(),
     );
     batch.commit().await?;
+    if replaced.is_none() {
+        state.stats_collector.increment_total_dids();
+    }
     if let Some(existing) = replaced.as_ref() {
         invalidate_cached_content(state, &mnemonic);
         info!(
@@ -758,6 +761,9 @@ pub async fn register_did_atomic(
     }
     batch.commit().await?;
     invalidate_cached_content(state, path);
+    if existing.is_none() {
+        state.stats_collector.increment_total_dids();
+    }
 
     // Same rationale as `publish_did`: the atomic register path commits
     // a new log entry, so it must advance the update counters when the
@@ -1871,6 +1877,7 @@ pub async fn delete_did(
     batch.remove(&state.dids_ks, owner_key(&record.owner, mnemonic));
     batch.commit().await?;
     invalidate_cached_content(state, mnemonic);
+    state.stats_collector.decrement_total_dids();
 
     info!(did = %auth.did, mnemonic = %mnemonic, "DID deleted on control plane");
 
@@ -3412,6 +3419,50 @@ mod tests_atomic {
             after + 1,
             "idempotent re-register must also advance total_updates"
         );
+    }
+
+    /// The hosted-DID count follows creates and deletes without a store scan:
+    /// a new slot counts once, publishing or replacing an existing slot does
+    /// not count again, and a delete uncounts it.
+    #[tokio::test]
+    async fn did_count_follows_creates_and_deletes() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let total = || state.stats_collector.get_aggregate().total_dids;
+        assert_eq!(total(), 0);
+
+        create_did(&owner_auth(owner), &state, Some("reserved"), false, None)
+            .await
+            .unwrap();
+        assert_eq!(total(), 1, "a reserved slot is a hosted DID");
+
+        let log = build_test_did_log("scid-reserved", "control.test", "reserved").await;
+        register_did_atomic(&owner_auth(owner), &state, "reserved", &log, false, None)
+            .await
+            .unwrap();
+        assert_eq!(total(), 1, "publishing into a reserved slot adds no DID");
+
+        let log = build_test_did_log("scid-fresh", "control.test", "fresh").await;
+        register_did_atomic(&owner_auth(owner), &state, "fresh", &log, false, None)
+            .await
+            .unwrap();
+        assert_eq!(total(), 2, "registering a fresh path adds a DID");
+
+        create_did(
+            &admin_auth("did:example:admin"),
+            &state,
+            Some("fresh"),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total(), 2, "a force-replace reuses the slot");
+
+        delete_did(&owner_auth(owner), &state, "reserved", None)
+            .await
+            .unwrap();
+        assert_eq!(total(), 1, "a delete removes the DID");
     }
 
     /// Mirror coverage for the `publish_did` path. Pre-create a slot via

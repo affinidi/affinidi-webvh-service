@@ -108,8 +108,12 @@ impl StatsCollector {
         self.agg_total_dids.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Decrement the DID count, stopping at zero: a count seeded or
+    /// reconciled after a delete must not wrap.
     pub fn decrement_total_dids(&self) {
-        self.agg_total_dids.fetch_sub(1, Ordering::Relaxed);
+        let _ = self
+            .agg_total_dids
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
     }
 
     /// Increment aggregate counters by the given deltas.
@@ -292,5 +296,19 @@ impl StatsCollector {
 impl Default for StatsCollector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decrement_total_dids_stops_at_zero() {
+        let collector = StatsCollector::new();
+        collector.increment_total_dids();
+        collector.decrement_total_dids();
+        collector.decrement_total_dids();
+        assert_eq!(collector.get_aggregate().total_dids, 0);
     }
 }

@@ -1255,12 +1255,14 @@ async fn run_daemon_storage_task(
                     &params.dids_ks,
                     did_ttl_seconds,
                 ).await {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        info!(count = n, "cleaned up empty DID records");
-                        for _ in 0..n {
-                            params.collector.decrement_total_dids();
+                    Ok(report) => {
+                        if report.removed > 0 {
+                            info!(count = report.removed, "cleaned up empty DID records");
                         }
+                        // The cleanup already read every DID record, so it
+                        // doubles as the DID-count reconcile the standalone
+                        // control plane runs on its own timer.
+                        params.collector.set_total_dids(report.remaining);
                     }
                     Err(e) => warn!("DID cleanup error: {e}"),
                 }
@@ -1270,16 +1272,18 @@ async fn run_daemon_storage_task(
                     &params.collector,
                     &params.stats_ks,
                     &params.timeseries_ks,
-                    &params.dids_ks,
                     &params.store,
                 ).await {
                     warn!("stats flush error: {e}");
                 }
             }
             _ = purge_timer.tick() => {
-                let purged = did_hosting_server::purge_sweep::run_sweep_once(&params.store).await;
-                if purged > 0 {
-                    info!(count = purged, "purge sweep tick completed");
+                let sweep = did_hosting_server::purge_sweep::run_sweep_once(&params.store).await;
+                if sweep.entries > 0 {
+                    info!(count = sweep.entries, "purge sweep tick completed");
+                }
+                for _ in 0..sweep.dids_deleted {
+                    params.collector.decrement_total_dids();
                 }
             }
             _ = identity_expiry_timer.tick() => {
@@ -1306,7 +1310,6 @@ async fn run_daemon_storage_task(
         &params.collector,
         &params.stats_ks,
         &params.timeseries_ks,
-        &params.dids_ks,
         &params.store,
     )
     .await;

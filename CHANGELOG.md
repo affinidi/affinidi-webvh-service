@@ -109,6 +109,13 @@ browser-extension releases.
 - **did:web `did.json` is cacheable.** It carried no `Cache-Control`, so the
   global default stamped it `no-store`; it now follows `[server.resolve_cache]`
   like the other resolve paths.
+- **The DID count no longer reads every DID record every 10 seconds.** The
+  control plane and the daemon recounted hosted DIDs from the store on every
+  stats flush, so an idle service's read load grew with the number of DIDs it
+  hosted. Creates, deletes and domain purges now keep the count. The control
+  plane recounts hourly to correct paths that bypass them; the daemon takes
+  the count from its empty-DID cleanup (hourly by default), which already
+  reads every record.
 
 ### Added — did:scid identities
 

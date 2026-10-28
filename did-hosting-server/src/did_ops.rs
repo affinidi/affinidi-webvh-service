@@ -26,15 +26,27 @@ pub fn validate_did_jsonl(content: &str) -> Result<(), AppError> {
 // Cleanup
 // ---------------------------------------------------------------------------
 
+/// What one cleanup pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupReport {
+    /// DID records removed.
+    pub removed: u64,
+    /// DID records left after the pass. The pass reads every record, so
+    /// callers can take the hosted-DID count from it instead of scanning
+    /// again.
+    pub remaining: u64,
+}
+
 /// Remove DID records that have `version_count == 0` and are older than `ttl_seconds`,
 /// or soft-deleted records past the 30-day retention period.
 pub async fn cleanup_empty_dids(
     dids_ks: &KeyspaceHandle,
     ttl_seconds: u64,
-) -> Result<u64, AppError> {
+) -> Result<CleanupReport, AppError> {
     const SOFT_DELETE_RETENTION: u64 = 30 * 24 * 3600; // 30 days
     let now = now_epoch();
     let raw = dids_ks.prefix_iter_raw("did:").await?;
+    let scanned = raw.len() as u64;
     let mut removed = 0u64;
 
     for (_key, value) in raw {
@@ -63,7 +75,10 @@ pub async fn cleanup_empty_dids(
         }
     }
 
-    Ok(removed)
+    Ok(CleanupReport {
+        removed,
+        remaining: scanned - removed,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -133,5 +148,57 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("line 2"), "expected 'line 2' in error: {err}");
+    }
+
+    /// The cleanup reads every DID record, so the count it reports left
+    /// must match what is stored after it removes the expired ones.
+    #[tokio::test]
+    async fn cleanup_reports_the_dids_left() {
+        use did_hosting_common::server::config::StoreConfig;
+        use did_hosting_common::server::store::{KS_DIDS, Store};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open fjall");
+        let ks = store.keyspace(KS_DIDS).unwrap();
+        let record = |mnemonic: &str, version_count: u64| DidRecord {
+            owner: "did:example:owner".into(),
+            mnemonic: mnemonic.into(),
+            created_at: 1,
+            updated_at: 1,
+            version_count,
+            did_id: None,
+            content_size: 0,
+            disabled: false,
+            deleted_at: None,
+            method: "webvh".into(),
+            domain: "example.com".into(),
+            services: None,
+            agent_names: Vec::new(),
+        };
+        ks.insert(did_key("empty"), &record("empty", 0))
+            .await
+            .unwrap();
+        ks.insert(did_key("live-a"), &record("live-a", 1))
+            .await
+            .unwrap();
+        ks.insert(did_key("live-b"), &record("live-b", 2))
+            .await
+            .unwrap();
+
+        let report = cleanup_empty_dids(&ks, 60).await.unwrap();
+
+        assert_eq!(
+            report,
+            CleanupReport {
+                removed: 1,
+                remaining: 2
+            }
+        );
+        assert_eq!(ks.prefix_iter_raw("did:").await.unwrap().len(), 2);
     }
 }

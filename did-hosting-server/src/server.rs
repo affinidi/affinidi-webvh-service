@@ -842,7 +842,7 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
         loop {
             tokio::select! {
                 _ = did_timer.tick() => {
-                    match cleanup_empty_dids(&dids_ks, did_ttl_seconds).await {
+                    match cleanup_empty_dids(&dids_ks, did_ttl_seconds).await.map(|r| r.removed) {
                         Ok(0) => {}
                         Ok(n) => {
                             info!(count = n, "cleaned up empty DID records");
