@@ -1,0 +1,67 @@
+name: Cut a release
+
+# Creates release/<major.minor> from nightly and opens the release-cut PR that
+# moves main to the next minor (RELEASES.md). Run it from the Actions tab on
+# main. The release bot app pushes both: `branch rules` accepts a cut PR only
+# from it, and a branch GITHUB_TOKEN pushes would never be tagged.
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "major.minor, e.g. 0.11"
+        required: true
+        type: string
+      from:
+        description: "Revision to cut from (origin/main before nightly exists)"
+        required: true
+        type: string
+        default: origin/nightly
+      dry-run:
+        description: "Build both commits, push nothing"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-cut
+  cancel-in-progress: false
+
+jobs:
+  cut:
+    name: Cut release/${{ inputs.name }}
+    runs-on: ubuntu-latest
+    # RELEASE_BOT_PRIVATE_KEY is a secret of this environment.
+    environment: release
+    timeout-minutes: 30
+    steps:
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+      - uses: affinidi/pipeline-rust/.github/actions/release-cut@feat/release-branch-actions
+        with:
+          name: ${{ inputs.name }}
+          from: ${{ inputs.from }}
+          dry-run: ${{ inputs.dry-run }}
+          token: ${{ steps.app.outputs.token }}
+      # main's next minor also moves the version the OpenAPI snapshot and
+      # fuzz/Cargo.lock record. The checkout pushes with the app token.
+      - name: Carry main's next version into docs/openapi.json and fuzz/Cargo.lock
+        if: ${{ !inputs.dry-run }}
+        env:
+          HEAD: release-cut/${{ inputs.name }}
+        run: |
+          set -euo pipefail
+          git fetch origin "refs/heads/${HEAD}"
+          git switch -c "${HEAD}" FETCH_HEAD
+          python3 scripts/sync-version-files.py
+          git add docs/openapi.json fuzz/Cargo.lock
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -s -m "chore(release): main's next version in docs/openapi.json and fuzz/Cargo.lock"
+          git push origin "HEAD:refs/heads/${HEAD}"
