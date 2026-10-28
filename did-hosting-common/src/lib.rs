@@ -25,6 +25,7 @@ pub mod server;
 #[allow(clippy::all, clippy::pedantic, missing_docs, unreachable_pub)]
 pub mod tasks {
     include!(concat!(env!("OUT_DIR"), "/trust_tasks_generated.rs"));
+    include!(concat!(env!("OUT_DIR"), "/trust_tasks_schema_index.rs"));
 }
 
 #[cfg(feature = "server-core")]

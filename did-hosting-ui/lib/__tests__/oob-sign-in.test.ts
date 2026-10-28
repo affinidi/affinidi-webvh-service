@@ -125,7 +125,7 @@ type Reply = { status: number; body: unknown };
 const ok = (payload: unknown): Reply => ({ status: 200, body: { type: "x#response", payload } });
 const err = (status: number, code: string, details?: unknown): Reply => ({
   status,
-  body: { type: "https://trusttasks.org/spec/trust-task-error/0.5", payload: { code, message: code, details } },
+  body: { type: "https://trusttasks.org/spec/trust-task-error/0.6", payload: { code, message: code, details } },
 });
 
 /** A service that answers `request`, then each redeem from a script. */

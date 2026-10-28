@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Changed — trust-tasks 0.36
+
+The workspace moves to trust-tasks-rs 0.36, with vta-sdk 0.75, vti-common
+0.51, vti-secrets 0.24, affinidi-tdk 0.36, affinidi-messaging-sdk 0.44,
+affinidi-messaging-didcomm-service 0.29 and the test mediator 0.48. The UI's
+`@openvtc/trust-tasks` runtime moves to 0.28.1.
+
+Error documents are now `trust-task-error/0.6`, on every path, routed or not.
+0.6 extends 0.5 with two codes, `unsupportedExtension` and `indeterminate`;
+a consumer that accepts later minors (SPEC §5.2), as the UI does, needs no
+change. No pinned task version changed.
+
 ### Changed — BREAKING: every Trust Task moves to its latest version
 
 Old versions are no longer served. A peer that still sends one gets

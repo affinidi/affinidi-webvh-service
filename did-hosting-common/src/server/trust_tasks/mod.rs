@@ -412,12 +412,16 @@ where
 /// §5.2 forward-minor compatibility a consumer pinned to `0.3` SHOULD accept
 /// these.
 ///
+/// Now `0.6`, tracking `trust-tasks-rs` 0.36: it appends `unsupportedExtension`
+/// and `indeterminate` to the code enum and declares `extends: "0.5"`, so it is
+/// a strict superset of `0.5`.
+///
 /// One definition for the whole workspace, pinned by
 /// `unrouted_and_routed_errors_agree_on_the_type_uri` below, which compares it
 /// against a real `reject_with`. A framework bump fails that test rather than
 /// re-splitting the service in two — which is exactly how this bump was caught.
 pub fn framework_error_type_uri() -> trust_tasks_rs::TypeUri {
-    "https://trusttasks.org/spec/trust-task-error/0.5"
+    "https://trusttasks.org/spec/trust-task-error/0.6"
         .parse()
         .expect("framework error Type URI parses")
 }
