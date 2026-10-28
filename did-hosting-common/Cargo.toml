@@ -194,7 +194,10 @@ affinidi-messaging-sdk = { workspace = true, optional = true }
 # store backends (optional)
 fjall = { workspace = true, optional = true }
 redis = { version = "1.0", features = ["tokio-comp", "aio"], optional = true }
-aws-sdk-dynamodb = { version = "1", optional = true }
+# No default features: the SDK's default `rustls` feature is the legacy
+# hyper-0.14 client on rustls 0.21 (unpatched: GHSA-c8m5-c952-6cm4 and two
+# lows). `default-https-client` is the current client on rustls 0.23.
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 firestore = { version = "0.61", optional = true }
 futures = { version = "0.3", optional = true }
 azure_data_cosmos = { version = "1", features = ["key_auth"], optional = true }
