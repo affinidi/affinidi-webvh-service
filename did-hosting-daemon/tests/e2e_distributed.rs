@@ -35,11 +35,11 @@ use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 use affinidi_messaging_test_mediator::TestMediator;
+use did_hosting_common::tasks::did_management::{did, domain};
+use did_hosting_common::tasks::webvh::witness::publish::v0_1 as witness_publish;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use trust_tasks_rs::Payload;
-use trust_tasks_rs::specs::did_management::{did, domain};
-use trust_tasks_rs::specs::webvh::witness::publish::v0_1 as witness_publish;
 
 use did_hosting_common::WitnessClient;
 use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};

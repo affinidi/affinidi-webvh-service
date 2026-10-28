@@ -8,7 +8,9 @@
 //!
 //! - `webvh/witness/key/create|list|delete/0.1` — administer witness identities;
 //! - `webvh/witness/sign/0.1` — witness one log entry, after verifying the log;
-//! - `acl/grant|revoke|change-role|show|list/0.1` — the witness's own ACL.
+//! - `acl/grant|revoke|change-role|show/0.2`, `acl/list/0.3` — the witness's
+//!   own ACL. An `Admin` may have the witness sign with any of its keys, so
+//!   the witness's entries state `keys: all` for an `Admin` (AclEntry 0.2).
 //!
 //! ## Every request is a document its issuer signed
 //!
@@ -36,13 +38,13 @@
 
 use std::sync::Arc;
 
-use serde_json::{Value, json};
-use tracing::{info, warn};
-use trust_tasks_rs::specs::acl::{change_role, grant, list, revoke, show};
-use trust_tasks_rs::specs::webvh::witness::{
+use did_hosting_common::tasks::acl::{change_role, grant, list, revoke, show};
+use did_hosting_common::tasks::webvh::witness::{
     key::{create::v0_1 as key_create, delete::v0_1 as key_delete, list::v0_1 as key_list},
     sign::v0_1 as sign,
 };
+use serde_json::{Value, json};
+use tracing::{info, warn};
 use trust_tasks_rs::{ErrorPayload, Payload, ProofPolicy, RejectReason, TrustTask};
 
 use did_hosting_common::did_ops::{WitnessLogRefusal, verify_log_for_witnessing};
@@ -74,11 +76,11 @@ pub const WITNESS_TASKS: &[&str] = &[
 
 /// The shared ACL family, served on the witness's own ACL.
 pub const ACL_TASKS: &[&str] = &[
-    grant::v0_1::Payload::TYPE_URI,
-    revoke::v0_1::Payload::TYPE_URI,
-    change_role::v0_1::Payload::TYPE_URI,
-    show::v0_1::Payload::TYPE_URI,
-    list::v0_1::Payload::TYPE_URI,
+    grant::v0_2::Payload::TYPE_URI,
+    revoke::v0_2::Payload::TYPE_URI,
+    change_role::v0_2::Payload::TYPE_URI,
+    show::v0_2::Payload::TYPE_URI,
+    list::v0_3::Payload::TYPE_URI,
 ];
 
 /// Build the proof verifier the witness checks requests with: the workspace's
@@ -206,6 +208,7 @@ pub async fn dispatch_inbound_document(
             acl_ks: &state.acl_ks,
             acl_locks: &state.acl_locks,
             my_vid: my_did,
+            signing_oracle: true,
         };
         // The proof was verified above, on the document as it arrived.
         let policy = ProofPolicy::<TransportBoundVerifier>::AcceptUnverified;

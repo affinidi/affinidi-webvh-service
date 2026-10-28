@@ -10,10 +10,9 @@
 //!   services wallet sign-in needs (`crate::sign_in_readiness`), read by the
 //!   login page;
 //! - `POST /api/auth/challenge`, which mints the challenge every sign-in
-//!   completes over the Trust Task surface (`auth/authenticate/0.2` for the
-//!   VTI Wallet extension, which this deployment cannot re-version; `0.3` for
-//!   the did-hosting UI's own wallet login and its VTA-proxied SIOP login —
-//!   see `trust_tasks_auth`). The console's session refresh went the same
+//!   completes over the Trust Task surface (`auth/authenticate/0.3`, for the
+//!   VTI Wallet extension, the did-hosting UI's own wallet login and its
+//!   VTA-proxied SIOP login — see `trust_tasks_auth`). The console's session refresh went the same
 //!   way: `auth/refresh/0.2` over `/api/trust-tasks`, not a REST route;
 //! - the admin console's static assets, as the fallback (standalone mode).
 

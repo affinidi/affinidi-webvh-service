@@ -53,8 +53,8 @@ pub const MSG_WITNESS_CONFIRM: &str =
     "https://trusttasks.org/spec/webvh/witness/publish/0.1#response";
 pub const MSG_INFO_REQUEST: &str = "https://trusttasks.org/spec/did-management/did/info/0.1";
 pub const MSG_INFO: &str = "https://trusttasks.org/spec/did-management/did/info/0.1#response";
-pub const MSG_LIST_REQUEST: &str = "https://trusttasks.org/spec/did-management/did/list/0.1";
-pub const MSG_LIST: &str = "https://trusttasks.org/spec/did-management/did/list/0.1#response";
+pub const MSG_LIST_REQUEST: &str = "https://trusttasks.org/spec/did-management/did/list/0.2";
+pub const MSG_LIST: &str = "https://trusttasks.org/spec/did-management/did/list/0.2#response";
 pub const MSG_DELETE: &str = "https://trusttasks.org/spec/did-management/did/delete/0.1";
 pub const MSG_DELETE_CONFIRM: &str =
     "https://trusttasks.org/spec/did-management/did/delete/0.1#response";
@@ -108,10 +108,17 @@ pub const MSG_AGENT_NAME_CHECK_RESPONSE: &str =
 // Server registration (server → control plane)
 // ---------------------------------------------------------------------------
 
+/// `did-management/server/register/0.2`. Its payload is closed, so this
+/// service's own registration hints (the delta-sync report, capability flags)
+/// travel under `ext` in the [`REGISTER_EXT_NAMESPACE`] namespace.
 pub const MSG_SERVER_REGISTER: &str =
-    "https://trusttasks.org/spec/did-management/server/register/0.1";
+    "https://trusttasks.org/spec/did-management/server/register/0.2";
 pub const MSG_SERVER_REGISTER_ACK: &str =
-    "https://trusttasks.org/spec/did-management/server/register/0.1#response";
+    "https://trusttasks.org/spec/did-management/server/register/0.2#response";
+/// The `ext` namespace (SPEC §4.5.1) a server's register payload carries this
+/// service's hints under: `trust_task_capable`, `sync_batch` and
+/// `preloaded_dids`. A control plane that does not know a hint ignores it.
+pub const REGISTER_EXT_NAMESPACE: &str = "com.affinidi.did-hosting";
 
 // ---------------------------------------------------------------------------
 // Health (control plane → server → control plane)
@@ -198,10 +205,11 @@ pub const MSG_REPLICA_DOMAIN_PURGE_ACK: &str =
 #[cfg(all(test, feature = "server-core"))]
 mod tests {
     use super::*;
+    use crate::tasks::did_management::replica::domain::{assign, purge, unassign, upsert};
+    use crate::tasks::did_management::server::register;
     use trust_tasks_rs::Payload;
-    use trust_tasks_rs::specs::did_management::replica::domain::{assign, purge, unassign, upsert};
 
-    /// The replica constants are the generated specifications' Type URIs, so a
+    /// The replica and register constants are the generated specifications' Type URIs, so a
     /// directive the control plane sends is one the server's typed handler reads.
     #[test]
     fn replica_constants_are_the_generated_type_uris() {
@@ -229,6 +237,8 @@ mod tests {
                 MSG_REPLICA_DOMAIN_PURGE_ACK,
                 purge::v0_1::Response::TYPE_URI,
             ),
+            (MSG_SERVER_REGISTER, register::v0_2::Payload::TYPE_URI),
+            (MSG_SERVER_REGISTER_ACK, register::v0_2::Response::TYPE_URI),
         ] {
             assert_eq!(constant, generated);
         }

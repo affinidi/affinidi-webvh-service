@@ -457,7 +457,12 @@ impl InfraRejection {
 }
 
 /// Transport-agnostic core of server registration, for the
-/// `.../server/register/0.1` trust task arriving over DIDComm **or** TSP.
+/// `.../server/register/0.2` trust task arriving over DIDComm **or** TSP.
+///
+/// The payload must parse as the generated `server/register/0.2` type (it is
+/// closed: an unknown member is refused, not dropped), `did` must be the
+/// signer and `instanceId` the signer's registry key. This service's own hints
+/// ride under `ext` in [`REGISTER_EXT_NAMESPACE`].
 ///
 /// `signer` is the registration document's proven issuer — the DID whose key
 /// signed it — so a server is registered, and synced every tenant's DIDs, only
@@ -502,10 +507,39 @@ pub(crate) async fn do_server_register(
         }
     };
 
-    let public_url = body
-        .get("public_url")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
+    let payload: did_hosting_common::tasks::did_management::server::register::v0_2::Payload =
+        serde_json::from_value(body.clone()).map_err(|e| {
+            warn!(did = signer, error = %e, "server registration rejected: malformed payload");
+            InfraRejection::new(
+                "e.p.registration.malformed",
+                format!("not a server/register/0.2 payload: {e}"),
+            )
+        })?;
+    // Use the signer DID as a stable instance ID (one registration per DID).
+    let instance_id = signer.replace(':', "_");
+    if payload.did.as_str() != signer || payload.instance_id.as_str() != instance_id {
+        warn!(
+            did = signer,
+            "server registration rejected: did/instanceId do not name the signer"
+        );
+        return Err(InfraRejection::new(
+            "e.p.registration.malformed",
+            format!("`did` must be the signer and `instanceId` must be `{instance_id}`"),
+        ));
+    }
+    // This service's hints (`ext`, in its namespace). A server that sends none
+    // gets the conservative defaults: legacy health pings, single sync frames,
+    // and a full sync.
+    let hints = payload
+        .ext
+        .as_ref()
+        .and_then(|ext| {
+            ext.iter()
+                .find(|(k, _)| k.as_str() == REGISTER_EXT_NAMESPACE)
+                .map(|(_, v)| v.clone())
+        })
+        .unwrap_or(Value::Null);
+    let public_url = payload.public_url.as_str();
 
     // Apply the same URL allowlist that the REST `register_service`
     // route enforces. Without this gate, an ACL'd Service-role caller
@@ -527,28 +561,20 @@ pub(crate) async fn do_server_register(
         ));
     }
 
-    let label = body.get("label").and_then(|v| v.as_str()).map(String::from);
+    let label = payload.label.as_ref().map(|l| l.to_string());
 
     // T27: parse capability declaration. Backwards-compat: pre-T27
     // servers don't send these fields; default to webvh-only.
-    let enabled_methods: Vec<String> = body
-        .get("enabled_methods")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_else(|| vec!["webvh".to_string()]);
-    let claimed_served_domains: Vec<String> = body
-        .get("served_domains")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let enabled_methods: Vec<String> = if payload.enabled_methods.is_empty() {
+        vec!["webvh".to_string()]
+    } else {
+        payload
+            .enabled_methods
+            .iter()
+            .map(|m| m.to_string())
+            .collect()
+    };
+    let claimed_served_domains: Vec<String> = payload.served_domains.clone();
     // Defense against a misbehaving server fabricating `served_domains`
     // entries to mislead operators (and the purge-fanout in
     // `delete_domain_route`). We intersect the self-asserted list
@@ -589,27 +615,23 @@ pub(crate) async fn do_server_register(
         }
         keep
     };
-    let protocol_version = body
-        .get("protocol_version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("1.0")
-        .to_string();
+    let protocol_version = payload
+        .protocol_version
+        .as_ref()
+        .map_or_else(|| "1.0".to_string(), |v| v.to_string());
 
     // Self-asserted: only a server that ships the trust-task dispatcher sends
     // this. Absent (older fleet) → false → the health loop keeps sending the
     // legacy `MSG_HEALTH_PING`, so upgrading the control plane first never
     // strands a server as Unreachable.
-    let trust_task_capable = body
+    let trust_task_capable = hints
         .get("trust_task_capable")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let sync_batch_capable = body
+    let sync_batch_capable = hints
         .get("sync_batch")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-
-    // Use the signer DID as a stable instance ID (one registration per DID)
-    let instance_id = signer.replace(':', "_");
 
     // `register_instance` overwrites the whole record, so carry the previous
     // badge cache forward rather than blanking it. The refresh below
@@ -690,13 +712,14 @@ pub(crate) async fn do_server_register(
     // (mnemonic → DID + version_count); anything absent, stale, or a different
     // DID at that slot is pushed. A server with an empty store sends none and
     // gets a full push. This is what stops a reboot from re-syncing every DID.
-    let reported = server_push::parse_reported(body);
+    let reported = server_push::parse_reported(&hints);
     server_push::sync_all_dids_to_server(state, signer.to_string(), reported);
     server_push::sync_all_domains_to_server(state, signer.to_string());
 
     Ok(json!({
-        "instance_id": instance_id,
-        "status": "registered",
+        "instanceId": instance_id,
+        "accepted": true,
+        "lastSeenAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
     }))
 }
 
@@ -1114,7 +1137,7 @@ pub(crate) async fn dispatch_trust_task_doc(
 ///
 /// A response is a document from this control plane to the requester, and a
 /// requester must be able to attribute it by signature, not by the channel it
-/// arrived on: `auth/authenticate/0.2` declares a proof REQUIRED and SPEC §7.3
+/// arrived on: `auth/authenticate/0.3` declares a proof REQUIRED and SPEC §7.3
 /// item 8 applies that to its response, and clients refuse unsigned non-error
 /// replies. So each reply is re-stamped `issuer` = this control plane,
 /// `recipient` = the requester (when the request named none), `issuedAt` = now,
@@ -1523,6 +1546,7 @@ async fn route_trust_task_doc(
         acl_ks: &state.acl_ks,
         acl_locks: &state.acl_locks,
         my_vid,
+        signing_oracle: false,
     };
 
     // The framework path, and the only one whose outcome carries a reject code
@@ -1553,19 +1577,19 @@ async fn route_trust_task_doc(
 /// reads included — is privileged, including a Type URI nobody serves, which
 /// is then refused as unsupported only once it has been proven.
 ///
-/// The one exception is an `auth/oob/*` version the table does not serve.
-/// That family's callers are fresh `did:key`s that are never in the ACL, and a
-/// wallet negotiates the version by trying its newest and falling back only on
-/// `unsupportedType` (it sent `prove/0.2` before this service served it, and
-/// got `permissionDenied` from the pre-filter, which ended the sign-in). So it
-/// is `Optional`, and reaches the framework's `unsupportedType`. That says
+/// The one exception is an `auth/oob/*` version the table does not serve
+/// (only the latest of each task is). That family's callers are fresh
+/// `did:key`s that are never in the ACL, and a wallet negotiates the version
+/// by trying its newest and falling back only on `unsupportedType` (a
+/// `permissionDenied` from the pre-filter would end the sign-in instead). So
+/// it is `Optional`, and reaches the framework's `unsupportedType`. That says
 /// only which versions of an already-public family are served.
 pub(crate) fn proof_rule(type_uri: &str) -> ProofRule {
     use trust_tasks_rs::Payload;
     if let Some(rule) = crate::control_tasks::proof_rule(type_uri) {
         return rule;
     }
-    if type_uri == trust_tasks_rs::specs::trust_task_discovery::v0_1::Payload::TYPE_URI
+    if type_uri == trust_tasks_rs::specs::trust_task_discovery::v0_3::Payload::TYPE_URI
         || crate::trust_tasks_auth::owns(type_uri)
         || type_uri.starts_with(OOB_FAMILY_PREFIX)
     {
@@ -1577,7 +1601,7 @@ pub(crate) fn proof_rule(type_uri: &str) -> ProofRule {
 /// The `auth/oob/*` family's Type URIs (see [`proof_rule`]).
 const OOB_FAMILY_PREFIX: &str = "https://trusttasks.org/spec/auth/oob/";
 
-/// Whether a session key bound at login (`auth/authenticate/0.2`, or a passkey
+/// Whether a session key bound at login (`auth/authenticate/0.3`, or a passkey
 /// login's browser key) may sign `type_uri` for its session's subject.
 ///
 /// Only an ordinary operational request (`ProofRule::Authentication`) may be
@@ -1931,7 +1955,7 @@ mod tests {
         json!({})
     }
 
-    /// Happy path: an ACL read (`acl/list/0.1`) signed by the Admin it names.
+    /// Happy path: an ACL read (`acl/list/0.3`) signed by the Admin it names.
     #[tokio::test]
     async fn trust_tasks_envelope_happy_path_list_returns_handled_response() {
         let (state, _dir) = signing_state().await;
@@ -1940,7 +1964,7 @@ mod tests {
 
         let doc = sign(
             request_doc(
-                "https://trusttasks.org/spec/acl/list/0.1",
+                "https://trusttasks.org/spec/acl/list/0.3",
                 Some(&admin),
                 list_payload(),
             ),
@@ -1951,7 +1975,7 @@ mod tests {
 
         let inner_type = resp["type"].as_str().unwrap();
         assert!(
-            inner_type.ends_with("/acl/list/0.1#response"),
+            inner_type.ends_with("/acl/list/0.3#response"),
             "expected acl/list response type, got {inner_type}"
         );
         let entries = resp["payload"]["entries"].as_array().unwrap();
@@ -1968,7 +1992,7 @@ mod tests {
         seed_role(&state, &admin, Role::Admin).await;
 
         let doc = request_doc(
-            "https://trusttasks.org/spec/acl/list/0.1",
+            "https://trusttasks.org/spec/acl/list/0.3",
             Some(&admin),
             list_payload(),
         );
@@ -2096,9 +2120,9 @@ mod tests {
         // is still a valid signature by the attacker over the rest.
         let mut signed = sign(
             request_doc(
-                "https://trusttasks.org/spec/acl/grant/0.1",
+                "https://trusttasks.org/spec/acl/grant/0.2",
                 Some(&attacker),
-                json!({ "entry": { "subject": attacker, "role": "admin" } }),
+                json!({ "entry": { "subject": attacker, "role": "admin", "act": { "scope": "all" }, "keys": { "scope": "none" }, "capabilities": { "scope": "ceiling" } } }),
             ),
             &attacker_key,
         )
@@ -2107,7 +2131,7 @@ mod tests {
         let resp = dispatch_envelope(&state, admin, signed).await;
         assert_ne!(
             resp["type"].as_str().unwrap_or(""),
-            "https://trusttasks.org/spec/acl/grant/0.1#response",
+            "https://trusttasks.org/spec/acl/grant/0.2#response",
             "{resp}"
         );
         assert!(
@@ -2320,11 +2344,14 @@ mod tests {
         );
     }
 
-    fn register_payload() -> Value {
+    fn register_payload(edge: &str) -> Value {
         json!({
-            "public_url": "https://edge.example",
+            "instanceId": edge.replace(':', "_"),
+            "did": edge,
+            "publicUrl": "https://edge.example",
             "label": "edge",
-            "trust_task_capable": true,
+            "servedDomains": [],
+            "ext": { (REGISTER_EXT_NAMESPACE): { "trust_task_capable": true } },
         })
     }
 
@@ -2338,7 +2365,7 @@ mod tests {
         let edge = "did:example:edge";
         seed_role(&state, edge, Role::Service).await;
 
-        let doc = request_doc(MSG_SERVER_REGISTER, Some(edge), register_payload());
+        let doc = request_doc(MSG_SERVER_REGISTER, Some(edge), register_payload(edge));
         let resp = dispatch_envelope(&state, edge, doc).await;
         assert_eq!(resp["payload"]["code"], "proofRequired", "{resp}");
         assert!(
@@ -2359,7 +2386,7 @@ mod tests {
         seed_role(&state, &edge, Role::Service).await;
 
         let doc = sign(
-            request_doc(MSG_SERVER_REGISTER, Some(&edge), register_payload()),
+            request_doc(MSG_SERVER_REGISTER, Some(&edge), register_payload(&edge)),
             &edge_key,
         )
         .await;
@@ -2456,7 +2483,7 @@ mod tests {
         state.config = Arc::new(cfg);
 
         let msg = envelope(request_doc(
-            "https://trusttasks.org/spec/acl/list/0.1",
+            "https://trusttasks.org/spec/acl/list/0.3",
             Some("did:example:admin"),
             list_payload(),
         ));
@@ -2476,30 +2503,22 @@ mod tests {
 
     use crate::signing::test_util::did_key_signer;
 
-    // ── Signed REQUIRED-spec envelope dispatch (`acl/grant/0.1`) ──────
+    // ── Signed REQUIRED-spec envelope dispatch (`acl/grant/0.2`) ──────
 
-    /// Build an (unsigned) typed `acl/grant/0.1` document granting
+    /// Build an (unsigned) typed `acl/grant/0.2` document granting
     /// `subject` the `owner` role, issued by `admin_did` to this test
     /// control plane.
     fn unsigned_grant_doc(admin_did: &str, subject: &str) -> Value {
-        use trust_tasks_rs::specs::acl::grant::v0_1 as grant;
-        let entry: grant::AclEntry = grant::AclEntry::builder()
-            .subject(subject)
-            .role("owner")
-            .scopes(vec![])
-            .label(Some(
-                "signed e2e grant"
-                    .parse::<grant::AclEntryLabel>()
-                    .expect("label"),
-            ))
-            .ext(
-                serde_json::from_value::<Option<grant::Ext>>(json!({
-                    "vnd.affinidi.webvh": { "domains": { "kind": "all" } }
-                }))
-                .expect("webvh ext parses"),
-            )
-            .try_into()
-            .expect("e2e ACL entry is well formed");
+        use did_hosting_common::tasks::acl::grant::v0_2 as grant;
+        let entry: grant::AclEntry = serde_json::from_value(json!({
+            "subject": subject,
+            "role": "owner",
+            "act": { "scope": "all" },
+            "keys": { "scope": "none" },
+            "capabilities": { "scope": "ceiling" },
+            "label": "signed e2e grant"
+        }))
+        .expect("e2e ACL entry is well formed");
         let payload: grant::Payload = grant::Payload::builder()
             .entry(entry)
             .reason(Some(
@@ -2548,7 +2567,7 @@ mod tests {
     }
 
     /// The signed REQUIRED-spec dispatch the retired deferral named:
-    /// `acl/grant/0.1` (proof REQUIRED) carrying a *real* Data Integrity
+    /// `acl/grant/0.2` (proof REQUIRED) carrying a *real* Data Integrity
     /// proof, dispatched through the DIDComm envelope path under
     /// `enforce_proofs = true` and the production verifier, landing the
     /// granted entry in the ACL store.
@@ -2573,7 +2592,7 @@ mod tests {
         assert_eq!(resp_type, trust_tasks_didcomm::ENVELOPE_TYPE);
         let inner = resp_body["type"].as_str().unwrap();
         assert!(
-            inner.ends_with("/acl/grant/0.1#response"),
+            inner.ends_with("/acl/grant/0.2#response"),
             "expected grant response, got {inner}"
         );
         let stored = did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, subject)

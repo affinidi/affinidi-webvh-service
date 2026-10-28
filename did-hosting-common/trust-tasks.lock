@@ -1,0 +1,519 @@
+# Written by `trust-tasks`. Do not edit by hand.
+version = 1
+registry = "https://trusttasks.org"
+
+[[task]]
+slug = "acl/change-role"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/acl/change-role/0.2"
+digest = "sha256:51afd47c891195d46100737ef888bd8e3dbb60879494e66c663ef491aedf238e"
+
+[[task]]
+slug = "acl/grant"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/acl/grant/0.2"
+digest = "sha256:c0a13be9c8038a5507f41517f7b92ef36a83d91506c525e8f8d7b7d0123c71a6"
+
+[[task]]
+slug = "acl/list"
+version = "0.3"
+type_uri = "https://trusttasks.org/spec/acl/list/0.3"
+digest = "sha256:a356c0fe141aaee16a8a1a666b9a5e617660ecd202ab9303b2c86c51078d54d3"
+
+[[task]]
+slug = "acl/revoke"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/acl/revoke/0.2"
+digest = "sha256:e9ffa6eae34d2ce2e50c65e42598c82f0ca470ea82cdc66360d8be13dbfa9c3c"
+
+[[task]]
+slug = "acl/show"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/acl/show/0.2"
+digest = "sha256:a196fe6c58e2af8687f4ac29d7366fab2ff3aabf83cbaabd9049bc722b9542c6"
+
+[[task]]
+slug = "auth/authenticate"
+version = "0.3"
+type_uri = "https://trusttasks.org/spec/auth/authenticate/0.3"
+digest = "sha256:9c7ed14b7271b786f7e4fcd9296710d5684c79ad868830bba3482c1440a6a667"
+
+[[task]]
+slug = "auth/challenge"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/auth/challenge/0.1"
+digest = "sha256:ff8c391590c7707af8ea160c33c8ef23eba0d54537b5f65429844a72ae5c29f6"
+
+[[task]]
+slug = "auth/oob/cancel"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/auth/oob/cancel/0.1"
+digest = "sha256:7a3339a2f5d5ca8e09d1235eeebe9309b0796f6ddd9b18cf018a2c753065fa71"
+
+[[task]]
+slug = "auth/oob/claim"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/auth/oob/claim/0.2"
+digest = "sha256:ae471bc35e6bf74a2d20a1dab1d1c9147c6d4b26ea42256e8c65761bf1933769"
+
+[[task]]
+slug = "auth/oob/grant"
+version = "0.3"
+type_uri = "https://trusttasks.org/spec/auth/oob/grant/0.3"
+digest = "sha256:2b42976a728fee0f84824d749ee15ae65854777ced09dfad858059181f4a9e6e"
+
+[[task]]
+slug = "auth/oob/identify"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/auth/oob/identify/0.1"
+digest = "sha256:07bd98d0bd9129ee2b09a429e2adf1042093a245b8b1de2f5f24ff74c25c7e39"
+
+[[task]]
+slug = "auth/oob/prove"
+version = "0.3"
+type_uri = "https://trusttasks.org/spec/auth/oob/prove/0.3"
+digest = "sha256:e32c7daf9e712a13ba49d0bdaee7125167c2d6412bad244aaceef1998278e934"
+
+[[task]]
+slug = "auth/oob/redeem"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/auth/oob/redeem/0.2"
+digest = "sha256:5705e149f7e659dcfb576f7bee7c8944b2c534244bfba53877029fd44d160904"
+
+[[task]]
+slug = "auth/oob/request"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/auth/oob/request/0.2"
+digest = "sha256:157bd78ed5d81485cca0a514db79e247d5cebf71f8e9f277d5179460fa3bc1c1"
+
+[[task]]
+slug = "auth/oob/respond"
+version = "0.3"
+type_uri = "https://trusttasks.org/spec/auth/oob/respond/0.3"
+digest = "sha256:c42014166dc5cf15f7889262b0460643847d907786b34230fa10aa865f7c247a"
+
+[[task]]
+slug = "auth/passkey/admin-list"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/auth/passkey/admin-list/0.1"
+digest = "sha256:cfe1a5d5004bfd01fc77de2cf23c072d68cace52f6f6ae9bd550faf489f21510"
+
+[[task]]
+slug = "auth/passkey/enroll/finish"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/auth/passkey/enroll/finish/0.2"
+digest = "sha256:dba82f315f53b4c4f29b417586214028a8fc914e4b237bf059ee35ab4a87d3a8"
+
+[[task]]
+slug = "auth/passkey/enroll/invite"
+version = "0.3"
+type_uri = "https://trusttasks.org/spec/auth/passkey/enroll/invite/0.3"
+digest = "sha256:ceeeb44b0df970a96f2c48f16c448d5acd34e4d46e082e76934ee95e5baa4d4c"
+
+[[task]]
+slug = "auth/passkey/enroll/invite/list"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/auth/passkey/enroll/invite/list/0.1"
+digest = "sha256:109445f9475372aafa5b9deb0a32d0e99267108a389cf2f76162e45af7eb1215"
+
+[[task]]
+slug = "auth/passkey/enroll/invite/revoke"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/auth/passkey/enroll/invite/revoke/0.1"
+digest = "sha256:7afb1d83b5d1be6caf8ef3e2aee52487de68668cb4ed5d9665b7116a5fb61f85"
+
+[[task]]
+slug = "auth/passkey/enroll/invite/update"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/auth/passkey/enroll/invite/update/0.1"
+digest = "sha256:c45f3cbae92b3c87c6355793a61da3e5ad7fc64f2deffee4ca9c7d5b1c3f4d29"
+
+[[task]]
+slug = "auth/passkey/enroll/redeem/finish"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/auth/passkey/enroll/redeem/finish/0.1"
+digest = "sha256:1a174c1e8b05e145ecf82166e28d695da9a434be0faf5c42b074ca69f6ff2271"
+
+[[task]]
+slug = "auth/passkey/enroll/redeem/start"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/auth/passkey/enroll/redeem/start/0.1"
+digest = "sha256:0e8fbd7331aaf44b786465400b1bcba34a33ac634c0143f44b0a1091ac6609f1"
+
+[[task]]
+slug = "auth/passkey/enroll/start"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/auth/passkey/enroll/start/0.2"
+digest = "sha256:36758fe9c40fbdb546aeba0d00b1897f7eeacd3089d0476d3bd4e1882c751c26"
+
+[[task]]
+slug = "auth/passkey/list"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/auth/passkey/list/0.1"
+digest = "sha256:ece1af814c8204a1869cbbd3f4f8e592c3782f44dedbf86139f1770732e3cbf3"
+
+[[task]]
+slug = "auth/passkey/login/finish"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/auth/passkey/login/finish/0.2"
+digest = "sha256:0815ad8dacda6c33938d58f6dfd23f8b7c91fbc2857427d2c74d5d5de41a155f"
+
+[[task]]
+slug = "auth/passkey/login/start"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/auth/passkey/login/start/0.2"
+digest = "sha256:fc930b698112405938fcbca4d2123c7e73c24abbe6a01e59cfe294b7588451f0"
+
+[[task]]
+slug = "auth/passkey/revoke/finish"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/auth/passkey/revoke/finish/0.2"
+digest = "sha256:25ecbf844531f9338731db4932d6b22edc68073980a9199fe362b809d4e3ac44"
+
+[[task]]
+slug = "auth/passkey/revoke/start"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/auth/passkey/revoke/start/0.2"
+digest = "sha256:c9f6ec9169dcda56ebb36a5654b382ccd2f4b6115fb352d03303b8900b3fbba4"
+
+[[task]]
+slug = "auth/refresh"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/auth/refresh/0.2"
+digest = "sha256:c59ee32c9569bae2e6e4069ee79e6bcf984def22587e7b626db8d2ba67eb93d8"
+
+[[task]]
+slug = "auth/revoke-session"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/auth/revoke-session/0.2"
+digest = "sha256:75f81da85bf6160b4d377a28f69afd51e3efed6f1d6f42aaf7574c5ce0f1a677"
+
+[[task]]
+slug = "auth/step-up/approve-request"
+version = "0.5"
+type_uri = "https://trusttasks.org/spec/auth/step-up/approve-request/0.5"
+digest = "sha256:708ba6e7447f9d62556f59019bd4da90ae73f5fe1b2a5b339b7f5665ec53811e"
+
+[[task]]
+slug = "auth/step-up/approve-response"
+version = "0.6"
+type_uri = "https://trusttasks.org/spec/auth/step-up/approve-response/0.6"
+digest = "sha256:bc641e92ffcd694d3ddf40ca01687f99fce4aeb3c8f818e009bfe7d422099b39"
+
+[[task]]
+slug = "auth/step-up/start"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/auth/step-up/start/0.2"
+digest = "sha256:e9bf641a76dc03e3e3dbb641b8efe31748979fd7a23bc3ec9fd34d90f5c091c9"
+
+[[task]]
+slug = "auth/whoami"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/auth/whoami/0.1"
+digest = "sha256:ad4f4385fe1abad5a8aaddc626e6ed001b86567f9510fdf95dd33371a1fd9866"
+
+[[task]]
+slug = "did-management/agent-name/check"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/agent-name/check/0.1"
+digest = "sha256:8517a9f662f18a39ea34c7b6db95ef25444b96645a1ac36e5c107799f946acfc"
+
+[[task]]
+slug = "did-management/agent-name/list"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/agent-name/list/0.1"
+digest = "sha256:eef51d1fa4262a1fe74a1e03be9203fede546511b68e3a251f0a7a53bb5ab872"
+
+[[task]]
+slug = "did-management/agent-name/remove"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/agent-name/remove/0.1"
+digest = "sha256:25f24193302917b1f1659055e54e22d6ea7555efae11ed9baaec71f1fd15fa4c"
+
+[[task]]
+slug = "did-management/agent-name/resolve"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/agent-name/resolve/0.1"
+digest = "sha256:7f9bade6be802070f7a4000462321a51eda2c6082f09acd4e7982fdc575dafad"
+
+[[task]]
+slug = "did-management/agent-name/update"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/agent-name/update/0.1"
+digest = "sha256:48a39488342b25aed098021801fe365a911ef146d50136da73f74ca4270e3dcb"
+
+[[task]]
+slug = "did-management/did/change-owner"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/did/change-owner/0.1"
+digest = "sha256:573ec8a20d54e018221dd25a90c6ca1fc2f7aa2c8cb689a48886ddc254e518cd"
+
+[[task]]
+slug = "did-management/did/check-name"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/did/check-name/0.1"
+digest = "sha256:b86149ad4b0fb6b4a54b60321f1b1a965668f45331998b0872051e6736d13d34"
+
+[[task]]
+slug = "did-management/did/delete"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/did/delete/0.1"
+digest = "sha256:728ac01a054d0b81a1b7efa5c84ed788861cee0b047f20e3e1664edb368b287c"
+
+[[task]]
+slug = "did-management/did/info"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/did/info/0.1"
+digest = "sha256:83044f5e8ed95ff7d0761a99a48af89312453dbf3a720090ecc7c48ceb931c5b"
+
+[[task]]
+slug = "did-management/did/list"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/did-management/did/list/0.2"
+digest = "sha256:c1cfd42f2efa3b4f91fc72cfa1d7137464b1a2f8defce8cd4589e3a065bd3fd4"
+
+[[task]]
+slug = "did-management/did/log"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/did/log/0.1"
+digest = "sha256:222147d0ade4c708e9583d9941a413d34e0f2c2641386b2ed0a3572fc32dcea1"
+
+[[task]]
+slug = "did-management/did/register"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/did/register/0.1"
+digest = "sha256:032a79608d45df4e243b55ddf58ffc393d17eeab84972ee4a0dcf3b612b44d53"
+
+[[task]]
+slug = "did-management/did/rollback"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/did/rollback/0.1"
+digest = "sha256:80c189677631708acdaa1d60edaec796102142b609d45b41e127602c11081947"
+
+[[task]]
+slug = "did-management/did/set-state"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/did/set-state/0.1"
+digest = "sha256:314b3955ccb7dd498f457c3e16278480f61e23d43853a4cedea608d39d616b1f"
+
+[[task]]
+slug = "did-management/domain/assign"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/domain/assign/0.1"
+digest = "sha256:d13316db16d85f895d88722b2f11c1e1b0e0dc04f3ab78b05a77472bf47126ed"
+
+[[task]]
+slug = "did-management/domain/create"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/domain/create/0.1"
+digest = "sha256:ee9dd0d816f7ea47217e6abaa40e6357b803a03182af64037585dc74ba7f73e8"
+
+[[task]]
+slug = "did-management/domain/list"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/domain/list/0.1"
+digest = "sha256:024a642a17718c331e2be7459e21ced70fb177bd1599ff6da7a14f2836615dad"
+
+[[task]]
+slug = "did-management/domain/purge"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/domain/purge/0.1"
+digest = "sha256:64306a5300775ba435486ad73d6084bedbd8576b53693feb1b49ab54b599c7fd"
+
+[[task]]
+slug = "did-management/domain/set-default"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/domain/set-default/0.1"
+digest = "sha256:80a70f7efdbca849f59050aece6a83073c0548bf15a200abd20bd1d50f31fb28"
+
+[[task]]
+slug = "did-management/domain/set-state"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/domain/set-state/0.1"
+digest = "sha256:5583059c00d0be08a8229d177103c86abca88fafcaf88efb2928159a58c47a70"
+
+[[task]]
+slug = "did-management/domain/unassign"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/domain/unassign/0.1"
+digest = "sha256:7cbc6f56c812e3d781a0469bb273741850adef496994aef0d2f504b6a7eab9a2"
+
+[[task]]
+slug = "did-management/domain/update"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/domain/update/0.1"
+digest = "sha256:337c2b5d6461f4b2b4c649fa5840f06ecbec42161e9022b024c73c452eb17a43"
+
+[[task]]
+slug = "did-management/identity/list"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/identity/list/0.1"
+digest = "sha256:26af07e89555d9544bbd1cbd2deef9951ae89d31d879ef5f2b618c6b5fda0adf"
+
+[[task]]
+slug = "did-management/identity/retire"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/identity/retire/0.1"
+digest = "sha256:f6c607ccf368c5c7611a69b98d25de2b69e02180be36a390dffebd7388ea3a93"
+
+[[task]]
+slug = "did-management/me/domains"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/me/domains/0.1"
+digest = "sha256:513fbd7d6968765415c5bb49161fffb202496a0ceb748f38eba50c3758901d69"
+
+[[task]]
+slug = "did-management/registry/admin-register"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/did-management/registry/admin-register/0.2"
+digest = "sha256:904ae5ea22ab23b148dd3a53b413ac5174570091b336d1be7ea9e79d4f0af540"
+
+[[task]]
+slug = "did-management/registry/check"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/did-management/registry/check/0.2"
+digest = "sha256:3a6848f64d61f08fa44017fa97dabcc6f32567217fcc7727302c27a0ac5b1a6b"
+
+[[task]]
+slug = "did-management/registry/deregister"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/registry/deregister/0.1"
+digest = "sha256:13e3d5ef38b3b1bf766feae04c98a6e2e7c4d1e0e77eb697b047f46e556f1e52"
+
+[[task]]
+slug = "did-management/registry/get"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/did-management/registry/get/0.2"
+digest = "sha256:18ad55edfea31423e314f448b38e5e8a59c5772133f5f79883211a49ac61da07"
+
+[[task]]
+slug = "did-management/registry/list"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/did-management/registry/list/0.2"
+digest = "sha256:9caabcf8c516fe57208e5fceb8e3c73a6cff10a6bd88761583b44b3c93a11c8c"
+
+[[task]]
+slug = "did-management/registry/purge-domain"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/registry/purge-domain/0.1"
+digest = "sha256:a4603ef273ada4465962cc9023ed57d5ebef2c662b48bb9d00a597f6bcd0e39f"
+
+[[task]]
+slug = "did-management/replica/domain/assign"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/replica/domain/assign/0.1"
+digest = "sha256:b2ce736bc22b5378948239b47e5e46ac551bd321db3d552771cd415836ea1659"
+
+[[task]]
+slug = "did-management/replica/domain/purge"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/replica/domain/purge/0.1"
+digest = "sha256:8a649c3b59ed03731a0947a5d93dc06f9d5661662db158a2d452135c062b6c4e"
+
+[[task]]
+slug = "did-management/replica/domain/unassign"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/replica/domain/unassign/0.1"
+digest = "sha256:a96a6941980e28d0bea8ab04c7a31293d8f5eff9c084ecfa41764401ca0eb40e"
+
+[[task]]
+slug = "did-management/replica/domain/upsert"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/replica/domain/upsert/0.1"
+digest = "sha256:57c8e292cecf7224bdf8ff0bc7883d8ea7f1aef08d8cabe5c94b8fe2524668e9"
+
+[[task]]
+slug = "did-management/server/config"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/server/config/0.1"
+digest = "sha256:b42c8ca19006b41464e8c5a19ee3848ffc78cd3331e894c37432e14c3359004f"
+
+[[task]]
+slug = "did-management/server/health"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/server/health/0.1"
+digest = "sha256:e395b918740726ac137da10c70980c4902f9203e24d99e6445a9158d874f8cd9"
+
+[[task]]
+slug = "did-management/server/info"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/server/info/0.1"
+digest = "sha256:441c845ec34d586b9495cb9e8cdd65011cbaa7d0aa98daf454dc296d4bb58f99"
+
+[[task]]
+slug = "did-management/server/metrics"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/server/metrics/0.1"
+digest = "sha256:3f9fef15ffe2c6ec124b51f87833005600853d3934f6fb8022dbb7025a853af5"
+
+[[task]]
+slug = "did-management/server/register"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/did-management/server/register/0.2"
+digest = "sha256:371c3f17911d506ff0cae155927a30d91c919fc5550c88953a453f4ecea9692e"
+
+[[task]]
+slug = "did-management/server/stats-sync"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/server/stats-sync/0.1"
+digest = "sha256:0f165d0d84a885deb9ac97d10fd6f39292cb5b49386b99ce5992d98263f18d67"
+
+[[task]]
+slug = "did-management/stats/get"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/stats/get/0.1"
+digest = "sha256:4d0549a19d2a0c21ab5157e41320b522b817d027bd80a3994367c8e16b05e22a"
+
+[[task]]
+slug = "did-management/stats/timeseries"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/did-management/stats/timeseries/0.2"
+digest = "sha256:483b44cdc2a418c947c46d716a95b95588b079244dfb55b2150c269c50c03cab"
+
+[[task]]
+slug = "webvh/sync/batch"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/webvh/sync/batch/0.1"
+digest = "sha256:98315d10ef8431ebd71296117b5809a568556c04a662e53c647791393ee16e1a"
+
+[[task]]
+slug = "webvh/sync/delete"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/webvh/sync/delete/0.2"
+digest = "sha256:53095e22133d140415c5d7173b3b21165b77866288b58a70e5f02ebf1e26b74b"
+
+[[task]]
+slug = "webvh/sync/update"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/webvh/sync/update/0.2"
+digest = "sha256:e185b6d12c11fd8289fb494ce1d3d6c37ba246363ff08a5ff67f36da3ee16f1a"
+
+[[task]]
+slug = "webvh/witness/key/create"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/webvh/witness/key/create/0.1"
+digest = "sha256:4da22bcc2d1384a929714bbf06d0013bb77dc2ea2ad0ae0a6dda95f1c2a30e17"
+
+[[task]]
+slug = "webvh/witness/key/delete"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/webvh/witness/key/delete/0.1"
+digest = "sha256:9fce48b0085a5bc2bae73c05258aad51b64b04bea68cdb814a0d9e387938e6b3"
+
+[[task]]
+slug = "webvh/witness/key/list"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/webvh/witness/key/list/0.1"
+digest = "sha256:0cf272b4bfd8bcdbc3d7541b2fbeabf95c648193d6f1ea87e88b15aa267f4ed0"
+
+[[task]]
+slug = "webvh/witness/publish"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/webvh/witness/publish/0.1"
+digest = "sha256:a65969b47253373149319c1407890ff26944ab80f44b7b12d4a1900c84195cca"
+
+[[task]]
+slug = "webvh/witness/sign"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/webvh/witness/sign/0.1"
+digest = "sha256:186cca1bc9720b3d39d2110b5aab0accceaa1638916c451e62e107c919b74515"

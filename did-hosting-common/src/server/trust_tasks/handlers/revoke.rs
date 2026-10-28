@@ -1,58 +1,53 @@
-//! `acl/revoke/0.1` handler — record the removal of a subject (or the
-//! reduction of their scopes).
+//! `acl/revoke/0.2` handler — remove a subject's entry, or narrow its act
+//! scope.
 //!
-//! Spec contract (from `specs/acl/revoke/0.1/spec.md`):
+//! Spec contract (`specs/acl/revoke/0.2/spec.md`, consumer items):
 //!
-//! * **Full removal** — `payload.scopes` absent; entire entry deleted.
-//! * **Scope reduction** — `payload.scopes` present; named scopes
-//!   removed from the entry. The webvh maintainer interprets each
-//!   `scopes` item with a `domain:` prefix as a domain-scope item;
-//!   items without that prefix are rejected as `malformed_request`
-//!   because this maintainer has no other opaque scope vocabulary.
-//! * **Self-revocation** — `issuer == payload.subject`; permitted
-//!   subject to the [`reject_last_authority`] guard.
-//! * **`acl/revoke:subject_not_present`** when the subject is absent.
-//! * **`acl/revoke:last_authority_protected`** when the revocation
-//!   would empty the privileged-role (Admin) set.
+//! * What is revoked is stated in `payload.revocation`:
+//!   `{"kind": "entry"}` removes the entry; `{"kind": "act", "act": …}`
+//!   narrows its act scope to the stated result.
+//! * **Self-revocation** — `issuer == payload.subject` — is permitted;
+//!   otherwise only an `Admin` may revoke.
+//! * `subjectNotPresent` when the subject has no entry.
+//! * A narrowing that is not strictly narrower than the stored act scope is
+//!   `notNarrowing`; one this maintainer cannot hold is `invalidActScope`.
+//! * `lastAuthorityProtected` when a removal would leave no `Admin`.
+//! * The revocation applies at the subject's next authorization decision:
+//!   every request reads the ACL afresh.
 //!
-//! ## Translating `scopes` → `DomainScope` reduction
+//! ## Narrowing an act scope
 //!
-//! Each `payload.scopes` item is parsed as `domain:<name>`. The set is
-//! subtracted from the entry's [`DomainScope::Allowed`] or
-//! [`DomainScope::AllowedWithDefault`] list. Three cases:
-//!
-//! 1. Scope set becomes empty → the entry is **fully removed** (the
-//!    response carries `entry: null`).
-//! 2. The `default` of an `AllowedWithDefault` is in the removed set →
-//!    the entry is demoted to plain `Allowed { remaining }`.
-//! 3. Otherwise → the entry's scope is reduced in place.
-//!
-//! Scope-reducing an `All`-scoped entry is malformed (no list to
-//! subtract from); the producer must grant a narrower scope first.
+//! An entry's act scope is its domains (see [`super::super::entry`]).
+//! Narrowing an `Owner` (or `MetricsReader`) from `all` or from a list of
+//! domains to a strict subset of them — or to `none` — rewrites its
+//! [`DomainScope`]; a default domain survives only while it is still one of
+//! the entry's domains. `Admin` and `Service` act on every domain whatever
+//! their entry says, so their act scope cannot be narrowed at all.
 
 use serde_json::json;
 use trust_tasks_rs::{
-    ErrorPayload, ErrorResponse, Payload, ProofPolicy, ProofVerifier, ResolvedParties,
-    StandardCode, TransportHandler, TrustTask, guards::acl::reject_last_authority,
-    specs::acl::revoke::v0_1 as revoke,
+    ErrorPayload, ErrorResponse, ProofPolicy, ProofVerifier, ResolvedParties, StandardCode,
+    TransportHandler, TrustTask, guards::acl::reject_last_authority,
 };
 
 use crate::server::acl::{self, AclEntry, Role};
 use crate::server::domain::DomainScope;
-use crate::server::trust_tasks::{
-    DispatchOutcome, TrustTaskContext, entry::SpecAclEntry, reject_with, run_pipeline,
+use crate::server::trust_tasks::entry::{
+    AuthorityScope, SpecAclEntry, act_covers, act_of, check_authority_scope, domains_for_act,
+    role_is_domain_scoped,
 };
+use crate::server::trust_tasks::{DispatchOutcome, TrustTaskContext, reject_with, run_pipeline};
+use crate::tasks::acl::revoke::v0_2 as revoke;
 
-const SCOPE_DOMAIN_PREFIX: &str = "domain:";
-
-/// Spec-extended error codes published in the `acl/revoke/0.1` front
-/// matter. Minted via [`Payload::extended_code`] so the slug is sourced
-/// from `TYPE_URI` and can't drift.
-const ERR_SUBJECT_NOT_PRESENT: &str = "subject_not_present";
-const ERR_LAST_AUTHORITY: &str = "last_authority_protected";
+/// What `payload.revocation` asks for.
+#[derive(Debug)]
+enum Revocation {
+    Entry,
+    NarrowAct(AuthorityScope),
+}
 
 /// Run the framework pipeline + business logic for an inbound
-/// `acl/revoke/0.1` request.
+/// `acl/revoke/0.2` request.
 pub async fn handle<V>(
     ctx: &TrustTaskContext<'_>,
     transport: &(impl TransportHandler + Sync),
@@ -64,6 +59,7 @@ where
 {
     let acl_ks = ctx.acl_ks.clone();
     let acl_locks = ctx.acl_locks.clone();
+    let signing_oracle = ctx.signing_oracle;
     run_pipeline(
         transport,
         policy,
@@ -79,7 +75,7 @@ where
             let _guard = acl_locks
                 .guard(crate::server::trust_tasks::ACL_WRITE_LOCK_KEY)
                 .await;
-            handle_inner(&acl_ks, doc, &parties).await
+            handle_inner(&acl_ks, doc, &parties, signing_oracle).await
         },
     )
     .await
@@ -89,8 +85,9 @@ async fn handle_inner(
     acl_ks: &crate::server::store::KeyspaceHandle,
     doc: TrustTask<revoke::Payload>,
     parties: &ResolvedParties,
+    signing_oracle: bool,
 ) -> Result<TrustTask<revoke::Response>, ErrorResponse> {
-    let subject = doc.payload.subject.clone();
+    let subject: String = (*doc.payload.subject).clone();
     let caller = parties.issuer.as_deref().ok_or_else(|| {
         reject_with(
             &doc,
@@ -121,6 +118,13 @@ async fn handle_inner(
         }
     }
 
+    let revocation = parse_revocation(&doc.payload.revocation).map_err(|msg| {
+        reject_with(
+            &doc,
+            ErrorPayload::new(StandardCode::MalformedRequest).with_message(msg),
+        )
+    })?;
+
     // Look up the target subject.
     let existing = acl::get_acl_entry(acl_ks, &subject)
         .await
@@ -130,94 +134,63 @@ async fn handle_inner(
         None => {
             return Err(reject_with(
                 &doc,
-                ErrorPayload::new(extended_code(ERR_SUBJECT_NOT_PRESENT))
-                    .with_message(format!("subject {subject} is not in the maintainer's ACL",)),
+                ErrorPayload::from(revoke::error_codes::SUBJECT_NOT_PRESENT)
+                    .with_message(format!("subject {subject} is not in the maintainer's ACL")),
             ));
         }
     };
 
-    let response_entry = if doc.payload.scopes.is_empty() {
-        // Full removal — first run the last-authority guard.
-        let all_entries = acl::list_acl_entries(acl_ks)
-            .await
-            .map_err(|e| internal(&doc, e))?;
-        if let Some(code) = reject_last_authority(
-            all_entries.iter(),
-            |e: &&AclEntry| matches!(e.role, Role::Admin),
-            |e: &&AclEntry| e.did == subject,
-        ) {
-            debug_assert_eq!(
-                code, "acl/revoke:last_authority_protected",
-                "guard returned unexpected code"
-            );
-            let remaining_admins: Vec<String> = all_entries
-                .iter()
-                .filter(|e| matches!(e.role, Role::Admin) && e.did != subject)
-                .map(|e| e.did.clone())
-                .collect();
-            return Err(reject_with(
-                &doc,
-                ErrorPayload::new(extended_code(ERR_LAST_AUTHORITY))
-                    .with_message(
-                        "this revocation would leave the maintainer with no Admin entries",
-                    )
-                    .with_details(json!({
-                        "protectedRole": "admin",
-                        "remainingHolders": remaining_admins,
-                    })),
-            ));
-        }
-
-        acl::delete_acl_entry(acl_ks, &subject)
-            .await
-            .map_err(|e| internal(&doc, e))?;
-        None
-    } else {
-        // Scope reduction — interpret the wire scopes as `domain:<name>`.
-        let scope_items: Vec<String> = doc.payload.scopes.iter().map(|s| (**s).clone()).collect();
-        let domains_to_remove = parse_domain_scopes(&scope_items).map_err(|msg| {
-            reject_with(
-                &doc,
-                ErrorPayload::new(StandardCode::MalformedRequest).with_message(msg),
+    let response_entry = match revocation {
+        Revocation::Entry => {
+            // Full removal — first run the last-authority guard.
+            let all_entries = acl::list_acl_entries(acl_ks)
+                .await
+                .map_err(|e| internal(&doc, e))?;
+            if reject_last_authority(
+                all_entries.iter(),
+                |e: &&AclEntry| matches!(e.role, Role::Admin),
+                |e: &&AclEntry| e.did == subject,
             )
-        })?;
-
-        match apply_scope_reduction(&existing.domains, &domains_to_remove) {
-            ScopeReduction::EntryRemoved => {
-                acl::delete_acl_entry(acl_ks, &subject)
-                    .await
-                    .map_err(|e| internal(&doc, e))?;
-                None
-            }
-            ScopeReduction::Narrowed(new_scope) => {
-                let mut updated = existing;
-                updated.domains = new_scope;
-                acl::store_acl_entry(acl_ks, &updated)
-                    .await
-                    .map_err(|e| internal(&doc, e))?;
-                Some(updated)
-            }
-            ScopeReduction::NoOp => {
-                // Removing zero matching scopes is idempotent — keep
-                // the existing entry unchanged.
-                Some(existing)
-            }
-            ScopeReduction::ScopeReduceOnAll => {
+            .is_some()
+            {
+                let remaining_admins: Vec<String> = all_entries
+                    .iter()
+                    .filter(|e| matches!(e.role, Role::Admin) && e.did != subject)
+                    .map(|e| e.did.clone())
+                    .collect();
                 return Err(reject_with(
                     &doc,
-                    ErrorPayload::new(StandardCode::MalformedRequest).with_message(
-                        "cannot scope-reduce an entry whose domain scope is `all`; grant a \
-                         narrower scope first",
-                    ),
+                    ErrorPayload::from(revoke::error_codes::LAST_AUTHORITY_PROTECTED)
+                        .with_message(
+                            "this revocation would leave the maintainer with no Admin entries",
+                        )
+                        .with_details(json!({
+                            "protectedRole": "admin",
+                            "remainingHolders": remaining_admins,
+                        })),
                 ));
             }
+
+            acl::delete_acl_entry(acl_ks, &subject)
+                .await
+                .map_err(|e| internal(&doc, e))?;
+            None
+        }
+        Revocation::NarrowAct(target) => {
+            let narrowed =
+                narrow_act(&existing, &target).map_err(|refusal| reject_with(&doc, refusal))?;
+            acl::store_acl_entry(acl_ks, &narrowed)
+                .await
+                .map_err(|e| internal(&doc, e))?;
+            Some(narrowed)
         }
     };
 
-    let resp_entry = response_entry.as_ref().map(into_spec_entry);
-    // The generated payload types are `#[non_exhaustive]` from trust-tasks
-    // 0.17 on: built through the generated builder, whose `try_into` can only
-    // fail on a field left unset.
+    let resp_entry = response_entry
+        .as_ref()
+        .map(|e| SpecAclEntry::from_local(e, signing_oracle).into_spec::<revoke::AclEntry>());
+    // The generated payload types are `#[non_exhaustive]`: built through the
+    // generated builder, whose `try_into` can only fail on a field left unset.
     let resp_payload: revoke::Response = revoke::Response::builder()
         .entry(resp_entry)
         .try_into()
@@ -226,88 +199,69 @@ async fn handle_inner(
     Ok(doc.respond_with(resp_id, resp_payload))
 }
 
-/// Parse the wire-form `scopes` array (e.g. `["domain:a.example",
-/// "domain:b.example"]`) into bare domain names. Any item without the
-/// `domain:` prefix is rejected; this maintainer has no other opaque
-/// scope vocabulary.
-fn parse_domain_scopes(items: &[String]) -> Result<Vec<String>, String> {
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        match item.strip_prefix(SCOPE_DOMAIN_PREFIX) {
-            Some(name) if !name.is_empty() => out.push(name.to_string()),
-            _ => {
-                return Err(format!(
-                    "scope item {item:?} is not understood by this maintainer; supported form is \
-                     `domain:<name>`",
-                ));
-            }
-        }
-    }
-    Ok(out)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum ScopeReduction {
-    /// The reduction removed every remaining domain — entry should be
-    /// fully removed.
-    EntryRemoved,
-    /// The reduction succeeded; the new domain scope is enclosed.
-    Narrowed(DomainScope),
-    /// None of the requested scopes were present on the entry — the
-    /// reduction is a no-op.
-    NoOp,
-    /// The entry's scope is `All`; scope-reduction is not meaningful.
-    ScopeReduceOnAll,
-}
-
-/// Apply a set of domain removals to a [`DomainScope`].
-fn apply_scope_reduction(current: &DomainScope, remove: &[String]) -> ScopeReduction {
-    let remove_set: std::collections::HashSet<&str> = remove.iter().map(String::as_str).collect();
-    match current {
-        DomainScope::All => ScopeReduction::ScopeReduceOnAll,
-        DomainScope::Allowed { domains } => {
-            let (kept, dropped): (Vec<String>, Vec<String>) = domains
-                .iter()
+/// Read `payload.revocation` by its `kind`. Read from the JSON rather than
+/// the generated untagged enum, whose `kind` members are untyped.
+fn parse_revocation(revocation: &revoke::Revocation) -> Result<Revocation, String> {
+    let value = serde_json::to_value(revocation).map_err(|e| format!("revocation: {e}"))?;
+    match value.get("kind").and_then(serde_json::Value::as_str) {
+        Some("entry") => Ok(Revocation::Entry),
+        Some("act") => {
+            let act = value
+                .get("act")
                 .cloned()
-                .partition(|d| !remove_set.contains(d.as_str()));
-            if dropped.is_empty() {
-                ScopeReduction::NoOp
-            } else if kept.is_empty() {
-                ScopeReduction::EntryRemoved
-            } else {
-                ScopeReduction::Narrowed(DomainScope::Allowed { domains: kept })
-            }
+                .ok_or("`revocation.act` is required for kind `act`")?;
+            let act: AuthorityScope = serde_json::from_value(act)
+                .map_err(|e| format!("`revocation.act` is not an act scope: {e}"))?;
+            check_authority_scope(&act, "revocation.act").map_err(|e| e.to_string())?;
+            Ok(Revocation::NarrowAct(act))
         }
-        DomainScope::AllowedWithDefault { domains, default } => {
-            let (kept, dropped): (Vec<String>, Vec<String>) = domains
-                .iter()
-                .cloned()
-                .partition(|d| !remove_set.contains(d.as_str()));
-            if dropped.is_empty() {
-                ScopeReduction::NoOp
-            } else if kept.is_empty() {
-                ScopeReduction::EntryRemoved
-            } else if kept.contains(default) {
-                ScopeReduction::Narrowed(DomainScope::AllowedWithDefault {
-                    domains: kept,
-                    default: default.clone(),
-                })
-            } else {
-                // The default was removed — demote to plain Allowed.
-                ScopeReduction::Narrowed(DomainScope::Allowed { domains: kept })
-            }
-        }
+        _ => Err("`revocation.kind` must be `entry` or `act`".into()),
     }
 }
 
-fn into_spec_entry(local: &AclEntry) -> revoke::AclEntry {
-    let neutral = SpecAclEntry::from_local(local);
-    let value = serde_json::to_value(&neutral).expect("SpecAclEntry serialises");
-    serde_json::from_value(value).expect("revoke::AclEntry from SpecAclEntry value")
+/// The entry `existing` becomes when its act scope is narrowed to `target`,
+/// or the refusal `acl/revoke/0.2` declares.
+fn narrow_act(existing: &AclEntry, target: &AuthorityScope) -> Result<AclEntry, ErrorPayload> {
+    let current = act_of(existing);
+    if !role_is_domain_scoped(&existing.role) {
+        // Admin and Service act everywhere; there is no narrower scope this
+        // maintainer can hold for them.
+        if *target == AuthorityScope::All {
+            return Err(not_narrowing(&current));
+        }
+        return Err(ErrorPayload::from(revoke::error_codes::INVALID_ACT_SCOPE)
+            .with_message(format!(
+                "a {} entry acts on every domain; its act scope cannot be narrowed — change \
+                 its role or remove it",
+                existing.role
+            ))
+            .with_details(json!({ "offendingContexts": offending_contexts(target) })));
+    }
+    // Strictly narrower: covered by the current scope, and not equal to it.
+    if !act_covers(&current, target) || act_covers(target, &current) {
+        return Err(not_narrowing(&current));
+    }
+    let default = match &existing.domains {
+        DomainScope::AllowedWithDefault { default, .. } => Some(default.as_str()),
+        _ => None,
+    };
+    let mut narrowed = existing.clone();
+    narrowed.domains = domains_for_act(target, default);
+    Ok(narrowed)
 }
 
-fn extended_code(local: &str) -> trust_tasks_rs::TrustTaskCode {
-    revoke::Payload::extended_code(local.to_string())
+fn not_narrowing(current: &AuthorityScope) -> ErrorPayload {
+    ErrorPayload::from(revoke::error_codes::NOT_NARROWING).with_message(format!(
+        "the stated act scope is not strictly narrower than the entry's current one ({})",
+        serde_json::to_string(current).expect("AuthorityScope serialises")
+    ))
+}
+
+fn offending_contexts(scope: &AuthorityScope) -> Vec<String> {
+    match scope {
+        AuthorityScope::Contexts { contexts } => contexts.clone(),
+        AuthorityScope::All | AuthorityScope::None => Vec::new(),
+    }
 }
 
 fn internal<P>(doc: &TrustTask<P>, err: impl std::fmt::Display) -> ErrorResponse {
@@ -327,7 +281,6 @@ mod tests {
     use crate::server::config::StoreConfig;
     use crate::server::store::{KS_ACL, Store};
     use crate::server::trust_tasks::TrustTaskContext;
-    use crate::server::trust_tasks::ext::WEBVH_EXT_KEY;
 
     const SERVICE_DID: &str = "did:web:maintainer.example";
     const ADMIN_DID: &str = "did:web:admin.example";
@@ -346,7 +299,7 @@ mod tests {
         }
     }
 
-    /// Default test policy: `AcceptUnverified`. `acl/revoke/0.1` is
+    /// Default test policy: `AcceptUnverified`. `acl/revoke/0.2` is
     /// REQUIRED — every test request carries a stub proof for the
     /// IS_PROOF_REQUIRED gate, and AcceptUnverified lets the framework
     /// pipeline reach the handler.
@@ -404,6 +357,7 @@ mod tests {
             acl_ks,
             acl_locks,
             my_vid: SERVICE_DID,
+            signing_oracle: false,
         }
     }
 
@@ -413,31 +367,39 @@ mod tests {
             .with_peer(peer.to_string())
     }
 
+    /// A removal (`act: None`) or a narrowing to `act`.
     fn revoke_request(
         issuer_did: &str,
         subject: &str,
-        scopes: &[&str],
+        act: Option<serde_json::Value>,
     ) -> TrustTask<revoke::Payload> {
-        let scopes: Vec<revoke::PayloadScopesItem> = scopes
-            .iter()
-            .map(|s| (*s).to_string().try_into().expect("scope item parses"))
-            .collect();
-        let payload: revoke::Payload = revoke::Payload::builder()
-            .reason(Some(
-                "integration test"
-                    .parse::<revoke::PayloadReason>()
-                    .expect("reason"),
-            ))
-            .scopes(scopes)
-            .subject(subject)
-            .try_into()
-            .expect("test revoke payload is well formed");
+        let revocation = match act {
+            None => serde_json::json!({ "kind": "entry" }),
+            Some(act) => serde_json::json!({ "kind": "act", "act": act }),
+        };
+        let payload: revoke::Payload = serde_json::from_value(serde_json::json!({
+            "subject": subject,
+            "revocation": revocation,
+            "reason": "integration test"
+        }))
+        .expect("test revoke payload is well formed");
         let mut doc = TrustTask::for_payload(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload);
         doc.issuer = Some(issuer_did.into());
         doc.recipient = Some(SERVICE_DID.into());
         doc.issued_at = Some(chrono::Utc::now());
         add_stub_proof(&mut doc);
         doc
+    }
+
+    fn contexts(c: &[&str]) -> Option<serde_json::Value> {
+        Some(serde_json::json!({ "scope": "contexts", "contexts": c }))
+    }
+
+    fn rejected(outcome: DispatchOutcome) -> ErrorResponse {
+        match outcome {
+            DispatchOutcome::Rejected(e) => e,
+            other => panic!("expected Rejected, got {other:?}"),
+        }
     }
 
     /// Helper: seed an entry with the given DID + role + scope.
@@ -472,7 +434,7 @@ mod tests {
             &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
-            revoke_request(ADMIN_DID, ALICE_DID, &[]),
+            revoke_request(ADMIN_DID, ALICE_DID, None),
         )
         .await;
         let resp = match outcome {
@@ -493,7 +455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scope_reduction_narrows_allowed_domains() {
+    async fn narrowing_act_drops_domains() {
         let (_s, acl_ks) = harness().await;
         let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(
@@ -510,34 +472,33 @@ mod tests {
             &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
-            revoke_request(ADMIN_DID, ALICE_DID, &["domain:b.example"]),
+            revoke_request(ADMIN_DID, ALICE_DID, contexts(&["a.example"])),
         )
         .await;
         let resp = match outcome {
             DispatchOutcome::Handled(d) => d,
             other => panic!("expected Handled, got {other:?}"),
         };
-        // entry is the reduced AclEntry
         let entry = resp.payload["entry"].clone();
         assert_eq!(entry["subject"], ALICE_DID);
-        // vendor ext carries the reduced domain set
-        let domains = &entry["ext"][WEBVH_EXT_KEY]["domains"];
-        assert_eq!(domains["kind"], "allowed");
-        assert_eq!(domains["domains"], serde_json::json!(["a.example"]));
-
-        // Storage reflects the reduction
+        assert_eq!(
+            entry["act"],
+            serde_json::json!({ "scope": "contexts", "contexts": ["a.example"] })
+        );
         let updated = acl::get_acl_entry(&acl_ks, ALICE_DID)
             .await
             .unwrap()
             .unwrap();
-        match updated.domains {
-            DomainScope::Allowed { domains } => assert_eq!(domains, vec!["a.example"]),
-            other => panic!("expected Allowed, got {other:?}"),
-        }
+        assert_eq!(
+            updated.domains,
+            DomainScope::Allowed {
+                domains: vec!["a.example".into()]
+            }
+        );
     }
 
     #[tokio::test]
-    async fn scope_reduction_removing_default_demotes_to_allowed() {
+    async fn narrowing_away_the_default_demotes_to_allowed() {
         let (_s, acl_ks) = harness().await;
         let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(
@@ -554,21 +515,58 @@ mod tests {
             &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
-            revoke_request(ADMIN_DID, ALICE_DID, &["domain:a.example"]),
+            revoke_request(ADMIN_DID, ALICE_DID, contexts(&["b.example"])),
         )
         .await;
         let updated = acl::get_acl_entry(&acl_ks, ALICE_DID)
             .await
             .unwrap()
             .unwrap();
-        match updated.domains {
-            DomainScope::Allowed { domains } => assert_eq!(domains, vec!["b.example"]),
-            other => panic!("default-removed entry must demote to Allowed, got {other:?}"),
-        }
+        assert_eq!(
+            updated.domains,
+            DomainScope::Allowed {
+                domains: vec!["b.example".into()]
+            }
+        );
     }
 
+    /// Narrowing to `none` keeps the entry — it states an entry that may act
+    /// nowhere — rather than removing it.
     #[tokio::test]
-    async fn scope_reduction_emptying_set_deletes_entry() {
+    async fn narrowing_to_none_keeps_an_entry_that_acts_nowhere() {
+        let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        seed(&acl_ks, ALICE_DID, Role::Owner, DomainScope::All).await;
+        let outcome = handle(
+            &ctx(&acl_ks, &acl_locks),
+            &transport(ADMIN_DID),
+            no_verifier(),
+            revoke_request(
+                ADMIN_DID,
+                ALICE_DID,
+                Some(serde_json::json!({ "scope": "none" })),
+            ),
+        )
+        .await;
+        let resp = match outcome {
+            DispatchOutcome::Handled(d) => d,
+            other => panic!("expected Handled, got {other:?}"),
+        };
+        assert_eq!(
+            resp.payload["entry"]["act"],
+            serde_json::json!({ "scope": "none" })
+        );
+        let updated = acl::get_acl_entry(&acl_ks, ALICE_DID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!updated.domains.allows("a.example"));
+    }
+
+    /// A stated scope that is not strictly narrower is `notNarrowing`: the
+    /// same scope, a wider one, or one naming a domain the entry lacks.
+    #[tokio::test]
+    async fn a_scope_that_does_not_narrow_is_refused() {
         let (_s, acl_ks) = harness().await;
         let acl_locks = crate::server::path_locks::PathLocks::new();
         seed(
@@ -580,23 +578,49 @@ mod tests {
             },
         )
         .await;
-        let outcome = handle(
-            &ctx(&acl_ks, &acl_locks),
-            &transport(ADMIN_DID),
-            no_verifier(),
-            revoke_request(ADMIN_DID, ALICE_DID, &["domain:a.example"]),
-        )
-        .await;
-        let resp = match outcome {
-            DispatchOutcome::Handled(d) => d,
-            other => panic!("expected Handled, got {other:?}"),
-        };
-        assert_eq!(resp.payload["entry"], serde_json::Value::Null);
+        for act in [
+            contexts(&["a.example"]),
+            contexts(&["a.example", "b.example"]),
+            contexts(&["b.example"]),
+            Some(serde_json::json!({ "scope": "all" })),
+        ] {
+            let err = rejected(
+                handle(
+                    &ctx(&acl_ks, &acl_locks),
+                    &transport(ADMIN_DID),
+                    no_verifier(),
+                    revoke_request(ADMIN_DID, ALICE_DID, act),
+                )
+                .await,
+            );
+            assert!(
+                revoke::error_codes::NOT_NARROWING.matches(&err.payload.code),
+                "{:?}",
+                err.payload.code
+            );
+        }
+    }
+
+    /// An Admin acts on every domain whatever its entry says; a narrower act
+    /// scope is one this maintainer cannot hold.
+    #[tokio::test]
+    async fn an_admin_act_scope_cannot_be_narrowed() {
+        let (_s, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        seed(&acl_ks, SECOND_ADMIN, Role::Admin, DomainScope::All).await;
+        let err = rejected(
+            handle(
+                &ctx(&acl_ks, &acl_locks),
+                &transport(ADMIN_DID),
+                no_verifier(),
+                revoke_request(ADMIN_DID, SECOND_ADMIN, contexts(&["a.example"])),
+            )
+            .await,
+        );
         assert!(
-            acl::get_acl_entry(&acl_ks, ALICE_DID)
-                .await
-                .unwrap()
-                .is_none()
+            revoke::error_codes::INVALID_ACT_SCOPE.matches(&err.payload.code),
+            "{:?}",
+            err.payload.code
         );
     }
 
@@ -609,14 +633,17 @@ mod tests {
             &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
-            revoke_request(ADMIN_DID, ADMIN_DID, &[]), // self-revoke as sole admin
+            revoke_request(ADMIN_DID, ADMIN_DID, None), // self-revoke as sole admin
         )
         .await;
         let err = match outcome {
             DispatchOutcome::Rejected(e) => e,
             other => panic!("expected Rejected, got {other:?}"),
         };
-        assert_eq!(err.payload.code, extended_code(ERR_LAST_AUTHORITY));
+        assert_eq!(
+            err.payload.code,
+            trust_tasks_rs::TrustTaskCode::from(revoke::error_codes::LAST_AUTHORITY_PROTECTED)
+        );
         let details = err.payload.details.expect("details present");
         assert_eq!(details["protectedRole"], "admin");
         assert_eq!(details["remainingHolders"], serde_json::json!([]));
@@ -654,12 +681,13 @@ mod tests {
                 acl_ks: &ks_a,
                 acl_locks: &locks_a,
                 my_vid: SERVICE_DID,
+                signing_oracle: false,
             };
             handle(
                 &ctx,
                 &transport_a,
                 no_verifier(),
-                revoke_request(ADMIN_DID, SECOND_ADMIN, &[]),
+                revoke_request(ADMIN_DID, SECOND_ADMIN, None),
             )
             .await
         });
@@ -670,12 +698,13 @@ mod tests {
                 acl_ks: &ks_b,
                 acl_locks: &locks_b,
                 my_vid: SERVICE_DID,
+                signing_oracle: false,
             };
             handle(
                 &ctx,
                 &transport_b,
                 no_verifier(),
-                revoke_request(SECOND_ADMIN, ADMIN_DID, &[]),
+                revoke_request(SECOND_ADMIN, ADMIN_DID, None),
             )
             .await
         });
@@ -723,7 +752,7 @@ mod tests {
             &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
-            revoke_request(ADMIN_DID, SECOND_ADMIN, &[]),
+            revoke_request(ADMIN_DID, SECOND_ADMIN, None),
         )
         .await;
         assert!(matches!(outcome, DispatchOutcome::Handled(_)));
@@ -737,14 +766,17 @@ mod tests {
             &ctx(&acl_ks, &acl_locks),
             &transport(ADMIN_DID),
             no_verifier(),
-            revoke_request(ADMIN_DID, "did:web:nobody.example", &[]),
+            revoke_request(ADMIN_DID, "did:web:nobody.example", None),
         )
         .await;
         let err = match outcome {
             DispatchOutcome::Rejected(e) => e,
             other => panic!("expected Rejected, got {other:?}"),
         };
-        assert_eq!(err.payload.code, extended_code(ERR_SUBJECT_NOT_PRESENT));
+        assert_eq!(
+            err.payload.code,
+            trust_tasks_rs::TrustTaskCode::from(revoke::error_codes::SUBJECT_NOT_PRESENT)
+        );
     }
 
     #[tokio::test]
@@ -756,7 +788,7 @@ mod tests {
             &ctx(&acl_ks, &acl_locks),
             &transport(ALICE_DID),
             no_verifier(),
-            revoke_request(ALICE_DID, ALICE_DID, &[]),
+            revoke_request(ALICE_DID, ALICE_DID, None),
         )
         .await;
         assert!(matches!(outcome, DispatchOutcome::Handled(_)));
@@ -784,7 +816,7 @@ mod tests {
             &ctx(&acl_ks, &acl_locks),
             &transport(ALICE_DID),
             no_verifier(),
-            revoke_request(ALICE_DID, "did:web:bob.example", &[]),
+            revoke_request(ALICE_DID, "did:web:bob.example", None),
         )
         .await;
         let err = match outcome {
@@ -794,58 +826,6 @@ mod tests {
         assert_eq!(
             err.payload.code,
             trust_tasks_rs::TrustTaskCode::Standard(StandardCode::PermissionDenied)
-        );
-    }
-
-    #[tokio::test]
-    async fn scope_with_unknown_prefix_rejected_as_malformed() {
-        let (_s, acl_ks) = harness().await;
-        let acl_locks = crate::server::path_locks::PathLocks::new();
-        seed(
-            &acl_ks,
-            ALICE_DID,
-            Role::Owner,
-            DomainScope::Allowed {
-                domains: vec!["a.example".into()],
-            },
-        )
-        .await;
-        let outcome = handle(
-            &ctx(&acl_ks, &acl_locks),
-            &transport(ADMIN_DID),
-            no_verifier(),
-            revoke_request(ADMIN_DID, ALICE_DID, &["context:project-alpha"]),
-        )
-        .await;
-        let err = match outcome {
-            DispatchOutcome::Rejected(e) => e,
-            other => panic!("expected Rejected, got {other:?}"),
-        };
-        assert_eq!(
-            err.payload.code,
-            trust_tasks_rs::TrustTaskCode::Standard(StandardCode::MalformedRequest)
-        );
-    }
-
-    #[tokio::test]
-    async fn scope_reduce_on_all_rejected() {
-        let (_s, acl_ks) = harness().await;
-        let acl_locks = crate::server::path_locks::PathLocks::new();
-        seed(&acl_ks, ALICE_DID, Role::Owner, DomainScope::All).await;
-        let outcome = handle(
-            &ctx(&acl_ks, &acl_locks),
-            &transport(ADMIN_DID),
-            no_verifier(),
-            revoke_request(ADMIN_DID, ALICE_DID, &["domain:a.example"]),
-        )
-        .await;
-        let err = match outcome {
-            DispatchOutcome::Rejected(e) => e,
-            other => panic!("expected Rejected, got {other:?}"),
-        };
-        assert_eq!(
-            err.payload.code,
-            trust_tasks_rs::TrustTaskCode::Standard(StandardCode::MalformedRequest)
         );
     }
 }

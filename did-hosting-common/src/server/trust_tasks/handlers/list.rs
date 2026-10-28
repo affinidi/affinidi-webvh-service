@@ -1,20 +1,26 @@
-//! `acl/list/0.1` handler — enumerate ACL entries with optional
+//! `acl/list/0.3` handler — enumerate ACL entries with optional
 //! filters and opaque-cursor paging.
 //!
-//! Spec contract (from `specs/acl/list/0.1/spec.md`):
+//! Spec contract (`specs/acl/list/0.3/spec.md`, consumer items):
 //!
-//! * Read-only; never mutates the ACL.
-//! * Filters (`role`, `scope`, `subjectPrefix`) are conjunctive.
-//!   Unrecognised filter values produce zero matches (NOT an error).
-//! * `pageSize`: maintainer chooses default + ceiling. We use 50 /
-//!   500. The spec's schema caps `pageSize` at 1000 — our ceiling
-//!   stays under that for safety on large ACL tables.
-//! * `cursor`: opaque to consumers. We encode `{last_seen: <did>}`
-//!   as base64 of its JSON; future maintainers may change the inner
-//!   shape without breaking clients (per spec "consumers MUST treat
-//!   the cursor as opaque").
-//! * `truncated` set to `true` when more matching entries exist;
-//!   `cursor` carries the continuation token in that case.
+//! * Read-only; only an `Admin` may enumerate (this maintainer has no
+//!   approvers, so no entry's approve scope reaches anyone else).
+//! * A `context` or `resource` filter without `direction`, or a `direction`
+//!   with neither, is `malformedRequest`; there is no default direction.
+//! * Filters are conjunctive. An entry's contexts are its domains (see
+//!   [`super::super::entry`]), and they are flat, so for a queried domain:
+//!   `actingIn` matches an entry whose act scope is `all` or names it;
+//!   `subtree` matches an entry that names it (an unrestricted entry is not
+//!   a grant *of* the domain); `any` matches either.
+//! * `capability` and `resource` are evaluated against an entry's effective
+//!   capabilities. This maintainer recognises no capability and qualifies
+//!   none, so either filter matches nothing — an unrecognised filter value is
+//!   zero matches, not an error.
+//! * `limit`: the maintainer chooses default + ceiling (50 / 500; the schema
+//!   caps it at 1000). `nextCursor` is present if, and only if, more matching
+//!   entries remain.
+//! * The cursor binds the filters and `direction` it was minted under; one
+//!   resumed under any other is `cursorMismatch`.
 //!
 //! ## Why the cursor encodes `last_seen` rather than an offset
 //!
@@ -24,38 +30,61 @@
 //! page would silently skip one row. An add at the same place would
 //! repeat one. Encoding the last subject DID we returned makes
 //! pagination stable: the next page starts at the first row whose
-//! `did > last_seen`. Inserts and deletes between pages produce the
-//! right "see new entries on the next round" / "skip rows that are
-//! gone" semantics with no positional drift.
+//! `did > last_seen`.
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use trust_tasks_rs::{
     ErrorPayload, ErrorResponse, ProofPolicy, ProofVerifier, ResolvedParties, StandardCode,
-    TransportHandler, TrustTask, specs::acl::list::v0_1 as list,
+    TransportHandler, TrustTask,
 };
 
 use crate::server::acl::{self, AclEntry, Role};
-use crate::server::trust_tasks::{
-    DispatchOutcome, TrustTaskContext, entry::SpecAclEntry, reject_with, run_pipeline,
-};
+use crate::server::trust_tasks::entry::{AuthorityScope, SpecAclEntry, act_of};
+use crate::server::trust_tasks::{DispatchOutcome, TrustTaskContext, reject_with, run_pipeline};
+use crate::tasks::acl::list::v0_3 as list;
 
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_PAGE_SIZE: usize = 500;
-const SCOPE_DOMAIN_PREFIX: &str = "domain:";
 
-/// Internal cursor shape: the subject DID of the last entry on the
-/// previous page. Round-tripped via base64+JSON; opaque to
-/// consumers. Stable across concurrent deletes — an offset-based
-/// cursor would skip an entry if a neighbour before the cursor were
-/// deleted, or repeat one if a neighbour after the cursor were
-/// granted-then-deleted between pages. Stable for our list-order
-/// invariant (sorted by `did` ascending).
+/// Internal cursor shape, opaque to consumers: the subject DID of the last
+/// entry on the previous page, and the filters the cursor was minted under.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CursorState {
     /// Last subject DID returned in the previous page. The next page
     /// begins at the first entry whose `did > last_seen`.
     last_seen: String,
+    /// [`Filters::binding`] of the request that minted the cursor.
+    filters: String,
+}
+
+/// The request's filters, as one value the cursor can bind.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Filters {
+    role: Option<String>,
+    subject_prefix: Option<String>,
+    context: Option<String>,
+    capability: Option<String>,
+    resource: Option<String>,
+    direction: Option<String>,
+}
+
+impl Filters {
+    fn of(p: &list::Payload) -> Self {
+        Self {
+            role: p.role.as_deref().map(String::from),
+            subject_prefix: p.subject_prefix.as_deref().map(String::from),
+            context: p.context.as_deref().map(String::from),
+            capability: p.capability.as_deref().map(String::from),
+            resource: p.resource.as_deref().map(String::from),
+            direction: p.direction.map(|d| d.to_string()),
+        }
+    }
+
+    fn binding(&self) -> String {
+        serde_json::to_string(self).expect("Filters serialises")
+    }
 }
 
 pub async fn handle<V>(
@@ -68,12 +97,15 @@ where
     V: ProofVerifier + ?Sized,
 {
     let acl_ks = ctx.acl_ks.clone();
+    let signing_oracle = ctx.signing_oracle;
     run_pipeline(
         transport,
         policy,
         doc,
         ctx.my_vid,
-        move |doc, parties| async move { handle_inner(&acl_ks, doc, &parties).await },
+        move |doc, parties| async move {
+            handle_inner(&acl_ks, doc, &parties, signing_oracle).await
+        },
     )
     .await
 }
@@ -82,6 +114,7 @@ async fn handle_inner(
     acl_ks: &crate::server::store::KeyspaceHandle,
     doc: TrustTask<list::Payload>,
     parties: &ResolvedParties,
+    signing_oracle: bool,
 ) -> Result<TrustTask<list::Response>, ErrorResponse> {
     let caller = parties.issuer.as_deref().ok_or_else(|| {
         reject_with(
@@ -101,21 +134,54 @@ async fn handle_inner(
         }
     }
 
-    // Parse the cursor (if present).
-    let last_seen = match doc.payload.cursor.as_deref() {
-        Some(c) => Some(decode_cursor(c).map_err(|msg| {
-            reject_with(
+    let filters = Filters::of(&doc.payload);
+    let hierarchical = filters.context.is_some() || filters.resource.is_some();
+    match (hierarchical, filters.direction.is_some()) {
+        (true, false) => {
+            return Err(reject_with(
                 &doc,
-                ErrorPayload::new(StandardCode::MalformedRequest).with_message(msg),
-            )
-        })?),
+                ErrorPayload::new(StandardCode::MalformedRequest).with_message(
+                    "a `context` or `resource` filter needs a `direction`: one of `actingIn`, \
+                     `subtree`, `any`",
+                ),
+            ));
+        }
+        (false, true) => {
+            return Err(reject_with(
+                &doc,
+                ErrorPayload::new(StandardCode::MalformedRequest)
+                    .with_message("`direction` applies only with a `context` or `resource` filter"),
+            ));
+        }
+        _ => {}
+    }
+
+    // Parse the cursor (if present) and hold it to the filters it was
+    // minted under.
+    let last_seen = match doc.payload.cursor.as_deref() {
+        Some(c) => {
+            let state = decode_cursor(c).map_err(|msg| {
+                reject_with(
+                    &doc,
+                    ErrorPayload::new(StandardCode::MalformedRequest).with_message(msg),
+                )
+            })?;
+            if state.filters != filters.binding() {
+                return Err(reject_with(
+                    &doc,
+                    ErrorPayload::from(list::error_codes::CURSOR_MISMATCH)
+                        .with_message("the cursor was issued for different filters or direction"),
+                ));
+            }
+            Some(state.last_seen)
+        }
         None => None,
     };
 
     let page_size = doc
         .payload
-        .page_size
-        .map(|n| (u64::from(n) as usize).min(MAX_PAGE_SIZE))
+        .limit
+        .map(|n| (n.get() as usize).min(MAX_PAGE_SIZE))
         .unwrap_or(DEFAULT_PAGE_SIZE);
 
     // Load every entry once. Acceptable for ACLs whose size is in the
@@ -125,37 +191,11 @@ async fn handle_inner(
         .await
         .map_err(|e| internal(&doc, e))?;
 
-    // Filter conjunctively.
-    let role_filter = doc.payload.role.as_deref().map(String::from);
-    let scope_filter = doc.payload.scope.as_deref().map(String::from);
-    let prefix_filter = doc.payload.subject_prefix.as_deref().map(String::from);
-
-    let filtered: Vec<&AclEntry> = all
-        .iter()
-        .filter(|e| match &role_filter {
-            Some(want) => e.role.to_string() == *want,
-            None => true,
-        })
-        .filter(|e| match &scope_filter {
-            Some(want) => entry_has_scope(e, want),
-            None => true,
-        })
-        .filter(|e| match &prefix_filter {
-            Some(want) => e.did.starts_with(want),
-            None => true,
-        })
-        .collect();
-
+    let mut sorted: Vec<&AclEntry> = all.iter().filter(|e| matches(e, &filters)).collect();
     // Sort by subject DID for stable ordering across pages — the
     // `last_seen` cursor relies on this monotonic order.
-    let mut sorted = filtered;
     sorted.sort_by(|a, b| a.did.cmp(&b.did));
 
-    // Start the page strictly after `last_seen` when a cursor was
-    // supplied. Stable under concurrent deletes: if an entry between
-    // `last_seen` and the start of this page is deleted, we just
-    // skip what's no longer there; we never repeat or skip a
-    // currently-present entry.
     let page: Vec<&AclEntry> = match last_seen.as_deref() {
         Some(last) => sorted
             .into_iter()
@@ -165,73 +205,86 @@ async fn handle_inner(
         None => sorted.into_iter().take(page_size + 1).collect(),
     };
     // `take(page_size + 1)` lets us look one entry past the page end:
-    // if we got one more than we asked for, more remain → truncated.
+    // if we got one more than we asked for, more remain.
     let has_more = page.len() > page_size;
     let page: Vec<&AclEntry> = page.into_iter().take(page_size).collect();
-    let cursor = if has_more {
-        page.last().map(|e| encode_cursor(&e.did))
+    let next_cursor = if has_more {
+        page.last().map(|e| encode_cursor(&e.did, &filters))
     } else {
         None
     };
-    let truncated = has_more;
 
-    let entries: Vec<list::AclEntry> = page.iter().map(|e| into_spec_entry(e)).collect();
-    // The generated payload types are `#[non_exhaustive]` from trust-tasks
-    // 0.17 on: built through the generated builder, whose `try_into` can only
-    // fail on a field left unset.
+    let entries: Vec<list::AclEntry> = page
+        .iter()
+        .map(|e| SpecAclEntry::from_local(e, signing_oracle).into_spec())
+        .collect();
+    let next_cursor = next_cursor
+        .map(|c| c.parse::<list::ResponseNextCursor>())
+        .transpose()
+        .map_err(|e| internal(&doc, e))?;
+    // The generated payload types are `#[non_exhaustive]`: built through the
+    // generated builder, whose `try_into` can only fail on a field left unset.
     let resp_payload: list::Response = list::Response::builder()
-        .cursor(cursor)
         .entries(entries)
+        .next_cursor(next_cursor)
         .redacted_fields(Vec::new())
-        .truncated(truncated)
         .try_into()
         .expect("list response has every required field set");
     let resp_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
     Ok(doc.respond_with(resp_id, resp_payload))
 }
 
-fn entry_has_scope(entry: &AclEntry, want: &str) -> bool {
-    // Match domain: prefixed filters against the entry's DomainScope.
-    // `All`-scoped entries match every `domain:` filter — they can
-    // operate on any domain, including the queried one. A UI use case
-    // is "show me every entry that can publish to alpha.example",
-    // which should include `All`-scoped Admins.
-    if let Some(domain) = want.strip_prefix(SCOPE_DOMAIN_PREFIX) {
-        return match &entry.domains {
-            crate::server::domain::DomainScope::All => true,
-            crate::server::domain::DomainScope::Allowed { domains } => {
-                domains.iter().any(|d| d == domain)
-            }
-            crate::server::domain::DomainScope::AllowedWithDefault { domains, .. } => {
-                domains.iter().any(|d| d == domain)
-            }
-        };
+/// Whether `entry` matches every filter in `f`.
+fn matches(entry: &AclEntry, f: &Filters) -> bool {
+    if f.role
+        .as_deref()
+        .is_some_and(|r| entry.role.to_string() != r)
+    {
+        return false;
     }
-    // Unrecognised filter prefix — spec says zero matches, not an error.
-    false
+    if f.subject_prefix
+        .as_deref()
+        .is_some_and(|p| !entry.did.starts_with(p))
+    {
+        return false;
+    }
+    // No capability is recognised and none is qualified: these filters
+    // match nothing.
+    if f.capability.is_some() || f.resource.is_some() {
+        return false;
+    }
+    if let Some(context) = f.context.as_deref() {
+        let act = act_of(entry);
+        let names_it = matches!(&act, AuthorityScope::Contexts { contexts } if contexts.iter().any(|c| c == context));
+        let unrestricted = act == AuthorityScope::All;
+        let hit = match f.direction.as_deref() {
+            Some("actingIn") => unrestricted || names_it,
+            Some("subtree") => names_it,
+            Some("any") => unrestricted || names_it,
+            _ => false,
+        };
+        if !hit {
+            return false;
+        }
+    }
+    true
 }
 
-fn into_spec_entry(local: &AclEntry) -> list::AclEntry {
-    let neutral = SpecAclEntry::from_local(local);
-    let value = serde_json::to_value(&neutral).expect("SpecAclEntry serialises");
-    serde_json::from_value(value).expect("list::AclEntry from SpecAclEntry value")
-}
-
-fn encode_cursor(last_seen: &str) -> String {
+fn encode_cursor(last_seen: &str, filters: &Filters) -> String {
     let state = CursorState {
         last_seen: last_seen.to_string(),
+        filters: filters.binding(),
     };
     let json = serde_json::to_vec(&state).expect("CursorState serialises");
     URL_SAFE_NO_PAD.encode(json)
 }
 
-fn decode_cursor(s: &str) -> Result<String, String> {
+fn decode_cursor(s: &str) -> Result<CursorState, String> {
     let bytes = URL_SAFE_NO_PAD
         .decode(s)
-        .map_err(|e| format!("cursor is not valid base64url: {e}"))?;
-    let state: CursorState =
-        serde_json::from_slice(&bytes).map_err(|e| format!("cursor payload malformed: {e}"))?;
-    Ok(state.last_seen)
+        .map_err(|_| "the cursor was not issued by this maintainer".to_string())?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| "the cursor was not issued by this maintainer".to_string())
 }
 
 fn internal<P>(doc: &TrustTask<P>, err: impl std::fmt::Display) -> ErrorResponse {
@@ -246,7 +299,6 @@ fn internal<P>(doc: &TrustTask<P>, err: impl std::fmt::Display) -> ErrorResponse
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::num::NonZeroU64;
     use trust_tasks_rs::{Payload, VerificationError, handlers::InMemoryHandler};
 
     use crate::server::config::StoreConfig;
@@ -304,6 +356,7 @@ mod tests {
             acl_ks,
             acl_locks,
             my_vid: SERVICE_DID,
+            signing_oracle: false,
         }
     }
 
@@ -339,27 +392,64 @@ mod tests {
         }
     }
 
+    /// `context` is `(context, direction)`.
     fn request(
         issuer_did: &str,
-        page_size: Option<u64>,
+        limit: Option<u64>,
         cursor: Option<&str>,
         role: Option<&str>,
-        scope: Option<&str>,
+        context: Option<(&str, &str)>,
         prefix: Option<&str>,
     ) -> TrustTask<list::Payload> {
-        let payload: list::Payload = list::Payload::builder()
-            .cursor(cursor.map(|s| s.to_string()))
-            .page_size(page_size.and_then(NonZeroU64::new))
-            .role(role.map(|s| s.to_string().try_into().expect("role parses")))
-            .scope(scope.map(|s| s.to_string().try_into().expect("scope parses")))
-            .subject_prefix(prefix.map(|s| s.to_string().try_into().expect("prefix parses")))
-            .try_into()
-            .expect("test list payload is well formed");
+        let mut payload = serde_json::json!({});
+        if let Some(n) = limit {
+            payload["limit"] = n.into();
+        }
+        if let Some(c) = cursor {
+            payload["cursor"] = c.into();
+        }
+        if let Some(r) = role {
+            payload["role"] = r.into();
+        }
+        if let Some((c, d)) = context {
+            payload["context"] = c.into();
+            payload["direction"] = d.into();
+        }
+        if let Some(p) = prefix {
+            payload["subjectPrefix"] = p.into();
+        }
+        request_with(issuer_did, payload)
+    }
+
+    fn request_with(issuer_did: &str, payload: serde_json::Value) -> TrustTask<list::Payload> {
+        let payload: list::Payload =
+            serde_json::from_value(payload).expect("test list payload is well formed");
         let mut doc = TrustTask::for_payload(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload);
         doc.issuer = Some(issuer_did.into());
         doc.recipient = Some(SERVICE_DID.into());
         doc.issued_at = Some(chrono::Utc::now());
         doc
+    }
+
+    async fn list(
+        acl_ks: &crate::server::store::KeyspaceHandle,
+        doc: TrustTask<list::Payload>,
+    ) -> DispatchOutcome {
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        handle(
+            &ctx(acl_ks, &acl_locks),
+            &transport(ADMIN_DID),
+            no_verifier(),
+            doc,
+        )
+        .await
+    }
+
+    fn rejected(outcome: DispatchOutcome) -> ErrorResponse {
+        match outcome {
+            DispatchOutcome::Rejected(e) => e,
+            other => panic!("expected Rejected, got {other:?}"),
+        }
     }
 
     fn unwrap_response(outcome: DispatchOutcome) -> TrustTask<serde_json::Value> {
@@ -392,8 +482,10 @@ mod tests {
         let entries = resp.payload["entries"].as_array().unwrap();
         // 5 owners + 1 admin from harness
         assert_eq!(entries.len(), 6);
-        assert_eq!(resp.payload["truncated"], false);
-        assert!(resp.payload.get("cursor").is_none() || resp.payload["cursor"].is_null());
+        assert!(
+            resp.payload.get("nextCursor").is_none(),
+            "last page has no nextCursor"
+        );
     }
 
     #[tokio::test]
@@ -420,7 +512,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pagination_returns_cursor_and_truncated() {
+    async fn pagination_returns_next_cursor_until_the_last_page() {
         let (_s, acl_ks) = harness().await;
         let acl_locks = crate::server::path_locks::PathLocks::new();
         seed_many(&acl_ks, "did:web:o", 12, Role::Owner).await;
@@ -436,8 +528,8 @@ mod tests {
         );
         let entries1 = resp1.payload["entries"].as_array().unwrap();
         assert_eq!(entries1.len(), 5);
-        assert_eq!(resp1.payload["truncated"], true);
-        let cursor1 = resp1.payload["cursor"].as_str().unwrap().to_string();
+        assert!(resp1.payload.get("nextCursor").is_some());
+        let cursor1 = resp1.payload["nextCursor"].as_str().unwrap().to_string();
 
         let resp2 = unwrap_response(
             handle(
@@ -457,7 +549,7 @@ mod tests {
         );
         let entries2 = resp2.payload["entries"].as_array().unwrap();
         assert_eq!(entries2.len(), 5);
-        assert_eq!(resp2.payload["truncated"], true);
+        assert!(resp2.payload.get("nextCursor").is_some());
 
         let resp3 = unwrap_response(
             handle(
@@ -467,7 +559,7 @@ mod tests {
                 request(
                     ADMIN_DID,
                     Some(5),
-                    resp2.payload["cursor"].as_str(),
+                    resp2.payload["nextCursor"].as_str(),
                     Some("owner"),
                     None,
                     None,
@@ -477,7 +569,7 @@ mod tests {
         );
         let entries3 = resp3.payload["entries"].as_array().unwrap();
         assert_eq!(entries3.len(), 2);
-        assert_eq!(resp3.payload["truncated"], false);
+        assert!(resp3.payload.get("nextCursor").is_none());
 
         // Sum of all pages == total matching, no duplicates.
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -491,13 +583,10 @@ mod tests {
         assert_eq!(seen.len(), 12);
     }
 
-    /// `domain:X` filter returns only entries that *could operate* on
-    /// X — `Allowed`/`AllowedWithDefault` entries whose list contains
-    /// X, *plus* `All`-scoped entries (which can operate on any
-    /// domain). A `domain:nonexistent` filter therefore returns the
-    /// `All`-scoped admins, not zero — the UI use case "show me
-    /// everyone who can publish to alpha.example" needs admins
-    /// included.
+    /// `context: X, direction: actingIn` returns the entries that *may act*
+    /// on domain X — those naming it, *plus* `act: all` entries (which act on
+    /// any domain). So a domain no owner holds still returns the
+    /// unrestricted admin: "who can publish to alpha.example" includes it.
     #[tokio::test]
     async fn domain_filter_includes_all_scoped_entries() {
         let (_s, acl_ks) = harness().await;
@@ -516,7 +605,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    Some("domain:nonexistent.example"),
+                    Some(("nonexistent.example", "actingIn")),
                     None,
                 ),
             )
@@ -526,37 +615,93 @@ mod tests {
         // Just the harness Admin matches; no owners do.
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["role"], "admin");
-        assert_eq!(resp.payload["truncated"], false);
+        assert!(resp.payload.get("nextCursor").is_none());
     }
 
-    /// Filter prefixes that aren't `domain:` (and aren't anything else
-    /// we understand) match nothing. The spec says "filter values the
-    /// maintainer does not recognize MUST simply produce zero matches;
-    /// they are not an error."
+    /// `subtree` asks what is granted *of* a domain: an unrestricted entry
+    /// names no domain, so it does not match.
     #[tokio::test]
-    async fn unrecognised_scope_filter_prefix_returns_empty() {
+    async fn subtree_excludes_unrestricted_entries() {
         let (_s, acl_ks) = harness().await;
-        let acl_locks = crate::server::path_locks::PathLocks::new();
         seed_many(&acl_ks, "did:web:o", 3, Role::Owner).await;
         let resp = unwrap_response(
-            handle(
-                &ctx(&acl_ks, &acl_locks),
-                &transport(ADMIN_DID),
-                no_verifier(),
+            list(
+                &acl_ks,
                 request(
                     ADMIN_DID,
                     None,
                     None,
                     None,
-                    Some("context:project-alpha"),
+                    Some(("a.example", "subtree")),
                     None,
                 ),
             )
             .await,
         );
         let entries = resp.payload["entries"].as_array().unwrap();
-        assert!(entries.is_empty());
-        assert_eq!(resp.payload["truncated"], false);
+        assert_eq!(entries.len(), 3, "the three owners, not the admin");
+        for e in entries {
+            assert_eq!(e["role"], "owner");
+        }
+    }
+
+    /// This maintainer recognises no capability and qualifies none, so a
+    /// `capability` or `resource` filter matches nothing — not an error.
+    #[tokio::test]
+    async fn capability_and_resource_filters_match_nothing() {
+        let (_s, acl_ks) = harness().await;
+        seed_many(&acl_ks, "did:web:o", 3, Role::Owner).await;
+        for payload in [
+            serde_json::json!({ "capability": "did.publish" }),
+            serde_json::json!({ "resource": "domain:a.example", "direction": "actingIn" }),
+        ] {
+            let resp = unwrap_response(list(&acl_ks, request_with(ADMIN_DID, payload)).await);
+            assert!(resp.payload["entries"].as_array().unwrap().is_empty());
+        }
+    }
+
+    /// There is no default direction: a hierarchical filter without one, or
+    /// a direction without a filter, is malformed.
+    #[tokio::test]
+    async fn direction_and_hierarchical_filter_go_together() {
+        let (_s, acl_ks) = harness().await;
+        for payload in [
+            serde_json::json!({ "context": "a.example" }),
+            serde_json::json!({ "direction": "subtree" }),
+        ] {
+            let err = rejected(list(&acl_ks, request_with(ADMIN_DID, payload)).await);
+            assert_eq!(
+                err.payload.code,
+                trust_tasks_rs::TrustTaskCode::Standard(StandardCode::MalformedRequest)
+            );
+        }
+    }
+
+    /// A cursor binds the filters it was minted under.
+    #[tokio::test]
+    async fn cursor_resumed_under_other_filters_is_cursor_mismatch() {
+        let (_s, acl_ks) = harness().await;
+        seed_many(&acl_ks, "did:web:o", 4, Role::Owner).await;
+        let resp = unwrap_response(
+            list(
+                &acl_ks,
+                request(ADMIN_DID, Some(2), None, Some("owner"), None, None),
+            )
+            .await,
+        );
+        let cursor = resp.payload["nextCursor"].as_str().unwrap().to_string();
+        let err = rejected(
+            list(
+                &acl_ks,
+                request(ADMIN_DID, Some(2), Some(&cursor), None, None, None),
+            )
+            .await,
+        );
+        assert!(
+            list::error_codes::CURSOR_MISMATCH.matches(&err.payload.code),
+            "{:?}",
+            err.payload.code
+        );
     }
 
     /// Cursor stability under concurrent deletes: if the entry at the
@@ -582,7 +727,7 @@ mod tests {
         );
         let entries1 = resp1.payload["entries"].as_array().unwrap().clone();
         assert_eq!(entries1.len(), 3);
-        let cursor1 = resp1.payload["cursor"].as_str().unwrap().to_string();
+        let cursor1 = resp1.payload["nextCursor"].as_str().unwrap().to_string();
         let last_did = entries1[2]["subject"].as_str().unwrap().to_string();
 
         // Delete the entry the cursor points at.

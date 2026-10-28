@@ -3,8 +3,9 @@
  *
  * Every management call is a signed Trust Task through `POST /api/trust-tasks`
  * (see `trust-task.ts` for the binding and how replies are checked). The
- * request and response shapes are the generated types in
- * `@openvtc/trust-tasks`; `wire.ts` projects each reply into the view models
+ * request and response shapes are the generated types in `lib/trust-tasks/`
+ * (`npm run gen:tasks`, from the versions `did-hosting-common/trust-tasks.lock`
+ * pins); `wire.ts` projects each reply into the view models
  * below, which are what the screens render.
  *
  * Two things stay plain HTTP: the unauthenticated `/api/health` liveness
@@ -13,51 +14,51 @@
  * its data rides inside their payloads.
  */
 
-import type * as DidList from "@openvtc/trust-tasks/did-management/did/list/0.1/payload";
-import type * as DidInfo from "@openvtc/trust-tasks/did-management/did/info/0.1/payload";
-import type * as DidLog from "@openvtc/trust-tasks/did-management/did/log/0.1/payload";
-import type * as DidCheckName from "@openvtc/trust-tasks/did-management/did/check-name/0.1/payload";
-import type * as DidRegister from "@openvtc/trust-tasks/did-management/did/register/0.1/payload";
-import type * as DidDelete from "@openvtc/trust-tasks/did-management/did/delete/0.1/payload";
-import type * as DidChangeOwner from "@openvtc/trust-tasks/did-management/did/change-owner/0.1/payload";
-import type * as DidRollback from "@openvtc/trust-tasks/did-management/did/rollback/0.1/payload";
-import type * as WitnessPublish from "@openvtc/trust-tasks/webvh/witness/publish/0.1/payload";
-import type * as AgentNameCheck from "@openvtc/trust-tasks/did-management/agent-name/check/0.1/payload";
-import type * as AgentNameResolve from "@openvtc/trust-tasks/did-management/agent-name/resolve/0.1/payload";
-import type * as DomainList from "@openvtc/trust-tasks/did-management/domain/list/0.1/payload";
-import type * as MeDomains from "@openvtc/trust-tasks/did-management/me/domains/0.1/payload";
-import type * as DomainCreate from "@openvtc/trust-tasks/did-management/domain/create/0.1/payload";
-import type * as DomainSetState from "@openvtc/trust-tasks/did-management/domain/set-state/0.1/payload";
-import type * as DomainSetDefault from "@openvtc/trust-tasks/did-management/domain/set-default/0.1/payload";
-import type * as DomainPurge from "@openvtc/trust-tasks/did-management/domain/purge/0.1/payload";
-import type * as DomainAssign from "@openvtc/trust-tasks/did-management/domain/assign/0.1/payload";
-import type * as DomainUnassign from "@openvtc/trust-tasks/did-management/domain/unassign/0.1/payload";
-import type * as RegistryList from "@openvtc/trust-tasks/did-management/registry/list/0.1/payload";
-import type * as RegistryPurgeDomain from "@openvtc/trust-tasks/did-management/registry/purge-domain/0.1/payload";
-import type * as StatsGet from "@openvtc/trust-tasks/did-management/stats/get/0.1/payload";
-import type * as StatsTimeseries from "@openvtc/trust-tasks/did-management/stats/timeseries/0.1/payload";
-import type * as ServerConfig from "@openvtc/trust-tasks/did-management/server/config/0.1/payload";
-import type * as IdentityList from "@openvtc/trust-tasks/did-management/identity/list/0.1/payload";
-import type * as IdentityRetire from "@openvtc/trust-tasks/did-management/identity/retire/0.1/payload";
-import type * as LoginStart from "@openvtc/trust-tasks/auth/passkey/login/start/0.2/payload";
-import type * as LoginFinish from "@openvtc/trust-tasks/auth/passkey/login/finish/0.2/payload";
-import type * as Invite from "@openvtc/trust-tasks/auth/passkey/enroll/invite/0.2/payload";
-import type * as RedeemStart from "@openvtc/trust-tasks/auth/passkey/enroll/redeem/start/0.1/payload";
-import type * as RedeemFinish from "@openvtc/trust-tasks/auth/passkey/enroll/redeem/finish/0.1/payload";
-import type * as InviteList from "@openvtc/trust-tasks/auth/passkey/enroll/invite/list/0.1/payload";
-import type * as InviteUpdate from "@openvtc/trust-tasks/auth/passkey/enroll/invite/update/0.1/payload";
-import type * as InviteRevoke from "@openvtc/trust-tasks/auth/passkey/enroll/invite/revoke/0.1/payload";
-import type * as PasskeyList from "@openvtc/trust-tasks/auth/passkey/list/0.1/payload";
-import type * as PasskeyAdminList from "@openvtc/trust-tasks/auth/passkey/admin-list/0.1/payload";
-import type * as PasskeyRevokeStart from "@openvtc/trust-tasks/auth/passkey/revoke/start/0.2/payload";
-import type * as PasskeyRevokeFinish from "@openvtc/trust-tasks/auth/passkey/revoke/finish/0.2/payload";
-import type * as AclList from "@openvtc/trust-tasks/acl/list/0.1/payload";
-import type * as AclShow from "@openvtc/trust-tasks/acl/show/0.1/payload";
-import type * as AclGrant from "@openvtc/trust-tasks/acl/grant/0.1/payload";
-import type * as AclRevoke from "@openvtc/trust-tasks/acl/revoke/0.1/payload";
-import type * as AclChangeRole from "@openvtc/trust-tasks/acl/change-role/0.1/payload";
-import type { Response as ServerInfo } from "@openvtc/trust-tasks/did-management/server/info/0.1/payload";
-import type * as RevokeSession from "@openvtc/trust-tasks/auth/revoke-session/0.2/payload";
+import type * as DidList from "./trust-tasks/did-management/did/list/0.2/payload";
+import type * as DidInfo from "./trust-tasks/did-management/did/info/0.1/payload";
+import type * as DidLog from "./trust-tasks/did-management/did/log/0.1/payload";
+import type * as DidCheckName from "./trust-tasks/did-management/did/check-name/0.1/payload";
+import type * as DidRegister from "./trust-tasks/did-management/did/register/0.1/payload";
+import type * as DidDelete from "./trust-tasks/did-management/did/delete/0.1/payload";
+import type * as DidChangeOwner from "./trust-tasks/did-management/did/change-owner/0.1/payload";
+import type * as DidRollback from "./trust-tasks/did-management/did/rollback/0.1/payload";
+import type * as WitnessPublish from "./trust-tasks/webvh/witness/publish/0.1/payload";
+import type * as AgentNameCheck from "./trust-tasks/did-management/agent-name/check/0.1/payload";
+import type * as AgentNameResolve from "./trust-tasks/did-management/agent-name/resolve/0.1/payload";
+import type * as DomainList from "./trust-tasks/did-management/domain/list/0.1/payload";
+import type * as MeDomains from "./trust-tasks/did-management/me/domains/0.1/payload";
+import type * as DomainCreate from "./trust-tasks/did-management/domain/create/0.1/payload";
+import type * as DomainSetState from "./trust-tasks/did-management/domain/set-state/0.1/payload";
+import type * as DomainSetDefault from "./trust-tasks/did-management/domain/set-default/0.1/payload";
+import type * as DomainPurge from "./trust-tasks/did-management/domain/purge/0.1/payload";
+import type * as DomainAssign from "./trust-tasks/did-management/domain/assign/0.1/payload";
+import type * as DomainUnassign from "./trust-tasks/did-management/domain/unassign/0.1/payload";
+import type * as RegistryList from "./trust-tasks/did-management/registry/list/0.2/payload";
+import type * as RegistryPurgeDomain from "./trust-tasks/did-management/registry/purge-domain/0.1/payload";
+import type * as StatsGet from "./trust-tasks/did-management/stats/get/0.1/payload";
+import type * as StatsTimeseries from "./trust-tasks/did-management/stats/timeseries/0.2/payload";
+import type * as ServerConfig from "./trust-tasks/did-management/server/config/0.1/payload";
+import type * as IdentityList from "./trust-tasks/did-management/identity/list/0.1/payload";
+import type * as IdentityRetire from "./trust-tasks/did-management/identity/retire/0.1/payload";
+import type * as LoginStart from "./trust-tasks/auth/passkey/login/start/0.2/payload";
+import type * as LoginFinish from "./trust-tasks/auth/passkey/login/finish/0.2/payload";
+import type * as Invite from "./trust-tasks/auth/passkey/enroll/invite/0.3/payload";
+import type * as RedeemStart from "./trust-tasks/auth/passkey/enroll/redeem/start/0.1/payload";
+import type * as RedeemFinish from "./trust-tasks/auth/passkey/enroll/redeem/finish/0.1/payload";
+import type * as InviteList from "./trust-tasks/auth/passkey/enroll/invite/list/0.1/payload";
+import type * as InviteUpdate from "./trust-tasks/auth/passkey/enroll/invite/update/0.1/payload";
+import type * as InviteRevoke from "./trust-tasks/auth/passkey/enroll/invite/revoke/0.1/payload";
+import type * as PasskeyList from "./trust-tasks/auth/passkey/list/0.1/payload";
+import type * as PasskeyAdminList from "./trust-tasks/auth/passkey/admin-list/0.1/payload";
+import type * as PasskeyRevokeStart from "./trust-tasks/auth/passkey/revoke/start/0.2/payload";
+import type * as PasskeyRevokeFinish from "./trust-tasks/auth/passkey/revoke/finish/0.2/payload";
+import type * as AclList from "./trust-tasks/acl/list/0.3/payload";
+import type * as AclShow from "./trust-tasks/acl/show/0.2/payload";
+import type * as AclGrant from "./trust-tasks/acl/grant/0.2/payload";
+import type * as AclRevoke from "./trust-tasks/acl/revoke/0.2/payload";
+import type * as AclChangeRole from "./trust-tasks/acl/change-role/0.2/payload";
+import type { Response as ServerInfo } from "./trust-tasks/did-management/server/info/0.1/payload";
+import type * as RevokeSession from "./trust-tasks/auth/revoke-session/0.2/payload";
 
 import { ApiError, request } from "./http";
 import {
@@ -88,6 +89,9 @@ import {
   timeRangeToWire,
   timeseriesFromWire,
   WEBVH_EXT,
+  actNarrowing,
+  actOf,
+  defaultDomainOf,
 } from "./wire";
 
 export { ApiError } from "./http";
@@ -486,7 +490,7 @@ export interface IdentityGenerationsResponse {
 // Task type URIs
 //
 // Each is typed as its generated `TYPE_URI`, so a typo or a version the
-// package does not know fails the typecheck. Only the types are imported —
+// lock does not pin fails the typecheck. Only the types are imported —
 // the generated modules carry their schemas as values, which the bundle does
 // not need.
 // ---------------------------------------------------------------------------
@@ -495,7 +499,7 @@ const TT = "https://trusttasks.org/spec/";
 const DM = `${TT}did-management/` as const;
 
 const T = {
-  didList: `${DM}did/list/0.1` as const satisfies typeof DidList.TYPE_URI,
+  didList: `${DM}did/list/0.2` as const satisfies typeof DidList.TYPE_URI,
   didInfo: `${DM}did/info/0.1` as const satisfies typeof DidInfo.TYPE_URI,
   didLog: `${DM}did/log/0.1` as const satisfies typeof DidLog.TYPE_URI,
   didCheckName: `${DM}did/check-name/0.1` as const satisfies typeof DidCheckName.TYPE_URI,
@@ -514,16 +518,16 @@ const T = {
   domainPurge: `${DM}domain/purge/0.1` as const satisfies typeof DomainPurge.TYPE_URI,
   domainAssign: `${DM}domain/assign/0.1` as const satisfies typeof DomainAssign.TYPE_URI,
   domainUnassign: `${DM}domain/unassign/0.1` as const satisfies typeof DomainUnassign.TYPE_URI,
-  registryList: `${DM}registry/list/0.1` as const satisfies typeof RegistryList.TYPE_URI,
+  registryList: `${DM}registry/list/0.2` as const satisfies typeof RegistryList.TYPE_URI,
   registryPurgeDomain: `${DM}registry/purge-domain/0.1` as const satisfies typeof RegistryPurgeDomain.TYPE_URI,
   statsGet: `${DM}stats/get/0.1` as const satisfies typeof StatsGet.TYPE_URI,
-  statsTimeseries: `${DM}stats/timeseries/0.1` as const satisfies typeof StatsTimeseries.TYPE_URI,
+  statsTimeseries: `${DM}stats/timeseries/0.2` as const satisfies typeof StatsTimeseries.TYPE_URI,
   serverConfig: `${DM}server/config/0.1` as const satisfies typeof ServerConfig.TYPE_URI,
   identityList: `${DM}identity/list/0.1` as const satisfies typeof IdentityList.TYPE_URI,
   identityRetire: `${DM}identity/retire/0.1` as const satisfies typeof IdentityRetire.TYPE_URI,
   loginStart: `${TT}auth/passkey/login/start/0.2` as const satisfies typeof LoginStart.TYPE_URI,
   loginFinish: `${TT}auth/passkey/login/finish/0.2` as const satisfies typeof LoginFinish.TYPE_URI,
-  invite: `${TT}auth/passkey/enroll/invite/0.2` as const satisfies typeof Invite.TYPE_URI,
+  invite: `${TT}auth/passkey/enroll/invite/0.3` as const satisfies typeof Invite.TYPE_URI,
   redeemStart: `${TT}auth/passkey/enroll/redeem/start/0.1` as const satisfies typeof RedeemStart.TYPE_URI,
   redeemFinish: `${TT}auth/passkey/enroll/redeem/finish/0.1` as const satisfies typeof RedeemFinish.TYPE_URI,
   inviteList: `${TT}auth/passkey/enroll/invite/list/0.1` as const satisfies typeof InviteList.TYPE_URI,
@@ -533,12 +537,12 @@ const T = {
   passkeyAdminList: `${TT}auth/passkey/admin-list/0.1` as const satisfies typeof PasskeyAdminList.TYPE_URI,
   passkeyRevokeStart: `${TT}auth/passkey/revoke/start/0.2` as const satisfies typeof PasskeyRevokeStart.TYPE_URI,
   passkeyRevokeFinish: `${TT}auth/passkey/revoke/finish/0.2` as const satisfies typeof PasskeyRevokeFinish.TYPE_URI,
-  aclList: `${TT}acl/list/0.1` as const satisfies typeof AclList.TYPE_URI,
+  aclList: `${TT}acl/list/0.3` as const satisfies typeof AclList.TYPE_URI,
   revokeSession: `${TT}auth/revoke-session/0.2` as const satisfies typeof RevokeSession.TYPE_URI,
-  aclShow: `${TT}acl/show/0.1` as const satisfies typeof AclShow.TYPE_URI,
-  aclGrant: `${TT}acl/grant/0.1` as const satisfies typeof AclGrant.TYPE_URI,
-  aclRevoke: `${TT}acl/revoke/0.1` as const satisfies typeof AclRevoke.TYPE_URI,
-  aclChangeRole: `${TT}acl/change-role/0.1` as const satisfies typeof AclChangeRole.TYPE_URI,
+  aclShow: `${TT}acl/show/0.2` as const satisfies typeof AclShow.TYPE_URI,
+  aclGrant: `${TT}acl/grant/0.2` as const satisfies typeof AclGrant.TYPE_URI,
+  aclRevoke: `${TT}acl/revoke/0.2` as const satisfies typeof AclRevoke.TYPE_URI,
+  aclChangeRole: `${TT}acl/change-role/0.2` as const satisfies typeof AclChangeRole.TYPE_URI,
 } as const;
 
 /** Largest page `did/list` answers. */
@@ -552,18 +556,39 @@ function didLog(mnemonic: string, raw: boolean): Promise<DidLog.Response> {
   });
 }
 
-/** The webvh extension object an ACL grant carries. */
-function webvhAclExt(
+/**
+ * The AclEntry 0.2 a grant states for `subject`. Everything is explicit:
+ * the entry's domains are its `act` scope (always `all` for Admin and
+ * Service), `keys` is `none` and `capabilities` the role's `ceiling` — the
+ * only values this control plane holds — and there is no `approve`. The
+ * webvh `ext` carries only `quota` and the `defaultDomain`, which must be
+ * one of the act contexts.
+ */
+function aclGrantEntry(
+  subject: string,
+  role: Role,
   domains: DomainScope,
+  label: string | null | undefined,
   maxTotalSize: number | null | undefined,
   maxDidCount: number | null | undefined,
-): Record<string, unknown> {
-  const ext: Record<string, unknown> = { domains };
+): AclGrant.AclEntry {
+  const act = actOf(role, domains);
+  const defaultDomain = act.scope === "contexts" ? defaultDomainOf(domains) : undefined;
+  const webvh: Record<string, unknown> = {};
   const quota: Record<string, number> = {};
   if (typeof maxTotalSize === "number") quota.maxTotalSize = maxTotalSize;
   if (typeof maxDidCount === "number") quota.maxDidCount = maxDidCount;
-  if (Object.keys(quota).length > 0) ext.quota = quota;
-  return { [WEBVH_EXT]: ext };
+  if (Object.keys(quota).length > 0) webvh.quota = quota;
+  if (defaultDomain !== undefined) webvh.defaultDomain = defaultDomain;
+  return {
+    subject,
+    role,
+    act,
+    keys: { scope: "none" },
+    capabilities: { scope: "ceiling" },
+    ...(label !== null && label !== undefined ? { label } : {}),
+    ...(Object.keys(webvh).length > 0 ? { ext: { [WEBVH_EXT]: webvh } } : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -636,15 +661,16 @@ export const api = {
    *  following `did/list`'s pages to the end. */
   listDids: async (owner?: string): Promise<DidRecord[]> => {
     const out: DidRecord[] = [];
-    for (let offset = 0; ; ) {
+    for (let cursor: string | undefined; ; ) {
       const page = await trustTask<DidList.Payload, DidList.Response>(T.didList, {
         ...(owner ? { owner } : {}),
         limit: DID_LIST_PAGE,
-        ...(offset > 0 ? { offset } : {}),
+        ...(cursor ? { cursor } : {}),
       });
       out.push(...page.records.map(didRecordFromWire));
-      offset += page.records.length;
-      if (page.records.length === 0 || offset >= page.total) return out;
+      // 0.2 pages by cursor: `nextCursor` is present while records remain.
+      if (!page.nextCursor) return out;
+      cursor = page.nextCursor;
     }
   },
 
@@ -875,8 +901,17 @@ export const api = {
   // The webvh-specific members travel under `ext["vnd.affinidi.webvh"]`.
 
   listAcl: async (): Promise<AclListResponse> => {
-    const resp = await trustTask<AclList.Payload, AclList.Response>(T.aclList, {});
-    return { entries: (resp.entries ?? []).map(aclEntryFromWire) };
+    // 0.3 pages by cursor: `nextCursor` is present while entries remain.
+    const entries: AclEntry[] = [];
+    for (let cursor: string | undefined; ; ) {
+      const resp = await trustTask<AclList.Payload, AclList.Response>(
+        T.aclList,
+        cursor ? { cursor } : {},
+      );
+      entries.push(...resp.entries.map(aclEntryFromWire));
+      if (!resp.nextCursor) return { entries };
+      cursor = resp.nextCursor;
+    }
   },
 
   /**
@@ -952,21 +987,25 @@ export const api = {
   ): Promise<AclEntry> => {
     const did = await api.resolveAclSubject(subject);
     const resp = await trustTask<AclGrant.Payload, AclGrant.Response>(T.aclGrant, {
-      entry: {
-        subject: did,
+      entry: aclGrantEntry(
+        did,
         role,
-        ...(opts?.label !== undefined ? { label: opts.label } : {}),
-        ext: webvhAclExt(opts?.domains ?? { kind: "all" }, opts?.maxTotalSize, opts?.maxDidCount),
-      },
+        opts?.domains ?? { kind: "all" },
+        opts?.label,
+        opts?.maxTotalSize,
+        opts?.maxDidCount,
+      ),
     });
     return aclEntryFromWire(resp.entry);
   },
 
   /**
    * Change an entry. A role change is `acl/change-role` (state-checked
-   * against the current role); anything else re-emits `acl/grant` with the
-   * new metadata, which the maintainer treats as an idempotent update. A
-   * combined update sends both, role first.
+   * against the current role). Anything else re-emits `acl/grant`, which may
+   * re-assert or widen an entry but never narrow it: dropping domains is
+   * first an `acl/revoke` narrowing of the act scope to the domains kept,
+   * then the grant states the rest. A combined update sends the role change
+   * first.
    */
   updateAcl: async (
     did: string,
@@ -1002,20 +1041,30 @@ export const api = {
       updates.domains !== undefined;
 
     if (wantsMetadataUpdate) {
-      const base = entry ?? (await api.aclShow(did));
+      let base = entry ?? (await api.aclShow(did));
       if (!base) throw notFound();
-      const label = updates.label === undefined ? base.label : updates.label;
-      const resp = await trustTask<AclGrant.Payload, AclGrant.Response>(T.aclGrant, {
-        entry: {
+      const domains = updates.domains ?? base.domains ?? { kind: "all" };
+      const narrower = actNarrowing(
+        actOf(base.role, base.domains ?? { kind: "all" }),
+        actOf(base.role, domains),
+      );
+      if (narrower) {
+        const revoked = await trustTask<AclRevoke.Payload, AclRevoke.Response>(T.aclRevoke, {
           subject: did,
-          role: base.role,
-          ...(label !== null && label !== undefined ? { label } : {}),
-          ext: webvhAclExt(
-            updates.domains ?? base.domains ?? { kind: "all" },
-            updates.maxTotalSize === undefined ? base.max_total_size : updates.maxTotalSize,
-            updates.maxDidCount === undefined ? base.max_did_count : updates.maxDidCount,
-          ),
-        },
+          revocation: { kind: "act", act: narrower },
+        });
+        if (!revoked.entry) throw notFound();
+        base = aclEntryFromWire(revoked.entry);
+      }
+      const resp = await trustTask<AclGrant.Payload, AclGrant.Response>(T.aclGrant, {
+        entry: aclGrantEntry(
+          did,
+          base.role,
+          domains,
+          updates.label === undefined ? base.label : updates.label,
+          updates.maxTotalSize === undefined ? base.max_total_size : updates.maxTotalSize,
+          updates.maxDidCount === undefined ? base.max_did_count : updates.maxDidCount,
+        ),
       });
       entry = aclEntryFromWire(resp.entry);
     }
@@ -1035,7 +1084,10 @@ export const api = {
   },
 
   deleteAcl: async (did: string): Promise<void> => {
-    await trustTask<AclRevoke.Payload, AclRevoke.Response>(T.aclRevoke, { subject: did });
+    await trustTask<AclRevoke.Payload, AclRevoke.Response>(T.aclRevoke, {
+      subject: did,
+      revocation: { kind: "entry" },
+    });
   },
 
   // ---- Hosting domains ----

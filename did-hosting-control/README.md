@@ -240,10 +240,10 @@ The control plane has no REST management API. Its HTTP surface is:
 | `GET` | `/*` | The management UI (`ui` feature), for any path outside `/api` |
 
 The three `/api/auth/*` routes are the one sign-in with no Trust Task form:
-`auth/authenticate/0.2` carries no `id_token`, and a browser session does not
+`auth/authenticate/0.3` carries no `id_token`, and a browser session does not
 hold the subject key a Trust Task `auth/refresh` must be signed with. A peer
 that signs its own documents signs in with `auth/challenge/0.1` and
-`auth/authenticate/0.2` on `POST /api/trust-tasks`.
+`auth/authenticate/0.3` on `POST /api/trust-tasks`.
 
 Operational metrics are the admin-only `did-management/server/metrics/0.1`
 Trust Task; there is no Prometheus scrape endpoint.
@@ -255,7 +255,7 @@ DIDComm), with WebAuthn's ceremony data inside their payloads:
 
 | Trust Task | Proof | Purpose |
 | --- | --- | --- |
-| `auth/passkey/enroll/invite/0.2` | administrator | Issue an invite: a URL token and a separate claim code, stored only as hashes |
+| `auth/passkey/enroll/invite/0.3` | administrator | Issue an invite: a URL token and a separate claim code, stored only as hashes |
 | `auth/passkey/enroll/redeem/start/0.1` | optional | Present token + claim code; get creation options (and `uvOptions` over existing passkeys of the purpose) |
 | `auth/passkey/enroll/redeem/finish/0.1` | optional | Bind the passkey to the invite's subject and consume the invite |
 | `auth/passkey/enroll/start/0.2`, `finish/0.2` | the subject | Add a login passkey to your own VID (re-verified with an existing one) |

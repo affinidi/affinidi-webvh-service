@@ -2,25 +2,25 @@
  * Wire → view model.
  *
  * The control plane answers every management call with the generated
- * response type of its Trust Task (`@openvtc/trust-tasks`): RFC 3339
+ * response type of its Trust Task (`lib/trust-tasks/`, generated): RFC 3339
  * timestamps, camelCase, host-specific members under the
  * `vnd.affinidi.webvh` extension namespace. The screens render epoch seconds
  * and flat records, so each reply is projected here, once, at the boundary.
  * Pure functions, so the projections are tested on their own.
  */
 
-import type { DidRecord as WireDidRecord } from "@openvtc/trust-tasks/did-management/did/list/0.1/payload";
-import type { Response as DidLogResponse } from "@openvtc/trust-tasks/did-management/did/log/0.1/payload";
-import type { Response as ConfigResponse } from "@openvtc/trust-tasks/did-management/server/config/0.1/payload";
-import type { Response as IdentityListResponse } from "@openvtc/trust-tasks/did-management/identity/list/0.1/payload";
-import type { ServiceInstance as WireServiceInstance } from "@openvtc/trust-tasks/did-management/registry/list/0.1/payload";
-import type { Response as StatsResponse } from "@openvtc/trust-tasks/did-management/stats/get/0.1/payload";
+import type { DidRecord as WireDidRecord } from "./trust-tasks/did-management/did/list/0.2/payload";
+import type { Response as DidLogResponse } from "./trust-tasks/did-management/did/log/0.1/payload";
+import type { Response as ConfigResponse } from "./trust-tasks/did-management/server/config/0.1/payload";
+import type { Response as IdentityListResponse } from "./trust-tasks/did-management/identity/list/0.1/payload";
+import type { ServiceInstance as WireServiceInstance } from "./trust-tasks/did-management/registry/list/0.2/payload";
+import type { Response as StatsResponse } from "./trust-tasks/did-management/stats/get/0.1/payload";
 import type {
   Payload as TimeseriesPayload,
   Response as TimeseriesResponse,
-} from "@openvtc/trust-tasks/did-management/stats/timeseries/0.1/payload";
-import type { InviteSummary } from "@openvtc/trust-tasks/auth/passkey/enroll/invite/list/0.1/payload";
-import type { AclEntry as WireAclEntry } from "@openvtc/trust-tasks/acl/list/0.1/payload";
+} from "./trust-tasks/did-management/stats/timeseries/0.2/payload";
+import type { InviteSummary } from "./trust-tasks/auth/passkey/enroll/invite/list/0.1/payload";
+import type { AclEntry as WireAclEntry } from "./trust-tasks/acl/list/0.3/payload";
 
 import type {
   AclEntry,
@@ -188,7 +188,7 @@ export function serviceInstanceFromWire(i: WireServiceInstance): ServiceInstance
     label: i.label ?? null,
     url: i.publicUrl ?? null,
     status: i.status,
-    lastHealthCheck: epochSeconds(i.lastHealthCheck),
+    lastHealthCheck: epochSeconds(i.lastHealthCheckAt),
     registeredAt: requiredEpoch(i.registeredAt),
     enabledMethods: i.enabledMethods ?? [],
     servedDomains: i.servedDomains,
@@ -199,13 +199,13 @@ export function serviceInstanceFromWire(i: WireServiceInstance): ServiceInstance
     ...(i.lastInbound
       ? {
           lastInboundTransport: i.lastInbound.transport,
-          lastInboundAt: epochSeconds(i.lastInbound.at) ?? undefined,
+          lastInboundAt: epochSeconds(i.lastInbound.observedAt) ?? undefined,
         }
       : {}),
     ...(i.lastOutbound
       ? {
           lastOutboundTransport: i.lastOutbound.transport,
-          lastOutboundAt: epochSeconds(i.lastOutbound.at) ?? undefined,
+          lastOutboundAt: epochSeconds(i.lastOutbound.observedAt) ?? undefined,
         }
       : {}),
   };
@@ -234,7 +234,7 @@ export function timeRangeToWire(range: TimeRange): TimeseriesPayload["range"] {
 
 export function timeseriesFromWire(t: TimeseriesResponse): TimeSeriesPoint[] {
   return t.points.map((p) => ({
-    timestamp: requiredEpoch(p.at),
+    timestamp: requiredEpoch(p.startsAt),
     resolves: p.resolves,
     updates: p.updates,
   }));
@@ -377,6 +377,58 @@ export function aclEntryFromWire(spec: WireAclEntry): AclEntry {
     created_at: epochSeconds(spec.createdAt) ?? 0,
     max_total_size: typeof quota.maxTotalSize === "number" ? quota.maxTotalSize : null,
     max_did_count: typeof quota.maxDidCount === "number" ? quota.maxDidCount : null,
-    domains: (webvh.domains as DomainScope | undefined) ?? { kind: "all" },
+    domains: domainsFromAct(
+      spec.act,
+      typeof webvh.defaultDomain === "string" ? webvh.defaultDomain : undefined,
+    ),
   };
+}
+
+/** AclEntry 0.2's act scope. */
+export type ActScope = WireAclEntry["act"];
+
+/** Whether a role is held to its domains. Admin and Service act on every
+ *  domain, so their act scope is always `all`. */
+export function roleIsDomainScoped(role: AclEntry["role"]): boolean {
+  return role === "owner" || role === "metricsReader";
+}
+
+/** An entry's domains are its act scope: `all` → every domain, `contexts`
+ *  → those domains (with the default when it is one of them), `none` → no
+ *  domain. */
+export function domainsFromAct(act: ActScope, defaultDomain?: string): DomainScope {
+  if (act.scope === "all") return { kind: "all" };
+  if (act.scope === "none") return { kind: "allowed", domains: [] };
+  const domains = [...act.contexts];
+  return defaultDomain !== undefined && domains.includes(defaultDomain)
+    ? { kind: "allowed_with_default", domains, default: defaultDomain }
+    : { kind: "allowed", domains };
+}
+
+/** The act scope an entry with `role` and `domains` states. An empty domain
+ *  list is `none`, never an empty `contexts`. */
+export function actOf(role: AclEntry["role"], domains: DomainScope): ActScope {
+  if (!roleIsDomainScoped(role) || domains.kind === "all") return { scope: "all" };
+  if (domains.domains.length === 0) return { scope: "none" };
+  return { scope: "contexts", contexts: [...new Set(domains.domains)] as [string, ...string[]] };
+}
+
+/** The default domain `domains` names, if any (it rides in `ext`). */
+export function defaultDomainOf(domains: DomainScope): string | undefined {
+  return domains.kind === "allowed_with_default" ? domains.default : undefined;
+}
+
+/**
+ * The narrower act scope `acl/revoke` must apply before a grant can move an
+ * entry from `current` to `next`, or `null` when no domain is dropped. A
+ * grant may only re-assert or widen; dropping a domain is a revoke to
+ * `current ∩ next`, after which the grant widens to `next`.
+ */
+export function actNarrowing(current: ActScope, next: ActScope): ActScope | null {
+  if (next.scope === "all" || current.scope === "none") return null;
+  if (current.scope === "all") return next;
+  const keep = new Set(next.scope === "contexts" ? next.contexts : []);
+  const kept = current.contexts.filter((c) => keep.has(c));
+  if (kept.length === current.contexts.length) return null;
+  return kept.length === 0 ? { scope: "none" } : { scope: "contexts", contexts: kept as [string, ...string[]] };
 }

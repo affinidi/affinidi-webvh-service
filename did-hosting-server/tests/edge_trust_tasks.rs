@@ -942,7 +942,7 @@ async fn a_listing_not_signed_by_the_control_plane_does_not_reconcile() {
         OtherThread,
     }
     let (state, _dir) = edge_state().await;
-    let empty = json!({ "records": [], "total": 0 });
+    let empty = json!({ "records": [] });
     for forgery in [Forgery::Stranger, Forgery::Unsigned, Forgery::OtherThread] {
         let outcome = reconcile_once(&state, |request| {
             let empty = empty.clone();

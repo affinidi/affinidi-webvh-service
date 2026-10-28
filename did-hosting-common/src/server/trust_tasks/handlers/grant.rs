@@ -1,31 +1,38 @@
-//! `acl/grant/0.1` handler — admin records that a subject has been
-//! added to the ACL with a named role and optional scopes.
+//! `acl/grant/0.2` handler — an admin adds a subject to the ACL with a
+//! named role and an explicitly stated authority (AclEntry 0.2).
 //!
-//! Spec contract (from `specs/acl/grant/0.1/spec.md`):
+//! Spec contract (`specs/acl/grant/0.2/spec.md`, consumer items):
 //!
-//! 1. **Idempotent**. Re-emitting an identical grant against an
-//!    unchanged ACL produces no state change.
-//! 2. A grant that **changes** an existing subject's role MUST NOT use
-//!    this task; respond with `permission_denied` plus `details.reason`
-//!    pointing to `acl/change-role/0.1`. We attach a richer `details`
-//!    body so clients can auto-recover.
-//! 3. On acceptance, persist the document as the evidentiary record
-//!    and return the canonical resulting [`AclEntry`].
+//! 1. An unrecognised role is `roleNotRecognized`, never a default role.
+//! 2. An `act` or `approve` scope this maintainer cannot hold is
+//!    `invalidActScope`; listed capabilities are `unknownCapability` (it
+//!    recognises none). Nothing is accepted by dropping it — see
+//!    [`SpecAclEntry::into_local`] for every member it refuses.
+//! 3. The granter is evaluated against its **stored** entry: only an
+//!    `Admin` may grant, and an `Admin` holds every axis this maintainer can
+//!    express, so a grant it may make never exceeds it.
+//! 4. A subject that is the granter itself is `permissionDenied`.
+//! 5. A subject held under a different role is `permissionDenied`
+//!    pointing at `acl/change-role/0.2`. Under the same role the grant is
+//!    an idempotent re-assertion, or a widening; it never narrows — a
+//!    narrower `act` is `permissionDenied` pointing at `acl/revoke/0.2`.
+//! 6. The maintainer sets `createdAt`/`createdBy` itself and returns the
+//!    realized entry.
 
 use serde_json::json;
 use trust_tasks_rs::{
     ErrorPayload, ErrorResponse, ProofPolicy, ProofVerifier, ResolvedParties, StandardCode,
-    TransportHandler, TrustTask, specs::acl::grant::v0_1 as grant,
+    TransportHandler, TrustTask,
 };
 
 use crate::server::acl::{self, AclEntry, Role};
 use crate::server::auth::session::now_epoch;
-use crate::server::trust_tasks::{
-    DispatchOutcome, TrustTaskContext, entry::SpecAclEntry, reject_with, run_pipeline,
-};
+use crate::server::trust_tasks::entry::{EntryRefusal, SpecAclEntry, act_covers, act_of};
+use crate::server::trust_tasks::{DispatchOutcome, TrustTaskContext, reject_with, run_pipeline};
+use crate::tasks::acl::grant::v0_2 as grant;
 
 /// Run the framework pipeline + business logic for an inbound
-/// `acl/grant/0.1` request.
+/// `acl/grant/0.2` request.
 pub async fn handle<V>(
     ctx: &TrustTaskContext<'_>,
     transport: &(impl TransportHandler + Sync),
@@ -37,6 +44,7 @@ where
 {
     let acl_ks = ctx.acl_ks.clone();
     let acl_locks = ctx.acl_locks.clone();
+    let signing_oracle = ctx.signing_oracle;
     run_pipeline(
         transport,
         policy,
@@ -50,7 +58,7 @@ where
             let _guard = acl_locks
                 .guard(crate::server::trust_tasks::ACL_WRITE_LOCK_KEY)
                 .await;
-            handle_inner(&acl_ks, doc, &parties).await
+            handle_inner(&acl_ks, doc, &parties, signing_oracle).await
         },
     )
     .await
@@ -60,14 +68,9 @@ async fn handle_inner(
     acl_ks: &crate::server::store::KeyspaceHandle,
     doc: TrustTask<grant::Payload>,
     parties: &ResolvedParties,
+    signing_oracle: bool,
 ) -> Result<TrustTask<grant::Response>, ErrorResponse> {
-    // ─── 1. Authorise the caller. ──────────────────────────────────
-    // The framework has already validated identity (in-band issuer
-    // matches transport-derived sender, proof verified, ...) and
-    // surfaced the resolved party in `parties.issuer` — in-band
-    // wins, transport fills in when in-band is absent (SPEC §4.8.1).
-    // We additionally check the maintainer-side policy: only Admin
-    // entries in our own ACL may grant.
+    // ─── 1. Authorise the caller against its stored entry. ─────────
     let caller = parties.issuer.as_deref().ok_or_else(|| {
         reject_with(
             &doc,
@@ -81,11 +84,10 @@ async fn handle_inner(
             return Err(reject_with(
                 &doc,
                 ErrorPayload::new(StandardCode::PermissionDenied)
-                    .with_message("only Admin callers may emit acl/grant/0.1"),
+                    .with_message("only Admin callers may emit acl/grant/0.2"),
             ));
         }
         Err(_) => {
-            // Not in ACL at all.
             return Err(reject_with(
                 &doc,
                 ErrorPayload::new(StandardCode::PermissionDenied)
@@ -95,12 +97,9 @@ async fn handle_inner(
     }
 
     // ─── 2. Translate the proposed entry to our local shape. ──────
-    let proposed = into_local_entry(&doc.payload.entry).map_err(|msg| {
-        reject_with(
-            &doc,
-            ErrorPayload::new(StandardCode::MalformedRequest).with_message(msg),
-        )
-    })?;
+    let proposed = SpecAclEntry::from_spec(&doc.payload.entry)
+        .and_then(|e| e.into_local(0, signing_oracle))
+        .map_err(|refusal| reject_with(&doc, refusal_payload(refusal)))?;
 
     // The subject must be a DID. Resolving an agent name to its DID is the
     // client's job (the console does it through `agent-name/resolve`); a
@@ -117,21 +116,12 @@ async fn handle_inner(
         ));
     }
 
-    // ─── 3. Spec invariants on the proposed entry shape. ──────────
-    // The spec models scopes as an opaque string array (e.g.
-    // `["context:project-alpha"]`). We don't model webvh's domain
-    // scope through `scopes` — it lives in
-    // `ext.vnd.affinidi.webvh.domains`. A grant carrying an opaque
-    // `scopes` array confuses the wire form (which scope binds?), so
-    // we refuse it for now. acl/revoke is welcome to carry `scopes`
-    // for scope-reduction; on grant, hold the line.
-    if !doc.payload.entry.scopes.is_empty() {
+    // ─── 3. No subject may grant to itself. ───────────────────────
+    if crate::scid::same_reference(caller, &proposed.did) {
         return Err(reject_with(
             &doc,
-            ErrorPayload::new(StandardCode::MalformedRequest).with_message(
-                "acl/grant/0.1 with `scopes` is not supported by this maintainer — \
-                 use `ext.vnd.affinidi.webvh.domains` for per-entry domain scope",
-            ),
+            ErrorPayload::new(StandardCode::PermissionDenied)
+                .with_message("a granter may not grant to itself"),
         ));
     }
 
@@ -140,18 +130,29 @@ async fn handle_inner(
         .await
         .map_err(|e| internal(&doc, e))?;
 
+    let created_by = existing.is_none().then(|| caller.to_string());
     let realized = match existing {
         Some(current) if current.role == proposed.role => {
-            // Idempotent on *role*, but the producer's view of the
-            // non-role metadata fields (label, quota knobs, domain
-            // scope) wins on re-grant. Spec §3 says "re-emitting an
-            // identical grant produces no state change" — and the
-            // common case for `updateAcl`-style flows is the UI
-            // changing a label or quota while leaving the role
-            // alone. We preserve `created_at` (the maintainer's
-            // canonical insertion time) and replace everything else
-            // from the producer's intent. Persist only when at
-            // least one mutable field actually changes.
+            // An idempotent re-assertion or a widening. The non-authority
+            // members (label, quota, default domain) take the producer's
+            // values; `created_at` stays the maintainer's insertion time.
+            let (old_act, new_act) = (act_of(&current), act_of(&proposed));
+            if !act_covers(&new_act, &old_act) {
+                return Err(reject_with(
+                    &doc,
+                    ErrorPayload::new(StandardCode::PermissionDenied)
+                        .with_message(
+                            "a grant may not narrow an existing entry's act scope; narrow it \
+                             with acl/revoke/0.2",
+                        )
+                        .with_details(json!({
+                            "reason": "narrowing_requires_revoke",
+                            "currentAct": serde_json::to_value(&old_act)
+                                .expect("AuthorityScope serialises"),
+                            "suggestedTask": "https://trusttasks.org/spec/acl/revoke/0.2"
+                        })),
+                ));
+            }
             let merged = AclEntry {
                 did: current.did.clone(),
                 role: current.role.clone(),
@@ -178,19 +179,17 @@ async fn handle_inner(
                 ErrorPayload::new(StandardCode::PermissionDenied)
                     .with_message(
                         "subject already exists with a different role; role changes must use \
-                         acl/change-role/0.1",
+                         acl/change-role/0.2",
                     )
                     .with_details(json!({
                         "reason": "role_change_required",
                         "existingRole": current.role.to_string(),
                         "proposedRole": proposed.role.to_string(),
-                        "suggestedTask": "https://trusttasks.org/spec/acl/change-role/0.1"
+                        "suggestedTask": "https://trusttasks.org/spec/acl/change-role/0.2"
                     })),
             ));
         }
         None => {
-            // Persist the new entry; the maintainer fills in createdAt
-            // / createdBy from the request metadata.
             let mut entry = proposed;
             entry.created_at = now_epoch();
             acl::store_acl_entry(acl_ks, &entry)
@@ -201,40 +200,48 @@ async fn handle_inner(
     };
 
     // ─── 5. Build the response document. ──────────────────────────
-    let resp_entry = into_spec_entry(&realized);
-    // The generated payload types are `#[non_exhaustive]` from trust-tasks
-    // 0.17 on: built through the generated builder, whose `try_into` can only
-    // fail on a field left unset.
+    let mut neutral = SpecAclEntry::from_local(&realized, signing_oracle);
+    neutral.created_by = created_by;
+    // The generated payload types are `#[non_exhaustive]`: built through the
+    // generated builder, whose `try_into` can only fail on a field left unset.
     let resp_payload: grant::Response = grant::Response::builder()
-        .entry(resp_entry)
+        .entry(neutral.into_spec::<grant::AclEntry>())
         .try_into()
         .expect("grant response has every required field set");
     let resp_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
     Ok(doc.respond_with(resp_id, resp_payload))
 }
 
-/// `grant::AclEntry` → local [`AclEntry`].
-///
-/// Routes the spec-typed entry through the neutral [`SpecAclEntry`]
-/// shape (same JSON, no per-spec Rust-type duplication). Returns
-/// `Err(message)` on translation failure — caller wraps as
-/// `MalformedRequest`.
-fn into_local_entry(spec: &grant::AclEntry) -> Result<AclEntry, String> {
-    let value = serde_json::to_value(spec).map_err(|e| format!("entry serialises: {e}"))?;
-    let neutral: SpecAclEntry =
-        serde_json::from_value(value).map_err(|e| format!("entry round-trip: {e}"))?;
-    // created_at_fallback = 0 here so absent createdAt surfaces as 0
-    // (the legacy "no timestamp" sentinel). handle_inner overwrites
-    // with now_epoch() at insert time.
-    neutral.into_local(0).map_err(|e| e.to_string())
-}
-
-/// Local [`AclEntry`] → `grant::AclEntry` (the canonical response
-/// form).
-fn into_spec_entry(local: &AclEntry) -> grant::AclEntry {
-    let neutral = SpecAclEntry::from_local(local);
-    let value = serde_json::to_value(&neutral).expect("SpecAclEntry serialises");
-    serde_json::from_value(value).expect("grant::AclEntry from SpecAclEntry value")
+/// Render an [`EntryRefusal`] with the code `acl/grant/0.2` declares for it.
+fn refusal_payload(refusal: EntryRefusal) -> ErrorPayload {
+    let message = refusal.to_string();
+    match refusal {
+        EntryRefusal::RoleNotRecognized(role) => {
+            ErrorPayload::from(grant::error_codes::ROLE_NOT_RECOGNIZED)
+                .with_message(message)
+                .with_details(json!({
+                    "offendingRole": role,
+                    "knownRoles": ["admin", "owner", "service", "metricsReader"],
+                }))
+        }
+        EntryRefusal::InvalidActScope { member, .. } => {
+            ErrorPayload::from(grant::error_codes::INVALID_ACT_SCOPE)
+                .with_message(message)
+                .with_details(json!({ "member": member }))
+        }
+        EntryRefusal::UnknownCapability(caps) => {
+            ErrorPayload::from(grant::error_codes::UNKNOWN_CAPABILITY)
+                .with_message(message)
+                .with_details(json!({ "capabilities": caps }))
+        }
+        EntryRefusal::NotSupported { member, .. } => ErrorPayload::new(StandardCode::TaskFailed)
+            .with_retryable(false)
+            .with_message(message)
+            .with_details(json!({ "reason": "notSupportedByMaintainer", "member": member })),
+        EntryRefusal::Malformed(_) => {
+            ErrorPayload::new(StandardCode::MalformedRequest).with_message(message)
+        }
+    }
 }
 
 fn internal<P>(doc: &TrustTask<P>, err: impl std::fmt::Display) -> ErrorResponse {
@@ -327,32 +334,27 @@ mod tests {
         (store, acl_ks)
     }
 
-    /// Build a typed `acl/grant/0.1` request document with `payload.entry`
-    /// for `subject` at `role`, the issuer pinned to `issuer_did`, and
+    /// Build a typed `acl/grant/0.2` request document for `subject` at
+    /// `role`, acting on every domain, the issuer pinned to `issuer_did`, and
     /// recipient pinned to `SERVICE_DID`.
     fn grant_request(issuer_did: &str, subject: &str, role: &str) -> TrustTask<grant::Payload> {
-        // The generated types are `#[non_exhaustive]` from trust-tasks 0.17
-        // on; the fields left unset here (`step_up`, the audit stamps) are the
-        // ones the literal used to spell as `None`. `step_up` in particular is
-        // an optional per-entry AAL hint we don't model, so the entry still
-        // translates as a plain webvh grant.
-        let entry: grant::AclEntry = grant::AclEntry::builder()
-            .subject(subject)
-            .role(role)
-            .scopes(vec![])
-            .label(Some(
-                "test entry".parse::<grant::AclEntryLabel>().expect("label"),
-            ))
-            // Owner needs domains; we always supply it via the webvh ext
-            // so the entry handler accepts it on translate.
-            .ext(
-                serde_json::from_value::<Option<grant::Ext>>(serde_json::json!({
-                    WEBVH_EXT_KEY: { "domains": { "kind": "all" } }
-                }))
-                .unwrap(),
-            )
-            .try_into()
-            .expect("test ACL entry is well formed");
+        grant_request_with(
+            issuer_did,
+            serde_json::json!({
+                "subject": subject,
+                "role": role,
+                "act": { "scope": "all" },
+                "keys": { "scope": "none" },
+                "capabilities": { "scope": "ceiling" },
+                "label": "test entry"
+            }),
+        )
+    }
+
+    /// Build a typed `acl/grant/0.2` request carrying `entry` verbatim.
+    fn grant_request_with(issuer_did: &str, entry: serde_json::Value) -> TrustTask<grant::Payload> {
+        let entry: grant::AclEntry =
+            serde_json::from_value(entry).expect("test ACL entry is an AclEntry 0.2");
         let payload: grant::Payload = grant::Payload::builder()
             .entry(entry)
             .reason(Some(
@@ -366,14 +368,30 @@ mod tests {
         doc.issuer = Some(issuer_did.into());
         doc.recipient = Some(SERVICE_DID.into());
         doc.issued_at = Some(chrono::Utc::now());
-        // `acl/grant/0.1` is REQUIRED: framework rejects proofless
+        // `acl/grant/0.2` is REQUIRED: framework rejects proofless
         // documents with `proof_required` regardless of policy. Every
-        // grant_request() carries a stub proof so the pipeline reaches
-        // the handler under `ProofPolicy::AcceptUnverified` (the test
-        // default, mirroring `enforce_proofs=false` minus the
-        // RECOMMENDED-spec-only constraint).
+        // request carries a stub proof so the pipeline reaches the handler
+        // under `ProofPolicy::AcceptUnverified`.
         add_stub_proof(&mut doc);
         doc
+    }
+
+    fn owner_entry(contexts: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "subject": ALICE_DID,
+            "role": "owner",
+            "act": { "scope": "contexts", "contexts": contexts },
+            "keys": { "scope": "none" },
+            "capabilities": { "scope": "ceiling" },
+            "label": "test entry"
+        })
+    }
+
+    fn rejected(outcome: DispatchOutcome) -> ErrorResponse {
+        match outcome {
+            DispatchOutcome::Rejected(e) => e,
+            other => panic!("expected Rejected, got {other:?}"),
+        }
     }
 
     fn ctx<'a>(
@@ -384,6 +402,7 @@ mod tests {
             acl_ks,
             acl_locks,
             my_vid: SERVICE_DID,
+            signing_oracle: false,
         }
     }
 
@@ -474,10 +493,16 @@ mod tests {
         let entry_value = resp.payload.get("entry").expect("response has entry");
         assert_eq!(entry_value["subject"], ALICE_DID);
         assert_eq!(entry_value["role"], "owner");
-        // Maintainer-filled fields: createdAt set to now.
+        // Maintainer-filled fields: createdAt set to now, createdBy the granter.
         assert!(entry_value.get("createdAt").is_some());
-        // Vendor ext round-tripped.
-        assert_eq!(entry_value["ext"][WEBVH_EXT_KEY]["domains"]["kind"], "all");
+        assert_eq!(entry_value["createdBy"], ADMIN_DID);
+        // Authority stated explicitly.
+        assert_eq!(entry_value["act"], serde_json::json!({ "scope": "all" }));
+        assert_eq!(entry_value["keys"], serde_json::json!({ "scope": "none" }));
+        assert_eq!(
+            entry_value["capabilities"],
+            serde_json::json!({ "scope": "ceiling" })
+        );
 
         let stored = acl::get_acl_entry(&acl_ks, ALICE_DID).await.unwrap();
         assert!(stored.is_some());
@@ -563,7 +588,7 @@ mod tests {
         assert_eq!(details["proposedRole"], "admin");
         assert_eq!(
             details["suggestedTask"],
-            "https://trusttasks.org/spec/acl/change-role/0.1"
+            "https://trusttasks.org/spec/acl/change-role/0.2"
         );
     }
 
@@ -615,69 +640,113 @@ mod tests {
         );
     }
 
-    /// Re-grant with the same role but a changed `label` /
-    /// `quota` / `domains` MUST persist the producer's updated view
-    /// of the metadata fields. Pinning this catches a regression where
-    /// the idempotent branch returns the existing entry verbatim and
-    /// silently drops UI-driven metadata edits.
+    /// Re-grant with the same role, a wider act scope and changed
+    /// `label` / quota / default domain persists the producer's view: a
+    /// grant may re-assert or widen an entry.
     #[tokio::test]
-    async fn same_role_regrant_with_changed_metadata_persists_updates() {
+    async fn same_role_regrant_that_widens_persists_updates() {
         let (_store, acl_ks) = harness().await;
         let acl_locks = crate::server::path_locks::PathLocks::new();
         let ctx = ctx(&acl_ks, &acl_locks);
         let transport = transport(ADMIN_DID);
 
-        let _ = handle(
+        let first = handle(
             &ctx,
             &transport,
             no_verifier(),
-            grant_request(ADMIN_DID, ALICE_DID, "owner"),
+            grant_request_with(ADMIN_DID, owner_entry(&["alpha.example"])),
         )
         .await;
+        assert!(matches!(first, DispatchOutcome::Handled(_)), "{first:?}");
         let before = acl::get_acl_entry(&acl_ks, ALICE_DID)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(before.label, Some("test entry".parse().expect("label")),);
 
-        let mut update = grant_request(ADMIN_DID, ALICE_DID, "owner");
-        update.payload.entry.label = Some("Alice — updated".parse().expect("label"));
-        update.payload.entry.ext = serde_json::from_value(serde_json::json!({
-            WEBVH_EXT_KEY: {
-                "domains": {
-                    "kind": "allowed",
-                    "domains": ["alpha.example", "beta.example"]
-                },
-                "quota": { "maxDidCount": 25 }
-            }
-        }))
-        .unwrap();
-
-        let outcome = handle(&ctx, &transport, no_verifier(), update).await;
-        let resp = match outcome {
+        let mut wider = owner_entry(&["alpha.example", "beta.example"]);
+        wider["label"] = serde_json::json!("Alice — updated");
+        wider["ext"] = serde_json::json!({
+            WEBVH_EXT_KEY: { "quota": { "maxDidCount": 25 }, "defaultDomain": "beta.example" }
+        });
+        let resp = match handle(
+            &ctx,
+            &transport,
+            no_verifier(),
+            grant_request_with(ADMIN_DID, wider),
+        )
+        .await
+        {
             DispatchOutcome::Handled(d) => d,
             other => panic!("expected Handled, got {other:?}"),
         };
         assert_eq!(resp.payload["entry"]["label"], "Alice — updated");
         assert_eq!(
-            resp.payload["entry"]["ext"][WEBVH_EXT_KEY]["domains"]["kind"],
-            "allowed"
+            resp.payload["entry"]["act"],
+            serde_json::json!({ "scope": "contexts", "contexts": ["alpha.example", "beta.example"] })
+        );
+        assert_eq!(
+            resp.payload["entry"]["ext"][WEBVH_EXT_KEY]["defaultDomain"],
+            "beta.example"
         );
 
         let after = acl::get_acl_entry(&acl_ks, ALICE_DID)
             .await
             .unwrap()
             .unwrap();
-        // created_at preserved from the original insert.
         assert_eq!(after.created_at, before.created_at);
         assert_eq!(after.label, Some("Alice — updated".into()));
         assert_eq!(after.max_did_count, Some(25));
-        match after.domains {
-            crate::server::domain::DomainScope::Allowed { domains } => {
-                assert_eq!(domains, vec!["alpha.example", "beta.example"]);
+        assert_eq!(
+            after.domains,
+            DomainScope::AllowedWithDefault {
+                domains: vec!["alpha.example".into(), "beta.example".into()],
+                default: "beta.example".into(),
             }
-            other => panic!("expected Allowed scope, got {other:?}"),
-        }
+        );
+    }
+
+    /// A grant never narrows: dropping a domain is `acl/revoke/0.2`'s job.
+    #[tokio::test]
+    async fn same_role_regrant_that_narrows_is_refused() {
+        let (_store, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        let ctx = ctx(&acl_ks, &acl_locks);
+        let transport = transport(ADMIN_DID);
+        let _ = handle(
+            &ctx,
+            &transport,
+            no_verifier(),
+            grant_request_with(ADMIN_DID, owner_entry(&["alpha.example", "beta.example"])),
+        )
+        .await;
+
+        let err = rejected(
+            handle(
+                &ctx,
+                &transport,
+                no_verifier(),
+                grant_request_with(ADMIN_DID, owner_entry(&["alpha.example"])),
+            )
+            .await,
+        );
+        assert_eq!(
+            err.payload.code,
+            trust_tasks_rs::TrustTaskCode::Standard(StandardCode::PermissionDenied)
+        );
+        assert_eq!(
+            err.payload.details.unwrap()["suggestedTask"],
+            "https://trusttasks.org/spec/acl/revoke/0.2"
+        );
+        let after = acl::get_acl_entry(&acl_ks, ALICE_DID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.domains,
+            DomainScope::Allowed {
+                domains: vec!["alpha.example".into(), "beta.example".into()]
+            }
+        );
     }
 
     /// Two concurrent `acl/grant` requests targeting the same fresh
@@ -701,6 +770,7 @@ mod tests {
                 acl_ks: &ctx_a_ks,
                 acl_locks: &ctx_a_locks,
                 my_vid: SERVICE_DID,
+                signing_oracle: false,
             };
             handle(
                 &ctx,
@@ -717,6 +787,7 @@ mod tests {
                 acl_ks: &ctx_b_ks,
                 acl_locks: &ctx_b_locks,
                 my_vid: SERVICE_DID,
+                signing_oracle: false,
             };
             handle(
                 &ctx,
@@ -806,7 +877,7 @@ mod tests {
     /// REQUIRED spec + absent proof → `proof_required`. Under upstream
     /// 0.1.1 this fires authoritatively from `P::IS_PROOF_REQUIRED`
     /// regardless of the consumer's `ProofPolicy`. Test pins the
-    /// framework's per-spec enforcement on `acl/grant/0.1`.
+    /// framework's per-spec enforcement on `acl/grant/0.2`.
     #[tokio::test]
     async fn required_spec_with_missing_proof_rejects_proof_required() {
         let (_store, acl_ks) = harness().await;
@@ -881,30 +952,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opaque_scopes_on_grant_rejected_as_malformed() {
+    async fn a_granter_may_not_grant_to_itself() {
+        let (_store, acl_ks) = harness().await;
+        let acl_locks = crate::server::path_locks::PathLocks::new();
+        let err = rejected(
+            handle(
+                &ctx(&acl_ks, &acl_locks),
+                &transport(ADMIN_DID),
+                no_verifier(),
+                grant_request(ADMIN_DID, ADMIN_DID, "admin"),
+            )
+            .await,
+        );
+        assert_eq!(
+            err.payload.code,
+            trust_tasks_rs::TrustTaskCode::Standard(StandardCode::PermissionDenied)
+        );
+    }
+
+    /// Each authority member this maintainer cannot hold is refused with the
+    /// code `acl/grant/0.2` declares for it — never accepted by dropping it.
+    #[tokio::test]
+    async fn authority_this_maintainer_cannot_hold_is_refused() {
         let (_store, acl_ks) = harness().await;
         let acl_locks = crate::server::path_locks::PathLocks::new();
         let ctx = ctx(&acl_ks, &acl_locks);
         let transport = transport(ADMIN_DID);
 
-        let mut doc = grant_request(ADMIN_DID, ALICE_DID, "owner");
-        doc.payload.entry.scopes = vec!["context:project-alpha".into()];
+        let mut admin_narrow = owner_entry(&["alpha.example"]);
+        admin_narrow["role"] = serde_json::json!("admin");
+        let mut approver = owner_entry(&["alpha.example"]);
+        approver["approve"] = serde_json::json!({ "scope": "all" });
+        let mut listed = owner_entry(&["alpha.example"]);
+        listed["capabilities"] =
+            serde_json::json!({ "scope": "listed", "grants": [{ "capability": "did.publish" }] });
+        let mut unknown_role = owner_entry(&["alpha.example"]);
+        unknown_role["role"] = serde_json::json!("superuser");
+        let mut expiring = owner_entry(&["alpha.example"]);
+        expiring["expiresAt"] = serde_json::json!("2030-01-01T00:00:00Z");
 
-        let outcome = handle(&ctx, &transport, no_verifier(), doc).await;
-        let err = match outcome {
-            DispatchOutcome::Rejected(e) => e,
-            other => panic!("expected Rejected, got {other:?}"),
-        };
-        assert_eq!(
-            err.payload.code,
-            trust_tasks_rs::TrustTaskCode::Standard(StandardCode::MalformedRequest)
-        );
-        // No partial write — Alice never landed.
-        assert!(
-            acl::get_acl_entry(&acl_ks, ALICE_DID)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        let cases = [
+            (
+                admin_narrow,
+                trust_tasks_rs::TrustTaskCode::from(grant::error_codes::INVALID_ACT_SCOPE),
+            ),
+            (approver, grant::error_codes::INVALID_ACT_SCOPE.into()),
+            (listed, grant::error_codes::UNKNOWN_CAPABILITY.into()),
+            (unknown_role, grant::error_codes::ROLE_NOT_RECOGNIZED.into()),
+            (expiring, StandardCode::TaskFailed.into()),
+        ];
+        for (entry, code) in cases {
+            let err = rejected(
+                handle(
+                    &ctx,
+                    &transport,
+                    no_verifier(),
+                    grant_request_with(ADMIN_DID, entry),
+                )
+                .await,
+            );
+            assert_eq!(err.payload.code, code, "{:?}", err.payload.message);
+            assert!(
+                acl::get_acl_entry(&acl_ks, ALICE_DID)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "nothing written"
+            );
+        }
     }
 }

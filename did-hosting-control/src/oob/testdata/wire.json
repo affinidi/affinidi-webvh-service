@@ -1,5 +1,5 @@
 {
-  "_comment": "auth/oob/* wire fixtures. `outbound` is what this service emitted with its local wire types before they were replaced by trust_tasks_rs::specs::auth::oob (captured from the old types, key-sorted as serde_json::Value writes them); `inbound` are schema-valid payloads a starter or wallet sends. oob::tests::wire_fixtures_round_trip pins both.",
+  "_comment": "auth/oob/* wire fixtures at the served versions (request/claim/redeem 0.2, prove/respond/grant 0.3, cancel/identify 0.1). `outbound` is what this service emits, key-sorted as serde_json::Value writes it; `inbound` are schema-valid payloads a starter or wallet sends. oob::tests::wire_fixtures_round_trip pins both.",
   "inbound": {
     "cancel": {
       "requestId": "AAAAAAAAAAAAAAAAAAAAAA"
@@ -11,18 +11,18 @@
       "approverKey": "did:key:z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2",
       "contextDigest": "zQmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR",
       "decision": "approve",
-      "notAfter": 1790003600,
       "origin": "https://control.example.com",
       "requestId": "AAAAAAAAAAAAAAAAAAAAAA",
+      "sessionEndsAt": "2026-09-21T15:13:20Z",
       "sessionKey": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
     },
     "grantDecline": {
       "approverKey": "did:key:z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2",
       "contextDigest": "zQmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR",
       "decision": "decline",
-      "notAfter": 1790003600,
       "origin": "https://control.example.com",
       "requestId": "AAAAAAAAAAAAAAAAAAAAAA",
+      "sessionEndsAt": "2026-09-21T15:13:20Z",
       "sessionKey": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
     },
     "identify": {
@@ -77,9 +77,9 @@
           "approverKey": "did:key:z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2",
           "contextDigest": "zQmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR",
           "decision": "approve",
-          "notAfter": 1790003600,
           "origin": "https://control.example.com",
           "requestId": "AAAAAAAAAAAAAAAAAAAAAA",
+          "sessionEndsAt": "2026-09-21T15:13:20Z",
           "sessionKey": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
         },
         "proof": {
@@ -91,7 +91,7 @@
           "verificationMethod": "did:webvh:QmMember:members.example.com#key-0"
         },
         "recipient": "did:webvh:QmScid:control.example.com",
-        "type": "https://trusttasks.org/spec/auth/oob/grant/0.1"
+        "type": "https://trusttasks.org/spec/auth/oob/grant/0.3"
       }
     }
   },
@@ -100,7 +100,7 @@
       "status": "cancelled"
     },
     "claim": {
-      "decisionDeadline": 1790000120,
+      "decisionClosesAt": "2026-09-21T14:15:20Z",
       "origin": "https://control.example.com",
       "purpose": "login",
       "requestId": "AAAAAAAAAAAAAAAAAAAAAA",
@@ -110,7 +110,7 @@
       }
     },
     "prove": {
-      "decisionDeadline": 1790000120,
+      "decisionClosesAt": "2026-09-21T14:15:20Z",
       "identifiedAs": "did:webvh:QmMember:members.example.com",
       "origin": "https://control.example.com",
       "purpose": "login",
@@ -129,7 +129,7 @@
       "sessionKey": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
     },
     "proveUnknownNetwork": {
-      "decisionDeadline": 1790000120,
+      "decisionClosesAt": "2026-09-21T14:15:20Z",
       "identifiedAs": "did:webvh:QmMember:members.example.com",
       "origin": "https://control.example.com",
       "purpose": "login",
@@ -162,7 +162,7 @@
           }
         }
       },
-      "notAfter": 1790003600,
+      "sessionEndsAt": "2026-09-21T15:13:20Z",
       "subject": "did:webvh:QmMember:members.example.com"
     },
     "redeemNoExt": {
@@ -172,11 +172,11 @@
         "uv"
       ],
       "displayName": "Alice",
-      "notAfter": 1790003600,
+      "sessionEndsAt": "2026-09-21T15:13:20Z",
       "subject": "did:webvh:QmMember:members.example.com"
     },
     "request": {
-      "claimDeadline": 1790000120,
+      "claimClosesAt": "2026-09-21T14:15:20Z",
       "requestId": "AAAAAAAAAAAAAAAAAAAAAA"
     },
     "respondApproved": {

@@ -701,7 +701,7 @@ pub struct AuthConfig {
     #[serde(default = "default_max_pending_challenges_per_did")]
     pub max_pending_challenges_per_did: usize,
     /// The absolute ceiling on a session's life, in seconds from
-    /// authentication (`auth/authenticate/0.2` or `/0.3`'s `Session.issuedAt`).
+    /// authentication (`auth/authenticate/0.3`'s `Session.issuedAt`).
     /// No `auth/refresh/0.2` may advance `Session.expiresAt` — nor, in this
     /// implementation, the underlying refresh-token deadline — past
     /// `issuedAt + absolute_session_lifetime`; a session that has already

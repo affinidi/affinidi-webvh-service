@@ -9,6 +9,7 @@
     "web": "expo start --web",
     "build:web": "expo export --platform web --output-dir ../did-hosting-control/ui-dist",
     "typecheck": "tsc --noEmit",
+    "gen:tasks": "trust-tasks-gen-ts --lock ../did-hosting-common/trust-tasks.lock --out lib/trust-tasks",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -33,7 +34,8 @@
     "recharts": "^3.7.0"
   },
   "devDependencies": {
-    "@openvtc/trust-tasks": "^0.26.20",
+    "@openvtc/trust-tasks": "^0.28.0",
+    "@openvtc/trust-tasks-gen": "^0.1.1",
     "@types/react": "~19.3.0",
     "typescript": "~7.0.2",
     "vitest": "^5.0.0"

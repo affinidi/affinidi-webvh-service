@@ -1,13 +1,13 @@
 //! `did-management/server/{info,config,metrics}`, `stats/*` and
 //! `identity/*`: what the service says about itself.
 
-use serde_json::{Value, json};
-use tracing::warn;
-use trust_tasks_rs::specs::did_management::{
+use did_hosting_common::tasks::did_management::{
     identity::{list as identity_list, retire as identity_retire},
     server::{config, info, metrics},
     stats::{get as stats_get, timeseries},
 };
+use serde_json::{Value, json};
+use tracing::warn;
 
 use did_hosting_common::server::pending_purge::parse_grace_string;
 
@@ -285,15 +285,15 @@ pub(crate) async fn stats_get(
     typed(Value::Object(body), "stats/get response")
 }
 
-/// `stats/timeseries/0.1`: a slot's series (owner or admin), a domain's
+/// `stats/timeseries/0.2`: a slot's series (owner or admin), a domain's
 /// (admin, or a caller whose domain scope holds it — a domain outside it
 /// answers exactly as an unknown one), or the server-wide series (admin).
 pub(crate) async fn timeseries(
     cx: &Cx<'_>,
-    p: timeseries::v0_1::Payload,
-) -> Result<timeseries::v0_1::Response, TaskError> {
+    p: timeseries::v0_2::Payload,
+) -> Result<timeseries::v0_2::Response, TaskError> {
     use crate::acl::Role;
-    use timeseries::v0_1::{PayloadRange, error_codes};
+    use timeseries::v0_2::{PayloadRange, error_codes};
 
     let auth = cx.auth().await?;
     let state = cx.state;
@@ -352,7 +352,7 @@ pub(crate) async fn timeseries(
     };
     let points: Vec<Value> = points
         .iter()
-        .map(|pt| json!({ "at": at(pt.timestamp), "resolves": pt.resolves, "updates": pt.updates }))
+        .map(|pt| json!({ "startsAt": at(pt.timestamp), "resolves": pt.resolves, "updates": pt.updates }))
         .collect();
     typed(
         json!({ "range": range_name, "bucketSeconds": bucket_seconds, "points": points }),

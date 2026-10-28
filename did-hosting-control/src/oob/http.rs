@@ -459,7 +459,7 @@ async fn create_session(state: &AppState, session: &ApprovedSession) -> Result<V
     )
     .await
     .map_err(|e| e.to_string())?;
-    // The absolute lifetime `auth/refresh` enforces: never past `notAfter`.
+    // The absolute lifetime `auth/refresh` enforces: never past `sessionEndsAt`.
     let absolute = session.not_after.min(now + auth.absolute_session_lifetime);
     crate::trust_tasks_auth::store_auth_proxy_meta(state, &tokens.session_id, None, absolute)
         .await

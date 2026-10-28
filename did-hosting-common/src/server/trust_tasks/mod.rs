@@ -71,15 +71,13 @@ pub use didwebvh_rs::host_policy::HostPolicy;
 pub use transport::{TSP_BINDING_URI, TspTransportHandler};
 pub use verifier::{TransportBoundVerifier, build_verifier, is_unreachable};
 
+use crate::tasks::acl::{change_role, grant, list, revoke, show};
 use chrono::Utc;
 use serde::Serialize;
 use trust_tasks_rs::{
     ConsumeChecks, ConsumeOutcome, Dispatcher, ErrorResponse, NoValidator, Payload, PayloadPolicy,
     ProofPolicy, ProofVerifier, ResolvedParties, TransportHandler, TrustTask, consume_inbound,
-    specs::{
-        acl::{change_role, grant, list, revoke, show},
-        trust_task_discovery as discovery,
-    },
+    specs::trust_task_discovery as discovery,
 };
 use uuid::Uuid;
 
@@ -98,12 +96,12 @@ pub enum TypedInbound {
     // Boxed: `AclEntry` carries the widest payload in this enum (scopes,
     // step-up, approve authority, key filter), so an unboxed variant sets the
     // size of every inbound message. See clippy::large_enum_variant.
-    Grant(Box<TrustTask<grant::v0_1::Payload>>),
-    Revoke(TrustTask<revoke::v0_1::Payload>),
-    ChangeRole(TrustTask<change_role::v0_1::Payload>),
-    Show(TrustTask<show::v0_1::Payload>),
-    List(TrustTask<list::v0_1::Payload>),
-    Discovery(TrustTask<discovery::v0_1::Payload>),
+    Grant(Box<TrustTask<grant::v0_2::Payload>>),
+    Revoke(TrustTask<revoke::v0_2::Payload>),
+    ChangeRole(TrustTask<change_role::v0_2::Payload>),
+    Show(TrustTask<show::v0_2::Payload>),
+    List(TrustTask<list::v0_3::Payload>),
+    Discovery(TrustTask<discovery::v0_3::Payload>),
 }
 
 /// Every Type URI [`build_dispatcher`] routes — the ACL family this
@@ -113,12 +111,12 @@ pub enum TypedInbound {
 /// `size::largest_max_document_bytes` need to decide whether a raised
 /// per-type limit is actually in force.
 pub const ACL_TASK_URIS: &[&str] = &[
-    <grant::v0_1::Payload as Payload>::TYPE_URI,
-    <revoke::v0_1::Payload as Payload>::TYPE_URI,
-    <change_role::v0_1::Payload as Payload>::TYPE_URI,
-    <show::v0_1::Payload as Payload>::TYPE_URI,
-    <list::v0_1::Payload as Payload>::TYPE_URI,
-    <discovery::v0_1::Payload as Payload>::TYPE_URI,
+    <grant::v0_2::Payload as Payload>::TYPE_URI,
+    <revoke::v0_2::Payload as Payload>::TYPE_URI,
+    <change_role::v0_2::Payload as Payload>::TYPE_URI,
+    <show::v0_2::Payload as Payload>::TYPE_URI,
+    <list::v0_3::Payload as Payload>::TYPE_URI,
+    <discovery::v0_3::Payload as Payload>::TYPE_URI,
 ];
 
 /// Build the shared [`Dispatcher`] keyed on each registered Type URI.
@@ -130,12 +128,12 @@ pub const ACL_TASK_URIS: &[&str] = &[
 /// handler.
 pub fn build_dispatcher() -> Dispatcher<TypedInbound> {
     Dispatcher::new()
-        .on::<grant::v0_1::Payload, _>(|d| TypedInbound::Grant(Box::new(d)))
-        .on::<revoke::v0_1::Payload, _>(TypedInbound::Revoke)
-        .on::<change_role::v0_1::Payload, _>(TypedInbound::ChangeRole)
-        .on::<show::v0_1::Payload, _>(TypedInbound::Show)
-        .on::<list::v0_1::Payload, _>(TypedInbound::List)
-        .on::<discovery::v0_1::Payload, _>(TypedInbound::Discovery)
+        .on::<grant::v0_2::Payload, _>(|d| TypedInbound::Grant(Box::new(d)))
+        .on::<revoke::v0_2::Payload, _>(TypedInbound::Revoke)
+        .on::<change_role::v0_2::Payload, _>(TypedInbound::ChangeRole)
+        .on::<show::v0_2::Payload, _>(TypedInbound::Show)
+        .on::<list::v0_3::Payload, _>(TypedInbound::List)
+        .on::<discovery::v0_3::Payload, _>(TypedInbound::Discovery)
 }
 
 /// What a served Trust Task requires of its proof before its handler runs.
@@ -249,6 +247,11 @@ pub struct TrustTaskContext<'a> {
     /// §7.2 item 5 recipient enforcement, and surfaces as `issuer` on
     /// outbound response documents.
     pub my_vid: &'a str,
+    /// Whether this service signs on an ACL member's behalf. The witness
+    /// does — an `Admin` may have it sign with any witness key — so its
+    /// entries state `keys: all` for `Admin`; every other service states
+    /// `keys: none` (AclEntry 0.2: a maintainer with no signing oracle).
+    pub signing_oracle: bool,
 }
 
 /// Single shared key under which every ACL write serialises. A
@@ -425,7 +428,7 @@ pub fn framework_error_type_uri() -> trust_tasks_rs::TypeUri {
 /// daemon's `fetch-metrics`) can sign against the canonical value rather than
 /// a hand-typed literal that a spec or namespace change could silently desync.
 pub fn metrics_request_type_uri() -> &'static str {
-    <trust_tasks_rs::specs::did_management::server::metrics::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI
+    <crate::tasks::did_management::server::metrics::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI
 }
 
 /// Build a framework error document addressed to the request's
@@ -530,7 +533,7 @@ mod tests {
     fn unrouted_and_routed_errors_agree_on_the_type_uri() {
         let request: TrustTask<serde_json::Value> = TrustTask::new(
             "urn:uuid:probe",
-            list::v0_1::Payload::TYPE_URI
+            list::v0_3::Payload::TYPE_URI
                 .parse()
                 .expect("acl/list Type URI parses"),
             serde_json::json!({}),
@@ -554,16 +557,30 @@ mod tests {
         let d = build_dispatcher();
         let registered: std::collections::HashSet<&str> = d.registered_uris().into_iter().collect();
         for uri in [
-            grant::v0_1::Payload::TYPE_URI,
-            revoke::v0_1::Payload::TYPE_URI,
-            change_role::v0_1::Payload::TYPE_URI,
-            show::v0_1::Payload::TYPE_URI,
-            list::v0_1::Payload::TYPE_URI,
-            discovery::v0_1::Payload::TYPE_URI,
+            grant::v0_2::Payload::TYPE_URI,
+            revoke::v0_2::Payload::TYPE_URI,
+            change_role::v0_2::Payload::TYPE_URI,
+            show::v0_2::Payload::TYPE_URI,
+            list::v0_3::Payload::TYPE_URI,
+            discovery::v0_3::Payload::TYPE_URI,
         ] {
             assert!(
                 registered.contains(uri),
                 "dispatcher missing route for {uri}"
+            );
+        }
+        // Latest only: the superseded versions are not served.
+        assert_eq!(registered.len(), ACL_TASK_URIS.len());
+        for old in [
+            "acl/grant/0.1",
+            "acl/list/0.1",
+            "acl/list/0.2",
+            "trust-task-discovery/0.1",
+        ] {
+            let uri = format!("https://trusttasks.org/spec/{old}");
+            assert!(
+                !registered.contains(uri.as_str()),
+                "{uri} must not be routed"
             );
         }
     }
@@ -608,21 +625,22 @@ mod tests {
             acl_ks: &acl_ks,
             acl_locks: &acl_locks,
             my_vid: SERVICE_DID,
+            signing_oracle: false,
         };
         let transport = InMemoryHandler::new()
             .with_local(SERVICE_DID.to_string())
             .with_peer(ADMIN_DID.to_string());
 
-        // Construct an untyped `acl/grant/0.1` envelope by way of a
+        // Construct an untyped `acl/grant/0.2` envelope by way of a
         // JSON value — exactly the shape the HTTPS body extractor and
-        // the DIDComm `message.body` produce. `acl/grant/0.1` is a
+        // the DIDComm `message.body` produce. `acl/grant/0.2` is a
         // REQUIRED spec, so the framework's IS_PROOF_REQUIRED check
         // refuses proofless documents regardless of policy; we
         // attach a stub proof so the pipeline reaches the handler
         // under `AcceptUnverified`.
         let body = serde_json::json!({
             "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-            "type": grant::v0_1::Payload::TYPE_URI,
+            "type": grant::v0_2::Payload::TYPE_URI,
             "issuer": ADMIN_DID,
             "recipient": SERVICE_DID,
             "issuedAt": chrono::Utc::now().to_rfc3339(),
@@ -630,11 +648,9 @@ mod tests {
                 "entry": {
                     "subject": "did:web:carol.example",
                     "role": "owner",
-                    "ext": {
-                        "vnd.affinidi.webvh": {
-                            "domains": { "kind": "all" }
-                        }
-                    }
+                    "act": { "scope": "all" },
+                    "keys": { "scope": "none" },
+                    "capabilities": { "scope": "ceiling" }
                 }
             },
             "proof": {
@@ -660,7 +676,7 @@ mod tests {
             DispatchOutcome::Handled(resp) => {
                 assert_eq!(
                     resp.type_uri.to_string(),
-                    format!("{}#response", grant::v0_1::Payload::TYPE_URI)
+                    format!("{}#response", grant::v0_2::Payload::TYPE_URI)
                 );
                 assert_eq!(resp.payload["entry"]["subject"], "did:web:carol.example");
             }
@@ -720,6 +736,7 @@ mod tests {
             acl_ks: &acl_ks,
             acl_locks: &acl_locks,
             my_vid: SERVICE_DID,
+            signing_oracle: false,
         };
 
         // Ephemeral "session" keypair — a did:key distinct from ADMIN_DID.
@@ -733,14 +750,16 @@ mod tests {
             async move {
                 let mut body = serde_json::json!({
                     "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-                    "type": grant::v0_1::Payload::TYPE_URI,
+                    "type": grant::v0_2::Payload::TYPE_URI,
                     "recipient": SERVICE_DID,
                     "issuedAt": chrono::Utc::now().to_rfc3339(),
                     "payload": {
                         "entry": {
                             "subject": subject,
                             "role": "owner",
-                            "ext": { "vnd.affinidi.webvh": { "domains": { "kind": "all" } } }
+                            "act": { "scope": "all" },
+                            "keys": { "scope": "none" },
+                            "capabilities": { "scope": "ceiling" }
                         }
                     }
                 });
@@ -819,6 +838,7 @@ mod tests {
             acl_ks: &acl_ks,
             acl_locks: &acl_locks,
             my_vid: SERVICE_DID,
+            signing_oracle: false,
         };
         let transport = InMemoryHandler::new()
             .with_local(SERVICE_DID.to_string())

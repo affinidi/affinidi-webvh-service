@@ -25,13 +25,13 @@ use did_hosting_common::server::identity::ServiceIdentity;
 use did_hosting_common::server::store::Store;
 use did_hosting_common::server::trust_tasks::send::build_request;
 use did_hosting_common::server::trust_tasks::{TransportBoundVerifier, sign_document};
-use serde_json::{Value, json};
-use trust_tasks_rs::Payload;
-use trust_tasks_rs::specs::acl::{list as acl_list, show as acl_show};
-use trust_tasks_rs::specs::webvh::witness::{
+use did_hosting_common::tasks::acl::{list as acl_list, show as acl_show};
+use did_hosting_common::tasks::webvh::witness::{
     key::{create::v0_1 as key_create, delete::v0_1 as key_delete, list::v0_1 as key_list},
     sign::v0_1 as sign,
 };
+use serde_json::{Value, json};
+use trust_tasks_rs::Payload;
 use webvh_witness::config::AppConfig;
 use webvh_witness::server::AppState;
 use webvh_witness::signing::LocalSigner;
@@ -408,13 +408,13 @@ async fn every_task_is_served_on_every_transport() {
             &state,
             via,
             &a.0,
-            signed(acl_list::v0_1::Payload::TYPE_URI, &a, json!({})).await,
+            signed(acl_list::v0_3::Payload::TYPE_URI, &a, json!({})).await,
         )
         .await
         .expect("answered");
         assert_eq!(
             reply["type"],
-            format!("{}#response", acl_list::v0_1::Payload::TYPE_URI),
+            format!("{}#response", acl_list::v0_3::Payload::TYPE_URI),
             "{via:?}: {reply}"
         );
         signed_by_the_witness(&reply, &a.0);
@@ -423,7 +423,7 @@ async fn every_task_is_served_on_every_transport() {
             via,
             &a.0,
             signed(
-                acl_show::v0_1::Payload::TYPE_URI,
+                acl_show::v0_2::Payload::TYPE_URI,
                 &a,
                 json!({ "subject": owner().0 }),
             )
@@ -433,7 +433,7 @@ async fn every_task_is_served_on_every_transport() {
         .expect("answered");
         assert_eq!(
             reply["type"],
-            format!("{}#response", acl_show::v0_1::Payload::TYPE_URI),
+            format!("{}#response", acl_show::v0_2::Payload::TYPE_URI),
             "{via:?}: {reply}"
         );
 
@@ -482,7 +482,7 @@ async fn every_task_is_served_on_every_transport() {
 /// The acl write family goes through the same gate: an admin's grant applies.
 #[tokio::test]
 async fn an_admin_grant_applies_on_every_transport() {
-    use trust_tasks_rs::specs::acl::grant;
+    use did_hosting_common::tasks::acl::grant;
     for via in VIAS {
         let (state, _dir) = witness_state().await;
         let a = admin();
@@ -492,12 +492,14 @@ async fn an_admin_grant_applies_on_every_transport() {
             via,
             &a.0,
             signed(
-                grant::v0_1::Payload::TYPE_URI,
+                grant::v0_2::Payload::TYPE_URI,
                 &a,
                 json!({ "entry": {
                     "subject": subject,
                     "role": "owner",
-                    "ext": { "vnd.affinidi.webvh": { "domains": { "kind": "all" } } },
+                    "act": { "scope": "all" },
+                    "keys": { "scope": "none" },
+                    "capabilities": { "scope": "ceiling" },
                 } }),
             )
             .await,
@@ -506,7 +508,7 @@ async fn an_admin_grant_applies_on_every_transport() {
         .expect("answered");
         assert_eq!(
             reply["type"],
-            format!("{}#response", grant::v0_1::Payload::TYPE_URI),
+            format!("{}#response", grant::v0_2::Payload::TYPE_URI),
             "{via:?}: {reply}"
         );
         signed_by_the_witness(&reply, &a.0);
@@ -537,9 +539,9 @@ async fn payloads(state: &AppState) -> Vec<(&'static str, Value)> {
             sign::Payload::TYPE_URI,
             sign_payload(&record.witness_id, &log),
         ),
-        (acl_list::v0_1::Payload::TYPE_URI, json!({})),
+        (acl_list::v0_3::Payload::TYPE_URI, json!({})),
         (
-            acl_show::v0_1::Payload::TYPE_URI,
+            acl_show::v0_2::Payload::TYPE_URI,
             json!({ "subject": owner().0 }),
         ),
     ]

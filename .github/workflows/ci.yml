@@ -49,6 +49,21 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  trust-tasks-lock:
+    # The Trust Task types are generated at build time from the versions
+    # pinned in did-hosting-common/trust-tasks.lock. The build already refuses
+    # a vendored bundle that does not match its locked digest; this also
+    # catches a manifest (trust-tasks.toml) that disagrees with the lock, and
+    # stray bundles nobody pins. Offline.
+    name: trust-tasks check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo install trust-tasks-cli --version 0.1.2 --locked
+      - run: trust-tasks -C did-hosting-common check
+
   msrv:
     # NB: the `env` context is NOT available in `jobs.<job_id>.name` (only
     # github/needs/strategy/matrix/inputs/vars are). Referencing `${{ env.MSRV }}`

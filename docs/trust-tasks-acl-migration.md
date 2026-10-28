@@ -1,5 +1,38 @@
 # Trust Tasks ACL — client migration guide (v0.7.0 → v0.8.0)
 
+> **Now AclEntry 0.2.** The ACL family is served at its latest versions
+> only: `acl/grant`, `acl/revoke`, `acl/change-role` and `acl/show` at
+> **0.2**, `acl/list` at **0.3**, and `trust-task-discovery` at **0.3**.
+> The 0.1 versions in the guide below are no longer served (a 0.1 document
+> is refused `unsupportedType`). What changes for a client:
+>
+> - **Authority is stated, never inferred.** Every entry carries `act`,
+>   `keys` and `capabilities`. An entry's **domains are its `act` scope**:
+>   `{"scope": "all"}` (every domain), `{"scope": "contexts", "contexts":
+>   ["a.example", …]}`, or `{"scope": "none"}`. `Admin` and `Service` act on
+>   every domain, so their `act` is always `all`. `keys` is
+>   `{"scope": "none"}` (the witness states `{"scope": "all"}` for an
+>   `Admin`, which may have it sign with any witness key); `capabilities` is
+>   `{"scope": "ceiling"}`. `approve` is absent — there are no approvers.
+> - **`ext.vnd.affinidi.webvh` is `quota` and `defaultDomain` only** — the
+>   0.1 `domains` member is refused. `defaultDomain` must be one of the
+>   `act` contexts.
+> - **A grant never narrows.** Re-granting the same role may re-assert or
+>   widen (more domains, a new label, quota or default); dropping a domain
+>   is `acl/revoke/0.2` with `{"kind": "act", "act": <the resulting
+>   scope>}`. Removing an entry is `{"kind": "entry"}`. A grant to oneself,
+>   and a role change of oneself, are `permissionDenied`.
+> - **What this service cannot hold is refused, not dropped:** an `act` it
+>   cannot hold or any `approve` is `invalidActScope`, listed capabilities
+>   `unknownCapability`, an unrecognised role `roleNotRecognized`, and
+>   `expiresAt`, `stepUp` or another `keys` scope `taskFailed` with
+>   `details.reason = "notSupportedByMaintainer"`.
+> - **`acl/list/0.3`** pages with `limit` / `nextCursor` (absent on the last
+>   page; `truncated` is gone). The 0.1 `scope: "domain:x"` filter is
+>   `context: "x"` with an explicit `direction` (`actingIn`: entries that may
+>   act on x, including `act: all`; `subtree`: entries that name x; `any`).
+>   A cursor reused with other filters is `cursorMismatch`.
+
 v0.7.0 introduces a new wire surface for ACL administration based on the
 [Trust Tasks framework](https://trusttasks.org/). The legacy
 `GET/POST /api/acl`, `PUT/DELETE /api/acl/{did}` REST routes are

@@ -1,14 +1,15 @@
 //! `did-management/did/*` and `webvh/witness/publish`.
 
 use did_hosting_common::server::auth::session::now_epoch;
-use serde_json::json;
-use tracing::info;
-use trust_tasks_rs::specs::{
+use did_hosting_common::tasks::{
     did_management::did::{
         change_owner, check_name, delete, info, list, log, register, rollback, set_state,
     },
     webvh::witness::publish as witness_publish,
 };
+use serde_json::json;
+use tracing::info;
+use trust_tasks_rs::StandardCode;
 
 use did_hosting_common::did_ops::did_key;
 
@@ -175,12 +176,12 @@ pub(crate) async fn info(
     typed(serde_json::Value::Object(body), "info response")
 }
 
-/// `did/list/0.1`: `{records, total}`, paged. A non-admin may name only
-/// themselves as `owner`; naming anyone else is refused, not ignored.
+/// `did/list/0.2`: `{records, nextCursor?}`, paged by cursor. A non-admin may
+/// name only themselves as `owner`; naming anyone else is refused, not ignored.
 pub(crate) async fn list(
     cx: &Cx<'_>,
-    p: list::v0_1::Payload,
-) -> Result<list::v0_1::Response, TaskError> {
+    p: list::v0_2::Payload,
+) -> Result<list::v0_2::Response, TaskError> {
     use crate::acl::Role;
 
     let auth = cx.auth().await?;
@@ -190,7 +191,7 @@ pub(crate) async fn list(
         && owner != auth.did
     {
         return Err(TaskError::Declared(
-            list::v0_1::error_codes::FORBIDDEN,
+            list::v0_2::error_codes::FORBIDDEN,
             "only an administrator may list another owner's slots".into(),
         ));
     }
@@ -218,24 +219,42 @@ pub(crate) async fn list(
     // each slot's owner and resolve count (below), so it discloses nothing
     // beyond that sync.
     let replica = auth.role == Role::Service && is_hosting_server(state, &auth.did).await;
-    if replica && p.owner.is_none() && p.offset.unwrap_or(0) == 0 {
+    let binding = list_cursor::binding(&auth.did, replica, p.owner.as_deref(), domain.as_deref());
+    let cursor_key = list_cursor::key(state).await?;
+    let after = match p.cursor.as_deref() {
+        Some(c) => Some(list_cursor::open(&cursor_key, c, &binding).ok_or_else(|| {
+            TaskError::Standard(
+                StandardCode::MalformedRequest,
+                "`cursor` is not one this service issued for this listing".into(),
+            )
+        })?),
+        None => None,
+    };
+    if replica && p.owner.is_none() && after.is_none() {
         crate::registry::record_reconcile(&state.registry_ks, &auth.did, now_epoch()).await;
     }
-    let (records, total) = did_ops::list_dids_page(
+    let (records, has_more) = did_ops::list_dids_page(
         &auth,
         replica,
         state,
         p.owner.as_deref(),
         domain.as_deref(),
         p.limit.map(|l| l.get() as usize),
-        p.offset.map(|o| o as usize),
+        after.as_deref(),
     )
     .await?;
+    let next_cursor = has_more
+        .then(|| {
+            records
+                .last()
+                .map(|(r, _)| list_cursor::seal(&cursor_key, &r.mnemonic, &binding))
+        })
+        .flatten();
     let records = records
         .iter()
         .map(|(record, total_resolves)| {
             let mut value =
-                serde_json::to_value(spec_record::<list::v0_1::DidRecord>(state, record)?)?;
+                serde_json::to_value(spec_record::<list::v0_2::DidRecord>(state, record)?)?;
             if replica {
                 // A replica reconciles on the slot, its DID, version and
                 // disabled state. Who owns each slot, and how often it is
@@ -252,10 +271,206 @@ pub(crate) async fn list(
             Ok(value)
         })
         .collect::<Result<Vec<_>, TaskError>>()?;
-    typed(
-        json!({ "records": records, "total": total }),
-        "list response",
-    )
+    let mut body = json!({ "records": records });
+    if let Some(next) = next_cursor {
+        body["nextCursor"] = json!(next);
+    }
+    typed(body, "list response")
+}
+
+/// `did/list` continuation tokens.
+///
+/// A cursor names the last mnemonic of the page it ends, bound to the listing
+/// it was minted for (the caller, whether it was served as a replica, and the
+/// `owner` / `domain` filters) and authenticated with a key kept in the
+/// store's `meta` keyspace. So a cursor this service did not issue, or one
+/// carried to another caller or another filter, is refused
+/// (`malformedRequest`) rather than read — the spec's "MUST NOT accept a
+/// cursor it did not issue". Because the key lives in the store, a cursor
+/// survives a restart and is honoured by every control-plane replica sharing
+/// that store.
+mod list_cursor {
+    use sha2::{Digest, Sha256};
+
+    use crate::server::AppState;
+    use did_hosting_common::server::store::keyspaces::KS_META;
+
+    const VERSION: &str = "v1";
+    const MAC_LEN: usize = 16;
+
+    fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
+        bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn hex_decode(s: &str) -> Option<Vec<u8>> {
+        if !s.len().is_multiple_of(2)
+            || !s
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return None;
+        }
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+            .collect()
+    }
+
+    const KEY_NAME: &str = "did-list-cursor-key";
+
+    /// The MAC key, created on first use. Two replicas creating it at once
+    /// each write, then both read back whichever landed, so they agree; a
+    /// cursor minted in that instant under the losing key is refused once and
+    /// the caller starts its listing again.
+    pub(super) type Key = [u8; 32];
+
+    pub(super) async fn key(state: &AppState) -> Result<Key, crate::error::AppError> {
+        let ks = state.store.keyspace(KS_META)?;
+        if let Some(k) = ks
+            .get_raw(KEY_NAME)
+            .await?
+            .and_then(|v| Key::try_from(v).ok())
+        {
+            return Ok(k);
+        }
+        let fresh: Key = rand::random();
+        ks.insert_raw(KEY_NAME, fresh.to_vec()).await?;
+        Ok(ks
+            .get_raw(KEY_NAME)
+            .await?
+            .and_then(|v| Key::try_from(v).ok())
+            .unwrap_or(fresh))
+    }
+
+    /// HMAC-SHA256 (RFC 2104) over `msg`, truncated to [`MAC_LEN`] bytes.
+    fn mac(k: &Key, msg: &[u8]) -> [u8; MAC_LEN] {
+        let (mut ipad, mut opad) = ([0x36u8; 64], [0x5cu8; 64]);
+        for (i, b) in k.iter().enumerate() {
+            ipad[i] ^= b;
+            opad[i] ^= b;
+        }
+        let inner = Sha256::new()
+            .chain_update(ipad)
+            .chain_update(msg)
+            .finalize();
+        let outer = Sha256::new()
+            .chain_update(opad)
+            .chain_update(inner)
+            .finalize();
+        let mut out = [0u8; MAC_LEN];
+        out.copy_from_slice(&outer[..MAC_LEN]);
+        out
+    }
+
+    /// The listing a cursor belongs to. Length-prefixed, so no two distinct
+    /// listings share an encoding.
+    pub(super) fn binding(
+        caller: &str,
+        replica: bool,
+        owner: Option<&str>,
+        domain: Option<&str>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        for part in [
+            Some(caller),
+            Some(if replica { "r" } else { "-" }),
+            owner,
+            domain,
+        ] {
+            match part {
+                Some(p) => {
+                    out.extend_from_slice(&(p.len() as u32).to_be_bytes());
+                    out.extend_from_slice(p.as_bytes());
+                }
+                None => out.extend_from_slice(&u32::MAX.to_be_bytes()),
+            }
+        }
+        out
+    }
+
+    fn message(after: &str, binding: &[u8]) -> Vec<u8> {
+        let mut msg = b"did-management/did/list cursor ".to_vec();
+        msg.extend_from_slice(VERSION.as_bytes());
+        msg.extend_from_slice(&(after.len() as u32).to_be_bytes());
+        msg.extend_from_slice(after.as_bytes());
+        msg.extend_from_slice(binding);
+        msg
+    }
+
+    /// The cursor that resumes a listing after `after`.
+    pub(super) fn seal(key: &Key, after: &str, binding: &[u8]) -> String {
+        format!(
+            "{VERSION}.{}.{}",
+            hex_encode(after),
+            hex_encode(mac(key, &message(after, binding)))
+        )
+    }
+
+    /// The mnemonic a cursor resumes after, when this process issued it for
+    /// this listing; `None` otherwise.
+    pub(super) fn open(key: &Key, cursor: &str, binding: &[u8]) -> Option<String> {
+        let mut parts = cursor.split('.');
+        let (version, after, tag) = (parts.next()?, parts.next()?, parts.next()?);
+        if version != VERSION || parts.next().is_some() {
+            return None;
+        }
+        let after = String::from_utf8(hex_decode(after)?).ok()?;
+        let tag = hex_decode(tag)?;
+        let expected = mac(key, &message(&after, binding));
+        // Constant-time compare: the tag is a MAC.
+        let ok = tag.len() == MAC_LEN
+            && tag
+                .iter()
+                .zip(expected.iter())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0;
+        ok.then_some(after)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn round_trips_only_for_its_own_listing() {
+            let k: Key = [7; 32];
+            let b = binding("did:example:a", false, None, Some("example.com"));
+            let c = seal(&k, "abc", &b);
+            assert_eq!(open(&k, &c, &b).as_deref(), Some("abc"));
+            // Another caller, another filter, the replica view: refused.
+            assert!(
+                open(
+                    &k,
+                    &c,
+                    &binding("did:example:b", false, None, Some("example.com"))
+                )
+                .is_none()
+            );
+            assert!(open(&k, &c, &binding("did:example:a", false, None, None)).is_none());
+            assert!(
+                open(
+                    &k,
+                    &c,
+                    &binding("did:example:a", true, None, Some("example.com"))
+                )
+                .is_none()
+            );
+            // Another key (another store): refused.
+            assert!(open(&[8; 32], &c, &b).is_none());
+        }
+
+        #[test]
+        fn refuses_forged_and_malformed_cursors() {
+            let k: Key = [7; 32];
+            let b = binding("did:example:a", false, None, None);
+            let c = seal(&k, "abc", &b);
+            let forged = c.replacen(&hex_encode("abc"), &hex_encode("abd"), 1);
+            assert!(open(&k, &forged, &b).is_none());
+            for bad in ["", "v1", "v1.zz.00", "v2.616263.00", &format!("{c}.x")] {
+                assert!(open(&k, bad, &b).is_none(), "{bad}");
+            }
+        }
+    }
 }
 
 /// Whether `did` is registered here as a hosting server (an edge).
@@ -269,7 +484,7 @@ async fn is_hosting_server(state: &AppState, did: &str) -> bool {
 
 fn unknown_domain(domain: &str) -> TaskError {
     TaskError::Declared(
-        list::v0_1::error_codes::UNKNOWN_DOMAIN,
+        list::v0_2::error_codes::UNKNOWN_DOMAIN,
         format!("`{domain}` is not a hosting domain on this service"),
     )
 }

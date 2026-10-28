@@ -19,7 +19,7 @@ use did_hosting_common::did_ops::{
     AgentNameEntry, DidRecord, agent_name_key, content_log_key, content_witness_key, did_key,
     extract_agent_names, extract_service_types, owner_key,
 };
-use did_hosting_common::didcomm_types::MSG_SERVER_REGISTER;
+use did_hosting_common::didcomm_types::{MSG_SERVER_REGISTER, REGISTER_EXT_NAMESPACE};
 use did_hosting_common::server::didcomm_profile::TransportFallback;
 use did_hosting_common::server::domain::safety::extract_did_host;
 use did_hosting_common::server::domain::{DomainStatus, list_domains};
@@ -27,6 +27,7 @@ use did_hosting_common::server::mnemonic::validate_agent_name_binding;
 use did_hosting_common::server::trust_tasks::send::{
     Retry, build_signed_request, send_trust_task_with_retry,
 };
+use did_hosting_common::tasks::did_management::server::register;
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -150,24 +151,39 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
         }
     };
 
+    // `did-management/server/register/0.2`. The payload is closed, so this
+    // service's own hints ride under `ext`, in its namespace.
     let body = json!({
-        "public_url": public_url,
+        // The control plane keys the registry by the signer's DID with `:`
+        // replaced, and refuses any other `instanceId`.
+        "instanceId": server_did.replace(':', "_"),
+        "did": server_did,
+        "publicUrl": public_url,
         "label": "did-hosting-server",
-        "enabled_methods": enabled_methods,
-        "served_domains": served_domains,
-        "protocol_version": "1.0",
-        // Tells the control plane it may send infrastructure ops (health ping)
-        // as trust tasks, and therefore over whichever transport this server's
-        // DID document advertises. An older control plane ignores the field.
-        "trust_task_capable": true,
-        // Tells the control plane it may coalesce DID sync updates into
-        // `MSG_SYNC_BATCH` messages instead of one frame per DID. An older
-        // control plane ignores this and sends singles.
-        "sync_batch": true,
-        // Delta-sync hint: the DIDs we already hold, so the control plane only
-        // pushes changes. An older control plane ignores this and full-syncs.
-        "preloaded_dids": preloaded_dids,
+        "enabledMethods": enabled_methods,
+        "servedDomains": served_domains,
+        "protocolVersion": "1.0",
+        "ext": {
+            (REGISTER_EXT_NAMESPACE): {
+                // Tells the control plane it may send infrastructure ops
+                // (health ping) as trust tasks, and therefore over whichever
+                // transport this server's DID document advertises.
+                "trust_task_capable": true,
+                // Tells the control plane it may coalesce DID sync updates
+                // into `MSG_SYNC_BATCH` messages instead of one frame per DID.
+                "sync_batch": true,
+                // Delta-sync hint: the DIDs we already hold, so the control
+                // plane only pushes changes.
+                "preloaded_dids": preloaded_dids,
+            }
+        },
     });
+    // Hold the body to the pinned schema before signing it: the control plane
+    // refuses a register payload that does not parse as the generated type.
+    if let Err(e) = serde_json::from_value::<register::v0_2::Payload>(body.clone()) {
+        warn!(error = %e, "cannot register: the register payload does not match server/register/0.2");
+        return;
+    }
 
     // Always a signed trust task. Registration makes this server a sync target
     // for every tenant's DIDs, so the control plane admits it only on a

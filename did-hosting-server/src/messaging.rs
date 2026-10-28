@@ -76,7 +76,9 @@ pub const MSG_SERVER_METRICS: &str =
 /// The `notAuthorized` code `type_uri`'s specification declares: its proven
 /// issuer is not this server's configured control plane.
 fn not_authorized_code(type_uri: &str) -> Option<trust_tasks_rs::DeclaredErrorCode> {
-    use trust_tasks_rs::specs::did_management::replica::domain::{assign, purge, unassign, upsert};
+    use did_hosting_common::tasks::did_management::replica::domain::{
+        assign, purge, unassign, upsert,
+    };
     Some(match type_uri {
         MSG_SYNC_UPDATE => sync_update::error_codes::NOT_AUTHORIZED,
         MSG_SYNC_BATCH => sync_batch::error_codes::NOT_AUTHORIZED,
@@ -587,7 +589,7 @@ async fn handle_fallback(
 // Sync message handling
 // ---------------------------------------------------------------------------
 
-use trust_tasks_rs::specs::webvh::sync::{
+use did_hosting_common::tasks::webvh::sync::{
     batch::v0_1 as sync_batch, delete::v0_2 as sync_delete, update::v0_2 as sync_update,
 };
 
@@ -862,7 +864,7 @@ async fn do_sync_delete(
 // signed by the configured control plane reach these cores (see
 // `VerifiedControlPlane`).
 
-use trust_tasks_rs::specs::did_management::replica::domain::{
+use did_hosting_common::tasks::did_management::replica::domain::{
     assign::v0_1 as replica_assign, purge::v0_1 as replica_purge,
     unassign::v0_1 as replica_unassign, upsert::v0_1 as replica_upsert,
 };
@@ -1146,7 +1148,7 @@ async fn do_domain_upsert(
 /// freshness the staleness bound is measured on, and the process counters.
 /// There is no Prometheus endpoint on an edge; this is the only read of them.
 async fn do_server_metrics(state: &AppState, body: &Value) -> Result<(String, Value), OpError> {
-    use trust_tasks_rs::specs::did_management::server::metrics::v0_1 as metrics;
+    use did_hosting_common::tasks::did_management::server::metrics::v0_1 as metrics;
 
     let _: metrics::Payload = payload(body, "server/metrics")?;
     let now = did_hosting_common::server::auth::session::now_epoch();

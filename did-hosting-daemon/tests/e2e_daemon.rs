@@ -36,9 +36,9 @@
 use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+use did_hosting_common::tasks::did_management::did;
 use serde_json::json;
 use trust_tasks_rs::Payload;
-use trust_tasks_rs::specs::did_management::did;
 
 use vta_sdk::provision_client::EphemeralSetupKey;
 

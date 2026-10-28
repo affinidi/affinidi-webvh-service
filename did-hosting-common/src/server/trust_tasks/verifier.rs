@@ -505,8 +505,8 @@ impl TransportBoundVerifier {
     /// that has not deactivated its DID.
     ///
     /// **Never by a session delegate.** A session key stands in for its
-    /// subject on ordinary requests only (`auth/authenticate/0.2` Conformance
-    /// item 11). An approval must be signed by a key under the approver's *own*
+    /// subject on ordinary requests only (`auth/authenticate/0.3` Conformance
+    /// item 13). An approval must be signed by a key under the approver's *own*
     /// `assertionMethod` relationship. A `did:key` document lists its one key
     /// under every relationship, so without this refusal a session key could
     /// approve its own session's step-up.
@@ -741,7 +741,7 @@ mod tests {
     fn base_body() -> Value {
         json!({
             "id": "urn:uuid:24f1b27f-36d9-49af-9a20-751def9000aa",
-            "type": "https://trusttasks.org/spec/acl/grant/0.1",
+            "type": "https://trusttasks.org/spec/acl/grant/0.2",
             "recipient": "did:web:server.example",
             "issuedAt": "2026-06-09T08:51:03Z",
             "payload": { "entry": { "subject": "did:web:alice.example", "role": "owner" } },
@@ -839,7 +839,7 @@ mod tests {
         assert!(matches!(err, VerificationError::IssuerMismatch(_)));
     }
 
-    /// GUARD (`auth/authenticate/0.2` Conformance item 11): a session key never
+    /// GUARD (`auth/authenticate/0.3` Conformance item 13): a session key never
     /// signs an approval, even for its own principal.
     ///
     /// The first assertion shows why the refusal has to be explicit. A

@@ -1713,14 +1713,16 @@ async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> 
 }
 
 /// One page of the slots a caller may see, with each slot's lifetime resolve
-/// count, and the size of the whole (unpaged) set.
+/// count, and whether more slots follow it.
 ///
 /// The scoping rule is [`list_dids`]'s: an admin sees every slot, or one
 /// owner's when `requested_owner` names one; anyone else sees their own.
 /// Refusing a non-admin who names another owner is the caller's job — this
 /// never widens a non-admin's view, whatever it is passed. `domain` (already
-/// canonical) keeps only slots hosted under it. Ordered by mnemonic so paging
-/// is stable.
+/// canonical) keeps only slots hosted under it. Ordered by mnemonic, and the
+/// page starts strictly after `after` (the last mnemonic of the previous
+/// page), so paging is stable under concurrent writes: a slot added or removed
+/// between pages is seen or not, but no present slot is repeated or skipped.
 ///
 /// `replica` is set when the caller is a hosting server this control plane
 /// drives, reconciling against the full listing (see
@@ -1733,8 +1735,8 @@ pub async fn list_dids_page(
     requested_owner: Option<&str>,
     domain: Option<&str>,
     limit: Option<usize>,
-    offset: Option<usize>,
-) -> Result<(Vec<(DidRecord, u64)>, u64), AppError> {
+    after: Option<&str>,
+) -> Result<(Vec<(DidRecord, u64)>, bool), AppError> {
     use crate::acl::Role;
 
     const MAX_LIST_LIMIT: usize = 1000;
@@ -1784,11 +1786,14 @@ pub async fn list_dids_page(
     }
     records.sort_by(|a, b| a.mnemonic.cmp(&b.mnemonic));
 
-    let total = records.len() as u64;
-    let offset = offset.unwrap_or(0);
-    let limit = limit.unwrap_or(MAX_LIST_LIMIT).min(MAX_LIST_LIMIT);
+    let total = records.len();
+    let limit = limit.unwrap_or(MAX_LIST_LIMIT).clamp(1, MAX_LIST_LIMIT);
+    if let Some(after) = after {
+        records.retain(|r| r.mnemonic.as_str() > after);
+    }
+    let has_more = records.len() > limit;
     let mut page = Vec::with_capacity(limit.min(records.len()));
-    for record in records.into_iter().skip(offset).take(limit) {
+    for record in records.into_iter().take(limit) {
         let stats: did_hosting_common::DidStats = state
             .stats_ks
             .get(format!("stats:{}", record.mnemonic))
@@ -1796,8 +1801,8 @@ pub async fn list_dids_page(
             .unwrap_or_default();
         page.push((record, stats.total_resolves));
     }
-    info!(did = %auth.did, total, returned = page.len(), "DID page listed on control plane");
-    Ok((page, total))
+    info!(did = %auth.did, total, returned = page.len(), has_more, "DID page listed on control plane");
+    Ok((page, has_more))
 }
 
 /// Cross-check a caller's explicit domain against the slot's own domain.

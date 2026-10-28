@@ -135,14 +135,22 @@ use did_hosting_control::trust_tasks_infra;
 const CONTROL_DID: &str = "did:webvh:test:control.example.com";
 const SERVER_DID: &str = "did:webvh:QmS:webvh.example.com:server1";
 
+/// A `server/register/0.2` payload from [`SERVER_DID`], with this service's
+/// hints under `ext`.
 fn register_body(trust_task_capable: bool) -> Value {
     json!({
-        "public_url": "https://webvh.example.com/server1",
+        "instanceId": instance_id_for(SERVER_DID),
+        "did": SERVER_DID,
+        "publicUrl": "https://webvh.example.com/server1",
         "label": "did-hosting-server",
-        "enabled_methods": ["webvh"],
-        "served_domains": [],
-        "protocol_version": "1.0",
-        "trust_task_capable": trust_task_capable,
+        "enabledMethods": ["webvh"],
+        "servedDomains": [],
+        "protocolVersion": "1.0",
+        "ext": {
+            (did_hosting_common::didcomm_types::REGISTER_EXT_NAMESPACE): {
+                "trust_task_capable": trust_task_capable,
+            }
+        },
     })
 }
 
@@ -150,7 +158,7 @@ fn instance_id_for(did: &str) -> String {
     did.replace(':', "_")
 }
 
-/// A `server/register/0.1` trust task registers the instance and answers with
+/// A `server/register/0.2` trust task registers the instance and answers with
 /// the `#response` variant of the *same* Type URI — not a separately-named ack
 /// constant. That is what makes the op identical across transports.
 #[tokio::test]
@@ -194,7 +202,7 @@ async fn register_without_capability_flag_defaults_to_legacy() {
     add_acl(&h.state, SERVER_DID, Role::Service).await;
 
     let mut body = register_body(false);
-    body.as_object_mut().unwrap().remove("trust_task_capable");
+    body.as_object_mut().unwrap().remove("ext");
 
     let doc = build_request(MSG_SERVER_REGISTER, SERVER_DID, CONTROL_DID, body).expect("build");
     trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
@@ -206,6 +214,39 @@ async fn register_without_capability_flag_defaults_to_legacy() {
         .unwrap()
         .unwrap();
     assert!(!inst.trust_task_capable);
+}
+
+/// The payload is `server/register/0.2`, closed: 0.1's snake_case members, or
+/// a `did` / `instanceId` that does not name the signer, are refused as
+/// malformed and register nothing.
+#[tokio::test]
+async fn register_refuses_a_payload_that_is_not_0_2_for_the_signer() {
+    let h = make_harness().await;
+    add_acl(&h.state, SERVER_DID, Role::Service).await;
+
+    let snake = json!({
+        "public_url": "https://webvh.example.com/server1",
+        "served_domains": [],
+        "trust_task_capable": true,
+    });
+    let mut other_did = register_body(true);
+    other_did["did"] = json!("did:webvh:QmS:webvh.example.com:server2");
+    let mut other_id = register_body(true);
+    other_id["instanceId"] = json!("someone-else");
+    for body in [snake, other_did, other_id] {
+        let doc = build_request(MSG_SERVER_REGISTER, SERVER_DID, CONTROL_DID, body).expect("build");
+        let resp =
+            trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
+                .await
+                .expect("a refusal is still a document");
+        assert_eq!(resp["payload"]["code"], "malformedRequest", "{resp}");
+    }
+    assert!(
+        registry::get_instance(&h.state.registry_ks, &instance_id_for(SERVER_DID))
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// Registration is ACL-gated exactly as the legacy DIDComm route was: a DID

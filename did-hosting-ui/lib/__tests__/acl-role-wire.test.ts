@@ -22,6 +22,9 @@ const base = {
   subject: "did:key:z6MkSidecar",
   label: null,
   createdAt: "2024-01-01T00:00:00Z",
+  act: { scope: "all" },
+  keys: { scope: "none" },
+  capabilities: { scope: "ceiling" },
   ext: {},
 };
 

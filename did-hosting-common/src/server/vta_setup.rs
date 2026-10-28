@@ -457,6 +457,9 @@ fn render_event_to_stderr(event: vta_sdk::provision_client::VtaEvent) {
             DiagStatus::Ok(detail) => eprintln!("  [OK] {}  {detail}", check.label()),
             DiagStatus::Skipped(detail) => eprintln!("  [--] {}  {detail}", check.label()),
             DiagStatus::Failed(detail) => eprintln!("  [!!] {}  {detail}", check.label()),
+            // `#[non_exhaustive]` since vta-sdk 0.74: a status this build
+            // does not know is shown without a detail.
+            _ => eprintln!("  [??] {}", check.label()),
         },
         VtaEvent::Resolved(_)
         | VtaEvent::AttemptCompleted { .. }
@@ -473,6 +476,9 @@ fn render_event_to_stderr(event: vta_sdk::provision_client::VtaEvent) {
             eprintln!();
             eprintln!("  ✗ {reason}");
         }
+        // `#[non_exhaustive]` since vta-sdk 0.74. Like the UI-only events
+        // above, an event this wizard does not know has nothing to show.
+        _ => {}
     }
 }
 

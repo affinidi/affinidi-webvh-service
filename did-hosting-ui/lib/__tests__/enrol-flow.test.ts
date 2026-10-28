@@ -74,7 +74,7 @@ describe("issuing an invite", () => {
     await generateSessionKeypair();
   });
 
-  it("is a signed invite/0.2, and hands back the link and the claim code apart", async () => {
+  it("is a signed invite/0.3, and hands back the link and the claim code apart", async () => {
     const sent = installControlPlane((req) =>
       seal(req, {
         invite: { token: "inv_tok", url: "https://control.example.com/enroll?token=inv_tok" },
@@ -94,7 +94,7 @@ describe("issuing an invite", () => {
     });
     expect(invite.inviteUrl).not.toContain(invite.claimCode);
     const { doc } = tasks(sent)[0]!;
-    expect(doc.type).toBe(`${TT}invite/0.2`);
+    expect(doc.type).toBe(`${TT}invite/0.3`);
     expect(doc.payload).toEqual({ subject: "did:example:carol", role: "owner" });
     expect(doc.issuer).toBe(ADMIN);
     expect(doc.proof).toBeDefined();
