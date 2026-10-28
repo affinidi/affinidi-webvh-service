@@ -39,6 +39,10 @@ pub struct AppConfig {
     /// How the watcher's own identity is produced.
     #[serde(default)]
     pub identity: IdentityConfig,
+    /// Bounds of the anti-replay cache for signed Trust Tasks (`[replay]`;
+    /// env `WATCHER_REPLAY_*`).
+    #[serde(default)]
+    pub replay: did_hosting_common::server::config::ReplayConfig,
     #[serde(default)]
     pub sync: SyncConfig,
     #[serde(skip)]
@@ -78,6 +82,7 @@ impl Default for AppConfig {
             secrets: SecretsConfig::default(),
             vta: VtaConfig::default(),
             identity: IdentityConfig::default(),
+            replay: Default::default(),
             sync: SyncConfig::default(),
             config_path: PathBuf::new(),
         }
@@ -124,6 +129,8 @@ impl AppConfig {
         )?;
         // WATCHER_SERVER_RESOLVE_CACHE_* — Cache-Control on DID resolution.
         config.server.resolve_cache.apply_env_overrides("WATCHER")?;
+        // WATCHER_REPLAY_* — anti-replay cache bounds. Also validates `[replay]`.
+        config.replay.apply_env_overrides("WATCHER")?;
         if let Ok(v) = std::env::var("WATCHER_SERVER_DID") {
             config.server_did = Some(v);
         }

@@ -217,6 +217,15 @@ Environment variables use the `DAEMON_` prefix:
 The same settings live in `[server.resolve_cache]` (`max_age_secs`,
 `shared_max_age_secs`, `stale_while_revalidate_secs`).
 
+| Variable | Description |
+| --- | --- |
+| `DAEMON_REPLAY_MAX_ENTRIES` | Replay cache records, all signers (default 50,000) |
+| `DAEMON_REPLAY_MAX_ENTRIES_PER_SIGNER` | Replay cache records per signer (default 5,000, about 14 signed requests a second) |
+
+These live in `[replay]` and apply to the embedded control plane and
+witness; the control plane's README explains the bounds ("Replay cache
+bounds").
+
 ## CLI Commands
 
 ```

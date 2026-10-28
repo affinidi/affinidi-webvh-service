@@ -1688,6 +1688,7 @@ mod tests {
             trust_tasks: Default::default(),
             hosting: Default::default(),
             identity: Default::default(),
+            replay: Default::default(),
             config_path: PathBuf::new(),
         };
 
@@ -2478,6 +2479,7 @@ mod tests {
             trust_tasks: state.config.trust_tasks.clone(),
             hosting: state.config.hosting.clone(),
             identity: Default::default(),
+            replay: Default::default(),
             config_path: state.config.config_path.clone(),
         };
         state.config = Arc::new(cfg);

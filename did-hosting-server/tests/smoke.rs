@@ -66,6 +66,7 @@ async fn make_state_with(server: ServerConfig) -> (AppState, tempfile::TempDir) 
         control_did: None,
         vta: VtaConfig::default(),
         identity: Default::default(),
+        replay: Default::default(),
         config_path: PathBuf::new(),
     };
 

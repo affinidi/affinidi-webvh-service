@@ -184,6 +184,11 @@ Environment variables use the `CONTROL_` prefix:
 | `CONTROL_SERVER_PORT`                      | Bind port                    |
 | `CONTROL_LOG_LEVEL`                        | Log level                    |
 | `CONTROL_REGISTRY_HEALTH_CHECK_INTERVAL`   | Health check interval (sec)  |
+| `CONTROL_REPLAY_MAX_ENTRIES`               | Replay cache records, all signers (default 50,000) |
+| `CONTROL_REPLAY_MAX_ENTRIES_PER_SIGNER`    | Replay cache records per signer (default 5,000) |
+
+The replay settings live in `[replay]` (`max_entries`,
+`max_entries_per_signer`); see "Replay cache bounds" below.
 
 ## CLI Commands
 
@@ -219,6 +224,32 @@ control plane then supports WebAuthn passkey enrollment and login,
 providing browser-based passwordless authentication alongside DIDComm
 challenge-response auth. Without a `public_url`, WebAuthn is not
 initialised and authentication falls back to DID challenge-response.
+
+### Replay cache bounds
+
+Every service that accepts signed Trust Tasks (control plane, edge server,
+watcher, witness and daemon) records each one as `(signer, id)` for the
+replay window (6 minutes), so a captured request cannot be submitted again.
+At a bound the cache refuses new requests (`unavailable`, retryable) rather
+than forget a record. The per-signer bound therefore caps one signer's
+sustained rate at about `max_entries_per_signer / 360` requests a second: 14
+a second at the default 5,000. Each record holds about 0.4 KB, so 50,000
+records take about 20 MB; `max_entries` may be at most 1,000,000.
+
+Raise the bounds wherever one signer sends faster than that:
+
+- On the control plane, for a VTA that creates DIDs at a high rate, and for
+  each edge's sync acknowledgements, which are counted against that edge.
+- On each edge server and watcher, by the same rate: every DID change
+  reaches them as a sync document signed by the control plane, so their
+  per-signer bound caps how fast they can follow it.
+- On a witness, for a VTA that has each new DID witnessed.
+
+```toml
+[replay]
+max_entries = 200000           # all signers
+max_entries_per_signer = 50000 # about 140 signed requests a second per signer
+```
 
 ### Health Checking
 

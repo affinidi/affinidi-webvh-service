@@ -110,9 +110,17 @@ different path with the `--config` flag or the
 | `WATCHER_SERVER_RESOLVE_CACHE_MAX_AGE_SECS` | DID-resolution `max-age` (0 = `no-cache`; default 300) |
 | `WATCHER_SERVER_RESOLVE_CACHE_SHARED_MAX_AGE_SECS` | DID-resolution `s-maxage` (empty clears) |
 | `WATCHER_SERVER_RESOLVE_CACHE_STALE_WHILE_REVALIDATE_SECS` | DID-resolution `stale-while-revalidate` (empty clears) |
+| `WATCHER_REPLAY_MAX_ENTRIES` | Replay cache records, all signers (default 50,000) |
+| `WATCHER_REPLAY_MAX_ENTRIES_PER_SIGNER` | Replay cache records per signer (default 5,000) |
 
 The same settings live in `[server.resolve_cache]` (`max_age_secs`,
 `shared_max_age_secs`, `stale_while_revalidate_secs`).
+
+The replay settings live in `[replay]` (`max_entries`,
+`max_entries_per_signer`). Every sync document is signed by a source control plane, so the
+per-signer bound caps how fast the watcher follows DID changes (about 14 a
+second at the default). The control plane's README explains the
+bounds ("Replay cache bounds").
 
 ## CLI Commands
 

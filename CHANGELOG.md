@@ -93,6 +93,20 @@ browser-extension releases.
   names were silently ignored. `WEBVH_` still works but is deprecated; when
   both are set, `DID_HOSTING_` wins.
 
+### Added — configurable replay-cache bounds
+
+Each service's anti-replay cache for signed Trust Tasks held at most 5,000
+records per signer and 50,000 in all, for the 6-minute replay window, and
+refused new requests at either bound. One signer was therefore limited to
+about 14 signed requests a second: a VTA creating DIDs on the control plane
+or daemon, a VTA witnessing them, and the control plane's sync to each edge
+server and watcher. Both bounds are now set in a `[replay]` table
+(`max_entries`, `max_entries_per_signer`) on every binary, or with
+`{CONTROL,DAEMON,DID_HOSTING,WATCHER,WITNESS}_REPLAY_*`; the daemon applies
+its table to the embedded control plane and witness. The defaults are
+unchanged. A zero bound, a per-signer bound above the global one, or more
+than 1,000,000 records is refused at startup.
+
 ### Added — configurable caching for DID resolution
 
 - **`[server.resolve_cache]`** sets the `Cache-Control` sent with every

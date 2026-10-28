@@ -18,9 +18,9 @@
 //! out and then replay it. So at its bounds the cache **refuses** new records
 //! ([`ReplayError::Full`]) — the request is turned away as temporarily
 //! unavailable, and is safe to retry — rather than forgetting anything. Two
-//! bounds apply: a global one ([`MAX_ENTRIES`]) and one per signer
-//! ([`MAX_ENTRIES_PER_SIGNER`]), so one (authorised) signer cannot exhaust the
-//! space for everyone else.
+//! bounds apply, both set by [`ReplayConfig`]: a global one and one per
+//! signer, so one (authorised) signer cannot exhaust the space for everyone
+//! else.
 //!
 //! Expiry is O(1) amortised: records are kept in insertion order (insert time
 //! is monotonic), so expired ones are popped from the front.
@@ -34,12 +34,14 @@ use std::sync::Mutex;
 use super::auth::session::now_epoch;
 use super::didcomm_unpack::REPLAY_WINDOW_SECS;
 
+use super::config::ReplayConfig;
 use super::error::AppError;
 
-/// Global cap on remembered `(signer, id)` pairs.
+/// Default cap on remembered `(signer, id)` pairs ([`ReplayConfig::max_entries`]).
 pub const MAX_ENTRIES: usize = 50_000;
 
-/// Cap on remembered pairs for any one signer.
+/// Default cap on remembered pairs for any one signer
+/// ([`ReplayConfig::max_entries_per_signer`]).
 pub const MAX_ENTRIES_PER_SIGNER: usize = 5_000;
 
 /// Why a record was refused.
@@ -94,11 +96,21 @@ impl Inner {
 #[derive(Debug, Default)]
 pub struct ReplayCache {
     inner: Mutex<Inner>,
+    limits: ReplayConfig,
 }
 
 impl ReplayCache {
+    /// A cache with the default bounds ([`ReplayConfig::default`]).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A cache with the configured bounds.
+    pub fn with_config(limits: ReplayConfig) -> Self {
+        Self {
+            inner: Mutex::default(),
+            limits,
+        }
     }
 
     /// Record `(signer, id)`, or refuse it as a replay or because the cache is
@@ -114,8 +126,9 @@ impl ReplayCache {
         if inner.seen.contains_key(&key) {
             return Err(ReplayError::Duplicate);
         }
-        if inner.seen.len() >= MAX_ENTRIES
-            || inner.per_signer.get(signer).copied().unwrap_or(0) >= MAX_ENTRIES_PER_SIGNER
+        if inner.seen.len() >= self.limits.max_entries
+            || inner.per_signer.get(signer).copied().unwrap_or(0)
+                >= self.limits.max_entries_per_signer
         {
             return Err(ReplayError::Full);
         }
@@ -218,5 +231,18 @@ mod tests {
             cache.check_at("did:fresh", "x", 1_000),
             Err(ReplayError::Full)
         );
+    }
+
+    #[test]
+    fn configured_bounds_replace_the_defaults() {
+        let cache = ReplayCache::with_config(ReplayConfig {
+            max_entries: 3,
+            max_entries_per_signer: 2,
+        });
+        cache.check_at("did:a", "1", 1_000).unwrap();
+        cache.check_at("did:a", "2", 1_000).unwrap();
+        assert_eq!(cache.check_at("did:a", "3", 1_000), Err(ReplayError::Full));
+        cache.check_at("did:b", "1", 1_000).unwrap();
+        assert_eq!(cache.check_at("did:c", "1", 1_000), Err(ReplayError::Full));
     }
 }

@@ -348,6 +348,7 @@ pub async fn apply_recipe(
             context_id: None,
         },
         identity: Default::default(),
+        replay: Default::default(),
         sync: SyncConfig {
             source_dids: recipe.watcher.source_dids.clone(),
         },

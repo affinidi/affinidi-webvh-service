@@ -81,6 +81,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         control_did: Some(control_did),
         vta: VtaConfig::default(),
         identity: Default::default(),
+        replay: Default::default(),
         config_path: PathBuf::new(),
     };
     let state = AppState {

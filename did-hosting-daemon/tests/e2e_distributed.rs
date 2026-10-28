@@ -173,6 +173,7 @@ impl Topology {
             trust_tasks: Default::default(),
             hosting: Default::default(),
             identity: Default::default(),
+            replay: Default::default(),
             config_path: PathBuf::new(),
         };
         let control = did_hosting_control::server::AppState {
@@ -303,6 +304,7 @@ impl Topology {
             control_did: Some(control_did.clone()),
             vta: VtaConfig::default(),
             identity: Default::default(),
+            replay: Default::default(),
             config_path: PathBuf::new(),
         };
         let edge = did_hosting_server::server::AppState {
@@ -366,6 +368,7 @@ impl Topology {
             secrets: SecretsConfig::default(),
             vta: VtaConfig::default(),
             identity: Default::default(),
+            replay: Default::default(),
             config_path: PathBuf::new(),
         };
         let witness_identity = ServiceIdentity::from_signing_secret(&witness_did, witness_key)

@@ -536,6 +536,7 @@ mod tests {
             control_did: None,
             vta: VtaConfig::default(),
             identity: Default::default(),
+            replay: Default::default(),
             config_path: PathBuf::new(),
         };
         (AppState::new(store, config).unwrap(), dir)

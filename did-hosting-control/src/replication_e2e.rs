@@ -117,6 +117,7 @@ async fn edge_state(
         control_did: Some(control_did.into()),
         vta: VtaConfig::default(),
         identity: Default::default(),
+        replay: Default::default(),
         config_path: PathBuf::new(),
     };
     let state = did_hosting_server::server::AppState {

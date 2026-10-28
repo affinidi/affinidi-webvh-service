@@ -267,6 +267,7 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         trust_tasks: Default::default(),
         hosting: HostingConfig::default(),
         identity: Default::default(),
+        replay: Default::default(),
         config_path: output_path.clone(),
     };
 
@@ -952,6 +953,7 @@ pub async fn run_setup_offline_complete(
         trust_tasks: Default::default(),
         hosting: HostingConfig::default(),
         identity: Default::default(),
+        replay: Default::default(),
         config_path: state.config_output.clone(),
     };
 
