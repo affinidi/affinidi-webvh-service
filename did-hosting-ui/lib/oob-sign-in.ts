@@ -9,7 +9,9 @@
  *
  * Differences from the reference that are deliberate, because contract C9 and
  * the `auth/oob/*` schemas fixed them after it was written:
- *  - `claimDeadline` and `notAfter` are integer epoch seconds only;
+ *  - `request`'s `claimClosesAt` and `redeem`'s `sessionEndsAt` are RFC 3339
+ *    date-times (0.2); the trigger link's `_exp` stays integer epoch seconds,
+ *    converted from `claimClosesAt`;
  *  - error codes are `auth/oob:*` / `auth/oob/<task>:*` (matched here on the
  *    part after the last `:`, so either spelling works);
  *  - `K_b` is this console's session key (`session-key.ts`), so after
@@ -24,6 +26,9 @@
 
 import { clearSessionKeypair, generateSessionKeypair, signEnvelope } from "./session-key";
 import { scidHost } from "./did-scid";
+import type * as OobRequest from "./trust-tasks/auth/oob/request/0.2/payload";
+import type * as OobRedeem from "./trust-tasks/auth/oob/redeem/0.2/payload";
+import type * as OobCancel from "./trust-tasks/auth/oob/cancel/0.1/payload";
 
 // ---- trigger links (VTI spec 07a, contract C1) --------------------------------
 
@@ -36,12 +41,21 @@ export const TRIGGER_LINK_MAX_BYTES = 251;
 /** VTI-LNK-100. */
 export const SIGN_IN_MAX_LIFETIME_SECS = 300;
 
-// TODO: replace with generated trust-tasks types
+/** Checked against the generated modules, which are imported for types only
+ *  so their schemas stay out of the bundle. */
 export const OOB_TYPES = {
-  request: "https://trusttasks.org/spec/auth/oob/request/0.1",
-  redeem: "https://trusttasks.org/spec/auth/oob/redeem/0.1",
-  cancel: "https://trusttasks.org/spec/auth/oob/cancel/0.1",
+  request: "https://trusttasks.org/spec/auth/oob/request/0.2" as const satisfies typeof OobRequest.TYPE_URI,
+  redeem: "https://trusttasks.org/spec/auth/oob/redeem/0.2" as const satisfies typeof OobRedeem.TYPE_URI,
+  cancel: "https://trusttasks.org/spec/auth/oob/cancel/0.1" as const satisfies typeof OobCancel.TYPE_URI,
 } as const;
+
+/** An RFC 3339 instant as integer epoch seconds, rounded down so nothing
+ *  derived from it outlives the instant; `null` when it does not parse. */
+function epochSecondsOf(instant: unknown): number | null {
+  if (typeof instant !== "string") return null;
+  const ms = Date.parse(instant);
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+}
 
 export class TriggerLinkError extends Error {
   constructor(
@@ -402,8 +416,9 @@ export class SignInController {
       const res = await this.post(await this.signed(OOB_TYPES.request, { purpose: "login", mode: "scan" }), this.opts.requestTimeoutMs ?? 15_000);
       if (run !== this.run) return;
       if (!res.ok) throw new SignInError(res.code, res.message, res.details);
-      const { requestId, claimDeadline } = res.payload as { requestId?: unknown; claimDeadline?: unknown };
-      if (typeof requestId !== "string" || typeof claimDeadline !== "number" || !Number.isSafeInteger(claimDeadline)) {
+      const { requestId, claimClosesAt } = res.payload as Partial<Record<keyof OobRequest.Response, unknown>>;
+      const claimDeadline = epochSecondsOf(claimClosesAt);
+      if (typeof requestId !== "string" || claimDeadline === null) {
         throw new SignInError("malformedResponse", "the service returned an unusable request");
       }
       const link = buildTriggerLink({
@@ -498,6 +513,7 @@ export class SignInController {
         if (typeof body.subject !== "string") {
           return this.fail(new SignInError("malformedResponse", "redeem returned no subject"));
         }
+        const sessionEnds = epochSecondsOf(body.sessionEndsAt);
         this.clearTimers();
         this.requestId = null;
         this.opts.onRedeemed?.(body);
@@ -506,7 +522,7 @@ export class SignInController {
           status: known && known === body.subject ? "signedIn" : "confirm",
           subject: body.subject,
           displayName: typeof body.displayName === "string" ? body.displayName : undefined,
-          notAfter: typeof body.notAfter === "number" ? new Date(body.notAfter * 1000) : undefined,
+          notAfter: sessionEnds === null ? undefined : new Date(sessionEnds * 1000),
         });
         return;
       }

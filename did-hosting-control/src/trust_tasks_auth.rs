@@ -1,18 +1,11 @@
-//! Control-plane auth trust tasks: `auth/challenge/0.1`, `auth/authenticate`
-//! (`0.2` and `0.3`) and `auth/refresh` (`0.1` and `0.2`).
+//! Control-plane auth trust tasks: `auth/challenge/0.1`,
+//! `auth/authenticate/0.3` and `auth/refresh/0.2`.
 //!
-//! Two versions of `authenticate` and of `refresh` are served side by side.
-//! This is not a compatibility shim for anything this service used to do
-//! itself — every in-repo caller (the did-hosting UI's wallet login and the
-//! VTA-proxied SIOP login, both below) moved onto `0.3`/`0.2`. It is because
-//! the VTI Wallet browser extension — a separate, externally-versioned
-//! client this change cannot reach — still emits `auth/authenticate/0.2` for
-//! its own login and `auth/refresh/0.1` for its step-up renewal
-//! (`stepUpVta`). `0.3` is a backwards-compatible `MINOR` increment over
-//! `0.2` by the spec's own design ("every `0.2` document... is processed
-//! identically"), and `0.2` says the same of `0.1` for refresh, so keeping
-//! both arms is exactly what the specs anticipate for a mixed-version fleet,
-//! not a hand-rolled compatibility layer this service invented.
+//! Only the latest version of each is served. `authenticate/0.2` and
+//! `refresh/0.1` are refused as unsupported types: a client still sending
+//! them (the VTI Wallet browser extension did, for its own login and its
+//! step-up renewal) has to move to `0.3` / `0.2`, which process every older
+//! document's members identically.
 //!
 //! Authentication to this control plane existed in two mutually exclusive
 //! shapes, and neither was reachable from the third transport:
@@ -67,7 +60,7 @@
 //! decorative on two of three bindings, and a decorative challenge is one that
 //! stops being checked.
 //!
-//! ## Session keys (`auth/authenticate/0.2`)
+//! ## Session keys (`auth/authenticate`)
 //!
 //! An authenticate document may name a `sessionKey`, a `did:key` the producer
 //! holds. It sits inside the payload, so the subject's own proof is what
@@ -96,15 +89,14 @@
 //! `auth/authenticate:sessionKeyUnsupported`, before the challenge is spent. It
 //! never falls back to a login without the binding the producer asked for.
 
+use did_hosting_common::tasks::auth::{
+    authenticate::v0_3 as authenticate, challenge::v0_1 as challenge, refresh::v0_2 as refresh,
+};
 use serde_json::Value;
 use tracing::warn;
 use trust_tasks_rs::{
     Dispatcher, ErrorPayload, ErrorResponse, ProofPolicy, ProofVerifier, ResolvedParties,
     StandardCode, TransportHandler, TrustTask,
-    specs::auth::{
-        authenticate::v0_2 as authenticate_v2, authenticate::v0_3 as authenticate,
-        challenge::v0_1 as challenge, refresh::v0_1 as refresh_v1, refresh::v0_2 as refresh,
-    },
 };
 
 use did_hosting_common::epoch_to_rfc3339;
@@ -115,13 +107,11 @@ use vti_common::auth::handlers::{handle_authenticate, handle_refresh};
 
 use crate::server::AppState;
 
-/// The five request documents this module narrows an untyped inbound into.
+/// The three request documents this module narrows an untyped inbound into.
 enum TypedAuth {
     Challenge(Box<TrustTask<challenge::Payload>>),
-    AuthenticateV2(Box<TrustTask<authenticate_v2::Payload>>),
-    AuthenticateV3(Box<TrustTask<authenticate::Payload>>),
-    RefreshV1(Box<TrustTask<refresh_v1::Payload>>),
-    RefreshV2(Box<TrustTask<refresh::Payload>>),
+    Authenticate(Box<TrustTask<authenticate::Payload>>),
+    Refresh(Box<TrustTask<refresh::Payload>>),
 }
 
 /// Narrowing dispatcher — SPEC §7.2 items 1–3 (framework schema, payload-type
@@ -130,10 +120,8 @@ enum TypedAuth {
 fn build_auth_dispatcher() -> Dispatcher<TypedAuth> {
     Dispatcher::new()
         .on::<challenge::Payload, _>(|d| TypedAuth::Challenge(Box::new(d)))
-        .on::<authenticate_v2::Payload, _>(|d| TypedAuth::AuthenticateV2(Box::new(d)))
-        .on::<authenticate::Payload, _>(|d| TypedAuth::AuthenticateV3(Box::new(d)))
-        .on::<refresh_v1::Payload, _>(|d| TypedAuth::RefreshV1(Box::new(d)))
-        .on::<refresh::Payload, _>(|d| TypedAuth::RefreshV2(Box::new(d)))
+        .on::<authenticate::Payload, _>(|d| TypedAuth::Authenticate(Box::new(d)))
+        .on::<refresh::Payload, _>(|d| TypedAuth::Refresh(Box::new(d)))
 }
 
 /// Does this Type URI belong to the auth family handled here?
@@ -175,17 +163,7 @@ where
             )
             .await
         }
-        TypedAuth::AuthenticateV2(d) => {
-            run_pipeline(
-                transport,
-                policy,
-                *d,
-                my_vid(state)?,
-                |doc, parties| async move { authenticate_v2_arm(state, doc, &parties).await },
-            )
-            .await
-        }
-        TypedAuth::AuthenticateV3(d) => {
+        TypedAuth::Authenticate(d) => {
             run_pipeline(
                 transport,
                 policy,
@@ -195,17 +173,7 @@ where
             )
             .await
         }
-        TypedAuth::RefreshV1(d) => {
-            run_pipeline(
-                transport,
-                policy,
-                *d,
-                my_vid(state)?,
-                |doc, parties| async move { refresh_v1_arm(state, doc, &parties).await },
-            )
-            .await
-        }
-        TypedAuth::RefreshV2(d) => {
+        TypedAuth::Refresh(d) => {
             run_pipeline(
                 transport,
                 policy,
@@ -320,101 +288,6 @@ fn ed25519_session_key(session_key: &str) -> Option<String> {
     let multikey = session_key.strip_prefix("did:key:")?;
     did_hosting_common::server::auth::session::is_ed25519_multikey(multikey)
         .then(|| multikey.to_string())
-}
-
-#[allow(clippy::result_large_err)]
-async fn authenticate_v2_arm(
-    state: &AppState,
-    doc: TrustTask<authenticate_v2::Payload>,
-    parties: &ResolvedParties,
-) -> Result<TrustTask<authenticate_v2::Response>, ErrorResponse> {
-    let signer_did = caller(&doc, parties)?;
-
-    // Refused before the challenge is touched, so the producer can retry the
-    // same challenge without the key. It is never quietly dropped: a login the
-    // producer believes bound a key, and which did not, would have every
-    // later call the key signs refused.
-    let requested_key = doc.payload.session_key.as_ref().map(|k| k.to_string());
-    let session_pubkey_b58btc = match requested_key.as_deref() {
-        None => None,
-        Some(key) => Some(ed25519_session_key(key).ok_or_else(|| {
-            warn!(session_key = %key, "authenticate refused: unsupported session key type");
-            doc.reject_with(
-                format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-                ErrorPayload::from(authenticate_v2::error_codes::SESSION_KEY_UNSUPPORTED)
-                    .with_message("this service binds Ed25519 did:key session keys only")
-                    .with_details(serde_json::json!({ "requested": key })),
-            )
-        })?),
-    };
-
-    let backend = crate::auth::DidHostingControlAuthBackend::from_state(state)
-        .map_err(|e| denied(&doc, "authenticate/backend", e))?;
-
-    let session_id = doc.payload.session_id.to_string();
-    let resp = handle_authenticate(
-        &backend,
-        AuthenticateInput {
-            session_id: session_id.clone(),
-            challenge: doc.payload.challenge.to_string(),
-            // The verified signer. See the module doc: this is the document's
-            // in-band `issuer`, which the proof is bound to.
-            signer_did,
-            // Freshness is the framework's job here — `validate_freshness` has
-            // already bounded `issuedAt` against the acceptance window by the
-            // time this runs, so there is no separate DIDComm `created_time`
-            // for the handler to re-check.
-            created_time: None,
-            // The session key the subject's proof covers, bound to the session
-            // row this creates. See the module doc for what it may then sign.
-            session_pubkey_b58btc,
-            // The document's `recipient` is covered by its proof and has been
-            // checked against `my_vid` twice already — by the proof gate in
-            // `dispatch_trust_task_doc` and by `run_pipeline`.
-            audience: vti_common::auth::AudienceBinding::Transport,
-        },
-    )
-    .await
-    .map_err(|e| denied(&doc, "authenticate", e))?;
-
-    // The challenge is spent: free its slot, whichever binding issued it.
-    state.pending_challenges.release_session(&session_id);
-
-    // The absolute session lifetime is this deployment's own backstop
-    // (`AuthConfig::absolute_session_lifetime`) against a refresh token (and,
-    // where bound, a session key) that stays quietly compromised — and its
-    // own doc comment states the ceiling in terms of "authenticated
-    // (`auth/authenticate/0.2` or `/0.3`)", not just 0.3. `refresh_v2_arm`
-    // enforces it by reading this same meta row; a 0.2 login that never wrote
-    // one would refresh forever with no ceiling at all, exactly the
-    // unbounded-compromise case this config exists to close. So every login
-    // through this arm gets one too, with no `actor` — 0.2 has no proxied
-    // form.
-    //
-    // Keyed by `resp.session.id` (the DID-keyed session `handle_authenticate`
-    // just minted) — never the local `session_id` above, which is
-    // `payload.sessionId`, the just-released *challenge* row. See
-    // `authenticate_v3_arm`'s identical note.
-    store_auth_proxy_meta(
-        state,
-        &resp.session.id,
-        None,
-        now_epoch() + state.config.auth.absolute_session_lifetime,
-    )
-    .await
-    .map_err(|e| denied(&doc, "authenticate/meta", e))?;
-
-    // The response echoes the bound key (`Session.sessionKey`), so the
-    // producer can confirm the binding it asked for is the one it got.
-    let mut value =
-        serde_json::to_value(&resp).map_err(|e| denied(&doc, "authenticate/response", e))?;
-    if let Some(key) = requested_key {
-        value["session"]["sessionKey"] = Value::String(key);
-    }
-    let payload: authenticate_v2::Response =
-        serde_json::from_value(value).map_err(|e| denied(&doc, "authenticate/response", e))?;
-
-    Ok(doc.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload))
 }
 
 // ---------------------------------------------------------------------------
@@ -659,9 +532,8 @@ async fn get_auth_proxy_meta(
 /// Called from `auth/revoke-session` (the console's logout) and from any
 /// other path that ends a session outright, so a proxied login's `actor`
 /// and absolute-lifetime cap never outlive the session they were minted
-/// for. Sessions never proxied (a direct `auth/authenticate/0.2` login)
-/// have no row here — deleting a key that was never written is a no-op,
-/// not an error.
+/// for. A session with no row here (one not minted by
+/// `auth/authenticate`) makes this a no-op, not an error.
 pub(crate) async fn delete_auth_proxy_meta(
     state: &AppState,
     session_id: &str,
@@ -801,35 +673,6 @@ async fn authenticate_v3_arm(
     Ok(doc.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload))
 }
 
-#[allow(clippy::result_large_err)]
-async fn refresh_v1_arm(
-    state: &AppState,
-    doc: TrustTask<refresh_v1::Payload>,
-    parties: &ResolvedParties,
-) -> Result<TrustTask<vta_sdk::protocols::auth::AuthenticateResponse>, ErrorResponse> {
-    let signer_did = caller(&doc, parties)?;
-    let backend = crate::auth::DidHostingControlAuthBackend::from_state(state)
-        .map_err(|e| denied(&doc, "refresh/backend", e))?;
-
-    let resp = handle_refresh(
-        &backend,
-        RefreshInput {
-            refresh_token: doc.payload.refresh_token.to_string(),
-            // Always `Some` on this path. `RefreshInput` documents `None` as
-            // "skip the signer-matches-session check", which is only safe where
-            // the transport offers no signer assertion — plain REST, where the
-            // token is the sole credential. A trust task always carries a
-            // verified identity, so declining to pass it would discard a check
-            // we are in a position to make.
-            signer_did: Some(signer_did),
-        },
-    )
-    .await
-    .map_err(|e| denied(&doc, "refresh", e))?;
-
-    Ok(doc.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), resp))
-}
-
 /// Re-type `doc` as the framework's untyped `TrustTask<Value>`, for
 /// [`crate::routes::auth::verify_session_bound_proof`], whose signature
 /// predates the typed `refresh::Payload`.
@@ -854,8 +697,7 @@ async fn refresh_v2_arm(
     doc: TrustTask<refresh::Payload>,
     parties: &ResolvedParties,
 ) -> Result<TrustTask<refresh::Response>, ErrorResponse> {
-    // Unlike `authenticate` (proof REQUIRED) and unlike `refresh_v1_arm`
-    // (which always demands one via `caller`), this arm does not require a
+    // Unlike `authenticate` (proof REQUIRED), this arm does not require a
     // verified issuer at all — SPEC declares `proofRequirement: OPTIONAL`,
     // and a session with no bound key legitimately omits `proof` entirely
     // (Conformance item 3, "exactly as in 0.1"). The refresh token itself is
@@ -993,16 +835,14 @@ mod tests {
     // would be dead weight in a non-test build.
     use trust_tasks_rs::Payload as PayloadSpec;
 
-    /// `owns` must claim exactly the five request URIs — and in particular not
-    /// the `#response` forms, which are documents *we* emit and must never
-    /// route back into ourselves.
+    /// `owns` must claim exactly the three request URIs — and in particular
+    /// not the `#response` forms, which are documents *we* emit and must
+    /// never route back into ourselves.
     #[test]
-    fn owns_the_five_request_uris_and_not_their_responses() {
+    fn owns_the_three_request_uris_and_not_their_responses() {
         for uri in [
             <challenge::Payload as PayloadSpec>::TYPE_URI,
-            <authenticate_v2::Payload as PayloadSpec>::TYPE_URI,
             <authenticate::Payload as PayloadSpec>::TYPE_URI,
-            <refresh_v1::Payload as PayloadSpec>::TYPE_URI,
             <refresh::Payload as PayloadSpec>::TYPE_URI,
         ] {
             assert!(owns(uri), "{uri} must be owned");
@@ -1017,6 +857,9 @@ mod tests {
     fn owns_nothing_outside_the_family() {
         assert!(!owns("https://trusttasks.org/spec/acl/list/0.1"));
         assert!(!owns("https://trusttasks.org/spec/auth/whoami/0.1"));
+        // Superseded versions are no longer served.
+        assert!(!owns("https://trusttasks.org/spec/auth/authenticate/0.2"));
+        assert!(!owns("https://trusttasks.org/spec/auth/refresh/0.1"));
         assert!(!owns("not a uri"));
     }
 }

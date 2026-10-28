@@ -162,8 +162,8 @@ impl World {
         let (status, body) = self.send(d).await;
         assert_eq!(status, 200, "{body}");
         assert!(
-            body["payload"]["claimDeadline"].is_u64(),
-            "C9: epoch seconds"
+            body["payload"]["claimClosesAt"].is_string(),
+            "an RFC 3339 instant"
         );
         body["payload"]["requestId"].as_str().unwrap().to_string()
     }
@@ -253,7 +253,7 @@ impl World {
                 "approverKey": self.approver.did,
                 "origin": ORIGIN,
                 "contextDigest": context_digest(step2),
-                "notAfter": self.env.now() + 3600,
+                "sessionEndsAt": rfc3339(self.env.now() + 3600),
             }),
             purpose,
         )
@@ -327,7 +327,7 @@ async fn sign_in_end_to_end() {
     assert_eq!(p1["service"]["did"], w.service_did());
     assert_eq!(p1["origin"], ORIGIN);
     assert_eq!(p1["purpose"], "login");
-    assert!(p1["decisionDeadline"].is_u64(), "C9: epoch seconds");
+    assert!(p1["decisionClosesAt"].is_string(), "an RFC 3339 instant");
     assert!(
         p1.get("sessionKey").is_none(),
         "step 1 says nothing about the starter"
@@ -372,26 +372,9 @@ async fn sign_in_end_to_end() {
     assert_eq!(code(&again), "requestExpired");
 }
 
-// ---- 0.2 (signingScope) ----------------------------------------------------
+// ---- signingScope, and the carried grant's version -----------------------
 
-/// A step 2 at `version`, through prove at that version.
-async fn step2_at(w: &World, rid: &str, prove_type: &str) -> Value {
-    let n = w.number(rid).await;
-    let id = w.identify(&w.member, rid, &n, "authentication").await;
-    let d = w
-        .doc(
-            &w.approver,
-            prove_type,
-            json!({"identify": id}),
-            "authentication",
-        )
-        .await;
-    let (status, step2) = w.send(d).await;
-    assert_eq!(status, 200, "{step2}");
-    step2
-}
-
-/// A grant at `grant_type`, with `extra` merged into its payload.
+/// A grant, with `extra` merged into its payload and signed as `grant_type`.
 async fn grant_at(w: &World, rid: &str, step2: &Value, grant_type: &str, extra: Value) -> Value {
     let mut payload = json!({
         "requestId": rid,
@@ -400,7 +383,7 @@ async fn grant_at(w: &World, rid: &str, step2: &Value, grant_type: &str, extra: 
         "approverKey": w.approver.did,
         "origin": ORIGIN,
         "contextDigest": context_digest(step2),
-        "notAfter": w.env.now() + 3600,
+        "sessionEndsAt": rfc3339(w.env.now() + 3600),
     });
     for (k, v) in extra.as_object().unwrap() {
         payload[k] = v.clone();
@@ -409,89 +392,75 @@ async fn grant_at(w: &World, rid: &str, step2: &Value, grant_type: &str, extra: 
         .await
 }
 
-async fn respond_at(w: &World, respond_type: &str, grant: Value) -> (u16, Value) {
-    let d = w
-        .doc(
-            &w.approver,
-            respond_type,
-            json!({"grant": grant}),
-            "authentication",
-        )
-        .await;
-    w.send(d).await
-}
-
-/// A wallet tries `prove/0.2` first. It is served, offers no signing scope
-/// (this service delegates none), and the sign-in completes at 0.2.
+/// Step 2 offers no signing scope (this service delegates none).
 #[tokio::test]
-async fn sign_in_end_to_end_at_0_2() {
+async fn step2_offers_no_signing_scope() {
     let w = world();
     let rid = w.request().await;
     w.claim(&rid).await;
-
-    let step2 = step2_at(&w, &rid, TYPE_PROVE_V0_2).await;
-    assert_signed(&step2, "assertionMethod").await;
-    assert_eq!(step2["type"], format!("{TYPE_PROVE_V0_2}#response"));
+    let step2 = w.prove(&rid).await;
+    assert_eq!(step2["type"], format!("{TYPE_PROVE}#response"));
     assert!(
         step2["payload"].get("signingScope").is_none(),
         "nothing is offered for delegation: {step2}"
     );
-    assert_eq!(step2["payload"]["identifiedAs"], w.member.did);
-
-    let grant = grant_at(&w, &rid, &step2, TYPE_GRANT_V0_2, json!({})).await;
-    let (status, ok) = respond_at(&w, TYPE_RESPOND_V0_2, grant).await;
-    assert_eq!(status, 200, "{ok}");
-    assert_eq!(ok["type"], format!("{TYPE_RESPOND_V0_2}#response"));
-    assert_eq!(ok["payload"], json!({"status": "approved"}));
-    assert_signed(&ok, "assertionMethod").await;
-
-    let (status, session) = w.redeem(&rid).await;
-    assert_eq!(status, 200, "{session}");
-    assert_eq!(session["approved"], w.member.did);
+    assert!(step2["payload"]["decisionClosesAt"].is_string());
 }
 
-/// A 0.2 grant may only copy step 2's scope; claiming one nobody offered is
-/// a context mismatch, and declines the request.
+/// A grant may only copy step 2's scope; claiming one nobody offered is a
+/// context mismatch, and declines the request.
 #[tokio::test]
-async fn a_0_2_grant_claiming_an_unoffered_signing_scope_is_refused() {
+async fn a_grant_claiming_an_unoffered_signing_scope_is_refused() {
     let w = world();
     let rid = w.request().await;
     w.claim(&rid).await;
-    let step2 = step2_at(&w, &rid, TYPE_PROVE_V0_2).await;
+    let step2 = w.prove(&rid).await;
     let grant = grant_at(
         &w,
         &rid,
         &step2,
-        TYPE_GRANT_V0_2,
+        TYPE_GRANT,
         json!({"signingScope": ["did-management"]}),
     )
     .await;
-    let (status, body) = respond_at(&w, TYPE_RESPOND_V0_2, grant).await;
+    let (status, body) = w.respond_with(grant).await;
     assert_eq!(code(&body), "contextMismatch", "{status} {body}");
     assert_eq!(w.state(&rid), OobState::Declined);
 }
 
-/// A `respond` carries the `grant` of its own version: 0.2 with a 0.1 grant,
-/// or 0.1 with a 0.2 grant, is refused.
+/// `respond/0.3` carries a `grant/0.3` only: an older grant is refused.
 #[tokio::test]
-async fn respond_and_grant_versions_must_agree() {
-    for (respond, grant_type) in [
-        (TYPE_RESPOND_V0_2, TYPE_GRANT),
-        (TYPE_RESPOND, TYPE_GRANT_V0_2),
+async fn an_older_grant_is_refused() {
+    for grant_type in [
+        "https://trusttasks.org/spec/auth/oob/grant/0.1",
+        "https://trusttasks.org/spec/auth/oob/grant/0.2",
     ] {
         let w = world();
         let rid = w.request().await;
         w.claim(&rid).await;
-        let step2 = step2_at(&w, &rid, TYPE_PROVE_V0_2).await;
+        let step2 = w.prove(&rid).await;
         let grant = grant_at(&w, &rid, &step2, grant_type, json!({})).await;
-        let (_, body) = respond_at(&w, respond, grant).await;
-        assert_eq!(
-            code(&body),
-            "notAuthorized",
-            "{respond} + {grant_type}: {body}"
-        );
+        let (_, body) = w.respond_with(grant).await;
+        assert_eq!(code(&body), "notAuthorized", "{grant_type}: {body}");
         assert_eq!(w.state(&rid), OobState::Declined);
     }
+}
+
+/// The state machine serves only the latest version of each task.
+#[tokio::test]
+async fn older_versions_are_not_served() {
+    let w = world();
+    let d = w
+        .doc(
+            &w.starter,
+            "https://trusttasks.org/spec/auth/oob/request/0.1",
+            json!({"purpose": "login", "mode": "scan"}),
+            "assertionMethod",
+        )
+        .await;
+    let (status, body) = w.send(d).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(code(&body), "malformedRequest");
 }
 
 #[tokio::test]
@@ -921,7 +890,7 @@ async fn grant_must_name_the_starter_key() {
             json!({
                 "requestId": rid, "decision": "approve", "sessionKey": key(8).did,
                 "approverKey": w.approver.did, "origin": ORIGIN,
-                "contextDigest": context_digest(&step2), "notAfter": w.env.now() + 60,
+                "contextDigest": context_digest(&step2), "sessionEndsAt": rfc3339(w.env.now() + 60),
             }),
             "assertionMethod",
         )
@@ -944,7 +913,7 @@ async fn grant_from_another_did_is_refused() {
             json!({
                 "requestId": rid, "decision": "approve", "sessionKey": w.starter.did,
                 "approverKey": w.approver.did, "origin": ORIGIN,
-                "contextDigest": context_digest(&step2), "notAfter": w.env.now() + 60,
+                "contextDigest": context_digest(&step2), "sessionEndsAt": rfc3339(w.env.now() + 60),
             }),
             "assertionMethod",
         )
@@ -978,27 +947,47 @@ async fn a_declining_grant_ends_the_request() {
     assert_eq!(code(&body), "declined");
 }
 
-/// C9: integer epoch seconds only.
+/// `sessionEndsAt` is an RFC 3339 instant: 0.2's integer epoch seconds are
+/// refused.
 #[tokio::test]
-async fn grant_refuses_an_rfc3339_not_after() {
+async fn grant_refuses_an_epoch_session_end() {
     let w = world();
     let rid = w.request().await;
     w.claim(&rid).await;
     let step2 = w.prove(&rid).await;
+    let grant = grant_at(
+        &w,
+        &rid,
+        &step2,
+        TYPE_GRANT,
+        json!({"sessionEndsAt": w.env.now() + 600}),
+    )
+    .await;
+    assert_eq!(code(&w.respond_with(grant).await.1), "notAuthorized");
+    assert_eq!(w.state(&rid), OobState::Declined);
+}
+
+/// The old member name is not read: a grant carrying `notAfter` (and no
+/// `sessionEndsAt`) is refused.
+#[tokio::test]
+async fn grant_refuses_the_old_not_after() {
+    let w = world();
+    let rid = w.request().await;
+    w.claim(&rid).await;
+    let step2 = w.prove(&rid).await;
+    let mut grant = grant_at(&w, &rid, &step2, TYPE_GRANT, json!({})).await;
+    let p = grant["payload"].as_object_mut().unwrap();
+    p.remove("sessionEndsAt");
+    p.insert("notAfter".into(), json!(w.env.now() + 600));
     let grant = w
         .doc(
             &w.member,
             TYPE_GRANT,
-            json!({
-                "requestId": rid, "decision": "approve", "sessionKey": w.starter.did,
-                "approverKey": w.approver.did, "origin": ORIGIN,
-                "contextDigest": context_digest(&step2), "notAfter": rfc3339(w.env.now() + 600),
-            }),
+            grant["payload"].clone(),
             "assertionMethod",
         )
         .await;
     assert_eq!(code(&w.respond_with(grant).await.1), "notAuthorized");
-    assert_eq!(w.state(&rid), OobState::Declined);
 }
 
 // ---- redeem and cancel --------------------------------------------------------
@@ -1725,7 +1714,7 @@ mod https {
             json!({
                 "requestId": rid, "decision": "approve", "sessionKey": starter.did,
                 "approverKey": approver.did, "origin": PORTAL,
-                "contextDigest": context_digest(&step2), "notAfter": now_epoch() + 1800,
+                "contextDigest": context_digest(&step2), "sessionEndsAt": rfc3339(now_epoch() + 1800),
             }),
             "assertionMethod",
         )
@@ -1753,10 +1742,10 @@ mod https {
         let p = &body["payload"];
         assert_eq!(p["subject"], member.did);
         assert_eq!(p["amr"], json!(["did", "oob", "uv"]));
-        assert!(
-            p["notAfter"].as_u64().unwrap() <= now_epoch() + 1800,
-            "C9: epoch seconds, bounded by the grant"
-        );
+        let ends = chrono::DateTime::parse_from_rfc3339(p["sessionEndsAt"].as_str().unwrap())
+            .expect("an RFC 3339 instant")
+            .timestamp() as u64;
+        assert!(ends <= now_epoch() + 1800, "bounded by the grant");
 
         // The service's own session, with K_b as its session key.
         assert_eq!(p["displayName"], member.did, "no ACL label: the DID");
@@ -1780,7 +1769,7 @@ mod https {
         assert_eq!(session.amr, vec!["did", "oob", "uv"]);
         assert!(
             session.refresh_expires_at.unwrap() <= now_epoch() + 1800,
-            "never past notAfter"
+            "never past sessionEndsAt"
         );
     }
 }

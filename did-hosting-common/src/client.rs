@@ -8,18 +8,18 @@
 //! the client verifies the reply against the service DID before it believes a
 //! word of it.
 
-use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
-use affinidi_tdk::secrets_resolver::secrets::Secret;
-use serde::Deserialize;
-use serde_json::{Value, json};
-use trust_tasks_rs::Payload;
-use trust_tasks_rs::specs::did_management::{
+use crate::tasks::did_management::{
     agent_name::{
         check as agent_name_check, remove as agent_name_remove, update as agent_name_update,
     },
     did::{check_name, delete, info, list, register},
     server::info as server_info,
 };
+use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+use affinidi_tdk::secrets_resolver::secrets::Secret;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use trust_tasks_rs::Payload;
 
 use crate::did::{build_did_document, create_log_entry, encode_host};
 use crate::error::{Result, WebVHError};
@@ -170,27 +170,37 @@ impl WebVHClient {
         Ok(())
     }
 
-    /// `did/list/0.1`: every slot the requester owns (every slot, for an
-    /// administrator), read page by page.
+    /// `did/list/0.2`: every slot the requester owns (every slot, for an
+    /// administrator), read page by page until a page carries no
+    /// `nextCursor`.
     pub async fn list_dids(&self) -> Result<Vec<DidSummary>> {
         #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct Page {
             records: Vec<DidSummary>,
-            total: u64,
+            #[serde(default)]
+            next_cursor: Option<String>,
         }
         const PAGE: u64 = 100;
         let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
         loop {
-            let page: Page = self
-                .call(
-                    list::v0_1::Payload::TYPE_URI,
-                    json!({ "limit": PAGE, "offset": out.len() }),
-                )
-                .await?;
+            let mut request = json!({ "limit": PAGE });
+            if let Some(c) = &cursor {
+                request["cursor"] = json!(c);
+            }
+            let page: Page = self.call(list::v0_2::Payload::TYPE_URI, request).await?;
             let got = page.records.len();
             out.extend(page.records);
-            if got == 0 || out.len() as u64 >= page.total {
-                return Ok(out);
+            match page.next_cursor {
+                None => return Ok(out),
+                // A further page promised after an empty one would never end.
+                Some(_) if got == 0 => {
+                    return Err(WebVHError::Transport(
+                        "did/list offered another page after an empty one".into(),
+                    ));
+                }
+                Some(next) => cursor = Some(next),
             }
         }
     }

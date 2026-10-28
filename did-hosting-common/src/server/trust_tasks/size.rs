@@ -82,7 +82,7 @@ pub const DID_REGISTER_MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
 /// much. Keyed by the full Type URI, so a new version of a task takes the
 /// default until it declares its own.
 pub const DECLARED: &[(&str, usize)] = &[(
-    <trust_tasks_rs::specs::did_management::did::register::v0_1::Payload as Payload>::TYPE_URI,
+    <crate::tasks::did_management::did::register::v0_1::Payload as Payload>::TYPE_URI,
     DID_REGISTER_MAX_DOCUMENT_BYTES,
 )];
 
@@ -451,8 +451,8 @@ mod tests {
     use super::*;
 
     const DID_REGISTER: &str =
-        <trust_tasks_rs::specs::did_management::did::register::v0_1::Payload as Payload>::TYPE_URI;
-    const ACL_SHOW: &str = <trust_tasks_rs::specs::acl::show::v0_1::Payload as Payload>::TYPE_URI;
+        <crate::tasks::did_management::did::register::v0_1::Payload as Payload>::TYPE_URI;
+    const ACL_SHOW: &str = <crate::tasks::acl::show::v0_2::Payload as Payload>::TYPE_URI;
 
     fn register_doc(issuer: &str, bytes: usize) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({

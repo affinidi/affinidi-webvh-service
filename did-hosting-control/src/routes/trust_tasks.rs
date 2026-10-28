@@ -120,7 +120,7 @@ fn is_redeem_start(body: &[u8]) -> bool {
     use trust_tasks_rs::Payload;
     serde_json::from_slice::<TrustTask<Value>>(body).is_ok_and(|doc| {
         doc.type_uri.to_string()
-            == trust_tasks_rs::specs::auth::passkey::enroll::redeem::start::v0_1::Payload::TYPE_URI
+            == did_hosting_common::tasks::auth::passkey::enroll::redeem::start::v0_1::Payload::TYPE_URI
     })
 }
 
@@ -228,7 +228,7 @@ pub async fn dispatch_trust_task(
     //     the session's DID. Always accepted. It is what a wallet signs an
     //     approval or a refresh with, even in a session that has a key bound.
     //
-    // (b) The session key bound at login (`auth/authenticate/0.2`
+    // (b) The session key bound at login (`auth/authenticate/0.3`
     //     `sessionKey`, or a passkey login's browser key): exactly
     //     `did:key:{pk}#{pk}`, and only for a task a session key may sign
     //     (`session_key_may_sign`). Never an approval, and never the auth
@@ -481,7 +481,8 @@ mod tests {
     //! tested exhaustively in
     //! `did_hosting_common::server::trust_tasks::handlers::*`.
 
-    use trust_tasks_rs::{Payload, specs::acl::grant::v0_1 as grant};
+    use did_hosting_common::tasks::acl::grant::v0_2 as grant;
+    use trust_tasks_rs::Payload;
 
     /// Unit test of [`body_parse_error`] — pins the wire shape clients
     /// depend on (code, type URI, unrouted issuer/recipient).
@@ -524,11 +525,9 @@ mod tests {
                 "entry": {
                     "subject": "did:web:alice.example",
                     "role": "owner",
-                    "ext": {
-                        "vnd.affinidi.webvh": {
-                            "domains": { "kind": "all" }
-                        }
-                    }
+                    "act": { "scope": "all" },
+                    "keys": { "scope": "none" },
+                    "capabilities": { "scope": "ceiling" }
                 }
             }
         });

@@ -1,6 +1,6 @@
 //! Passkey enrolment as Trust Tasks.
 //!
-//! - `auth/passkey/enroll/invite/0.2` — an administrator issues a single-use
+//! - `auth/passkey/enroll/invite/0.3` — an administrator issues a single-use
 //!   invite: a token for the URL and a claim code for a second channel, both
 //!   returned once and stored only as hashes (`passkey::invite`).
 //! - `auth/passkey/enroll/redeem/{start,finish}/0.1` — the invitee, who holds
@@ -29,10 +29,7 @@
 //! the record whatever the outcome, so a replayed finish — or an assertion
 //! made for any other ceremony — has nothing to answer.
 
-use serde_json::{Value, json};
-use tracing::{info, warn};
-use trust_tasks_rs::StandardCode;
-use trust_tasks_rs::specs::auth::passkey::enroll::{
+use did_hosting_common::tasks::auth::passkey::enroll::{
     finish as enroll_finish,
     invite::{
         self as tt_invite, list as invite_list, revoke as invite_revoke, update as invite_update,
@@ -40,6 +37,9 @@ use trust_tasks_rs::specs::auth::passkey::enroll::{
     redeem::{finish as redeem_finish, start as redeem_start},
     start as enroll_start,
 };
+use serde_json::{Value, json};
+use tracing::{info, warn};
+use trust_tasks_rs::StandardCode;
 use webauthn_rs::prelude::{
     CreationChallengeResponse, Passkey, PasskeyAuthentication, PublicKeyCredential,
     RegisterPublicKeyCredential, RequestChallengeResponse,
@@ -394,10 +394,10 @@ fn wire_cred_id(passkey: &Passkey) -> Result<Value, TaskError> {
 }
 
 // ---------------------------------------------------------------------------
-// auth/passkey/enroll/invite/0.2
+// auth/passkey/enroll/invite/0.3
 // ---------------------------------------------------------------------------
 
-/// `auth/passkey/enroll/invite/0.2`: issue an invite. Administrator only.
+/// `auth/passkey/enroll/invite/0.3`: issue an invite. Administrator only.
 ///
 /// `session` invites are for a subject with no login passkey yet; `stepUp`
 /// invites for a subject this service already recognises (an ACL entry), and
@@ -405,9 +405,9 @@ fn wire_cred_id(passkey: &Passkey) -> Result<Value, TaskError> {
 /// nowhere else — the store keeps their hashes.
 pub(crate) async fn invite(
     cx: &Cx<'_>,
-    p: tt_invite::v0_2::Payload,
-) -> Result<tt_invite::v0_2::Response, TaskError> {
-    use tt_invite::v0_2::{PayloadPurpose, error_codes};
+    p: tt_invite::v0_3::Payload,
+) -> Result<tt_invite::v0_3::Response, TaskError> {
+    use tt_invite::v0_3::{PayloadPurpose, error_codes};
 
     let auth = cx.auth().await?;
     if auth.role != Role::Admin {
@@ -499,7 +499,7 @@ pub(crate) async fn invite(
         }
     };
     let ttl = p
-        .ttl
+        .ttl_seconds
         .map(|t| t.get())
         .unwrap_or(invite::DEFAULT_TTL_SECS)
         .min(state.config.auth.passkey_enrollment_ttl.max(1));

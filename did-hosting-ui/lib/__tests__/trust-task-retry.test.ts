@@ -50,11 +50,11 @@ vi.mock("../session-key", async (importOriginal) => ({
 
 const SUBJECT = "did:web:admin.example";
 
-const GRANT = "https://trusttasks.org/spec/acl/grant/0.1";
-const REVOKE = "https://trusttasks.org/spec/acl/revoke/0.1";
-const CHANGE_ROLE = "https://trusttasks.org/spec/acl/change-role/0.1";
-const LIST = "https://trusttasks.org/spec/acl/list/0.1";
-const SHOW = "https://trusttasks.org/spec/acl/show/0.1";
+const GRANT = "https://trusttasks.org/spec/acl/grant/0.2";
+const REVOKE = "https://trusttasks.org/spec/acl/revoke/0.2";
+const CHANGE_ROLE = "https://trusttasks.org/spec/acl/change-role/0.2";
+const LIST = "https://trusttasks.org/spec/acl/list/0.3";
+const SHOW = "https://trusttasks.org/spec/acl/show/0.2";
 
 const NOW = Date.parse("2026-07-28T12:00:00Z");
 const at = (offsetMs: number) => new Date(NOW + offsetMs).toISOString();

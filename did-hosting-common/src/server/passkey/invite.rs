@@ -1,4 +1,4 @@
-//! Passkey enrolment invites (`auth/passkey/enroll/invite/0.2`), stored hashed.
+//! Passkey enrolment invites (`auth/passkey/enroll/invite/0.3`), stored hashed.
 //!
 //! An invite is two secrets delivered over two channels: a **token**, carried
 //! in the invite URL, and a short **claim code** the invitee types. Neither is

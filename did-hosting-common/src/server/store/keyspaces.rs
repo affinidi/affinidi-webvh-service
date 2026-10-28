@@ -32,7 +32,7 @@ pub const KS_ACL: &str = "acl";
 pub const KS_SESSIONS: &str = "sessions";
 
 /// `pk_user:<uuid>`, `pk_did:<did>`, `pk_cred:<cred_id_hex>` — **step-up-only**
-/// passkeys (`auth/passkey/enroll/invite/0.2` `purpose: stepUp`), in the same
+/// passkeys (`auth/passkey/enroll/invite/0.3` `purpose: stepUp`), in the same
 /// layout [`KS_SESSIONS`] holds login passkeys in.
 ///
 /// A separate keyspace so the separation holds by construction: the passkey

@@ -30,11 +30,11 @@
 
 use std::sync::Arc;
 
-use serde_json::{Value, json};
-use tracing::{debug, info, warn};
-use trust_tasks_rs::specs::webvh::sync::{
+use did_hosting_common::tasks::webvh::sync::{
     batch::v0_1 as sync_batch, delete::v0_2 as sync_delete, update::v0_2 as sync_update,
 };
+use serde_json::{Value, json};
+use tracing::{debug, info, warn};
 use trust_tasks_rs::{DeclaredErrorCode, ErrorPayload, RejectReason, TrustTask};
 
 use did_hosting_common::didcomm_types::{MSG_SYNC_BATCH, MSG_SYNC_DELETE, MSG_SYNC_UPDATE};

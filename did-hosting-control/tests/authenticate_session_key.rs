@@ -1,6 +1,6 @@
-//! `auth/authenticate/0.2` session keys, end to end over `POST /api/trust-tasks`.
+//! `auth/authenticate/0.3` session keys, end to end over `POST /api/trust-tasks`.
 //!
-//! A subject logs in with `auth/challenge/0.1` then `auth/authenticate/0.2`,
+//! A subject logs in with `auth/challenge/0.1` then `auth/authenticate/0.3`,
 //! naming a `sessionKey`. The control plane binds it to the new session and
 //! then accepts that key's `authentication` proofs as the subject:
 //!
@@ -118,7 +118,7 @@ async fn challenge(h: &TestServer, subject: &Key) -> (String, String) {
     )
 }
 
-/// `auth/authenticate/0.2` for a challenge, optionally binding `session_key`.
+/// `auth/authenticate/0.3` for a challenge, optionally binding `session_key`.
 async fn authenticate(
     h: &TestServer,
     subject: &Key,
@@ -130,7 +130,7 @@ async fn authenticate(
         payload["sessionKey"] = json!(k);
     }
     let d = sign(
-        doc("auth/authenticate/0.2", &subject.did, payload),
+        doc("auth/authenticate/0.3", &subject.did, payload),
         subject,
         "authentication",
     )
@@ -154,7 +154,7 @@ async fn login(h: &TestServer, subject: &Key, session_key: Option<&Key>) -> (Str
 /// An ordinary operational request (`acl/list`) as `subject`, signed by `by`.
 async fn list_as(h: &TestServer, bearer: &str, subject: &Key, by: &Key) -> (StatusCode, Value) {
     let d = sign(
-        doc("acl/list/0.1", &subject.did, json!({})),
+        doc("acl/list/0.3", &subject.did, json!({})),
         by,
         "authentication",
     )
@@ -192,7 +192,7 @@ async fn login_binds_the_session_key_and_it_signs_for_its_session() {
     h.add_acl(&alice.did, Role::Admin).await;
 
     let (token, body) = login(&h, &alice, Some(&browser)).await;
-    assert_eq!(body["type"], format!("{TT}auth/authenticate/0.2#response"));
+    assert_eq!(body["type"], format!("{TT}auth/authenticate/0.3#response"));
     assert_eq!(
         body["payload"]["session"]["sessionKey"], browser.did,
         "the binding is echoed"
@@ -244,7 +244,7 @@ async fn the_session_key_is_accepted_only_for_its_own_session() {
     }
     // Nor does a request with no session at all.
     let d = sign(
-        doc("acl/list/0.1", &alice.did, json!({})),
+        doc("acl/list/0.3", &alice.did, json!({})),
         &browser,
         "authentication",
     )
@@ -408,7 +408,7 @@ async fn the_session_key_cannot_approve_a_step_up() {
 
     let approve = || {
         doc(
-            "auth/step-up/approve-response/0.5",
+            "auth/step-up/approve-response/0.6",
             &alice.did,
             json!({
                 "subject": alice.did,
@@ -450,10 +450,11 @@ async fn the_session_key_cannot_mint_or_refresh_a_session() {
         .unwrap()
         .to_string();
 
-    // A refresh signed by the session key is refused, even with the refresh
-    // token: any proof on a refresh must be the subject's own.
+    // A refresh naming the subject as `issuer` but signed by the session key
+    // is refused, even with the refresh token: the key never speaks for the
+    // subject on an auth task.
     let refresh = doc(
-        "auth/refresh/0.1",
+        "auth/refresh/0.2",
         &alice.did,
         json!({ "refreshToken": refresh_token }),
     );
@@ -466,7 +467,7 @@ async fn the_session_key_cannot_mint_or_refresh_a_session() {
     let (ch, sid) = challenge(&h, &alice).await;
     let d = sign(
         doc(
-            "auth/authenticate/0.2",
+            "auth/authenticate/0.3",
             &alice.did,
             json!({ "challenge": ch, "sessionId": sid }),
         ),
@@ -478,10 +479,12 @@ async fn the_session_key_cannot_mint_or_refresh_a_session() {
     assert_ne!(status, StatusCode::OK, "{body}");
     assert_eq!(code(&body), "proofInvalid", "{body}");
 
-    // The refresh token with the subject's own proof still works.
+    // Under `auth/refresh/0.2` a session that bound a key refreshes with
+    // that key's proof, not the subject's: the subject's own proof is
+    // refused, without spending the token.
     let d = sign(
         doc(
-            "auth/refresh/0.1",
+            "auth/refresh/0.2",
             &alice.did,
             json!({ "refreshToken": refresh_token }),
         ),
@@ -490,6 +493,26 @@ async fn the_session_key_cannot_mint_or_refresh_a_session() {
     )
     .await;
     let (status, body) = post(&h, Some(&token), &d).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        code(&body),
+        "auth/refresh:sessionKeyProofRequired",
+        "{body}"
+    );
+
+    // Issued and proved by the bound key itself, the refresh rotates the
+    // session — the token was not burned by the refusals above.
+    let d = sign(
+        doc(
+            "auth/refresh/0.2",
+            &browser.did,
+            json!({ "refreshToken": refresh_token }),
+        ),
+        &browser,
+        "authentication",
+    )
+    .await;
+    let (status, body) = post(&h, None, &d).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 

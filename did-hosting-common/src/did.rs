@@ -184,7 +184,7 @@ pub fn add_sign_in_portal_service(doc: &mut serde_json::Value, endpoint: &str) {
 ///
 /// Stricter than [`is_https_or_loopback`] on purpose: the portal's origin is
 /// what `auth/oob/*` binds a sign-in to, and the published `Origin` type
-/// (`trust_tasks_rs::specs::auth::oob`) admits `https://` only, so a plain-
+/// (`crate::tasks::auth::oob`) admits `https://` only, so a plain-
 /// http portal — even on loopback — could never complete a conforming
 /// sign-in (a wallet refuses to approve one). The control plane applies the
 /// same rule to its `public_url` before it serves the family at all

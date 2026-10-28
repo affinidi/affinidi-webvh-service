@@ -15,8 +15,8 @@
 //! their request:
 //!
 //! ```text
-//! MSG_SERVER_REGISTER      .../spec/did-management/server/register/0.1
-//! MSG_SERVER_REGISTER_ACK  .../spec/did-management/server/register/0.1#response
+//! MSG_SERVER_REGISTER      .../spec/did-management/server/register/0.2
+//! MSG_SERVER_REGISTER_ACK  .../spec/did-management/server/register/0.2#response
 //! MSG_HEALTH_PING          .../spec/did-management/server/health/0.1
 //! MSG_HEALTH_PONG          .../spec/did-management/server/health/0.1#response
 //! MSG_STATS_SYNC           .../spec/did-management/server/stats-sync/0.1
@@ -130,12 +130,18 @@ async fn dispatch_inner(
                     Some(serde_json::to_value(&resp).expect("ack document serialises"))
                 }
                 Err(rej) => {
-                    let err = doc.reject_with(
-                        reply_id,
+                    // A payload that is not `server/register/0.2` is malformed,
+                    // not forbidden: the caller is told which, and can fix it.
+                    let reason = if rej.code == "e.p.registration.malformed" {
+                        trust_tasks_rs::RejectReason::MalformedRequest {
+                            reason: rej.comment.clone(),
+                        }
+                    } else {
                         trust_tasks_rs::RejectReason::PermissionDenied {
                             reason: rej.comment.clone(),
-                        },
-                    );
+                        }
+                    };
+                    let err = doc.reject_with(reply_id, reason);
                     warn!(
                         sender,
                         code = rej.code,

@@ -155,8 +155,8 @@ mod tests {
     /// or every verified scrape would be reported as the wrong type.
     #[test]
     fn the_metrics_response_type_is_the_request_type_with_a_response_fragment() {
+        use crate::tasks::did_management::server::metrics::v0_1;
         use trust_tasks_rs::Payload;
-        use trust_tasks_rs::specs::did_management::server::metrics::v0_1;
         assert_eq!(
             format!("{}#response", super::metrics_request_type_uri()),
             <v0_1::Response as Payload>::TYPE_URI

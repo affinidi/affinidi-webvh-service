@@ -135,8 +135,8 @@ function service(redeems: Reply[], claimWindowSecs = 120) {
     const doc = JSON.parse(String(init.body)) as Record<string, unknown>;
     sent.push(doc);
     let r: Reply;
-    if (String(doc.type).endsWith("/request/0.1")) {
-      r = ok({ requestId: RID, claimDeadline: Math.floor(Date.now() / 1000) + claimWindowSecs });
+    if (String(doc.type).endsWith("/request/0.2")) {
+      r = ok({ requestId: RID, claimClosesAt: new Date((Math.floor(Date.now() / 1000) + claimWindowSecs) * 1000).toISOString() });
     } else if (String(doc.type).endsWith("/cancel/0.1")) {
       r = ok({ status: "cancelled" });
     } else {
@@ -160,7 +160,7 @@ describe("sign-in controller", () => {
   it("waits, shows the number, then asks Continue as …", async () => {
     const svc = service([
       err(409, "auth/oob/redeem:pending", { state: "claimed", matchNumber: "47" }),
-      ok({ subject: "did:example:alice", displayName: "Alice", notAfter: 1_900_000_000, amr: ["did", "oob", "uv"] }),
+      ok({ subject: "did:example:alice", displayName: "Alice", sessionEndsAt: new Date(1_900_000_000_000).toISOString(), amr: ["did", "oob", "uv"] }),
     ]);
     let redeemed: Record<string, unknown> | undefined;
     const s = createSignIn({
@@ -237,7 +237,7 @@ describe("sign-in controller", () => {
     const svc = service([
       err(409, "auth/oob/redeem:pending", { state: "pending" }),
       err(409, "auth/oob/redeem:pending", { state: "pending" }),
-      ok({ subject: "did:example:alice", displayName: "Alice", notAfter: 1_900_000_000, amr: ["did"] }),
+      ok({ subject: "did:example:alice", displayName: "Alice", sessionEndsAt: new Date(1_900_000_000_000).toISOString(), amr: ["did"] }),
     ]);
     const s = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: svc.f, keys: keys(), document: doc as unknown as Document, pageHost: "dids.example.org" });
     await s.start();
@@ -260,7 +260,7 @@ describe("sign-in controller", () => {
     doc.show();
     // The same request, shown again: no new request, nothing cancelled.
     expect(s.state).toMatchObject({ status: "waiting", codeVisible: true, requestId: (first as { requestId: string }).requestId });
-    expect(svc.sent.filter((d) => String(d.type).endsWith("/request/0.1"))).toHaveLength(1);
+    expect(svc.sent.filter((d) => String(d.type).endsWith("/request/0.2"))).toHaveLength(1);
     expect(svc.sent.some((d) => String(d.type).endsWith("/cancel/0.1"))).toBe(false);
     s.destroy();
   });
@@ -328,10 +328,10 @@ describe("sign-in controller", () => {
     const seen: string[] = [];
     s.subscribe((st) => seen.push(st.status));
     s.startWhenVisible();
-    for (let i = 0; i < 200 && svc.sent.filter((d) => String(d.type).endsWith("/request/0.1")).length < 3; i++) {
+    for (let i = 0; i < 200 && svc.sent.filter((d) => String(d.type).endsWith("/request/0.2")).length < 3; i++) {
       await new Promise((r) => setTimeout(r, 5));
     }
-    expect(svc.sent.filter((d) => String(d.type).endsWith("/request/0.1")).length).toBeGreaterThanOrEqual(3);
+    expect(svc.sent.filter((d) => String(d.type).endsWith("/request/0.2")).length).toBeGreaterThanOrEqual(3);
     expect(seen).not.toContain("expired");
     s.destroy();
   });
@@ -339,7 +339,7 @@ describe("sign-in controller", () => {
   it("puts a renewal off while the tab is hidden, and renews once it is visible", async () => {
     const doc = new FakeDocument();
     const svc = service([], 0);
-    const requests = () => svc.sent.filter((d) => String(d.type).endsWith("/request/0.1")).length;
+    const requests = () => svc.sent.filter((d) => String(d.type).endsWith("/request/0.2")).length;
     const s = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: svc.f, keys: keys(), document: doc as unknown as Document, pageHost: "dids.example.org", renew: true });
     doc.hide();
     // Opened by hand while hidden: its window closes, and nothing is renewed.
@@ -361,7 +361,7 @@ describe("sign-in controller", () => {
     const s = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: svc.f, keys: keys(), document: new FakeDocument() as unknown as Document, pageHost: "dids.example.org", renew: true });
     s.startWhenVisible();
     await until(() => s.state, "expired");
-    expect(svc.sent.filter((d) => String(d.type).endsWith("/request/0.1"))).toHaveLength(1);
+    expect(svc.sent.filter((d) => String(d.type).endsWith("/request/0.2"))).toHaveLength(1);
     s.destroy();
   });
 

@@ -1,11 +1,11 @@
 //! `did-management/me/domains` and the `domain/*` family.
 
-use serde_json::{Value, json};
-use tracing::{info, warn};
-use trust_tasks_rs::specs::did_management::{
+use did_hosting_common::tasks::did_management::{
     domain::{assign, create, list, purge, set_default, set_state, unassign, update},
     me::domains as me_domains_spec,
 };
+use serde_json::{Value, json};
+use tracing::{info, warn};
 
 use did_hosting_common::server::auth::session::now_epoch;
 use did_hosting_common::server::domain::{

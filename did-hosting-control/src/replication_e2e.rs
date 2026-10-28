@@ -672,18 +672,27 @@ async fn reconcile_repairs_a_missed_disable_on_every_transport() {
 async fn only_a_registered_server_is_given_the_full_listing() {
     let f = fleet().await;
     publish(&f.control, "alice").await;
-    let request = did_hosting_server::replication::list_request(&f.edge, 0)
+    let request = did_hosting_server::replication::list_request(&f.edge, None)
         .await
         .unwrap();
     let reply = f.ask_control(Via::Https, request).await.unwrap();
-    assert_eq!(reply.payload["total"], 0, "{reply:?}");
+    assert_eq!(
+        reply.payload["records"].as_array().map(Vec::len),
+        Some(0),
+        "{reply:?}"
+    );
 
     f.register_edge().await;
-    let request = did_hosting_server::replication::list_request(&f.edge, 0)
+    let request = did_hosting_server::replication::list_request(&f.edge, None)
         .await
         .unwrap();
     let reply = f.ask_control(Via::Https, request).await.unwrap();
-    assert_eq!(reply.payload["total"], 1, "{reply:?}");
+    assert_eq!(
+        reply.payload["records"].as_array().map(Vec::len),
+        Some(1),
+        "{reply:?}"
+    );
+    assert!(reply.payload.get("nextCursor").is_none(), "{reply:?}");
     // Each slot's owner and resolve count are withheld from a replica.
     let record = &reply.payload["records"][0];
     assert_eq!(record["owner"], "", "{reply:?}");
