@@ -424,11 +424,23 @@ impl KeyspaceHandle {
     /// would. Reads are untouched. Raise `allowed` to let writes through
     /// again.
     pub fn failing_writes_after(&self, allowed: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        self.wrap_failing(allowed, false)
+    }
+
+    /// Like [`Self::failing_writes_after`], but a failing write is applied
+    /// before it reports failure, as when a store times out after the write
+    /// landed.
+    pub fn failing_acks_after(&self, allowed: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        self.wrap_failing(allowed, true)
+    }
+
+    fn wrap_failing(&self, allowed: Arc<std::sync::atomic::AtomicUsize>, apply: bool) -> Self {
         Self {
             name: self.name.clone(),
             inner: Arc::new(FailingWrites {
                 inner: self.inner.clone(),
                 allowed,
+                apply,
             }),
             backend: self.backend.clone(),
         }
@@ -439,6 +451,8 @@ impl KeyspaceHandle {
 struct FailingWrites {
     inner: Arc<dyn KeyspaceOps>,
     allowed: Arc<std::sync::atomic::AtomicUsize>,
+    /// Apply a failing write before reporting the failure.
+    apply: bool,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -456,8 +470,15 @@ impl FailingWrites {
 impl KeyspaceOps for FailingWrites {
     fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async move {
-            self.take_write()?;
-            self.inner.insert_raw(key, value).await
+            match self.take_write() {
+                Ok(()) => self.inner.insert_raw(key, value).await,
+                Err(e) => {
+                    if self.apply {
+                        self.inner.insert_raw(key, value).await?;
+                    }
+                    Err(e)
+                }
+            }
         })
     }
     fn get_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {

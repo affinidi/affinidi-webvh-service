@@ -237,8 +237,7 @@ pub(crate) async fn do_stats_sync(
         .and_then(|v| v.as_array())
         .map(Vec::as_slice)
         .unwrap_or_default();
-    const MAX_DELTAS_PER_SYNC: usize = 10_000;
-    if deltas.len() > MAX_DELTAS_PER_SYNC {
+    if deltas.len() > did_hosting_common::server::stats_collector::MAX_STATS_SYNC_DELTAS {
         warn!(
             did = signer,
             count = deltas.len(),
@@ -250,12 +249,29 @@ pub(crate) async fn do_stats_sync(
         ));
     }
     let mut invalid = 0usize;
+    let mut invalid_sample: Vec<String> = Vec::new();
+    // Lookups left for paths outside the current grammar (see below).
+    let mut lookups_left = MAX_HOSTED_LOOKUPS_PER_SYNC;
     for d in deltas {
         let mnemonic = d.get("mnemonic").and_then(|v| v.as_str()).unwrap_or("");
         // The path keys `stats:` and `ts:` rows: only a hosted-path shape is
-        // accepted, and never the server-wide series name.
-        if !is_stats_mnemonic(mnemonic) {
+        // accepted, and never the server-wide series name. A path stored
+        // before the current path rules is accepted if it is hosted here;
+        // that costs a read, so only a few are looked up per sync.
+        let mut accepted = is_stats_mnemonic(mnemonic);
+        if !accepted && lookups_left > 0 && is_key_safe_stats_path(mnemonic) {
+            lookups_left -= 1;
+            accepted = state
+                .dids_ks
+                .contains_key(did_hosting_common::did_ops::did_key(mnemonic))
+                .await
+                .unwrap_or(false);
+        }
+        if !accepted {
             invalid += 1;
+            if invalid_sample.len() < 5 {
+                invalid_sample.push(mnemonic.chars().take(64).collect());
+            }
             continue;
         }
         let resolve_delta = d.get("resolve_delta").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -275,7 +291,9 @@ pub(crate) async fn do_stats_sync(
     if invalid > 0 {
         warn!(
             server_did,
-            invalid, "stats sync: skipped deltas with an invalid DID path"
+            invalid,
+            sample = ?invalid_sample,
+            "stats sync: skipped deltas whose path is not a hosted DID path"
         );
     }
     debug!(
@@ -286,6 +304,23 @@ pub(crate) async fn do_stats_sync(
     );
 
     Ok(json!({ "status": "accepted" }))
+}
+
+/// Most odd-shaped stats-sync paths one sync may have looked up in the
+/// store to see whether they are hosted here.
+const MAX_HOSTED_LOOKUPS_PER_SYNC: usize = 100;
+
+/// Whether a path outside the current path grammar could still key a stats
+/// row safely: non-empty, bounded, never the server-wide series name, and
+/// without the `:` that separates a `ts:` key's path from its epoch.
+fn is_key_safe_stats_path(mnemonic: &str) -> bool {
+    use did_hosting_common::server::stats_collector::ALL_SERIES;
+
+    !mnemonic.is_empty()
+        && mnemonic.len() <= 255
+        && mnemonic != ALL_SERIES
+        && !mnemonic.contains(':')
+        && !mnemonic.chars().any(char::is_control)
 }
 
 /// Whether a stats-sync delta's path can key a stats row: a hosted path's
@@ -1691,6 +1726,16 @@ mod tests {
         }
     }
 
+    /// A path outside the current grammar may still be a hosted legacy
+    /// path, but never one that could break a `ts:` key or alias `_all`.
+    #[test]
+    fn legacy_stats_paths_must_be_key_safe() {
+        assert!(is_key_safe_stats_path("Alice/bob"));
+        for bad in ["", "_all", "a:b", "ts:_all:300", "a\nb"] {
+            assert!(!is_key_safe_stats_path(bad), "{bad:?} should be refused");
+        }
+    }
+
     /// Build a minimal `AppState` backed by a tempdir-rooted fjall store. The
     /// returned `_dir` guard must outlive `state` — when it drops, fjall
     /// removes the partition files on disk.
@@ -1926,6 +1971,40 @@ mod tests {
             Arc::new(DidKeyResolver),
         )));
         (state, dir)
+    }
+
+    /// A synced delta for a hosted path that predates the current path
+    /// grammar still counts; an unhosted path of the same shape does not.
+    #[tokio::test]
+    async fn stats_sync_counts_a_hosted_legacy_path() {
+        let (state, _dir) = test_state().await;
+        let edge = "did:example:stats-legacy-edge";
+        seed_role(&state, edge, Role::Service).await;
+        state
+            .dids_ks
+            .insert(
+                did_hosting_common::did_ops::did_key("Legacy/Path"),
+                &json!({}),
+            )
+            .await
+            .unwrap();
+
+        let body = json!({
+            "server_did": edge,
+            "seq": 1,
+            "did_deltas": [
+                {"mnemonic": "Legacy/Path", "resolve_delta": 3, "update_delta": 0},
+                {"mnemonic": "Unhosted/Path", "resolve_delta": 5, "update_delta": 0},
+            ],
+        });
+        assert!(do_stats_sync(&state, edge, &body).await.is_ok());
+
+        let deltas = state.stats_collector.drain_for_sync();
+        let counted: Vec<_> = deltas
+            .iter()
+            .map(|d| (d.mnemonic.as_str(), d.resolve_delta))
+            .collect();
+        assert_eq!(counted, [("Legacy/Path", 3)]);
     }
 
     async fn seed_role(state: &AppState, did: &str, role: Role) {
