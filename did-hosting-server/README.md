@@ -375,6 +375,14 @@ work but are deprecated, and the `DID_HOSTING_` name wins when both are set.
 | `DID_HOSTING_SERVER_RESOLVE_CACHE_MAX_AGE_SECS` | Resolve `max-age` (0 = `no-cache`) |
 | `DID_HOSTING_SERVER_RESOLVE_CACHE_SHARED_MAX_AGE_SECS` | Resolve `s-maxage` (empty clears) |
 | `DID_HOSTING_SERVER_RESOLVE_CACHE_STALE_WHILE_REVALIDATE_SECS` | Resolve `stale-while-revalidate` (empty clears) |
+| `DID_HOSTING_REPLAY_MAX_ENTRIES`            | Replay cache records, all signers (default 1,000,000, about 32 MB) |
+| `DID_HOSTING_REPLAY_MAX_ENTRIES_PER_SIGNER` | Replay cache records per signer (default 250,000, about 600 signed requests a second) |
+
+The replay settings live in `[replay]` (`max_entries`,
+`max_entries_per_signer`). Every sync document is signed by the control plane, so the per-signer
+bound caps how fast this edge follows DID changes (about 600 a second at
+the default). The deprecated `WEBVH_REPLAY_*` names are still read. The control plane's README explains the
+bounds ("Replay cache bounds").
 
 ## Building
 

@@ -81,6 +81,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         control_did: Some(control_did),
         vta: VtaConfig::default(),
         identity: Default::default(),
+        replay: Default::default(),
         config_path: PathBuf::new(),
     };
     let state = AppState {
@@ -106,6 +107,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
             ),
         ),
         sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+        replay_cache: std::sync::Arc::new(did_hosting_common::server::replay::ReplayCache::new()),
     };
     (state, dir)
 }

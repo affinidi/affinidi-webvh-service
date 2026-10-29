@@ -221,6 +221,7 @@ pub async fn run_wizard(
             context_id: None,
         },
         registry: did_hosting_control::config::RegistryConfig::default(),
+        replay: Default::default(),
         features,
         identity: IdentityConfig::default(),
         enable,
@@ -1077,6 +1078,7 @@ async fn run_self_managed_setup(
         limits: did_hosting_server::config::LimitsConfig::default(),
         vta: VtaConfig::default(),
         registry: did_hosting_control::config::RegistryConfig::default(),
+        replay: Default::default(),
         features,
         identity: IdentityConfig {
             mode: IdentityMode::SelfManaged,
@@ -1451,6 +1453,7 @@ pub async fn run_setup_offline_complete(
             context_id: None,
         },
         registry: did_hosting_control::config::RegistryConfig::default(),
+        replay: Default::default(),
         features: state.features.clone(),
         identity: IdentityConfig::default(),
         hosting: did_hosting_common::server::config::HostingConfig::default(),

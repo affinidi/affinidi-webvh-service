@@ -295,6 +295,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // Gather storage thread inputs before moving config into Arc
     let storage_sessions_ks = sessions_ks.clone();
     let storage_auth_config = config.auth.clone();
+    let replay_config = config.replay.clone();
     let has_auth = jwt_keys.is_some();
 
     let stats_dids_ks = dids_ks.clone();
@@ -380,7 +381,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         stats_ks: stats_ks.clone(),
         timeseries_ks: timeseries_ks.clone(),
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
-        replay_cache: Arc::new(crate::replay::ReplayCache::new()),
+        replay_cache: Arc::new(crate::replay::ReplayCache::with_config(replay_config)?),
         path_locks: crate::path_locks::PathLocks::new(),
         acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
         pending_challenges: Arc::new(pending_challenges),

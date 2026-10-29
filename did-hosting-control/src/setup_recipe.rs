@@ -240,6 +240,7 @@ pub async fn apply_recipe(
         trust_tasks: Default::default(),
         hosting: HostingConfig::default(),
         identity: Default::default(),
+        replay: Default::default(),
         config_path: recipe.output.config_path.clone(),
     };
 

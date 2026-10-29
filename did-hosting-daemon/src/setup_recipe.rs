@@ -258,6 +258,7 @@ pub async fn apply_recipe(
             context_id: None,
         },
         registry: did_hosting_control::config::RegistryConfig::default(),
+        replay: Default::default(),
         features,
         identity: IdentityConfig {
             mode: identity_mode,

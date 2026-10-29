@@ -219,6 +219,7 @@ pub async fn run_wizard(
             context_id: None,
         },
         identity: Default::default(),
+        replay: Default::default(),
         config_path: output_path.clone(),
     };
 
@@ -843,6 +844,7 @@ pub async fn run_setup_offline_complete(
             context_id: None,
         },
         identity: Default::default(),
+        replay: Default::default(),
         config_path: state.config_output.clone(),
     };
 

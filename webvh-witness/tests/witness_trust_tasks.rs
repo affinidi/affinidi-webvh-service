@@ -105,6 +105,7 @@ async fn witness_state() -> (AppState, tempfile::TempDir) {
         secrets: SecretsConfig::default(),
         vta: VtaConfig::default(),
         identity: Default::default(),
+        replay: Default::default(),
         config_path: PathBuf::new(),
     };
     let identity = ServiceIdentity::from_signing_secret(&my_did, my_key)

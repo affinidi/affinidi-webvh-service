@@ -67,6 +67,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         trust_tasks: Default::default(),
         hosting: Default::default(),
         identity: Default::default(),
+        replay: Default::default(),
         config_path: PathBuf::new(),
     };
 

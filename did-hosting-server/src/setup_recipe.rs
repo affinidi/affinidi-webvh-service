@@ -277,6 +277,7 @@ pub async fn apply_recipe(
         },
         stats: StatsConfig::default(),
         identity: Default::default(),
+        replay: Default::default(),
         config_path: recipe.output.config_path.clone(),
     };
 

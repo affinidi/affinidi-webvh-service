@@ -52,6 +52,13 @@ pub struct AppConfig {
     /// (`identity.rotation_grace_period`).
     #[serde(default)]
     pub identity: did_hosting_common::server::config::IdentityConfig,
+    /// Bounds of the anti-replay cache for signed Trust Tasks (`[replay]`;
+    /// env `CONTROL_REPLAY_*`).
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_common::server::config::ReplayConfig::is_default"
+    )]
+    pub replay: did_hosting_common::server::config::ReplayConfig,
     #[serde(skip)]
     pub config_path: PathBuf,
 }
@@ -207,6 +214,8 @@ impl AppConfig {
             "CONTROL",
             &mut config.hosting,
         );
+        // CONTROL_REPLAY_* — anti-replay cache bounds. Also validates `[replay]`.
+        config.replay.apply_env_overrides("CONTROL")?;
 
         // Control-specific env vars
         macro_rules! env_opt {

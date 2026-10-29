@@ -1463,17 +1463,10 @@ async fn route_trust_task_doc(
     // At its bounds the cache refuses (retryable) rather than forgetting.
     if signed
         && rule.uses_shared_replay_cache()
-        && let Err(e) = state.replay_cache.check(&principal, &doc.id)
+        && let Err(e) = state.replay_cache.check(&principal, &doc.id, doc.issued_at)
     {
         warn!(did = %principal, doc_id = %doc.id, %type_uri, ?e, "trust task refused: replay cache");
-        let reason = match e {
-            did_hosting_common::server::replay::ReplayError::Duplicate => {
-                trust_tasks_rs::RejectReason::IdConflict
-            }
-            did_hosting_common::server::replay::ReplayError::Full => {
-                trust_tasks_rs::RejectReason::Unavailable { retry_after: None }
-            }
-        };
+        let reason = e.reject_reason();
         return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
             doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
         ))));
@@ -1688,6 +1681,7 @@ mod tests {
             trust_tasks: Default::default(),
             hosting: Default::default(),
             identity: Default::default(),
+            replay: Default::default(),
             config_path: PathBuf::new(),
         };
 
@@ -2478,6 +2472,7 @@ mod tests {
             trust_tasks: state.config.trust_tasks.clone(),
             hosting: state.config.hosting.clone(),
             identity: Default::default(),
+            replay: Default::default(),
             config_path: state.config.config_path.clone(),
         };
         state.config = Arc::new(cfg);

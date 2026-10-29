@@ -148,15 +148,14 @@ pub async fn dispatch_inbound_document(
         .await;
     }
 
-    match state.replay_cache.check(&principal, &doc.id) {
+    match state.replay_cache.check(&principal, &doc.id, doc.issued_at) {
         Ok(()) => {}
         Err(ReplayError::Duplicate) => {
             warn!(issuer = %principal, doc_id = %doc.id, "sync not answered: replay");
             return None;
         }
-        Err(ReplayError::Full) => {
-            let refusal =
-                doc.reject_with(reply_id(), RejectReason::Unavailable { retry_after: None });
+        Err(e @ (ReplayError::Full | ReplayError::Stale)) => {
+            let refusal = doc.reject_with(reply_id(), e.reject_reason());
             return seal(state, my_did, &principal, error_value(refusal)).await;
         }
     }

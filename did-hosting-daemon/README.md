@@ -217,6 +217,17 @@ Environment variables use the `DAEMON_` prefix:
 The same settings live in `[server.resolve_cache]` (`max_age_secs`,
 `shared_max_age_secs`, `stale_while_revalidate_secs`).
 
+| Variable | Description |
+| --- | --- |
+| `DAEMON_REPLAY_MAX_ENTRIES` | Replay cache records, all signers (default 1,000,000, about 32 MB) |
+| `DAEMON_REPLAY_MAX_ENTRIES_PER_SIGNER` | Replay cache records per signer (default 250,000, about 600 signed requests a second) |
+
+These live in `[replay]` and apply to each embedded service that accepts
+signed Trust Tasks: the control plane, the witness and the watcher. Each
+keeps its own cache with these bounds, so the daemon's worst case is up to
+three times `max_entries` records (about 96 MB at the defaults). The
+control plane's README explains the bounds ("Replay cache bounds").
+
 ## CLI Commands
 
 ```

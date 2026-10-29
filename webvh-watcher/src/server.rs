@@ -59,13 +59,14 @@ impl AppState {
     ) -> Result<Self, AppError> {
         let did_resolver: Option<DIDCacheClient> =
             identity.as_ref().map(|i| i.did_resolver.clone());
+        let replay_cache = Arc::new(ReplayCache::with_config(config.replay.clone())?);
         Ok(Self {
             dids_ks: store.keyspace(KS_DIDS)?,
             store,
             config: Arc::new(config),
             trust_tasks_verifier: crate::trust_tasks::build_verifier(did_resolver.as_ref()),
             identity,
-            replay_cache: Arc::new(ReplayCache::new()),
+            replay_cache,
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
             didcomm_service: Arc::new(OnceLock::new()),
             trust_tasks_rate_limiter: Arc::new(

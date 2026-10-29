@@ -35,6 +35,13 @@ pub struct AppConfig {
     /// generation keeps being honoured after a rotation.
     #[serde(default)]
     pub identity: did_hosting_common::server::config::IdentityConfig,
+    /// Bounds of the anti-replay cache for signed Trust Tasks (`[replay]`;
+    /// env `WITNESS_REPLAY_*`).
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_common::server::config::ReplayConfig::is_default"
+    )]
+    pub replay: did_hosting_common::server::config::ReplayConfig,
     #[serde(skip)]
     pub config_path: PathBuf,
 }
@@ -90,6 +97,8 @@ impl AppConfig {
         // _MAX_JOURNAL) — shared, unprefixed names; see
         // `did_hosting_common::server::config::apply_fjall_env_overrides`.
         did_hosting_common::server::config::apply_fjall_env_overrides(&mut config.fjall)?;
+        // WITNESS_REPLAY_* — anti-replay cache bounds. Also validates `[replay]`.
+        config.replay.apply_env_overrides("WITNESS")?;
 
         // Witness-specific env vars
         macro_rules! env_opt {

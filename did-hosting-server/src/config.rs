@@ -58,6 +58,13 @@ pub struct AppConfig {
     /// (`identity.rotation_grace_period`).
     #[serde(default)]
     pub identity: did_hosting_common::server::config::IdentityConfig,
+    /// Bounds of the anti-replay cache for signed Trust Tasks (`[replay]`;
+    /// env `DID_HOSTING_REPLAY_*`).
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_common::server::config::ReplayConfig::is_default"
+    )]
+    pub replay: did_hosting_common::server::config::ReplayConfig,
     #[serde(skip)]
     pub config_path: PathBuf,
 }
@@ -305,6 +312,12 @@ impl AppConfig {
             .server
             .resolve_cache
             .apply_env_overrides("DID_HOSTING")?;
+        // DID_HOSTING_REPLAY_* (and the deprecated WEBVH_REPLAY_*, like the
+        // shared overrides above) — anti-replay cache bounds. Also validates
+        // `[replay]`.
+        config
+            .replay
+            .apply_env_overrides_for(&["WEBVH", "DID_HOSTING"])?;
 
         // Validate configuration
         config.auth.validate()?;

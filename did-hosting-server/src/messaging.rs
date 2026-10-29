@@ -50,7 +50,6 @@ use tracing::{debug, info, warn};
 
 use did_hosting_common::didcomm_types::*;
 use did_hosting_common::server::problem_report::log_problem_report;
-use did_hosting_common::server::replay::ReplayCache;
 use did_hosting_common::server::trust_tasks::{TransportBoundVerifier, verify_sender_bound};
 
 use crate::server::AppState;
@@ -90,11 +89,6 @@ fn not_authorized_code(type_uri: &str) -> Option<trust_tasks_rs::DeclaredErrorCo
         _ => return None,
     })
 }
-
-/// Documents already applied, keyed on `(issuer, document id)`. Process-wide:
-/// an edge has exactly one control plane, and the cache only needs to outlive
-/// the freshness window.
-static REPLAY_CACHE: std::sync::LazyLock<ReplayCache> = std::sync::LazyLock::new(ReplayCache::new);
 
 /// Proof that a document was signed by the configured control plane, addressed
 /// to this server, fresh, and not previously applied. Constructed only by
@@ -232,18 +226,20 @@ where
         );
         return Err(Refusal::NotAuthorized { issuer: did });
     }
-    match REPLAY_CACHE.check(&did, &doc.id) {
-        Ok(()) => {}
-        Err(did_hosting_common::server::replay::ReplayError::Duplicate) => {
-            warn!(did, doc_id = %doc.id, "control-plane document rejected: replay");
-            return Err(Refusal::Unverified(RejectReason::IdConflict));
+    if let Err(e) = state.replay_cache.check(&did, &doc.id, doc.issued_at) {
+        use did_hosting_common::server::replay::ReplayError;
+        match e {
+            ReplayError::Duplicate => {
+                warn!(did, doc_id = %doc.id, "control-plane document rejected: replay")
+            }
+            ReplayError::Full => {
+                warn!(did, doc_id = %doc.id, "control-plane document deferred: replay cache full")
+            }
+            ReplayError::Stale => {
+                warn!(did, doc_id = %doc.id, "control-plane document rejected: outside the replay window")
+            }
         }
-        Err(did_hosting_common::server::replay::ReplayError::Full) => {
-            warn!(did, doc_id = %doc.id, "control-plane document deferred: replay cache full");
-            return Err(Refusal::Unverified(RejectReason::Unavailable {
-                retry_after: None,
-            }));
-        }
+        return Err(Refusal::Unverified(e.reject_reason()));
     }
     let issued_at = doc
         .issued_at

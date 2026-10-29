@@ -245,6 +245,7 @@ pub async fn run_wizard(
         },
         stats: crate::config::StatsConfig::default(),
         identity: Default::default(),
+        replay: Default::default(),
         config_path: output_path.clone(),
     };
 
@@ -839,6 +840,7 @@ pub async fn run_setup_offline_complete(
         },
         stats: crate::config::StatsConfig::default(),
         identity: Default::default(),
+        replay: Default::default(),
         config_path: state.config_output.clone(),
     };
 

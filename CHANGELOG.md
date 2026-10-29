@@ -112,6 +112,38 @@ browser-extension releases.
   names were silently ignored. `WEBVH_` still works but is deprecated; when
   both are set, `DID_HOSTING_` wins.
 
+### Added — configurable, compact replay caches
+
+Each service's anti-replay cache for signed Trust Tasks held at most 5,000
+records per signer and 50,000 in all, about 0.4 KB each, and refused new
+requests at either bound. One signer was therefore limited to about 14
+signed requests a second: a VTA creating DIDs on the control plane or
+daemon, a VTA witnessing them, and the control plane's sync to each edge
+server and watcher.
+
+- **Compact records.** A record is now a 128-bit keyed hash of
+  `(signer, id)`, about 32 bytes, filed by the document's signed `issuedAt`
+  in one-minute buckets that are dropped whole as they leave the freshness
+  window. A document whose `issuedAt` is missing or outside the window is
+  refused as stale.
+- **Higher defaults.** 1,000,000 records in all (about 32 MB) and 250,000
+  per signer (about 600 signed requests a second).
+- **A reserve for quiet signers.** The last 10% of the global bound is kept
+  for signers holding fewer than 100 records, so several busy signers
+  together cannot lock out the rest.
+- **Configurable.** A `[replay]` table (`max_entries`,
+  `max_entries_per_signer`) on every binary, or
+  `{CONTROL,DAEMON,DID_HOSTING,WATCHER,WITNESS}_REPLAY_*` (the edge also
+  reads the deprecated `WEBVH_REPLAY_*`). The daemon applies its table to
+  the embedded control plane, witness and watcher, each with its own cache.
+  A zero bound, a per-signer bound above the global one, or more than
+  10,000,000 records is refused at startup, including for a cache built in
+  code. Setup leaves the table out unless it differs from the defaults, so
+  later defaults apply. Wallet sign-in (`auth/oob/*`) keeps its own replay
+  record and is not affected.
+- The edge's cache is now part of its state rather than process-wide, so
+  each edge in one process has its own bounds.
+
 ### Added — configurable caching for DID resolution
 
 - **`[server.resolve_cache]`** sets the `Cache-Control` sent with every

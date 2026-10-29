@@ -97,6 +97,7 @@ async fn make_harness() -> Harness {
         trust_tasks: Default::default(),
         hosting: Default::default(),
         identity: Default::default(),
+        replay: Default::default(),
         config_path: PathBuf::new(),
     };
 

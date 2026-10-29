@@ -59,6 +59,13 @@ pub struct DaemonConfig {
     /// How the daemon obtains its own identity (VTA-provisioned or self-managed).
     #[serde(default)]
     pub identity: IdentityConfig,
+    /// Bounds of the anti-replay cache for signed Trust Tasks (`[replay]`;
+    /// env `DAEMON_REPLAY_*`).
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_common::server::config::ReplayConfig::is_default"
+    )]
+    pub replay: did_hosting_common::server::config::ReplayConfig,
 
     /// Multi-domain hosting settings (T18). `bootstrap_domains` seeds
     /// the `domains` keyspace on first boot when no entries exist;
@@ -188,6 +195,8 @@ impl DaemonConfig {
         }
         // DAEMON_SERVER_RESOLVE_CACHE_* — Cache-Control on DID resolution.
         config.server.resolve_cache.apply_env_overrides("DAEMON")?;
+        // DAEMON_REPLAY_* — anti-replay cache bounds. Also validates `[replay]`.
+        config.replay.apply_env_overrides("DAEMON")?;
 
         // Fjall memory settings (STORAGE_FJALL_BLOCK_CACHE / _WRITE_BUFFER /
         // _MAX_JOURNAL) — shared, unprefixed names; see
@@ -228,6 +237,7 @@ impl DaemonConfig {
             // DIDComm listener of its own, so its rotation path is inert — the
             // daemon's control plane owns the identity.
             identity: self.identity.clone(),
+            replay: self.replay.clone(),
             config_path: self.config_path.clone(),
         }
     }
@@ -248,6 +258,7 @@ impl DaemonConfig {
             // the only DIDComm listener, so the embedded witness's rotation path
             // is inert — its `didcomm_service` slot is never filled.
             identity: self.identity.clone(),
+            replay: self.replay.clone(),
             config_path: self.config_path.clone(),
         }
     }
@@ -267,6 +278,7 @@ impl DaemonConfig {
             secrets: self.secrets.clone(),
             vta: self.vta.clone(),
             identity: self.identity.clone(),
+            replay: self.replay.clone(),
             sync: Default::default(),
             config_path: self.config_path.clone(),
         }
@@ -294,6 +306,7 @@ impl DaemonConfig {
             // is the one that rotates — it needs the daemon's grace period, not
             // a default.
             identity: self.identity.clone(),
+            replay: self.replay.clone(),
             config_path: self.config_path.clone(),
         }
     }
@@ -399,6 +412,35 @@ context_id = "webvh"
             cfg.public_url.as_deref(),
             Some("https://daemon.example.com")
         );
+    }
+
+    /// `[replay]` reaches the embedded control plane, witness and watcher,
+    /// the services that hold a replay cache; without it the defaults apply,
+    /// and an inconsistent table stops the load.
+    #[test]
+    fn replay_bounds_reach_the_embedded_services() {
+        use did_hosting_common::server::config::ReplayConfig;
+
+        let (_dir, path) = write_temp_config(SELF_MANAGED_TOML);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert_eq!(cfg.control_config().replay, ReplayConfig::default());
+
+        let toml = format!(
+            "{SELF_MANAGED_TOML}\n[replay]\nmax_entries = 200000\nmax_entries_per_signer = 50000\n"
+        );
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        let expected = ReplayConfig {
+            max_entries: 200_000,
+            max_entries_per_signer: 50_000,
+        };
+        assert_eq!(cfg.control_config().replay, expected);
+        assert_eq!(cfg.witness_config().replay, expected);
+        assert_eq!(cfg.watcher_config().replay, expected);
+
+        let toml = format!("{SELF_MANAGED_TOML}\n[replay]\nmax_entries_per_signer = 2000000\n");
+        let (_dir, path) = write_temp_config(&toml);
+        assert!(DaemonConfig::load(Some(path)).is_err());
     }
 
     #[test]
