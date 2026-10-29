@@ -246,7 +246,9 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 
     // Initialize in-memory stats collector (starts at zero — no disk persistence)
     let stats_collector = {
-        let collector = stats::StatsCollector::new();
+        // An edge syncs only per-DID deltas, so it keeps no time-series
+        // buckets: nothing would ever drain them.
+        let collector = stats::StatsCollector::without_timeseries();
         let total_dids = storage_dids_ks
             .prefix_iter_raw("did:")
             .await

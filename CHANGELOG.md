@@ -171,6 +171,47 @@ server and watcher.
   an expired reserved slot after the scan could be removed. Each record is
   now re-read and re-checked under the slot's path lock before it is deleted,
   and one failed delete no longer ends the pass.
+- **A failed stats flush no longer loses that window's statistics.** The
+  control plane and the daemon wrote every stats and time-series row of a
+  flush in one transaction, and dropped the drained counts when any read or
+  write failed, as under store throttling. Each row is now its own write,
+  eight at a time; the first failure ends the flush and the unwritten rows
+  are retried on the next one. A write that reports failure is read back
+  first, so one the store applied before timing out is not counted twice.
+  On DynamoDB, plain writes use half the write units of a transaction, at
+  the cost of one request per row. A flush writes at most 200 rows, so its
+  load on the store is spread across flushes: the server-wide series goes
+  first, then per-DID totals and per-DID buckets alternately, so neither
+  starves the other under load. Time-series buckets that cannot be written
+  within an hour are dropped with a warning. The flush at shutdown writes
+  for at most 15 seconds, so the store is still persisted inside a
+  container's termination grace period, and logs an error saying how many
+  rows it could not write.
+- **Pending statistics are capped.** At most 100,000 DIDs' totals and
+  200,000 per-DID time-series buckets wait to be written, whether they
+  came from local events, a peer's stats sync or a failed flush. Past the
+  caps the per-DID figures are dropped, with a warning at most every five
+  minutes; the server-wide totals and series still count them.
+- **A server's stats sync can no longer write rows outside its DIDs'
+  series.** The control plane used each synced delta's path verbatim in
+  its `stats:` and `ts:` keys, so a path of `_all` added to the server-wide
+  series. A delta is now counted only if its path has a hosted path's
+  shape, or is hosted here (for paths stored before the current path
+  rules), and never contains `:` or is `_all`; skipped deltas are logged
+  with a sample of their paths.
+- **No service keeps every time-series bucket in memory any more.** The
+  collector's per-DID 5-minute buckets were never drained, so they grew for
+  as long as the process ran. The control plane and the daemon now write
+  them, which also puts each local event in the bucket of the time it
+  happened rather than the time it was flushed. A synced edge delta is
+  filed under the edge's latest event time (or the time it arrived, if
+  that is implausible), not the arrival time. An edge no longer keeps
+  buckets at all, since it only syncs per-DID totals.
+- **An edge keeps its statistics when a stats sync fails to send.** It
+  drained them before sending and discarded them on failure; they are now
+  retried on the next sync. A sync carries at most 10,000 DIDs, the most
+  the control plane accepts, and the rest wait for the next one, so a
+  backlog after an outage drains instead of being refused every time.
 
 ### Added — did:scid identities
 

@@ -412,3 +412,100 @@ async fn create_backend(
         "no storage backend compiled — enable a store-* feature".into(),
     ))
 }
+
+// ---------------------------------------------------------------------------
+// Test support: a keyspace whose writes start failing
+// ---------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "test-support"))]
+impl KeyspaceHandle {
+    /// Wrap this keyspace so that once `allowed` writes have succeeded,
+    /// every further write fails with a store error, as a throttled store
+    /// would. Reads are untouched. Raise `allowed` to let writes through
+    /// again.
+    pub fn failing_writes_after(&self, allowed: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        self.wrap_failing(allowed, false)
+    }
+
+    /// Like [`Self::failing_writes_after`], but a failing write is applied
+    /// before it reports failure, as when a store times out after the write
+    /// landed.
+    pub fn failing_acks_after(&self, allowed: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        self.wrap_failing(allowed, true)
+    }
+
+    fn wrap_failing(&self, allowed: Arc<std::sync::atomic::AtomicUsize>, apply: bool) -> Self {
+        Self {
+            name: self.name.clone(),
+            inner: Arc::new(FailingWrites {
+                inner: self.inner.clone(),
+                allowed,
+                apply,
+            }),
+            backend: self.backend.clone(),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct FailingWrites {
+    inner: Arc<dyn KeyspaceOps>,
+    allowed: Arc<std::sync::atomic::AtomicUsize>,
+    /// Apply a failing write before reporting the failure.
+    apply: bool,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl FailingWrites {
+    fn take_write(&self) -> Result<(), AppError> {
+        use std::sync::atomic::Ordering;
+        self.allowed
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .map(|_| ())
+            .map_err(|_| AppError::Store("injected write failure".into()))
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl KeyspaceOps for FailingWrites {
+    fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
+        Box::pin(async move {
+            match self.take_write() {
+                Ok(()) => self.inner.insert_raw(key, value).await,
+                Err(e) => {
+                    if self.apply {
+                        self.inner.insert_raw(key, value).await?;
+                    }
+                    Err(e)
+                }
+            }
+        })
+    }
+    fn get_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        self.inner.get_raw(key)
+    }
+    fn remove(&self, key: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
+        Box::pin(async move {
+            self.take_write()?;
+            self.inner.remove(key).await
+        })
+    }
+    fn contains_key(&self, key: Vec<u8>) -> BoxFuture<'_, Result<bool, AppError>> {
+        self.inner.contains_key(key)
+    }
+    fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
+        self.inner.prefix_iter_raw(prefix)
+    }
+    fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        Box::pin(async move {
+            self.take_write()?;
+            self.inner.take_raw_atomic(key).await
+        })
+    }
+    fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
+        Box::pin(async move {
+            self.take_write()?;
+            self.inner.incr_raw(key).await
+        })
+    }
+}
