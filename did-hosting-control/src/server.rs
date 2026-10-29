@@ -962,7 +962,9 @@ fn run_storage_thread(
 
         let mut session_timer = tokio::time::interval(session_interval);
         let mut flush_timer = tokio::time::interval(flush_interval);
-        let mut did_count_timer = tokio::time::interval(DID_COUNT_RECONCILE_INTERVAL);
+        let mut did_count_timer = tokio::time::interval(
+            did_hosting_common::server::stats_collector::DID_COUNT_RECONCILE_INTERVAL,
+        );
 
         // Skip first tick (immediate)
         session_timer.tick().await;
@@ -983,7 +985,7 @@ fn run_storage_thread(
                     }
                 }
                 _ = did_count_timer.tick() => {
-                    if let Err(e) = reconcile_total_dids(&collector, &dids_ks).await {
+                    if let Err(e) = did_hosting_common::server::stats_collector::reconcile_total_dids(&collector, &dids_ks).await {
                         warn!("DID count reconcile error: {e}");
                     }
                 }
@@ -1081,28 +1083,6 @@ pub async fn flush_stats_to_store(
     batch.commit().await?;
 
     debug!(count = deltas.len(), "flushed stats deltas to store");
-    Ok(())
-}
-
-/// How often the standalone control plane recounts its DIDs from the store.
-///
-/// Creates and deletes keep the count current in between; the recount
-/// corrects paths that do not, such as an offline `remove`. It reads every
-/// DID record, so on a metered store its cost grows with the number of DIDs
-/// hosted: keep it rare. The daemon takes its count from the empty-DID
-/// cleanup instead, which reads every record anyway.
-pub const DID_COUNT_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
-
-/// Recount the hosted DIDs from the store and reset the collector's count.
-///
-/// Best effort: a create or delete that commits while the scan runs can be
-/// lost from the count until the next recount. The count is for display.
-pub async fn reconcile_total_dids(
-    collector: &did_hosting_common::server::stats_collector::StatsCollector,
-    dids_ks: &KeyspaceHandle,
-) -> Result<(), AppError> {
-    let dids = dids_ks.prefix_iter_raw("did:").await?;
-    collector.set_total_dids(dids.len() as u64);
     Ok(())
 }
 

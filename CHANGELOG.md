@@ -112,10 +112,14 @@ browser-extension releases.
 - **The DID count no longer reads every DID record every 10 seconds.** The
   control plane and the daemon recounted hosted DIDs from the store on every
   stats flush, so an idle service's read load grew with the number of DIDs it
-  hosted. Creates, deletes and domain purges now keep the count. The control
-  plane recounts hourly to correct paths that bypass them; the daemon takes
-  the count from its empty-DID cleanup (hourly by default), which already
-  reads every record.
+  hosted. Creates, deletes, empty-DID cleanups and domain purges now keep the
+  count, and the control plane, daemon and edge recount hourly to correct
+  paths that bypass them (an edge's synced DIDs, an offline `remove`).
+- **Empty-DID cleanup no longer deletes a slot published into mid-pass.** It
+  deleted from a snapshot of the records; in the daemon a DID published into
+  an expired reserved slot after the scan could be removed. Each record is
+  now re-read and re-checked under the slot's path lock before it is deleted,
+  and one failed delete no longer ends the pass.
 
 ### Added — did:scid identities
 
