@@ -962,10 +962,14 @@ fn run_storage_thread(
 
         let mut session_timer = tokio::time::interval(session_interval);
         let mut flush_timer = tokio::time::interval(flush_interval);
+        let mut did_count_timer = tokio::time::interval(
+            did_hosting_common::server::stats_collector::DID_COUNT_RECONCILE_INTERVAL,
+        );
 
         // Skip first tick (immediate)
         session_timer.tick().await;
         flush_timer.tick().await;
+        did_count_timer.tick().await;
 
         loop {
             tokio::select! {
@@ -976,8 +980,13 @@ fn run_storage_thread(
                 }
                 _ = flush_timer.tick() => {
                     // Flush accumulated per-DID stats deltas to persistent store
-                    if let Err(e) = flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, &dids_ks, &store).await {
+                    if let Err(e) = flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, &store).await {
                         warn!("stats flush error: {e}");
+                    }
+                }
+                _ = did_count_timer.tick() => {
+                    if let Err(e) = did_hosting_common::server::stats_collector::reconcile_total_dids(&collector, &dids_ks).await {
+                        warn!("DID count reconcile error: {e}");
                     }
                 }
                 _ = shutdown_rx.changed() => {
@@ -988,7 +997,7 @@ fn run_storage_thread(
         }
 
         // Final flush before shutdown
-        let _ = flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, &dids_ks, &store).await;
+        let _ = flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, &store).await;
 
         if let Err(e) = store.persist().await {
             error!("failed to persist store on shutdown: {e}");
@@ -1009,15 +1018,10 @@ pub async fn flush_stats_to_store(
     collector: &did_hosting_common::server::stats_collector::StatsCollector,
     stats_ks: &KeyspaceHandle,
     timeseries_ks: &KeyspaceHandle,
-    dids_ks: &KeyspaceHandle,
     store: &Store,
 ) -> Result<(), AppError> {
     let deltas = collector.drain_for_sync();
     if deltas.is_empty() {
-        // Update total DID count even if no deltas
-        if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
-            collector.set_total_dids(dids.len() as u64);
-        }
         return Ok(());
     }
 
@@ -1077,14 +1081,6 @@ pub async fn flush_stats_to_store(
     }
 
     batch.commit().await?;
-
-    // Update total DID count (periodic reconciliation)
-    if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
-        collector.set_total_dids(dids.len() as u64);
-    }
-    // Note: control plane still does the full scan because DIDs are managed
-    // from external sources (REST API, sync) making incremental tracking complex.
-    // This runs every 10s and is acceptable at 10K DIDs.
 
     debug!(count = deltas.len(), "flushed stats deltas to store");
     Ok(())

@@ -836,21 +836,36 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
         let did_interval = Duration::from_secs(did_ttl_seconds.max(60));
         let mut did_timer = tokio::time::interval(did_interval);
 
+        // DIDs reach an edge by sync, which does not count them; the
+        // recount keeps the edge's figure in step.
+        let mut did_count_timer = tokio::time::interval(
+            did_hosting_common::server::stats_collector::DID_COUNT_RECONCILE_INTERVAL,
+        );
+
         // First tick completes immediately; skip so cleanup doesn't run at startup
         did_timer.tick().await;
+        did_count_timer.tick().await;
 
         loop {
             tokio::select! {
                 _ = did_timer.tick() => {
-                    match cleanup_empty_dids(&dids_ks, did_ttl_seconds).await {
+                    // An edge writes DID records only from its control
+                    // plane's directives, which take no path lock.
+                    match cleanup_empty_dids(&dids_ks, did_ttl_seconds, None).await {
                         Ok(0) => {}
                         Ok(n) => {
                             info!(count = n, "cleaned up empty DID records");
-                            for _ in 0..n {
-                                collector.decrement_total_dids();
-                            }
+                            collector.subtract_total_dids(n);
                         }
                         Err(e) => warn!("DID cleanup error: {e}"),
+                    }
+                }
+                _ = did_count_timer.tick() => {
+                    if let Err(e) = did_hosting_common::server::stats_collector::reconcile_total_dids(
+                        &collector,
+                        &dids_ks,
+                    ).await {
+                        warn!("DID count reconcile error: {e}");
                     }
                 }
                 _ = shutdown_rx.changed() => {

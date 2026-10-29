@@ -12,6 +12,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::DidStatsDelta;
+use crate::server::error::AppError;
+use crate::server::store::KeyspaceHandle;
 
 const BUCKET_SECS: u64 = 300; // 5-minute buckets
 
@@ -108,8 +110,22 @@ impl StatsCollector {
         self.agg_total_dids.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Decrement the DID count, stopping at zero: a count seeded or
+    /// reconciled after a delete must not wrap.
     pub fn decrement_total_dids(&self) {
-        self.agg_total_dids.fetch_sub(1, Ordering::Relaxed);
+        self.subtract_total_dids(1);
+    }
+
+    /// Subtract `n` deleted DIDs from the count, stopping at zero.
+    pub fn subtract_total_dids(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let _ = self
+            .agg_total_dids
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                Some(c.saturating_sub(n))
+            });
     }
 
     /// Increment aggregate counters by the given deltas.
@@ -289,8 +305,53 @@ impl StatsCollector {
     }
 }
 
+/// How often a service recounts its hosted DIDs from the store.
+///
+/// Creates, deletes, cleanups and purges keep the count current in between;
+/// the recount corrects paths that do not, such as an offline `remove` or a
+/// DID an edge receives by sync. It reads every DID record, so on a metered
+/// store its cost grows with the number of DIDs hosted: keep it rare.
+pub const DID_COUNT_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Recount the hosted DIDs from the store and reset the collector's count.
+///
+/// Best effort: a create or delete that commits while the scan runs can be
+/// lost from the count until the next recount. The count is for display.
+pub async fn reconcile_total_dids(
+    collector: &StatsCollector,
+    dids_ks: &KeyspaceHandle,
+) -> Result<(), AppError> {
+    let dids = dids_ks.prefix_iter_raw("did:").await?;
+    collector.set_total_dids(dids.len() as u64);
+    Ok(())
+}
+
 impl Default for StatsCollector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decrement_total_dids_stops_at_zero() {
+        let collector = StatsCollector::new();
+        collector.increment_total_dids();
+        collector.decrement_total_dids();
+        collector.decrement_total_dids();
+        assert_eq!(collector.get_aggregate().total_dids, 0);
+    }
+
+    #[test]
+    fn subtract_total_dids_stops_at_zero() {
+        let collector = StatsCollector::new();
+        collector.set_total_dids(5);
+        collector.subtract_total_dids(3);
+        assert_eq!(collector.get_aggregate().total_dids, 2);
+        collector.subtract_total_dids(10);
+        assert_eq!(collector.get_aggregate().total_dids, 0);
     }
 }
