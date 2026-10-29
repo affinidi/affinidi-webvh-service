@@ -1046,6 +1046,10 @@ async fn do_domain_purge(
     let report = purge_domain_dids(&state.store, &domain, "admin-immediate")
         .await
         .map_err(OpError::from)?;
+    // Uncount what was deleted even if some slots failed and the op is retried.
+    if let Some(collector) = state.stats_collector.as_ref() {
+        collector.subtract_total_dids(report.deleted);
+    }
     if report.failed > 0 {
         return Err(OpError::Transient(format!(
             "{} slot(s) on {domain} could not be deleted just now",

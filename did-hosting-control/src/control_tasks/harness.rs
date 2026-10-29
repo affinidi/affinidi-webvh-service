@@ -294,7 +294,7 @@ pub(crate) fn code(reply: &Value) -> String {
 /// Assert `reply`'s payload validates against the schema its `type` names.
 pub(crate) fn conforms(reply: &Value) {
     let type_uri = reply["type"].as_str().expect("reply has a type");
-    let schema = trust_tasks_rs::schema_index::schema_for(type_uri)
+    let schema = did_hosting_common::tasks::payload_schema(type_uri)
         .unwrap_or_else(|| panic!("no schema is known for {type_uri}: {reply}"));
     if let Err(e) = trust_tasks_rs::validate::against_schema(schema, &reply["payload"]) {
         panic!("{type_uri} reply does not match its schema: {e:?}\n{reply}");

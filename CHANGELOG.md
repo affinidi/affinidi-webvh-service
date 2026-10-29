@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Security — rustls 0.21 removed from the AWS backends
+
+The DynamoDB store and AWS secret backends no longer build the AWS SDK's
+legacy HTTPS client, which used rustls 0.21 (GHSA-c8m5-c952-6cm4,
+GHSA-w44r-93j7-qv28, GHSA-h2v8-394m-p7vv). They now use the SDK's current
+client on rustls 0.23.46, so the lockfile carries a single rustls.
+
+### Changed — trust-tasks 0.36
+
+The workspace moves to trust-tasks-rs 0.36, with vta-sdk 0.75, vti-common
+0.51, vti-secrets 0.24, affinidi-tdk 0.36, affinidi-messaging-sdk 0.44,
+affinidi-messaging-didcomm-service 0.29 and the test mediator 0.48. The UI's
+`@openvtc/trust-tasks` runtime moves to 0.28.1.
+
+Error documents are now `trust-task-error/0.6`, on every path, routed or not.
+0.6 extends 0.5 with two codes, `unsupportedExtension` and `indeterminate`;
+a consumer that accepts later minors (SPEC §5.2), as the UI does, needs no
+change. No pinned task version changed.
+
 ### Changed — BREAKING: every Trust Task moves to its latest version
 
 Old versions are no longer served. A peer that still sends one gets
@@ -112,10 +131,14 @@ browser-extension releases.
 - **The DID count no longer reads every DID record every 10 seconds.** The
   control plane and the daemon recounted hosted DIDs from the store on every
   stats flush, so an idle service's read load grew with the number of DIDs it
-  hosted. Creates, deletes and domain purges now keep the count. The control
-  plane recounts hourly to correct paths that bypass them; the daemon takes
-  the count from its empty-DID cleanup (hourly by default), which already
-  reads every record.
+  hosted. Creates, deletes, empty-DID cleanups and domain purges now keep the
+  count, and the control plane, daemon and edge recount hourly to correct
+  paths that bypass them (an edge's synced DIDs, an offline `remove`).
+- **Empty-DID cleanup no longer deletes a slot published into mid-pass.** It
+  deleted from a snapshot of the records; in the daemon a DID published into
+  an expired reserved slot after the scan could be removed. Each record is
+  now re-read and re-checked under the slot's path lock before it is deleted,
+  and one failed delete no longer ends the pass.
 - **A failed stats flush no longer loses that window's statistics.** The
   control plane and the daemon wrote every stats and time-series row of a
   flush in one transaction, and dropped the drained counts when any read or

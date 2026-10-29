@@ -1219,6 +1219,11 @@ async fn run_daemon_storage_task(
     // A flush that overruns its interval is followed by a full interval, not
     // an immediate catch-up flush.
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Same recount as the standalone control plane: corrects the count for
+    // paths that do not keep it, such as an offline `remove`.
+    let mut did_count_timer = tokio::time::interval(
+        did_hosting_common::server::stats_collector::DID_COUNT_RECONCILE_INTERVAL,
+    );
     // T30 background purge sweep — 60s tick, processes ripe pending
     // entries (unassign-then-wait-grace) by deleting matching DID
     // records and clearing the pending entry.
@@ -1239,6 +1244,7 @@ async fn run_daemon_storage_task(
     session_timer.tick().await;
     did_timer.tick().await;
     flush_timer.tick().await;
+    did_count_timer.tick().await;
     purge_timer.tick().await;
     identity_expiry_timer.tick().await;
     identity_reload_timer.tick().await;
@@ -1254,20 +1260,27 @@ async fn run_daemon_storage_task(
                 }
             }
             _ = did_timer.tick() => {
+                // The control plane publishes into slots under its path
+                // locks; the cleanup takes the same lock before deleting one.
                 match did_hosting_server::did_ops::cleanup_empty_dids(
                     &params.dids_ks,
                     did_ttl_seconds,
+                    params.control_state.as_ref().map(|s| &s.path_locks),
                 ).await {
-                    Ok(report) => {
-                        if report.removed > 0 {
-                            info!(count = report.removed, "cleaned up empty DID records");
-                        }
-                        // The cleanup already read every DID record, so it
-                        // doubles as the DID-count reconcile the standalone
-                        // control plane runs on its own timer.
-                        params.collector.set_total_dids(report.remaining);
+                    Ok(0) => {}
+                    Ok(n) => {
+                        info!(count = n, "cleaned up empty DID records");
+                        params.collector.subtract_total_dids(n);
                     }
                     Err(e) => warn!("DID cleanup error: {e}"),
+                }
+            }
+            _ = did_count_timer.tick() => {
+                if let Err(e) = did_hosting_common::server::stats_collector::reconcile_total_dids(
+                    &params.collector,
+                    &params.dids_ks,
+                ).await {
+                    warn!("DID count reconcile error: {e}");
                 }
             }
             _ = flush_timer.tick() => {
@@ -1285,9 +1298,7 @@ async fn run_daemon_storage_task(
                 if sweep.entries > 0 {
                     info!(count = sweep.entries, "purge sweep tick completed");
                 }
-                for _ in 0..sweep.dids_deleted {
-                    params.collector.decrement_total_dids();
-                }
+                params.collector.subtract_total_dids(sweep.dids_deleted);
             }
             _ = identity_expiry_timer.tick() => {
                 if let Some(state) = params.control_state.as_ref() {

@@ -92,7 +92,7 @@ did-hosting-common = { version = "0.11", path = "../did-hosting-common", feature
 # declarations (did-hosting-common/-server, webvh-witness) and to
 # the workspace `vta-sdk = "0.38"` — see the lockstep note in
 # did-hosting-common/Cargo.toml.
-vti-common = { version = "0.50", default-features = false }
+vti-common = { version = "0.51", default-features = false }
 async-trait = "0.1"
 # Trust Tasks framework — used by routes/trust_tasks.rs (the
 # /api/trust-tasks endpoint introduced in v0.7.1).
@@ -154,7 +154,7 @@ tower-http = { version = "0.7", features = ["trace"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
-aws-sdk-secretsmanager = { version = "1", optional = true }
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 aws-config = { version = "1", features = [
   "behavior-version-latest",
 ], optional = true }
@@ -163,7 +163,7 @@ google-cloud-secretmanager-v1 = { version = "1", optional = true }
 google-cloud-auth = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
 redis = { version = "1.0", features = ["tokio-comp", "aio"], optional = true }
-aws-sdk-dynamodb = { version = "1", optional = true }
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 firestore = { version = "0.61", optional = true }
 futures = { version = "0.3", optional = true }
 azure_data_cosmos = { version = "1", features = [
@@ -199,9 +199,9 @@ openssl = "0.10"
 # graph on trust-tasks 0.17 puts a second copy of both in the dev graph. See the
 # dev-graph note beside `vta-sdk` in the workspace Cargo.toml.
 #
-# 0.46.0 is the line built on affinidi-tdk 0.33 / trust-tasks-rs 0.35, the same
+# 0.48.0 is the line built on affinidi-tdk 0.36 / trust-tasks-rs 0.36, the same
 # the root manifest now pins.
-affinidi-messaging-test-mediator = "0.46.0"
+affinidi-messaging-test-mediator = "0.48.0"
 # Self-dependency with `test-support` on, so this crate's own integration
 # tests compile the `test_support` module (and get `tempfile`) exactly as a
 # downstream consumer would via `features = ["test-support"]`.

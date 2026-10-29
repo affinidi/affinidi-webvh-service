@@ -965,7 +965,9 @@ fn run_storage_thread(
         // A flush that overruns its interval is followed by a full interval,
         // not an immediate catch-up flush.
         flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut did_count_timer = tokio::time::interval(DID_COUNT_RECONCILE_INTERVAL);
+        let mut did_count_timer = tokio::time::interval(
+            did_hosting_common::server::stats_collector::DID_COUNT_RECONCILE_INTERVAL,
+        );
 
         // Skip first tick (immediate)
         session_timer.tick().await;
@@ -986,7 +988,7 @@ fn run_storage_thread(
                     }
                 }
                 _ = did_count_timer.tick() => {
-                    if let Err(e) = reconcile_total_dids(&collector, &dids_ks).await {
+                    if let Err(e) = did_hosting_common::server::stats_collector::reconcile_total_dids(&collector, &dids_ks).await {
                         warn!("DID count reconcile error: {e}");
                     }
                 }
@@ -1286,28 +1288,6 @@ async fn write_timeseries_bucket(
     let r = existing.get("r").and_then(|v| v.as_u64()).unwrap_or(0) + b.resolves;
     let u = existing.get("u").and_then(|v| v.as_u64()).unwrap_or(0) + b.updates;
     write_stats_row(timeseries_ks, key, serde_json::json!({"r": r, "u": u})).await
-}
-
-/// How often the standalone control plane recounts its DIDs from the store.
-///
-/// Creates and deletes keep the count current in between; the recount
-/// corrects paths that do not, such as an offline `remove`. It reads every
-/// DID record, so on a metered store its cost grows with the number of DIDs
-/// hosted: keep it rare. The daemon takes its count from the empty-DID
-/// cleanup instead, which reads every record anyway.
-pub const DID_COUNT_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
-
-/// Recount the hosted DIDs from the store and reset the collector's count.
-///
-/// Best effort: a create or delete that commits while the scan runs can be
-/// lost from the count until the next recount. The count is for display.
-pub async fn reconcile_total_dids(
-    collector: &did_hosting_common::server::stats_collector::StatsCollector,
-    dids_ks: &KeyspaceHandle,
-) -> Result<(), AppError> {
-    let dids = dids_ks.prefix_iter_raw("did:").await?;
-    collector.set_total_dids(dids.len() as u64);
-    Ok(())
 }
 
 /// Ping one trust-task-capable instance, letting its DID document choose the

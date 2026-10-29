@@ -34,7 +34,7 @@
     "recharts": "^3.7.0"
   },
   "devDependencies": {
-    "@openvtc/trust-tasks": "^0.28.0",
+    "@openvtc/trust-tasks": "^0.28.1",
     "@openvtc/trust-tasks-gen": "^0.1.1",
     "@types/react": "~19.3.0",
     "typescript": "~7.0.2",

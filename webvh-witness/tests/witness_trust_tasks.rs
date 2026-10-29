@@ -229,7 +229,7 @@ fn signed_by_the_witness(reply: &Value, to: &str) {
 fn answered(reply: &Value, type_uri: &str) -> Value {
     assert_eq!(reply["type"], format!("{type_uri}#response"), "{reply}");
     signed_by_the_witness(reply, &admin().0);
-    let schema = trust_tasks_rs::schema_index::schema_for(&format!("{type_uri}#response"))
+    let schema = did_hosting_common::tasks::payload_schema(&format!("{type_uri}#response"))
         .unwrap_or_else(|| panic!("no schema is known for {type_uri}#response"));
     if let Err(e) = trust_tasks_rs::validate::against_schema(schema, &reply["payload"]) {
         panic!("{type_uri} reply does not match its schema: {e:?}\n{reply}");

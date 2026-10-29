@@ -25,6 +25,16 @@ pub mod server;
 #[allow(clippy::all, clippy::pedantic, missing_docs, unreachable_pub)]
 pub mod tasks {
     include!(concat!(env!("OUT_DIR"), "/trust_tasks_generated.rs"));
+    include!(concat!(env!("OUT_DIR"), "/trust_tasks_schema_index.rs"));
+
+    /// The payload schema a document of `type_uri` must satisfy: a pinned
+    /// version's from [`schema_for`], else the framework's own specs
+    /// (discovery, `trust-task-error`), which the runtime carries and this
+    /// workspace does not pin. The one lookup every reply-conformance check
+    /// uses, so they cannot drift apart.
+    pub fn payload_schema(type_uri: &str) -> Option<&'static str> {
+        schema_for(type_uri).or_else(|| ::trust_tasks_rs::schema_index::schema_for(type_uri))
+    }
 }
 
 #[cfg(feature = "server-core")]

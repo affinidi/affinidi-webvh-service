@@ -8,6 +8,8 @@
 use crate::error::AppError;
 use crate::store::KeyspaceHandle;
 use did_hosting_common::server::auth::session::now_epoch;
+use did_hosting_common::server::path_locks::PathLocks;
+use tracing::warn;
 
 // Re-export shared types and helpers from did-hosting-common so existing code
 // that imports from `crate::did_ops::*` continues to work.
@@ -26,59 +28,76 @@ pub fn validate_did_jsonl(content: &str) -> Result<(), AppError> {
 // Cleanup
 // ---------------------------------------------------------------------------
 
-/// What one cleanup pass did.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct CleanupReport {
-    /// DID records removed.
-    pub removed: u64,
-    /// DID records left after the pass. The pass reads every record, so
-    /// callers can take the hosted-DID count from it instead of scanning
-    /// again.
-    pub remaining: u64,
-}
-
 /// Remove DID records that have `version_count == 0` and are older than `ttl_seconds`,
-/// or soft-deleted records past the 30-day retention period.
+/// or soft-deleted records past the 30-day retention period. Returns how many
+/// records were removed.
+///
+/// `locks` is the per-path lock the service's writers take (the daemon's
+/// control plane). Each candidate is re-read and re-checked under its lock
+/// before it is deleted, so a slot published into after the scan is kept.
+/// Pass `None` where nothing else writes DID records under a path lock.
+///
+/// A failed delete is logged and skipped rather than ending the pass, so the
+/// count returned always matches what was removed.
 pub async fn cleanup_empty_dids(
     dids_ks: &KeyspaceHandle,
     ttl_seconds: u64,
-) -> Result<CleanupReport, AppError> {
+    locks: Option<&PathLocks>,
+) -> Result<u64, AppError> {
     const SOFT_DELETE_RETENTION: u64 = 30 * 24 * 3600; // 30 days
     let now = now_epoch();
+    let should_remove = |record: &DidRecord| {
+        // Empty records past TTL
+        (record.version_count == 0 && now.saturating_sub(record.created_at) > ttl_seconds)
+            // Soft-deleted records past retention
+            || record
+                .deleted_at
+                .is_some_and(|d| now.saturating_sub(d) > SOFT_DELETE_RETENTION)
+    };
+
     let raw = dids_ks.prefix_iter_raw("did:").await?;
-    let scanned = raw.len() as u64;
     let mut removed = 0u64;
 
     for (_key, value) in raw {
-        let record: DidRecord = match serde_json::from_slice(&value) {
-            Ok(r) => r,
-            Err(_) => continue,
+        let Ok(snapshot) = serde_json::from_slice::<DidRecord>(&value) else {
+            continue;
+        };
+        if !should_remove(&snapshot) {
+            continue;
+        }
+        let mnemonic = snapshot.mnemonic;
+
+        let _guard = match locks {
+            Some(locks) => Some(locks.guard(&mnemonic).await),
+            None => None,
+        };
+        // The scan is a snapshot: re-read under the lock and decide again.
+        let record = match dids_ks.get::<DidRecord>(did_key(&mnemonic)).await {
+            Ok(Some(record)) if should_remove(&record) => record,
+            Ok(_) => continue,
+            Err(e) => {
+                warn!(mnemonic = %mnemonic, error = %e, "DID cleanup: re-read failed; skipping");
+                continue;
+            }
         };
 
-        let should_remove =
-            // Empty records past TTL
-            (record.version_count == 0 && now.saturating_sub(record.created_at) > ttl_seconds)
-            // Soft-deleted records past retention
-            || record.deleted_at.is_some_and(|d| now.saturating_sub(d) > SOFT_DELETE_RETENTION);
-
-        if should_remove {
-            // One atomic write per DID: a crash part-way can no longer leave
-            // a record without its content, or an owner index without its
-            // record.
-            let mut batch = dids_ks.batch();
-            batch.remove(dids_ks, did_key(&record.mnemonic));
-            batch.remove(dids_ks, content_log_key(&record.mnemonic));
-            batch.remove(dids_ks, content_witness_key(&record.mnemonic));
-            batch.remove(dids_ks, owner_key(&record.owner, &record.mnemonic));
-            batch.commit().await?;
-            removed += 1;
+        // One atomic write per DID: a crash part-way can no longer leave
+        // a record without its content, or an owner index without its
+        // record.
+        let mut batch = dids_ks.batch();
+        batch.remove(dids_ks, did_key(&record.mnemonic));
+        batch.remove(dids_ks, content_log_key(&record.mnemonic));
+        batch.remove(dids_ks, content_witness_key(&record.mnemonic));
+        batch.remove(dids_ks, owner_key(&record.owner, &record.mnemonic));
+        match batch.commit().await {
+            Ok(()) => removed += 1,
+            Err(e) => {
+                warn!(mnemonic = %mnemonic, error = %e, "DID cleanup: delete failed; will retry next pass");
+            }
         }
     }
 
-    Ok(CleanupReport {
-        removed,
-        remaining: scanned - removed,
-    })
+    Ok(removed)
 }
 
 // ---------------------------------------------------------------------------
@@ -150,10 +169,9 @@ mod tests {
         assert!(err.contains("line 2"), "expected 'line 2' in error: {err}");
     }
 
-    /// The cleanup reads every DID record, so the count it reports left
-    /// must match what is stored after it removes the expired ones.
+    /// The cleanup removes only the expired records and reports how many.
     #[tokio::test]
-    async fn cleanup_reports_the_dids_left() {
+    async fn cleanup_removes_expired_dids() {
         use did_hosting_common::server::config::StoreConfig;
         use did_hosting_common::server::store::{KS_DIDS, Store};
 
@@ -190,15 +208,66 @@ mod tests {
             .await
             .unwrap();
 
-        let report = cleanup_empty_dids(&ks, 60).await.unwrap();
+        let removed = cleanup_empty_dids(&ks, 60, None).await.unwrap();
 
-        assert_eq!(
-            report,
-            CleanupReport {
-                removed: 1,
-                remaining: 2
-            }
-        );
+        assert_eq!(removed, 1);
         assert_eq!(ks.prefix_iter_raw("did:").await.unwrap().len(), 2);
+    }
+
+    /// A slot the scan saw as empty but that is published into before the
+    /// cleanup takes its lock must be kept: the delete decision is made
+    /// again on the record read under the lock.
+    #[tokio::test]
+    async fn cleanup_keeps_a_slot_published_after_the_scan() {
+        use did_hosting_common::server::config::StoreConfig;
+        use did_hosting_common::server::store::{KS_DIDS, Store};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open fjall");
+        let ks = store.keyspace(KS_DIDS).unwrap();
+        let mut record = DidRecord {
+            owner: "did:example:owner".into(),
+            mnemonic: "slot".into(),
+            created_at: 1,
+            updated_at: 1,
+            version_count: 0,
+            did_id: None,
+            content_size: 0,
+            disabled: false,
+            deleted_at: None,
+            method: "webvh".into(),
+            domain: "example.com".into(),
+            services: None,
+            agent_names: Vec::new(),
+        };
+        ks.insert(did_key("slot"), &record).await.unwrap();
+
+        // A publish holds the slot's lock while the cleanup scans.
+        let locks = PathLocks::new();
+        let publish_guard = locks.guard("slot").await;
+        let cleanup = {
+            let ks = ks.clone();
+            let locks = locks.clone();
+            tokio::spawn(async move { cleanup_empty_dids(&ks, 60, Some(&locks)).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!cleanup.is_finished(), "cleanup waits for the slot's lock");
+
+        record.version_count = 1;
+        ks.insert(did_key("slot"), &record).await.unwrap();
+        drop(publish_guard);
+
+        assert_eq!(cleanup.await.unwrap().unwrap(), 0);
+        assert!(
+            ks.get::<DidRecord>(did_key("slot"))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

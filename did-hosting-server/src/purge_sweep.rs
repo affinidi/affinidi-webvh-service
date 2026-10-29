@@ -26,11 +26,13 @@
 //! (it's a no-op on already-empty records) and then remove the
 //! pending entry on this second pass.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use did_hosting_common::server::domain::{self, DISABLE_PURGE_REASON};
 use did_hosting_common::server::domain_purge::purge_domain_dids;
 use did_hosting_common::server::pending_purge::{self, PurgeCheck};
+use did_hosting_common::server::stats_collector::StatsCollector;
 use did_hosting_common::server::store::Store;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
@@ -176,7 +178,11 @@ async fn still_due(store: &Store, entry: &pending_purge::PendingPurge) -> bool {
 /// 60-second tick until `shutdown` flips. The daemon spawns one of
 /// these per process; standalone servers spawn it in their own
 /// startup chain.
-pub async fn run_purge_sweep_loop(store: Store, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_purge_sweep_loop(
+    store: Store,
+    collector: Arc<StatsCollector>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let mut ticker = tokio::time::interval(DEFAULT_SWEEP_INTERVAL);
     // Skip the immediate first tick — the daemon's startup is busy
     // enough already, and a fresh boot is unlikely to have ripe
@@ -186,10 +192,11 @@ pub async fn run_purge_sweep_loop(store: Store, mut shutdown: watch::Receiver<bo
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let purged = run_sweep_once(&store).await.entries;
-                if purged > 0 {
-                    info!(count = purged, "purge sweep tick completed");
+                let sweep = run_sweep_once(&store).await;
+                if sweep.entries > 0 {
+                    info!(count = sweep.entries, "purge sweep tick completed");
                 }
+                collector.subtract_total_dids(sweep.dids_deleted);
             }
             _ = shutdown.changed() => {
                 info!("purge sweep loop shutting down");
