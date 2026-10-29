@@ -136,6 +136,7 @@ async fn edge_state() -> (AppState, tempfile::TempDir) {
             ),
         ),
         sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+        replay_cache: std::sync::Arc::new(did_hosting_common::server::replay::ReplayCache::new()),
     };
     (state, dir)
 }

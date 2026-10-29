@@ -81,6 +81,11 @@ pub struct AppState {
     /// operations running at once could each pass their read-check against
     /// the same stale state. Mirrors the watcher's `sync_lock`.
     pub sync_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Control-plane documents already applied, keyed on `(issuer, id)`,
+    /// with this edge's `[replay]` bounds. Every sync document is signed by
+    /// the control plane, so its per-signer bound caps how fast the edge
+    /// can follow DID changes.
+    pub replay_cache: Arc<did_hosting_common::server::replay::ReplayCache>,
 }
 
 impl AppState {
@@ -95,10 +100,14 @@ impl AppState {
                 "server.trusted_proxy_cidrs contains unparseable entries; ignoring them"
             );
         }
+        let replay_cache = Arc::new(
+            did_hosting_common::server::replay::ReplayCache::with_config(config.replay.clone())?,
+        );
         Ok(Self {
             dids_ks: store.keyspace(KS_DIDS)?,
             store,
             config: Arc::new(config),
+            replay_cache,
             did_resolver: None,
             trust_tasks_verifier: None,
             secrets_resolver: None,

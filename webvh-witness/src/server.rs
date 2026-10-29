@@ -77,7 +77,7 @@ impl AppState {
     ) -> Result<Self, AppError> {
         let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
         let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
-        let replay_cache = Arc::new(ReplayCache::with_config(config.replay.clone()));
+        let replay_cache = Arc::new(ReplayCache::with_config(config.replay.clone())?);
         Ok(Self {
             acl_ks: store.keyspace(KS_ACL)?,
             witnesses_ks: store.keyspace(KS_WITNESSES)?,

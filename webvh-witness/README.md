@@ -116,8 +116,8 @@ Environment variables use the `WITNESS_` prefix:
 | `WITNESS_VTA_URL`           | VTA REST URL              |
 | `WITNESS_VTA_DID`           | VTA DID                   |
 | `WITNESS_VTA_CONTEXT_ID`    | VTA context ID            |
-| `WITNESS_REPLAY_MAX_ENTRIES` | Replay cache records, all signers (default 50,000) |
-| `WITNESS_REPLAY_MAX_ENTRIES_PER_SIGNER` | Replay cache records per signer (default 5,000) |
+| `WITNESS_REPLAY_MAX_ENTRIES` | Replay cache records, all signers (default 1,000,000, about 32 MB) |
+| `WITNESS_REPLAY_MAX_ENTRIES_PER_SIGNER` | Replay cache records per signer (default 250,000, about 600 signed requests a second) |
 
 The replay settings live in `[replay]` (`max_entries`,
 `max_entries_per_signer`). The per-signer bound caps how fast one caller, such as a VTA, can have

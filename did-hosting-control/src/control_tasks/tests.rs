@@ -2741,7 +2741,12 @@ async fn bound_key_rows_do_not_touch_the_shared_replay_cache() {
     let reply = https(&state, None, doc).await;
     assert_eq!(code(&reply), "auth/oob:requestNotFound", "{reply}");
     assert_eq!(state.replay_cache.len(), before);
-    assert!(state.replay_cache.check(&starter.did, &id).is_ok());
+    assert!(
+        state
+            .replay_cache
+            .check(&starter.did, &id, Some(chrono::Utc::now()))
+            .is_ok()
+    );
 }
 
 /// A bound-key row's admission runs before the gate does any proof work: past

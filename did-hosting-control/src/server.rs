@@ -381,7 +381,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         stats_ks: stats_ks.clone(),
         timeseries_ks: timeseries_ks.clone(),
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
-        replay_cache: Arc::new(crate::replay::ReplayCache::with_config(replay_config)),
+        replay_cache: Arc::new(crate::replay::ReplayCache::with_config(replay_config)?),
         path_locks: crate::path_locks::PathLocks::new(),
         acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
         pending_challenges: Arc::new(pending_challenges),

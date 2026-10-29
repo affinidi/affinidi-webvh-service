@@ -41,7 +41,10 @@ pub struct AppConfig {
     pub identity: IdentityConfig,
     /// Bounds of the anti-replay cache for signed Trust Tasks (`[replay]`;
     /// env `WATCHER_REPLAY_*`).
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_common::server::config::ReplayConfig::is_default"
+    )]
     pub replay: did_hosting_common::server::config::ReplayConfig,
     #[serde(default)]
     pub sync: SyncConfig,

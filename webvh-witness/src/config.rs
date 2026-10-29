@@ -37,7 +37,10 @@ pub struct AppConfig {
     pub identity: did_hosting_common::server::config::IdentityConfig,
     /// Bounds of the anti-replay cache for signed Trust Tasks (`[replay]`;
     /// env `WITNESS_REPLAY_*`).
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_common::server::config::ReplayConfig::is_default"
+    )]
     pub replay: did_hosting_common::server::config::ReplayConfig,
     #[serde(skip)]
     pub config_path: PathBuf,

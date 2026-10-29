@@ -184,8 +184,8 @@ Environment variables use the `CONTROL_` prefix:
 | `CONTROL_SERVER_PORT`                      | Bind port                    |
 | `CONTROL_LOG_LEVEL`                        | Log level                    |
 | `CONTROL_REGISTRY_HEALTH_CHECK_INTERVAL`   | Health check interval (sec)  |
-| `CONTROL_REPLAY_MAX_ENTRIES`               | Replay cache records, all signers (default 50,000) |
-| `CONTROL_REPLAY_MAX_ENTRIES_PER_SIGNER`    | Replay cache records per signer (default 5,000) |
+| `CONTROL_REPLAY_MAX_ENTRIES`               | Replay cache records, all signers (default 1,000,000, about 32 MB) |
+| `CONTROL_REPLAY_MAX_ENTRIES_PER_SIGNER`    | Replay cache records per signer (default 250,000, about 600 signed requests a second) |
 
 The replay settings live in `[replay]` (`max_entries`,
 `max_entries_per_signer`); see "Replay cache bounds" below.
@@ -228,15 +228,28 @@ initialised and authentication falls back to DID challenge-response.
 ### Replay cache bounds
 
 Every service that accepts signed Trust Tasks (control plane, edge server,
-watcher, witness and daemon) records each one as `(signer, id)` for the
-replay window (6 minutes), so a captured request cannot be submitted again.
-At a bound the cache refuses new requests (`unavailable`, retryable) rather
-than forget a record. The per-signer bound therefore caps one signer's
-sustained rate at about `max_entries_per_signer / 360` requests a second: 14
-a second at the default 5,000. Each record holds about 0.4 KB, so 50,000
-records take about 20 MB; `max_entries` may be at most 1,000,000.
+watcher, witness and daemon) remembers each one as `(signer, id)` for as
+long as its `issuedAt` is inside the freshness window (up to about 7
+minutes), so a captured request cannot be submitted again. A record is a
+fixed-size hash, about 32 bytes whatever the DID and id, filed by the
+document's signed `issuedAt` so whole minutes are dropped as they leave the
+window.
 
-Raise the bounds wherever one signer sends faster than that:
+At a bound the cache refuses new requests (`unavailable`, retryable) rather
+than forget a record:
+
+- `max_entries` (default 1,000,000, about 32 MB) bounds all signers
+  together, and so the cache's memory. It may be at most 10,000,000
+  (about 320 MB).
+- `max_entries_per_signer` (default 250,000) bounds one signer, so one
+  authorised signer cannot fill the cache for the others. It caps that
+  signer's sustained rate at about `max_entries_per_signer / 420` requests
+  a second: about 600 at the default.
+- The last 10% of `max_entries` is kept for signers holding fewer than 100
+  records, so several busy signers together cannot lock out a quiet one.
+
+The defaults suit most deployments. Raise `max_entries_per_signer` wherever
+one signer sends faster than that:
 
 - On the control plane, for a VTA that creates DIDs at a high rate, and for
   each edge's sync acknowledgements, which are counted against that edge.
@@ -247,9 +260,14 @@ Raise the bounds wherever one signer sends faster than that:
 
 ```toml
 [replay]
-max_entries = 200000           # all signers
-max_entries_per_signer = 50000 # about 140 signed requests a second per signer
+max_entries = 4000000             # all signers, about 128 MB
+max_entries_per_signer = 1000000  # about 2,400 signed requests a second per signer
 ```
+
+Leave the table out to take the defaults; setup does not write it, so a
+later release's defaults apply. Wallet sign-in (`auth/oob/*`) keeps its own,
+separate replay record, because its signers are fresh keys anyone can mint;
+`[replay]` does not change it.
 
 ### Health Checking
 

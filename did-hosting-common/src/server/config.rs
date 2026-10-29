@@ -281,45 +281,51 @@ impl ResolveCacheConfig {
 /// Bounds of the anti-replay cache for signed inbound requests
 /// (`[replay]`; see [`crate::server::replay`]).
 ///
-/// The cache remembers every accepted `(signer, id)` pair for the replay
-/// window (6 minutes) and refuses new signed requests at either bound rather
-/// than forget one, so the per-signer bound caps one signer's sustained rate
-/// at about `max_entries_per_signer / 360` requests a second. Each record
-/// holds about 0.4 KB, so `max_entries` also bounds the cache's memory.
+/// The cache remembers every accepted `(signer, id)` pair for as long as
+/// the freshness window would accept its document (about 7 minutes,
+/// with margin) and refuses new signed requests at either bound rather than
+/// forget one, so the per-signer bound caps one signer's sustained rate at
+/// about `max_entries_per_signer / 420` requests a second. Each record holds
+/// about 32 bytes ([`crate::server::replay::BYTES_PER_RECORD`]), so
+/// `max_entries` also bounds the cache's memory. Every service has its own
+/// cache; a daemon has up to three (control plane, witness, watcher), each
+/// with these bounds.
+///
+/// Leave the table out to take the defaults, which may rise in later
+/// releases; generated configs omit it unless it differs from them.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct ReplayConfig {
-    /// Records held across all signers. Default 50,000 (about 20 MB).
-    #[serde(default = "default_replay_max_entries")]
+    /// Records held across all signers. Default
+    /// [`MAX_ENTRIES`](crate::server::replay::MAX_ENTRIES), 1,000,000 (about
+    /// 32 MB).
     pub max_entries: usize,
     /// Records held for any one signer, so one authorised signer cannot
-    /// exhaust the cache for the others. Default 5,000 (about 14 signed
-    /// requests a second, sustained).
-    #[serde(default = "default_replay_max_entries_per_signer")]
+    /// exhaust the cache for the others. Default
+    /// [`MAX_ENTRIES_PER_SIGNER`](crate::server::replay::MAX_ENTRIES_PER_SIGNER),
+    /// 250,000 (about 600 signed requests a second, sustained).
     pub max_entries_per_signer: usize,
 }
 
-fn default_replay_max_entries() -> usize {
-    crate::server::replay::MAX_ENTRIES
-}
-
-fn default_replay_max_entries_per_signer() -> usize {
-    crate::server::replay::MAX_ENTRIES_PER_SIGNER
-}
-
-/// The most records `[replay] max_entries` may allow: about 400 MB.
-const REPLAY_MAX_ENTRIES_CEILING: usize = 1_000_000;
+/// The most records `[replay] max_entries` may allow: about 320 MB.
+const REPLAY_MAX_ENTRIES_CEILING: usize = 10_000_000;
 
 impl Default for ReplayConfig {
     fn default() -> Self {
         Self {
-            max_entries: default_replay_max_entries(),
-            max_entries_per_signer: default_replay_max_entries_per_signer(),
+            max_entries: crate::server::replay::MAX_ENTRIES,
+            max_entries_per_signer: crate::server::replay::MAX_ENTRIES_PER_SIGNER,
         }
     }
 }
 
 impl ReplayConfig {
+    /// Whether this is the default, so a generated config can leave the
+    /// table out and pick up later defaults.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
     /// Refuse a zero bound, a per-signer bound above the global one, and a
     /// global bound above the ceiling.
     pub fn validate(&self) -> Result<(), AppError> {
@@ -346,25 +352,34 @@ impl ReplayConfig {
     /// Apply `{prefix}_REPLAY_MAX_ENTRIES` and
     /// `{prefix}_REPLAY_MAX_ENTRIES_PER_SIGNER` env overrides, then validate.
     pub fn apply_env_overrides(&mut self, prefix: &str) -> Result<(), AppError> {
-        self.apply_overrides(prefix, |var| std::env::var(var).ok())
+        self.apply_env_overrides_for(&[prefix])
     }
 
-    /// [`Self::apply_env_overrides`] reading variables through `lookup`.
+    /// [`Self::apply_env_overrides`] for several prefixes in turn (a later
+    /// one wins), validating once after all of them, so a pair of values
+    /// split across a deprecated and a current prefix is judged together.
+    pub fn apply_env_overrides_for(&mut self, prefixes: &[&str]) -> Result<(), AppError> {
+        self.apply_overrides(prefixes, |var| std::env::var(var).ok())
+    }
+
+    /// [`Self::apply_env_overrides_for`] reading variables through `lookup`.
     fn apply_overrides(
         &mut self,
-        prefix: &str,
+        prefixes: &[&str],
         lookup: impl Fn(&str) -> Option<String>,
     ) -> Result<(), AppError> {
-        for (suffix, field) in [
-            ("MAX_ENTRIES", &mut self.max_entries),
-            ("MAX_ENTRIES_PER_SIGNER", &mut self.max_entries_per_signer),
-        ] {
-            let var = format!("{prefix}_REPLAY_{suffix}");
-            if let Some(v) = lookup(&var) {
-                *field = v
-                    .trim()
-                    .parse()
-                    .map_err(|e| AppError::Config(format!("invalid {var}: {e}")))?;
+        for prefix in prefixes {
+            for (suffix, field) in [
+                ("MAX_ENTRIES", &mut self.max_entries),
+                ("MAX_ENTRIES_PER_SIGNER", &mut self.max_entries_per_signer),
+            ] {
+                let var = format!("{prefix}_REPLAY_{suffix}");
+                if let Some(v) = lookup(&var) {
+                    *field = v
+                        .trim()
+                        .parse()
+                        .map_err(|e| AppError::Config(format!("invalid {var}: {e}")))?;
+                }
             }
         }
         self.validate()
@@ -1643,8 +1658,15 @@ mod tests {
     fn replay_bounds_parse_and_validate() {
         let parsed: ReplayConfig = toml::from_str("").unwrap();
         assert_eq!(parsed, ReplayConfig::default());
-        assert_eq!(parsed.max_entries, 50_000);
-        assert_eq!(parsed.max_entries_per_signer, 5_000);
+        assert_eq!(parsed.max_entries, 1_000_000);
+        assert_eq!(parsed.max_entries_per_signer, 250_000);
+        assert!(parsed.is_default());
+
+        // A partial table takes the default for the other bound.
+        let parsed: ReplayConfig = toml::from_str("max_entries = 2000000").unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(parsed.max_entries_per_signer, 250_000);
+        assert!(!parsed.is_default());
 
         let parsed: ReplayConfig =
             toml::from_str("max_entries = 200000\nmax_entries_per_signer = 50000").unwrap();
@@ -1652,7 +1674,7 @@ mod tests {
         assert_eq!(parsed.max_entries_per_signer, 50_000);
 
         assert!(toml::from_str::<ReplayConfig>("max_entrys = 1").is_err());
-        for (max_entries, max_entries_per_signer) in [(0, 0), (10, 0), (10, 20), (2_000_000, 1)] {
+        for (max_entries, max_entries_per_signer) in [(0, 0), (10, 0), (10, 20), (20_000_000, 1)] {
             let config = ReplayConfig {
                 max_entries,
                 max_entries_per_signer,
@@ -1677,7 +1699,7 @@ mod tests {
         let mut config = ReplayConfig::default();
         config
             .apply_overrides(
-                "DAEMON",
+                &["DAEMON"],
                 env(&[
                     ("DAEMON_REPLAY_MAX_ENTRIES", "200000"),
                     ("DAEMON_REPLAY_MAX_ENTRIES_PER_SIGNER", " 50000 "),
@@ -1690,17 +1712,35 @@ mod tests {
             (200_000, 50_000)
         );
 
+        // A deprecated prefix still applies; the current one wins, and the
+        // pair is validated only once both are in.
         let mut config = ReplayConfig::default();
-        config.apply_overrides("DAEMON", env(&[])).unwrap();
+        config
+            .apply_overrides(
+                &["WEBVH", "DID_HOSTING"],
+                env(&[
+                    ("WEBVH_REPLAY_MAX_ENTRIES_PER_SIGNER", "3000000"),
+                    ("WEBVH_REPLAY_MAX_ENTRIES", "1"),
+                    ("DID_HOSTING_REPLAY_MAX_ENTRIES", "5000000"),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(
+            (config.max_entries, config.max_entries_per_signer),
+            (5_000_000, 3_000_000)
+        );
+
+        let mut config = ReplayConfig::default();
+        config.apply_overrides(&["DAEMON"], env(&[])).unwrap();
         assert_eq!(config, ReplayConfig::default());
 
         for pairs in [
             &[("DAEMON_REPLAY_MAX_ENTRIES", "lots")][..],
-            &[("DAEMON_REPLAY_MAX_ENTRIES_PER_SIGNER", "60000")][..],
+            &[("DAEMON_REPLAY_MAX_ENTRIES_PER_SIGNER", "2000000")][..],
         ] {
             let mut config = ReplayConfig::default();
             assert!(
-                config.apply_overrides("DAEMON", env(pairs)).is_err(),
+                config.apply_overrides(&["DAEMON"], env(pairs)).is_err(),
                 "{pairs:?} should be refused"
             );
         }

@@ -61,7 +61,10 @@ pub struct DaemonConfig {
     pub identity: IdentityConfig,
     /// Bounds of the anti-replay cache for signed Trust Tasks (`[replay]`;
     /// env `DAEMON_REPLAY_*`).
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_common::server::config::ReplayConfig::is_default"
+    )]
     pub replay: did_hosting_common::server::config::ReplayConfig,
 
     /// Multi-domain hosting settings (T18). `bootstrap_domains` seeds
@@ -411,11 +414,11 @@ context_id = "webvh"
         );
     }
 
-    /// `[replay]` reaches the embedded control plane and witness, the two
-    /// that hold a replay cache; without it the defaults apply, and an
-    /// inconsistent table stops the load.
+    /// `[replay]` reaches the embedded control plane, witness and watcher,
+    /// the services that hold a replay cache; without it the defaults apply,
+    /// and an inconsistent table stops the load.
     #[test]
-    fn replay_bounds_reach_the_control_plane_and_witness() {
+    fn replay_bounds_reach_the_embedded_services() {
         use did_hosting_common::server::config::ReplayConfig;
 
         let (_dir, path) = write_temp_config(SELF_MANAGED_TOML);
@@ -433,8 +436,9 @@ context_id = "webvh"
         };
         assert_eq!(cfg.control_config().replay, expected);
         assert_eq!(cfg.witness_config().replay, expected);
+        assert_eq!(cfg.watcher_config().replay, expected);
 
-        let toml = format!("{SELF_MANAGED_TOML}\n[replay]\nmax_entries_per_signer = 60000\n");
+        let toml = format!("{SELF_MANAGED_TOML}\n[replay]\nmax_entries_per_signer = 2000000\n");
         let (_dir, path) = write_temp_config(&toml);
         assert!(DaemonConfig::load(Some(path)).is_err());
     }

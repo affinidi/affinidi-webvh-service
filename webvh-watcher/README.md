@@ -110,8 +110,8 @@ different path with the `--config` flag or the
 | `WATCHER_SERVER_RESOLVE_CACHE_MAX_AGE_SECS` | DID-resolution `max-age` (0 = `no-cache`; default 300) |
 | `WATCHER_SERVER_RESOLVE_CACHE_SHARED_MAX_AGE_SECS` | DID-resolution `s-maxage` (empty clears) |
 | `WATCHER_SERVER_RESOLVE_CACHE_STALE_WHILE_REVALIDATE_SECS` | DID-resolution `stale-while-revalidate` (empty clears) |
-| `WATCHER_REPLAY_MAX_ENTRIES` | Replay cache records, all signers (default 50,000) |
-| `WATCHER_REPLAY_MAX_ENTRIES_PER_SIGNER` | Replay cache records per signer (default 5,000) |
+| `WATCHER_REPLAY_MAX_ENTRIES` | Replay cache records, all signers (default 1,000,000, about 32 MB) |
+| `WATCHER_REPLAY_MAX_ENTRIES_PER_SIGNER` | Replay cache records per signer (default 250,000, about 600 signed requests a second) |
 
 The same settings live in `[server.resolve_cache]` (`max_age_secs`,
 `shared_max_age_secs`, `stale_while_revalidate_secs`).

@@ -59,7 +59,7 @@ impl AppState {
     ) -> Result<Self, AppError> {
         let did_resolver: Option<DIDCacheClient> =
             identity.as_ref().map(|i| i.did_resolver.clone());
-        let replay_cache = Arc::new(ReplayCache::with_config(config.replay.clone()));
+        let replay_cache = Arc::new(ReplayCache::with_config(config.replay.clone())?);
         Ok(Self {
             dids_ks: store.keyspace(KS_DIDS)?,
             store,

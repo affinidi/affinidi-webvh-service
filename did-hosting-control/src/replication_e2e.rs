@@ -151,6 +151,7 @@ async fn edge_state(
             ),
         ),
         sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+        replay_cache: Arc::new(did_hosting_common::server::replay::ReplayCache::new()),
     };
     (state, dir)
 }

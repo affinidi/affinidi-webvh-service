@@ -334,6 +334,9 @@ impl Topology {
                 ),
             ),
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            replay_cache: std::sync::Arc::new(
+                did_hosting_common::server::replay::ReplayCache::new(),
+            ),
         };
         dirs.push(edge_dir);
         let edge_router = did_hosting_server::routes::router(1024 * 1024).with_state(edge.clone());
