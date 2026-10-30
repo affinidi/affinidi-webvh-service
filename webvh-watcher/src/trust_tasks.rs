@@ -35,7 +35,7 @@ use did_hosting_common::tasks::webvh::sync::{
 };
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
-use trust_tasks_rs::{DeclaredErrorCode, ErrorPayload, RejectReason, TrustTask};
+use trust_tasks_rs::{DeclaredErrorCode, ErrorPayload, RejectReason, StandardCode, TrustTask};
 
 use did_hosting_common::didcomm_types::{MSG_SYNC_BATCH, MSG_SYNC_DELETE, MSG_SYNC_UPDATE};
 use did_hosting_common::server::replay::ReplayError;
@@ -262,6 +262,11 @@ fn refusal_payload(refusal: SyncRefusal) -> ErrorPayload {
         SyncRefusal::NotOwner(m) => {
             ErrorPayload::from(sync_update::error_codes::NOT_AUTHORIZED).with_message(m)
         }
+        SyncRefusal::TooLarge(reason) => RejectReason::TaskFailed {
+            reason,
+            details: None,
+        }
+        .into(),
         SyncRefusal::Transient(reason) => {
             warn!(%reason, "sync not applied (transient); the source will re-send it");
             RejectReason::InternalError { reason }.into()
@@ -275,6 +280,8 @@ fn refusal_code(refusal: &SyncRefusal) -> Option<&'static str> {
         SyncRefusal::HistoryRewrite(_) => Some(sync_update::error_codes::HISTORY_REWRITE.code),
         SyncRefusal::Deactivated(_) => Some(sync_update::error_codes::DEACTIVATED.code),
         SyncRefusal::NotOwner(_) => Some(sync_update::error_codes::NOT_AUTHORIZED.code),
+        // What the entry would have received on its own.
+        SyncRefusal::TooLarge(_) => Some(StandardCode::TaskFailed.as_str()),
         SyncRefusal::Transient(_) => None,
     }
 }
@@ -389,4 +396,29 @@ async fn sync_delete_task(
         "mnemonic": mnemonic,
         "status": if held { "deleted" } else { "absent" },
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use did_hosting_common::server::error::AppError;
+
+    /// A store's size refusal is a permanent `taskFailed`, so the source
+    /// stops re-sending it; any other store error stays retryable.
+    #[test]
+    fn a_store_size_refusal_is_permanent_and_other_store_errors_retry() {
+        let too_large = SyncRefusal::from(AppError::QuotaExceeded(
+            "item size 431916 bytes is over the store's per-item limit of 409600 bytes".into(),
+        ));
+        assert_eq!(refusal_code(&too_large), Some("taskFailed"));
+        let payload = serde_json::to_value(refusal_payload(too_large)).expect("serialise");
+        assert_eq!(payload["code"], "taskFailed", "{payload}");
+
+        let store_down = SyncRefusal::from(AppError::Store("connection reset".into()));
+        assert_eq!(
+            refusal_code(&store_down),
+            None,
+            "a transient failure is retried"
+        );
+    }
 }

@@ -280,6 +280,11 @@ pub(crate) enum OpError {
     Refused(String),
     /// Refused, under a code the op's specification declares.
     Declared(trust_tasks_rs::DeclaredErrorCode, String),
+    /// The op is valid but this server will not apply it (its store's
+    /// per-item size limit refuses the log): `taskFailed`, non-retryable.
+    /// Unlike [`Self::Refused`], a sync batch reports it as `taskFailed`,
+    /// not `invalidLog`, since the log itself verified.
+    Failed(String),
     /// This server could not apply it just now (storage, I/O): reported
     /// retryable, so the control plane keeps it queued.
     Transient(String),
@@ -305,6 +310,7 @@ impl From<crate::error::AppError> for OpError {
             | AppError::Store(_)
             | AppError::SecretStore(_)
             | AppError::Internal(_) => OpError::Transient(e.to_string()),
+            AppError::QuotaExceeded(_) => OpError::Failed(e.to_string()),
             other => OpError::Refused(other.to_string()),
         }
     }
@@ -313,11 +319,13 @@ impl From<crate::error::AppError> for OpError {
 impl OpError {
     fn reject_reason(self) -> trust_tasks_rs::ErrorPayload {
         match self {
-            OpError::Refused(reason) => trust_tasks_rs::RejectReason::TaskFailed {
-                reason,
-                details: None,
+            OpError::Refused(reason) | OpError::Failed(reason) => {
+                trust_tasks_rs::RejectReason::TaskFailed {
+                    reason,
+                    details: None,
+                }
+                .into()
             }
-            .into(),
             OpError::Declared(code, message) => {
                 trust_tasks_rs::ErrorPayload::from(code).with_message(message)
             }
@@ -673,6 +681,14 @@ async fn do_sync_batch(
                     "mnemonic": entry.mnemonic,
                     "status": "refused",
                     "code": sync_update::error_codes::INVALID_LOG.code,
+                }));
+            }
+            Err(OpError::Failed(e)) => {
+                warn!(mnemonic = %entry.mnemonic, error = %e, "sync-batch: entry refused");
+                results.push(json!({
+                    "mnemonic": entry.mnemonic,
+                    "status": "refused",
+                    "code": trust_tasks_rs::StandardCode::TaskFailed.as_str(),
                 }));
             }
             Err(OpError::Transient(e)) => {
@@ -1238,5 +1254,18 @@ mod tests {
             assert!(matches!(err, OpError::Refused(_)), "{err:?}");
             assert_eq!(payload_of(err)["retryable"], false);
         }
+    }
+
+    /// A log over this server's store item limit is final but not invalid:
+    /// `taskFailed`, non-retryable, so the control plane stops re-sending it.
+    #[test]
+    fn a_store_size_refusal_is_final_and_not_an_invalid_log() {
+        let err = OpError::from(AppError::QuotaExceeded(
+            "item size 431916 bytes is over the store's per-item limit of 409600 bytes".into(),
+        ));
+        assert!(matches!(err, OpError::Failed(_)), "{err:?}");
+        let payload = payload_of(err);
+        assert_eq!(payload["code"], "taskFailed");
+        assert_eq!(payload["retryable"], false);
     }
 }

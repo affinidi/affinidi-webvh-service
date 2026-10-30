@@ -65,6 +65,33 @@ pub type RawKvPair = (Vec<u8>, Vec<u8>);
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Refuse a write whose stored item, `size` bytes as `backend` counts it,
+/// is over that backend's per-item `limit`.
+///
+/// Backends with a per-item limit (DynamoDB, Firestore) check every item
+/// before they send anything, so a refused batch writes nothing. The error is
+/// [`AppError::QuotaExceeded`], whose message reaches the caller: a Trust Task
+/// answers `taskFailed` with it (HTTPS `422`), and an edge or watcher refuses
+/// the sync as `taskFailed` rather than retrying it. Left to the backend, the
+/// same write failed as a store error (`500`) that no retry could fix. The
+/// backend is logged here, not told to the caller.
+#[cfg(any(feature = "store-dynamodb", feature = "store-firestore"))]
+fn check_item_size(backend: &str, size: usize, limit: usize) -> Result<(), AppError> {
+    if size > limit {
+        tracing::warn!(
+            backend,
+            size,
+            limit,
+            "write refused: item over the store's per-item limit"
+        );
+        // `AppError::quota_kind` keys on the word "size".
+        return Err(AppError::QuotaExceeded(format!(
+            "item size {size} bytes is over the store's per-item limit of {limit} bytes"
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Traits
 // ---------------------------------------------------------------------------
