@@ -293,6 +293,18 @@ external services.
 | Google Firestore          | `store-firestore` | `store.firestore_project`, `store.firestore_database`                                                        |
 | Azure Cosmos DB           | `store-cosmosdb`  | `store.cosmosdb_endpoint`, `store.cosmosdb_database`, `store.cosmosdb_container`, `store.cosmosdb_region`    |
 
+A DID's whole log is stored as one item, so a backend's item size limit is
+the largest log it can hold: about 400 KB on DynamoDB, and about 750 KB on
+Firestore (1 MiB, with the log stored base64-encoded). The other backends hold
+any log `did/register` accepts (1 MiB). An update that would take a log past
+the limit is refused with the size in its message, and the DID keeps its last
+version; with 2.3 KB entries, a DynamoDB-backed DID takes about 170 updates.
+A DID at its limit takes no further entry, a deactivation or key rotation
+included. An edge whose store holds less than its control plane's refuses
+the larger logs and keeps serving the versions it had (the control plane logs
+a warning), so give edges a store whose limit is at least the control
+plane's.
+
 To build with a non-default storage backend:
 
 ```bash

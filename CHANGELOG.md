@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Fixed — a DID log over the store's item size limit is refused, not a 500
+
+DynamoDB stores at most 400 KB per item and Firestore 1 MiB per document,
+and a DID's whole log is one item, while `did/register` accepts logs up to
+1 MiB. A larger log failed at the store as an internal error (`500`): the
+caller could not tell why, and an edge or watcher receiving it by sync
+retried it forever.
+
+- The DynamoDB and Firestore backends now check each item against their
+  limit before they write anything, so a refused batch leaves nothing
+  half-written. `did/register` (HTTPS, DIDComm and TSP alike) answers
+  `taskFailed` (HTTPS `422`) with the size and the limit in its message; the
+  backend is logged, not told to the caller. The witness file is checked the
+  same way.
+- An edge or watcher refuses such a sync as `taskFailed` rather than
+  retrying it, alone or in a `sync/batch` (where an edge used to report it as
+  `invalidLog`), and keeps serving the version it had. The control plane
+  logs a warning for each entry an edge refuses in a batch. Give edges a
+  store whose limit is at least the control plane's.
+- The DID keeps its last version. A DynamoDB-backed log holds about
+  400 KB (about 170 updates of 2.3 KB entries); Firestore about 750 KB,
+  because the log is stored base64-encoded. Fjall, Redis and Cosmos DB hold
+  any log `did/register` accepts. A DID at its limit takes no further entry,
+  a deactivation or key rotation included. The server README states the
+  limits.
+
 ### Added — wallet sign-in locations from a local GeoIP database
 
 The control plane (standalone or in the daemon) now fills in
