@@ -64,8 +64,7 @@ pub async fn challenge(
     }
 
     // IP rate limit (defence in depth before any session-storage I/O).
-    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
-    let client_ip = resolve_client_ip(addr.ip(), xff, &state.config.server.trusted_proxies);
+    let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.server.trusted_proxies);
     state
         .ip_rate_limiter
         .try_consume(client_ip, now_epoch())

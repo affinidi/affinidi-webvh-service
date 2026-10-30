@@ -19,17 +19,13 @@
 //!
 //! - Empty `trusted_proxies` (default): always use the direct TCP peer.
 //!   Safe when running on the open internet without a proxy.
-//! - Non-empty `trusted_proxies`: walk `X-Forwarded-For` from the
-//!   right, skip any entry that's in `trusted_proxies`, and use the
-//!   first non-trusted entry as the client IP. If every XFF entry is
-//!   trusted (shouldn't happen in practice — there's always a public
-//!   client at the head), fall back to the leftmost.
+//! - Non-empty `trusted_proxies` (addresses or CIDR ranges): walk
+//!   `X-Forwarded-For` from the right, skip each trusted proxy, and use
+//!   the first entry that isn't one; on any doubt, the TCP peer.
 //!
-//! Configuring `trusted_proxies` with the wrong value is a foot-gun:
-//! trust too much and an attacker can spoof XFF to bypass the limit;
-//! trust too little and legitimate proxied requests all hit one
-//! limit. Operators should put their actual reverse-proxy IPs there
-//! and nothing else.
+//! The rule is shared with every other service —
+//! [`did_hosting_common::server::rate_limit::resolve_client_ip`], re-exported
+//! here — and documented there, foot-guns included.
 //!
 //! # Algorithm
 //!
@@ -205,69 +201,14 @@ impl SourceRateLimiter {
     }
 }
 
-/// Resolve the client IP from a TCP peer + `X-Forwarded-For` header.
-///
-/// Behaviour:
-/// - `trusted_proxies` empty → always return `peer`.
-/// - `peer` not in `trusted_proxies` → return `peer` (the request
-///   isn't coming from a configured proxy, so XFF is untrusted).
-/// - `peer` in `trusted_proxies` and `xff` provided → walk the XFF
-///   list right-to-left, skipping any IP that's also in
-///   `trusted_proxies`, and return the first non-trusted entry. If
-///   every entry is trusted, return the leftmost (best-effort).
-/// - `peer` in `trusted_proxies` but no XFF → return `peer`.
-///
-/// Malformed XFF entries are silently skipped; if all entries fail to
-/// parse, return `peer`.
-pub fn resolve_client_ip(peer: IpAddr, xff: Option<&str>, trusted_proxies: &[String]) -> IpAddr {
-    if trusted_proxies.is_empty() {
-        return peer;
-    }
-
-    let trusted: Vec<IpAddr> = trusted_proxies
-        .iter()
-        .filter_map(|s| s.parse::<IpAddr>().ok())
-        .collect();
-
-    if !trusted.contains(&peer) {
-        return peer;
-    }
-
-    let Some(xff) = xff else {
-        return peer;
-    };
-
-    // Parse all XFF entries (left-to-right) into IpAddrs, skipping
-    // unparseable ones. Empty-after-filter falls through to peer.
-    let parsed: Vec<IpAddr> = xff
-        .split(',')
-        .filter_map(|s| s.trim().parse::<IpAddr>().ok())
-        .collect();
-
-    if parsed.is_empty() {
-        return peer;
-    }
-
-    // Walk right-to-left, returning the first non-trusted IP.
-    for candidate in parsed.iter().rev() {
-        if !trusted.contains(candidate) {
-            return *candidate;
-        }
-    }
-
-    // Every entry is trusted — fall back to the leftmost (the
-    // documented "original client" position).
-    parsed[0]
-}
+/// Resolve the client IP from the TCP peer and `X-Forwarded-For` — the one
+/// shared rule every service applies; see its docs.
+pub use did_hosting_common::server::rate_limit::resolve_client_ip;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
-
-    fn ip(s: &str) -> IpAddr {
-        s.parse().unwrap()
-    }
 
     // --- IpRateLimiter ---
 
@@ -350,78 +291,5 @@ mod tests {
         // a is full, b is fresh.
         assert!(l.try_consume(a, 1000).is_err());
         l.try_consume(b, 1000).unwrap();
-    }
-
-    // --- resolve_client_ip ---
-
-    #[test]
-    fn resolve_no_trusted_proxies_returns_peer() {
-        let peer = ip("203.0.113.1");
-        // Even with XFF set, with no trusted_proxies the header is ignored.
-        assert_eq!(resolve_client_ip(peer, Some("198.51.100.1"), &[]), peer);
-    }
-
-    #[test]
-    fn resolve_peer_not_in_trusted_returns_peer() {
-        let peer = ip("203.0.113.1");
-        let trusted = vec!["10.0.0.1".to_string()];
-        assert_eq!(
-            resolve_client_ip(peer, Some("198.51.100.1"), &trusted),
-            peer
-        );
-    }
-
-    #[test]
-    fn resolve_trusted_peer_picks_xff_client() {
-        let peer = ip("10.0.0.1");
-        let trusted = vec!["10.0.0.1".to_string()];
-        // Single client, single trusted proxy.
-        assert_eq!(
-            resolve_client_ip(peer, Some("198.51.100.1"), &trusted),
-            ip("198.51.100.1")
-        );
-    }
-
-    /// Walk past the trusted-proxy chain to find the original client.
-    /// `XFF: client, proxy1, proxy2` → the rightmost entry is the
-    /// closest proxy. With proxy1 and proxy2 both trusted, the
-    /// original client is the leftmost.
-    #[test]
-    fn resolve_walks_past_trusted_chain() {
-        let peer = ip("10.0.0.2");
-        let trusted = vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()];
-        assert_eq!(
-            resolve_client_ip(peer, Some("198.51.100.1, 10.0.0.1, 10.0.0.2"), &trusted,),
-            ip("198.51.100.1")
-        );
-    }
-
-    /// XFF spoofing: an attacker whose request actually originates
-    /// from a non-trusted host injects fake XFF entries trying to
-    /// impersonate another IP. With the actual peer not in trusted,
-    /// XFF is ignored entirely.
-    #[test]
-    fn resolve_attacker_spoof_ignored() {
-        let peer = ip("203.0.113.99"); // attacker's real IP
-        let trusted = vec!["10.0.0.1".to_string()];
-        // Attacker tries to claim they came through a trusted proxy.
-        assert_eq!(
-            resolve_client_ip(peer, Some("198.51.100.5, 10.0.0.1"), &trusted,),
-            peer
-        );
-    }
-
-    #[test]
-    fn resolve_malformed_xff_falls_back_to_peer() {
-        let peer = ip("10.0.0.1");
-        let trusted = vec!["10.0.0.1".to_string()];
-        assert_eq!(resolve_client_ip(peer, Some("not-an-ip"), &trusted), peer);
-    }
-
-    #[test]
-    fn resolve_no_xff_returns_peer() {
-        let peer = ip("10.0.0.1");
-        let trusted = vec!["10.0.0.1".to_string()];
-        assert_eq!(resolve_client_ip(peer, None, &trusted), peer);
     }
 }

@@ -80,9 +80,11 @@ pub async fn trust_tasks_endpoint(
             "no connection address for this request".into(),
         ));
     };
-    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
-    let ip =
-        crate::rate_limit::resolve_client_ip(addr.ip(), xff, &state.config.server.trusted_proxies);
+    let ip = crate::rate_limit::resolve_client_ip(
+        addr.ip(),
+        &headers,
+        &state.config.server.trusted_proxies,
+    );
     let client_ip = Some(ip);
     if is_redeem_start(&body) {
         let limited = state.redeem_rate_limiter.try_consume(
