@@ -83,20 +83,6 @@ pub fn trust_task_listener(body_limit: usize) -> Router<AppState> {
     Router::new().nest("/api", trust_task_routes(body_limit))
 }
 
-/// The edge's router without the DID-serving fallback: public resolution
-/// (`/.well-known/*`, the agent-name redirects) and the HTTPS binding of the
-/// Trust Task listener.
-///
-/// There is no management surface. Every write reaches an edge as a Trust
-/// Task signed by its control plane, over TSP, DIDComm or `POST
-/// /api/trust-tasks` alike; the edge holds no sessions and no ACL of its own.
-pub fn router_without_fallback(body_limit: usize) -> Router<AppState> {
-    // No Prometheus `/metrics`: an edge's metrics are read by its control
-    // plane as `did-management/server/metrics/0.1`, authenticated like any
-    // other directive.
-    router_public_only().merge(trust_task_listener(body_limit))
-}
-
 /// Public DID-serving routes only (`.well-known` and the agent-name
 /// redirects), without the Trust Task listener.
 ///
@@ -144,12 +130,21 @@ pub fn router(body_limit: usize) -> Router<AppState> {
     router_with_resolve_limit(body_limit, Arc::new(ResolveRateLimiter::disabled()))
 }
 
-/// The edge's full router: `resolve_limit` on every resolution route and the
-/// DID-serving fallback. The Trust Task listener keeps its own limiter.
+/// The edge's full router: public resolution (`/.well-known/*`, the
+/// agent-name redirects and the DID-serving fallback), with `resolve_limit` on
+/// all of it, and the HTTPS binding of the Trust Task listener, which keeps
+/// its own limiter.
+///
+/// There is no management surface. Every write reaches an edge as a Trust
+/// Task signed by its control plane, over TSP, DIDComm or `POST
+/// /api/trust-tasks` alike; the edge holds no sessions and no ACL of its own.
 pub fn router_with_resolve_limit(
     body_limit: usize,
     resolve_limit: Arc<ResolveRateLimiter>,
 ) -> Router<AppState> {
+    // No Prometheus `/metrics`: an edge's metrics are read by its control
+    // plane as `did-management/server/metrics/0.1`, authenticated like any
+    // other directive.
     router_public_only()
         .fallback(did_public::serve_public)
         .layer(axum::middleware::from_fn_with_state(

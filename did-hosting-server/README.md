@@ -383,7 +383,7 @@ work but are deprecated, and the `DID_HOSTING_` name wins when both are set.
 | `DID_HOSTING_REPLAY_MAX_ENTRIES`            | Replay cache records, all signers (default 1,000,000, about 32 MB) |
 | `DID_HOSTING_REPLAY_MAX_ENTRIES_PER_SIGNER` | Replay cache records per signer (default 250,000, about 600 signed requests a second) |
 | `DID_HOSTING_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW` | Resolution requests per client address per window (empty clears: no limit) |
-| `DID_HOSTING_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS` | Resolution rate-limit window (default 10) |
+| `DID_HOSTING_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS` | Resolution rate-limit window (default 10; empty restores it) |
 | `DID_HOSTING_SERVER_TRUSTED_PROXIES` | Comma-separated proxy addresses or CIDR ranges whose `X-Forwarded-For` is trusted (empty clears) |
 
 The replay settings live in `[replay]` (`max_entries`,

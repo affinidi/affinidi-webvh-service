@@ -214,7 +214,7 @@ Environment variables use the `DAEMON_` prefix:
 | `DAEMON_SERVER_RESOLVE_CACHE_SHARED_MAX_AGE_SECS` | DID-resolution `s-maxage` (empty clears) |
 | `DAEMON_SERVER_RESOLVE_CACHE_STALE_WHILE_REVALIDATE_SECS` | DID-resolution `stale-while-revalidate` (empty clears) |
 | `DAEMON_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW` | Resolution requests per client address per window (empty clears: no limit) |
-| `DAEMON_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS` | Resolution rate-limit window (default 10) |
+| `DAEMON_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS` | Resolution rate-limit window (default 10; empty restores it) |
 | `DAEMON_SERVER_TRUSTED_PROXIES` | Comma-separated proxy addresses or CIDR ranges whose `X-Forwarded-For` is trusted (empty clears) |
 
 The same settings live in `[server.resolve_cache]` (`max_age_secs`,

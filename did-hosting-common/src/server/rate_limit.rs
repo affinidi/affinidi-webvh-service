@@ -1,4 +1,7 @@
-//! Per-address rate limiter for an unauthenticated Trust Task listener.
+//! Per-address rate limiters for unauthenticated listeners: the Trust Task
+//! listener's (below), wallet sign-in's, and public DID resolution's
+//! ([`ResolveRateLimiter`], `[server.resolve_rate_limit]`, off by default;
+//! an IPv6 client counts by its /64).
 //!
 //! `POST /api/trust-tasks` is reachable by anyone who can resolve a service's
 //! DID document and reach its HTTPS binding — it carries its own proof, so
@@ -42,9 +45,17 @@
 //! Per-address fixed-window counter, refreshed every `window_secs`. Each
 //! `try_consume(addr)` increments and refuses past `max_per_window`. The
 //! window resets lazily on the next call after expiry — no separate sweep
-//! task required. Per-address HashMap entries persist across the whole
-//! process lifetime; under sustained novel-address flood the map grows until
-//! eviction kicks in.
+//! task required.
+//!
+//! # Eviction
+//!
+//! At most [`MAX_TRACKED_ADDRESSES`] addresses are tracked. On reaching it,
+//! addresses whose window has ended are dropped (their counts would reset on
+//! the next call anyway). If more than [`EVICTION_LOW_WATER`] are still live,
+//! the whole map is cleared: drastic, but the alternative is unbounded memory
+//! under a flood from many addresses, which a per-address limit cannot hold
+//! back in any case. The low-water mark keeps that scan to once per few
+//! thousand new addresses rather than once per request.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};

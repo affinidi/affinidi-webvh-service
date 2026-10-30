@@ -142,15 +142,19 @@ pub mod ip_networks {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<IpNetwork>, D::Error> {
         Vec::<String>::deserialize(d)?
             .iter()
-            .map(|entry| {
-                entry.trim().parse::<IpNetwork>().map_err(|_| {
-                    serde::de::Error::custom(format!(
-                        "invalid network `{entry}`: expected an IP address (`10.0.0.1`) \
-                         or a CIDR range (`10.0.0.0/8`, `2001:db8::/32`)"
-                    ))
-                })
-            })
+            .map(|entry| parse(entry).map_err(serde::de::Error::custom))
             .collect()
+    }
+
+    /// One entry: an address or a CIDR range, surrounding whitespace ignored.
+    /// The error names the entry.
+    pub fn parse(entry: &str) -> Result<IpNetwork, String> {
+        entry.trim().parse::<IpNetwork>().map_err(|_| {
+            format!(
+                "invalid network `{entry}`: expected an IP address (`10.0.0.1`) \
+                 or a CIDR range (`10.0.0.0/8`, `2001:db8::/32`)"
+            )
+        })
     }
 
     fn max_prefix(n: &IpNetwork) -> u8 {
@@ -227,11 +231,7 @@ impl ServerConfig {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(|entry| {
-                    entry.parse::<IpNetwork>().map_err(|_| {
-                        AppError::Config(format!(
-                            "invalid {var} entry `{entry}`: expected an IP address or a CIDR range"
-                        ))
-                    })
+                    ip_networks::parse(entry).map_err(|e| AppError::Config(format!("{var}: {e}")))
                 })
                 .collect::<Result<_, _>>()?;
         }
@@ -529,7 +529,7 @@ impl ResolveRateLimitConfig {
 
     /// Apply `{prefix}_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW` (an empty
     /// value clears it) and `{prefix}_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS`
-    /// env overrides, then validate.
+    /// (an empty value restores the default) env overrides, then validate.
     pub fn apply_env_overrides(&mut self, prefix: &str) -> Result<(), AppError> {
         self.apply_overrides(prefix, |var| std::env::var(var).ok())
     }
@@ -555,7 +555,11 @@ impl ResolveRateLimitConfig {
         }
         let var = format!("{prefix}_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS");
         if let Some(v) = lookup(&var) {
-            self.window_secs = parse(&var, &v)?;
+            self.window_secs = if v.trim().is_empty() {
+                default_resolve_rate_limit_window_secs()
+            } else {
+                parse(&var, &v)?
+            };
         }
         self.validate()
     }
@@ -1998,6 +2002,17 @@ mod tests {
         assert_eq!(
             config.max_per_window, None,
             "an empty value clears the limit"
+        );
+        config
+            .apply_overrides(
+                "DAEMON",
+                env(&[("DAEMON_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS", " ")]),
+            )
+            .unwrap();
+        assert_eq!(
+            config.window_secs,
+            default_resolve_rate_limit_window_secs(),
+            "an empty value restores the default window"
         );
 
         for pairs in [

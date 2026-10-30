@@ -203,7 +203,6 @@ impl DaemonConfig {
             config.log.level = v;
         }
         // DAEMON_SERVER_TRUSTED_PROXIES — load balancer addresses or ranges.
-        // Also validates `server.trusted_proxies`.
         config.server.apply_trusted_proxies_env_override("DAEMON")?;
         // DAEMON_SERVER_RESOLVE_CACHE_* — Cache-Control on DID resolution.
         config.server.resolve_cache.apply_env_overrides("DAEMON")?;

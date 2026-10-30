@@ -201,8 +201,9 @@ metered store's read capacity for every other client.
   inside one block does not escape the limit. The budget is per process. In
   the daemon one budget covers the server's and watcher's resolution and the
   root fallback, which also serves the UI.
-- Every per-address limiter now drops addresses whose window has ended
-  when it reaches 10,000 tracked addresses, and clears all counts only if
+- The shared per-address limiter (resolution, the Trust Task listeners and
+  wallet sign-in) now drops addresses whose window has ended when it reaches
+  10,000 tracked addresses, and clears all counts only if
   more than 7,500 are still live, so a flood does not rescan the map on
   every request.
 

@@ -95,13 +95,15 @@ impl Daemon {
     async fn spawn_with_acl(
         extra_main_acl: &[(String, did_hosting_common::server::acl::Role)],
     ) -> Self {
-        Self::spawn_with(extra_main_acl, &[]).await
+        Self::spawn_with(extra_main_acl, &[], false).await
     }
 
-    /// Like [`Self::spawn_with_acl`], with `env` set on the daemon process.
+    /// Like [`Self::spawn_with_acl`], with `env` set on the daemon process and
+    /// the embedded watcher (`/watcher`) on when `watcher` is set.
     async fn spawn_with(
         extra_main_acl: &[(String, did_hosting_common::server::acl::Role)],
         env: &[(&str, &str)],
+        watcher: bool,
     ) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let port = reserve_port().await;
@@ -141,7 +143,7 @@ mode = "did"
 did = "{admin_did}"
 
 [daemon]
-enable_watcher = false
+enable_watcher = {watcher}
 "#,
         );
         std::fs::write(&recipe_path, recipe).expect("write recipe");
@@ -589,20 +591,23 @@ async fn resolution_is_rate_limited_per_address() {
             ("DAEMON_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW", "20"),
             ("DAEMON_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS", "3600"),
         ],
+        true,
     )
     .await;
     let http = reqwest::Client::new();
     let get = |path: &str| http.get(format!("{}{path}", daemon.base_url)).send();
 
     // Spawning already resolved the root DID at least once, so the budget
-    // runs out within LIMIT requests, alternating the two route kinds.
+    // runs out within LIMIT requests, cycling through the server's routes,
+    // the root fallback and the nested watcher's.
+    const PATHS: [&str; 3] = [
+        "/.well-known/did.jsonl",
+        "/ghost/did.jsonl",
+        "/watcher/ghost/did.jsonl",
+    ];
     let mut refused_at = None;
     for i in 0..LIMIT {
-        let path = if i % 2 == 0 {
-            "/.well-known/did.jsonl"
-        } else {
-            "/ghost/did.jsonl"
-        };
+        let path = PATHS[i % PATHS.len()];
         let resp = get(path).await.expect("GET the daemon");
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             assert!(resp.headers().contains_key("retry-after"));
@@ -612,10 +617,10 @@ async fn resolution_is_rate_limited_per_address() {
     }
     let refused_at = refused_at.expect("the resolution budget runs out");
     assert!(
-        refused_at >= 2,
-        "both route kinds were served before the limit"
+        refused_at >= PATHS.len(),
+        "every route kind was served before the limit"
     );
-    for path in ["/.well-known/did.jsonl", "/ghost/did.jsonl"] {
+    for path in PATHS {
         assert_eq!(
             get(path).await.expect("GET the daemon").status(),
             reqwest::StatusCode::TOO_MANY_REQUESTS,
