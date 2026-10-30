@@ -355,9 +355,13 @@ impl KeyspaceHandle {
         let mut corrupted = 0u64;
         for (key, value) in &all {
             let key_str = String::from_utf8_lossy(key);
-            // Skip entries that store raw bytes, not JSON
+            // Skip entries that store raw bytes, not JSON: logs (`content:`,
+            // the edge's `hw:` high-water JSONL) and reverse indexes whose
+            // value is a bare mnemonic (`owner:`, the agent-name `name:`).
             if key_str.starts_with("content:")
                 || key_str.starts_with("owner:")
+                || key_str.starts_with("name:")
+                || key_str.starts_with("hw:")
                 || key_str.starts_with("refresh:")
                 || key_str.starts_with("ts:")
             {

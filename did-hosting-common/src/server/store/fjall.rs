@@ -777,4 +777,32 @@ mod tests {
         let val: Option<String> = ks.get("k").await.unwrap();
         assert_eq!(val, Some("v".to_string()));
     }
+
+    /// Raw-byte entries (reverse indexes holding a bare mnemonic, JSONL logs)
+    /// are not JSON and must not be reported as corrupt; a JSON-typed key
+    /// holding garbage still is.
+    #[tokio::test]
+    async fn verify_integrity_skips_raw_byte_entries() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace("dids").unwrap();
+        ks.insert_raw(b"name:example.com:alice".to_vec(), b"alice-vta".to_vec())
+            .await
+            .unwrap();
+        ks.insert_raw(b"owner:did:key:z6Mk:alice".to_vec(), b"alice".to_vec())
+            .await
+            .unwrap();
+        ks.insert_raw(b"hw:id:abc".to_vec(), b"{\"a\":1}\n{\"b\":2}\n".to_vec())
+            .await
+            .unwrap();
+        ks.insert_raw(b"content:alice:log".to_vec(), b"{}\n{}\n".to_vec())
+            .await
+            .unwrap();
+        ks.insert("did:alice", &"ok").await.unwrap();
+        assert_eq!(ks.verify_integrity().await.unwrap(), 0);
+
+        ks.insert_raw(b"did:bad".to_vec(), b"not json".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(ks.verify_integrity().await.unwrap(), 1);
+    }
 }
