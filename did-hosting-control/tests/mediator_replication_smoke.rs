@@ -207,6 +207,7 @@ async fn control_state(
         hosting: Default::default(),
         identity: Default::default(),
         replay: Default::default(),
+        geoip: Default::default(),
         config_path: PathBuf::new(),
     };
     let state = did_hosting_control::server::AppState {

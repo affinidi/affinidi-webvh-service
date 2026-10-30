@@ -152,6 +152,13 @@ dialoguer = "0.12"
 rust-embed = { version = "8", features = ["compression"] }
 mime_guess = "2"
 
+# Local GeoIP lookups for the control plane's wallet sign-in
+# (`did-hosting-control` `geoip`): reads DB-IP / MaxMind `.mmdb` files from
+# disk, never a network call (base design §12.6). No default features — the
+# file is read into memory, so `mmap` (and its `unsafe`) stays off. Same line
+# as the VTC's, which this lookup mirrors.
+maxminddb = { version = "0.32", default-features = false }
+
 # DID resolver
 affinidi-did-resolver-cache-sdk = "0.8.43"
 

@@ -186,6 +186,7 @@ Environment variables use the `CONTROL_` prefix:
 | `CONTROL_REGISTRY_HEALTH_CHECK_INTERVAL`   | Health check interval (sec)  |
 | `CONTROL_REPLAY_MAX_ENTRIES`               | Replay cache records, all signers (default 1,000,000, about 32 MB) |
 | `CONTROL_REPLAY_MAX_ENTRIES_PER_SIGNER`    | Replay cache records per signer (default 250,000, about 600 signed requests a second) |
+| `CONTROL_GEOIP_DATABASE`                   | Local GeoIP `.mmdb` file for wallet sign-in locations (empty clears) |
 
 The replay settings live in `[replay]` (`max_entries`,
 `max_entries_per_signer`); see "Replay cache bounds" below.
@@ -268,6 +269,24 @@ Leave the table out to take the defaults; setup does not write it, so a
 later release's defaults apply. Wallet sign-in (`auth/oob/*`) keeps its own,
 separate replay record, because its signers are fresh keys anyone can mint;
 `[replay]` does not change it.
+
+### Wallet sign-in locations (GeoIP)
+
+When someone signs in with their wallet (`auth/oob`), the wallet shows where
+the request came from, for example `Vienna, AT`. The control plane looks the
+browser's address up in a **local** MaxMind DB (`.mmdb`) file and never calls
+a third-party service. Without one every location is `unknown`, which the
+wallet shows as a warning.
+
+```toml
+[geoip]
+database = "/var/lib/did-hosting/geoip/dbip-city-lite.mmdb"
+```
+
+A missing or unreadable file is a warning, not a startup failure, and a
+replaced file is picked up within a minute without a restart. See
+[`docs/geoip.md`](../docs/geoip.md) for choosing a database (DB-IP City Lite
+or MaxMind GeoLite2 City), attribution and a monthly update job.
 
 ### Health Checking
 

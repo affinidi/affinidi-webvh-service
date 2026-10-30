@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Added — wallet sign-in locations from a local GeoIP database
+
+The control plane (standalone or in the daemon) now fills in
+`requester.location` for `auth/oob` sign-in requests, which the wallet shows
+its approver (`Vienna, AT`). It was always `unknown`. The lookup follows the
+VTC's: a local MaxMind DB (`.mmdb`) file only, never a third-party call;
+non-public addresses are never looked up; the address is neither logged nor
+stored. Point `[geoip] database` (or `CONTROL_GEOIP_DATABASE` /
+`DAEMON_GEOIP_DATABASE`) at a DB-IP City Lite or MaxMind GeoLite2 City file.
+A missing or bad file is a warning, not a startup failure, and a replaced
+file is re-read within a minute. Without the table nothing changes. See
+`docs/geoip.md`.
+
+### Fixed — false "corrupted entry" warnings at startup
+
+The store integrity check reported every agent-name index entry
+(`name:{domain}:{name}`) as invalid JSON. Those entries, and an edge's
+`hw:` high-water logs, hold raw bytes by design and are now skipped. No
+data was affected.
+
 ### Security — rustls 0.21 removed from the AWS backends
 
 The DynamoDB store and AWS secret backends no longer build the AWS SDK's

@@ -59,8 +59,39 @@ pub struct AppConfig {
         skip_serializing_if = "did_hosting_common::server::config::ReplayConfig::is_default"
     )]
     pub replay: did_hosting_common::server::config::ReplayConfig,
+    /// Local GeoIP database (`[geoip]`; env `CONTROL_GEOIP_DATABASE`) for the
+    /// city and country a wallet shows for a sign-in request.
+    #[serde(default, skip_serializing_if = "GeoIpConfig::is_default")]
+    pub geoip: GeoIpConfig,
     #[serde(skip)]
     pub config_path: PathBuf,
+}
+
+/// Local GeoIP lookups (`[geoip]`) — base design §12.6: a local database only,
+/// never a third-party call. See `docs/geoip.md` and [`crate::geoip`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeoIpConfig {
+    /// Path of a MaxMind DB (`.mmdb`) file with the GeoIP2 City record shape:
+    /// DB-IP "IP to City Lite" (recommended) or MaxMind GeoLite2 City. Unset,
+    /// every sign-in location is `"unknown"`. A file that is missing or not a
+    /// database is a warning at startup, not a boot failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<PathBuf>,
+}
+
+impl GeoIpConfig {
+    pub fn is_default(&self) -> bool {
+        self.database.is_none()
+    }
+
+    /// `{prefix}_GEOIP_DATABASE` overrides `[geoip] database`; an empty value
+    /// clears one set in the file.
+    pub fn apply_env_overrides(&mut self, prefix: &str) {
+        if let Ok(path) = std::env::var(format!("{prefix}_GEOIP_DATABASE")) {
+            self.database = (!path.trim().is_empty()).then(|| PathBuf::from(path));
+        }
+    }
 }
 
 /// Trust Tasks framework runtime knobs.
@@ -216,6 +247,8 @@ impl AppConfig {
         );
         // CONTROL_REPLAY_* — anti-replay cache bounds. Also validates `[replay]`.
         config.replay.apply_env_overrides("CONTROL")?;
+        // CONTROL_GEOIP_DATABASE — the local sign-in location database.
+        config.geoip.apply_env_overrides("CONTROL");
 
         // Control-specific env vars
         macro_rules! env_opt {

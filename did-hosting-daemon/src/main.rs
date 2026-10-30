@@ -1134,6 +1134,11 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     // handle, and starting it eagerly avoids racing the first
     // `notify_one`.
     let (outbox_shutdown_tx, outbox_shutdown_rx) = watch::channel(false);
+    // 4d. A refreshed GeoIP database is picked up without a restart; stops
+    // on the outbox worker's signal.
+    let geoip_reloader = control_state
+        .as_ref()
+        .and_then(|state| state.oob.geoip().spawn_reloader(outbox_shutdown_rx.clone()));
     let outbox_handle = if let Some(state) = control_state.as_ref() {
         let outbox_state = state.clone();
         let outbox_notify = state.outbox_notify.clone();
@@ -1164,6 +1169,11 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             Ok(()) => info!("outbox worker stopped"),
             Err(e) => warn!("outbox worker didn't shut down cleanly: {e}"),
         }
+    }
+    if let Some(handle) = geoip_reloader
+        && let Err(e) = handle.await
+    {
+        warn!("GeoIP reloader didn't shut down cleanly: {e}");
     }
 
     // 5b. Stop storage task (includes final flush + persist main_store)
@@ -1516,7 +1526,11 @@ async fn build_control(
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
         redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),
         cache_invalidate,
-        oob: Default::default(),
+        // Wallet sign-in locations from the local GeoIP database, if any
+        // (mirrors `did_hosting_control::server`).
+        oob: Arc::new(did_hosting_control::oob::OobRuntime::with_geoip(
+            did_hosting_control::server::open_geoip(config.geoip.database.clone()).await?,
+        )),
         large_document_budget: Arc::new(
             did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
         ),

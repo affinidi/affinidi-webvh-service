@@ -222,6 +222,17 @@ impl AuthState for AppState {
     }
 }
 
+/// Open the configured GeoIP database (see [`crate::geoip`]). Never fails on
+/// the file itself — only if the blocking read task cannot be joined.
+pub async fn open_geoip(
+    path: Option<std::path::PathBuf>,
+) -> Result<Arc<crate::geoip::GeoIp>, AppError> {
+    tokio::task::spawn_blocking(move || crate::geoip::GeoIp::open(path))
+        .await
+        .map(Arc::new)
+        .map_err(|e| AppError::Internal(format!("GeoIP database load task: {e}")))
+}
+
 pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
     // Validate that at least one management interface is enabled
     if !config.features.rest_api && !config.features.didcomm && !config.features.tsp {
@@ -309,6 +320,11 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let pending_challenges =
         crate::pending_challenges::PendingChallengeTracker::for_auth_config(&config.auth);
 
+    // The local GeoIP database, if configured (base design §12.6). Advisory:
+    // a file that cannot be read is a warning, and sign-in locations show as
+    // "unknown". Read off the runtime's workers — it can be 100+ MB.
+    let geoip = open_geoip(config.geoip.database.clone()).await?;
+
     let state = AppState {
         store: store.clone(),
         sessions_ks,
@@ -394,7 +410,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         // Standalone control plane: no content cache of its own to
         // invalidate. See the field doc.
         cache_invalidate: None,
-        oob: Arc::default(),
+        oob: Arc::new(crate::oob::OobRuntime::with_geoip(geoip)),
     };
 
     // Reload challenges issued before a restart, so the caps hold across it.
@@ -590,6 +606,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let (outbox_shutdown_tx, outbox_shutdown_rx) = tokio::sync::watch::channel(false);
     let outbox_state = state.clone();
     let outbox_notify = state.outbox_notify.clone();
+    // The GeoIP reloader (step 8) stops on the same signal.
+    let geoip_shutdown_rx = outbox_shutdown_rx.clone();
     let outbox_handle = tokio::spawn(async move {
         crate::outbox::run_outbox_loop(outbox_state, outbox_notify, outbox_shutdown_rx).await;
     });
@@ -597,6 +615,9 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // 7. Check, in the background, that our own DID lists the services
     // wallet sign-in needs; warn once with the fix if not. Never blocks.
     crate::sign_in_readiness::spawn(&state);
+
+    // 8. A refreshed GeoIP database is picked up without a restart.
+    let geoip_reloader = state.oob.geoip().spawn_reloader(geoip_shutdown_rx);
 
     // Wait for shutdown signal
     init::shutdown_signal().await;
@@ -649,6 +670,12 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 
     if let Err(e) = outbox_handle.await {
         warn!("outbox worker didn't shut down cleanly: {e}");
+    }
+
+    if let Some(handle) = geoip_reloader
+        && let Err(e) = handle.await
+    {
+        warn!("GeoIP reloader didn't shut down cleanly: {e}");
     }
 
     if any_panic {

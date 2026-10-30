@@ -222,6 +222,7 @@ pub async fn run_wizard(
         },
         registry: did_hosting_control::config::RegistryConfig::default(),
         replay: Default::default(),
+        geoip: Default::default(),
         features,
         identity: IdentityConfig::default(),
         enable,
@@ -1079,6 +1080,7 @@ async fn run_self_managed_setup(
         vta: VtaConfig::default(),
         registry: did_hosting_control::config::RegistryConfig::default(),
         replay: Default::default(),
+        geoip: Default::default(),
         features,
         identity: IdentityConfig {
             mode: IdentityMode::SelfManaged,
@@ -1454,6 +1456,7 @@ pub async fn run_setup_offline_complete(
         },
         registry: did_hosting_control::config::RegistryConfig::default(),
         replay: Default::default(),
+        geoip: Default::default(),
         features: state.features.clone(),
         identity: IdentityConfig::default(),
         hosting: did_hosting_common::server::config::HostingConfig::default(),

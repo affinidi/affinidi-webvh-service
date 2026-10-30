@@ -70,6 +70,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         hosting: Default::default(),
         identity: Default::default(),
         replay: Default::default(),
+        geoip: Default::default(),
         config_path: PathBuf::new(),
     };
 

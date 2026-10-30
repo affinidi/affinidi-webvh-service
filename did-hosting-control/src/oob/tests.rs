@@ -313,6 +313,36 @@ async fn assert_signed(body: &Value, purpose: &str) {
 
 // ---- the whole flow --------------------------------------------------------
 
+/// The location the connection was given when the request was made (from the
+/// local GeoIP database, `crate::geoip`) is what step 2 shows the approver.
+#[tokio::test]
+async fn step_2_shows_the_requests_location() {
+    let w = world();
+    let d = w
+        .doc(
+            &w.starter,
+            TYPE_REQUEST,
+            json!({"purpose": "login", "mode": "scan"}),
+            "assertionMethod",
+        )
+        .await;
+    let conn = Connection {
+        ip: Some("203.0.113.7".into()),
+        location: Some("Vienna, AT".into()),
+        browser: Some("Firefox".into()),
+        os: Some("macOS".into()),
+    };
+    let OobReply::Document { status, body } = w.svc.handle(&w.env, d, &conn).await else {
+        panic!("a request is answered with a document");
+    };
+    assert_eq!(status, 200, "{body}");
+    let rid = body["payload"]["requestId"].as_str().unwrap().to_string();
+
+    w.claim(&rid).await;
+    let step2 = w.prove(&rid).await;
+    assert_eq!(step2["payload"]["requester"]["location"], "Vienna, AT");
+}
+
 #[tokio::test]
 async fn sign_in_end_to_end() {
     let w = world();

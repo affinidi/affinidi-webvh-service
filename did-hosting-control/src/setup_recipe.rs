@@ -241,6 +241,7 @@ pub async fn apply_recipe(
         hosting: HostingConfig::default(),
         identity: Default::default(),
         replay: Default::default(),
+        geoip: Default::default(),
         config_path: recipe.output.config_path.clone(),
     };
 

@@ -66,6 +66,14 @@ pub struct DaemonConfig {
         skip_serializing_if = "did_hosting_common::server::config::ReplayConfig::is_default"
     )]
     pub replay: did_hosting_common::server::config::ReplayConfig,
+    /// Local GeoIP database (`[geoip]`; env `DAEMON_GEOIP_DATABASE`) for the
+    /// city and country a wallet shows for a sign-in request. Reaches the
+    /// embedded control plane, which answers wallet sign-in.
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_control::config::GeoIpConfig::is_default"
+    )]
+    pub geoip: did_hosting_control::config::GeoIpConfig,
 
     /// Multi-domain hosting settings (T18). `bootstrap_domains` seeds
     /// the `domains` keyspace on first boot when no entries exist;
@@ -197,6 +205,8 @@ impl DaemonConfig {
         config.server.resolve_cache.apply_env_overrides("DAEMON")?;
         // DAEMON_REPLAY_* — anti-replay cache bounds. Also validates `[replay]`.
         config.replay.apply_env_overrides("DAEMON")?;
+        // DAEMON_GEOIP_DATABASE — the local sign-in location database.
+        config.geoip.apply_env_overrides("DAEMON");
 
         // Fjall memory settings (STORAGE_FJALL_BLOCK_CACHE / _WRITE_BUFFER /
         // _MAX_JOURNAL) — shared, unprefixed names; see
@@ -307,6 +317,7 @@ impl DaemonConfig {
             // a default.
             identity: self.identity.clone(),
             replay: self.replay.clone(),
+            geoip: self.geoip.clone(),
             config_path: self.config_path.clone(),
         }
     }
@@ -441,6 +452,27 @@ context_id = "webvh"
         let toml = format!("{SELF_MANAGED_TOML}\n[replay]\nmax_entries_per_signer = 2000000\n");
         let (_dir, path) = write_temp_config(&toml);
         assert!(DaemonConfig::load(Some(path)).is_err());
+    }
+
+    /// `[geoip]` reaches the embedded control plane, which answers wallet
+    /// sign-in; without it no database is configured.
+    #[test]
+    fn geoip_database_reaches_the_control_plane() {
+        let (_dir, path) = write_temp_config(SELF_MANAGED_TOML);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert_eq!(cfg.control_config().geoip.database, None);
+
+        let toml = format!(
+            "{SELF_MANAGED_TOML}\n[geoip]\ndatabase = \"/var/lib/did-hosting/geoip/dbip-city-lite.mmdb\"\n"
+        );
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert_eq!(
+            cfg.control_config().geoip.database.as_deref(),
+            Some(std::path::Path::new(
+                "/var/lib/did-hosting/geoip/dbip-city-lite.mmdb"
+            ))
+        );
     }
 
     #[test]

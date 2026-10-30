@@ -68,6 +68,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         hosting: Default::default(),
         identity: Default::default(),
         replay: Default::default(),
+        geoip: Default::default(),
         config_path: PathBuf::new(),
     };
 

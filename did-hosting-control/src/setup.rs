@@ -268,6 +268,7 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         hosting: HostingConfig::default(),
         identity: Default::default(),
         replay: Default::default(),
+        geoip: Default::default(),
         config_path: output_path.clone(),
     };
 
@@ -954,6 +955,7 @@ pub async fn run_setup_offline_complete(
         hosting: HostingConfig::default(),
         identity: Default::default(),
         replay: Default::default(),
+        geoip: Default::default(),
         config_path: state.config_output.clone(),
     };
 
