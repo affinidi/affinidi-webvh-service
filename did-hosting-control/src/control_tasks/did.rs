@@ -11,8 +11,6 @@ use serde_json::json;
 use tracing::info;
 use trust_tasks_rs::StandardCode;
 
-use did_hosting_common::did_ops::did_key;
-
 use super::{Cx, TaskError, spec_record, typed};
 use crate::did_ops;
 use crate::error::AppError;
@@ -72,12 +70,9 @@ pub(crate) async fn check_name(
     // A named path that is already taken is not an error: the spec answers
     // `available: false, reserved: false` and changes nothing.
     match did_ops::create_did(&auth, state, path, false, resolved_domain.as_deref()).await {
-        Ok(result) => {
-            let record: did_hosting_common::did_ops::DidRecord = state
-                .dids_ks
-                .get(did_key(&result.mnemonic))
-                .await?
-                .ok_or_else(|| AppError::Internal("record missing after reservation".into()))?;
+        // Answer from the record reserved, not a read-back an eventually
+        // consistent store can miss.
+        Ok(record) => {
             let record: check_name::v0_1::DidRecord = spec_record(state, &record)?;
             typed(
                 json!({ "available": true, "reserved": true, "record": record }),
@@ -120,7 +115,7 @@ pub(crate) async fn register(
         AppError::Validation(format!("[log] webvh didData is not valid UTF-8: {e}"))
     })?;
 
-    let result = did_ops::register_did_atomic(
+    let record = did_ops::register_did_atomic(
         &auth,
         state,
         p.path.as_str(),
@@ -129,9 +124,8 @@ pub(crate) async fn register(
         p.domain.as_deref(),
     )
     .await?;
-    server_push::notify_servers_did(state, result.mnemonic.clone());
+    server_push::notify_servers_did(state, record.mnemonic.clone());
 
-    let record = stored(cx, &result.mnemonic).await?;
     typed(
         json!({ "record": spec_record::<register::v0_1::DidRecord>(state, &record)? }),
         "register response",
@@ -548,19 +542,6 @@ pub(crate) async fn witness_publish(
     )
 }
 
-/// The stored record for `mnemonic`, which the caller has just written.
-async fn stored(
-    cx: &Cx<'_>,
-    mnemonic: &str,
-) -> Result<did_hosting_common::did_ops::DidRecord, TaskError> {
-    Ok(cx
-        .state
-        .dids_ks
-        .get(did_key(mnemonic))
-        .await?
-        .ok_or_else(|| AppError::Internal(format!("record `{mnemonic}` missing after write")))?)
-}
-
 /// `did/set-state/0.1`: `suspended` stops the slot resolving on every edge,
 /// `active` resumes it. The state travels to edges with the slot's content.
 pub(crate) async fn set_state(
@@ -576,9 +557,8 @@ pub(crate) async fn set_state(
         set_state::v0_1::PayloadState::Suspended => true,
         _ => return Err(AppError::Validation("unsupported DID state".into()).into()),
     };
-    did_ops::set_did_disabled(&auth, state, &p.mnemonic, disabled).await?;
+    let record = did_ops::set_did_disabled(&auth, state, &p.mnemonic, disabled).await?;
     server_push::notify_servers_did(state, p.mnemonic.to_string());
-    let record = stored(cx, &p.mnemonic).await?;
     typed(
         json!({ "record": spec_record::<set_state::v0_1::DidRecord>(state, &record)? }),
         "set-state response",
