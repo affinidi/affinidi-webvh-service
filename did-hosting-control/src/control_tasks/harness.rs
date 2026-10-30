@@ -80,7 +80,7 @@ pub(crate) async fn state() -> (AppState, tempfile::TempDir) {
         sessions_ks: store.keyspace(KS_SESSIONS).unwrap(),
         acl_ks: store.keyspace(KS_ACL).unwrap(),
         registry_ks: store.keyspace(KS_REGISTRY).unwrap(),
-        dids_ks: store.keyspace(KS_DIDS).unwrap(),
+        dids_ks: store.keyspace_consistent(KS_DIDS).unwrap(),
         config: Arc::new(config),
         did_resolver: None,
         secrets_resolver: None,

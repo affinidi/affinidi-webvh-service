@@ -125,6 +125,15 @@ pub trait BatchOps: Send {
 /// Factory: create keyspaces, create batches, persist/flush.
 pub trait StorageBackend: Send + Sync {
     fn keyspace(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError>;
+
+    /// [`Self::keyspace`], with every `get_raw` and `contains_key` seeing
+    /// all writes that committed before it. DynamoDB overrides this; fjall,
+    /// Redis (against a primary) and Firestore already read their latest
+    /// write. Cosmos DB does only if the account's consistency level gives
+    /// it: nothing here asks for more.
+    fn keyspace_consistent(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
+        self.keyspace(name)
+    }
     fn batch(&self) -> Box<dyn BatchOps>;
     fn persist(&self) -> BoxFuture<'_, Result<(), AppError>>;
 }
@@ -183,6 +192,22 @@ impl Store {
 
     pub fn keyspace(&self, name: &str) -> Result<KeyspaceHandle, AppError> {
         let (ks_name, ops) = self.inner.keyspace(name)?;
+        Ok(KeyspaceHandle {
+            name: ks_name,
+            inner: ops,
+            backend: self.inner.clone(),
+        })
+    }
+
+    /// [`Self::keyspace`] for code whose reads decide a write: a key read
+    /// through this handle reflects every write committed before the read
+    /// (on Cosmos DB, only as far as the account's consistency level
+    /// allows; see [`StorageBackend::keyspace_consistent`]). Prefix scans
+    /// are not covered. Costs more on
+    /// DynamoDB (twice the read units), so read-heavy paths such as DID
+    /// resolution keep [`Self::keyspace`].
+    pub fn keyspace_consistent(&self, name: &str) -> Result<KeyspaceHandle, AppError> {
+        let (ks_name, ops) = self.inner.keyspace_consistent(name)?;
         Ok(KeyspaceHandle {
             name: ks_name,
             inner: ops,

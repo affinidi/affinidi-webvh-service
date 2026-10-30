@@ -42,6 +42,7 @@ pub struct AppState {
     pub sessions_ks: KeyspaceHandle,
     pub acl_ks: KeyspaceHandle,
     pub registry_ks: KeyspaceHandle,
+    /// Opened with [`Store::keyspace_consistent`]: its reads decide writes.
     pub dids_ks: KeyspaceHandle,
     pub config: Arc<AppConfig>,
     pub did_resolver: Option<DIDCacheClient>,
@@ -253,7 +254,10 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let sessions_ks = store.keyspace(KS_SESSIONS)?;
     let acl_ks = store.keyspace(KS_ACL)?;
     let registry_ks = store.keyspace(KS_REGISTRY)?;
-    let dids_ks = store.keyspace(KS_DIDS)?;
+    // Strongly consistent: the control plane's DID reads decide writes
+    // (ownership, slot existence, what to push to edges), so a read that
+    // missed a just-committed write could hand one owner's slot to another.
+    let dids_ks = store.keyspace_consistent(KS_DIDS)?;
     let stats_ks = store.keyspace(KS_STATS)?;
     // Time-series buckets live in their own keyspace from v0.7 — see
     // the `timeseries_ks` field doc on `AppState`.

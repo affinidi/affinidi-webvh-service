@@ -699,7 +699,9 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         });
 
     // Open keyspaces early — needed for bootstrap, stats seeding, and builders.
-    let dids_ks = main_store.keyspace(KS_DIDS).unwrap_or_else(|e| {
+    // Strongly consistent: the storage task's DID cleanup re-reads a record
+    // to decide whether to delete it. Resolution does not use this handle.
+    let dids_ks = main_store.keyspace_consistent(KS_DIDS).unwrap_or_else(|e| {
         error!("failed to open dids keyspace: {e}");
         std::process::exit(1);
     });
@@ -1466,7 +1468,9 @@ async fn build_control(
     let sessions_ks = store.keyspace(KS_SESSIONS)?;
     let acl_ks = store.keyspace(KS_ACL)?;
     let registry_ks = store.keyspace(KS_REGISTRY)?;
-    let dids_ks = store.keyspace(KS_DIDS)?;
+    // Strongly consistent, as in the standalone control plane; the embedded
+    // server opens its own handle and resolves with ordinary reads.
+    let dids_ks = store.keyspace_consistent(KS_DIDS)?;
     let stats_ks = store.keyspace(KS_STATS)?;
     let timeseries_ks = store.keyspace(KS_TIMESERIES)?;
 
