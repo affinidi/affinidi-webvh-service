@@ -63,6 +63,7 @@ impl DynamoDbBackend {
         &self,
         name: &str,
         consistent_read: bool,
+        consistent_scan: bool,
     ) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
         Ok((
             name.to_string(),
@@ -71,6 +72,7 @@ impl DynamoDbBackend {
                 table: self.table_name(name),
                 verified: self.verified_tables.clone(),
                 consistent_read,
+                consistent_scan,
             }),
         ))
     }
@@ -78,11 +80,18 @@ impl DynamoDbBackend {
 
 impl StorageBackend for DynamoDbBackend {
     fn keyspace(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
-        self.open_keyspace(name, false)
+        self.open_keyspace(name, false, false)
     }
 
     fn keyspace_consistent(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
-        self.open_keyspace(name, true)
+        self.open_keyspace(name, true, false)
+    }
+
+    fn keyspace_consistent_with_scans(
+        &self,
+        name: &str,
+    ) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
+        self.open_keyspace(name, true, true)
     }
 
     fn batch(&self) -> Box<dyn BatchOps> {
@@ -161,6 +170,10 @@ struct DynamoDbKeyspace {
     /// read costs half the read units and is fine where a stale answer
     /// decides nothing.
     consistent_read: bool,
+    /// Send `Scan` with `ConsistentRead` too. Separate from
+    /// `consistent_read` because a scan reads the whole table: doubling
+    /// that is only worth it on a small keyspace.
+    consistent_scan: bool,
 }
 
 impl KeyspaceOps for DynamoDbKeyspace {
@@ -314,7 +327,11 @@ impl KeyspaceOps for DynamoDbKeyspace {
             let mut results = Vec::new();
             let mut last_key: Option<HashMap<String, AttributeValue>> = None;
             loop {
-                let mut req = self.client.scan().table_name(&self.table);
+                let mut req = self
+                    .client
+                    .scan()
+                    .table_name(&self.table)
+                    .consistent_read(self.consistent_scan);
                 if let Some(ref key) = last_key {
                     req = req.set_exclusive_start_key(Some(key.clone()));
                 }
@@ -514,6 +531,22 @@ mod tests {
         for body in &bodies {
             assert!(!body.contains(r#""ConsistentRead":true"#), "{body}");
         }
+    }
+
+    #[tokio::test]
+    async fn only_a_with_scans_keyspace_scans_strongly_consistent() {
+        let capture = CaptureBodies::default();
+        let backend = offline_backend(&capture);
+        let scan = async |ops: Arc<dyn KeyspaceOps>| {
+            assert!(ops.prefix_iter_raw(b"did:".to_vec()).await.is_err());
+            let bodies = std::mem::take(&mut *capture.0.lock().unwrap());
+            assert_eq!(bodies.len(), 1, "one scan: {bodies:?}");
+            bodies[0].contains(r#""ConsistentRead":true"#)
+        };
+
+        assert!(scan(backend.keyspace_consistent_with_scans("dids").unwrap().1).await);
+        assert!(!scan(backend.keyspace_consistent("dids").unwrap().1).await);
+        assert!(!scan(backend.keyspace("dids").unwrap().1).await);
     }
 
     fn bin_item(pk: &[u8], val: &[u8]) -> HashMap<String, AttributeValue> {

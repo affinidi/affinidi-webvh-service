@@ -832,9 +832,7 @@ async fn do_sync_delete(
             );
         }
         batch.commit().await.map_err(OpError::from)?;
-        state
-            .did_cache
-            .invalidate(&did_ops::content_log_key(mnemonic));
+        state.did_cache.invalidate_did(mnemonic);
         info!(did = %control.did, mnemonic = %mnemonic, "deleted DID via sync from control plane");
         "deleted"
     } else {

@@ -134,6 +134,17 @@ pub trait StorageBackend: Send + Sync {
     fn keyspace_consistent(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
         self.keyspace(name)
     }
+
+    /// [`Self::keyspace_consistent`], with `prefix_iter_raw` consistent
+    /// too. DynamoDB overrides this; the other backends' scans already
+    /// read their latest write, with the same Cosmos DB caveat.
+    fn keyspace_consistent_with_scans(
+        &self,
+        name: &str,
+    ) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
+        self.keyspace_consistent(name)
+    }
+
     fn batch(&self) -> Box<dyn BatchOps>;
     fn persist(&self) -> BoxFuture<'_, Result<(), AppError>>;
 }
@@ -203,11 +214,25 @@ impl Store {
     /// through this handle reflects every write committed before the read
     /// (on Cosmos DB, only as far as the account's consistency level
     /// allows; see [`StorageBackend::keyspace_consistent`]). Prefix scans
-    /// are not covered. Costs more on
-    /// DynamoDB (twice the read units), so read-heavy paths such as DID
-    /// resolution keep [`Self::keyspace`].
+    /// are not covered; see [`Self::keyspace_consistent_with_scans`]. Costs
+    /// more on DynamoDB (twice the read units), so read-heavy paths keep
+    /// [`Self::keyspace`]: an edge reads DID records through it on every
+    /// resolve.
     pub fn keyspace_consistent(&self, name: &str) -> Result<KeyspaceHandle, AppError> {
         let (ks_name, ops) = self.inner.keyspace_consistent(name)?;
+        Ok(KeyspaceHandle {
+            name: ks_name,
+            inner: ops,
+            backend: self.inner.clone(),
+        })
+    }
+
+    /// [`Self::keyspace_consistent`], with prefix scans consistent too. A
+    /// consistent scan costs twice the read units of the whole keyspace on
+    /// DynamoDB, so this is for small keyspaces whose scan decides
+    /// something, such as the domains resolution checks.
+    pub fn keyspace_consistent_with_scans(&self, name: &str) -> Result<KeyspaceHandle, AppError> {
+        let (ks_name, ops) = self.inner.keyspace_consistent_with_scans(name)?;
         Ok(KeyspaceHandle {
             name: ks_name,
             inner: ops,

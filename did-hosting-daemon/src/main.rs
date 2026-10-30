@@ -965,7 +965,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             &stats_collector,
             &http_client,
             identity.clone(),
-            server_state.as_ref().map(|s| s.did_cache.clone()),
+            server_state.as_ref(),
         )
         .await
         {
@@ -1043,6 +1043,8 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             has_auth: config.server_did.is_some(),
             collector: stats_collector.clone(),
             control_state: control_state.clone(),
+            content_cache: server_state.as_ref().map(|s| s.did_cache.clone()),
+            gate_cache: server_state.as_ref().and_then(|s| s.gate_cache.clone()),
         },
         storage_shutdown_rx,
     ));
@@ -1212,6 +1214,11 @@ struct DaemonStorageParams {
     /// as their own task lands in this unified storage task instead. `None` when
     /// the control plane is disabled — nothing owns the identity then.
     control_state: Option<did_hosting_control::server::AppState>,
+    /// The embedded server's content cache, when it runs: expired entries
+    /// are evicted here, and a purge clears it.
+    content_cache: Option<Arc<did_hosting_server::cache::ContentCache>>,
+    /// Its gate cache, when it keeps one (control plane on): likewise.
+    gate_cache: Option<Arc<did_hosting_server::cache::GateCache>>,
 }
 
 async fn run_daemon_storage_task(
@@ -1310,6 +1317,16 @@ async fn run_daemon_storage_task(
                 if sweep.entries > 0 {
                     info!(count = sweep.entries, "purge sweep tick completed");
                 }
+                // A purge deletes DIDs or a domain record without the control
+                // plane's hook hearing of it: drop everything. Otherwise this
+                // one-minute tick evicts what has outlived its TTL.
+                let purged = sweep.entries > 0 || sweep.dids_deleted > 0;
+                if let Some(content) = &params.content_cache {
+                    if purged { content.clear() } else { content.evict_expired() }
+                }
+                if let Some(gate) = &params.gate_cache {
+                    if purged { gate.clear() } else { gate.evict_expired() }
+                }
                 params.collector.subtract_total_dids(sweep.dids_deleted);
             }
             _ = identity_expiry_timer.tick() => {
@@ -1374,6 +1391,18 @@ async fn build_server(
     // control plane writes, so there is nothing to replicate to it.
     let mut state = AppState::new(store.clone(), server_config)?.with_identity(identity);
     state.stats_collector = Some(stats_collector.clone());
+    // With its control plane on, every change to a record or domain is made
+    // in this process, which clears the gate cache after each commit
+    // (`build_control`), so a warm resolve can skip the store entirely. With
+    // it off, changes come from elsewhere and nothing would clear it: read
+    // the store on every resolve, as a standalone edge does. Either way this
+    // assumes one daemon per store.
+    if config.enable.control {
+        state.gate_cache = Some(Arc::new(did_hosting_server::cache::GateCache::new(
+            store,
+            did_hosting_server::cache::RESOLUTION_CACHE_TTL,
+        )?));
+    }
 
     let router = did_hosting_server::routes::router_public_only().with_state(state.clone());
     info!("server service initialized (public-only, daemon mode)");
@@ -1433,6 +1462,23 @@ fn control_verifier(
     did_hosting_common::server::trust_tasks::build_verifier(did_resolver)
 }
 
+/// The control plane's cache hook in the daemon: each change it commits
+/// clears what the embedded server cached from it, so a resolve that skips
+/// the store never serves a DID or domain state from before the change.
+fn resolution_cache_hook(
+    content: Arc<did_hosting_server::cache::ContentCache>,
+    gate: Arc<did_hosting_server::cache::GateCache>,
+) -> Arc<did_hosting_control::server::CacheInvalidateFn> {
+    use did_hosting_control::server::CacheChange;
+    Arc::new(move |change: CacheChange<'_>| match change {
+        CacheChange::Did(mnemonic) => {
+            content.invalidate_did(mnemonic);
+            gate.forget_did(mnemonic);
+        }
+        CacheChange::Domains => gate.forget_domains(),
+    })
+}
+
 async fn build_control(
     config: &DaemonConfig,
     secrets: &ServerSecrets,
@@ -1440,18 +1486,22 @@ async fn build_control(
     stats_collector: &Arc<StatsCollector>,
     http_client: &reqwest::Client,
     identity: Option<Arc<ServiceIdentity>>,
-    did_cache: Option<Arc<did_hosting_server::cache::ContentCache>>,
+    server: Option<&did_hosting_server::server::AppState>,
 ) -> Result<(Router, did_hosting_control::server::AppState), AppError> {
-    use did_hosting_control::server::{AppState, CacheInvalidateFn};
+    use did_hosting_control::server::AppState;
 
     // Lets the control plane's own mutations (register, publish, disable,
-    // rollback, delete) evict the embedded server's resolved-content cache
-    // in the same process — there is no sync round-trip to do it the way a
-    // standalone edge does on receipt of `webvh/sync/*`. `None` when the
-    // server component isn't enabled in this deployment: nothing serves
-    // resolution, so nothing to invalidate.
-    let cache_invalidate: Option<Arc<CacheInvalidateFn>> = did_cache
-        .map(|cache| Arc::new(move |key: &str| cache.invalidate(key)) as Arc<CacheInvalidateFn>);
+    // rollback, delete, and domain changes) evict what the embedded server
+    // cached from them in the same process — there is no sync round-trip to
+    // do it the way a standalone edge does on receipt of `webvh/sync/*`.
+    // `None` when the server component isn't enabled in this deployment:
+    // nothing serves resolution, so nothing to invalidate.
+    let cache_invalidate = server.and_then(|server| {
+        Some(resolution_cache_hook(
+            server.did_cache.clone(),
+            server.gate_cache.clone()?,
+        ))
+    });
 
     let control_config = config.control_config();
 
@@ -2745,5 +2795,108 @@ mod verifier_tests {
             matches!(err.reject_reason(), RejectReason::Unavailable { .. }),
             "{err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod resolution_cache_hook_tests {
+    //! The hook is what keeps the embedded server's caches honest: a resolve
+    //! that skips the store must not outlive a change the control plane made.
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use did_hosting_common::did_ops::{DidRecord, content_log_key, did_key};
+    use did_hosting_common::server::config::StoreConfig;
+    use did_hosting_common::server::domain::{DomainEntry, DomainStatus, DomainUrlScheme};
+    use did_hosting_common::server::store::{KS_DIDS, KS_DOMAINS, Store};
+    use did_hosting_control::server::CacheChange;
+    use did_hosting_server::cache::{ContentCache, GateCache};
+
+    use super::resolution_cache_hook;
+
+    fn record(disabled: bool) -> DidRecord {
+        DidRecord {
+            owner: "did:example:owner".into(),
+            mnemonic: "alice".into(),
+            created_at: 0,
+            updated_at: 0,
+            version_count: 1,
+            did_id: Some("did:webvh:Q1:a.example:alice".into()),
+            content_size: 0,
+            disabled,
+            deleted_at: None,
+            method: "webvh".into(),
+            domain: "a.example".into(),
+            services: None,
+            agent_names: Vec::new(),
+        }
+    }
+
+    fn domain(status: DomainStatus) -> DomainEntry {
+        DomainEntry {
+            name: "a.example".into(),
+            label: None,
+            scheme: DomainUrlScheme::Https,
+            status,
+            created_at: 0,
+            default_domain: false,
+            branding: None,
+            witnesses: None,
+            watchers: None,
+            quota: None,
+            well_known_enabled: false,
+            disabled_at: None,
+            purge_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn each_change_clears_what_the_embedded_server_cached_from_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .unwrap();
+        let dids = store.keyspace(KS_DIDS).unwrap();
+        let domains = store.keyspace(KS_DOMAINS).unwrap();
+        let content = Arc::new(ContentCache::new(Duration::from_secs(60)));
+        let gate = Arc::new(GateCache::new(&store, Duration::from_secs(60)).unwrap());
+        let hook = resolution_cache_hook(content.clone(), gate.clone());
+
+        // Warm every cache from the store.
+        dids.insert(did_key("alice"), &record(false)).await.unwrap();
+        domains
+            .insert("a.example", &domain(DomainStatus::Active))
+            .await
+            .unwrap();
+        let web_key = ContentCache::did_web_document_key("alice");
+        for key in [content_log_key("alice"), web_key.clone()] {
+            content.insert(content.generation(), key, b"old".to_vec());
+        }
+        assert!(!gate.record("alice").await.unwrap().unwrap().disabled);
+        let allowed = |d: &did_hosting_common::server::domain::ResolutionDomains| {
+            d.assert_allowed(Some("a.example"), "did:webvh:Q1:a.example:alice")
+                .is_ok()
+        };
+        assert!(allowed(&gate.domains().await.unwrap()));
+
+        // A DID change: the store moves on, and the hook names the DID.
+        dids.insert(did_key("alice"), &record(true)).await.unwrap();
+        hook(CacheChange::Did("alice"));
+        assert!(content.get(&content_log_key("alice")).is_none(), "log");
+        assert!(content.get(&web_key).is_none(), "did:web document");
+        assert!(gate.record("alice").await.unwrap().unwrap().disabled);
+
+        // A domain change, likewise.
+        domains
+            .insert("a.example", &domain(DomainStatus::Disabled))
+            .await
+            .unwrap();
+        assert!(allowed(&gate.domains().await.unwrap()), "still cached");
+        hook(CacheChange::Domains);
+        assert!(!allowed(&gate.domains().await.unwrap()));
     }
 }

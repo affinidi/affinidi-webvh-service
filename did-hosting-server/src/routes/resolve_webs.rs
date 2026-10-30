@@ -21,10 +21,11 @@
 //!
 //! Deriving costs a full key-event-log verification per `did.json` hit,
 //! and that is a deliberate trade. The alternative is a second cache
-//! entry, which would have to be invalidated at all five sites that
-//! currently invalidate `content_log_key` — and a single missed one
-//! serves a document from *before* a key rotation, which is precisely
-//! the attack pre-rotation exists to defeat. The CESR bytes themselves
+//! entry, and a single path that changed the log without dropping it
+//! would serve a document from *before* a key rotation, which is
+//! precisely the attack pre-rotation exists to defeat. (did:web does keep
+//! one, in the daemon only, where every change goes through
+//! `ContentCache::invalidate_did`; its documents rotate no keys.) The CESR bytes themselves
 //! still come from the existing content cache, so the cost is CPU on
 //! already-resident bytes. If it ever shows up in a profile, the safe
 //! fix is a memo keyed by a hash of those bytes, which cannot go stale.
@@ -36,14 +37,15 @@
 //! record is actually a `did:webs` record. Anything else falls through
 //! with `None`, leaving the did:web bridge exactly as it was.
 
+use std::sync::Arc;
+
 use axum::http::{StatusCode, request::Parts};
 use axum::response::{IntoResponse, Response};
 use did_hosting_common::method::webs::{CESR_CONTENT_TYPE, Webs};
-use did_hosting_common::server::domain::assert_resolution_allowed;
 use did_hosting_common::server::mnemonic::validate_webs_mnemonic;
 use tracing::{debug, error};
 
-use super::resolve_shared::extract_request_host;
+use super::resolve_shared::{assert_gate_allows, content_ks, extract_request_host, gate_record};
 use crate::did_ops::{self, DidRecord};
 use crate::error::AppError;
 use crate::server::AppState;
@@ -59,12 +61,8 @@ async fn webs_record(
     state: &AppState,
     mnemonic: &str,
     request_host: Option<&str>,
-) -> Result<Option<DidRecord>, AppError> {
-    let Some(record) = state
-        .dids_ks
-        .get::<DidRecord>(did_ops::did_key(mnemonic))
-        .await?
-    else {
+) -> Result<Option<Arc<DidRecord>>, AppError> {
+    let Some(record) = gate_record(state, mnemonic).await? else {
         return Ok(None);
     };
     if record.method != "webs" {
@@ -74,7 +72,7 @@ async fn webs_record(
         return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
     }
     if let Some(ref did_id) = record.did_id {
-        assert_resolution_allowed(&state.store, request_host, did_id).await?;
+        assert_gate_allows(state, request_host, did_id).await?;
     }
     Ok(Some(record))
 }
@@ -89,12 +87,12 @@ async fn load_keri_cesr(state: &AppState, mnemonic: &str) -> Result<Vec<u8>, App
     }
     #[cfg(feature = "metrics")]
     did_hosting_common::server::metrics::inc_cache_miss();
-    let data = state
-        .dids_ks
+    let generation = state.did_cache.generation();
+    let data = content_ks(state)
         .get_raw(key.as_str())
         .await?
         .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?;
-    state.did_cache.insert(key, data.clone());
+    state.did_cache.insert(generation, key, data.clone());
     Ok(data)
 }
 

@@ -1754,10 +1754,20 @@ async fn agent_name_resolve_does_not_disclose_other_owners_dids() {
     assert_eq!(body["entries"], json!([]));
 }
 
-/// Domains, end to end; purging needs a stepped-up session.
+/// Domains, end to end; purging needs a stepped-up session. Each change
+/// reports `CacheChange::Domains` (the daemon's resolution gate drops its
+/// copy of the domains on it).
 #[tokio::test]
 async fn domains_are_administered_over_trust_tasks() {
-    let (state, _dir) = state().await;
+    let (mut state, _dir) = state().await;
+    let changes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = changes.clone();
+    state.cache_invalidate = Some(std::sync::Arc::new(move |change| {
+        if change == crate::server::CacheChange::Domains {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }));
+    let changes = move || changes.load(std::sync::atomic::Ordering::SeqCst);
     let admin = member(&state, 50, Role::Admin).await;
     let create = t("did-management/domain/create/0.1");
     for name in ["a.example.com", "b.example.com"] {
@@ -1784,6 +1794,7 @@ async fn domains_are_administered_over_trust_tasks() {
         "did-management/domain/create:domainExists",
         "{reply}"
     );
+    assert_eq!(changes(), 2, "one per domain created");
 
     let list = t("did-management/domain/list/0.1");
     let reply = call(&state, Via::Tsp, &admin, &list, json!({})).await;
@@ -1791,6 +1802,17 @@ async fn domains_are_administered_over_trust_tasks() {
     let body = ok(&reply, &list);
     assert_eq!(body["default"], "a.example.com");
     assert_eq!(body["domains"].as_array().unwrap().len(), 2);
+
+    let update = t("did-management/domain/update/0.1");
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &update,
+        json!({ "name": "b.example.com", "label": "B" }),
+    )
+    .await;
+    conforms(&reply);
 
     let set_state = t("did-management/domain/set-state/0.1");
     let reply = call(
@@ -1816,6 +1838,7 @@ async fn domains_are_administered_over_trust_tasks() {
     .await;
     conforms(&reply);
     assert_eq!(ok(&reply, &set_state)["entry"]["status"], "disabled");
+    assert_eq!(changes(), 4, "updating, then disabling, a domain");
 
     let set_default = t("did-management/domain/set-default/0.1");
     let reply = call(
@@ -1853,6 +1876,7 @@ async fn domains_are_administered_over_trust_tasks() {
     let reply = https(&state, Some(bearer), doc).await;
     conforms(&reply);
     assert_eq!(ok(&reply, &purge)["name"], "b.example.com");
+    assert_eq!(changes(), 5, "purging a domain");
 
     // Owners do not administer domains.
     let owner = member(&state, 51, Role::Owner).await;

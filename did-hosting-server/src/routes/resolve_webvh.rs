@@ -21,11 +21,10 @@
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, request::Parts};
 use axum::response::{IntoResponse, Response};
-use did_hosting_common::server::domain::assert_resolution_allowed;
 use tracing::debug;
 
-use super::resolve_shared::extract_request_host;
-use crate::did_ops::{self, DidRecord};
+use super::resolve_shared::{assert_gate_allows, content_ks, extract_request_host, gate_record};
+use crate::did_ops;
 use crate::error::AppError;
 use crate::mnemonic::validate_mnemonic;
 use crate::server::AppState;
@@ -41,17 +40,13 @@ async fn serve_content(
     track_stats: bool,
     request_host: Option<&str>,
 ) -> Result<Response, AppError> {
-    match state
-        .dids_ks
-        .get::<DidRecord>(did_ops::did_key(mnemonic))
-        .await?
-    {
+    match gate_record(state, mnemonic).await? {
         Some(record) => {
             if record.disabled || record.deleted_at.is_some() {
                 return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
             }
             if let Some(ref did_id) = record.did_id {
-                assert_resolution_allowed(&state.store, request_host, did_id).await?;
+                assert_gate_allows(state, request_host, did_id).await?;
             }
         }
         // No record at all — e.g. `did/delete`, which removes the record
@@ -70,8 +65,8 @@ async fn serve_content(
     } else {
         #[cfg(feature = "metrics")]
         did_hosting_common::server::metrics::inc_cache_miss();
-        let data = state
-            .dids_ks
+        let generation = state.did_cache.generation();
+        let data = content_ks(state)
             .get_raw(key)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?;
@@ -85,8 +80,7 @@ async fn serve_content(
         let data = if content_type == "application/jsonl+json" {
             let log_text = String::from_utf8(data)
                 .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
-            let witness_text = state
-                .dids_ks
+            let witness_text = content_ks(state)
                 .get_raw(did_ops::content_witness_key(mnemonic))
                 .await?
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
@@ -96,7 +90,9 @@ async fn serve_content(
         } else {
             data
         };
-        state.did_cache.insert(key.to_string(), data.clone());
+        state
+            .did_cache
+            .insert(generation, key.to_string(), data.clone());
         std::sync::Arc::new(data)
     };
 

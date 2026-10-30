@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Changed — the daemon resolves a cached DID without reading the store
+
+Every resolve read the DID's record and scanned the domains keyspace before
+serving, even with the log cached: on DynamoDB, two reads and a scan per
+resolve. A daemon running its control plane now caches the record and the
+domains next to the log (its gate cache), so a warm resolve of `did.jsonl`,
+`did-witness.json`, a did:web `did.json` or a did:webs DID reads nothing from
+the store. Its control plane clears them after each commit that changes a
+DID (agent-name changes included) or a domain, so disabling or deleting a
+DID, or disabling a domain, still takes effect on the next resolve. On a
+cache miss the daemon reads strongly consistent (the domains scan too), and
+a miss that raced a change does not cache what it read, so a just-published
+log or a disable is never hidden behind a cached copy. This assumes one
+daemon per store. A write made from another process (an admin command
+against a running daemon's store), or one the store applied but reported as
+failed, is picked up within five minutes, the caches' TTL. A daemon with its
+control plane off keeps no gate cache: its changes come from elsewhere.
+
+Standalone edges keep reading the record on every resolve, since another
+replica sharing their store could change it without telling them; they drop
+the separate read of the matched domain, which the scan already returned. A
+sync now clears every cached file for its DID, so an edge's witness file no
+longer stays stale until the TTL, and edges evict expired cache entries each
+minute (they never did).
+
 ### Fixed — on DynamoDB, the control plane no longer acts on a stale DID read
 
 The control plane (standalone or in the daemon) now reads its DID keyspace
