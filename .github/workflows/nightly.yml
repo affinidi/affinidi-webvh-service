@@ -5,9 +5,8 @@ name: Nightly
 # tip is not something to cut a release from; `nightly` is: a fast-forward-only
 # pointer that moves only to a commit every ci.yml job passed on.
 #
-# Moved with RELEASE_TOKEN when it is set, so a ruleset can restrict `nightly`
-# to that identity; GITHUB_TOKEN works otherwise (nothing triggers on a push to
-# `nightly`, so the token's no-workflows rule costs nothing here).
+# Moved with the release bot's token: a ruleset lets only the bot, maintainers
+# and admins move `nightly`, and it cannot let GITHUB_TOKEN bypass.
 on:
   schedule:
     - cron: "0 2 * * *"
