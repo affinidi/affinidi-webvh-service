@@ -285,7 +285,10 @@ fn run_rest_thread(
     rt.block_on(async {
         let listener =
             tokio::net::TcpListener::from_std(std_listener).expect("failed to convert TcpListener");
-        let app = routes::router()
+        let resolve_limit = Arc::new(
+            did_hosting_common::server::rate_limit::ResolveRateLimiter::new(&state.config.server),
+        );
+        let app = routes::router_with_resolve_limit(resolve_limit)
             .with_state(state)
             .layer(
                 TraceLayer::new_for_http()

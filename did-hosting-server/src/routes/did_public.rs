@@ -60,6 +60,7 @@ use crate::server::AppState;
     responses(
         (status = 200, description = "did:webvh log (JSONL) or did:web document for the slot", content_type = "application/jsonl+json"),
         (status = 404, description = "No DID hosted at this path"),
+        (status = 429, description = "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`", content_type = "application/json"),
     ),
 ))]
 pub async fn serve_public(State(state): State<AppState>, request: Request) -> Response {

@@ -910,9 +910,23 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         .build()
         .expect("failed to build HTTP client");
 
+    // One per-address resolution limit for the whole process, so a client's
+    // budget covers the server's routes, the DID-serving fallback and the
+    // watcher's routes together.
+    let resolve_limit =
+        Arc::new(did_hosting_common::server::rate_limit::ResolveRateLimiter::new(&config.server));
+
     // 2a. Server — public DID-serving routes only (.well-known)
     if config.enable.server {
-        match build_server(&config, &main_store, &stats_collector, identity.clone()).await {
+        match build_server(
+            &config,
+            &main_store,
+            &stats_collector,
+            identity.clone(),
+            resolve_limit.clone(),
+        )
+        .await
+        {
             Ok((router, state)) => {
                 combined = combined.merge(router);
                 server_state = Some(state);
@@ -941,7 +955,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // 2c. Watcher (nested at /watcher)
     if config.enable.watcher {
-        match build_watcher(&config, &main_store).await {
+        match build_watcher(&config, &main_store, resolve_limit.clone()).await {
             Ok(router) => {
                 combined = combined.nest("/watcher", router);
                 enabled_services.push("watcher (/watcher)");
@@ -983,9 +997,11 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     combined = match server_state {
         Some(ref state) => combined.fallback({
             let state = state.clone();
+            let resolve_limit = resolve_limit.clone();
             move |request: axum::extract::Request| {
                 let state = state.clone();
-                async move { daemon_fallback(state, request).await }
+                let resolve_limit = resolve_limit.clone();
+                async move { daemon_fallback(state, &resolve_limit, request).await }
             }
         }),
         None => {
@@ -1360,6 +1376,7 @@ async fn build_server(
     store: &Store,
     stats_collector: &Arc<StatsCollector>,
     identity: Option<Arc<ServiceIdentity>>,
+    resolve_limit: Arc<did_hosting_common::server::rate_limit::ResolveRateLimiter>,
 ) -> Result<(Router, did_hosting_server::server::AppState), AppError> {
     use did_hosting_server::server::AppState;
 
@@ -1373,7 +1390,8 @@ async fn build_server(
     let mut state = AppState::new(store.clone(), server_config)?.with_identity(identity);
     state.stats_collector = Some(stats_collector.clone());
 
-    let router = did_hosting_server::routes::router_public_only().with_state(state.clone());
+    let router = did_hosting_server::routes::router_public_only_with_resolve_limit(resolve_limit)
+        .with_state(state.clone());
     info!("server service initialized (public-only, daemon mode)");
 
     Ok((router, state))
@@ -1405,7 +1423,11 @@ async fn build_witness(
     Ok(router)
 }
 
-async fn build_watcher(config: &DaemonConfig, store: &Store) -> ServiceResult {
+async fn build_watcher(
+    config: &DaemonConfig,
+    store: &Store,
+    resolve_limit: Arc<did_hosting_common::server::rate_limit::ResolveRateLimiter>,
+) -> ServiceResult {
     use webvh_watcher::server::AppState;
 
     // Resolution only. The embedded watcher reads the daemon's one store, and
@@ -1413,7 +1435,8 @@ async fn build_watcher(config: &DaemonConfig, store: &Store) -> ServiceResult {
     // ever synced into it. A watcher that mirrors control planes is a
     // standalone `webvh-watcher` with its own DID.
     let state = AppState::new(store.clone(), config.watcher_config(), None)?;
-    let router = webvh_watcher::routes::router_public_only().with_state(state);
+    let router = webvh_watcher::routes::router_public_only_with_resolve_limit(resolve_limit)
+        .with_state(state);
     info!("watcher service initialized (resolution only, daemon mode)");
 
     Ok(router)
@@ -1570,10 +1593,18 @@ async fn build_control(
 /// Tries DID public serving first (e.g. `/{mnemonic}/did.jsonl`).
 /// If that returns 404, falls through to the SPA static handler so that
 /// paths like `/enroll` serve `index.html` for client-side routing.
+///
+/// Every request here counts against `resolve_limit`, the UI's included:
+/// whether a path is a DID is only known after the store lookup the limit
+/// exists to bound.
 async fn daemon_fallback(
     state: did_hosting_server::server::AppState,
+    resolve_limit: &did_hosting_common::server::rate_limit::ResolveRateLimiter,
     request: axum::extract::Request,
 ) -> Response {
+    if let Err(refusal) = resolve_limit.check(&request) {
+        return axum::response::IntoResponse::into_response(refusal);
+    }
     // Snapshot the URI for the SPA fallback (which only needs path
     // routing); the full Request is consumed by serve_public to read
     // ConnectInfo + headers for resolve-side host detection.

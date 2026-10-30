@@ -222,6 +222,7 @@ pub async fn run_wizard(
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
             resolve_cache: Default::default(),
+            resolve_rate_limit: Default::default(),
         },
         log: LogConfig {
             level: log_level,
@@ -817,6 +818,7 @@ pub async fn run_setup_offline_complete(
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
             resolve_cache: Default::default(),
+            resolve_rate_limit: Default::default(),
         },
         log: LogConfig {
             level: state.log_level.clone(),

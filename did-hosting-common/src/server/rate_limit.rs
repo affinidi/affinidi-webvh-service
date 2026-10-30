@@ -47,12 +47,18 @@
 //! eviction kicks in.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Mutex;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
 
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderName};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use ipnetwork::IpNetwork;
+use tracing::{error, info, warn};
 
+use super::auth::session::now_epoch;
+use super::config::ServerConfig;
 use super::error::AppError;
 
 /// The `limiter` name every Trust Task listener's per-address limiter uses
@@ -70,12 +76,19 @@ pub const TRUST_TASKS_MAX_PER_WINDOW: u64 = 10;
 /// Fixed-window length, in seconds, for the Trust Task listener limiter.
 pub const TRUST_TASKS_WINDOW_SECS: u64 = 60;
 
-/// Hard cap on tracked-address HashMap size. Once exceeded, the entire map is
-/// cleared in a single pass — drastic but the alternative is unbounded memory
+/// Hard cap on tracked-address HashMap size. Once reached, addresses whose
+/// window has ended are dropped; if that leaves more than
+/// [`EVICTION_LOW_WATER`], the entire map is cleared in a single pass — drastic but the alternative is unbounded memory
 /// growth under sustained novel-address flood. Operators who don't want this
 /// behaviour should put the listener behind a CDN or deploy a real DDoS
 /// mitigation.
 pub const MAX_TRACKED_ADDRESSES: usize = 10_000;
+
+/// Most addresses an eviction at [`MAX_TRACKED_ADDRESSES`] may keep. Leaving
+/// a quarter of the map free means the next eviction scan waits for that
+/// many new addresses, rather than running on every request of a flood that
+/// keeps the map full of live addresses.
+pub const EVICTION_LOW_WATER: usize = MAX_TRACKED_ADDRESSES * 3 / 4;
 
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
@@ -83,6 +96,18 @@ struct Bucket {
     count: u64,
     /// The epoch second of the window start.
     window_start: u64,
+    /// Whether an attempt has been refused in the current window.
+    refused: bool,
+}
+
+/// A refused [`IpRateLimiter::try_consume_reporting`] attempt.
+#[derive(Debug)]
+pub struct Refused {
+    /// The refusal, an [`AppError::RateLimited`].
+    pub error: AppError,
+    /// Whether this is the address's first refusal in its window, so a
+    /// caller can log once per window rather than once per request.
+    pub first_in_window: bool,
 }
 
 /// Per-IP fixed-window rate limiter for an inbound listener, parameterised by
@@ -110,26 +135,37 @@ impl IpRateLimiter {
     /// has made `max_per_window` attempts within the current `window_secs`
     /// window.
     pub fn try_consume(&self, ip: IpAddr, now: u64) -> Result<(), AppError> {
+        self.try_consume_reporting(ip, now).map_err(|r| r.error)
+    }
+
+    /// [`Self::try_consume`], also reporting whether a refusal is the
+    /// address's first in its window.
+    pub fn try_consume_reporting(&self, ip: IpAddr, now: u64) -> Result<(), Refused> {
         let mut buckets = self
             .buckets
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // Drastic eviction: if the map has grown past the cap, clear it
-        // entirely. Documented in the module docs.
+        // At the cap, drop addresses whose window has ended; if too many are
+        // still live, clear the map entirely. Documented in the module docs.
         if buckets.len() >= MAX_TRACKED_ADDRESSES {
-            buckets.clear();
+            buckets.retain(|_, b| now.saturating_sub(b.window_start) < self.window_secs);
+            if buckets.len() > EVICTION_LOW_WATER {
+                buckets.clear();
+            }
         }
 
         let entry = buckets.entry(ip).or_insert(Bucket {
             count: 0,
             window_start: now,
+            refused: false,
         });
 
         // Reset on window boundary. Lazy — no sweep task.
         if now.saturating_sub(entry.window_start) >= self.window_secs {
             entry.count = 0;
             entry.window_start = now;
+            entry.refused = false;
         }
 
         if entry.count >= self.max_per_window {
@@ -137,13 +173,18 @@ impl IpRateLimiter {
             // the time left in it is exactly when the next attempt can
             // succeed.
             let retry_after_secs = (entry.window_start + self.window_secs).saturating_sub(now);
-            return Err(AppError::RateLimited {
-                limiter: self.limiter,
-                message: format!(
-                    "rate limit exceeded ({} requests per {}s); try again later",
-                    self.max_per_window, self.window_secs
-                ),
-                retry_after_secs,
+            let first_in_window = !entry.refused;
+            entry.refused = true;
+            return Err(Refused {
+                error: AppError::RateLimited {
+                    limiter: self.limiter,
+                    message: format!(
+                        "rate limit exceeded ({} requests per {}s); try again later",
+                        self.max_per_window, self.window_secs
+                    ),
+                    retry_after_secs,
+                },
+                first_in_window,
             });
         }
         entry.count += 1;
@@ -155,6 +196,115 @@ impl IpRateLimiter {
         let buckets = self.buckets.lock().unwrap();
         buckets.get(&ip).map(|b| b.count).unwrap_or(0)
     }
+}
+
+/// The `limiter` name of the per-address limit on public DID resolution.
+pub const RESOLVE_RATE_LIMIT_NAME: &str = "resolve-per-address";
+
+/// The per-client-address limit on public DID resolution
+/// (`[server.resolve_rate_limit]`), shared by the edge server, the watcher and
+/// the daemon. Does nothing when no limit is configured.
+///
+/// An IPv6 client is counted by its /64, the block one host is normally
+/// given, so rotating addresses inside it does not escape the limit.
+pub struct ResolveRateLimiter {
+    limiter: Option<IpRateLimiter>,
+    trusted_proxies: Vec<IpNetwork>,
+}
+
+impl ResolveRateLimiter {
+    /// The limiter `server.resolve_rate_limit` describes, attributing
+    /// requests through `server.trusted_proxies`. Warns when a limit is set
+    /// with no trusted proxies: behind a load balancer every client would
+    /// then share one budget.
+    pub fn new(server: &ServerConfig) -> Self {
+        let config = &server.resolve_rate_limit;
+        let trusted_proxies = server.trusted_proxies.clone();
+        if let Some(max) = config.max_per_window {
+            if trusted_proxies.is_empty() {
+                warn!(
+                    "server.resolve_rate_limit is on with no server.trusted_proxies: it counts \
+                     the TCP peer, so behind a load balancer every client shares one budget"
+                );
+            }
+            info!(
+                max_per_window = max,
+                window_secs = config.window_secs,
+                "resolution rate limit on"
+            );
+        }
+        Self {
+            limiter: config
+                .max_per_window
+                .map(|max| IpRateLimiter::new(RESOLVE_RATE_LIMIT_NAME, max, config.window_secs)),
+            trusted_proxies,
+        }
+    }
+
+    /// A limiter that lets everything through.
+    pub fn disabled() -> Self {
+        Self {
+            limiter: None,
+            trusted_proxies: Vec::new(),
+        }
+    }
+
+    /// Count `request` against its client address, or refuse it
+    /// ([`AppError::RateLimited`]: `429` with `Retry-After`) once the address
+    /// is over the limit.
+    ///
+    /// With a limit set, a request without a peer address (`ConnectInfo`) is
+    /// refused (`500`) rather than let through: production serves with
+    /// `into_make_service_with_connect_info`, so a missing peer is a wiring
+    /// fault, and passing it would leave resolution unlimited.
+    pub fn check(&self, request: &Request) -> Result<(), AppError> {
+        let Some(limiter) = &self.limiter else {
+            return Ok(());
+        };
+        let Some(ConnectInfo(peer)) = request.extensions().get::<ConnectInfo<SocketAddr>>() else {
+            error!("resolution rate limit is on but the request has no peer address");
+            return Err(AppError::Internal(
+                "resolution rate limit: no peer address".into(),
+            ));
+        };
+        let client = client_key(resolve_client_ip(
+            peer.ip(),
+            request.headers(),
+            &self.trusted_proxies,
+        ));
+        limiter
+            .try_consume_reporting(client, now_epoch())
+            .map_err(|refused| {
+                if refused.first_in_window {
+                    warn!(%client, "client over the resolution rate limit; refusing it until its window ends");
+                }
+                refused.error
+            })
+    }
+}
+
+/// The address a client is counted under: an IPv4 address as is, an IPv6
+/// address by its /64 (an IPv4-mapped one as its IPv4 address).
+fn client_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64))),
+        },
+    }
+}
+
+/// Middleware applying a [`ResolveRateLimiter`] to the routes it wraps.
+pub async fn limit_resolution(
+    State(limiter): State<Arc<ResolveRateLimiter>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Err(refusal) = limiter.check(&request) {
+        return refusal.into_response();
+    }
+    next.run(request).await
 }
 
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
@@ -422,5 +572,185 @@ mod tests {
             resolve_client_ip(peer, &xff(&["198.51.100.7,"]), &trusted),
             ip("198.51.100.7")
         );
+    }
+
+    fn resolve_limiter(
+        max_per_window: Option<u64>,
+        trusted_proxies: &[&str],
+    ) -> ResolveRateLimiter {
+        let mut server = ServerConfig::default();
+        server.resolve_rate_limit.max_per_window = max_per_window;
+        server.trusted_proxies = nets(trusted_proxies);
+        ResolveRateLimiter::new(&server)
+    }
+
+    fn resolve_request(peer: &str, xff: Option<&str>) -> Request {
+        let mut builder = Request::builder().uri("/alice/did.jsonl");
+        if let Some(xff) = xff {
+            builder = builder.header("x-forwarded-for", xff);
+        }
+        let mut request = builder.body(axum::body::Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(ip(peer), 443)));
+        request
+    }
+
+    /// Unset, the limit lets everything through, even a request with no
+    /// peer address.
+    #[test]
+    fn resolve_limit_off_by_default() {
+        let limiter = resolve_limiter(None, &[]);
+        for _ in 0..1_000 {
+            limiter.check(&resolve_request("10.0.0.1", None)).unwrap();
+        }
+        let bare = Request::builder().body(axum::body::Body::empty()).unwrap();
+        limiter.check(&bare).unwrap();
+    }
+
+    /// Past the limit one address gets 429 with Retry-After; another address
+    /// is unaffected.
+    #[test]
+    fn resolve_limit_refuses_one_address_past_the_limit() {
+        let limiter = resolve_limiter(Some(3), &[]);
+        for _ in 0..3 {
+            limiter.check(&resolve_request("10.0.0.1", None)).unwrap();
+        }
+        let refusal = limiter
+            .check(&resolve_request("10.0.0.1", None))
+            .unwrap_err()
+            .into_response();
+        assert_eq!(refusal.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            refusal
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER)
+        );
+        limiter.check(&resolve_request("10.0.0.2", None)).unwrap();
+    }
+
+    /// Behind a trusted proxy the limit follows the client in
+    /// `X-Forwarded-For`, not the proxy; an untrusted peer's header is
+    /// ignored.
+    #[test]
+    fn resolve_limit_keys_on_the_forwarded_client_behind_a_trusted_proxy() {
+        let limiter = resolve_limiter(Some(1), &["10.0.0.9"]);
+        limiter
+            .check(&resolve_request("10.0.0.9", Some("203.0.113.1")))
+            .unwrap();
+        limiter
+            .check(&resolve_request("10.0.0.9", Some("203.0.113.2")))
+            .unwrap();
+        assert!(
+            limiter
+                .check(&resolve_request("10.0.0.9", Some("203.0.113.1")))
+                .is_err()
+        );
+
+        limiter
+            .check(&resolve_request("198.51.100.7", Some("203.0.113.3")))
+            .unwrap();
+        assert!(
+            limiter
+                .check(&resolve_request("198.51.100.7", Some("203.0.113.4")))
+                .is_err(),
+            "an untrusted peer is limited on its own address"
+        );
+    }
+
+    /// With a limit set, a request without a peer address is refused rather
+    /// than let through unlimited.
+    #[test]
+    fn resolve_limit_refuses_a_request_without_a_peer_address() {
+        let limiter = resolve_limiter(Some(100), &[]);
+        let bare = Request::builder().body(axum::body::Body::empty()).unwrap();
+        let refusal = limiter.check(&bare).unwrap_err().into_response();
+        assert_eq!(
+            refusal.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// An IPv6 client is counted by its /64, an IPv4-mapped one by its IPv4
+    /// address.
+    #[test]
+    fn resolve_limit_counts_an_ipv6_client_by_its_64() {
+        assert_eq!(client_key(ip("2001:db8:1:2:aaaa::1")), ip("2001:db8:1:2::"));
+        assert_eq!(client_key(ip("::ffff:203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(client_key(ip("203.0.113.5")), ip("203.0.113.5"));
+
+        let limiter = resolve_limiter(Some(2), &[]);
+        limiter
+            .check(&resolve_request("2001:db8:1:2::1", None))
+            .unwrap();
+        limiter
+            .check(&resolve_request("2001:db8:1:2::2", None))
+            .unwrap();
+        assert!(
+            limiter
+                .check(&resolve_request("2001:db8:1:2::3", None))
+                .is_err()
+        );
+        limiter
+            .check(&resolve_request("2001:db8:1:3::1", None))
+            .unwrap();
+    }
+
+    /// Only the first refusal in an address's window is reported as first,
+    /// so callers can log once per window.
+    #[test]
+    fn only_the_first_refusal_in_a_window_is_first() {
+        let l = IpRateLimiter::new(LIMITER, 1, WINDOW_SECS);
+        let p = ip("203.0.113.1");
+        l.try_consume_reporting(p, 1000).unwrap();
+        assert!(
+            l.try_consume_reporting(p, 1000)
+                .unwrap_err()
+                .first_in_window
+        );
+        assert!(
+            !l.try_consume_reporting(p, 1001)
+                .unwrap_err()
+                .first_in_window
+        );
+        l.try_consume_reporting(p, 1000 + WINDOW_SECS).unwrap();
+        assert!(
+            l.try_consume_reporting(p, 1000 + WINDOW_SECS)
+                .unwrap_err()
+                .first_in_window,
+            "a new window reports again"
+        );
+    }
+
+    /// At the address cap, addresses whose window has ended are dropped and
+    /// live counts kept; the map is cleared only when too many are live.
+    #[test]
+    fn at_the_cap_expired_addresses_go_first() {
+        let l = IpRateLimiter::new(LIMITER, 1, WINDOW_SECS);
+        let live = ip("203.0.113.1");
+        l.try_consume(live, 2000).unwrap();
+        for i in 0..(MAX_TRACKED_ADDRESSES - 1) as u32 {
+            l.try_consume(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i)), 1000)
+                .unwrap();
+        }
+        l.try_consume(ip("198.51.100.1"), 2000).unwrap();
+        assert!(
+            l.try_consume(live, 2000).is_err(),
+            "the live address keeps its count"
+        );
+    }
+
+    /// A flood that keeps the map full of live addresses clears it, so the
+    /// next eviction waits for the map to refill rather than scanning on
+    /// every request.
+    #[test]
+    fn at_the_cap_mostly_live_addresses_clear_the_map() {
+        let l = IpRateLimiter::new(LIMITER, 1, WINDOW_SECS);
+        for i in 0..MAX_TRACKED_ADDRESSES as u32 {
+            l.try_consume(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i)), 1000)
+                .unwrap();
+        }
+        l.try_consume(ip("198.51.100.1"), 1000).unwrap();
+        assert_eq!(l.buckets.lock().unwrap().len(), 1);
     }
 }

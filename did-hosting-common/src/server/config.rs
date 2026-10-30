@@ -197,6 +197,46 @@ pub struct ServerConfig {
     /// resolution — the server, the watcher and the daemon.
     #[serde(default)]
     pub resolve_cache: ResolveCacheConfig,
+    /// Per-client-address limit on public DID resolution
+    /// (`[server.resolve_rate_limit]`). Off by default. Read only by the
+    /// binaries that serve resolution — the server, the watcher and the
+    /// daemon.
+    #[serde(default)]
+    pub resolve_rate_limit: ResolveRateLimitConfig,
+}
+
+impl ServerConfig {
+    /// Apply `{prefix}_SERVER_TRUSTED_PROXIES` (comma-separated addresses or
+    /// CIDR ranges; an empty value clears the list), refusing any entry that
+    /// is neither.
+    pub fn apply_trusted_proxies_env_override(&mut self, prefix: &str) -> Result<(), AppError> {
+        self.apply_trusted_proxies_override(prefix, |var| std::env::var(var).ok())
+    }
+
+    /// [`Self::apply_trusted_proxies_env_override`] reading variables through
+    /// `lookup`.
+    fn apply_trusted_proxies_override(
+        &mut self,
+        prefix: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), AppError> {
+        let var = format!("{prefix}_SERVER_TRUSTED_PROXIES");
+        if let Some(v) = lookup(&var) {
+            self.trusted_proxies = v
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|entry| {
+                    entry.parse::<IpNetwork>().map_err(|_| {
+                        AppError::Config(format!(
+                            "invalid {var} entry `{entry}`: expected an IP address or a CIDR range"
+                        ))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+        }
+        Ok(())
+    }
 }
 
 /// The `Cache-Control` header sent with successful DID-resolution responses
@@ -421,6 +461,101 @@ impl ReplayConfig {
                         .map_err(|e| AppError::Config(format!("invalid {var}: {e}")))?;
                 }
             }
+        }
+        self.validate()
+    }
+}
+
+/// A per-client-address limit on public DID resolution (`did.jsonl`,
+/// `did-witness.json`, `did.json`, `keri.cesr`, `.well-known` and the
+/// `/@name` redirect).
+///
+/// Resolution is unauthenticated, and each one costs store reads, so without
+/// a limit one client can use up a metered store's capacity for everyone. A
+/// client past `max_per_window` requests in a `window_secs` fixed window gets
+/// `429 Too Many Requests` with `Retry-After` until the window ends.
+///
+/// The client address is the TCP peer unless `server.trusted_proxies` names
+/// that peer, in which case it is read from `X-Forwarded-For`. Behind a load
+/// balancer, set `trusted_proxies` before turning this on: otherwise every
+/// client shares the load balancer's address and one limit.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveRateLimitConfig {
+    /// Resolution requests one client address may make per window. Unset
+    /// (default) means no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_per_window: Option<u64>,
+    /// The fixed window, in seconds. Default 10.
+    #[serde(default = "default_resolve_rate_limit_window_secs")]
+    pub window_secs: u64,
+}
+
+fn default_resolve_rate_limit_window_secs() -> u64 {
+    10
+}
+
+/// The longest resolve rate-limit window: one hour.
+const RESOLVE_RATE_LIMIT_MAX_WINDOW_SECS: u64 = 3600;
+
+impl Default for ResolveRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_per_window: None,
+            window_secs: default_resolve_rate_limit_window_secs(),
+        }
+    }
+}
+
+impl ResolveRateLimitConfig {
+    /// Refuse a zero limit and a window outside 1 second to one hour.
+    pub fn validate(&self) -> Result<(), AppError> {
+        if self.max_per_window == Some(0) {
+            return Err(AppError::Config(
+                "server.resolve_rate_limit.max_per_window must be at least 1; \
+                 leave it unset for no limit"
+                    .into(),
+            ));
+        }
+        if !(1..=RESOLVE_RATE_LIMIT_MAX_WINDOW_SECS).contains(&self.window_secs) {
+            return Err(AppError::Config(format!(
+                "server.resolve_rate_limit.window_secs ({}) must be between 1 and \
+                 {RESOLVE_RATE_LIMIT_MAX_WINDOW_SECS}",
+                self.window_secs
+            )));
+        }
+        Ok(())
+    }
+
+    /// Apply `{prefix}_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW` (an empty
+    /// value clears it) and `{prefix}_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS`
+    /// env overrides, then validate.
+    pub fn apply_env_overrides(&mut self, prefix: &str) -> Result<(), AppError> {
+        self.apply_overrides(prefix, |var| std::env::var(var).ok())
+    }
+
+    /// [`Self::apply_env_overrides`] reading variables through `lookup`.
+    fn apply_overrides(
+        &mut self,
+        prefix: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), AppError> {
+        fn parse(var: &str, v: &str) -> Result<u64, AppError> {
+            v.trim()
+                .parse()
+                .map_err(|e| AppError::Config(format!("invalid {var}: {e}")))
+        }
+        let var = format!("{prefix}_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW");
+        if let Some(v) = lookup(&var) {
+            self.max_per_window = if v.trim().is_empty() {
+                None
+            } else {
+                Some(parse(&var, &v)?)
+            };
+        }
+        let var = format!("{prefix}_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS");
+        if let Some(v) = lookup(&var) {
+            self.window_secs = parse(&var, &v)?;
         }
         self.validate()
     }
@@ -1026,6 +1161,7 @@ impl Default for ServerConfig {
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
             resolve_cache: Default::default(),
+            resolve_rate_limit: Default::default(),
         }
     }
 }
@@ -1476,6 +1612,7 @@ pub fn apply_env_overrides(
     // Server
     env_str!(&format!("{prefix}_SERVER_HOST"), server.host);
     env_parse!(&format!("{prefix}_SERVER_PORT"), server.port);
+    server.apply_trusted_proxies_env_override(prefix)?;
 
     // Logging
     env_str!(&format!("{prefix}_LOG_LEVEL"), log.level);
@@ -1781,6 +1918,97 @@ mod tests {
             let mut config = ReplayConfig::default();
             assert!(
                 config.apply_overrides(&["DAEMON"], env(pairs)).is_err(),
+                "{pairs:?} should be refused"
+            );
+        }
+    }
+
+    /// `{prefix}_SERVER_TRUSTED_PROXIES` takes addresses and CIDR ranges,
+    /// an empty value clears the list, and anything else is refused.
+    #[test]
+    fn trusted_proxies_env_override_takes_addresses_and_ranges() {
+        let mut server: ServerConfig = toml::from_str("trusted_proxies = [\"10.0.0.1\"]").unwrap();
+        server
+            .apply_trusted_proxies_override("DAEMON", |var| {
+                (var == "DAEMON_SERVER_TRUSTED_PROXIES")
+                    .then(|| " 10.0.0.0/20, 2001:db8::/32 ,".into())
+            })
+            .unwrap();
+        assert_eq!(
+            server.trusted_proxies,
+            [
+                "10.0.0.0/20".parse::<IpNetwork>().unwrap(),
+                "2001:db8::/32".parse().unwrap()
+            ]
+        );
+
+        server
+            .apply_trusted_proxies_override("DAEMON", |_| Some(String::new()))
+            .unwrap();
+        assert!(
+            server.trusted_proxies.is_empty(),
+            "an empty value clears the list"
+        );
+
+        for bad in ["load-balancer", "10.0.0.0/33"] {
+            let result = server.apply_trusted_proxies_override("DAEMON", |_| Some(bad.into()));
+            assert!(result.is_err(), "{bad} should be refused");
+        }
+    }
+
+    /// An absent `[server.resolve_rate_limit]` means no limit; a set one is
+    /// read from the file and the env, and a zero limit or window is refused.
+    #[test]
+    fn resolve_rate_limit_parses_overrides_and_validates() {
+        let parsed: ResolveRateLimitConfig = toml::from_str("").unwrap();
+        assert_eq!(parsed, ResolveRateLimitConfig::default());
+        assert_eq!(parsed.max_per_window, None);
+
+        let parsed: ResolveRateLimitConfig =
+            toml::from_str("max_per_window = 500\nwindow_secs = 60").unwrap();
+        parsed.validate().unwrap();
+        assert_eq!((parsed.max_per_window, parsed.window_secs), (Some(500), 60));
+        assert!(toml::from_str::<ResolveRateLimitConfig>("max_per_windw = 1").is_err());
+
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |var: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == var)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let mut config = ResolveRateLimitConfig::default();
+        config
+            .apply_overrides(
+                "DAEMON",
+                env(&[
+                    ("DAEMON_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW", " 200 "),
+                    ("DAEMON_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS", "5"),
+                ]),
+            )
+            .unwrap();
+        assert_eq!((config.max_per_window, config.window_secs), (Some(200), 5));
+        config
+            .apply_overrides(
+                "DAEMON",
+                env(&[("DAEMON_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW", "")]),
+            )
+            .unwrap();
+        assert_eq!(
+            config.max_per_window, None,
+            "an empty value clears the limit"
+        );
+
+        for pairs in [
+            &[("DAEMON_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW", "0")][..],
+            &[("DAEMON_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS", "0")][..],
+            &[("DAEMON_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS", "3601")][..],
+            &[("DAEMON_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW", "many")][..],
+        ] {
+            let mut config = ResolveRateLimitConfig::default();
+            assert!(
+                config.apply_overrides("DAEMON", env(pairs)).is_err(),
                 "{pairs:?} should be refused"
             );
         }

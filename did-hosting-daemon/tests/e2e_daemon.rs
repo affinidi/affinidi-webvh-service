@@ -95,6 +95,14 @@ impl Daemon {
     async fn spawn_with_acl(
         extra_main_acl: &[(String, did_hosting_common::server::acl::Role)],
     ) -> Self {
+        Self::spawn_with(extra_main_acl, &[]).await
+    }
+
+    /// Like [`Self::spawn_with_acl`], with `env` set on the daemon process.
+    async fn spawn_with(
+        extra_main_acl: &[(String, did_hosting_common::server::acl::Role)],
+        env: &[(&str, &str)],
+    ) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let port = reserve_port().await;
         // `localhost`, not `127.0.0.1`: first-boot domain seeding refuses an
@@ -232,6 +240,7 @@ enable_watcher = false
             .arg("--config")
             .arg(&config_path)
             .env("RUST_LOG", "warn")
+            .envs(env.iter().copied())
             .kill_on_drop(true)
             .spawn()
             .expect("spawn did-hosting-daemon");
@@ -563,6 +572,71 @@ async fn fetch_metrics_succeeds_for_a_granted_key() {
         parsed.is_array(),
         "counters output must be a JSON array, got {parsed:?}"
     );
+
+    daemon.teardown().await;
+}
+
+/// `DAEMON_SERVER_RESOLVE_RATE_LIMIT_*` reaches a running daemon: its
+/// `.well-known` routes and its root fallback share one per-address budget,
+/// a refusal is `429` with `Retry-After`, and neither the health check nor
+/// the Trust Task listener is counted.
+#[tokio::test]
+async fn resolution_is_rate_limited_per_address() {
+    const LIMIT: usize = 20;
+    let daemon = Daemon::spawn_with(
+        &[],
+        &[
+            ("DAEMON_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW", "20"),
+            ("DAEMON_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS", "3600"),
+        ],
+    )
+    .await;
+    let http = reqwest::Client::new();
+    let get = |path: &str| http.get(format!("{}{path}", daemon.base_url)).send();
+
+    // Spawning already resolved the root DID at least once, so the budget
+    // runs out within LIMIT requests, alternating the two route kinds.
+    let mut refused_at = None;
+    for i in 0..LIMIT {
+        let path = if i % 2 == 0 {
+            "/.well-known/did.jsonl"
+        } else {
+            "/ghost/did.jsonl"
+        };
+        let resp = get(path).await.expect("GET the daemon");
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            assert!(resp.headers().contains_key("retry-after"));
+            refused_at = Some(i);
+            break;
+        }
+    }
+    let refused_at = refused_at.expect("the resolution budget runs out");
+    assert!(
+        refused_at >= 2,
+        "both route kinds were served before the limit"
+    );
+    for path in ["/.well-known/did.jsonl", "/ghost/did.jsonl"] {
+        assert_eq!(
+            get(path).await.expect("GET the daemon").status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "{path} shares the budget"
+        );
+    }
+
+    assert!(
+        get("/api/health")
+            .await
+            .expect("GET health")
+            .status()
+            .is_success()
+    );
+    let trust_task = http
+        .post(format!("{}/api/trust-tasks", daemon.base_url))
+        .body("{}")
+        .send()
+        .await
+        .expect("POST the daemon");
+    assert_ne!(trust_task.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
 
     daemon.teardown().await;
 }

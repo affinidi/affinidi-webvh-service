@@ -183,6 +183,7 @@ Environment variables use the `CONTROL_` prefix:
 | `CONTROL_SERVER_HOST`                      | Bind host                    |
 | `CONTROL_SERVER_PORT`                      | Bind port                    |
 | `CONTROL_LOG_LEVEL`                        | Log level                    |
+| `CONTROL_SERVER_TRUSTED_PROXIES`           | Comma-separated proxy addresses or CIDR ranges whose `X-Forwarded-For` is trusted |
 | `CONTROL_REGISTRY_HEALTH_CHECK_INTERVAL`   | Health check interval (sec)  |
 | `CONTROL_REPLAY_MAX_ENTRIES`               | Replay cache records, all signers (default 1,000,000, about 32 MB) |
 | `CONTROL_REPLAY_MAX_ENTRIES_PER_SIGNER`    | Replay cache records per signer (default 250,000, about 600 signed requests a second) |

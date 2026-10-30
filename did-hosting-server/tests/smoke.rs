@@ -785,3 +785,83 @@ async fn resolve_cache_policy_is_configurable() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(response.headers()["cache-control"], "no-store");
 }
+
+/// `[server.resolve_rate_limit]` reaches the wire: past the limit a client
+/// address gets 429 with Retry-After on both the DID-serving fallback and the
+/// `.well-known` routes, another address is still served, and the Trust Task
+/// listener is not counted.
+#[tokio::test]
+async fn resolve_rate_limit_refuses_one_address_past_the_limit() {
+    use axum::extract::ConnectInfo;
+    use std::net::SocketAddr;
+
+    let server = ServerConfig {
+        resolve_rate_limit: did_hosting_common::server::config::ResolveRateLimitConfig {
+            max_per_window: Some(2),
+            window_secs: 60,
+        },
+        ..ServerConfig::default()
+    };
+    let (state, _dir) = make_state_with(server).await;
+    let did_id = "did:webvh:test:server.example.com:alice";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, "alice", did_id, &body).await;
+
+    let limit = std::sync::Arc::new(
+        did_hosting_common::server::rate_limit::ResolveRateLimiter::new(&state.config.server),
+    );
+    let app = did_hosting_server::routes::router_with_resolve_limit(1024 * 1024, limit)
+        .with_state(state.clone());
+
+    let send = |method: &'static str, uri: &'static str, peer: &'static str| {
+        let app = app.clone();
+        async move {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+            app.oneshot(request).await.unwrap()
+        }
+    };
+
+    assert_eq!(
+        send("GET", "/alice/did.jsonl", "203.0.113.1:1000")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_ne!(
+        send("GET", "/.well-known/did.jsonl", "203.0.113.1:1000")
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let refused = send("GET", "/alice/did.jsonl", "203.0.113.1:1000").await;
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(refused.headers().contains_key("retry-after"));
+    assert_eq!(
+        send("GET", "/.well-known/did.jsonl", "203.0.113.1:1000")
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    assert_eq!(
+        send("GET", "/alice/did.jsonl", "203.0.113.2:1000")
+            .await
+            .status(),
+        StatusCode::OK,
+        "another address keeps its own budget"
+    );
+    assert_ne!(
+        send("POST", "/api/trust-tasks", "203.0.113.1:1000")
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the Trust Task listener is not counted against resolution"
+    );
+}

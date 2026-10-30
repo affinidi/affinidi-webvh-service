@@ -13,9 +13,12 @@ pub mod resolve_webs;
 pub mod resolve_webvh;
 pub mod trust_tasks;
 
+use std::sync::Arc;
+
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
+use did_hosting_common::server::rate_limit::{ResolveRateLimiter, limit_resolution};
 
 use crate::server::AppState;
 
@@ -124,7 +127,34 @@ pub fn router_public_only() -> Router<AppState> {
     router.merge(agent_name_routes())
 }
 
-/// The edge's full router, with the DID-serving fallback.
+/// [`router_public_only`] with `resolve_limit` on every route: what the
+/// daemon mounts.
+pub fn router_public_only_with_resolve_limit(
+    resolve_limit: Arc<ResolveRateLimiter>,
+) -> Router<AppState> {
+    router_public_only().layer(axum::middleware::from_fn_with_state(
+        resolve_limit,
+        limit_resolution,
+    ))
+}
+
+/// The edge's full router, with the DID-serving fallback and no resolution
+/// limit: [`router_with_resolve_limit`] with a disabled limiter.
 pub fn router(body_limit: usize) -> Router<AppState> {
-    router_without_fallback(body_limit).fallback(did_public::serve_public)
+    router_with_resolve_limit(body_limit, Arc::new(ResolveRateLimiter::disabled()))
+}
+
+/// The edge's full router: `resolve_limit` on every resolution route and the
+/// DID-serving fallback. The Trust Task listener keeps its own limiter.
+pub fn router_with_resolve_limit(
+    body_limit: usize,
+    resolve_limit: Arc<ResolveRateLimiter>,
+) -> Router<AppState> {
+    router_public_only()
+        .fallback(did_public::serve_public)
+        .layer(axum::middleware::from_fn_with_state(
+            resolve_limit,
+            limit_resolution,
+        ))
+        .merge(trust_task_listener(body_limit))
 }

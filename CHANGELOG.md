@@ -185,6 +185,37 @@ server and watcher.
 - The edge's cache is now part of its state rather than process-wide, so
   each edge in one process has its own bounds.
 
+### Added — per-client rate limit on DID resolution
+
+Public DID resolution had no rate limit, so one client could use up a
+metered store's read capacity for every other client.
+
+- **`[server.resolve_rate_limit]`** (`max_per_window`, `window_secs`, default
+  10) caps the resolution requests one client may make per fixed window on
+  the server, watcher and daemon; past it the client gets `429 Too Many
+  Requests` with `Retry-After`, and one warning per client per window is
+  logged. It is off by default. Each setting has a
+  `{DID_HOSTING,WATCHER,DAEMON}_SERVER_RESOLVE_RATE_LIMIT_*` env override; a
+  zero limit or a window outside 1 to 3,600 seconds is refused at startup.
+- A client is its address, an IPv6 client its /64, so rotating addresses
+  inside one block does not escape the limit. The budget is per process. In
+  the daemon one budget covers the server's and watcher's resolution and the
+  root fallback, which also serves the UI.
+- Every per-address limiter now drops addresses whose window has ended
+  when it reaches 10,000 tracked addresses, and clears all counts only if
+  more than 7,500 are still live, so a flood does not rescan the map on
+  every request.
+
+### Added — `trusted_proxies` from the environment
+
+- `{CONTROL,DID_HOSTING,WATCHER,WITNESS,DAEMON}_SERVER_TRUSTED_PROXIES` sets
+  `server.trusted_proxies` as a comma-separated list of addresses or CIDR
+  ranges (empty clears it), so a deployment can set it without rewriting the
+  config file. A bad entry is refused at startup.
+- The service warns at startup when the resolution limit is on with no
+  trusted proxies: behind a load balancer every client would share one
+  budget.
+
 ### Added — configurable caching for DID resolution
 
 - **`[server.resolve_cache]`** sets the `Cache-Control` sent with every
