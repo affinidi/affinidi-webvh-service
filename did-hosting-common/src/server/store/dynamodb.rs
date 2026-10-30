@@ -58,18 +58,31 @@ impl DynamoDbBackend {
     fn table_name(&self, keyspace: &str) -> String {
         format!("{}_{}", self.table_prefix, keyspace)
     }
-}
 
-impl StorageBackend for DynamoDbBackend {
-    fn keyspace(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
+    fn open_keyspace(
+        &self,
+        name: &str,
+        consistent_read: bool,
+    ) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
         Ok((
             name.to_string(),
             Arc::new(DynamoDbKeyspace {
                 client: self.client.clone(),
                 table: self.table_name(name),
                 verified: self.verified_tables.clone(),
+                consistent_read,
             }),
         ))
+    }
+}
+
+impl StorageBackend for DynamoDbBackend {
+    fn keyspace(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
+        self.open_keyspace(name, false)
+    }
+
+    fn keyspace_consistent(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
+        self.open_keyspace(name, true)
     }
 
     fn batch(&self) -> Box<dyn BatchOps> {
@@ -143,6 +156,11 @@ struct DynamoDbKeyspace {
     client: Client,
     table: String,
     verified: Arc<RwLock<HashSet<String>>>,
+    /// Send `GetItem` with `ConsistentRead`, so a read sees every write
+    /// that committed before it. Off by default: an eventually consistent
+    /// read costs half the read units and is fine where a stale answer
+    /// decides nothing.
+    consistent_read: bool,
 }
 
 impl KeyspaceOps for DynamoDbKeyspace {
@@ -169,6 +187,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
                 .get_item()
                 .table_name(&self.table)
                 .key(PK_ATTR, AttributeValue::B(Blob::new(key)))
+                .consistent_read(self.consistent_read)
                 .send()
                 .await
                 .map_err(|e| AppError::Store(format!("dynamodb get: {e}")))?;
@@ -208,6 +227,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
                 .table_name(&self.table)
                 .key(PK_ATTR, AttributeValue::B(Blob::new(key)))
                 .projection_expression(PK_ATTR)
+                .consistent_read(self.consistent_read)
                 .send()
                 .await
                 .map_err(|e| AppError::Store(format!("dynamodb get: {e}")))?;
@@ -421,7 +441,80 @@ impl BatchOps for DynamoDbBatch {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use aws_sdk_dynamodb::config::interceptors::BeforeTransmitInterceptorContextRef;
+    use aws_sdk_dynamodb::config::{
+        BehaviorVersion, ConfigBag, Credentials, Intercept, Region, RuntimeComponents,
+    };
+
     use super::*;
+
+    /// Records each request body and stops it before it leaves the process.
+    #[derive(Debug, Default, Clone)]
+    struct CaptureBodies(Arc<Mutex<Vec<String>>>);
+
+    impl Intercept for CaptureBodies {
+        fn name(&self) -> &'static str {
+            "CaptureBodies"
+        }
+
+        fn read_before_transmit(
+            &self,
+            context: &BeforeTransmitInterceptorContextRef<'_>,
+            _runtime_components: &RuntimeComponents,
+            _cfg: &mut ConfigBag,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let body = context.request().body().bytes().unwrap_or_default();
+            self.0
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(body).into_owned());
+            Err("request captured".into())
+        }
+    }
+
+    fn offline_backend(capture: &CaptureBodies) -> DynamoDbBackend {
+        let config = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("eu-west-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .endpoint_url("http://127.0.0.1:1")
+            .interceptor(capture.clone())
+            .build();
+        DynamoDbBackend {
+            client: Client::from_conf(config),
+            table_prefix: "webvh".into(),
+            // Marked as present so `ensure_table` sends nothing.
+            verified_tables: Arc::new(RwLock::new(HashSet::from(["webvh_dids".to_string()]))),
+        }
+    }
+
+    async fn read_requests(ops: Arc<dyn KeyspaceOps>, capture: &CaptureBodies) -> Vec<String> {
+        assert!(ops.get_raw(b"did:a".to_vec()).await.is_err());
+        assert!(ops.contains_key(b"did:a".to_vec()).await.is_err());
+        std::mem::take(&mut *capture.0.lock().unwrap())
+    }
+
+    #[tokio::test]
+    async fn consistent_keyspace_reads_strongly_consistent() {
+        let capture = CaptureBodies::default();
+        let backend = offline_backend(&capture);
+
+        let (_, ops) = backend.keyspace_consistent("dids").unwrap();
+        let bodies = read_requests(ops, &capture).await;
+        assert_eq!(bodies.len(), 2, "get_raw and contains_key: {bodies:?}");
+        for body in &bodies {
+            assert!(body.contains(r#""ConsistentRead":true"#), "{body}");
+        }
+
+        let (_, ops) = backend.keyspace("dids").unwrap();
+        let bodies = read_requests(ops, &capture).await;
+        assert_eq!(bodies.len(), 2, "get_raw and contains_key: {bodies:?}");
+        for body in &bodies {
+            assert!(!body.contains(r#""ConsistentRead":true"#), "{body}");
+        }
+    }
 
     fn bin_item(pk: &[u8], val: &[u8]) -> HashMap<String, AttributeValue> {
         HashMap::from([
