@@ -169,4 +169,4 @@ Settings, not files:
   PR only when this app opened it, and the enterprise does not allow
   `GITHUB_TOKEN` to open pull requests (one it opened would trigger no CI
   anyway).
-- `release-tag.yml` needs no secret.
+- `release-tag.yml` tags as the release bot too, from the `release` environment.

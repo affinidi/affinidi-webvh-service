@@ -5,7 +5,7 @@ name: Tag a release
 # prerelease. Its notes are the version's CHANGELOG.md section where it has
 # one, otherwise generated.
 #
-# GITHUB_TOKEN is enough: no tag ruleset applies and nothing runs on a tag.
+# Tagged as the release bot: the org's tag ruleset lets only it create tags.
 # Crates are published by hand from the tag (RELEASES.md, "Publish").
 on:
   push:
@@ -22,11 +22,19 @@ concurrency:
 jobs:
   tag:
     name: Tag v<RELEASE>
+    # RELEASE_BOT_PRIVATE_KEY is a secret of this environment.
+    environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      contents: write
+      contents: read
     steps:
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
       - uses: affinidi/pipeline-rust/.github/actions/release-tag@feat/release-branch-actions
         with:
-          token: ${{ github.token }}
+          token: ${{ steps.app.outputs.token }}
