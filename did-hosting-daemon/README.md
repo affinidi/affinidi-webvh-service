@@ -228,6 +228,13 @@ keeps its own cache with these bounds, so the daemon's worst case is up to
 three times `max_entries` records (about 96 MB at the defaults). The
 control plane's README explains the bounds ("Replay cache bounds").
 
+| Variable | Description |
+| --- | --- |
+| `DAEMON_GEOIP_DATABASE` | Local GeoIP `.mmdb` file for wallet sign-in locations (empty clears) |
+
+This lives in `[geoip] database` and reaches the embedded control plane,
+which answers wallet sign-in. See [`docs/geoip.md`](../docs/geoip.md).
+
 ## CLI Commands
 
 ```

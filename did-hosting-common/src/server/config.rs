@@ -1,4 +1,5 @@
 use super::error::AppError;
+use ipnetwork::IpNetwork;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -123,22 +124,61 @@ impl TransportSelection {
     }
 }
 
+/// Serde for a list of networks written as strings: an address
+/// (`"10.0.0.1"`, its own one-address network) or a CIDR (`"10.0.0.0/8"`).
+/// A bad entry is a load error that names it, not a silently dropped one.
+pub mod ip_networks {
+    use ipnetwork::IpNetwork;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(nets: &[IpNetwork], s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(nets.iter().map(|n| match n.prefix() {
+            // A one-address network reads back as the address it was written as.
+            p if p == max_prefix(n) => n.ip().to_string(),
+            _ => n.to_string(),
+        }))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<IpNetwork>, D::Error> {
+        Vec::<String>::deserialize(d)?
+            .iter()
+            .map(|entry| {
+                entry.trim().parse::<IpNetwork>().map_err(|_| {
+                    serde::de::Error::custom(format!(
+                        "invalid network `{entry}`: expected an IP address (`10.0.0.1`) \
+                         or a CIDR range (`10.0.0.0/8`, `2001:db8::/32`)"
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    fn max_prefix(n: &IpNetwork) -> u8 {
+        match n {
+            IpNetwork::V4(_) => 32,
+            IpNetwork::V6(_) => 128,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
     #[serde(default = "default_host")]
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
-    /// Trusted reverse-proxy IPs whose `X-Forwarded-For` header is
-    /// honoured for client-IP attribution. Empty (default) =
-    /// X-Forwarded-For is ignored and the direct TCP peer is used —
-    /// safe behind nothing or behind a CDN that strips XFF, but
-    /// wrong behind a load balancer (every request appears to come
-    /// from the LB, so per-IP rate limits become a global cap).
-    /// Configure with the IPs of your reverse proxies (e.g.
-    /// `["10.0.0.1", "10.0.0.2"]`) to opt in.
-    #[serde(default)]
-    pub trusted_proxies: Vec<String>,
+    /// Trusted reverse proxies whose `X-Forwarded-For` header is
+    /// honoured for client-IP attribution — addresses or CIDR ranges
+    /// (`"10.0.0.1"`, `"10.20.0.0/16"`, `"2001:db8::/48"`), the same shape
+    /// as the VTC's `trust_xff_cidrs`. Empty (default) = X-Forwarded-For is
+    /// ignored and the direct TCP peer is used — safe behind nothing or
+    /// behind a CDN that strips XFF, but wrong behind a load balancer
+    /// (every request appears to come from the LB, so per-IP rate limits
+    /// become a global cap). List only your actual reverse proxies: see
+    /// [`crate::server::rate_limit::resolve_client_ip`]. An entry that is
+    /// neither an address nor a CIDR is refused at load.
+    #[serde(default, with = "ip_networks")]
+    pub trusted_proxies: Vec<IpNetwork>,
     /// Trusted reverse-proxy CIDRs whose `Forwarded` (RFC 7239) and
     /// `X-Forwarded-Host` headers are honoured for **request host /
     /// domain detection** (multi-domain feature, T19). Distinct from
@@ -2291,5 +2331,49 @@ mod resolve_cache_tests {
             std::env::remove_var(SHARED);
             std::env::remove_var(SWR);
         }
+    }
+}
+
+#[cfg(test)]
+mod trusted_proxies_tests {
+    use super::*;
+
+    /// Addresses and CIDR ranges both parse; an address is its own
+    /// one-address network and is written back as it was given.
+    #[test]
+    fn addresses_and_ranges_parse_and_round_trip() {
+        let s: ServerConfig = toml::from_str(
+            "trusted_proxies = [\"10.0.0.1\", \"10.20.0.0/16\", \"2001:db8::/48\", \" 192.0.2.7 \"]\n",
+        )
+        .unwrap();
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert!(s.trusted_proxies[0].contains(ip("10.0.0.1")));
+        assert!(!s.trusted_proxies[0].contains(ip("10.0.0.2")));
+        assert!(s.trusted_proxies[1].contains(ip("10.20.255.1")));
+        assert!(s.trusted_proxies[2].contains(ip("2001:db8:0:1::5")));
+
+        let written = toml::to_string(&s).unwrap();
+        assert!(
+            written.contains(
+                r#"trusted_proxies = ["10.0.0.1", "10.20.0.0/16", "2001:db8::/48", "192.0.2.7"]"#
+            ),
+            "{written}"
+        );
+        let back: ServerConfig = toml::from_str(&written).unwrap();
+        assert_eq!(back.trusted_proxies, s.trusted_proxies);
+    }
+
+    /// A bad entry stops the load and is named, rather than being dropped
+    /// (which left the proxy untrusted and every client in one bucket).
+    #[test]
+    fn a_bad_entry_is_refused_by_name() {
+        for bad in ["proxy.internal", "10.0.0.0/33", "10.0.0.0/"] {
+            let err = toml::from_str::<ServerConfig>(&format!("trusted_proxies = [\"{bad}\"]\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(bad), "{err}");
+        }
+        let s: ServerConfig = toml::from_str("host = \"0.0.0.0\"").unwrap();
+        assert!(s.trusted_proxies.is_empty());
     }
 }

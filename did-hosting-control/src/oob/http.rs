@@ -44,11 +44,12 @@
 //! member's grant. HTTPS answers it with `Cache-Control: no-store` and
 //! `Referrer-Policy: no-referrer`. On a successful `redeem` the row creates
 //! this service's existing session: a bearer session bound to `K_b` as its
-//! session key. Requester details come from the connection (IP, User-Agent;
-//! no GeoIP).
+//! session key. Requester details come from the connection: the IP, the
+//! User-Agent, and the city and country from the local GeoIP database
+//! ([`crate::geoip`]), if one is configured.
 
 use std::net::IpAddr;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use axum::http::{HeaderMap, header};
@@ -64,6 +65,7 @@ use super::service::{
 };
 use super::types::{OobErrorCode, TYPE_REDEEM, TYPE_REQUEST};
 use crate::control_tasks::SealedReply;
+use crate::geoip::GeoIp;
 use crate::messaging::HttpsFacts;
 use crate::server::AppState;
 
@@ -87,10 +89,11 @@ pub const GLOBAL_REQUEST_MAX_PER_MINUTE: u64 = 600;
 /// bucket).
 const GLOBAL_KEY: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
 
-/// Per-process state: the service (built on first use, from config) and the
-/// limiters.
+/// Per-process state: the service (built on first use, from config), the
+/// limiters and the local GeoIP database.
 pub struct OobRuntime {
     service: OnceLock<Option<OobService>>,
+    geoip: Arc<GeoIp>,
     request_limiter: IpRateLimiter,
     global_request_limiter: IpRateLimiter,
     other_limiter: IpRateLimiter,
@@ -98,8 +101,16 @@ pub struct OobRuntime {
 
 impl Default for OobRuntime {
     fn default() -> Self {
+        Self::with_geoip(Arc::new(GeoIp::disabled()))
+    }
+}
+
+impl OobRuntime {
+    /// A runtime whose sign-in requests are located with `geoip`.
+    pub fn with_geoip(geoip: Arc<GeoIp>) -> Self {
         Self {
             service: OnceLock::new(),
+            geoip,
             request_limiter: IpRateLimiter::new(
                 "auth-oob-request-per-ip",
                 REQUEST_MAX_PER_MINUTE,
@@ -113,9 +124,13 @@ impl Default for OobRuntime {
             other_limiter: IpRateLimiter::new("auth-oob-per-ip", OTHER_MAX_PER_MINUTE, 60),
         }
     }
-}
 
-impl OobRuntime {
+    /// The local GeoIP database, for the process to keep current
+    /// ([`GeoIp::spawn_reloader`]).
+    pub fn geoip(&self) -> &Arc<GeoIp> {
+        &self.geoip
+    }
+
     /// The service, or `None` when this deployment has no service DID or no
     /// `https` public URL (and so no portal origin and no `SignInPortal`
     /// service). Every `auth/oob/*` document is then answered `503` "wallet
@@ -380,8 +395,9 @@ pub(crate) async fn exchange(
     let (browser, os) = parse_user_agent(ua);
     let conn = Connection {
         ip: https.ip.map(|ip| ip.to_string()),
-        // No local GeoIP database: "unknown" (base design 12 item 6).
-        location: None,
+        // From the local GeoIP database only (base design §12.6); `None` is
+        // sent as "unknown", which the wallet shows as a warning.
+        location: https.ip.and_then(|ip| state.oob.geoip.locate(ip)),
         browser: Some(browser.to_string()),
         os: Some(os.to_string()),
     };

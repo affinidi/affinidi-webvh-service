@@ -1763,6 +1763,7 @@ mod tests {
             hosting: Default::default(),
             identity: Default::default(),
             replay: Default::default(),
+            geoip: Default::default(),
             config_path: PathBuf::new(),
         };
 
@@ -2588,6 +2589,7 @@ mod tests {
             hosting: state.config.hosting.clone(),
             identity: Default::default(),
             replay: Default::default(),
+            geoip: Default::default(),
             config_path: state.config.config_path.clone(),
         };
         state.config = Arc::new(cfg);
