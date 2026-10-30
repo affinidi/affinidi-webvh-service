@@ -97,6 +97,7 @@ fn default_server() -> ServerConfig {
         trusted_proxies: Vec::new(),
         trusted_proxy_cidrs: Vec::new(),
         resolve_cache: Default::default(),
+        resolve_rate_limit: Default::default(),
     }
 }
 
@@ -201,12 +202,19 @@ impl DaemonConfig {
         if let Ok(v) = std::env::var("DAEMON_LOG_LEVEL") {
             config.log.level = v;
         }
+        // DAEMON_SERVER_TRUSTED_PROXIES — load balancer addresses or ranges.
+        config.server.apply_trusted_proxies_env_override("DAEMON")?;
         // DAEMON_SERVER_RESOLVE_CACHE_* — Cache-Control on DID resolution.
         config.server.resolve_cache.apply_env_overrides("DAEMON")?;
         // DAEMON_REPLAY_* — anti-replay cache bounds. Also validates `[replay]`.
         config.replay.apply_env_overrides("DAEMON")?;
         // DAEMON_GEOIP_DATABASE — the local sign-in location database.
         config.geoip.apply_env_overrides("DAEMON");
+        // DAEMON_SERVER_RESOLVE_RATE_LIMIT_* — per-address limit on resolution.
+        config
+            .server
+            .resolve_rate_limit
+            .apply_env_overrides("DAEMON")?;
 
         // Fjall memory settings (STORAGE_FJALL_BLOCK_CACHE / _WRITE_BUFFER /
         // _MAX_JOURNAL) — shared, unprefixed names; see

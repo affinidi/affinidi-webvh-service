@@ -75,6 +75,7 @@ impl Default for AppConfig {
                 trusted_proxies: Vec::new(),
                 trusted_proxy_cidrs: Vec::new(),
                 resolve_cache: Default::default(),
+                resolve_rate_limit: Default::default(),
             },
             log: LogConfig::default(),
             store: StoreConfig {
@@ -134,6 +135,11 @@ impl AppConfig {
         config.server.resolve_cache.apply_env_overrides("WATCHER")?;
         // WATCHER_REPLAY_* — anti-replay cache bounds. Also validates `[replay]`.
         config.replay.apply_env_overrides("WATCHER")?;
+        // WATCHER_SERVER_RESOLVE_RATE_LIMIT_* — per-address limit on resolution.
+        config
+            .server
+            .resolve_rate_limit
+            .apply_env_overrides("WATCHER")?;
         if let Ok(v) = std::env::var("WATCHER_SERVER_DID") {
             config.server_did = Some(v);
         }

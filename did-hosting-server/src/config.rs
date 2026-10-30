@@ -318,6 +318,12 @@ impl AppConfig {
         config
             .replay
             .apply_env_overrides_for(&["WEBVH", "DID_HOSTING"])?;
+        // DID_HOSTING_SERVER_RESOLVE_RATE_LIMIT_* — per-address limit on
+        // resolution. Also validates `[server.resolve_rate_limit]`.
+        config
+            .server
+            .resolve_rate_limit
+            .apply_env_overrides("DID_HOSTING")?;
 
         // Validate configuration
         config.auth.validate()?;
