@@ -16,7 +16,17 @@ use trust_tasks_rs::DeclaredErrorCode;
 
 use super::{Cx, TaskError, typed};
 use crate::error::AppError;
-use crate::server::AppState;
+use crate::server::{AppState, CacheChange};
+
+/// Tell a cache of domain state in this process (the daemon's resolution
+/// gate) that a domain changed. Call after every commit that writes a
+/// domain's entry: resolution checks its existence and status. Only
+/// `set-default`, which changes nothing but the default flag, skips it.
+fn domains_changed(state: &AppState) {
+    if let Some(invalidate) = &state.cache_invalidate {
+        invalidate(CacheChange::Domains);
+    }
+}
 
 /// A stored domain in the shared `DomainEntry` wire shape.
 pub(crate) fn spec_domain_entry(entry: &DomainEntry) -> Value {
@@ -122,6 +132,7 @@ pub(crate) async fn create(
             }
             other => other.into(),
         })?;
+    domains_changed(state);
     if p.set_as_default {
         store::set_default_domain(&state.store, &name).await?;
     }
@@ -145,6 +156,7 @@ pub(crate) async fn update(
         entry.label = Some(label.to_string());
     }
     store::update_domain(&state.store, &name, &entry).await?;
+    domains_changed(state);
     let (sent, failed) = crate::server_push::fanout_domain_upsert(state, &entry).await;
     info!(caller = %auth.did, domain = %name, fanout_sent = sent, fanout_failed = failed, "domain updated");
     entry_response(&entry, "domain update response")
@@ -182,6 +194,7 @@ pub(crate) async fn set_state(
         }
         _ => return Err(AppError::Validation("unsupported domain state".into()).into()),
     }
+    domains_changed(state);
     let entry = existing(state, &name, unknown).await?;
     let (sent, failed) = crate::server_push::fanout_domain_upsert(state, &entry).await;
     info!(caller = %auth.did, domain = %name, status = ?entry.status, fanout_sent = sent, fanout_failed = failed, "domain state set");
@@ -271,6 +284,7 @@ pub(crate) async fn purge(
         }
     }
     store::delete_domain_record(&state.store, &name).await?;
+    domains_changed(state);
     let _ = pending_purge::cancel(&state.store, &name).await;
     info!(caller = %auth.did, acr = %auth.acr, domain = %name, servers = fanout.len(), "domain purged (admin override of grace window)");
     typed(

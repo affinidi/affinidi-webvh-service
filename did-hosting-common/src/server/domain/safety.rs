@@ -16,10 +16,14 @@
 //! messages — "we don't serve that domain" (operator misconfig) vs
 //! "you can't post there" (ACL misconfig).
 
+use std::collections::HashMap;
+
 use super::super::acl::{AclEntry, Role};
 use super::super::error::AppError;
-use super::super::store::Store;
+use super::super::store::{KeyspaceHandle, Store};
+use super::normalize::normalize_domain_name;
 use super::store::get_domain;
+use super::types::DomainEntry;
 use crate::method::{method_by_name, parse_did_method};
 
 /// Verify that `host` is an active configured domain on this server.
@@ -208,7 +212,13 @@ pub async fn assert_domain_active_for_resolution(
     store: &Store,
     host: &str,
 ) -> Result<(), AppError> {
-    let entry = get_domain(store, host).await?.ok_or_else(|| {
+    domain_active_for_resolution(host, get_domain(store, host).await?)
+}
+
+/// The verdict of [`assert_domain_active_for_resolution`] for `host`'s
+/// stored entry.
+fn domain_active_for_resolution(host: &str, entry: Option<DomainEntry>) -> Result<(), AppError> {
+    let entry = entry.ok_or_else(|| {
         // Unexpected — the host came from the embedded DID, and the
         // create-side check refused to write it without a matching
         // active domain. Reaching this branch means a domain was
@@ -303,35 +313,70 @@ pub async fn assert_resolution_allowed(
     request_host: Option<&str>,
     did_id: &str,
 ) -> Result<(), AppError> {
-    use crate::server::store::KS_DOMAINS;
-    let ks = store.keyspace(KS_DOMAINS)?;
-    let any_domain = ks
-        .prefix_iter_raw(b"".to_vec())
+    ResolutionDomains::load(store)
         .await?
-        .into_iter()
-        .next()
-        .is_some();
-    if !any_domain {
-        tracing::warn!(
-            did = %did_id,
-            request_host = ?request_host,
-            "domains keyspace is empty — skipping resolve-side safety check"
-        );
-        return Ok(());
+        .assert_allowed(request_host, did_id)
+}
+
+/// The `domains` keyspace as the resolve-side check reads it: loaded
+/// with one scan, then checked against any number of requests.
+///
+/// [`assert_resolution_allowed`] loads one per request. A caller that
+/// can tell when a domain changes may keep one and drop it on each
+/// change, so a resolve reads no domain from the store.
+#[derive(Debug, Clone, Default)]
+pub struct ResolutionDomains {
+    /// Raw entries by stored key (the canonical domain name). Parsed
+    /// only when a request names one, as a direct read would.
+    entries: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+impl ResolutionDomains {
+    /// Read every domain entry.
+    pub async fn load(store: &Store) -> Result<Self, AppError> {
+        Self::load_from(&store.keyspace(crate::server::store::KS_DOMAINS)?).await
     }
-    let Some(request_host) = request_host else {
-        tracing::warn!(
-            did = %did_id,
-            "no resolvable request host (no Host header, and none of Forwarded / \
-             X-Forwarded-Host from a trusted peer); refusing to serve now that at least \
-             one domain is configured"
-        );
-        return Err(AppError::NotFound(format!(
-            "no resolvable request host for {did_id}"
-        )));
-    };
-    assert_request_host_matches_did(request_host, did_id)?;
-    assert_domain_active_for_resolution(store, request_host).await
+
+    /// Read every domain entry through `domains`, a handle on the
+    /// `domains` keyspace.
+    pub async fn load_from(domains: &KeyspaceHandle) -> Result<Self, AppError> {
+        let entries = domains
+            .prefix_iter_raw(b"".to_vec())
+            .await?
+            .into_iter()
+            .collect();
+        Ok(Self { entries })
+    }
+
+    /// [`assert_resolution_allowed`] against these entries.
+    pub fn assert_allowed(&self, request_host: Option<&str>, did_id: &str) -> Result<(), AppError> {
+        if self.entries.is_empty() {
+            tracing::warn!(
+                did = %did_id,
+                request_host = ?request_host,
+                "domains keyspace is empty — skipping resolve-side safety check"
+            );
+            return Ok(());
+        }
+        let Some(request_host) = request_host else {
+            tracing::warn!(
+                did = %did_id,
+                "no resolvable request host (no Host header, and none of Forwarded / \
+                 X-Forwarded-Host from a trusted peer); refusing to serve now that at least \
+                 one domain is configured"
+            );
+            return Err(AppError::NotFound(format!(
+                "no resolvable request host for {did_id}"
+            )));
+        };
+        assert_request_host_matches_did(request_host, did_id)?;
+        let canonical = normalize_domain_name(request_host)?;
+        let entry = match self.entries.get(canonical.as_bytes()) {
+            Some(bytes) => Some(serde_json::from_slice::<DomainEntry>(bytes)?),
+            None => None,
+        };
+        domain_active_for_resolution(request_host, entry)
+    }
 }
 
 #[cfg(test)]

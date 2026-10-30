@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 
 use crate::auth::AuthClaims;
 use crate::error::AppError;
-use crate::server::AppState;
+use crate::server::{AppState, CacheChange};
 use crate::store::KeyspaceHandle;
 
 /// Run the T20 safety check before any storage write on an inbound
@@ -34,19 +34,19 @@ use crate::store::KeyspaceHandle;
 /// permissive when the `domains` keyspace is empty (legacy / test
 /// state) and strict otherwise.
 ///
-/// Evict `mnemonic`'s resolved-content cache entry, if this process also
-/// serves resolution from the same store (the unified daemon).
+/// Evict what resolution cached about `mnemonic` (its log, witness file
+/// and record), if this process also serves resolution from the same store
+/// (the unified daemon).
 ///
 /// Call this after every commit that changes or removes `content_log_key`,
-/// or the record's `disabled`/`deleted_at` state — register, publish,
-/// disable, rollback, delete. A no-op for a standalone control plane; see
-/// `AppState::cache_invalidate`'s doc.
+/// `content_witness_key`, or the record's `disabled`/`deleted_at`/`did_id`
+/// — create (replacing a slot), register, publish, agent-name set/remove,
+/// witness publish, disable, rollback, delete. A
+/// no-op for a standalone control plane; see `AppState::cache_invalidate`'s
+/// doc.
 fn invalidate_cached_content(state: &AppState, mnemonic: &str) {
     if let Some(invalidate) = &state.cache_invalidate {
-        invalidate(&content_log_key(mnemonic));
-        // The witness file is served from the same cache, keyed the same
-        // way — `webvh/witness/publish` and rollback both change it.
-        invalidate(&content_witness_key(mnemonic));
+        invalidate(CacheChange::Did(mnemonic));
     }
 }
 
@@ -1398,6 +1398,7 @@ async fn apply_agent_name_op(
         IndexWrite::Keep => {}
     }
     batch.commit().await?;
+    invalidate_cached_content(state, mnemonic);
 
     state.stats_collector.record_update(mnemonic);
 
@@ -2660,66 +2661,45 @@ mod tests_atomic {
         let (mut state, _dir) = test_state().await;
         let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = calls.clone();
-        state.cache_invalidate = Some(Arc::new(move |key: &str| {
-            recorded.lock().unwrap().push(key.to_string());
+        state.cache_invalidate = Some(Arc::new(move |change: CacheChange<'_>| {
+            recorded.lock().unwrap().push(format!("{change:?}"));
         }));
 
         let owner = "did:example:owner";
         let path = "cache-hook";
         let did_log = build_test_did_log("scid-cache-hook", "control.test", path).await;
-        let expected_log_key = content_log_key(path);
-        let expected_witness_key = content_witness_key(path);
-        // Every mutation invalidates both the log and the witness cache
-        // entries — the same `serve_content` serves each, keyed the same
-        // way.
-        let count_of = |calls: &[String], key: &str| calls.iter().filter(|k| *k == key).count();
-
-        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
-            .await
-            .expect("register");
-        {
-            let calls = calls.lock().unwrap();
-            assert_eq!(count_of(&calls, &expected_log_key), 1, "register: log key");
-            assert_eq!(
-                count_of(&calls, &expected_witness_key),
-                1,
-                "register: witness key"
-            );
-        }
-
-        publish_did(&owner_auth(owner), &state, path, &did_log, None)
-            .await
-            .expect("publish");
-        assert_eq!(
-            count_of(&calls.lock().unwrap(), &expected_log_key),
-            2,
-            "publish must invalidate too"
-        );
-
-        set_did_disabled(&owner_auth(owner), &state, path, true)
-            .await
-            .expect("disable");
-        assert_eq!(
-            count_of(&calls.lock().unwrap(), &expected_log_key),
-            3,
-            "disable must invalidate too"
-        );
-
-        delete_did(&owner_auth(owner), &state, path, None)
-            .await
-            .expect("delete");
-        assert_eq!(
-            count_of(&calls.lock().unwrap(), &expected_log_key),
-            4,
-            "delete must invalidate too"
-        );
-        assert!(
+        let expected = format!("{:?}", CacheChange::Did(path));
+        let count = |calls: &std::sync::Mutex<Vec<String>>| {
             calls
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|k| *k == expected_log_key || *k == expected_witness_key),
-            "every call must invalidate this mnemonic's own content keys"
+                .filter(|c| **c == expected)
+                .count()
+        };
+
+        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
+            .await
+            .expect("register");
+        assert_eq!(count(&calls), 1, "register must invalidate");
+
+        publish_did(&owner_auth(owner), &state, path, &did_log, None)
+            .await
+            .expect("publish");
+        assert_eq!(count(&calls), 2, "publish must invalidate too");
+
+        set_did_disabled(&owner_auth(owner), &state, path, true)
+            .await
+            .expect("disable");
+        assert_eq!(count(&calls), 3, "disable must invalidate too");
+
+        delete_did(&owner_auth(owner), &state, path, None)
+            .await
+            .expect("delete");
+        assert_eq!(count(&calls), 4, "delete must invalidate too");
+        assert!(
+            calls.lock().unwrap().iter().all(|c| *c == expected),
+            "every call must name this mnemonic"
         );
     }
 
@@ -4060,6 +4040,31 @@ mod tests_atomic {
 
     /// Happy path: the document claims the name, so it binds — the entry is
     /// enabled, the index points at the slot, and the version advances.
+    /// An agent-name change commits a new log and may change the record, so
+    /// it must clear what the daemon's embedded server cached for the DID.
+    #[tokio::test]
+    async fn agent_name_changes_call_the_cache_invalidate_hook() {
+        let (mut state, _dir) = test_state().await;
+        let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        state.cache_invalidate = Some(Arc::new(move |change: CacheChange<'_>| {
+            recorded.lock().unwrap().push(format!("{change:?}"));
+        }));
+        let owner = "did:example:owner";
+        let path = "slot-hook";
+        register_owned(&state, owner, path).await;
+        calls.lock().unwrap().clear();
+
+        let log = build_test_did_log_with_names("control.test", path, &["alice"]).await;
+        set_agent_name(&owner_auth(owner), &state, path, "alice", &log, None)
+            .await
+            .expect("set");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![format!("{:?}", CacheChange::Did(path))]
+        );
+    }
+
     #[tokio::test]
     async fn set_agent_name_binds_when_document_claims_it() {
         let (state, _dir) = test_state().await;

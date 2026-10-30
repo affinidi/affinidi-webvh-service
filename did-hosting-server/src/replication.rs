@@ -36,7 +36,7 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
-use did_hosting_common::did_ops::{DidRecord, content_log_key, did_key};
+use did_hosting_common::did_ops::{DidRecord, did_key};
 use did_hosting_common::server::auth::session::now_epoch;
 
 use crate::server::AppState;
@@ -458,9 +458,7 @@ async fn apply_listing(
                 .insert(did_key(&record.mnemonic), &current)
                 .await
                 .map_err(|e| e.to_string())?;
-            state
-                .did_cache
-                .invalidate(&content_log_key(&record.mnemonic));
+            state.did_cache.invalidate_did(&record.mnemonic);
             warn!(
                 mnemonic = %record.mnemonic,
                 disabled = want.disabled,
