@@ -48,6 +48,15 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # Lockstep versions, CHANGELOG.md and RELEASE agree, RELEASE never moves
+  # backwards (RELEASES.md). Here so nightly only advances past it green.
+  release-guards:
+    name: release guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: affinidi/pipeline-rust/.github/actions/release-guards@feat/release-branch-actions
+
   clippy:
     name: cargo clippy
     runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-latest' }}

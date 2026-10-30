@@ -11,12 +11,11 @@ name: Backport
 # action comments on the source PR; backport it by hand on a branch named
 # `backport-<pr>-to-release/<name>`.
 #
-# pull_request_target, so it runs with this repository's token even for a PR
+# pull_request_target, so it runs with this repository's secrets even for a PR
 # from a fork. It checks out no PR code to run: the action only cherry-picks
-# the commits a maintainer already merged. The PR is opened with RELEASE_TOKEN
-# because one opened with GITHUB_TOKEN triggers no workflows, and the backport
-# needs CI. The secret is required here: the enterprise does not allow
-# GITHUB_TOKEN to open pull requests (RELEASES.md).
+# the commits a maintainer already merged. The PR is opened with the release
+# bot app: `branch rules` accepts a backport only from it, and a PR opened
+# with GITHUB_TOKEN would run no CI.
 on:
   pull_request_target:
     types: [closed, labeled]
@@ -31,34 +30,23 @@ jobs:
       github.event.pull_request.merged == true &&
       (github.event.action == 'closed' || startsWith(github.event.label.name, 'backport '))
     runs-on: ubuntu-latest
+    # RELEASE_BOT_PRIVATE_KEY is a secret of this environment.
+    environment: release
     timeout-minutes: 15
-    permissions:
-      contents: write
-      pull-requests: write
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app
         with:
-          token: ${{ secrets.RELEASE_TOKEN || github.token }}
-      # Every backport conflicts on CHANGELOG.md (main's `## Unreleased` is not
-      # on a GA'd branch), and the fix is always the same: keep the release
-      # branch's copy. Do that in the cherry-pick itself. Left to the action, a
-      # conflict is committed as `BACKPORT-CONFLICT`, which the repository's
-      # commit-message rule rejects, so the push fails and no PR is opened.
-      # A merge driver of `true` keeps "ours", which during a cherry-pick is the
-      # release branch.
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+      # Every backport conflicts on CHANGELOG.md, and the fix is always the same:
+      # keep the release branch's copy ("ours" during a cherry-pick). Global, as
+      # the action makes its own checkout.
       - name: Keep the release branch's CHANGELOG.md when cherry-picking
         run: |
-          git config merge.keep-release-changelog.driver true
-          echo "CHANGELOG.md merge=keep-release-changelog" >> "$(git rev-parse --git-path info/attributes)"
-      - uses: korthout/backport-action@8560fb503c275d433c56f05a2f64850093baa9f7 # v4.7.0
+          git config --global merge.keep-release-changelog.driver true
+          echo "CHANGELOG.md merge=keep-release-changelog" > "$RUNNER_TEMP/backport.gitattributes"
+          git config --global core.attributesFile "$RUNNER_TEMP/backport.gitattributes"
+      - uses: affinidi/pipeline-rust/.github/actions/release-backport@feat/release-branch-actions
         with:
-          github_token: ${{ secrets.RELEASE_TOKEN || github.token }}
-          label_pattern: '^backport (release/\d+\.\d+)$'
-          pull_title: '${pull_title}'
-          pull_description: |-
-            Backport of #${pull_number} to `${target_branch}`.
-
-            ${pull_description}
-          add_labels: backport
-          copy_assignees: true
-          experimental: '{"conflict_resolution": "draft_commit_conflicts"}'
+          token: ${{ steps.app.outputs.token }}

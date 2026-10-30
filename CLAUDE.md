@@ -451,10 +451,12 @@ Also worth knowing before you go looking for them:
   supported release lands on `main` first, then gets a `backport
   release/<major.minor>` label. See `RELEASES.md`.
 
-  The tooling (`scripts/release_lib.py::set_version`) also moves the internal
-  path-dep pins and refreshes `fuzz/Cargo.lock`. That detached workspace's
-  committed lock records `did-hosting-common`'s version, and the nightly Fuzz
-  job gates on `cargo fetch --locked` with no PR check exercising it — so a
+  The version is `[workspace.package] version`, inherited by every crate; the
+  tooling also moves the internal path-dep pins, and
+  `scripts/sync-version-files.py` refreshes `docs/openapi.json` and
+  `fuzz/Cargo.lock`. That detached workspace's committed lock records
+  `did-hosting-common`'s version, and the nightly Fuzz job gates on `cargo
+  fetch --locked` with no PR check exercising it — so a
   **dependency-requirement bump** in a normal PR still needs `cargo
   generate-lockfile --manifest-path fuzz/Cargo.toml`, or the fuzz job turns red
   the next morning with no fuzzing having run.
