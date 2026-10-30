@@ -78,11 +78,73 @@ pub struct GeoIpConfig {
     /// database is a warning at startup, not a boot failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database: Option<PathBuf>,
+    /// Operator-named networks (`[[geoip.networks]]`), checked before the
+    /// database: an office LAN, a VPN, or a known egress address, which a
+    /// public database cannot place (private ranges are never looked up in
+    /// it). The most specific range containing the address wins. Works with
+    /// or without `database`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub networks: Vec<NamedNetwork>,
+}
+
+/// One `[[geoip.networks]]` entry: every address in `cidr` is shown as
+/// `location`. Checked at load — a bad range, or a label that is empty, has
+/// control characters, or is over the schema's 128 characters, is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "RawNamedNetwork", into = "RawNamedNetwork")]
+pub struct NamedNetwork {
+    pub cidr: ipnetwork::IpNetwork,
+    pub location: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawNamedNetwork {
+    cidr: String,
+    location: String,
+}
+
+impl TryFrom<RawNamedNetwork> for NamedNetwork {
+    type Error = String;
+
+    fn try_from(raw: RawNamedNetwork) -> Result<Self, String> {
+        let cidr = raw.cidr.trim().parse().map_err(|_| {
+            format!(
+                "[[geoip.networks]] cidr `{}` is not an IP address or CIDR range",
+                raw.cidr
+            )
+        })?;
+        let location = raw.location.trim().to_string();
+        if location.is_empty() || location.chars().any(char::is_control) {
+            return Err(format!(
+                "[[geoip.networks]] location for `{}` must be non-empty text without \
+                 control characters",
+                raw.cidr
+            ));
+        }
+        if location.chars().count() > crate::geoip::MAX_LOCATION_CHARS {
+            return Err(format!(
+                "[[geoip.networks]] location for `{}` is longer than {} characters",
+                raw.cidr,
+                crate::geoip::MAX_LOCATION_CHARS
+            ));
+        }
+        Ok(Self { cidr, location })
+    }
+}
+
+impl From<NamedNetwork> for RawNamedNetwork {
+    fn from(n: NamedNetwork) -> Self {
+        Self {
+            cidr: n.cidr.to_string(),
+            location: n.location,
+        }
+    }
 }
 
 impl GeoIpConfig {
     pub fn is_default(&self) -> bool {
-        self.database.is_none()
+        self.database.is_none() && self.networks.is_empty()
     }
 
     /// `{prefix}_GEOIP_DATABASE` overrides `[geoip] database`; an empty value

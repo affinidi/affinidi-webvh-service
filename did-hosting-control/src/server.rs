@@ -222,14 +222,17 @@ impl AuthState for AppState {
     }
 }
 
-/// Open the configured GeoIP database (see [`crate::geoip`]). Never fails on
-/// the file itself — only if the blocking read task cannot be joined.
+/// Open the configured GeoIP database and named networks (see
+/// [`crate::geoip`]). Never fails on the file itself — only if the blocking
+/// read task cannot be joined.
 pub async fn open_geoip(
-    path: Option<std::path::PathBuf>,
+    config: &crate::config::GeoIpConfig,
 ) -> Result<Arc<crate::geoip::GeoIp>, AppError> {
+    let path = config.database.clone();
+    let networks = config.networks.iter().map(|n| (n.cidr, n.location.clone()));
     tokio::task::spawn_blocking(move || crate::geoip::GeoIp::open(path))
         .await
-        .map(Arc::new)
+        .map(|geoip| Arc::new(geoip.with_networks(networks)))
         .map_err(|e| AppError::Internal(format!("GeoIP database load task: {e}")))
 }
 
@@ -323,7 +326,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // The local GeoIP database, if configured (base design §12.6). Advisory:
     // a file that cannot be read is a warning, and sign-in locations show as
     // "unknown". Read off the runtime's workers — it can be 100+ MB.
-    let geoip = open_geoip(config.geoip.database.clone()).await?;
+    let geoip = open_geoip(&config.geoip).await?;
 
     let state = AppState {
         store: store.clone(),

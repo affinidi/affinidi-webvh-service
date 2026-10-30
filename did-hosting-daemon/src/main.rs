@@ -1529,7 +1529,7 @@ async fn build_control(
         // Wallet sign-in locations from the local GeoIP database, if any
         // (mirrors `did_hosting_control::server`).
         oob: Arc::new(did_hosting_control::oob::OobRuntime::with_geoip(
-            did_hosting_control::server::open_geoip(config.geoip.database.clone()).await?,
+            did_hosting_control::server::open_geoip(&config.geoip).await?,
         )),
         large_document_budget: Arc::new(
             did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),

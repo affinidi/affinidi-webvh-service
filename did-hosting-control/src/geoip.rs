@@ -10,6 +10,11 @@
 //! address is `None`, which the caller reports as `"unknown"` (the wallet
 //! shows that as a warning, not as neutral). See `docs/geoip.md`.
 //!
+//! Operator-named networks (`[[geoip.networks]]`, [`GeoIp::with_networks`])
+//! are checked first, so an office LAN or VPN — private ranges the database
+//! is never asked about — can still be shown as somewhere. This part is ours;
+//! the VTC has no equivalent.
+//!
 //! The file is read into memory, and re-read when it changes on disk (a
 //! periodic check of its modification time and length,
 //! [`GeoIp::spawn_reloader`]), so a monthly database refresh needs no restart.
@@ -25,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
+use ipnetwork::IpNetwork;
 use maxminddb::{Reader, geoip2};
 use tracing::{info, warn};
 
@@ -80,6 +86,8 @@ pub enum Refresh {
 /// The process's GeoIP handle, carried on [`crate::oob::OobRuntime`].
 pub struct GeoIp {
     path: Option<PathBuf>,
+    /// Operator-named networks, most specific first.
+    networks: Vec<(IpNetwork, String)>,
     /// The database in use. A lookup clones the `Arc` and releases the lock,
     /// so a reload swaps it without waiting on lookups, and a lookup in flight
     /// finishes on the version it started with.
@@ -93,6 +101,7 @@ impl std::fmt::Debug for GeoIp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GeoIp")
             .field("path", &self.path)
+            .field("networks", &self.networks.len())
             .field("loaded", &self.is_loaded())
             .finish()
     }
@@ -103,6 +112,7 @@ impl GeoIp {
     pub fn disabled() -> Self {
         Self {
             path: None,
+            networks: Vec::new(),
             reader: RwLock::new(None),
             seen: Mutex::new(Seen::Never),
         }
@@ -121,6 +131,25 @@ impl GeoIp {
         };
         geoip.refresh();
         geoip
+    }
+
+    /// Name these networks: an address in one is shown as its label, ahead of
+    /// any database lookup, and whether or not it is publicly routable. When
+    /// ranges overlap the most specific (longest prefix) wins.
+    pub fn with_networks(
+        mut self,
+        networks: impl IntoIterator<Item = (IpNetwork, String)>,
+    ) -> Self {
+        let mut networks: Vec<_> = networks
+            .into_iter()
+            .map(|(net, label)| (canonical_network(net), label))
+            .collect();
+        networks.sort_by_key(|(net, _)| std::cmp::Reverse(net.prefix()));
+        if !networks.is_empty() {
+            info!(count = networks.len(), "GeoIP named networks configured");
+        }
+        self.networks = networks;
+        self
     }
 
     /// Whether a database is loaded.
@@ -210,12 +239,27 @@ impl GeoIp {
     /// link-local, CGNAT, unique-local, documentation …) or has no record.
     pub fn locate(&self, ip: IpAddr) -> Option<String> {
         let ip = ip.to_canonical();
+        if let Some((_, label)) = self.networks.iter().find(|(net, _)| net.contains(ip)) {
+            return Some(label.clone());
+        }
         if !is_locatable(ip) {
             return None;
         }
         let reader = self.reader.read().ok()?.as_ref().map(Arc::clone)?;
         let city = reader.lookup(ip).ok()?.decode::<geoip2::City>().ok()??;
         format_location(&city)
+    }
+}
+
+/// An IPv4-mapped IPv6 range (`::ffff:10.0.0.0/104`) as the IPv4 range it
+/// is, so it matches the canonical addresses [`GeoIp::locate`] compares.
+fn canonical_network(net: IpNetwork) -> IpNetwork {
+    match net {
+        IpNetwork::V6(v6) if v6.prefix() >= 96 => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => IpNetwork::new(IpAddr::V4(v4), v6.prefix() - 96).unwrap_or(net),
+            None => net,
+        },
+        _ => net,
     }
 }
 
@@ -667,6 +711,58 @@ mod tests {
         for addr in ["81.2.69.160", "8.8.8.8", "10.0.0.1"] {
             assert!(!logs.contains(addr), "{logs}");
         }
+    }
+
+    fn named(list: &[(&str, &str)]) -> Vec<(IpNetwork, String)> {
+        list.iter()
+            .map(|(net, label)| (net.parse().unwrap(), label.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn named_networks_work_without_a_database() {
+        let g = GeoIp::disabled().with_networks(named(&[
+            ("10.20.0.0/16", "Sydney office"),
+            ("fd00:1::/32", "VPN"),
+        ]));
+        assert!(!g.is_loaded());
+        // Private addresses, which the database is never asked about.
+        assert_eq!(g.locate(ip("10.20.3.4")).as_deref(), Some("Sydney office"));
+        assert_eq!(
+            g.locate(ip("::ffff:10.20.3.4")).as_deref(),
+            Some("Sydney office")
+        );
+        assert_eq!(g.locate(ip("fd00:1::9")).as_deref(), Some("VPN"));
+        assert_eq!(g.locate(ip("10.21.0.1")), None);
+        assert_eq!(g.locate(ip("81.2.69.160")), None);
+    }
+
+    #[test]
+    fn the_most_specific_named_network_wins_over_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("city.mmdb");
+        write_db(&path, &vienna_db(), 1_000);
+        // Listed broad-first: order in the config does not matter.
+        let g = GeoIp::open(Some(path)).with_networks(named(&[
+            ("10.0.0.0/8", "Corporate network"),
+            ("10.20.0.0/16", "Sydney office"),
+            ("81.2.69.160/32", "Vienna office egress"),
+            ("::ffff:192.168.0.0/112", "Lab"),
+        ]));
+        assert_eq!(g.locate(ip("10.20.3.4")).as_deref(), Some("Sydney office"));
+        assert_eq!(
+            g.locate(ip("10.99.0.1")).as_deref(),
+            Some("Corporate network")
+        );
+        // A named public address overrides the database...
+        assert_eq!(
+            g.locate(ip("81.2.69.160")).as_deref(),
+            Some("Vienna office egress")
+        );
+        // ...and the rest of the database still answers.
+        assert_eq!(g.locate(ip("81.2.69.161")).as_deref(), Some("Vienna, AT"));
+        // A mapped range in the config matches the plain IPv4 address.
+        assert_eq!(g.locate(ip("192.168.4.4")).as_deref(), Some("Lab"));
     }
 
     #[test]

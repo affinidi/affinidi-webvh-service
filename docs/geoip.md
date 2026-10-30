@@ -22,10 +22,12 @@ warning rather than as neutral. Configuring one is optional, but recommended.
   address, or the address is not a public one: private (`10/8`,
   `172.16/12`, `192.168/16`), loopback, link-local, carrier-grade NAT
   (`100.64/10`), IPv6 unique-local (`fc00::/7`), documentation, benchmarking,
-  multicast and reserved ranges are never looked up. Behind a reverse proxy,
-  list the proxy in `[server] trusted_proxies` so its `X-Forwarded-For` is
-  honoured; otherwise every request comes from the proxy's (usually private)
-  address and every location is `unknown`.
+  multicast and reserved ranges are never looked up in the database — name
+  them yourself if you want them shown (see "Naming your own networks").
+  Behind a reverse proxy, list the proxy in `[server] trusted_proxies` (see
+  "Behind a reverse proxy") so its `X-Forwarded-For` is honoured; otherwise
+  every request comes from the proxy's (usually private) address and every
+  location is `unknown`.
 
 The result is at most 128 characters, the limit the `auth/oob` schema sets.
 Only that coarse result is kept, in the sign-in request while it is open;
@@ -100,6 +102,56 @@ and sign-in works without it. Leaving `[geoip]` out keeps every location
 
 The service reads the whole file into memory (about the size of the unpacked
 file), and briefly holds two copies while a new version loads.
+
+## Naming your own networks
+
+A public database cannot place an office LAN, a VPN pool or any other private
+range, so a sign-in from one shows as `unknown`. Name them instead:
+
+```toml
+[[geoip.networks]]
+cidr = "10.20.0.0/16"
+location = "Sydney office"
+
+[[geoip.networks]]
+cidr = "fd00:1::/32"
+location = "Corporate VPN"
+
+[[geoip.networks]]
+cidr = "203.0.113.10"         # a single address: the office's public egress
+location = "Sydney office"
+```
+
+- `cidr` is a CIDR range or a single address; `location` is what the wallet
+  shows, at most 128 characters.
+- These are checked **before** the database, for any address, private or
+  public, so a named public address overrides the database's answer.
+- When ranges overlap, the most specific (longest prefix) wins, whatever the
+  order in the file.
+- They work with or without `database`. A bad range or label stops the
+  service at startup with the entry named; changes need a restart.
+
+This is specific to the hosting service; the VTC has no equivalent.
+
+## Behind a reverse proxy
+
+The location is only as good as the client address. Behind a load balancer
+or reverse proxy, the TCP peer is the proxy, so list your proxies — single
+addresses or CIDR ranges, like the VTC's `trust_xff_cidrs`:
+
+```toml
+[server]
+trusted_proxies = ["10.0.0.0/16", "2001:db8:100::/48"]
+```
+
+When a request comes from one of them, the service walks `X-Forwarded-For`
+from the right, skips every hop that is itself a trusted proxy, and uses the
+first address that isn't. Anything doubtful — no header, a malformed entry,
+a chain of more than 64 entries, or one trusted end to end — falls back to
+the proxy's own address. List only proxies that append to (or overwrite)
+`X-Forwarded-For`, and never a layer-4 (TCP) forwarder, which passes the
+client's own header through: that lets anyone choose their address. The
+same setting drives every per-address rate limit, on every service.
 
 ## Keeping it current
 

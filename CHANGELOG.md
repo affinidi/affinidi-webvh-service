@@ -15,6 +15,27 @@ A missing or bad file is a warning, not a startup failure, and a replaced
 file is re-read within a minute. Without the table nothing changes. See
 `docs/geoip.md`.
 
+`[[geoip.networks]]` names your own ranges (`cidr`, `location`), such as an
+office LAN or VPN that no public database can place. They are checked before
+the database, the most specific range wins, and a bad entry stops startup.
+
+### Changed — `trusted_proxies` takes CIDR ranges and follows the VTC's rules
+
+`[server] trusted_proxies`, on every service, now accepts CIDR ranges
+(`"10.0.0.0/16"`) as well as single addresses, like the VTC's
+`trust_xff_cidrs`. An entry that is neither used to be dropped silently,
+leaving that proxy untrusted; it now stops startup with the entry named.
+
+Client-address resolution from `X-Forwarded-For` now matches the VTC:
+- every header line is read, as one chain;
+- `addr:port`, `[v6]` and IPv4-mapped entries are accepted;
+- a malformed entry reached before the client, a chain of more than 64
+  entries, or a chain trusted end to end falls back to the TCP peer. The last
+  case used to return the leftmost entry, which the client controls.
+
+The control plane's duplicate of this function is gone; every service uses
+the one in `did-hosting-common`.
+
 ### Fixed — false "corrupted entry" warnings at startup
 
 The store integrity check reported every agent-name index entry

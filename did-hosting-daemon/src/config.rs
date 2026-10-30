@@ -475,6 +475,38 @@ context_id = "webvh"
         );
     }
 
+    /// `[[geoip.networks]]` reaches the control plane; a bad range or label
+    /// stops the load and says which entry.
+    #[test]
+    fn geoip_named_networks_are_checked_at_load() {
+        let toml = format!(
+            "{SELF_MANAGED_TOML}\n[[geoip.networks]]\ncidr = \"10.20.0.0/16\"\nlocation = \" Sydney office \"\n\n[[geoip.networks]]\ncidr = \"192.0.2.7\"\nlocation = \"VPN\"\n"
+        );
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        let nets = cfg.control_config().geoip.networks;
+        assert_eq!(nets.len(), 2);
+        assert_eq!(nets[0].cidr.to_string(), "10.20.0.0/16");
+        assert_eq!(nets[0].location, "Sydney office");
+        assert_eq!(nets[1].cidr.to_string(), "192.0.2.7/32");
+
+        let long = "x".repeat(129);
+        for (cidr, location, needle) in [
+            ("10.0.0.0/33", "Office", "10.0.0.0/33"),
+            ("office-lan", "Office", "office-lan"),
+            ("10.0.0.0/8", "", "10.0.0.0/8"),
+            ("10.0.0.0/8", "Bad\\u0007", "10.0.0.0/8"),
+            ("10.0.0.0/8", long.as_str(), "128"),
+        ] {
+            let toml = format!(
+                "{SELF_MANAGED_TOML}\n[[geoip.networks]]\ncidr = \"{cidr}\"\nlocation = \"{location}\"\n"
+            );
+            let (_dir, path) = write_temp_config(&toml);
+            let err = DaemonConfig::load(Some(path)).unwrap_err().to_string();
+            assert!(err.contains(needle), "{cidr} / {location}: {err}");
+        }
+    }
+
     #[test]
     fn loads_vta_config_without_identity_block_defaults_to_vta() {
         // Back-compat: existing VTA-mode configs don't have an `[identity]`

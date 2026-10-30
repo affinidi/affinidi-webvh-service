@@ -283,8 +283,12 @@ wallet shows as a warning.
 database = "/var/lib/did-hosting/geoip/dbip-city-lite.mmdb"
 ```
 
-A missing or unreadable file is a warning, not a startup failure, and a
-replaced file is picked up within a minute without a restart. See
+Private ranges (an office LAN, a VPN) can be named with
+`[[geoip.networks]]` (`cidr`, `location`). Behind a reverse proxy, list it in
+`[server] trusted_proxies` (addresses or CIDR ranges) so the real client
+address is used. A missing or unreadable file is a warning, not a startup
+failure, and a replaced file is picked up within a minute without a restart.
+See
 [`docs/geoip.md`](../docs/geoip.md) for choosing a database (DB-IP City Lite
 or MaxMind GeoLite2 City), attribution and a monthly update job.
 
