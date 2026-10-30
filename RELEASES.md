@@ -159,8 +159,9 @@ Settings, not files:
 - **Ruleset on `release/**`:** require a PR, require the CI jobs and
   `branch rules`, block force pushes and deletion.
 - **Ruleset on `main`:** require a PR, and require `branch rules`.
-- **Ruleset on `nightly`:** block force pushes and deletion; only the
-  workflow's identity may update it.
+- **Ruleset on `nightly`:** block force pushes and deletion; only the release
+  bot (which `nightly.yml` runs as), maintainers and admins may create or
+  update it.
 - **The release bot app** (required for backports, preps and workflow cuts) —
   `affinidi-semantic-release`, installed on this repository with contents and
   pull-requests write. `RELEASE_BOT_APP_ID` and `RELEASE_BOT_PRIVATE_KEY` must
@@ -168,5 +169,4 @@ Settings, not files:
   PR only when this app opened it, and the enterprise does not allow
   `GITHUB_TOKEN` to open pull requests (one it opened would trigger no CI
   anyway).
-- **`RELEASE_TOKEN`** (optional) — moves `nightly` when set; `GITHUB_TOKEN`
-  otherwise. `release-tag.yml` needs no secret.
+- `release-tag.yml` needs no secret.
