@@ -2,13 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use aws_sdk_dynamodb::Client;
+use aws_sdk_dynamodb::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
+use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{
     AttributeValue, Delete, KeySchemaElement, KeyType, ProvisionedThroughput, Put, ReturnValue,
     ScalarAttributeType, TransactWriteItem,
 };
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::server::config::StoreConfig;
 use crate::server::error::AppError;
@@ -21,6 +23,51 @@ const VAL_ATTR: &str = "val";
 /// `VAL_ATTR` so an increment never collides with a JSON blob some other
 /// caller stores at the same partition key.
 const CNT_ATTR: &str = "cnt";
+
+/// DynamoDB's error codes for a request refused because the table or the
+/// account is over its throughput, after the SDK's own retries.
+const THROTTLING_CODES: &[&str] = &[
+    "ProvisionedThroughputExceededException",
+    "ThrottlingException",
+    "RequestLimitExceeded",
+];
+
+/// The same, as a reason a cancelled transaction gives for one of its items.
+const THROTTLED_CANCELLATION_CODES: &[&str] = &["ThrottlingError", "ProvisionedThroughputExceeded"];
+
+/// A failed request as an [`AppError`]: throttling is
+/// [`AppError::RateLimited`], so it reaches the client as "retry later"
+/// rather than as a fault; anything else stays [`AppError::Store`].
+fn request_error<E, R>(op: &str, e: SdkError<E, R>) -> AppError
+where
+    E: ProvideErrorMetadata + std::error::Error + 'static,
+    R: std::fmt::Debug,
+{
+    if e.code()
+        .is_some_and(|code| THROTTLING_CODES.contains(&code))
+    {
+        warn!(op, error = %DisplayErrorContext(&e), "dynamodb throttled");
+        return AppError::store_throttled();
+    }
+    AppError::Store(format!("dynamodb {op}: {e}"))
+}
+
+/// [`request_error`] for `TransactWriteItems`, whose throttling can also
+/// arrive as a cancelled transaction naming throttling as an item's reason.
+fn transact_error<R: std::fmt::Debug>(e: SdkError<TransactWriteItemsError, R>) -> AppError {
+    if let Some(TransactWriteItemsError::TransactionCanceledException(cancelled)) =
+        e.as_service_error()
+        && cancelled.cancellation_reasons().iter().any(|reason| {
+            reason
+                .code()
+                .is_some_and(|code| THROTTLED_CANCELLATION_CODES.contains(&code))
+        })
+    {
+        warn!(error = %DisplayErrorContext(&e), "dynamodb transaction throttled");
+        return AppError::store_throttled();
+    }
+    request_error("transact", e)
+}
 
 // ---------------------------------------------------------------------------
 // DynamoDbBackend
@@ -156,7 +203,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
                 .item(VAL_ATTR, AttributeValue::B(Blob::new(value)))
                 .send()
                 .await
-                .map_err(|e| AppError::Store(format!("dynamodb put: {e}")))?;
+                .map_err(|e| request_error("put", e))?;
             Ok(())
         })
     }
@@ -171,7 +218,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
                 .key(PK_ATTR, AttributeValue::B(Blob::new(key)))
                 .send()
                 .await
-                .map_err(|e| AppError::Store(format!("dynamodb get: {e}")))?;
+                .map_err(|e| request_error("get", e))?;
 
             Ok(result.item.and_then(|item| {
                 item.get(VAL_ATTR).and_then(|attr| {
@@ -194,7 +241,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
                 .key(PK_ATTR, AttributeValue::B(Blob::new(key)))
                 .send()
                 .await
-                .map_err(|e| AppError::Store(format!("dynamodb delete: {e}")))?;
+                .map_err(|e| request_error("delete", e))?;
             Ok(())
         })
     }
@@ -210,7 +257,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
                 .projection_expression(PK_ATTR)
                 .send()
                 .await
-                .map_err(|e| AppError::Store(format!("dynamodb get: {e}")))?;
+                .map_err(|e| request_error("get", e))?;
             Ok(result.item.is_some())
         })
     }
@@ -231,7 +278,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
                 .return_values(ReturnValue::AllOld)
                 .send()
                 .await
-                .map_err(|e| AppError::Store(format!("dynamodb delete (atomic take): {e}")))?;
+                .map_err(|e| request_error("delete (atomic take)", e))?;
             Ok(response.attributes.and_then(|attrs| {
                 attrs.get(VAL_ATTR).and_then(|attr| {
                     if let AttributeValue::B(blob) = attr {
@@ -264,7 +311,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
                 .return_values(ReturnValue::UpdatedNew)
                 .send()
                 .await
-                .map_err(|e| AppError::Store(format!("dynamodb update (incr): {e}")))?;
+                .map_err(|e| request_error("update (incr)", e))?;
             let n = response
                 .attributes
                 .as_ref()
@@ -298,10 +345,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
                 if let Some(ref key) = last_key {
                     req = req.set_exclusive_start_key(Some(key.clone()));
                 }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| AppError::Store(format!("dynamodb scan: {e}")))?;
+                let resp = req.send().await.map_err(|e| request_error("scan", e))?;
 
                 if let Some(items) = resp.items {
                     filter_items_by_prefix(items, &prefix, &mut results);
@@ -411,7 +455,7 @@ impl BatchOps for DynamoDbBatch {
                     .set_transact_items(Some(items))
                     .send()
                     .await
-                    .map_err(|e| AppError::Store(format!("dynamodb transact: {e}")))?;
+                    .map_err(transact_error)?;
             }
 
             Ok(())
@@ -421,7 +465,56 @@ impl BatchOps for DynamoDbBatch {
 
 #[cfg(test)]
 mod tests {
+    use aws_sdk_dynamodb::error::ErrorMetadata;
+    use aws_sdk_dynamodb::operation::get_item::GetItemError;
+    use aws_sdk_dynamodb::types::CancellationReason;
+    use aws_sdk_dynamodb::types::error::TransactionCanceledException;
+
     use super::*;
+
+    fn get_failure(code: &str) -> SdkError<GetItemError, ()> {
+        SdkError::service_error(
+            GetItemError::generic(ErrorMetadata::builder().code(code).build()),
+            (),
+        )
+    }
+
+    #[test]
+    fn throttling_is_rate_limited_and_other_failures_stay_store_errors() {
+        for code in THROTTLING_CODES {
+            let e = request_error("get", get_failure(code));
+            assert!(e.is_store_throttled(), "{code}: {e:?}");
+        }
+        assert!(matches!(
+            request_error("get", get_failure("ResourceNotFoundException")),
+            AppError::Store(_)
+        ));
+    }
+
+    #[test]
+    fn a_transaction_cancelled_for_throttling_is_rate_limited() {
+        let cancelled = |code: &str| {
+            SdkError::<_, ()>::service_error(
+                TransactWriteItemsError::TransactionCanceledException(
+                    TransactionCanceledException::builder()
+                        .cancellation_reasons(CancellationReason::builder().code("None").build())
+                        .cancellation_reasons(CancellationReason::builder().code(code).build())
+                        .build(),
+                ),
+                (),
+            )
+        };
+        for code in THROTTLED_CANCELLATION_CODES {
+            assert!(
+                transact_error(cancelled(code)).is_store_throttled(),
+                "{code}"
+            );
+        }
+        assert!(matches!(
+            transact_error(cancelled("ConditionalCheckFailed")),
+            AppError::Store(_)
+        ));
+    }
 
     fn bin_item(pk: &[u8], val: &[u8]) -> HashMap<String, AttributeValue> {
         HashMap::from([

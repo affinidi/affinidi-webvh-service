@@ -79,6 +79,12 @@ pub const CLOCK_MARGIN_SECS: u64 = 60;
 /// Width of a bucket, in seconds of `issuedAt`.
 const BUCKET_SECS: u64 = 60;
 
+/// What a caller refused with [`ReplayError::Full`] is told to wait: the
+/// cache drops its oldest minute of records once a bucket width. A hint, not
+/// a promise: if that minute held few records, or (for the per-signer
+/// bound) none of this signer's, a retry can be refused again.
+pub const FULL_RETRY_AFTER_SECS: u64 = BUCKET_SECS;
+
 /// Why a record was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplayError {
@@ -97,7 +103,9 @@ impl ReplayError {
         use trust_tasks_rs::RejectReason;
         match self {
             ReplayError::Duplicate => RejectReason::IdConflict,
-            ReplayError::Full => RejectReason::Unavailable { retry_after: None },
+            ReplayError::Full => RejectReason::Unavailable {
+                retry_after: Some(super::error::retry_at(FULL_RETRY_AFTER_SECS)),
+            },
             ReplayError::Stale => RejectReason::Stale {
                 detail: trust_tasks_rs::freshness::StaleReason::OlderThanWindow,
             },
@@ -111,9 +119,11 @@ impl From<ReplayError> for AppError {
             ReplayError::Duplicate => {
                 AppError::Validation("duplicate message id (replay-detected)".into())
             }
-            ReplayError::Full => AppError::Internal(
-                "replay cache is full; refusing new signed requests until records expire".into(),
-            ),
+            ReplayError::Full => AppError::RateLimited {
+                limiter: super::error::LIMITER_REPLAY_CACHE,
+                message: "too many signed requests in flight; retry later".into(),
+                retry_after_secs: FULL_RETRY_AFTER_SECS,
+            },
             ReplayError::Stale => {
                 AppError::Validation("issuedAt is missing or outside the replay window".into())
             }
@@ -201,6 +211,45 @@ impl ReplayCache {
             limits,
             ..Self::default()
         })
+    }
+
+    /// Forget a record [`Self::check`] accepted, so the same document can be
+    /// sent again: for a document refused as `unavailable` after it was
+    /// recorded, which did not run. A refused document can be resent as a
+    /// retry (the VTA's contract for a refusal under load), and without this
+    /// the resend would be refused as a replay. Only ever for a document whose
+    /// task committed nothing; a record already gone is left alone.
+    pub fn release(&self, signer: &str, id: &str, issued_at: Option<DateTime<Utc>>) {
+        let Some(issued_at) = issued_at.map(|t| t.timestamp()) else {
+            return;
+        };
+        let Ok(issued_at) = u64::try_from(issued_at) else {
+            return;
+        };
+        let signer_hash = self.keys.0.hash_one(signer);
+        let record = (u128::from(self.keys.0.hash_one((signer, id))) << 64)
+            | u128::from(self.keys.1.hash_one((signer, id)));
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let slot = issued_at / BUCKET_SECS;
+        let Some(bucket) = inner.buckets.get_mut(&slot) else {
+            return;
+        };
+        if !bucket.records.remove(&record) {
+            return;
+        }
+        if let Some(n) = bucket.per_signer.get_mut(&signer_hash) {
+            *n -= 1;
+            if *n == 0 {
+                bucket.per_signer.remove(&signer_hash);
+            }
+        }
+        if let Some(held) = inner.per_signer.get_mut(&signer_hash) {
+            *held -= 1;
+            if *held == 0 {
+                inner.per_signer.remove(&signer_hash);
+            }
+        }
+        inner.total -= 1;
     }
 
     /// Record `(signer, id)` for the document issued at `issued_at`, or refuse
@@ -488,5 +537,41 @@ mod tests {
         assert!(
             bucket.records.capacity() * std::mem::size_of::<u128>() < 10_000 * BYTES_PER_RECORD
         );
+    }
+
+    #[test]
+    fn a_full_cache_tells_the_caller_when_to_retry() {
+        let trust_tasks_rs::RejectReason::Unavailable {
+            retry_after: Some(at),
+        } = ReplayError::Full.reject_reason()
+        else {
+            panic!("a full cache must be unavailable with a retry time");
+        };
+        assert!(at > Utc::now());
+        assert_eq!(
+            AppError::from(ReplayError::Full).retry_after_secs(),
+            Some(FULL_RETRY_AFTER_SECS)
+        );
+    }
+
+    #[test]
+    fn a_released_record_can_be_sent_again_and_only_once() {
+        let cache = ReplayCache::new();
+        let at = Some(Utc::now());
+        assert_eq!(cache.check("did:example:a", "urn:1", at), Ok(()));
+        assert_eq!(
+            cache.check("did:example:a", "urn:1", at),
+            Err(ReplayError::Duplicate)
+        );
+        cache.release("did:example:a", "urn:1", at);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.check("did:example:a", "urn:1", at), Ok(()));
+        assert_eq!(
+            cache.check("did:example:a", "urn:1", at),
+            Err(ReplayError::Duplicate)
+        );
+        // Releasing what was never recorded changes nothing.
+        cache.release("did:example:b", "urn:1", at);
+        assert_eq!(cache.len(), 1);
     }
 }

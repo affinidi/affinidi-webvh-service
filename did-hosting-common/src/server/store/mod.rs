@@ -438,6 +438,26 @@ impl KeyspaceHandle {
         self.wrap_failing(allowed, true)
     }
 
+    /// Wrap this keyspace so every read fails as a throttled store would
+    /// ([`AppError::store_throttled`]). Writes are untouched.
+    pub fn throttled_reads(&self) -> Self {
+        self.failing_reads_after(0, AppError::store_throttled)
+    }
+
+    /// Wrap this keyspace so that once `allowed` reads have succeeded, every
+    /// further read fails with `error()`. Writes are untouched.
+    pub fn failing_reads_after(&self, allowed: usize, error: fn() -> AppError) -> Self {
+        Self {
+            name: self.name.clone(),
+            inner: Arc::new(FailingReads {
+                inner: self.inner.clone(),
+                allowed: std::sync::atomic::AtomicUsize::new(allowed),
+                error,
+            }),
+            backend: self.backend.clone(),
+        }
+    }
+
     fn wrap_failing(&self, allowed: Arc<std::sync::atomic::AtomicUsize>, apply: bool) -> Self {
         Self {
             name: self.name.clone(),
@@ -511,5 +531,57 @@ impl KeyspaceOps for FailingWrites {
             self.take_write()?;
             self.inner.incr_raw(key).await
         })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct FailingReads {
+    inner: Arc<dyn KeyspaceOps>,
+    allowed: std::sync::atomic::AtomicUsize,
+    error: fn() -> AppError,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl FailingReads {
+    fn take_read(&self) -> Result<(), AppError> {
+        use std::sync::atomic::Ordering;
+        self.allowed
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .map(|_| ())
+            .map_err(|_| (self.error)())
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl KeyspaceOps for FailingReads {
+    fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
+        self.inner.insert_raw(key, value)
+    }
+    fn get_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        Box::pin(async move {
+            self.take_read()?;
+            self.inner.get_raw(key).await
+        })
+    }
+    fn remove(&self, key: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
+        self.inner.remove(key)
+    }
+    fn contains_key(&self, key: Vec<u8>) -> BoxFuture<'_, Result<bool, AppError>> {
+        Box::pin(async move {
+            self.take_read()?;
+            self.inner.contains_key(key).await
+        })
+    }
+    fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
+        Box::pin(async move {
+            self.take_read()?;
+            self.inner.prefix_iter_raw(prefix).await
+        })
+    }
+    fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        self.inner.take_raw_atomic(key)
+    }
+    fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
+        self.inner.incr_raw(key)
     }
 }

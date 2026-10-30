@@ -32,6 +32,7 @@ use trust_tasks_rs::{
 
 use crate::server::acl::{self, AclEntry, Role};
 use crate::server::domain::DomainScope;
+use crate::server::error::AppError;
 use crate::server::trust_tasks::entry::{
     AuthorityScope, SpecAclEntry, act_covers, act_of, check_authority_scope, domains_for_act,
     role_is_domain_scoped,
@@ -108,13 +109,14 @@ async fn handle_inner(
                         .with_message("only Admin callers may revoke another subject"),
                 ));
             }
-            Err(_) => {
+            Err(e) if acl::is_acl_refusal(&e) => {
                 return Err(reject_with(
                     &doc,
                     ErrorPayload::new(StandardCode::PermissionDenied)
                         .with_message("caller is not present in the maintainer's ACL"),
                 ));
             }
+            Err(e) => return Err(internal(&doc, e)),
         }
     }
 
@@ -264,13 +266,12 @@ fn offending_contexts(scope: &AuthorityScope) -> Vec<String> {
     }
 }
 
-fn internal<P>(doc: &TrustTask<P>, err: impl std::fmt::Display) -> ErrorResponse {
+fn internal<P>(doc: &TrustTask<P>, err: AppError) -> ErrorResponse {
+    // A store or internal failure says nothing about the request: the wire
+    // gets `unavailable` with a retry time when the store is over capacity,
+    // else a bare `internalError`; the detail stays in the operator log.
     tracing::error!(error = %err, "acl/revoke internal failure");
-    reject_with(
-        doc,
-        ErrorPayload::new(StandardCode::InternalError)
-            .with_message("the maintainer encountered an internal failure"),
-    )
+    reject_with(doc, err.failure_reject_reason().into())
 }
 
 #[cfg(test)]

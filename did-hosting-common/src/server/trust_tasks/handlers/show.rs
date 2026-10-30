@@ -20,6 +20,7 @@ use trust_tasks_rs::{
 };
 
 use crate::server::acl::{self, Role};
+use crate::server::error::AppError;
 use crate::server::trust_tasks::{
     DispatchOutcome, TrustTaskContext, entry::SpecAclEntry, reject_with, run_pipeline,
 };
@@ -68,6 +69,7 @@ async fn handle_inner(
     if !self_lookup {
         match acl::check_acl(acl_ks, caller).await {
             Ok(Role::Admin) => {}
+            Err(e) if !acl::is_acl_refusal(&e) => return Err(internal(&doc, e)),
             Ok(_) | Err(_) => {
                 return Err(reject_with(
                     &doc,
@@ -97,13 +99,12 @@ async fn handle_inner(
     Ok(doc.respond_with(resp_id, resp_payload))
 }
 
-fn internal<P>(doc: &TrustTask<P>, err: impl std::fmt::Display) -> ErrorResponse {
+fn internal<P>(doc: &TrustTask<P>, err: AppError) -> ErrorResponse {
+    // A store or internal failure says nothing about the request: the wire
+    // gets `unavailable` with a retry time when the store is over capacity,
+    // else a bare `internalError`; the detail stays in the operator log.
     tracing::error!(error = %err, "acl/show internal failure");
-    reject_with(
-        doc,
-        ErrorPayload::new(StandardCode::InternalError)
-            .with_message("the maintainer encountered an internal failure"),
-    )
+    reject_with(doc, err.failure_reject_reason().into())
 }
 
 #[cfg(test)]

@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+### Fixed — overload asks the client to retry, instead of looking like a fault
+
+When the store was over capacity, callers could not tell it from a server
+fault or a revoked grant, so they did not back off. Overload now answers the
+way this service's rate limits already do (and as a VTA answers its own
+operation budgets):
+
+- A throttled DynamoDB request (after the SDK's own retries) was a 500
+  `internalError`. Over HTTP it is now **429** with `x-rate-limit-source:
+  did-host`, `Retry-After`, and `{ "error": "rate_limited", "limiter":
+  "store-throughput", ... }`; as a Trust Task refusal, `unavailable` with
+  `retryAfter`, on the control plane and the witness. An edge reports it to
+  its control plane as retryable, as it now does any rate limit (one used to
+  be reported final).
+- A Trust Task refused as `unavailable` did not run, and sending the same
+  signed document again is now a retry: the control plane and the witness
+  forget its id rather than refusing the resend as a replay.
+- A failed lookup of the sender's ACL entry was refused as if the sender had
+  no grant: `permissionDenied` "caller is not present in the maintainer's
+  ACL" at the control plane's dispatch gate, in its tasks and in `acl/*`; "not
+  authorised on this witness" at the witness; a final "unauthorized" for an
+  edge's registration and stats sync; and, for a document over 64 KiB,
+  `malformedRequest` "too large". Each now answers `unavailable` with a retry
+  time when the store is throttled, else `internalError`; only an answer
+  from the ACL is a refusal. An edge's acknowledgements and health pongs
+  whose sender's role cannot be read are not recorded (an op stays queued and
+  is re-sent; a pong waits for the next ping).
+- The witness no longer puts internal error text in an `internalError`.
+- A full replay cache answered `unavailable` with no retry time. It now
+  suggests a minute, when its oldest records start to expire; a retry can
+  still be refused if the cache is still full.
+- The control plane's `POST /api/trust-tasks` sets `Retry-After`, rounded
+  up, on a refusal that carries `retryAfter`.
+- The `check-name` reservation and agent-name tasks no longer take a failed
+  read for "no default domain" (which could store a DID without one) or for
+  "this DID has no names"; the failure is reported.
+
+Not changed: sign-in (`auth/challenge`, `auth/authenticate`, `auth/refresh`,
+`auth/oob/*`) still refuses a store failure the generic way, since the shared
+sign-in library does not pass the store's error through. Only the DynamoDB
+backend recognises its throttling; other backends' store errors are still
+`internalError`.
+
 ### Added — wallet sign-in locations from a local GeoIP database
 
 The control plane (standalone or in the daemon) now fills in

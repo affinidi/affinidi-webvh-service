@@ -2378,13 +2378,9 @@ pub async fn resolve_agent_names(
         let Some(mnemonic) = mnemonic_from_did(did) else {
             continue;
         };
-        let Some(record) = state
-            .dids_ks
-            .get::<DidRecord>(did_key(&mnemonic))
-            .await
-            .ok()
-            .flatten()
-        else {
+        // A failed read is reported, not taken for "no names": a throttled
+        // store would otherwise answer success with the names missing.
+        let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? else {
             continue;
         };
         // The slot must hold *this* DID. `mnemonic_from_did` yields the slot a

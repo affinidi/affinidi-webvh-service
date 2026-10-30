@@ -493,11 +493,17 @@ impl Cx<'_> {
                 "the request carries no verified issuer".into(),
             )
         })?;
-        let role = check_acl(&self.state.acl_ks, did).await.map_err(|_| {
-            TaskError::Standard(
-                StandardCode::PermissionDenied,
-                "caller is not present in the maintainer's ACL".into(),
-            )
+        let role = check_acl(&self.state.acl_ks, did).await.map_err(|e| {
+            // Only an answer from the ACL is a refusal; a failed lookup is
+            // reported as what it is (see `is_acl_refusal`).
+            if did_hosting_common::server::acl::is_acl_refusal(&e) {
+                TaskError::Standard(
+                    StandardCode::PermissionDenied,
+                    "caller is not present in the maintainer's ACL".into(),
+                )
+            } else {
+                TaskError::App(e)
+            }
         })?;
         if let Some(bearer) = self.bearer.filter(|b| b.did == did) {
             return Ok(AuthClaims {
@@ -570,14 +576,9 @@ impl TaskError {
                     .with_message("the maintainer encountered an internal failure")
             }
             Mapped::Standard(StandardCode::Unavailable) => {
-                let retry_after = match &message {
-                    AppError::RateLimited {
-                        retry_after_secs, ..
-                    } => Some(
-                        chrono::Utc::now() + chrono::Duration::seconds(*retry_after_secs as i64),
-                    ),
-                    _ => None,
-                };
+                let retry_after = message
+                    .retry_after_secs()
+                    .map(did_hosting_common::server::error::retry_at);
                 let p = ErrorPayload::new(StandardCode::Unavailable)
                     .with_message(message.user_message());
                 match retry_after {

@@ -40,6 +40,7 @@ use trust_tasks_rs::{
 };
 
 use crate::server::acl::{self, AclEntry, Role};
+use crate::server::error::AppError;
 use crate::server::trust_tasks::entry::{AuthorityScope, SpecAclEntry, act_of};
 use crate::server::trust_tasks::{DispatchOutcome, TrustTaskContext, reject_with, run_pipeline};
 use crate::tasks::acl::list::v0_3 as list;
@@ -125,6 +126,7 @@ async fn handle_inner(
     })?;
     match acl::check_acl(acl_ks, caller).await {
         Ok(Role::Admin) => {}
+        Err(e) if !acl::is_acl_refusal(&e) => return Err(internal(&doc, e)),
         Ok(_) | Err(_) => {
             return Err(reject_with(
                 &doc,
@@ -221,7 +223,7 @@ async fn handle_inner(
     let next_cursor = next_cursor
         .map(|c| c.parse::<list::ResponseNextCursor>())
         .transpose()
-        .map_err(|e| internal(&doc, e))?;
+        .map_err(|e| internal(&doc, AppError::Internal(format!("acl/list cursor: {e}"))))?;
     // The generated payload types are `#[non_exhaustive]`: built through the
     // generated builder, whose `try_into` can only fail on a field left unset.
     let resp_payload: list::Response = list::Response::builder()
@@ -287,13 +289,12 @@ fn decode_cursor(s: &str) -> Result<CursorState, String> {
         .map_err(|_| "the cursor was not issued by this maintainer".to_string())
 }
 
-fn internal<P>(doc: &TrustTask<P>, err: impl std::fmt::Display) -> ErrorResponse {
+fn internal<P>(doc: &TrustTask<P>, err: AppError) -> ErrorResponse {
+    // A store or internal failure says nothing about the request: the wire
+    // gets `unavailable` with a retry time when the store is over capacity,
+    // else a bare `internalError`; the detail stays in the operator log.
     tracing::error!(error = %err, "acl/list internal failure");
-    reject_with(
-        doc,
-        ErrorPayload::new(StandardCode::InternalError)
-            .with_message("the maintainer encountered an internal failure"),
-    )
+    reject_with(doc, err.failure_reject_reason().into())
 }
 
 #[cfg(test)]

@@ -213,3 +213,76 @@ pub async fn dispatch(state: &AppState, parts: &Parts) -> Option<Response> {
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use did_hosting_common::server::config::{
+        AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
+    };
+    use did_hosting_common::server::store::Store;
+    use tower::ServiceExt;
+
+    use crate::config::{AppConfig, LimitsConfig, StatsConfig};
+    use crate::server::AppState;
+
+    /// A throttled store is the store's limit, not a fault: resolution answers
+    /// 429 with `Retry-After` and `x-rate-limit-source: did-host`, the shape a
+    /// client recognises as "wait and retry". (A unit test: the throttling is
+    /// injected, which integration tests do not do.)
+    #[tokio::test]
+    async fn a_throttled_store_answers_429_with_retry_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_config = StoreConfig {
+            data_dir: PathBuf::from(dir.path()),
+            ..StoreConfig::default()
+        };
+        let store = Store::open(&store_config).await.unwrap();
+        let config = AppConfig {
+            fjall: Default::default(),
+            features: FeaturesConfig::default(),
+            server_did: None,
+            mediator_did: None,
+            public_url: None,
+            server: ServerConfig::default(),
+            log: LogConfig::default(),
+            store: store_config,
+            auth: AuthConfig::default(),
+            hosting: Default::default(),
+            secrets: SecretsConfig::default(),
+            limits: LimitsConfig::default(),
+            replication: Default::default(),
+            stats: StatsConfig::default(),
+            control_did: None,
+            vta: VtaConfig::default(),
+            identity: Default::default(),
+            replay: Default::default(),
+            config_path: PathBuf::new(),
+        };
+        let mut state = AppState::new(store, config).unwrap();
+        state.dids_ks = state.dids_ks.throttled_reads();
+
+        let response = crate::routes::router(1024 * 1024)
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/alice/did.jsonl")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let headers = response.headers();
+        assert_eq!(headers.get("x-rate-limit-source").unwrap(), "did-host");
+        assert_eq!(headers.get("retry-after").unwrap(), "2");
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["limiter"], "store-throughput");
+    }
+}

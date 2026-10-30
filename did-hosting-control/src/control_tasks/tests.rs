@@ -2790,3 +2790,114 @@ async fn bound_key_rows_refuse_an_oversized_document_before_its_proof() {
     assert_eq!(code(&reply), "malformedRequest", "{reply}");
     assert_eq!(reply["payload"]["message"], "document too large", "{reply}");
 }
+
+/// A throttled ACL read says nothing about the caller: it is answered as
+/// `unavailable` with a retry time (HTTPS: 503 with `Retry-After`), never as
+/// "not present in the maintainer's ACL", which reads as a revoked grant.
+#[tokio::test]
+async fn a_throttled_acl_lookup_asks_for_a_retry_not_a_new_grant() {
+    use axum::response::IntoResponse;
+
+    let (mut state, _dir) = state().await;
+    let admin = member(&state, 53, Role::Admin).await;
+    state.acl_ks = state.acl_ks.throttled_reads();
+    let list = t("did-management/domain/list/0.1");
+
+    let reply = call(&state, Via::Tsp, &admin, &list, json!({})).await;
+    assert_eq!(code(&reply), "unavailable", "{reply}");
+    assert!(reply["payload"]["retryAfter"].is_string(), "{reply}");
+
+    let doc = signed(request(&list, &admin.did, json!({})), &admin.key).await;
+    let response = crate::routes::trust_tasks::dispatch_trust_task(
+        None,
+        axum::extract::State(state.clone()),
+        None,
+        &axum::http::HeaderMap::new(),
+        axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        response.headers().get(axum::http::header::RETRY_AFTER),
+        Some(&axum::http::HeaderValue::from(
+            did_hosting_common::server::error::STORE_THROTTLED_RETRY_AFTER_SECS
+        )),
+        "the store's hint, not rounded down"
+    );
+}
+
+/// Past the gate, a task's own ACL read can still be the one throttled: the
+/// shared engine's `cx.admin()` and the `acl/*` handlers answer it the same
+/// way as the gate, never as "not in the ACL".
+#[tokio::test]
+async fn a_throttled_acl_read_after_the_gate_asks_for_a_retry() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 54, Role::Admin).await;
+    let acl_ks = state.acl_ks.clone();
+    for slug in ["did-management/domain/list/0.1", "acl/list/0.3"] {
+        let mut state = state.clone();
+        // One read for the gate, then throttled.
+        state.acl_ks = acl_ks.failing_reads_after(
+            1,
+            did_hosting_common::server::error::AppError::store_throttled,
+        );
+        let reply = call(&state, Via::Tsp, &admin, &t(slug), json!({})).await;
+        assert_eq!(code(&reply), "unavailable", "{slug}: {reply}");
+        assert!(
+            reply["payload"]["retryAfter"].is_string(),
+            "{slug}: {reply}"
+        );
+    }
+}
+
+/// A lookup that fails for any other reason is the maintainer's fault, not a
+/// refusal of the sender: `internalError`, which names nothing internal.
+#[tokio::test]
+async fn a_failed_acl_lookup_is_an_internal_error_not_a_refusal() {
+    let (mut state, _dir) = state().await;
+    let admin = member(&state, 55, Role::Admin).await;
+    state.acl_ks = state.acl_ks.failing_reads_after(0, || {
+        did_hosting_common::server::error::AppError::Store("disk failure".into())
+    });
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t("did-management/domain/list/0.1"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(code(&reply), "internalError", "{reply}");
+    assert!(!reply.to_string().contains("disk failure"), "{reply}");
+}
+
+/// A document refused as `unavailable` did not run, so sending the very same
+/// signed document again is a retry, not a replay.
+#[tokio::test]
+async fn a_document_refused_as_unavailable_can_be_sent_again() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 56, Role::Admin).await;
+    let list = t("did-management/domain/list/0.1");
+    let doc = signed(request(&list, &admin.did, json!({})), &admin.key).await;
+
+    let mut throttled = state.clone();
+    throttled.acl_ks = state.acl_ks.failing_reads_after(
+        1,
+        did_hosting_common::server::error::AppError::store_throttled,
+    );
+    let reply = send(&throttled, Via::Tsp, &admin, doc.clone()).await;
+    assert_eq!(code(&reply), "unavailable", "{reply}");
+
+    let reply = send(&state, Via::Tsp, &admin, doc.clone()).await;
+    conforms(&reply);
+    ok(&reply, &list);
+    // Run once, it is remembered again.
+    assert_eq!(
+        code(&send(&state, Via::Tsp, &admin, doc).await),
+        "idConflict"
+    );
+}

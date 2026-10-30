@@ -132,7 +132,9 @@ async fn dispatch_inner(
                 Err(rej) => {
                     // A payload that is not `server/register/0.2` is malformed,
                     // not forbidden: the caller is told which, and can fix it.
-                    let reason = if rej.code == "e.p.registration.malformed" {
+                    let reason = if let Some(reason) = rej.reason.clone() {
+                        reason
+                    } else if rej.code == "e.p.registration.malformed" {
                         trust_tasks_rs::RejectReason::MalformedRequest {
                             reason: rej.comment.clone(),
                         }
@@ -161,12 +163,12 @@ async fn dispatch_inner(
                     Some(serde_json::to_value(&resp).expect("ack document serialises"))
                 }
                 Err(rej) => {
-                    let err = doc.reject_with(
-                        reply_id,
+                    let reason = rej.reason.clone().unwrap_or_else(|| {
                         trust_tasks_rs::RejectReason::PermissionDenied {
                             reason: rej.comment.clone(),
-                        },
-                    );
+                        }
+                    });
+                    let err = doc.reject_with(reply_id, reason);
                     Some(serde_json::to_value(&err).expect("error document serialises"))
                 }
             }
@@ -221,14 +223,20 @@ pub(crate) async fn acknowledge_outbox(
     // A registered Service settles what it was sent; so does a configured
     // watcher (see `server_push::is_configured_watcher`). The outbox only ever
     // settles an entry on its own target's signature either way.
-    if !crate::server_push::is_configured_watcher(state, sender)
-        && !matches!(
-            crate::acl::check_acl(&state.acl_ks, sender).await,
-            Ok(crate::acl::Role::Service)
-        )
-    {
-        warn!(sender, "acknowledgement ignored: Service role required");
-        return;
+    if !crate::server_push::is_configured_watcher(state, sender) {
+        match crate::acl::check_acl(&state.acl_ks, sender).await {
+            Ok(crate::acl::Role::Service) => {}
+            // Not settled either way: a failed lookup is no answer about the
+            // sender, and the entry stays queued to be acknowledged again.
+            Err(e) if !crate::acl::is_acl_refusal(&e) => {
+                warn!(sender, error = %e, "acknowledgement ignored: ACL lookup failed");
+                return;
+            }
+            _ => {
+                warn!(sender, "acknowledgement ignored: Service role required");
+                return;
+            }
+        }
     }
     match crate::outbox::acknowledge(&state.store, sender, thread).await {
         Ok(true) => {

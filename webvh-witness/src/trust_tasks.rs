@@ -55,6 +55,7 @@ use did_hosting_common::server::trust_tasks::{
     dispatch_inbound, identity_signing_secret, sign_document, verify_sender_bound,
 };
 
+use crate::error::AppError;
 use crate::server::AppState;
 use crate::witness_ops::{self, WitnessRecord};
 
@@ -135,7 +136,16 @@ pub async fn dispatch_inbound_document(
     // gets, not a weaker one: only a claimed issuer the ACL would actually
     // authorise goes on to have its proof checked.
     let claimed_role = match doc.issuer.as_deref() {
-        Some(issuer) => crate::acl::check_acl(&state.acl_ks, issuer).await.ok(),
+        Some(issuer) => match crate::acl::check_acl(&state.acl_ks, issuer).await {
+            Ok(role) => Some(role),
+            Err(e) if crate::acl::is_acl_refusal(&e) => None,
+            // Still no reply to an unverified document; its sender times out
+            // and sends it again, which is the retry a failed lookup needs.
+            Err(e) => {
+                warn!(%type_uri, error = %e, "trust task dropped: ACL lookup failed");
+                return None;
+            }
+        },
         None => None,
     };
     if !task_authorised(&type_uri, claimed_role) {
@@ -166,7 +176,18 @@ pub async fn dispatch_inbound_document(
     // the *proven* one, which is what a reply may safely attribute the
     // refusal to.
     let reply_id = || format!("urn:uuid:{}", uuid::Uuid::new_v4());
-    let role = crate::acl::check_acl(&state.acl_ks, &principal).await.ok();
+    let role = match crate::acl::check_acl(&state.acl_ks, &principal).await {
+        Ok(role) => Some(role),
+        Err(e) if crate::acl::is_acl_refusal(&e) => None,
+        // A failed lookup is no answer about the issuer: say so, rather than
+        // that it is not authorised. Nothing is remembered yet, so the same
+        // document can be sent again.
+        Err(e) => {
+            warn!(issuer = %principal, %type_uri, error = %e, "trust task deferred: ACL lookup failed");
+            let refusal = doc.reject_with(reply_id(), e.failure_reject_reason());
+            return seal(state, my_did, &principal, error_value(refusal)).await;
+        }
+    };
     let authorised = task_authorised(&type_uri, role);
     if !authorised {
         warn!(issuer = %principal, %type_uri, "trust task refused: the issuer is not authorised");
@@ -179,6 +200,7 @@ pub async fn dispatch_inbound_document(
         return seal(state, my_did, &principal, error_value(refusal)).await;
     }
 
+    let (doc_id, issued_at) = (doc.id.clone(), doc.issued_at);
     match state.replay_cache.check(&principal, &doc.id, doc.issued_at) {
         Ok(()) => {}
         Err(ReplayError::Duplicate) => {
@@ -242,6 +264,11 @@ pub async fn dispatch_inbound_document(
             },
         ))
     };
+    // Refused as over capacity: the task did not run, so the same document
+    // can be sent again as a retry rather than refused as a replay.
+    if reply.payload.get("code").and_then(Value::as_str) == Some("unavailable") {
+        state.replay_cache.release(&principal, &doc_id, issued_at);
+    }
     seal(state, my_did, &principal, reply).await
 }
 
@@ -306,11 +333,24 @@ fn invalid_log(reason: String) -> ErrorPayload {
         .with_details(json!({ "reason": reason }))
 }
 
+/// A failure that is not the request's: the detail goes in the operator log,
+/// never on the wire.
 fn internal(e: impl std::fmt::Display) -> ErrorPayload {
+    tracing::error!(error = %e, "witness trust task: internal failure");
     RejectReason::InternalError {
-        reason: e.to_string(),
+        reason: "the witness encountered an internal failure".into(),
     }
     .into()
+}
+
+/// A store failure: `unavailable` with a retry time when the store is over
+/// capacity, else [`internal`].
+fn store_failure(e: AppError) -> ErrorPayload {
+    if e.retry_after_secs().is_some() {
+        warn!(error = %e, "witness trust task deferred: store over capacity");
+        return e.failure_reject_reason().into();
+    }
+    internal(e)
 }
 
 fn rfc3339(secs: u64) -> String {
@@ -339,7 +379,7 @@ async fn key_create_task(state: &AppState, doc: &TrustTask<Value>) -> Result<Val
     let p: key_create::Payload = payload(doc)?;
     let record = witness_ops::create_witness(&state.witnesses_ks, p.label.map(|l| l.to_string()))
         .await
-        .map_err(internal)?;
+        .map_err(store_failure)?;
     info!(audit = true, witness_id = %record.witness_id, did = %record.did, "witness identity created");
     reply::<key_create::Response>(json!({ "key": witness_key(&record) }))
 }
@@ -349,7 +389,7 @@ async fn key_list_task(state: &AppState, doc: &TrustTask<Value>) -> Result<Value
     let _: key_list::Payload = payload(doc)?;
     let mut records = witness_ops::list_witnesses(&state.witnesses_ks)
         .await
-        .map_err(internal)?;
+        .map_err(store_failure)?;
     records.sort_by(|a, b| {
         a.created_at
             .cmp(&b.created_at)
@@ -365,7 +405,7 @@ async fn key_delete_task(state: &AppState, doc: &TrustTask<Value>) -> Result<Val
     let witness_id = p.witness_id.as_str();
     if witness_ops::get_witness(&state.witnesses_ks, witness_id)
         .await
-        .map_err(internal)?
+        .map_err(store_failure)?
         .is_none()
     {
         return Err(ErrorPayload::from(key_delete::error_codes::NOT_FOUND)
@@ -373,7 +413,7 @@ async fn key_delete_task(state: &AppState, doc: &TrustTask<Value>) -> Result<Val
     }
     witness_ops::delete_witness(&state.store, &state.witnesses_ks, witness_id)
         .await
-        .map_err(internal)?;
+        .map_err(store_failure)?;
     info!(audit = true, witness_id, "witness identity deleted");
     reply::<key_delete::Response>(json!({
         "witnessId": witness_id,
@@ -397,7 +437,7 @@ async fn sign_task(
     let version_id = p.version_id.as_str();
     let Some(record) = witness_ops::get_witness(&state.witnesses_ks, witness_id)
         .await
-        .map_err(internal)?
+        .map_err(store_failure)?
     else {
         return Err(ErrorPayload::from(sign::error_codes::NOT_FOUND)
             .with_message(format!("no witness identity {witness_id}")));
@@ -444,7 +484,7 @@ async fn sign_task(
     let version_number = witnessed.version_ids.len() as u64;
     let mark = witness_ops::get_witnessed_mark(&state.witnesses_ks, witness_id, &witnessed.scid)
         .await
-        .map_err(internal)?;
+        .map_err(store_failure)?;
     if let Some(mark) = mark.as_ref() {
         let extends = version_number >= mark.version_number
             && usize::try_from(mark.version_number)
@@ -487,7 +527,7 @@ async fn sign_task(
         advance.as_ref().map(|m| (witnessed.scid.as_str(), m)),
     )
     .await
-    .map_err(internal)?;
+    .map_err(store_failure)?;
     drop(_guard);
     let did = did_hosting_common::did_ops::extract_did_id(&p.log_content).unwrap_or_default();
     info!(
@@ -503,4 +543,21 @@ async fn sign_task(
         "versionId": version_id,
         "proof": serde_json::to_value(&proof).map_err(internal)?,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_throttled_store_asks_for_a_retry_and_nothing_internal_reaches_the_wire() {
+        let payload = store_failure(AppError::store_throttled());
+        assert_eq!(payload.code.to_string(), "unavailable");
+        assert!(payload.retry_after.is_some());
+
+        let payload = store_failure(AppError::Store("table witnesses: disk full".into()));
+        assert_eq!(payload.code.to_string(), "internalError");
+        let wire = serde_json::to_string(&payload).unwrap();
+        assert!(!wire.contains("disk full"), "{wire}");
+    }
 }

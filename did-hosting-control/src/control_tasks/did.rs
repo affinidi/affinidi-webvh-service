@@ -51,10 +51,8 @@ pub(crate) async fn check_name(
             Some(e) => e.domains,
             None => did_hosting_common::server::domain::DomainScope::All,
         };
-    let system_default = did_hosting_common::server::domain::get_default_domain(&state.store)
-        .await
-        .ok()
-        .flatten();
+    let system_default =
+        did_hosting_common::server::domain::get_default_domain(&state.store).await?;
     let resolved_domain = match did_hosting_common::server::domain::resolve_request_domain(
         p.domain.as_deref(),
         &acl_scope,

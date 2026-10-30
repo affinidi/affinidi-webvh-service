@@ -23,6 +23,7 @@ use trust_tasks_rs::{
 };
 
 use crate::server::acl::{self, AclEntry, Role};
+use crate::server::error::AppError;
 use crate::server::trust_tasks::entry::SpecAclEntry;
 use crate::server::trust_tasks::{DispatchOutcome, TrustTaskContext, reject_with, run_pipeline};
 use crate::tasks::acl::change_role::v0_2 as change_role;
@@ -88,13 +89,14 @@ async fn handle_inner(
                     .with_message("only Admin callers may emit acl/change-role/0.2"),
             ));
         }
-        Err(_) => {
+        Err(e) if acl::is_acl_refusal(&e) => {
             return Err(reject_with(
                 &doc,
                 ErrorPayload::new(StandardCode::PermissionDenied)
                     .with_message("caller is not present in the maintainer's ACL"),
             ));
         }
+        Err(e) => return Err(internal(&doc, e)),
     }
 
     let from_role_str: String = (*doc.payload.from_role).clone();
@@ -245,13 +247,12 @@ fn build_response(
     request.respond_with(id, payload)
 }
 
-fn internal<P>(doc: &TrustTask<P>, err: impl std::fmt::Display) -> ErrorResponse {
+fn internal<P>(doc: &TrustTask<P>, err: AppError) -> ErrorResponse {
+    // A store or internal failure says nothing about the request: the wire
+    // gets `unavailable` with a retry time when the store is over capacity,
+    // else a bare `internalError`; the detail stays in the operator log.
     tracing::error!(error = %err, "acl/change-role internal failure");
-    reject_with(
-        doc,
-        ErrorPayload::new(StandardCode::InternalError)
-            .with_message("the maintainer encountered an internal failure"),
-    )
+    reject_with(doc, err.failure_reject_reason().into())
 }
 
 #[cfg(test)]

@@ -195,10 +195,11 @@ pub(crate) async fn do_stats_sync(
     // on ServiceAuth. An Owner-role DID must not be able to write per-DID
     // stats deltas: doing so would let any tenant tamper with another
     // server's resolved/update counters.
-    if !matches!(
-        check_acl(&state.acl_ks, signer).await,
-        Ok(crate::acl::Role::Service)
-    ) {
+    let service = is_service(state, signer).await.map_err(|e| {
+        warn!(did = signer, error = %e, "stats sync deferred: ACL lookup failed");
+        InfraRejection::lookup_failed(&e)
+    })?;
+    if !service {
         warn!(did = signer, "stats sync rejected: Service role required");
         return Err(InfraRejection::new(
             "e.p.stats.unauthorized",
@@ -350,12 +351,16 @@ fn is_stats_mnemonic(mnemonic: &str) -> bool {
 pub(crate) async fn do_health_pong(state: &AppState, signer: &str, body: &Value) {
     use crate::registry::{self, ServiceStatus};
 
-    if !matches!(
-        check_acl(&state.acl_ks, signer).await,
-        Ok(crate::acl::Role::Service)
-    ) {
-        warn!(did = signer, "health pong ignored: Service role required");
-        return;
+    match is_service(state, signer).await {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!(did = signer, "health pong ignored: Service role required");
+            return;
+        }
+        Err(e) => {
+            warn!(did = signer, error = %e, "health pong ignored: ACL lookup failed");
+            return;
+        }
     }
 
     let status = body
@@ -436,11 +441,17 @@ pub(crate) async fn do_domain_ack(state: &AppState, signer: &str, type_uri: &str
             warn!(did = signer, role = %other, domain, op, "domain ack rejected: Service role required");
             return;
         }
-        Err(_) => {
+        Err(e) if crate::acl::is_acl_refusal(&e) => {
             warn!(
                 did = signer,
                 domain, op, "domain ack rejected: DID not in ACL"
             );
+            return;
+        }
+        // Not settled: the control plane re-sends the op, and the server
+        // acknowledges it again.
+        Err(e) => {
+            warn!(did = signer, domain, op, error = %e, "domain ack ignored: ACL lookup failed");
             return;
         }
     }
@@ -501,6 +512,9 @@ pub(crate) async fn do_domain_ack(state: &AppState, signer: &str, type_uri: &str
 pub(crate) struct InfraRejection {
     pub code: &'static str,
     pub comment: String,
+    /// The refusal to send, when it is not a permission or shape problem
+    /// (a failed lookup): see [`InfraRejection::lookup_failed`].
+    pub reason: Option<trust_tasks_rs::RejectReason>,
 }
 
 impl InfraRejection {
@@ -508,7 +522,30 @@ impl InfraRejection {
         Self {
             code,
             comment: comment.into(),
+            reason: None,
         }
+    }
+
+    /// The sender's role could not be read (a throttled store, say). That is
+    /// no answer about the sender, so it is not refused as unauthorised: it
+    /// is told to retry, or that the failure was ours.
+    fn lookup_failed(e: &crate::error::AppError) -> Self {
+        Self {
+            code: "e.p.lookup.failed",
+            comment: "the sender's role could not be read".into(),
+            reason: Some(e.failure_reject_reason()),
+        }
+    }
+}
+
+/// The sender's role, for the edge-facing tasks that require Service:
+/// `Ok(true)` for Service, `Ok(false)` for any other answer from the ACL,
+/// `Err` when the ACL could not be read.
+async fn is_service(state: &AppState, signer: &str) -> Result<bool, crate::error::AppError> {
+    match check_acl(&state.acl_ks, signer).await {
+        Ok(role) => Ok(role == crate::acl::Role::Service),
+        Err(e) if crate::acl::is_acl_refusal(&e) => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -550,6 +587,10 @@ pub(crate) async fn do_server_register(
                 "e.p.registration.unauthorized",
                 "service role required to register as a server",
             ));
+        }
+        Err(e) if !crate::acl::is_acl_refusal(&e) => {
+            warn!(did = signer, error = %e, "server registration deferred: ACL lookup failed");
+            return Err(InfraRejection::lookup_failed(&e));
         }
         Err(_) => {
             warn!(
@@ -1083,6 +1124,26 @@ pub(crate) enum RoutedReply {
 }
 
 impl RoutedReply {
+    /// Whether this is a refusal with the standard `unavailable` code: the
+    /// task did not run, and the same document can be sent again.
+    pub(crate) fn is_unavailable(&self) -> bool {
+        use did_hosting_common::server::trust_tasks::DispatchOutcome;
+        const UNAVAILABLE: &str = "unavailable";
+        match self {
+            RoutedReply::Framework(outcome) => matches!(
+                outcome.as_ref(),
+                DispatchOutcome::Rejected(err) if err.payload.code.to_string() == UNAVAILABLE
+            ),
+            RoutedReply::Document(value) => {
+                value["payload"]["code"].as_str() == Some(UNAVAILABLE)
+                    && value["type"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("/trust-task-error/"))
+            }
+            RoutedReply::Suppressed | RoutedReply::Sealed(_) => false,
+        }
+    }
+
     /// The reply document, for a transport with no status codes to carry.
     pub(crate) fn into_document(self) -> Option<Value> {
         use did_hosting_common::server::trust_tasks::DispatchOutcome;
@@ -1450,22 +1511,28 @@ async fn route_trust_task_doc(
         type_uri.as_str(),
         MSG_SYNC_UPDATE_ACK | MSG_SYNC_DELETE_ACK | MSG_SYNC_BATCH_ACK
     ) && crate::server_push::is_configured_watcher(state, sender);
-    if needs_acl
-        && !watcher_ack
-        && !matches!(
-            did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, sender).await,
-            Ok(Some(_))
-        )
-    {
-        warn!(sender, %type_uri, "trust task refused: sender has no ACL entry");
-        return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
-            doc.reject_with(
-                format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-                trust_tasks_rs::RejectReason::PermissionDenied {
-                    reason: "caller is not present in the maintainer's ACL".into(),
-                },
-            ),
-        ))));
+    if needs_acl && !watcher_ack {
+        let refusal =
+            match did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, sender).await {
+                Ok(Some(_)) => None,
+                Ok(None) => {
+                    warn!(sender, %type_uri, "trust task refused: sender has no ACL entry");
+                    Some(trust_tasks_rs::RejectReason::PermissionDenied {
+                        reason: "caller is not present in the maintainer's ACL".into(),
+                    })
+                }
+                // A failed lookup says nothing about the sender: refusing it as
+                // "not in the ACL" would read as a revoked grant.
+                Err(e) => {
+                    warn!(sender, %type_uri, error = %e, "trust task deferred: ACL lookup failed");
+                    Some(e.failure_reject_reason())
+                }
+            };
+        if let Some(reason) = refusal {
+            return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
+                doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
+            ))));
+        }
     }
     let principal = if signed {
         let bound = match rule {
@@ -1527,83 +1594,100 @@ async fn route_trust_task_doc(
             doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
         ))));
     }
+    let recorded = (signed && rule.uses_shared_replay_cache())
+        .then(|| (principal.clone(), doc.id.clone(), doc.issued_at));
 
-    // Proofs are verified on every path — there is no configuration under
-    // which a proof-bearing document is accepted unverified.
-    let policy: trust_tasks_rs::ProofPolicy<'_, TransportBoundVerifier> =
-        trust_tasks_rs::ProofPolicy::Verify(verifier);
+    let reply = async {
+        // Proofs are verified on every path — there is no configuration under
+        // which a proof-bearing document is accepted unverified.
+        let policy: trust_tasks_rs::ProofPolicy<'_, TransportBoundVerifier> =
+            trust_tasks_rs::ProofPolicy::Verify(verifier);
 
-    // Auth (`auth/{challenge,authenticate,refresh}/0.1`). Before the framework
-    // check below: the shared `build_dispatcher` does not carry this family —
-    // its context is the ACL keyspace — so an auth document would fall through
-    // to `bridge_did_management`, a table of DID operations that has never
-    // heard of it, and come back a bogus "unknown op".
-    if crate::trust_tasks_auth::owns(&type_uri) {
-        return Ok(RoutedReply::Document(
-            crate::trust_tasks_auth::dispatch(state, transport, policy, doc)
-                .await
-                .ok_or(DIDCommServiceError::Internal(
-                    "auth dispatch produced no reply".into(),
-                ))?,
-        ));
+        // Auth (`auth/{challenge,authenticate,refresh}/0.1`). Before the framework
+        // check below: the shared `build_dispatcher` does not carry this family —
+        // its context is the ACL keyspace — so an auth document would fall through
+        // to `bridge_did_management`, a table of DID operations that has never
+        // heard of it, and come back a bogus "unknown op".
+        if crate::trust_tasks_auth::owns(&type_uri) {
+            return Ok(RoutedReply::Document(
+                crate::trust_tasks_auth::dispatch(state, transport, policy, doc)
+                    .await
+                    .ok_or(DIDCommServiceError::Internal(
+                        "auth dispatch produced no reply".into(),
+                    ))?,
+            ));
+        }
+
+        // Control↔server infrastructure ops (server registration, health pong,
+        // stats, sync and domain acks). Must be checked *before* the
+        // `bridge_did_management` fallthrough below, which would otherwise hand
+        // them to `dispatch_did_op` — a table of DID operations that has never
+        // heard of them — and answer with a bogus "unknown op" problem report.
+        if crate::trust_tasks_infra::owns(&type_uri) {
+            // The dispatcher stays transport-agnostic; we only tell it which binding
+            // the document came in on so the registry can record what actually moved.
+            let via =
+                did_hosting_common::server::didcomm_profile::ObservedTransport::from_binding_uri(
+                    transport.binding_uri(),
+                );
+            return Ok(
+                match crate::trust_tasks_infra::dispatch(state, &principal, via, doc).await {
+                    Some(value) => RoutedReply::Document(value),
+                    None => RoutedReply::Suppressed,
+                },
+            );
+        }
+
+        // The control plane's own table: DID management, agent names, domains.
+        // Every row is typed against its generated request and response.
+        //
+        // The gate above has verified every proof this document carries, on the
+        // document as it arrived. Narrowing it into a generated type can
+        // materialise a schema default the signer never wrote (`reserve: false`),
+        // which a second verification over the re-serialised document would read
+        // as tampering; so the rows do not verify again.
+        let doc = match crate::control_tasks::route(
+            state,
+            bearer,
+            https,
+            transport,
+            trust_tasks_rs::ProofPolicy::<TransportBoundVerifier>::AcceptUnverified,
+            doc,
+        )
+        .await
+        {
+            Ok(reply) => return Ok(reply),
+            Err(unclaimed) => *unclaimed,
+        };
+
+        // What is left is the shared framework family (ACL, discovery); a Type URI
+        // nobody serves is refused there as `unsupportedType`.
+        let ctx = TrustTaskContext {
+            acl_ks: &state.acl_ks,
+            acl_locks: &state.acl_locks,
+            my_vid,
+            signing_oracle: false,
+        };
+
+        // The framework path, and the only one whose outcome carries a reject code
+        // — so it is handed back whole rather than serialised here, and HTTPS maps
+        // it to a status.
+        Ok(RoutedReply::Framework(Box::new(
+            dispatch_inbound::<TransportBoundVerifier>(&ctx, transport, policy, doc).await,
+        )))
     }
+    .await;
 
-    // Control↔server infrastructure ops (server registration, health pong,
-    // stats, sync and domain acks). Must be checked *before* the
-    // `bridge_did_management` fallthrough below, which would otherwise hand
-    // them to `dispatch_did_op` — a table of DID operations that has never
-    // heard of them — and answer with a bogus "unknown op" problem report.
-    if crate::trust_tasks_infra::owns(&type_uri) {
-        // The dispatcher stays transport-agnostic; we only tell it which binding
-        // the document came in on so the registry can record what actually moved.
-        let via = did_hosting_common::server::didcomm_profile::ObservedTransport::from_binding_uri(
-            transport.binding_uri(),
-        );
-        return Ok(
-            match crate::trust_tasks_infra::dispatch(state, &principal, via, doc).await {
-                Some(value) => RoutedReply::Document(value),
-                None => RoutedReply::Suppressed,
-            },
-        );
-    }
-
-    // The control plane's own table: DID management, agent names, domains.
-    // Every row is typed against its generated request and response.
-    //
-    // The gate above has verified every proof this document carries, on the
-    // document as it arrived. Narrowing it into a generated type can
-    // materialise a schema default the signer never wrote (`reserve: false`),
-    // which a second verification over the re-serialised document would read
-    // as tampering; so the rows do not verify again.
-    let doc = match crate::control_tasks::route(
-        state,
-        bearer,
-        https,
-        transport,
-        trust_tasks_rs::ProofPolicy::<TransportBoundVerifier>::AcceptUnverified,
-        doc,
-    )
-    .await
+    // A task refused as `unavailable` (over capacity) did not run, and a
+    // refused document can be sent again as a retry: forget its record, or
+    // the resend would be refused as a replay. Every task answers that way
+    // only for a store refusal that committed nothing.
+    if let Some((signer, id, issued_at)) = &recorded
+        && matches!(&reply, Ok(r) if r.is_unavailable())
     {
-        Ok(reply) => return Ok(reply),
-        Err(unclaimed) => *unclaimed,
-    };
-
-    // What is left is the shared framework family (ACL, discovery); a Type URI
-    // nobody serves is refused there as `unsupportedType`.
-    let ctx = TrustTaskContext {
-        acl_ks: &state.acl_ks,
-        acl_locks: &state.acl_locks,
-        my_vid,
-        signing_oracle: false,
-    };
-
-    // The framework path, and the only one whose outcome carries a reject code
-    // — so it is handed back whole rather than serialised here, and HTTPS maps
-    // it to a status.
-    Ok(RoutedReply::Framework(Box::new(
-        dispatch_inbound::<TransportBoundVerifier>(&ctx, transport, policy, doc).await,
-    )))
+        state.replay_cache.release(signer, id, *issued_at);
+    }
+    reply
 }
 
 /// What [`dispatch_trust_task_doc`] requires of `type_uri`'s proof.
@@ -1966,6 +2050,41 @@ mod tests {
             Arc::new(DidKeyResolver),
         )));
         (state, dir)
+    }
+
+    /// An edge whose role cannot be read (a throttled store) is told to retry,
+    /// on both tasks that answer it; one not in the ACL is still refused.
+    #[tokio::test]
+    async fn a_failed_role_lookup_asks_an_edge_to_retry() {
+        let (state, _dir) = test_state().await;
+        let edge = "did:example:throttled-edge";
+        seed_role(&state, edge, Role::Service).await;
+        let mut throttled = state.clone();
+        throttled.acl_ks = state.acl_ks.throttled_reads();
+        let stats = json!({ "server_did": edge, "seq": 1, "did_deltas": [] });
+
+        let Err(rej) = do_stats_sync(&throttled, edge, &stats).await else {
+            panic!("stats sync must not succeed without its role");
+        };
+        assert!(matches!(
+            rej.reason,
+            Some(trust_tasks_rs::RejectReason::Unavailable {
+                retry_after: Some(_)
+            })
+        ));
+        let Err(rej) = do_server_register(&throttled, edge, &json!({})).await else {
+            panic!("registration must not succeed without its role");
+        };
+        assert!(matches!(
+            rej.reason,
+            Some(trust_tasks_rs::RejectReason::Unavailable { .. })
+        ));
+
+        let Err(rej) = do_stats_sync(&state, "did:example:stranger", &stats).await else {
+            panic!("a stranger's stats sync must be refused");
+        };
+        assert_eq!(rej.code, "e.p.stats.unauthorized");
+        assert!(rej.reason.is_none());
     }
 
     /// A synced delta for a hosted path that predates the current path
