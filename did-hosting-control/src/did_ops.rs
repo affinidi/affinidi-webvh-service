@@ -16,7 +16,7 @@ use did_hosting_common::server::identity::mnemonic_from_did;
 use did_hosting_common::server::mnemonic::{
     validate_agent_name, validate_agent_name_binding, validate_custom_path, validate_mnemonic,
 };
-use did_hosting_common::{CheckNameResponse, DidListEntry, RequestUriResponse};
+use did_hosting_common::{CheckNameResponse, DidListEntry};
 use rand::random_range;
 use tracing::{debug, info, warn};
 
@@ -328,7 +328,7 @@ pub async fn create_did(
     path: Option<&str>,
     force: bool,
     domain: Option<&str>,
-) -> Result<RequestUriResponse, AppError> {
+) -> Result<DidRecord, AppError> {
     use crate::acl::Role;
     use crate::auth::session::now_epoch;
 
@@ -440,18 +440,10 @@ pub async fn create_did(
         );
     }
 
-    // Build the DID URL using the did_hosting_url if configured, else public_url
-    let base_url = state
-        .config
-        .did_hosting_url
-        .as_deref()
-        .or(state.config.public_url.as_deref())
-        .unwrap_or("http://localhost");
-    let did_url = format!("{base_url}/{mnemonic}/did.jsonl");
-
     info!(did = %auth.did, mnemonic = %mnemonic, "DID URI created on control plane");
 
-    Ok(RequestUriResponse { mnemonic, did_url })
+    // The record as written, so the caller need not read it back.
+    Ok(record)
 }
 
 /// Atomic claim-and-publish for a DID at a known path.
@@ -489,7 +481,7 @@ pub async fn register_did_atomic(
     did_log: &str,
     force: bool,
     domain: Option<&str>,
-) -> Result<RequestUriResponse, AppError> {
+) -> Result<DidRecord, AppError> {
     use crate::acl::Role;
     use crate::auth::session::now_epoch;
 
@@ -770,8 +762,6 @@ pub async fn register_did_atomic(
     // control plane is authoritative for stats.
     state.stats_collector.record_update(path);
 
-    let did_url = format!("{}/{path}/did.jsonl", server_base_url.trim_end_matches('/'));
-
     info!(
         did = %auth.did,
         path = %path,
@@ -780,10 +770,10 @@ pub async fn register_did_atomic(
         "DID atomically registered on control plane"
     );
 
-    Ok(RequestUriResponse {
-        mnemonic: path.to_string(),
-        did_url,
-    })
+    // The record as written. Answer from it rather than reading it back: on an
+    // eventually consistent store that read can miss the write, and the caller
+    // would be told a stored DID failed.
+    Ok(new_record)
 }
 
 /// Shared front-half of a new-version publish: authorize the caller, verify
@@ -1971,7 +1961,7 @@ pub async fn set_did_disabled(
     state: &AppState,
     mnemonic: &str,
     disabled: bool,
-) -> Result<(), AppError> {
+) -> Result<DidRecord, AppError> {
     validate_mnemonic(mnemonic)?;
     // This writes the whole record back, so it must be read under the same
     // per-path lock every other record writer holds — otherwise a publish
@@ -1991,7 +1981,8 @@ pub async fn set_did_disabled(
         disabled,
         "DID disabled state updated on control plane"
     );
-    Ok(())
+    // The record as written, so the caller need not read it back.
+    Ok(record)
 }
 
 /// Roll back (remove) the last log entry from a DID's JSONL content.
@@ -2604,6 +2595,51 @@ mod tests_atomic {
         }
     }
 
+    /// Reserve, register and set-state return the record they committed, so a caller
+    /// can answer from it rather than read it back: on an eventually consistent
+    /// store that read can miss a write that succeeded.
+    #[tokio::test]
+    async fn writers_return_the_record_they_committed() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "alpha";
+        let did_log = build_test_did_log("scid-alpha", "control.test", path).await;
+        let stored = |state: &AppState| {
+            let ks = state.dids_ks.clone();
+            async move {
+                let record: DidRecord = ks.get(did_key(path)).await.unwrap().expect("record");
+                serde_json::to_value(record).unwrap()
+            }
+        };
+
+        // Reserve, then register, as the VTA does.
+        let reserved = create_did(&owner_auth(owner), &state, Some(path), false, None)
+            .await
+            .expect("reserve");
+        assert_eq!(
+            serde_json::to_value(&reserved).unwrap(),
+            stored(&state).await
+        );
+
+        let registered =
+            register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
+                .await
+                .expect("register");
+        assert_eq!(
+            serde_json::to_value(&registered).unwrap(),
+            stored(&state).await
+        );
+
+        let disabled = set_did_disabled(&owner_auth(owner), &state, path, true)
+            .await
+            .expect("disable");
+        assert!(disabled.disabled);
+        assert_eq!(
+            serde_json::to_value(&disabled).unwrap(),
+            stored(&state).await
+        );
+    }
+
     /// Fresh slot, well-formed did.jsonl, caller becomes owner.
     #[tokio::test]
     async fn fresh_slot_succeeds_and_writes_atomically() {
@@ -2616,7 +2652,6 @@ mod tests_atomic {
             .await
             .expect("fresh-slot register should succeed");
         assert_eq!(result.mnemonic, path);
-        assert_eq!(result.did_url, "http://control.test/alpha/did.jsonl");
 
         // Record + log + owner-index all present after the single batch commit.
         let record: DidRecord = state

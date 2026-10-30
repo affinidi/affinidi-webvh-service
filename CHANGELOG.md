@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed — DID tasks no longer report a write that succeeded as failed
+
+`did/check-name` (with `reserve`), `did/register` and `did/set-state` wrote
+the record, then read it back to build their answer. On an eventually
+consistent store (DynamoDB without `ConsistentRead`) that read could miss
+the write, and the caller got an internal error (`record … missing after
+reservation` / `… after write`) for a slot that was reserved or a DID that
+was stored. A reservation retried after that error found the slot taken
+(`available: false`). All three now answer from the record they wrote,
+with no read-back.
+
 ### Added — wallet sign-in locations from a local GeoIP database
 
 The control plane (standalone or in the daemon) now fills in
