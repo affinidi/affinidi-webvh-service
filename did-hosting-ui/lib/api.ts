@@ -14,6 +14,7 @@
  * its data rides inside their payloads.
  */
 
+import type { ScidAliasState } from "./scid-alias";
 import type * as DidList from "./trust-tasks/did-management/did/list/0.2/payload";
 import type * as DidInfo from "./trust-tasks/did-management/did/info/0.1/payload";
 import type * as DidLog from "./trust-tasks/did-management/did/log/0.1/payload";
@@ -135,6 +136,9 @@ export interface DidRecord {
    *  ones — filter with `servedNames` before showing them as resolvable.
    *  Absent when the DID has none. */
   agentNames?: AgentNameEntry[];
+  /** The latest document's did:scid alias state, from `did/info` only —
+   *  derived by the control plane (see `lib/scid-alias`). */
+  scidAlias?: ScidAliasState;
 }
 
 export type DomainStatus = "active" | "disabled";

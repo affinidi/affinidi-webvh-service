@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Added — the did:scid alias of existing DIDs: state, and listing or removing it
+
+A did:webvh log and its `did:scid:vh:1:<scid>` form are one subject only while
+the document lists `did:scid:vh:1:<scid>?src=<location>` in `alsoKnownAs`
+(VTI-KEY-164). New DIDs got it at creation; existing ones now can too.
+
+- `did/info` reports the latest document's alias under
+  `record.ext["vnd.affinidi.webvh"].scidAlias` — the DID URL for the log's
+  current location and whether it is `listed`, `notListed`, or `stale`
+  (listed for an old location). Derived on the server, from the log.
+- The DID page has a **did:scid Alias** card showing that state. For a DID an
+  agent holds, with the wallet's task relay present, it asks the agent to list
+  or remove the alias (`vta/webvh/dids/update/1.1`, `scidAlsoKnownAs`) through
+  the same approval ceremony as agent-name changes, warning that the entry
+  rotates the update key. Without the relay it is read-only and points at the
+  controller (pnm or the browser-plugin console).
+- `identity-scid-alias list|remove` (control, server, daemon; service stopped)
+  lists or removes the alias on the service's own DID — the only log this
+  service signs. A stale `src` is replaced, removal drops every entry of the
+  SCID, and a request that would change nothing is refused. The update key
+  does not rotate.
+
 ### Added — wallet sign-in locations from a local GeoIP database
 
 The control plane (standalone or in the daemon) now fills in
