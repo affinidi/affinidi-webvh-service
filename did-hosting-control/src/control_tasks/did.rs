@@ -12,6 +12,7 @@ use tracing::info;
 use trust_tasks_rs::StandardCode;
 
 use did_hosting_common::did_ops::did_key;
+use did_hosting_common::server::trust_tasks::ext::WEBVH_EXT_KEY;
 
 use super::{Cx, TaskError, spec_record, typed};
 use crate::did_ops;
@@ -149,10 +150,16 @@ pub(crate) async fn info(
     did_ops::ensure_slot_domain_matches(&record, p.domain.as_deref())?;
 
     let mut body = serde_json::Map::new();
-    body.insert(
-        "record".into(),
-        serde_json::to_value(spec_record::<info::v0_1::DidRecord>(state, &record)?)?,
-    );
+    let mut record_json =
+        serde_json::to_value(spec_record::<info::v0_1::DidRecord>(state, &record)?)?;
+    // The did:scid alias state of the latest document — the DID URL it would
+    // list and whether it does, for its current location (VTI-KEY-164). Read
+    // from the log, never stored: whoever signs the log decides it. Derived
+    // here so a client never re-derives the `src` locator itself.
+    if let Some(alias) = log_metadata.as_ref().and_then(|m| m.scid_alias.as_ref()) {
+        record_json["ext"][WEBVH_EXT_KEY]["scidAlias"] = serde_json::to_value(alias)?;
+    }
+    body.insert("record".into(), record_json);
     if let Some(meta) = log_metadata {
         let mut summary = serde_json::Map::new();
         if let Some(id) = meta.latest_version_id {

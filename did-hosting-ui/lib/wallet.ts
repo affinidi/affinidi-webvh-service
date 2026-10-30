@@ -603,6 +603,11 @@ export function isWalletTaskRelayAvailable(): boolean {
 export const WEBVH_DIDS_UPDATE_1_0 =
   "https://trusttasks.org/spec/vta/webvh/dids/update/1.0";
 
+/** 1.1 adds `scidAlsoKnownAs`: list or remove the log's did:scid alias, with
+ *  the agent deriving the DID URL and editing `alsoKnownAs` itself. */
+export const WEBVH_DIDS_UPDATE_1_1 =
+  "https://trusttasks.org/spec/vta/webvh/dids/update/1.1";
+
 /** Park / resume an agent name. Same `vta/webvh/...` dispatch discipline as
  *  {@link WEBVH_DIDS_UPDATE_1_0}. */
 export const WEBVH_AGENT_NAME_DISABLE_1_0 =
@@ -702,6 +707,40 @@ export async function requestAgentNameTask(args: {
   const reply = (await wallet.requestTask({
     type: args.enable ? WEBVH_AGENT_NAME_ENABLE_1_0 : WEBVH_AGENT_NAME_DISABLE_1_0,
     payload: { did: args.did, name: args.name },
+  })) as Record<string, unknown>;
+
+  return readOutcome(reply);
+}
+
+/**
+ * Ask the user's VTA to list (`scidAlsoKnownAs: true`) or remove (`false`) the
+ * did:scid alias of a hosted did:webvh DID (`vta/webvh/dids/update/1.1`).
+ *
+ * Like {@link requestAgentNameTask}, no document is sent: the VTA starts from
+ * the latest entry, derives `did:scid:vh:1:<scid>?src=…` itself, replaces an
+ * alias listed for an old location, refuses a request that would change
+ * nothing (`noChange`) or would end an identity it presents as did:scid
+ * (`scidAliasRequired`), signs and publishes. `expectedVersionId` pins the
+ * version the user looked at, as for a document edit. The task is
+ * `destructive` — the entry rotates the update key — so the approval ceremony
+ * applies.
+ */
+export async function requestScidAliasUpdate(args: {
+  did: string;
+  scidAlsoKnownAs: boolean;
+  expectedVersionId?: string;
+}): Promise<RequestTaskOutcome> {
+  const wallet = window.vtaWallet;
+  if (!wallet?.requestTask) {
+    throw new Error("This wallet does not support delegated task execution.");
+  }
+  const reply = (await wallet.requestTask({
+    type: WEBVH_DIDS_UPDATE_1_1,
+    payload: {
+      did: args.did,
+      scidAlsoKnownAs: args.scidAlsoKnownAs,
+      ...(args.expectedVersionId ? { expectedVersionId: args.expectedVersionId } : {}),
+    },
   })) as Record<string, unknown>;
 
   return readOutcome(reply);

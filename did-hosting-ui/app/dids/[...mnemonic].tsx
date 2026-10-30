@@ -17,6 +17,11 @@ import { useAgentNames } from "../../lib/use-agent-names";
 import { hasLogMovedPast } from "../../lib/pinned-edit";
 import { extractDidHost } from "../../lib/domain";
 import { scidAliasesOf } from "../../lib/did-scid";
+import {
+  scidAliasConfirm,
+  scidAliasView,
+  type ScidAliasAction,
+} from "../../lib/scid-alias";
 import { ChipInput } from "../../components/ChipInput";
 import { UsageChart } from "../../components/UsageChart";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
@@ -25,6 +30,7 @@ import {
   isWalletTaskRelayAvailable,
   requestDidUpdate,
   requestAgentNameTask,
+  requestScidAliasUpdate,
   digestPrefix,
   type TaskConsentRequired,
   type RequestTaskOutcome,
@@ -121,6 +127,9 @@ export default function DidDetail() {
   // Delegated publish: the VTA holds the update key, so we propose and it decides.
   const [publishing, setPublishing] = useState(false);
   const [consent, setConsent] = useState<TaskConsentRequired | null>(null);
+  // Which card asked for the outstanding approval, so its code is shown once,
+  // beside the action that raised it.
+  const [consentOrigin, setConsentOrigin] = useState<"scidAlias" | "other">("other");
   // The exact re-submit the outstanding approval is bound to — a document
   // publish OR an agent-name park/resume.
   //
@@ -234,6 +243,17 @@ export default function DidDetail() {
   // The did:scid alias the live document lists for itself, if any: the same
   // log under its did:scid DID, linked as one subject by the listing.
   const scidAliases = scidAliasesOf(didDetail?.didId, currentState?.alsoKnownAs);
+  // What the did:scid alias card shows and offers. The state comes from the
+  // control plane (`did/info`), which derives the alias for the log's current
+  // location; who can change it decides the actions.
+  const scidAliasPanel = didDetail?.scidAlias
+    ? scidAliasView({
+        alias: didDetail.scidAlias,
+        owner: didDetail.owner,
+        canDelegate: isWalletTaskRelayAvailable(),
+        preRotation: didDetail.log?.preRotation ?? false,
+      })
+    : null;
 
   // Parked names come from the host's authoritative registry — they are
   // deliberately absent from the document, so they cannot be derived like the
@@ -431,6 +451,7 @@ export default function DidDetail() {
     resubmit: (opts?: { silent?: boolean }) => Promise<PublishResult>,
     successMsg: string,
     opts?: { silent?: boolean },
+    origin: "scidAlias" | "other" = "other",
   ): Promise<PublishResult> => {
     const silent = opts?.silent ?? false;
     if (!silent) setPublishing(true);
@@ -439,6 +460,7 @@ export default function DidDetail() {
       if (outcome.kind === "consentRequired") {
         resubmitRef.current = resubmit;
         pinnedVersionRef.current = logEntries[logEntries.length - 1]?.versionId ?? null;
+        setConsentOrigin(origin);
         setConsent(outcome);
         return "consent";
       }
@@ -520,6 +542,50 @@ export default function DidDetail() {
         ? `${agentNameLabel(name, agentDomain)} is being served again.`
         : `${agentNameLabel(name, agentDomain)} has been parked.`,
       opts,
+    );
+  };
+
+  // List or remove the did:scid alias through the agent. Like park/resume, no
+  // document is sent: the VTA derives the DID URL, edits `alsoKnownAs`, signs
+  // and publishes (`vta/webvh/dids/update/1.1`, `scidAlsoKnownAs`). The version
+  // the user looked at is pinned once, so a re-submit after approval sends the
+  // byte-identical payload the approval digest covers.
+  const runScidAlias = (
+    scidAlsoKnownAs: boolean,
+    expectedVersionId: string | undefined,
+    opts?: { silent?: boolean },
+  ): Promise<PublishResult> => {
+    const didId = didDetail?.didId;
+    if (!didId) {
+      if (!opts?.silent) showAlert("Error", "This DID has no published identifier yet.");
+      return Promise.resolve("error");
+    }
+    return runDelegatedTask(
+      () =>
+        requestScidAliasUpdate({
+          did: didId,
+          scidAlsoKnownAs,
+          ...(expectedVersionId ? { expectedVersionId } : {}),
+        }),
+      (o) => runScidAlias(scidAlsoKnownAs, expectedVersionId, o),
+      scidAlsoKnownAs
+        ? "Your agent published a version that lists the did:scid alias."
+        : "Your agent published a version without the did:scid alias.",
+      opts,
+      "scidAlias",
+    );
+  };
+
+  const handleScidAlias = (action: ScidAliasAction) => {
+    const alias = didDetail?.scidAlias;
+    if (!alias || !scidAliasPanel) return;
+    const expectedVersionId = logEntries[logEntries.length - 1]?.versionId ?? undefined;
+    showConfirm(
+      action.label,
+      withDelegationWarning(
+        `${scidAliasConfirm(alias, action)}\n\n${scidAliasPanel.warning ?? ""}`.trim(),
+      ),
+      () => void runScidAlias(action.scidAlsoKnownAs, expectedVersionId),
     );
   };
 
@@ -1213,6 +1279,56 @@ export default function DidDetail() {
           </View>
         )}
 
+        {/* did:scid alias */}
+        {didDetail?.scidAlias && scidAliasPanel && (
+          <View style={styles.card}>
+            <Text style={styles.sectionTitle}>did:scid Alias</Text>
+            <Text style={styles.hint}>
+              This log also verifies {didDetail.scidAlias.didUrl}. The two forms
+              are one subject only while the document lists it in alsoKnownAs.
+            </Text>
+            <Text
+              style={{
+                marginTop: spacing.md,
+                color:
+                  didDetail.scidAlias.status === "listed"
+                    ? colors.success
+                    : didDetail.scidAlias.status === "stale"
+                      ? (colors.warning ?? colors.textPrimary)
+                      : colors.textSecondary,
+              }}
+            >
+              {scidAliasPanel.summary}
+            </Text>
+            {scidAliasPanel.readOnlyReason ? (
+              <Text style={[styles.hint, { marginTop: spacing.md }]}>
+                {scidAliasPanel.readOnlyReason}
+              </Text>
+            ) : (
+              <View style={{ marginTop: spacing.md, gap: spacing.sm }}>
+                {scidAliasPanel.warning && (
+                  <Text style={styles.hint}>{scidAliasPanel.warning}</Text>
+                )}
+                <View style={{ flexDirection: "row", gap: spacing.sm }}>
+                  {scidAliasPanel.actions.map((action) => (
+                    <Pressable
+                      key={action.label}
+                      style={[styles.smallButton, publishing && styles.disabled]}
+                      onPress={() => handleScidAlias(action)}
+                      disabled={publishing}
+                    >
+                      <Text style={styles.smallButtonText}>
+                        {publishing ? "Asking your agent..." : action.label}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
+                {!editingDoc && consentOrigin === "scidAlias" && consentMatchPanel()}
+              </View>
+            )}
+          </View>
+        )}
+
         {/* Agent names */}
         {logEntries.length > 0 && (
           <View style={styles.card}>
@@ -1409,8 +1525,9 @@ export default function DidDetail() {
                   </View>
                 )}
                 {/* The approval code lands here when a name change is pending
-                    (the doc editor shows it in its own section when open). */}
-                {!editingDoc && consentMatchPanel()}
+                    (the doc editor shows it in its own section when open; the
+                    did:scid alias card shows its own). */}
+                {!editingDoc && consentOrigin !== "scidAlias" && consentMatchPanel()}
               </View>
             ) : (
               <Text style={[styles.hint, { marginTop: spacing.md }]}>

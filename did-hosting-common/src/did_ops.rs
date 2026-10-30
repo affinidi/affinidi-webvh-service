@@ -158,6 +158,10 @@ pub struct LogMetadata {
     pub watchers: bool,
     pub watcher_count: u32,
     pub watcher_urls: Vec<String>,
+    /// The did:scid alias of the latest document and whether it lists it
+    /// (VTI-KEY-164); `None` when the latest document is not did:webvh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scid_alias: Option<crate::scid::ScidAliasInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,6 +1079,8 @@ pub fn extract_log_metadata(jsonl_content: &str) -> LogMetadata {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    meta.scid_alias = entry.get("state").and_then(crate::scid::scid_alias_info);
+
     if let Some(params) = entry.get("parameters") {
         meta.method = params
             .get("method")
@@ -1336,6 +1342,21 @@ mod tests {
         assert_eq!(meta.log_entry_count, 1);
         assert_eq!(meta.latest_version_id.as_deref(), Some("1-QmHash"));
         assert!(meta.portable);
+        assert_eq!(meta.scid_alias, None);
+    }
+
+    /// The did:scid alias state is read from the latest entry only.
+    #[test]
+    fn log_metadata_scid_alias_from_latest_state() {
+        use crate::scid::ScidAliasStatus;
+        let jsonl = concat!(
+            r#"{"versionId":"1-a","state":{"id":"did:webvh:Qm1:a.example:alice","alsoKnownAs":["did:scid:vh:1:Qm1?src=a.example/alice"]}}"#,
+            "\n",
+            r#"{"versionId":"2-b","state":{"id":"did:webvh:Qm1:b.example:alice","alsoKnownAs":["did:scid:vh:1:Qm1?src=a.example/alice"]}}"#,
+        );
+        let alias = extract_log_metadata(jsonl).scid_alias.unwrap();
+        assert_eq!(alias.did_url, "did:scid:vh:1:Qm1?src=b.example/alice");
+        assert_eq!(alias.status, ScidAliasStatus::Stale);
     }
 
     #[test]
