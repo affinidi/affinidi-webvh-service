@@ -190,6 +190,7 @@ fn default_server() -> ServerConfig {
         trusted_proxies: Vec::new(),
         trusted_proxy_cidrs: Vec::new(),
         resolve_cache: Default::default(),
+        resolve_rate_limit: Default::default(),
     }
 }
 

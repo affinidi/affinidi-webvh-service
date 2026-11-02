@@ -213,6 +213,9 @@ Environment variables use the `DAEMON_` prefix:
 | `DAEMON_SERVER_RESOLVE_CACHE_MAX_AGE_SECS` | DID-resolution `max-age` (0 = `no-cache`; default 300) |
 | `DAEMON_SERVER_RESOLVE_CACHE_SHARED_MAX_AGE_SECS` | DID-resolution `s-maxage` (empty clears) |
 | `DAEMON_SERVER_RESOLVE_CACHE_STALE_WHILE_REVALIDATE_SECS` | DID-resolution `stale-while-revalidate` (empty clears) |
+| `DAEMON_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW` | Resolution requests per client address per window (empty clears: no limit) |
+| `DAEMON_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS` | Resolution rate-limit window (default 10; empty restores it) |
+| `DAEMON_SERVER_TRUSTED_PROXIES` | Comma-separated proxy addresses or CIDR ranges whose `X-Forwarded-For` is trusted (empty clears) |
 
 The same settings live in `[server.resolve_cache]` (`max_age_secs`,
 `shared_max_age_secs`, `stale_while_revalidate_secs`).
@@ -234,6 +237,14 @@ control plane's README explains the bounds ("Replay cache bounds").
 
 This lives in `[geoip] database` and reaches the embedded control plane,
 which answers wallet sign-in. See [`docs/geoip.md`](../docs/geoip.md).
+
+The resolution limit lives in `[server.resolve_rate_limit]` (`max_per_window`,
+`window_secs`) and is off by default; the edge server's README explains it
+("Resolution rate limit"), including `server.trusted_proxies`, which must
+list the load balancer's addresses or subnets before the limit is turned on
+behind one.
+In the daemon one budget covers the server's resolution, the watcher's and
+the root fallback, which also serves the UI.
 
 ## CLI Commands
 
