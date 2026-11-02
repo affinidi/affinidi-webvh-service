@@ -112,15 +112,21 @@ different path with the `--config` flag or the
 | `WATCHER_SERVER_RESOLVE_CACHE_STALE_WHILE_REVALIDATE_SECS` | DID-resolution `stale-while-revalidate` (empty clears) |
 | `WATCHER_REPLAY_MAX_ENTRIES` | Replay cache records, all signers (default 1,000,000, about 32 MB) |
 | `WATCHER_REPLAY_MAX_ENTRIES_PER_SIGNER` | Replay cache records per signer (default 250,000, about 600 signed requests a second) |
+| `WATCHER_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW` | Resolution requests per client address per window (empty clears: no limit) |
+| `WATCHER_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS` | Resolution rate-limit window (default 10; empty restores it) |
+| `WATCHER_SERVER_TRUSTED_PROXIES` | Comma-separated proxy addresses or CIDR ranges whose `X-Forwarded-For` is trusted (empty clears) |
 
 The same settings live in `[server.resolve_cache]` (`max_age_secs`,
 `shared_max_age_secs`, `stale_while_revalidate_secs`).
 
 The replay settings live in `[replay]` (`max_entries`,
 `max_entries_per_signer`). Every sync document is signed by a source control plane, so the
-per-signer bound caps how fast the watcher follows DID changes (about 14 a
-second at the default). The control plane's README explains the
+per-signer bound caps how fast the watcher follows DID changes (about 600 a second at the default). The control plane's README explains the
 bounds ("Replay cache bounds").
+
+The resolution limit lives in `[server.resolve_rate_limit]` (`max_per_window`,
+`window_secs`) and is off by default; the edge server's README explains it
+("Resolution rate limit"), including `server.trusted_proxies`.
 
 ## CLI Commands
 
