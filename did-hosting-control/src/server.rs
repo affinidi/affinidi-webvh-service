@@ -32,9 +32,18 @@ use tokio::sync::{oneshot, watch};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, debug, error, info, warn};
 
-/// A cache-eviction hook: takes the store key whose cached content is now
-/// stale. See `AppState::cache_invalidate`.
-pub type CacheInvalidateFn = dyn Fn(&str) + Send + Sync;
+/// What a cache-eviction hook is told has changed in the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheChange<'a> {
+    /// One DID's record, log or witness file, by mnemonic.
+    Did(&'a str),
+    /// A domain entry (created, updated, enabled, disabled or purged).
+    Domains,
+}
+
+/// A cache-eviction hook: told what changed, so whatever it cached from
+/// that is now stale. See `AppState::cache_invalidate`.
+pub type CacheInvalidateFn = dyn Fn(CacheChange<'_>) + Send + Sync;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -152,10 +161,10 @@ pub struct AppState {
     /// this notify so delivery happens promptly in the happy path.
     /// On notify-miss the worker still runs on its 30 s tick.
     pub outbox_notify: Arc<tokio::sync::Notify>,
-    /// Evicts a resolved-content cache entry (keyed by
-    /// `did_ops::content_log_key(mnemonic)`) when this process also serves
-    /// resolution from the same store — the unified `did-hosting-daemon`,
-    /// which wires this to its embedded server's `did_cache`.
+    /// Evicts what resolution cached about a DID or the domains when this
+    /// process also serves resolution from the same store — the unified
+    /// `did-hosting-daemon`, which wires this to its embedded server's
+    /// content cache and gate cache.
     ///
     /// `None` for a standalone control plane: it holds no content cache of
     /// its own, and a registered edge's cache is kept in step independently,
@@ -164,7 +173,10 @@ pub struct AppState {
     /// mutation here (register, publish, disable, rollback, delete) would
     /// leave the daemon's embedded server serving a stale or since-deleted
     /// cache entry for up to its TTL — there is no sync round-trip within a
-    /// single process to invalidate it the way a standalone edge does.
+    /// single process to invalidate it the way a standalone edge does. The
+    /// daemon also caches each DID's record and the domains (its gate
+    /// cache), so a DID disabled or a domain disabled here without this
+    /// call would keep resolving.
     pub cache_invalidate: Option<Arc<CacheInvalidateFn>>,
     /// Wallet sign-in with a trigger link (`auth/oob/*`): the open requests
     /// and their limiters. See [`crate::oob`].

@@ -71,6 +71,7 @@ async fn make_state(agent_names_enabled: bool) -> (AppState, tempfile::TempDir) 
         didcomm_service: Arc::new(std::sync::OnceLock::new()),
         stats_collector: None,
         did_cache: Arc::new(ContentCache::new(Duration::from_secs(60))),
+        gate_cache: None,
         trusted_proxy_cidrs: Arc::new(Vec::new()),
         replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
             did_hosting_common::server::auth::session::now_epoch(),

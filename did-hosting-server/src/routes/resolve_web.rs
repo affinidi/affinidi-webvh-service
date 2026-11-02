@@ -23,11 +23,11 @@ use axum::extract::{Request, State};
 use axum::http::{StatusCode, request::Parts};
 use axum::response::{IntoResponse, Response};
 use did_hosting_common::did::build_did_web_id;
-use did_hosting_common::server::domain::assert_resolution_allowed;
 use tracing::debug;
 
-use super::resolve_shared::extract_request_host;
-use crate::did_ops::{self, DidRecord};
+use super::resolve_shared::{assert_gate_allows, content_ks, extract_request_host, gate_record};
+use crate::cache::ContentCache;
+use crate::did_ops;
 use crate::error::AppError;
 use crate::mnemonic::validate_mnemonic;
 use crate::server::AppState;
@@ -39,34 +39,51 @@ async fn serve_did_web(
     mnemonic: &str,
     request_host: Option<&str>,
 ) -> Result<Response, AppError> {
-    if let Some(record) = state
-        .dids_ks
-        .get::<DidRecord>(did_ops::did_key(mnemonic))
-        .await?
-    {
+    let record = gate_record(state, mnemonic).await?;
+    if let Some(record) = &record {
         if record.disabled || record.deleted_at.is_some() {
             return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
         }
         if let Some(ref did_id) = record.did_id {
-            assert_resolution_allowed(&state.store, request_host, did_id).await?;
+            assert_gate_allows(state, request_host, did_id).await?;
         }
     }
 
-    let content_bytes = state
-        .dids_ks
-        .get_raw(did_ops::content_log_key(mnemonic))
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?;
+    // The extracted document is cached only behind a gate cache (the
+    // daemon), where every change to the DID clears it in-process, and only
+    // for a DID with a record: without one there is no gate to refuse a
+    // deleted DID before the cache would answer. Anywhere else, read the
+    // store as before, so a change made elsewhere shows on the next resolve.
+    let cacheable = state.gate_cache.is_some() && record.is_some();
+    let key = ContentCache::did_web_document_key(mnemonic);
+    let cached = cacheable.then(|| state.did_cache.get(&key)).flatten();
+    let doc_bytes = if let Some(cached) = cached {
+        #[cfg(feature = "metrics")]
+        did_hosting_common::server::metrics::inc_cache_hit();
+        (*cached).clone()
+    } else {
+        #[cfg(feature = "metrics")]
+        did_hosting_common::server::metrics::inc_cache_miss();
+        let generation = state.did_cache.generation();
+        let content_bytes = content_ks(state)
+            .get_raw(did_ops::content_log_key(mnemonic))
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?;
 
-    let jsonl = String::from_utf8(content_bytes)
-        .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
+        let jsonl = String::from_utf8(content_bytes)
+            .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
 
-    let server_url = state.config.public_base_url();
-    let expected_did_web = build_did_web_id(&server_url, mnemonic)
-        .map_err(|e| AppError::Internal(format!("failed to build did:web id: {e}")))?;
+        let server_url = state.config.public_base_url();
+        let expected_did_web = build_did_web_id(&server_url, mnemonic)
+            .map_err(|e| AppError::Internal(format!("failed to build did:web id: {e}")))?;
 
-    let doc_bytes = did_ops::extract_did_web_document(&jsonl, &expected_did_web)
-        .ok_or_else(|| AppError::NotFound(format!("no did:web document for: {mnemonic}")))?;
+        let doc_bytes = did_ops::extract_did_web_document(&jsonl, &expected_did_web)
+            .ok_or_else(|| AppError::NotFound(format!("no did:web document for: {mnemonic}")))?;
+        if cacheable {
+            state.did_cache.insert(generation, key, doc_bytes.clone());
+        }
+        doc_bytes
+    };
 
     if let Some(ref collector) = state.stats_collector {
         collector.record_resolve(mnemonic);

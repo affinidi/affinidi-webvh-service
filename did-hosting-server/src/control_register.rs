@@ -767,7 +767,7 @@ pub async fn apply_single_update(
     )?;
     batch.commit().await?;
 
-    did_cache.invalidate(&content_log_key(&update.mnemonic));
+    did_cache.invalidate_did(&update.mnemonic);
 
     info!(
         mnemonic = %update.mnemonic,

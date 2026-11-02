@@ -34,7 +34,7 @@ pub mod wire;
 pub use detect::{HostHeaders, parse_forwarded_host, parse_trusted_cidrs, resolve_request_host};
 pub use normalize::normalize_domain_name;
 pub use safety::{
-    assert_acl_allows_host, assert_did_host_allowed,
+    ResolutionDomains, assert_acl_allows_host, assert_did_host_allowed,
     assert_did_host_allowed_when_domains_configured, assert_domain_active_for_resolution,
     assert_host_is_active_domain, assert_request_host_matches_did, assert_resolution_allowed,
     extract_did_host,
