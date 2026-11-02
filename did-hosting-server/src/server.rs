@@ -759,7 +759,10 @@ fn run_rest_thread(
         // Public DID resolution and the Trust Task listener's HTTPS binding.
         // There is no management surface to switch on.
         info!("HTTP thread started (public DID serving + Trust Task listener)");
-        let base_router = routes::router(upload_body_limit);
+        let resolve_limit = Arc::new(
+            did_hosting_common::server::rate_limit::ResolveRateLimiter::new(&state.config.server),
+        );
+        let base_router = routes::router_with_resolve_limit(upload_body_limit, resolve_limit);
 
         // Cloned before `with_state` consumes `state`: the health route is
         // added below the router's state type has already collapsed to

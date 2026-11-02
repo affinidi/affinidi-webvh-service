@@ -66,6 +66,33 @@ pub type RawKvPair = (Vec<u8>, Vec<u8>);
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Refuse a write whose stored item, `size` bytes as `backend` counts it,
+/// is over that backend's per-item `limit`.
+///
+/// Backends with a per-item limit (DynamoDB, Firestore) check every item
+/// before they send anything, so a refused batch writes nothing. The error is
+/// [`AppError::QuotaExceeded`], whose message reaches the caller: a Trust Task
+/// answers `taskFailed` with it (HTTPS `422`), and an edge or watcher refuses
+/// the sync as `taskFailed` rather than retrying it. Left to the backend, the
+/// same write failed as a store error (`500`) that no retry could fix. The
+/// backend is logged here, not told to the caller.
+#[cfg(any(feature = "store-dynamodb", feature = "store-firestore"))]
+fn check_item_size(backend: &str, size: usize, limit: usize) -> Result<(), AppError> {
+    if size > limit {
+        tracing::warn!(
+            backend,
+            size,
+            limit,
+            "write refused: item over the store's per-item limit"
+        );
+        // `AppError::quota_kind` keys on the word "size".
+        return Err(AppError::QuotaExceeded(format!(
+            "item size {size} bytes is over the store's per-item limit of {limit} bytes"
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Traits
 // ---------------------------------------------------------------------------
@@ -126,6 +153,15 @@ pub trait BatchOps: Send {
 /// Factory: create keyspaces, create batches, persist/flush.
 pub trait StorageBackend: Send + Sync {
     fn keyspace(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError>;
+
+    /// [`Self::keyspace`], with every `get_raw` and `contains_key` seeing
+    /// all writes that committed before it. DynamoDB overrides this; fjall,
+    /// Redis (against a primary) and Firestore already read their latest
+    /// write. Cosmos DB does only if the account's consistency level gives
+    /// it: nothing here asks for more.
+    fn keyspace_consistent(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
+        self.keyspace(name)
+    }
     fn batch(&self) -> Box<dyn BatchOps>;
     fn persist(&self) -> BoxFuture<'_, Result<(), AppError>>;
 }
@@ -215,6 +251,22 @@ impl Store {
 
     pub fn keyspace(&self, name: &str) -> Result<KeyspaceHandle, AppError> {
         let (ks_name, ops) = self.inner.keyspace(name)?;
+        Ok(KeyspaceHandle {
+            name: ks_name,
+            inner: ops,
+            backend: self.inner.clone(),
+        })
+    }
+
+    /// [`Self::keyspace`] for code whose reads decide a write: a key read
+    /// through this handle reflects every write committed before the read
+    /// (on Cosmos DB, only as far as the account's consistency level
+    /// allows; see [`StorageBackend::keyspace_consistent`]). Prefix scans
+    /// are not covered. Costs more on
+    /// DynamoDB (twice the read units), so read-heavy paths such as DID
+    /// resolution keep [`Self::keyspace`].
+    pub fn keyspace_consistent(&self, name: &str) -> Result<KeyspaceHandle, AppError> {
+        let (ks_name, ops) = self.inner.keyspace_consistent(name)?;
         Ok(KeyspaceHandle {
             name: ks_name,
             inner: ops,

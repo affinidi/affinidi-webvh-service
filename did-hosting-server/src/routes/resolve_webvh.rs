@@ -133,6 +133,7 @@ async fn serve_content(
     responses(
         (status = 200, description = "Root DID's did:webvh log (JSONL)", content_type = "application/jsonl+json"),
         (status = 404, description = "No root DID hosted on this domain"),
+        (status = 429, description = "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`", content_type = "application/json"),
     ),
 ))]
 pub async fn serve_root_did_log(

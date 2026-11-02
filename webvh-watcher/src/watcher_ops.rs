@@ -93,13 +93,19 @@ pub enum SyncRefusal {
     /// The slot holds a different DID, written by a different source: one
     /// source cannot take over, or delete, another's slot (`notAuthorized`).
     NotOwner(String),
+    /// The store's per-item size limit refuses the log (`taskFailed`). Not
+    /// retryable: the same log will be refused every time.
+    TooLarge(String),
     /// The watcher could not apply it just now (storage): retryable.
     Transient(String),
 }
 
 impl From<AppError> for SyncRefusal {
     fn from(e: AppError) -> Self {
-        SyncRefusal::Transient(e.to_string())
+        match e {
+            AppError::QuotaExceeded(_) => SyncRefusal::TooLarge(e.to_string()),
+            e => SyncRefusal::Transient(e.to_string()),
+        }
     }
 }
 

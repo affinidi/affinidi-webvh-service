@@ -124,7 +124,7 @@ impl TestServer {
         let sessions_ks = store.keyspace(KS_SESSIONS).expect("sessions ks");
         let acl_ks = store.keyspace(KS_ACL).expect("acl ks");
         let registry_ks = store.keyspace(KS_REGISTRY).expect("registry ks");
-        let dids_ks = store.keyspace(KS_DIDS).expect("dids ks");
+        let dids_ks = store.keyspace_consistent(KS_DIDS).expect("dids ks");
         let stats_ks = store.keyspace(KS_STATS).expect("stats ks");
         let timeseries_ks = store.keyspace(KS_TIMESERIES).expect("timeseries ks");
 

@@ -69,6 +69,60 @@ sign-in library does not pass the store's error through. Only the DynamoDB
 backend recognises its throttling; other backends' store errors are still
 `internalError`.
 
+### Fixed — on DynamoDB, the control plane no longer acts on a stale DID read
+
+The control plane (standalone or in the daemon) now reads its DID keyspace
+with strongly consistent reads on DynamoDB. Its reads decide writes: who owns
+a slot, whether a path is free, which log to push to edges. An eventually
+consistent read can miss a write that just committed, so a register right
+after another owner's could take over that owner's slot, and an edge push
+right after a write could find nothing and skip the edge. The daemon's
+expired-DID cleanup, which re-reads a record before deleting it, reads the
+same way, so it can no longer delete a DID published a moment before. Prefix
+scans (listings, quota counts) stay eventually consistent.
+
+Cost: these reads now use twice the read units. They are management traffic
+plus two reads per `/api/health` probe. DID resolution, on edges and in the
+daemon's embedded server, keeps eventually consistent reads and costs the
+same. Other backends are unchanged.
+
+### Fixed — a DID log over the store's item size limit is refused, not a 500
+
+DynamoDB stores at most 400 KB per item and Firestore 1 MiB per document,
+and a DID's whole log is one item, while `did/register` accepts logs up to
+1 MiB. A larger log failed at the store as an internal error (`500`): the
+caller could not tell why, and an edge or watcher receiving it by sync
+retried it forever.
+
+- The DynamoDB and Firestore backends now check each item against their
+  limit before they write anything, so a refused batch leaves nothing
+  half-written. `did/register` (HTTPS, DIDComm and TSP alike) answers
+  `taskFailed` (HTTPS `422`) with the size and the limit in its message; the
+  backend is logged, not told to the caller. The witness file is checked the
+  same way.
+- An edge or watcher refuses such a sync as `taskFailed` rather than
+  retrying it, alone or in a `sync/batch` (where an edge used to report it as
+  `invalidLog`), and keeps serving the version it had. The control plane
+  logs a warning for each entry an edge refuses in a batch. Give edges a
+  store whose limit is at least the control plane's.
+- The DID keeps its last version. A DynamoDB-backed log holds about
+  400 KB (about 170 updates of 2.3 KB entries); Firestore about 750 KB,
+  because the log is stored base64-encoded. Fjall, Redis and Cosmos DB hold
+  any log `did/register` accepts. A DID at its limit takes no further entry,
+  a deactivation or key rotation included. The server README states the
+  limits.
+
+### Fixed — DID tasks no longer report a write that succeeded as failed
+
+`did/check-name` (with `reserve`), `did/register` and `did/set-state` wrote
+the record, then read it back to build their answer. On an eventually
+consistent store (DynamoDB without `ConsistentRead`) that read could miss
+the write, and the caller got an internal error (`record … missing after
+reservation` / `… after write`) for a slot that was reserved or a DID that
+was stored. A reservation retried after that error found the slot taken
+(`available: false`). All three now answer from the record they wrote,
+with no read-back.
+
 ### Added — wallet sign-in locations from a local GeoIP database
 
 The control plane (standalone or in the daemon) now fills in
@@ -251,6 +305,38 @@ server and watcher.
   record and is not affected.
 - The edge's cache is now part of its state rather than process-wide, so
   each edge in one process has its own bounds.
+
+### Added — per-client rate limit on DID resolution
+
+Public DID resolution had no rate limit, so one client could use up a
+metered store's read capacity for every other client.
+
+- **`[server.resolve_rate_limit]`** (`max_per_window`, `window_secs`, default
+  10) caps the resolution requests one client may make per fixed window on
+  the server, watcher and daemon; past it the client gets `429 Too Many
+  Requests` with `Retry-After`, and one warning per client per window is
+  logged. It is off by default. Each setting has a
+  `{DID_HOSTING,WATCHER,DAEMON}_SERVER_RESOLVE_RATE_LIMIT_*` env override; a
+  zero limit or a window outside 1 to 3,600 seconds is refused at startup.
+- A client is its address, an IPv6 client its /64, so rotating addresses
+  inside one block does not escape the limit. The budget is per process. In
+  the daemon one budget covers the server's and watcher's resolution and the
+  root fallback, which also serves the UI.
+- The shared per-address limiter (resolution, the Trust Task listeners and
+  wallet sign-in) now drops addresses whose window has ended when it reaches
+  10,000 tracked addresses, and clears all counts only if
+  more than 7,500 are still live, so a flood does not rescan the map on
+  every request.
+
+### Added — `trusted_proxies` from the environment
+
+- `{CONTROL,DID_HOSTING,WATCHER,WITNESS,DAEMON}_SERVER_TRUSTED_PROXIES` sets
+  `server.trusted_proxies` as a comma-separated list of addresses or CIDR
+  ranges (empty clears it), so a deployment can set it without rewriting the
+  config file. A bad entry is refused at startup.
+- The service warns at startup when the resolution limit is on with no
+  trusted proxies: behind a load balancer every client would share one
+  budget.
 
 ### Added — configurable caching for DID resolution
 

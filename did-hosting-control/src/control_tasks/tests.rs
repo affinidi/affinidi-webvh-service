@@ -2979,3 +2979,19 @@ async fn a_document_refused_as_unavailable_after_a_write_is_not_run_again() {
         "idConflict"
     );
 }
+
+/// A store's per-item size refusal reaches a task that declares no size code
+/// (such as `did/register`) as `taskFailed` with the limit in its message,
+/// not as an internal failure that hides why.
+#[test]
+fn a_store_size_refusal_is_a_task_failure_naming_the_limit() {
+    use did_hosting_common::server::error::AppError;
+    let payload = super::TaskError::App(AppError::QuotaExceeded(
+        "item size 431916 bytes is over the store's per-item limit of 409600 bytes".into(),
+    ))
+    .payload(&[]);
+    let payload = serde_json::to_value(payload).expect("serialise the error payload");
+    assert_eq!(payload["code"], "taskFailed", "{payload}");
+    let message = payload["message"].as_str().unwrap_or_default();
+    assert!(message.contains("409600"), "{payload}");
+}

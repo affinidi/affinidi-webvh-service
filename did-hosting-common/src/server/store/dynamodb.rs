@@ -69,6 +69,15 @@ fn transact_error<R: std::fmt::Debug>(e: SdkError<TransactWriteItemsError, R>) -
     request_error("transact", e)
 }
 
+/// DynamoDB's item size limit, 400 KB: attribute names and values together.
+const MAX_ITEM_BYTES: usize = 400 * 1024;
+
+/// Refuse a `pk`/`val` item DynamoDB would reject as too large.
+fn check_item_size(key: &[u8], value: &[u8]) -> Result<(), AppError> {
+    let size = PK_ATTR.len() + key.len() + VAL_ATTR.len() + value.len();
+    super::check_item_size("DynamoDB", size, MAX_ITEM_BYTES)
+}
+
 // ---------------------------------------------------------------------------
 // DynamoDbBackend
 // ---------------------------------------------------------------------------
@@ -105,18 +114,31 @@ impl DynamoDbBackend {
     fn table_name(&self, keyspace: &str) -> String {
         format!("{}_{}", self.table_prefix, keyspace)
     }
-}
 
-impl StorageBackend for DynamoDbBackend {
-    fn keyspace(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
+    fn open_keyspace(
+        &self,
+        name: &str,
+        consistent_read: bool,
+    ) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
         Ok((
             name.to_string(),
             Arc::new(DynamoDbKeyspace {
                 client: self.client.clone(),
                 table: self.table_name(name),
                 verified: self.verified_tables.clone(),
+                consistent_read,
             }),
         ))
+    }
+}
+
+impl StorageBackend for DynamoDbBackend {
+    fn keyspace(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
+        self.open_keyspace(name, false)
+    }
+
+    fn keyspace_consistent(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
+        self.open_keyspace(name, true)
     }
 
     fn batch(&self) -> Box<dyn BatchOps> {
@@ -190,11 +212,17 @@ struct DynamoDbKeyspace {
     client: Client,
     table: String,
     verified: Arc<RwLock<HashSet<String>>>,
+    /// Send `GetItem` with `ConsistentRead`, so a read sees every write
+    /// that committed before it. Off by default: an eventually consistent
+    /// read costs half the read units and is fine where a stale answer
+    /// decides nothing.
+    consistent_read: bool,
 }
 
 impl KeyspaceOps for DynamoDbKeyspace {
     fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async move {
+            check_item_size(&key, &value)?;
             ensure_table(&self.client, &self.table, &self.verified).await?;
             self.client
                 .put_item()
@@ -216,6 +244,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
                 .get_item()
                 .table_name(&self.table)
                 .key(PK_ATTR, AttributeValue::B(Blob::new(key)))
+                .consistent_read(self.consistent_read)
                 .send()
                 .await
                 .map_err(|e| request_error("get", e))?;
@@ -255,6 +284,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
                 .table_name(&self.table)
                 .key(PK_ATTR, AttributeValue::B(Blob::new(key)))
                 .projection_expression(PK_ATTR)
+                .consistent_read(self.consistent_read)
                 .send()
                 .await
                 .map_err(|e| request_error("get", e))?;
@@ -423,6 +453,12 @@ impl BatchOps for DynamoDbBatch {
 
     fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>> {
         Box::pin(async move {
+            // Before the first chunk is sent, so a refused item writes nothing.
+            for op in &self.ops {
+                if let DynamoDbBatchOp::Insert { key, value, .. } = op {
+                    check_item_size(key, value)?;
+                }
+            }
             // DynamoDB TransactWriteItems supports up to 100 items per request.
             for chunk in self.ops.chunks(100) {
                 let mut items = Vec::with_capacity(chunk.len());
@@ -465,6 +501,12 @@ impl BatchOps for DynamoDbBatch {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use aws_sdk_dynamodb::config::interceptors::BeforeTransmitInterceptorContextRef;
+    use aws_sdk_dynamodb::config::{
+        BehaviorVersion, ConfigBag, Credentials, Intercept, Region, RuntimeComponents,
+    };
     use aws_sdk_dynamodb::error::ErrorMetadata;
     use aws_sdk_dynamodb::operation::get_item::GetItemError;
     use aws_sdk_dynamodb::types::CancellationReason;
@@ -516,6 +558,72 @@ mod tests {
         ));
     }
 
+    /// Records each request body and stops it before it leaves the process.
+    #[derive(Debug, Default, Clone)]
+    struct CaptureBodies(Arc<Mutex<Vec<String>>>);
+
+    impl Intercept for CaptureBodies {
+        fn name(&self) -> &'static str {
+            "CaptureBodies"
+        }
+
+        fn read_before_transmit(
+            &self,
+            context: &BeforeTransmitInterceptorContextRef<'_>,
+            _runtime_components: &RuntimeComponents,
+            _cfg: &mut ConfigBag,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let body = context.request().body().bytes().unwrap_or_default();
+            self.0
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(body).into_owned());
+            Err("request captured".into())
+        }
+    }
+
+    fn offline_backend(capture: &CaptureBodies) -> DynamoDbBackend {
+        let config = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("eu-west-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .endpoint_url("http://127.0.0.1:1")
+            .interceptor(capture.clone())
+            .build();
+        DynamoDbBackend {
+            client: Client::from_conf(config),
+            table_prefix: "webvh".into(),
+            // Marked as present so `ensure_table` sends nothing.
+            verified_tables: Arc::new(RwLock::new(HashSet::from(["webvh_dids".to_string()]))),
+        }
+    }
+
+    async fn read_requests(ops: Arc<dyn KeyspaceOps>, capture: &CaptureBodies) -> Vec<String> {
+        assert!(ops.get_raw(b"did:a".to_vec()).await.is_err());
+        assert!(ops.contains_key(b"did:a".to_vec()).await.is_err());
+        std::mem::take(&mut *capture.0.lock().unwrap())
+    }
+
+    #[tokio::test]
+    async fn consistent_keyspace_reads_strongly_consistent() {
+        let capture = CaptureBodies::default();
+        let backend = offline_backend(&capture);
+
+        let (_, ops) = backend.keyspace_consistent("dids").unwrap();
+        let bodies = read_requests(ops, &capture).await;
+        assert_eq!(bodies.len(), 2, "get_raw and contains_key: {bodies:?}");
+        for body in &bodies {
+            assert!(body.contains(r#""ConsistentRead":true"#), "{body}");
+        }
+
+        let (_, ops) = backend.keyspace("dids").unwrap();
+        let bodies = read_requests(ops, &capture).await;
+        assert_eq!(bodies.len(), 2, "get_raw and contains_key: {bodies:?}");
+        for body in &bodies {
+            assert!(!body.contains(r#""ConsistentRead":true"#), "{body}");
+        }
+    }
+
     fn bin_item(pk: &[u8], val: &[u8]) -> HashMap<String, AttributeValue> {
         HashMap::from([
             (
@@ -527,6 +635,30 @@ mod tests {
                 AttributeValue::B(Blob::new(val.to_vec())),
             ),
         ])
+    }
+
+    /// An item at DynamoDB's 400 KB limit is written; one byte over is
+    /// refused as a size quota, before anything is sent.
+    #[test]
+    fn item_over_400_kb_is_refused_as_a_size_quota() {
+        let key = b"content:alice:log";
+        let overhead = PK_ATTR.len() + key.len() + VAL_ATTR.len();
+        let fits = vec![b'x'; MAX_ITEM_BYTES - overhead];
+        check_item_size(key, &fits).unwrap();
+
+        let over = vec![b'x'; MAX_ITEM_BYTES - overhead + 1];
+        let err = check_item_size(key, &over).unwrap_err();
+        let AppError::QuotaExceeded(message) = &err else {
+            panic!("expected a size quota, got {err:?}");
+        };
+        assert!(
+            message.contains("per-item limit of 409600 bytes"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("DynamoDB"),
+            "the backend is not told to the caller"
+        );
     }
 
     #[test]
