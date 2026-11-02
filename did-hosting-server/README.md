@@ -422,8 +422,8 @@ When sizing `max_per_window`:
   the root fallback, which also serves the UI; one UI page load takes several
   dozen requests.
 - At most 10,000 clients are tracked. Clients whose window has ended are
-  dropped first; if all 10,000 are live, the counts are cleared, so a flood
-  from more addresses than that is not held back. A CDN or web application
+  dropped first; if more than 7,500 are still live, all counts are cleared,
+  so a flood from that many addresses (or IPv6 /64s) is not held back. A CDN or web application
   firewall is the defence against that.
 
 ## Building
