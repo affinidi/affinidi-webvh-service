@@ -331,8 +331,11 @@ pub async fn dispatch_trust_task(
             // line, before ever reading the body, that its login or refresh
             // succeeded. Map it through the same table `into_response` uses.
             let status = document_status(&value);
-            let retry_after = value["payload"]["retryAfter"]
-                .as_str()
+            // Only a refusal carries a retry hint; a success payload's own
+            // field of that name is not one.
+            let retry_after = (!status.is_success())
+                .then(|| value["payload"]["retryAfter"].as_str())
+                .flatten()
                 .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
                 .map(|t| t.with_timezone(&chrono::Utc));
             let mut response = (
@@ -453,11 +456,6 @@ fn into_response(outcome: DispatchOutcome) -> Response {
     }
 }
 
-/// The status for a bare serialised reply document from
-/// `trust_tasks_auth::dispatch` — `200` for a success (or anything not shaped
-/// like a framework error), and [`status_for_code`]'s mapping for a
-/// `trust-task-error` document, exactly as [`into_response`] applies it to a
-/// routed [`DispatchOutcome::Rejected`].
 /// A refusal carrying `retryAfter` says what an HTTP client reads from
 /// `Retry-After`: give it both. Rounded up, since a hint rounded down invites
 /// a retry too soon.
@@ -472,6 +470,11 @@ fn set_retry_after(response: &mut Response, at: Option<chrono::DateTime<chrono::
     );
 }
 
+/// The status for a bare serialised reply document from
+/// `trust_tasks_auth::dispatch` — `200` for a success (or anything not shaped
+/// like a framework error), and [`status_for_code`]'s mapping for a
+/// `trust-task-error` document, exactly as [`into_response`] applies it to a
+/// routed [`DispatchOutcome::Rejected`].
 fn document_status(value: &Value) -> StatusCode {
     let error_type_uri =
         did_hosting_common::server::trust_tasks::framework_error_type_uri().to_string();
