@@ -27,6 +27,7 @@ use trust_tasks_rs::{
 
 use crate::server::acl::{self, AclEntry, Role};
 use crate::server::auth::session::now_epoch;
+use crate::server::error::AppError;
 use crate::server::trust_tasks::entry::{EntryRefusal, SpecAclEntry, act_covers, act_of};
 use crate::server::trust_tasks::{DispatchOutcome, TrustTaskContext, reject_with, run_pipeline};
 use crate::tasks::acl::grant::v0_2 as grant;
@@ -87,13 +88,14 @@ async fn handle_inner(
                     .with_message("only Admin callers may emit acl/grant/0.2"),
             ));
         }
-        Err(_) => {
+        Err(e) if acl::is_acl_refusal(&e) => {
             return Err(reject_with(
                 &doc,
                 ErrorPayload::new(StandardCode::PermissionDenied)
                     .with_message("caller is not present in the maintainer's ACL"),
             ));
         }
+        Err(e) => return Err(internal(&doc, e)),
     }
 
     // ─── 2. Translate the proposed entry to our local shape. ──────
@@ -244,16 +246,12 @@ fn refusal_payload(refusal: EntryRefusal) -> ErrorPayload {
     }
 }
 
-fn internal<P>(doc: &TrustTask<P>, err: impl std::fmt::Display) -> ErrorResponse {
-    // Internal failures (fjall I/O, JSON shape bugs, …) collapse to
-    // `internal_error` on the wire. Operator detail stays in the log
-    // stream rather than leaking into the response.
+fn internal<P>(doc: &TrustTask<P>, err: AppError) -> ErrorResponse {
+    // A store or internal failure says nothing about the request: the wire
+    // gets `unavailable` with a retry time when the store is over capacity,
+    // else a bare `internalError`; the detail stays in the operator log.
     tracing::error!(error = %err, "acl/grant internal failure");
-    reject_with(
-        doc,
-        ErrorPayload::new(StandardCode::InternalError)
-            .with_message("the maintainer encountered an internal failure"),
-    )
+    reject_with(doc, err.failure_reject_reason().into())
 }
 
 #[cfg(test)]

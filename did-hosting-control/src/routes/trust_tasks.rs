@@ -331,12 +331,21 @@ pub async fn dispatch_trust_task(
             // line, before ever reading the body, that its login or refresh
             // succeeded. Map it through the same table `into_response` uses.
             let status = document_status(&value);
-            Ok((
+            // Only a refusal carries a retry hint; a success payload's own
+            // field of that name is not one.
+            let retry_after = (!status.is_success())
+                .then(|| value["payload"]["retryAfter"].as_str())
+                .flatten()
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.with_timezone(&chrono::Utc));
+            let mut response = (
                 status,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
                 serde_json::to_vec(&value).expect("Trust Task response serialises"),
             )
-                .into_response())
+                .into_response();
+            set_retry_after(&mut response, retry_after);
+            Ok(response)
         }
         crate::messaging::RoutedReply::Suppressed => Ok(StatusCode::NO_CONTENT.into_response()),
         crate::messaging::RoutedReply::Sealed(sealed) => Ok(sealed_response(sealed)),
@@ -424,12 +433,14 @@ fn into_response(outcome: DispatchOutcome) -> Response {
             });
             let body =
                 serde_json::to_vec(&err_doc).expect("error document serialises (trust-task-error)");
-            (
+            let mut response = (
                 status,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
                 body,
             )
-                .into_response()
+                .into_response();
+            set_retry_after(&mut response, err_doc.payload.retry_after);
+            response
         }
         DispatchOutcome::Suppressed => {
             // SPEC.md §8.1: identity-mismatch with no transport
@@ -443,6 +454,20 @@ fn into_response(outcome: DispatchOutcome) -> Response {
             StatusCode::NO_CONTENT.into_response()
         }
     }
+}
+
+/// A refusal carrying `retryAfter` says what an HTTP client reads from
+/// `Retry-After`: give it both. Rounded up, since a hint rounded down invites
+/// a retry too soon.
+fn set_retry_after(response: &mut Response, at: Option<chrono::DateTime<chrono::Utc>>) {
+    let Some(at) = at else {
+        return;
+    };
+    let millis = (at - chrono::Utc::now()).num_milliseconds().max(0) as u64;
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(millis.div_ceil(1000).max(1)),
+    );
 }
 
 /// The status for a bare serialised reply document from
