@@ -141,10 +141,9 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         .await
         .expect("create_did");
     assert_eq!(request.mnemonic, "tenant/alice");
-    assert!(
-        request.did_url.contains("tenant/alice/did.jsonl"),
-        "did_url should reference the mnemonic, got {}",
-        request.did_url
+    assert_eq!(
+        request.owner, tenant_did,
+        "the reserved record names its owner"
     );
 
     // 6. Phase 2 — tenant builds a real signed did:webvh log entry locally
