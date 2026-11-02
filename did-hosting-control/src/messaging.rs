@@ -402,6 +402,31 @@ pub(crate) fn do_sync_ack(signer: &str, type_uri: &str, body: &Value) {
         signer,
         mnemonic, status, type_uri, "DID sync: server acknowledged"
     );
+    // A `sync/batch` ack carries a result per entry. A refused entry settles
+    // with the batch, and that server keeps serving the version it had (for
+    // example, a log over its store's item limit), so it is worth an operator's
+    // attention.
+    for result in body
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|r| r.get("status").and_then(Value::as_str) == Some("refused"))
+    {
+        let field = |name| {
+            result
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        };
+        let (mnemonic, code) = (field("mnemonic"), field("code"));
+        warn!(
+            signer,
+            mnemonic,
+            code,
+            "DID sync: server refused an entry and keeps serving its previous version"
+        );
+    }
 }
 
 /// A server acknowledged a `domain/{assign,unassign,purge}` push.
