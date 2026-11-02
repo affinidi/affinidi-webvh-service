@@ -154,3 +154,7 @@ ratatui = "0.30"
 crossterm = "0.29"
 reqwest = { workspace = true }
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+# Adds `test-support` to the regular `did-hosting-common` dependency (Cargo
+# unifies the two): a unit test resolves against a keyspace whose reads fail
+# as a throttled store's would.
+did-hosting-common = { path = "../did-hosting-common", features = ["server-core", "test-support"] }

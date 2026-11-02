@@ -28,6 +28,24 @@ pub const LIMITER_PENDING_CHALLENGES_PER_DID: &str = "auth-challenge-pending-per
 /// substitute the configured values via [`AppError::with_retry_after`].
 pub const DEFAULT_PENDING_CHALLENGE_RETRY_AFTER_SECS: u64 = 30 + 600;
 
+/// [`AppError::RateLimited::limiter`] for a store request the store refused
+/// for its throughput: the store's limit, not this service's.
+pub const LIMITER_STORE_THROUGHPUT: &str = "store-throughput";
+
+/// [`AppError::RateLimited::limiter`] for a signed request refused because
+/// the replay cache is at a bound.
+pub const LIMITER_REPLAY_CACHE: &str = "replay-cache";
+
+/// What a caller is told to wait after a throttled store request. Short: the
+/// store's SDK has already backed off, and a client backs off further on
+/// repeats.
+pub const STORE_THROTTLED_RETRY_AFTER_SECS: u64 = 2;
+
+/// The instant `secs` from now: a Trust Task `retryAfter`.
+pub fn retry_at(secs: u64) -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now() + chrono::Duration::seconds(secs as i64)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("configuration error: {0}")]
@@ -78,7 +96,9 @@ pub enum AppError {
     #[error("quota exceeded: {0}")]
     QuotaExceeded(String),
 
-    /// One of this service's own rate limiters refused the request.
+    /// One of this service's own rate limiters refused the request, or the
+    /// service is over capacity for now (a throttled store, a full replay
+    /// cache): either way, retrying after `retry_after_secs` can succeed.
     ///
     /// Renders to **429** with `x-rate-limit-source: did-host`, a
     /// `Retry-After` in seconds, and the body `{ "error": "rate_limited",
@@ -247,6 +267,55 @@ impl From<vti_common::auth::backend::AuthError> for AppError {
 }
 
 impl AppError {
+    /// A store request the store refused for its throughput (after its own
+    /// retries). The message names nothing internal: the operation goes in
+    /// the operator log.
+    pub fn store_throttled() -> Self {
+        AppError::RateLimited {
+            limiter: LIMITER_STORE_THROUGHPUT,
+            message: "the store is over its throughput; retry later".into(),
+            retry_after_secs: STORE_THROTTLED_RETRY_AFTER_SECS,
+        }
+    }
+
+    /// Whether this is [`Self::store_throttled`].
+    pub fn is_store_throttled(&self) -> bool {
+        matches!(
+            self,
+            AppError::RateLimited {
+                limiter: LIMITER_STORE_THROUGHPUT,
+                ..
+            }
+        )
+    }
+
+    /// The Trust Task refusal for a failure that says nothing about the
+    /// request or its sender (a store or internal error met while deciding):
+    /// `unavailable` with `retryAfter` when this service is over capacity, so
+    /// the sender retries; else `internalError` with a fixed message, the
+    /// detail being for the operator log.
+    pub fn failure_reject_reason(&self) -> trust_tasks_rs::RejectReason {
+        match self.retry_after_secs() {
+            Some(secs) => trust_tasks_rs::RejectReason::Unavailable {
+                retry_after: Some(retry_at(secs)),
+            },
+            None => trust_tasks_rs::RejectReason::InternalError {
+                reason: "the maintainer encountered an internal failure".into(),
+            },
+        }
+    }
+
+    /// Seconds after which a retry can succeed, for a refusal that is only
+    /// about load ([`AppError::RateLimited`]).
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            AppError::RateLimited {
+                retry_after_secs, ..
+            } => Some((*retry_after_secs).max(1)),
+            _ => None,
+        }
+    }
+
     /// Replace the retry hint on an [`AppError::RateLimited`]; any other
     /// variant is returned unchanged. For route handlers that know the
     /// deployment's configured timings when the refusal was raised by code

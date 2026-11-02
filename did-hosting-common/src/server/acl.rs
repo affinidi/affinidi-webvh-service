@@ -330,6 +330,14 @@ pub async fn seed_provisioning_vta_acl(
     Ok(true)
 }
 
+/// Whether a [`check_acl`] failure is the ACL's answer (no entry, or a DID
+/// it cannot hold) rather than a failed lookup. Only the answer is a refusal:
+/// a failed lookup (a throttled store) says nothing about the caller, and
+/// refusing it as "not in the ACL" reads as a revoked grant.
+pub fn is_acl_refusal(e: &AppError) -> bool {
+    matches!(e, AppError::Forbidden(_) | AppError::Validation(_))
+}
+
 /// Check whether a DID is in the ACL and return its role.
 ///
 /// Returns `Forbidden` if the DID is not found.

@@ -309,7 +309,10 @@ impl From<crate::error::AppError> for OpError {
             AppError::Io(_)
             | AppError::Store(_)
             | AppError::SecretStore(_)
-            | AppError::Internal(_) => OpError::Transient(e.to_string()),
+            | AppError::Internal(_)
+            // Over capacity (a throttled store): this server can apply it
+            // later, so the control plane keeps it queued.
+            | AppError::RateLimited { .. } => OpError::Transient(e.to_string()),
             AppError::QuotaExceeded(_) => OpError::Failed(e.to_string()),
             other => OpError::Refused(other.to_string()),
         }
@@ -1235,6 +1238,7 @@ mod tests {
             AppError::Store("disk full".into()),
             AppError::Internal("lock poisoned".into()),
             AppError::Io(std::io::Error::other("eio")),
+            AppError::store_throttled(),
         ] {
             let err = OpError::from(e);
             assert!(matches!(err, OpError::Transient(_)), "{err:?}");
