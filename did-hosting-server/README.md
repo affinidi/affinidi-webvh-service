@@ -310,6 +310,15 @@ the larger logs and keeps serving the versions it had (the control plane logs
 a warning), so give edges a store whose limit is at least the control
 plane's.
 
+A change that spans several items (a DID's record, log, witness file and
+agent names) is written atomically. On DynamoDB that is one transaction,
+which takes at most 100 writes and 4 MB, so a single change over either is
+refused with nothing written rather than split. Only a DID with close to 100
+agent names, or with a log and witness file together near 4 MB, comes near
+it. On Firestore it is one commit, of at most 500 writes and about 10 MB.
+`backup restore` is a bulk load and is split across as many transactions as
+it needs.
+
 To build with a non-default storage backend:
 
 ```bash

@@ -470,50 +470,146 @@ impl BatchOps for DynamoDbBatch {
 
     fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>> {
         Box::pin(async move {
-            // Before the first chunk is sent, so a refused item writes nothing.
-            for op in &self.ops {
-                if let DynamoDbBatchOp::Insert { key, value, .. } = op {
-                    check_item_size(key, value)?;
-                }
+            let ops = prepare_ops(self.ops)?;
+            if ops.is_empty() {
+                return Ok(());
             }
-            // DynamoDB TransactWriteItems supports up to 100 items per request.
-            for chunk in self.ops.chunks(100) {
-                let mut items = Vec::with_capacity(chunk.len());
-                for op in chunk {
-                    match op {
-                        DynamoDbBatchOp::Insert { table, key, value } => {
-                            let put = Put::builder()
-                                .table_name(table)
-                                .item(PK_ATTR, AttributeValue::B(Blob::new(key.clone())))
-                                .item(VAL_ATTR, AttributeValue::B(Blob::new(value.clone())))
-                                .build()
-                                .map_err(|e| AppError::Store(format!("dynamodb put build: {e}")))?;
-                            items.push(TransactWriteItem::builder().put(put).build());
-                        }
-                        DynamoDbBatchOp::Remove { table, key } => {
-                            let del = Delete::builder()
-                                .table_name(table)
-                                .key(PK_ATTR, AttributeValue::B(Blob::new(key.clone())))
-                                .build()
-                                .map_err(|e| {
-                                    AppError::Store(format!("dynamodb delete build: {e}"))
-                                })?;
-                            items.push(TransactWriteItem::builder().delete(del).build());
-                        }
-                    }
-                }
-
-                self.client
-                    .transact_write_items()
-                    .set_transact_items(Some(items))
-                    .send()
-                    .await
-                    .map_err(transact_error)?;
+            // One transaction, so the batch lands whole or not at all. A batch
+            // over the bound is refused here, before anything is sent, rather
+            // than split into transactions that could land part-way.
+            let bytes: usize = ops.iter().map(DynamoDbBatchOp::size).sum();
+            if ops.len() > MAX_TRANSACT_ACTIONS || bytes > MAX_TRANSACT_BYTES {
+                warn!(
+                    writes = ops.len(),
+                    bytes, "batch refused: over one DynamoDB transaction"
+                );
+                // `AppError::quota_kind` keys on the word "size".
+                return Err(AppError::QuotaExceeded(format!(
+                    "a change of {} writes ({bytes} bytes) is over the store's \
+                     size limit for one atomic write: {MAX_TRANSACT_ACTIONS} \
+                     writes and {MAX_TRANSACT_BYTES} bytes",
+                    ops.len()
+                )));
             }
+            send_transaction(&self.client, &ops).await
+        })
+    }
 
+    fn commit_in_parts(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>> {
+        Box::pin(async move {
+            let ops = prepare_ops(self.ops)?;
+            for part in split_transactions(&ops) {
+                send_transaction(&self.client, part).await?;
+            }
             Ok(())
         })
     }
+}
+
+/// `TransactWriteItems` takes at most 100 actions.
+const MAX_TRANSACT_ACTIONS: usize = 100;
+
+/// `TransactWriteItems` takes at most 4 MB of items in all. Counted as
+/// 4,000,000 bytes, not 4 MiB, so the bound errs on the side of refusing.
+const MAX_TRANSACT_BYTES: usize = 4_000_000;
+
+impl DynamoDbBatchOp {
+    fn target(&self) -> (&str, &[u8]) {
+        match self {
+            Self::Insert { table, key, .. } | Self::Remove { table, key } => (table, key),
+        }
+    }
+
+    /// The size DynamoDB counts against a transaction: a put's whole item, a
+    /// delete's key.
+    fn size(&self) -> usize {
+        match self {
+            Self::Insert { key, value, .. } => {
+                PK_ATTR.len() + key.len() + VAL_ATTR.len() + value.len()
+            }
+            Self::Remove { key, .. } => PK_ATTR.len() + key.len(),
+        }
+    }
+}
+
+/// Check every item fits, then keep only the last operation on each item.
+///
+/// The size check runs over every operation before anything is sent, so a
+/// refused item writes nothing. DynamoDB refuses a transaction that names an
+/// item twice; applied in order, the batch leaves each item as its last
+/// operation says, so that is the one kept.
+fn prepare_ops(ops: Vec<DynamoDbBatchOp>) -> Result<Vec<DynamoDbBatchOp>, AppError> {
+    for op in &ops {
+        if let DynamoDbBatchOp::Insert { key, value, .. } = op {
+            check_item_size(key, value)?;
+        }
+    }
+    let mut last = HashMap::with_capacity(ops.len());
+    for (i, op) in ops.iter().enumerate() {
+        let (table, key) = op.target();
+        last.insert((table.to_owned(), key.to_vec()), i);
+    }
+    Ok(ops
+        .into_iter()
+        .enumerate()
+        .filter(|(i, op)| {
+            let (table, key) = op.target();
+            last.get(&(table.to_owned(), key.to_vec())) == Some(i)
+        })
+        .map(|(_, op)| op)
+        .collect())
+}
+
+/// Split operations into runs that each fit one transaction. Every item
+/// already fits on its own ([`check_item_size`]), so no run is empty.
+fn split_transactions(ops: &[DynamoDbBatchOp]) -> Vec<&[DynamoDbBatchOp]> {
+    let mut parts = Vec::new();
+    let (mut start, mut bytes) = (0, 0);
+    for (i, op) in ops.iter().enumerate() {
+        let size = op.size();
+        if i > start && (i - start == MAX_TRANSACT_ACTIONS || bytes + size > MAX_TRANSACT_BYTES) {
+            parts.push(&ops[start..i]);
+            (start, bytes) = (i, 0);
+        }
+        bytes += size;
+    }
+    if start < ops.len() {
+        parts.push(&ops[start..]);
+    }
+    parts
+}
+
+/// Send `ops` as one `TransactWriteItems`.
+async fn send_transaction(client: &Client, ops: &[DynamoDbBatchOp]) -> Result<(), AppError> {
+    let mut items = Vec::with_capacity(ops.len());
+    for op in ops {
+        match op {
+            DynamoDbBatchOp::Insert { table, key, value } => {
+                let put = Put::builder()
+                    .table_name(table)
+                    .item(PK_ATTR, AttributeValue::B(Blob::new(key.clone())))
+                    .item(VAL_ATTR, AttributeValue::B(Blob::new(value.clone())))
+                    .build()
+                    .map_err(|e| AppError::Store(format!("dynamodb put build: {e}")))?;
+                items.push(TransactWriteItem::builder().put(put).build());
+            }
+            DynamoDbBatchOp::Remove { table, key } => {
+                let del = Delete::builder()
+                    .table_name(table)
+                    .key(PK_ATTR, AttributeValue::B(Blob::new(key.clone())))
+                    .build()
+                    .map_err(|e| AppError::Store(format!("dynamodb delete build: {e}")))?;
+                items.push(TransactWriteItem::builder().delete(del).build());
+            }
+        }
+    }
+    client
+        .transact_write_items()
+        .set_transact_items(Some(items))
+        .send()
+        .await
+        .map_err(transact_error)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -655,6 +751,120 @@ mod tests {
         assert!(scan(backend.keyspace_consistent_with_scans("dids").unwrap().1).await);
         assert!(!scan(backend.keyspace_consistent("dids").unwrap().1).await);
         assert!(!scan(backend.keyspace("dids").unwrap().1).await);
+    }
+
+    fn batch_of(backend: &DynamoDbBackend, ops: &[(&[u8], Option<usize>)]) -> Box<dyn BatchOps> {
+        let mut batch = backend.batch();
+        for (key, value_len) in ops {
+            match value_len {
+                Some(len) => batch.insert_raw("dids", key.to_vec(), vec![b'x'; *len]),
+                None => batch.remove("dids", key.to_vec()),
+            }
+        }
+        batch
+    }
+
+    fn keys(n: usize) -> Vec<Vec<u8>> {
+        (0..n).map(|i| format!("did:{i}").into_bytes()).collect()
+    }
+
+    /// A batch is one transaction: up to 100 writes is sent as one request,
+    /// more is refused as a size quota with nothing sent, rather than split
+    /// into transactions that could land part-way.
+    #[tokio::test]
+    async fn an_atomic_batch_over_100_writes_is_refused_before_sending() {
+        let capture = CaptureBodies::default();
+        let backend = offline_backend(&capture);
+
+        let keys = keys(101);
+        let ops: Vec<_> = keys.iter().map(|k| (k.as_slice(), Some(10))).collect();
+
+        // At the bound: sent (the offline client then fails the send).
+        assert!(batch_of(&backend, &ops[..100]).commit().await.is_err());
+        let bodies = std::mem::take(&mut *capture.0.lock().unwrap());
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        assert_eq!(bodies[0].matches(r#"{"Put":"#).count(), 100);
+
+        let err = batch_of(&backend, &ops).commit().await.unwrap_err();
+        assert!(matches!(err, AppError::QuotaExceeded(_)), "{err:?}");
+        assert_eq!(err.quota_kind(), crate::server::error::QuotaKind::Size);
+        assert!(capture.0.lock().unwrap().is_empty(), "nothing is sent");
+    }
+
+    /// Eleven items that each fit are over 4 MB together: refused, nothing sent.
+    #[tokio::test]
+    async fn an_atomic_batch_over_4_mb_is_refused_before_sending() {
+        let capture = CaptureBodies::default();
+        let backend = offline_backend(&capture);
+
+        let keys = keys(11);
+        let ops: Vec<_> = keys
+            .iter()
+            .map(|k| (k.as_slice(), Some(390 * 1024)))
+            .collect();
+        let err = batch_of(&backend, &ops).commit().await.unwrap_err();
+        assert!(matches!(err, AppError::QuotaExceeded(_)), "{err:?}");
+        assert!(capture.0.lock().unwrap().is_empty(), "nothing is sent");
+    }
+
+    /// DynamoDB refuses a transaction naming an item twice, so a batch keeps
+    /// only each item's last operation: the one that decides its final state.
+    #[tokio::test]
+    async fn a_batch_writing_one_item_twice_sends_its_last_operation() {
+        let capture = CaptureBodies::default();
+        let backend = offline_backend(&capture);
+
+        let ops: &[(&[u8], Option<usize>)] = &[
+            (b"did:a", Some(1)),
+            (b"did:b", None),
+            (b"did:a", None),
+            (b"did:b", Some(2)),
+            (b"did:c", None),
+        ];
+        assert!(batch_of(&backend, ops).commit().await.is_err());
+        let bodies = std::mem::take(&mut *capture.0.lock().unwrap());
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        // did:a deleted, did:b put, did:c deleted.
+        assert_eq!(bodies[0].matches(r#"{"Put":"#).count(), 1, "{}", bodies[0]);
+        assert_eq!(
+            bodies[0].matches(r#"{"Delete":"#).count(),
+            2,
+            "{}",
+            bodies[0]
+        );
+    }
+
+    /// `commit_in_parts` splits on both bounds, keeping every operation once
+    /// and in order.
+    #[test]
+    fn parts_stay_within_100_writes_and_4_mb() {
+        let op = |key: Vec<u8>, len| DynamoDbBatchOp::Insert {
+            table: "webvh_dids".into(),
+            key,
+            value: vec![b'x'; len],
+        };
+
+        let small: Vec<_> = keys(250).into_iter().map(|k| op(k, 10)).collect();
+        let parts = split_transactions(&small);
+        let lens: Vec<_> = parts.iter().map(|p| p.len()).collect();
+        assert_eq!(lens, [100, 100, 50]);
+
+        let large: Vec<_> = keys(30).into_iter().map(|k| op(k, 300 * 1024)).collect();
+        let parts = split_transactions(&large);
+        assert!(parts.len() > 1);
+        for part in &parts {
+            let bytes: usize = part.iter().map(DynamoDbBatchOp::size).sum();
+            assert!(bytes <= MAX_TRANSACT_BYTES, "{bytes}");
+            assert!(part.len() <= MAX_TRANSACT_ACTIONS);
+        }
+        let rejoined: Vec<_> = parts.iter().flat_map(|p| p.iter()).collect();
+        assert_eq!(rejoined.len(), large.len());
+        assert!(
+            rejoined
+                .iter()
+                .zip(&large)
+                .all(|(a, b)| a.target() == b.target())
+        );
     }
 
     fn bin_item(pk: &[u8], val: &[u8]) -> HashMap<String, AttributeValue> {

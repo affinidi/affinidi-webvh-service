@@ -311,7 +311,10 @@ async fn restore_keyspace(
                 .map_err(|e| AppError::Config(format!("invalid base64url value: {e}")))?;
             batch.insert_raw(ks, key, value);
         }
-        batch.commit().await?;
+        // A restore is a bulk load that is safe to re-run, and a chunk of
+        // 1,000 entries can be over one DynamoDB transaction, so it need
+        // not land atomically.
+        batch.commit_in_parts().await?;
     }
 
     Ok(entries.len())
