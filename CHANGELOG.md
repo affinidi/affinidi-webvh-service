@@ -24,6 +24,23 @@ the document lists `did:scid:vh:1:<scid>?src=<location>` in `alsoKnownAs`
   SCID, and a request that would change nothing is refused. The update key
   does not rotate.
 
+### Fixed — on DynamoDB, the control plane no longer acts on a stale DID read
+
+The control plane (standalone or in the daemon) now reads its DID keyspace
+with strongly consistent reads on DynamoDB. Its reads decide writes: who owns
+a slot, whether a path is free, which log to push to edges. An eventually
+consistent read can miss a write that just committed, so a register right
+after another owner's could take over that owner's slot, and an edge push
+right after a write could find nothing and skip the edge. The daemon's
+expired-DID cleanup, which re-reads a record before deleting it, reads the
+same way, so it can no longer delete a DID published a moment before. Prefix
+scans (listings, quota counts) stay eventually consistent.
+
+Cost: these reads now use twice the read units. They are management traffic
+plus two reads per `/api/health` probe. DID resolution, on edges and in the
+daemon's embedded server, keeps eventually consistent reads and costs the
+same. Other backends are unchanged.
+
 ### Fixed — a DID log over the store's item size limit is refused, not a 500
 
 DynamoDB stores at most 400 KB per item and Firestore 1 MiB per document,
