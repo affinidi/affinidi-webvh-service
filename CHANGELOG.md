@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Security — UI build dependencies (15 npm advisories)
+
+All 15 open advisories in `did-hosting-ui`'s lockfile came in through Expo's
+build tooling (`@expo/cli`, `@expo/config`, `@expo/fingerprint`), not the
+UI's own code. In-range updates (Expo 58.0.22) cleared 14: `node-forge`
+1.4.0 → 1.4.2 (GHSA-7wch-p9px-956x, GHSA-jc66-7q78-782g, GHSA-8hrf-8g6f-7xwp,
+GHSA-hqq3-7jhf-c5jx, GHSA-5x38-2vff-x55p and five lower), `minimatch`
+10.2.6 → 11.0.4 under the existing override (GHSA-g3hv-75wg-m249), and
+`zod` 3 (GHSA-mrhx-c7xc-m3w5) and `deepmerge` (GHSA-gcqx-w48m-w2h4, no fixed
+release), which current Expo no longer uses. `glob` has no fixed 13.x, so a
+new `>=14.0.2` override moves it to 14 (GHSA-3g3m-2fjr-6pw4); 14 only adds
+options and follows minimatch 11. `npm audit` reports none.
+
 ### Fixed — DynamoDB writes that change several items are atomic
 
 A write batch on DynamoDB was sent 100 items at a time, one transaction per
