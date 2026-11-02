@@ -133,6 +133,21 @@ enum Command {
         #[arg(long)]
         grace: Option<String>,
     },
+    /// List or remove the did:scid alias of the service's own DID.
+    ///
+    /// Publishes a new DID log entry whose `alsoKnownAs` lists (`list`) or no
+    /// longer lists (`remove`) `did:scid:vh:1:<scid>?src=<location>` — the
+    /// listing that makes the DID's did:webvh and did:scid forms one subject
+    /// (VTI-KEY-164). `list` replaces an alias listed for an older location.
+    /// Refused when nothing would change. Signed with the current update key,
+    /// which does not rotate.
+    ///
+    /// The service must be STOPPED (the store is exclusively locked).
+    IdentityScidAlias {
+        /// "list" or "remove".
+        #[arg(value_parser = ["list", "remove"])]
+        action: String,
+    },
     /// Stop honouring a superseded identity generation immediately.
     ///
     /// The offline kill switch, for a compromised key. Messages still addressed
@@ -490,6 +505,12 @@ async fn main() {
         }
         Some(Command::IdentityList) => {
             if let Err(e) = run_identity_list(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::IdentityScidAlias { action }) => {
+            if let Err(e) = run_identity_scid_alias(cli.config, action).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1604,6 +1625,22 @@ async fn run_identity_retire_now(
         &config.secrets,
         &config.config_path,
         generation,
+    )
+    .await
+}
+
+/// `identity-scid-alias` — list or remove the service DID's did:scid alias, offline.
+async fn run_identity_scid_alias(
+    config_path: Option<PathBuf>,
+    action: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    did_hosting_common::server::cli_identity::run_identity_scid_alias(
+        &config.store,
+        &config.secrets,
+        &config.config_path,
+        config.server_did.as_deref(),
+        &action,
     )
     .await
 }

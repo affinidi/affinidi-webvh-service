@@ -41,6 +41,7 @@ import type {
   TimeRange,
   TimeSeriesPoint,
 } from "./api";
+import { scidAliasFromExt } from "./scid-alias";
 
 /** The extension namespace this host's members travel under. */
 export const WEBVH_EXT = "vnd.affinidi.webvh";
@@ -70,7 +71,9 @@ function requiredEpoch(at: string): number {
 // ---------------------------------------------------------------------------
 
 export function didRecordFromWire(r: WireDidRecord): DidRecord {
-  const names = webvhExt(r.ext as Ext).agentNames;
+  const ext = webvhExt(r.ext as Ext);
+  const names = ext.agentNames;
+  const scidAlias = scidAliasFromExt(ext);
   return {
     mnemonic: r.mnemonic,
     owner: r.owner,
@@ -84,6 +87,7 @@ export function didRecordFromWire(r: WireDidRecord): DidRecord {
     ...(r.method ? { method: r.method } : {}),
     ...(r.domain ? { domain: r.domain } : {}),
     ...(Array.isArray(names) ? { agentNames: names as AgentNameEntry[] } : {}),
+    ...(scidAlias ? { scidAlias } : {}),
   };
 }
 
