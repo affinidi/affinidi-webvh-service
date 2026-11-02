@@ -79,11 +79,21 @@ pub const CLOCK_MARGIN_SECS: u64 = 60;
 /// Width of a bucket, in seconds of `issuedAt`.
 const BUCKET_SECS: u64 = 60;
 
-/// What a caller refused with [`ReplayError::Full`] is told to wait: the
-/// cache drops its oldest minute of records once a bucket width. A hint, not
-/// a promise: if that minute held few records, or (for the per-signer
+/// The least a caller refused with [`ReplayError::Full`] is told to wait:
+/// the cache drops its oldest minute of records once a bucket width. A hint,
+/// not a promise: if that minute held few records, or (for the per-signer
 /// bound) none of this signer's, a retry can be refused again.
 pub const FULL_RETRY_AFTER_SECS: u64 = BUCKET_SECS;
+
+/// The most added at random to [`FULL_RETRY_AFTER_SECS`], so callers refused
+/// together don't all retry in the same second and fill the cache again.
+pub const FULL_RETRY_JITTER_SECS: u64 = BUCKET_SECS / 2;
+
+/// How long a caller refused with [`ReplayError::Full`] is told to wait:
+/// [`FULL_RETRY_AFTER_SECS`] plus up to [`FULL_RETRY_JITTER_SECS`].
+pub fn full_retry_after_secs() -> u64 {
+    FULL_RETRY_AFTER_SECS + rand::random_range(0..=FULL_RETRY_JITTER_SECS)
+}
 
 /// Why a record was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +114,7 @@ impl ReplayError {
         match self {
             ReplayError::Duplicate => RejectReason::IdConflict,
             ReplayError::Full => RejectReason::Unavailable {
-                retry_after: Some(super::error::retry_at(FULL_RETRY_AFTER_SECS)),
+                retry_after: Some(super::error::retry_at(full_retry_after_secs())),
             },
             ReplayError::Stale => RejectReason::Stale {
                 detail: trust_tasks_rs::freshness::StaleReason::OlderThanWindow,
@@ -122,7 +132,7 @@ impl From<ReplayError> for AppError {
             ReplayError::Full => AppError::RateLimited {
                 limiter: super::error::LIMITER_REPLAY_CACHE,
                 message: "too many signed requests in flight; retry later".into(),
-                retry_after_secs: FULL_RETRY_AFTER_SECS,
+                retry_after_secs: full_retry_after_secs(),
             },
             ReplayError::Stale => {
                 AppError::Validation("issuedAt is missing or outside the replay window".into())
@@ -549,11 +559,29 @@ mod tests {
         else {
             panic!("a full cache must be unavailable with a retry time");
         };
-        assert!(at > Utc::now());
-        assert_eq!(
-            AppError::from(ReplayError::Full).retry_after_secs(),
-            Some(FULL_RETRY_AFTER_SECS)
+        let wait = at - Utc::now();
+        assert!(wait > chrono::Duration::seconds(FULL_RETRY_AFTER_SECS as i64 - 1));
+        assert!(
+            wait <= chrono::Duration::seconds(
+                (FULL_RETRY_AFTER_SECS + FULL_RETRY_JITTER_SECS) as i64
+            )
         );
+        let secs = AppError::from(ReplayError::Full)
+            .retry_after_secs()
+            .expect("a full cache must carry a retry time");
+        assert!(
+            (FULL_RETRY_AFTER_SECS..=FULL_RETRY_AFTER_SECS + FULL_RETRY_JITTER_SECS)
+                .contains(&secs)
+        );
+    }
+
+    #[test]
+    fn callers_refused_together_are_told_different_retry_times() {
+        let waits: HashSet<u64> = (0..200).map(|_| full_retry_after_secs()).collect();
+        assert!(waits.len() > 1, "every caller was told the same retry time");
+        assert!(waits.iter().all(|w| {
+            (FULL_RETRY_AFTER_SECS..=FULL_RETRY_AFTER_SECS + FULL_RETRY_JITTER_SECS).contains(w)
+        }));
     }
 
     #[test]

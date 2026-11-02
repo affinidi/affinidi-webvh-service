@@ -102,8 +102,9 @@ operation budgets):
   is re-sent; a pong waits for the next ping).
 - The witness no longer puts internal error text in an `internalError`.
 - A full replay cache answered `unavailable` with no retry time. It now
-  suggests a minute, when its oldest records start to expire; a retry can
-  still be refused if the cache is still full.
+  suggests a minute, when its oldest records start to expire, plus up to 30
+  seconds at random, so callers refused together don't all retry at once and
+  fill it again; a retry can still be refused if the cache is still full.
 - The control plane's `POST /api/trust-tasks` sets `Retry-After`, rounded
   up, on a refusal that carries `retryAfter`.
 - The `check-name` reservation and agent-name tasks no longer take a failed
