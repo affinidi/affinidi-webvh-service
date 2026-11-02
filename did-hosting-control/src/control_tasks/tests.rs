@@ -613,6 +613,53 @@ async fn a_record_carries_its_agent_names_under_the_host_extension() {
     );
 }
 
+/// `did/info` reports the latest document's did:scid alias state under the
+/// host extension, derived on the server so a client never re-derives `src`.
+#[tokio::test]
+async fn info_reports_the_did_scid_alias_state_of_the_latest_document() {
+    let (state, _dir) = state().await;
+    let owner = member(&state, 22, Role::Owner).await;
+    seed_did(&state, &owner.did, "alpha-beta").await;
+    for (aka, status) in [
+        (json!([]), "notListed"),
+        (
+            json!(["did:scid:vh:1:Qm1?src=a.example/alpha-beta"]),
+            "stale",
+        ),
+        (
+            json!(["did:scid:vh:1:Qm1?src=b.example/alpha-beta"]),
+            "listed",
+        ),
+    ] {
+        let line = json!({
+            "versionId": "1-a",
+            "state": { "id": "did:webvh:Qm1:b.example:alpha-beta", "alsoKnownAs": aka },
+            "parameters": {},
+        });
+        state
+            .dids_ks
+            .insert_raw(content_log_key("alpha-beta"), line.to_string().into_bytes())
+            .await
+            .unwrap();
+        let reply = call(
+            &state,
+            Via::Tsp,
+            &owner,
+            INFO,
+            json!({ "mnemonic": "alpha-beta" }),
+        )
+        .await;
+        conforms(&reply);
+        let body = ok(&reply, INFO);
+        let alias = &body["record"]["ext"]["vnd.affinidi.webvh"]["scidAlias"];
+        assert_eq!(
+            alias["didUrl"], "did:scid:vh:1:Qm1?src=b.example/alpha-beta",
+            "{body}"
+        );
+        assert_eq!(alias["status"], status, "{body}");
+    }
+}
+
 #[tokio::test]
 async fn delete_answers_the_record_as_it_stood() {
     let (state, _dir) = state().await;

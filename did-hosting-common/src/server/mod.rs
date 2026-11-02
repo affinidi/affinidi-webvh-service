@@ -16,6 +16,7 @@ pub mod health;
 pub mod identity;
 pub mod identity_drain;
 pub mod identity_rotate;
+pub mod identity_scid_alias;
 pub mod init;
 #[cfg(feature = "metrics")]
 pub mod metrics;
