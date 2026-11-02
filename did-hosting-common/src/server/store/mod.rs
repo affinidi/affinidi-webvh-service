@@ -147,7 +147,17 @@ pub trait KeyspaceOps: Send + Sync {
 pub trait BatchOps: Send {
     fn insert_raw(&mut self, keyspace: &str, key: Vec<u8>, value: Vec<u8>);
     fn remove(&mut self, keyspace: &str, key: Vec<u8>);
+    /// Apply every operation or none. A backend whose transactions are
+    /// bounded (DynamoDB: 100 writes, 4 MB) refuses a batch over its bound
+    /// before writing anything, rather than splitting it.
     fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>>;
+    /// Apply every operation, in as many store transactions as the backend
+    /// needs: a failure part-way leaves the earlier parts written. Only for
+    /// bulk loads that are safe to re-run, such as a backup restore. The
+    /// default is [`Self::commit`], for backends with no such bound.
+    fn commit_in_parts(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>> {
+        self.commit()
+    }
 }
 
 /// Factory: create keyspaces, create batches, persist/flush.
@@ -343,10 +353,22 @@ impl WriteBatch {
         self.inner.remove(&ks.name, key.into());
     }
 
-    /// Commit all batched operations atomically.
+    /// Commit all batched operations atomically. On DynamoDB a batch over
+    /// one transaction's bound (100 writes, 4 MB) is refused as
+    /// [`AppError::QuotaExceeded`] and writes nothing.
     pub async fn commit(self) -> Result<(), AppError> {
         note_write();
         self.inner.commit().await
+    }
+
+    /// Commit all batched operations, **not** atomically: a backend with a
+    /// transaction bound splits the batch, and a failure part-way leaves the
+    /// earlier parts written. Only for bulk loads that are safe to re-run
+    /// (a backup restore); anything that must change together uses
+    /// [`Self::commit`].
+    pub async fn commit_in_parts(self) -> Result<(), AppError> {
+        note_write();
+        self.inner.commit_in_parts().await
     }
 }
 

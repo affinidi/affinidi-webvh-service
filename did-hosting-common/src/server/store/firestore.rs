@@ -35,10 +35,35 @@ const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
 /// each), and 32 for the document. The value is stored base64url-encoded, so
 /// it counts about a third more than its raw length.
 fn check_document_size(collection: &str, doc: &KvDoc) -> Result<(), AppError> {
+    super::check_item_size(
+        "Firestore",
+        document_size(collection, doc),
+        MAX_DOCUMENT_BYTES,
+    )
+}
+
+fn document_size(collection: &str, doc: &KvDoc) -> usize {
     let name = collection.len() + 1 + doc.key.len() + 1 + 16;
     let fields = "key".len() + 1 + doc.key.len() + 1 + "data".len() + 1 + doc.data.len() + 1;
-    super::check_item_size("Firestore", name + fields + 32, MAX_DOCUMENT_BYTES)
+    name + fields + 32
 }
+
+/// The most writes one commit (a batch, sent as one transaction) carries.
+/// Firestore's documented bound; kept even where it is no longer enforced,
+/// since only an unusually large change comes near it.
+const MAX_COMMIT_WRITES: usize = 500;
+
+/// The most bytes of documents one commit carries. A commit is one request,
+/// and a request is at most 10 MiB; each write is counted as its document's
+/// size plus [`COMMIT_WRITE_OVERHEAD`] for its full resource name and
+/// encoding, against 10,000,000 bytes, so the bound errs on the side of
+/// refusing.
+const MAX_COMMIT_BYTES: usize = 10_000_000;
+
+/// Per-write allowance for what a commit request carries besides the
+/// document: its full resource name (`projects/…/databases/…/documents/…`)
+/// and the write's own framing.
+const COMMIT_WRITE_OVERHEAD: usize = 512;
 
 // ---------------------------------------------------------------------------
 // FirestoreBackend
@@ -362,63 +387,133 @@ impl BatchOps for FirestoreBatch {
 
     fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>> {
         Box::pin(async move {
-            // Before the first chunk is sent, so a refused document writes
-            // nothing.
-            for op in &self.ops {
-                if let FirestoreBatchOp::Insert {
-                    collection, doc, ..
-                } = op
-                {
-                    check_document_size(collection, doc)?;
-                }
+            check_documents(&self.ops)?;
+            check_one_commit(&self.ops)?;
+            if self.ops.is_empty() {
+                return Ok(());
             }
-            // Firestore batched writes support up to 500 operations per request.
-            for chunk in self.ops.chunks(500) {
-                let mut batch =
-                    self.db.begin_transaction().await.map_err(|e| {
-                        AppError::Store(format!("firestore begin transaction: {e}"))
-                    })?;
+            send_commit(&self.db, &self.ops).await
+        })
+    }
 
-                for op in chunk {
-                    match op {
-                        FirestoreBatchOp::Insert {
-                            collection,
-                            doc_id,
-                            doc,
-                        } => {
-                            self.db
-                                .fluent()
-                                .update()
-                                .in_col(collection)
-                                .document_id(doc_id)
-                                .object(doc)
-                                .add_to_transaction(&mut batch)
-                                .map_err(|e| {
-                                    AppError::Store(format!("firestore batch insert: {e}"))
-                                })?;
-                        }
-                        FirestoreBatchOp::Remove { collection, doc_id } => {
-                            self.db
-                                .fluent()
-                                .delete()
-                                .from(collection)
-                                .document_id(doc_id)
-                                .add_to_transaction(&mut batch)
-                                .map_err(|e| {
-                                    AppError::Store(format!("firestore batch remove: {e}"))
-                                })?;
-                        }
-                    }
-                }
-
-                batch
-                    .commit()
-                    .await
-                    .map_err(|e| AppError::Store(format!("firestore commit transaction: {e}")))?;
+    fn commit_in_parts(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>> {
+        Box::pin(async move {
+            check_documents(&self.ops)?;
+            for part in split_commits(&self.ops) {
+                send_commit(&self.db, part).await?;
             }
             Ok(())
         })
     }
+}
+
+impl FirestoreBatchOp {
+    /// What this write counts against a commit's [`MAX_COMMIT_BYTES`].
+    fn size(&self) -> usize {
+        COMMIT_WRITE_OVERHEAD
+            + match self {
+                Self::Insert {
+                    collection, doc, ..
+                } => document_size(collection, doc),
+                Self::Remove { collection, doc_id } => collection.len() + doc_id.len(),
+            }
+    }
+}
+
+/// Check every document fits, before anything is sent, so a refused document
+/// writes nothing.
+fn check_documents(ops: &[FirestoreBatchOp]) -> Result<(), AppError> {
+    for op in ops {
+        if let FirestoreBatchOp::Insert {
+            collection, doc, ..
+        } = op
+        {
+            check_document_size(collection, doc)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a batch over one commit's bound. A batch is one commit, so it lands
+/// whole or not at all; one over the bound is refused before anything is
+/// sent, rather than split into commits that could land part-way.
+fn check_one_commit(ops: &[FirestoreBatchOp]) -> Result<(), AppError> {
+    let bytes: usize = ops.iter().map(FirestoreBatchOp::size).sum();
+    if ops.len() > MAX_COMMIT_WRITES || bytes > MAX_COMMIT_BYTES {
+        tracing::warn!(
+            writes = ops.len(),
+            bytes,
+            "batch refused: over one Firestore commit"
+        );
+        // `AppError::quota_kind` keys on the word "size".
+        return Err(AppError::QuotaExceeded(format!(
+            "a change of {} writes ({bytes} bytes) is over the store's size \
+             limit for one atomic write: {MAX_COMMIT_WRITES} writes and \
+             {MAX_COMMIT_BYTES} bytes",
+            ops.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Split writes into runs that each fit one commit, keeping their order (a
+/// commit applies its writes in order, and a later write to a document wins).
+/// Every document already fits on its own, so no run is empty.
+fn split_commits(ops: &[FirestoreBatchOp]) -> Vec<&[FirestoreBatchOp]> {
+    let mut parts = Vec::new();
+    let (mut start, mut bytes) = (0, 0);
+    for (i, op) in ops.iter().enumerate() {
+        let size = op.size();
+        if i > start && (i - start == MAX_COMMIT_WRITES || bytes + size > MAX_COMMIT_BYTES) {
+            parts.push(&ops[start..i]);
+            (start, bytes) = (i, 0);
+        }
+        bytes += size;
+    }
+    if start < ops.len() {
+        parts.push(&ops[start..]);
+    }
+    parts
+}
+
+/// Send `ops` as one transaction commit.
+async fn send_commit(db: &FirestoreDb, ops: &[FirestoreBatchOp]) -> Result<(), AppError> {
+    let mut batch = db
+        .begin_transaction()
+        .await
+        .map_err(|e| AppError::Store(format!("firestore begin transaction: {e}")))?;
+
+    for op in ops {
+        match op {
+            FirestoreBatchOp::Insert {
+                collection,
+                doc_id,
+                doc,
+            } => {
+                db.fluent()
+                    .update()
+                    .in_col(collection)
+                    .document_id(doc_id)
+                    .object(doc)
+                    .add_to_transaction(&mut batch)
+                    .map_err(|e| AppError::Store(format!("firestore batch insert: {e}")))?;
+            }
+            FirestoreBatchOp::Remove { collection, doc_id } => {
+                db.fluent()
+                    .delete()
+                    .from(collection)
+                    .document_id(doc_id)
+                    .add_to_transaction(&mut batch)
+                    .map_err(|e| AppError::Store(format!("firestore batch remove: {e}")))?;
+            }
+        }
+    }
+
+    batch
+        .commit()
+        .await
+        .map_err(|e| AppError::Store(format!("firestore commit transaction: {e}")))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -449,6 +544,67 @@ mod tests {
         assert!(
             !message.contains("Firestore"),
             "the backend is not told to the caller"
+        );
+    }
+
+    fn insert(i: usize, value_len: usize) -> FirestoreBatchOp {
+        let doc_id = encode_doc_id(format!("did:{i}").as_bytes());
+        FirestoreBatchOp::Insert {
+            collection: "dids".into(),
+            doc_id: doc_id.clone(),
+            doc: KvDoc {
+                key: doc_id,
+                data: BASE64.encode(vec![b'x'; value_len]),
+            },
+        }
+    }
+
+    /// A batch is one commit: up to 500 writes is accepted, more is refused
+    /// as a size quota rather than split into commits that could land
+    /// part-way.
+    #[test]
+    fn an_atomic_batch_over_500_writes_is_refused() {
+        let ops: Vec<_> = (0..501).map(|i| insert(i, 10)).collect();
+        check_one_commit(&ops[..500]).unwrap();
+        let err = check_one_commit(&ops).unwrap_err();
+        assert!(matches!(err, AppError::QuotaExceeded(_)), "{err:?}");
+        assert_eq!(err.quota_kind(), crate::server::error::QuotaKind::Size);
+    }
+
+    /// Fourteen 700 KB logs each fit a document, but base64-encoded they are
+    /// over one 10 MiB commit together: refused.
+    #[test]
+    fn an_atomic_batch_over_10_mib_is_refused() {
+        let ops: Vec<_> = (0..14).map(|i| insert(i, 700 * 1024)).collect();
+        check_documents(&ops).unwrap();
+        let err = check_one_commit(&ops).unwrap_err();
+        assert!(matches!(err, AppError::QuotaExceeded(_)), "{err:?}");
+    }
+
+    /// `commit_in_parts` splits on both bounds, keeping every write once and
+    /// in order.
+    #[test]
+    fn parts_stay_within_500_writes_and_10_mib() {
+        let small: Vec<_> = (0..1200).map(|i| insert(i, 10)).collect();
+        let lens: Vec<_> = split_commits(&small).iter().map(|p| p.len()).collect();
+        assert_eq!(lens, [500, 500, 200]);
+
+        let large: Vec<_> = (0..40).map(|i| insert(i, 700 * 1024)).collect();
+        let parts = split_commits(&large);
+        assert!(parts.len() > 1);
+        for part in &parts {
+            check_one_commit(part).unwrap();
+        }
+        let ids = |ops: &mut dyn Iterator<Item = &FirestoreBatchOp>| -> Vec<String> {
+            ops.map(|op| match op {
+                FirestoreBatchOp::Insert { doc_id, .. }
+                | FirestoreBatchOp::Remove { doc_id, .. } => doc_id.clone(),
+            })
+            .collect()
+        };
+        assert_eq!(
+            ids(&mut parts.iter().flat_map(|p| p.iter())),
+            ids(&mut large.iter())
         );
     }
 }

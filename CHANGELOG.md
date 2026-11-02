@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Fixed — DynamoDB writes that change several items are atomic
+
+A write batch on DynamoDB was sent 100 items at a time, one transaction per
+chunk: a batch over 100 items could land part-way, and a chunk over 4 MB
+(possible in `backup restore`, 1,000 entries at a time) was rejected by
+DynamoDB, so the restore failed. A batch is now one transaction. One over
+DynamoDB's bound (100 writes, 4 MB) is refused before anything is written,
+as `taskFailed` with the size in its message, like an over-size item. A
+batch naming one item twice now sends only that item's last operation,
+since DynamoDB refuses a transaction that touches an item twice.
+`backup restore` loads in as many transactions as it needs, each within both
+bounds, and is not atomic, as before.
+
+### Fixed — Firestore writes that change several items are atomic
+
+A write batch on Firestore was committed 500 writes at a time, so a batch
+over 500 could land part-way, and a commit is one request of at most
+10 MiB, which a few base64-encoded logs together can pass. A batch is now
+one commit. One over 500 writes or about 10 MB is refused before anything
+is written, as `taskFailed` with the size in its message. `backup restore`
+splits on both bounds.
+
 ### Changed — the daemon resolves a cached DID without reading the store
 
 Every resolve read the DID's record and scanned the domains keyspace before
