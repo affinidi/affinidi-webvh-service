@@ -26,6 +26,20 @@ struct KvDoc {
     data: String,
 }
 
+/// Firestore's document size limit, 1 MiB.
+const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
+
+/// Refuse a document Firestore would reject as too large, sized by its
+/// documented rules: the name (each collection and document ID, plus one
+/// byte each, plus 16), each field's name and string value (plus one byte
+/// each), and 32 for the document. The value is stored base64url-encoded, so
+/// it counts about a third more than its raw length.
+fn check_document_size(collection: &str, doc: &KvDoc) -> Result<(), AppError> {
+    let name = collection.len() + 1 + doc.key.len() + 1 + 16;
+    let fields = "key".len() + 1 + doc.key.len() + 1 + "data".len() + 1 + doc.data.len() + 1;
+    super::check_item_size("Firestore", name + fields + 32, MAX_DOCUMENT_BYTES)
+}
+
 // ---------------------------------------------------------------------------
 // FirestoreBackend
 // ---------------------------------------------------------------------------
@@ -115,6 +129,7 @@ impl KeyspaceOps for FirestoreKeyspace {
                 key: doc_id.clone(),
                 data: BASE64.encode(&value),
             };
+            check_document_size(&self.collection, &doc)?;
             // `update` acts as an upsert in Firestore
             let _: KvDoc = self
                 .db
@@ -347,6 +362,16 @@ impl BatchOps for FirestoreBatch {
 
     fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>> {
         Box::pin(async move {
+            // Before the first chunk is sent, so a refused document writes
+            // nothing.
+            for op in &self.ops {
+                if let FirestoreBatchOp::Insert {
+                    collection, doc, ..
+                } = op
+                {
+                    check_document_size(collection, doc)?;
+                }
+            }
             // Firestore batched writes support up to 500 operations per request.
             for chunk in self.ops.chunks(500) {
                 let mut batch =
@@ -393,5 +418,37 @@ impl BatchOps for FirestoreBatch {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(value_len: usize) -> KvDoc {
+        let key = encode_doc_id(b"content:alice:log");
+        KvDoc {
+            data: BASE64.encode(vec![b'x'; value_len]),
+            key,
+        }
+    }
+
+    /// The base64 encoding counts against Firestore's 1 MiB: a 700 KB log
+    /// fits, an 800 KB one does not, and it is refused as a size quota.
+    #[test]
+    fn document_over_1_mib_after_encoding_is_refused_as_a_size_quota() {
+        check_document_size("dids", &doc(700 * 1024)).unwrap();
+        let err = check_document_size("dids", &doc(800 * 1024)).unwrap_err();
+        let AppError::QuotaExceeded(message) = &err else {
+            panic!("expected a size quota, got {err:?}");
+        };
+        assert!(
+            message.contains("per-item limit of 1048576 bytes"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("Firestore"),
+            "the backend is not told to the caller"
+        );
     }
 }
