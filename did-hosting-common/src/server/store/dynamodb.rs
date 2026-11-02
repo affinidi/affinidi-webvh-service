@@ -22,6 +22,15 @@ const VAL_ATTR: &str = "val";
 /// caller stores at the same partition key.
 const CNT_ATTR: &str = "cnt";
 
+/// DynamoDB's item size limit, 400 KB: attribute names and values together.
+const MAX_ITEM_BYTES: usize = 400 * 1024;
+
+/// Refuse a `pk`/`val` item DynamoDB would reject as too large.
+fn check_item_size(key: &[u8], value: &[u8]) -> Result<(), AppError> {
+    let size = PK_ATTR.len() + key.len() + VAL_ATTR.len() + value.len();
+    super::check_item_size("DynamoDB", size, MAX_ITEM_BYTES)
+}
+
 // ---------------------------------------------------------------------------
 // DynamoDbBackend
 // ---------------------------------------------------------------------------
@@ -148,6 +157,7 @@ struct DynamoDbKeyspace {
 impl KeyspaceOps for DynamoDbKeyspace {
     fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async move {
+            check_item_size(&key, &value)?;
             ensure_table(&self.client, &self.table, &self.verified).await?;
             self.client
                 .put_item()
@@ -379,6 +389,12 @@ impl BatchOps for DynamoDbBatch {
 
     fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>> {
         Box::pin(async move {
+            // Before the first chunk is sent, so a refused item writes nothing.
+            for op in &self.ops {
+                if let DynamoDbBatchOp::Insert { key, value, .. } = op {
+                    check_item_size(key, value)?;
+                }
+            }
             // DynamoDB TransactWriteItems supports up to 100 items per request.
             for chunk in self.ops.chunks(100) {
                 let mut items = Vec::with_capacity(chunk.len());
@@ -434,6 +450,30 @@ mod tests {
                 AttributeValue::B(Blob::new(val.to_vec())),
             ),
         ])
+    }
+
+    /// An item at DynamoDB's 400 KB limit is written; one byte over is
+    /// refused as a size quota, before anything is sent.
+    #[test]
+    fn item_over_400_kb_is_refused_as_a_size_quota() {
+        let key = b"content:alice:log";
+        let overhead = PK_ATTR.len() + key.len() + VAL_ATTR.len();
+        let fits = vec![b'x'; MAX_ITEM_BYTES - overhead];
+        check_item_size(key, &fits).unwrap();
+
+        let over = vec![b'x'; MAX_ITEM_BYTES - overhead + 1];
+        let err = check_item_size(key, &over).unwrap_err();
+        let AppError::QuotaExceeded(message) = &err else {
+            panic!("expected a size quota, got {err:?}");
+        };
+        assert!(
+            message.contains("per-item limit of 409600 bytes"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("DynamoDB"),
+            "the backend is not told to the caller"
+        );
     }
 
     #[test]
