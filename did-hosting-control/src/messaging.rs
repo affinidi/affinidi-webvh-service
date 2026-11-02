@@ -514,7 +514,7 @@ pub(crate) struct InfraRejection {
     pub comment: String,
     /// The refusal to send, when it is not a permission or shape problem
     /// (a failed lookup): see [`InfraRejection::lookup_failed`].
-    pub reason: Option<trust_tasks_rs::RejectReason>,
+    pub reason: Option<Box<trust_tasks_rs::RejectReason>>,
 }
 
 impl InfraRejection {
@@ -533,7 +533,7 @@ impl InfraRejection {
         Self {
             code: "e.p.lookup.failed",
             comment: "the sender's role could not be read".into(),
-            reason: Some(e.failure_reject_reason()),
+            reason: Some(Box::new(e.failure_reject_reason())),
         }
     }
 }
@@ -2069,8 +2069,8 @@ mod tests {
             panic!("stats sync must not succeed without its role");
         };
         assert!(matches!(
-            rej.reason,
-            Some(trust_tasks_rs::RejectReason::Unavailable {
+            rej.reason.as_deref(),
+            Some(&trust_tasks_rs::RejectReason::Unavailable {
                 retry_after: Some(_)
             })
         ));
@@ -2078,8 +2078,8 @@ mod tests {
             panic!("registration must not succeed without its role");
         };
         assert!(matches!(
-            rej.reason,
-            Some(trust_tasks_rs::RejectReason::Unavailable { .. })
+            rej.reason.as_deref(),
+            Some(&trust_tasks_rs::RejectReason::Unavailable { .. })
         ));
 
         let Err(rej) = do_stats_sync(&state, "did:example:stranger", &stats).await else {

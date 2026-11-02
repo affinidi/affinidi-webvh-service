@@ -132,7 +132,7 @@ async fn dispatch_inner(
                 Err(rej) => {
                     // A payload that is not `server/register/0.2` is malformed,
                     // not forbidden: the caller is told which, and can fix it.
-                    let reason = if let Some(reason) = rej.reason.clone() {
+                    let reason = if let Some(reason) = rej.reason.as_deref().cloned() {
                         reason
                     } else if rej.code == "e.p.registration.malformed" {
                         trust_tasks_rs::RejectReason::MalformedRequest {
@@ -163,7 +163,7 @@ async fn dispatch_inner(
                     Some(serde_json::to_value(&resp).expect("ack document serialises"))
                 }
                 Err(rej) => {
-                    let reason = rej.reason.clone().unwrap_or_else(|| {
+                    let reason = rej.reason.as_deref().cloned().unwrap_or_else(|| {
                         trust_tasks_rs::RejectReason::PermissionDenied {
                             reason: rej.comment.clone(),
                         }
