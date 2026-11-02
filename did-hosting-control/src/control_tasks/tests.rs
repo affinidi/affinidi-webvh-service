@@ -2901,3 +2901,34 @@ async fn a_document_refused_as_unavailable_can_be_sent_again() {
         "idConflict"
     );
 }
+
+/// A task refused as `unavailable` after it attempted a write may have applied
+/// part of it, so the same document is not run again: a retry is a new one.
+#[tokio::test]
+async fn a_document_refused_as_unavailable_after_a_write_is_not_run_again() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 57, Role::Admin).await;
+    let grant = t("acl/grant/0.2");
+    let entry = json!({
+        "entry": {
+            "subject": "did:example:a-new-member",
+            "role": "owner",
+            "act": { "scope": "all" },
+            "keys": { "scope": "none" },
+            "capabilities": { "scope": "ceiling" }
+        }
+    });
+    let doc = signed(request(&grant, &admin.did, entry), &admin.key).await;
+
+    let mut throttled = state.clone();
+    throttled.acl_ks = state
+        .acl_ks
+        .throttled_writes_after(std::sync::Arc::new(0.into()));
+    let reply = send(&throttled, Via::Tsp, &admin, doc.clone()).await;
+    assert_eq!(code(&reply), "unavailable", "{reply}");
+
+    assert_eq!(
+        code(&send(&state, Via::Tsp, &admin, doc).await),
+        "idConflict"
+    );
+}

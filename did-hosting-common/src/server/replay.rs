@@ -218,7 +218,9 @@ impl ReplayCache {
     /// recorded, which did not run. A refused document can be resent as a
     /// retry (the VTA's contract for a refusal under load), and without this
     /// the resend would be refused as a replay. Only ever for a document whose
-    /// task committed nothing; a record already gone is left alone.
+    /// task attempted no store write ([`crate::server::store::track_writes`]):
+    /// one that did may have committed part of its work, and a resend would
+    /// apply it twice. A record already gone is left alone.
     pub fn release(&self, signer: &str, id: &str, issued_at: Option<DateTime<Utc>>) {
         let Some(issued_at) = issued_at.map(|t| t.timestamp()) else {
             return;

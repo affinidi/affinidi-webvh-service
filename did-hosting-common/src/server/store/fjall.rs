@@ -384,6 +384,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_write_is_tracked_even_when_it_fails_and_a_read_is_not() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace("test").unwrap();
+        ks.insert("key1", &"hello").await.unwrap();
+
+        let ((), wrote) = track_writes(async {
+            let _: Option<String> = ks.get("key1").await.unwrap();
+            ks.contains_key("key1").await.unwrap();
+            ks.prefix_iter_raw("key").await.unwrap();
+        })
+        .await;
+        assert!(!wrote, "reads are not writes");
+
+        let refused = ks.throttled_writes_after(Arc::new(0.into()));
+        let (result, wrote) = track_writes(refused.insert("key2", &"world")).await;
+        assert!(result.unwrap_err().is_store_throttled());
+        assert!(wrote, "a refused write may still have landed");
+
+        let ((), wrote) = track_writes(async {
+            let mut batch = store.batch();
+            batch.remove(&ks, "key1");
+            batch.commit().await.unwrap();
+        })
+        .await;
+        assert!(wrote, "a batch commit is a write");
+    }
+
+    #[tokio::test]
     async fn insert_and_get_roundtrip() {
         let (store, _dir) = temp_store().await;
         let ks = store.keyspace("test").unwrap();

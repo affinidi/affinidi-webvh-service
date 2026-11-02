@@ -16,9 +16,11 @@ operation budgets):
   `retryAfter`, on the control plane and the witness. An edge reports it to
   its control plane as retryable, as it now does any rate limit (one used to
   be reported final).
-- A Trust Task refused as `unavailable` did not run, and sending the same
-  signed document again is now a retry: the control plane and the witness
-  forget its id rather than refusing the resend as a replay.
+- A Trust Task refused as `unavailable` before it wrote anything did not
+  run, and sending the same signed document again is now a retry: the
+  control plane and the witness forget its id rather than refusing the
+  resend as a replay. One refused after it attempted a write may have
+  applied part of it, so its id is kept and a retry must be a new document.
 - A failed lookup of the sender's ACL entry was refused as if the sender had
   no grant: `permissionDenied` "caller is not present in the maintainer's
   ACL" at the control plane's dispatch gate, in its tasks and in `acl/*`; "not

@@ -18,6 +18,7 @@ pub use keyspaces::{
     KS_TIMESERIES, KS_TSP_RELATIONSHIPS, KS_WITNESSES,
 };
 
+use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -130,6 +131,37 @@ pub trait StorageBackend: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// Write tracking
+// ---------------------------------------------------------------------------
+
+tokio::task_local! {
+    /// Set once the task running under [`track_writes`] attempts a store write.
+    static WROTE: Cell<bool>;
+}
+
+/// Run `f` and report whether it attempted a store write, through any
+/// keyspace or batch. A write that failed counts too: a backend may have
+/// applied it, or part of a batch, before reporting the failure. Writes made
+/// by tasks `f` spawns are not seen. Box a large `f` (a dispatch) before
+/// passing it: built on the stack and nested in the scope's future, it can
+/// overflow a thread's stack.
+pub async fn track_writes<F: Future>(f: F) -> (F::Output, bool) {
+    WROTE
+        .scope(
+            Cell::new(false),
+            Box::pin(async {
+                let out = f.await;
+                (out, WROTE.with(Cell::get))
+            }),
+        )
+        .await
+}
+
+fn note_write() {
+    let _ = WROTE.try_with(|wrote| wrote.set(true));
+}
+
+// ---------------------------------------------------------------------------
 // Public wrapper types (same API surface as before)
 // ---------------------------------------------------------------------------
 
@@ -236,6 +268,7 @@ impl WriteBatch {
 
     /// Commit all batched operations atomically.
     pub async fn commit(self) -> Result<(), AppError> {
+        note_write();
         self.inner.commit().await
     }
 }
@@ -260,6 +293,7 @@ impl KeyspaceHandle {
         value: &V,
     ) -> Result<(), AppError> {
         let bytes = serde_json::to_vec(value)?;
+        note_write();
         self.inner.insert_raw(key.into(), bytes).await
     }
 
@@ -283,6 +317,7 @@ impl KeyspaceHandle {
         &self,
         key: impl Into<Vec<u8>>,
     ) -> Result<Option<V>, AppError> {
+        note_write();
         match self.inner.take_raw_atomic(key.into()).await? {
             Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
             None => Ok(None),
@@ -295,6 +330,7 @@ impl KeyspaceHandle {
     /// stored value is not JSON (e.g. a raw session_id under a refresh-
     /// token index).
     pub async fn take_raw(&self, key: impl Into<Vec<u8>>) -> Result<Option<Vec<u8>>, AppError> {
+        note_write();
         self.inner.take_raw_atomic(key.into()).await
     }
 
@@ -304,10 +340,12 @@ impl KeyspaceHandle {
     /// store, so a caller relying on the returned count for a lockout
     /// decision gets the same guarantee `take` gives a single-use token.
     pub async fn incr_raw(&self, key: impl Into<Vec<u8>>) -> Result<u64, AppError> {
+        note_write();
         self.inner.incr_raw(key.into()).await
     }
 
     pub async fn remove(&self, key: impl Into<Vec<u8>>) -> Result<(), AppError> {
+        note_write();
         self.inner.remove(key.into()).await
     }
 
@@ -316,6 +354,7 @@ impl KeyspaceHandle {
         key: impl Into<Vec<u8>>,
         value: impl Into<Vec<u8>>,
     ) -> Result<(), AppError> {
+        note_write();
         self.inner.insert_raw(key.into(), value.into()).await
     }
 
@@ -428,14 +467,20 @@ impl KeyspaceHandle {
     /// would. Reads are untouched. Raise `allowed` to let writes through
     /// again.
     pub fn failing_writes_after(&self, allowed: Arc<std::sync::atomic::AtomicUsize>) -> Self {
-        self.wrap_failing(allowed, false)
+        self.wrap_failing(allowed, false, injected_write_failure)
+    }
+
+    /// Like [`Self::failing_writes_after`], but a failing write is refused as
+    /// a throttled store would ([`AppError::store_throttled`]).
+    pub fn throttled_writes_after(&self, allowed: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        self.wrap_failing(allowed, false, AppError::store_throttled)
     }
 
     /// Like [`Self::failing_writes_after`], but a failing write is applied
     /// before it reports failure, as when a store times out after the write
     /// landed.
     pub fn failing_acks_after(&self, allowed: Arc<std::sync::atomic::AtomicUsize>) -> Self {
-        self.wrap_failing(allowed, true)
+        self.wrap_failing(allowed, true, injected_write_failure)
     }
 
     /// Wrap this keyspace so every read fails as a throttled store would
@@ -458,13 +503,19 @@ impl KeyspaceHandle {
         }
     }
 
-    fn wrap_failing(&self, allowed: Arc<std::sync::atomic::AtomicUsize>, apply: bool) -> Self {
+    fn wrap_failing(
+        &self,
+        allowed: Arc<std::sync::atomic::AtomicUsize>,
+        apply: bool,
+        error: fn() -> AppError,
+    ) -> Self {
         Self {
             name: self.name.clone(),
             inner: Arc::new(FailingWrites {
                 inner: self.inner.clone(),
                 allowed,
                 apply,
+                error,
             }),
             backend: self.backend.clone(),
         }
@@ -477,6 +528,12 @@ struct FailingWrites {
     allowed: Arc<std::sync::atomic::AtomicUsize>,
     /// Apply a failing write before reporting the failure.
     apply: bool,
+    error: fn() -> AppError,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn injected_write_failure() -> AppError {
+    AppError::Store("injected write failure".into())
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -486,7 +543,7 @@ impl FailingWrites {
         self.allowed
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .map(|_| ())
-            .map_err(|_| AppError::Store("injected write failure".into()))
+            .map_err(|_| (self.error)())
     }
 }
 

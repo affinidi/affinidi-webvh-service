@@ -213,60 +213,69 @@ pub async fn dispatch_inbound_document(
         }
     }
 
-    let reply = if WITNESS_TASKS.contains(&type_uri.as_str()) {
-        let result = match type_uri.as_str() {
-            t if t == key_create::Payload::TYPE_URI => key_create_task(state, &doc).await,
-            t if t == key_list::Payload::TYPE_URI => key_list_task(state, &doc).await,
-            t if t == key_delete::Payload::TYPE_URI => key_delete_task(state, &doc).await,
-            _ => sign_task(state, &principal, &doc).await,
-        };
-        match result {
-            Ok(payload) => doc.respond_with(reply_id(), payload),
-            Err(e) => error_value(doc.reject_with(reply_id(), e)),
-        }
-    } else if ACL_TASKS.contains(&type_uri.as_str()) {
-        let ctx = TrustTaskContext {
-            acl_ks: &state.acl_ks,
-            acl_locks: &state.acl_locks,
-            my_vid: my_did,
-            signing_oracle: true,
-        };
-        // The proof was verified above, on the document as it arrived.
-        let policy = ProofPolicy::<TransportBoundVerifier>::AcceptUnverified;
-        let outcome = match via {
-            Via::Tsp => {
-                let t = TspTransportHandler::new(my_did.to_string(), principal.clone());
-                dispatch_inbound(&ctx, &t, policy, doc).await
+    let (reply, wrote) = did_hosting_common::server::store::track_writes(Box::pin(async {
+        let reply = if WITNESS_TASKS.contains(&type_uri.as_str()) {
+            let result = match type_uri.as_str() {
+                t if t == key_create::Payload::TYPE_URI => key_create_task(state, &doc).await,
+                t if t == key_list::Payload::TYPE_URI => key_list_task(state, &doc).await,
+                t if t == key_delete::Payload::TYPE_URI => key_delete_task(state, &doc).await,
+                _ => sign_task(state, &principal, &doc).await,
+            };
+            match result {
+                Ok(payload) => doc.respond_with(reply_id(), payload),
+                Err(e) => error_value(doc.reject_with(reply_id(), e)),
             }
-            Via::Didcomm => {
-                let t =
-                    trust_tasks_didcomm::DidcommHandler::new(my_did.to_string(), principal.clone());
-                dispatch_inbound(&ctx, &t, policy, doc).await
+        } else if ACL_TASKS.contains(&type_uri.as_str()) {
+            let ctx = TrustTaskContext {
+                acl_ks: &state.acl_ks,
+                acl_locks: &state.acl_locks,
+                my_vid: my_did,
+                signing_oracle: true,
+            };
+            // The proof was verified above, on the document as it arrived.
+            let policy = ProofPolicy::<TransportBoundVerifier>::AcceptUnverified;
+            let outcome = match via {
+                Via::Tsp => {
+                    let t = TspTransportHandler::new(my_did.to_string(), principal.clone());
+                    dispatch_inbound(&ctx, &t, policy, doc).await
+                }
+                Via::Didcomm => {
+                    let t = trust_tasks_didcomm::DidcommHandler::new(
+                        my_did.to_string(),
+                        principal.clone(),
+                    );
+                    dispatch_inbound(&ctx, &t, policy, doc).await
+                }
+                Via::Https => {
+                    let t = trust_tasks_https::HttpsHandler::new(
+                        my_did.to_string(),
+                        Some(principal.clone()),
+                    );
+                    dispatch_inbound(&ctx, &t, policy, doc).await
+                }
+            };
+            match outcome {
+                DispatchOutcome::Handled(reply) => reply,
+                DispatchOutcome::Rejected(err) => error_value(err),
+                DispatchOutcome::Suppressed => return None,
             }
-            Via::Https => {
-                let t = trust_tasks_https::HttpsHandler::new(
-                    my_did.to_string(),
-                    Some(principal.clone()),
-                );
-                dispatch_inbound(&ctx, &t, policy, doc).await
-            }
+        } else {
+            error_value(doc.reject_with(
+                reply_id(),
+                RejectReason::UnsupportedType {
+                    type_uri: type_uri.clone(),
+                },
+            ))
         };
-        match outcome {
-            DispatchOutcome::Handled(reply) => reply,
-            DispatchOutcome::Rejected(err) => error_value(err),
-            DispatchOutcome::Suppressed => return None,
-        }
-    } else {
-        error_value(doc.reject_with(
-            reply_id(),
-            RejectReason::UnsupportedType {
-                type_uri: type_uri.clone(),
-            },
-        ))
-    };
-    // Refused as over capacity: the task did not run, so the same document
-    // can be sent again as a retry rather than refused as a replay.
-    if reply.payload.get("code").and_then(Value::as_str) == Some("unavailable") {
+        Some(reply)
+    }))
+    .await;
+    let reply = reply?;
+    // Refused as over capacity before it wrote anything: the task did not
+    // run, so the same document can be sent again as a retry rather than
+    // refused as a replay. One that attempted a write may have applied part
+    // of it, so its record stays.
+    if !wrote && reply.payload.get("code").and_then(Value::as_str) == Some("unavailable") {
         state.replay_cache.release(&principal, &doc_id, issued_at);
     }
     seal(state, my_did, &principal, reply).await

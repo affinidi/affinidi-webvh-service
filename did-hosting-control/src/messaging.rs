@@ -1597,7 +1597,7 @@ async fn route_trust_task_doc(
     let recorded = (signed && rule.uses_shared_replay_cache())
         .then(|| (principal.clone(), doc.id.clone(), doc.issued_at));
 
-    let reply = async {
+    let (reply, wrote) = did_hosting_common::server::store::track_writes(Box::pin(async {
         // Proofs are verified on every path — there is no configuration under
         // which a proof-bearing document is accepted unverified.
         let policy: trust_tasks_rs::ProofPolicy<'_, TransportBoundVerifier> =
@@ -1675,14 +1675,16 @@ async fn route_trust_task_doc(
         Ok(RoutedReply::Framework(Box::new(
             dispatch_inbound::<TransportBoundVerifier>(&ctx, transport, policy, doc).await,
         )))
-    }
+    }))
     .await;
 
-    // A task refused as `unavailable` (over capacity) did not run, and a
-    // refused document can be sent again as a retry: forget its record, or
-    // the resend would be refused as a replay. Every task answers that way
-    // only for a store refusal that committed nothing.
+    // A task refused as `unavailable` (over capacity) before it wrote
+    // anything did not run, and a refused document can be sent again as a
+    // retry: forget its record, or the resend would be refused as a replay.
+    // One that attempted a write may have applied part of it, so its record
+    // stays and a retry must be a new document.
     if let Some((signer, id, issued_at)) = &recorded
+        && !wrote
         && matches!(&reply, Ok(r) if r.is_unavailable())
     {
         state.replay_cache.release(signer, id, *issued_at);
