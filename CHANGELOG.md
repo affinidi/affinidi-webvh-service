@@ -2,18 +2,27 @@
 
 ## Unreleased
 
-### Fixed — the single-table DynamoDB backend handles overload and large logs like the multi-table one
+### Added — `store-dynamodb-single`, a DynamoDB backend on one table you provision
 
-`store-dynamodb-single` now does what 0.11 does for `store-dynamodb`:
+A storage backend that keeps every keyspace in one existing DynamoDB table
+with a composite key (`pk` the keyspace, `sk` the record key), instead of
+the table per keyspace `store-dynamodb` creates. It needs no table-management
+permissions, and prefix listings are `Query` calls on one partition rather
+than table scans. See `docs/store-dynamodb-single.md` for the table
+definition, permissions and settings.
 
-- A throttled request, including a transaction cancelled for throttling, is
-  answered as a rate limit (HTTP 429 with `Retry-After`, or Trust Task
-  `unavailable`), not a store error. A throttled transaction is no longer
-  reported as having an unknown outcome.
-- An item over DynamoDB's 400 KB limit is refused before it is sent, as a size
-  quota, instead of failing at DynamoDB as a store error.
-- The control plane's DID records are read strongly consistent even with
-  `dynamodb_consistent_reads = false`.
+- `store.dynamodb_table_name` names the table. An optional
+  `store.dynamodb_key_namespace` lets several stores share one table without
+  sharing rows.
+- Reads are strongly consistent by default, at twice the read units;
+  `store.dynamodb_consistent_reads = false` opts out, except for the reads
+  that decide a write, which stay consistent.
+- A batch is one transaction, at most 100 operations and 4 MB, and is
+  refused rather than split when larger. So a DID may claim at most 47 agent
+  names on this backend; the control plane refuses more up front.
+- Throttling is answered as a rate limit (HTTP 429 with `Retry-After`, or
+  Trust Task `unavailable`), and an item over 400 KB is refused as a size
+  quota before it is sent, as on `store-dynamodb`.
 
 ## 0.11.0 (2026-11-03)
 

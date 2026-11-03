@@ -188,8 +188,9 @@ every write that completed before it. This matters for sessions, refresh tokens,
 lockout counters and the outbound queue. Strongly consistent reads use twice the
 read capacity of eventually consistent ones. To trade that guarantee for cost, set
 `dynamodb_consistent_reads = false`. Writes are unaffected. Reads that decide a
-write stay strongly consistent whatever this says: the control plane's DID records
-(ownership checks, edge sync, the daemon's resolution after a cache miss).
+write stay strongly consistent whatever this says: point reads of DID records
+(ownership checks, edge sync, the daemon's resolution after a cache miss), and the
+daemon's reads of the domains. Listings of DID records follow the setting.
 
 ## 6. Limits
 

@@ -41,7 +41,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use aws_sdk_dynamodb::Client;
-use aws_sdk_dynamodb::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
+use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{AttributeValue, Delete, Put, ReturnValue, TransactWriteItem};
@@ -50,6 +50,7 @@ use tracing::{info, warn};
 use crate::server::config::StoreConfig;
 use crate::server::error::AppError;
 
+use super::dynamodb_errors::{self, MAX_ITEM_BYTES};
 use super::{BatchLimits, BatchOps, BoxFuture, KeyspaceOps, RawKvPair, StorageBackend};
 
 const PK_ATTR: &str = "pk";
@@ -57,32 +58,13 @@ const SK_ATTR: &str = "sk";
 const VAL_ATTR: &str = "val";
 const CNT_ATTR: &str = "cnt";
 
-/// DynamoDB's error codes for a request refused because the table or the
-/// account is over its throughput, after the SDK's own retries.
-const THROTTLING_CODES: &[&str] = &[
-    "ProvisionedThroughputExceededException",
-    "ThrottlingException",
-    "RequestLimitExceeded",
-];
-
-/// The same, as a reason a cancelled transaction gives for one of its items.
-const THROTTLED_CANCELLATION_CODES: &[&str] = &["ThrottlingError", "ProvisionedThroughputExceeded"];
-
-/// A failed request as an [`AppError`]: throttling is
-/// [`AppError::RateLimited`], so it reaches the client as "retry later"
-/// rather than as a fault; anything else stays [`AppError::Store`].
+/// A failed request as an [`AppError`]; see [`dynamodb_errors::request_error`].
 fn request_error<E, R>(op: &str, e: SdkError<E, R>) -> AppError
 where
     E: ProvideErrorMetadata + std::error::Error + 'static,
     R: std::fmt::Debug,
 {
-    if e.code()
-        .is_some_and(|code| THROTTLING_CODES.contains(&code))
-    {
-        warn!(op, error = %DisplayErrorContext(&e), "dynamodb-single throttled");
-        return AppError::store_throttled();
-    }
-    AppError::Store(format!("dynamodb-single {op}: {e}"))
+    dynamodb_errors::request_error("dynamodb-single", op, e)
 }
 
 /// [`request_error`] for `TransactWriteItems`. Throttling can also arrive as
@@ -90,30 +72,16 @@ where
 /// nothing was written. Any other failure whose outcome is unknown
 /// ([`transact_outcome_known`]) is [`AppError::StoreOutcomeUnknown`].
 fn transact_error<R: std::fmt::Debug>(e: SdkError<TransactWriteItemsError, R>) -> AppError {
-    if let Some(TransactWriteItemsError::TransactionCanceledException(cancelled)) =
-        e.as_service_error()
-        && cancelled.cancellation_reasons().iter().any(|reason| {
-            reason
-                .code()
-                .is_some_and(|code| THROTTLED_CANCELLATION_CODES.contains(&code))
-        })
-    {
-        warn!(error = %DisplayErrorContext(&e), "dynamodb-single transaction throttled");
-        return AppError::store_throttled();
+    if dynamodb_errors::cancelled_for_throttling(&e) {
+        return dynamodb_errors::throttled_transaction("dynamodb-single", &e);
     }
     // A throttled request was refused, so its outcome is known even where
     // `transact_outcome_known` does not list the code (`ThrottlingException`).
-    let throttled = e
-        .code()
-        .is_some_and(|code| THROTTLING_CODES.contains(&code));
-    if !throttled && !transact_outcome_known(&e) {
+    if !dynamodb_errors::is_throttled(&e) && !transact_outcome_known(&e) {
         return AppError::StoreOutcomeUnknown(format!("dynamodb-single transact: {e}"));
     }
     request_error("transact", e)
 }
-
-/// DynamoDB's item size limit, 400 KB: attribute names and values together.
-const MAX_ITEM_BYTES: usize = 400 * 1024;
 
 /// Refuse a `pk`/`sk`/`val` item DynamoDB would reject as too large.
 fn check_item_size(pk: &str, sk: &str, value: &[u8]) -> Result<(), AppError> {
@@ -342,6 +310,7 @@ impl SingleTableDynamoDbBackend {
         &self,
         name: &str,
         consistent_reads: bool,
+        consistent_scans: bool,
     ) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
         // A '#' in a keyspace name would let it alias another namespace's
         // partition ("witness#acl" is keyspace `acl` in namespace `witness`).
@@ -357,6 +326,7 @@ impl SingleTableDynamoDbBackend {
                 table_name: self.table_name.clone(),
                 pk: pk_for(self.namespace.as_deref(), name),
                 consistent_reads,
+                consistent_scans,
             }),
         ))
     }
@@ -364,21 +334,22 @@ impl SingleTableDynamoDbBackend {
 
 impl StorageBackend for SingleTableDynamoDbBackend {
     fn keyspace(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
-        self.open_keyspace(name, self.consistent_reads)
+        self.open_keyspace(name, self.consistent_reads, self.consistent_reads)
     }
 
-    /// Strongly consistent whatever `dynamodb_consistent_reads` says: a
-    /// caller asks for this where a stale read would decide a write wrongly.
-    /// Scans are consistent too, since one flag covers both here.
+    /// Point reads strongly consistent whatever `dynamodb_consistent_reads`
+    /// says: a caller asks for this where a stale read would decide a write
+    /// wrongly. Scans follow the setting, as the trait documents.
     fn keyspace_consistent(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
-        self.open_keyspace(name, true)
+        self.open_keyspace(name, true, self.consistent_reads)
     }
 
+    /// Point reads and scans strongly consistent whatever the setting says.
     fn keyspace_consistent_with_scans(
         &self,
         name: &str,
     ) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
-        self.open_keyspace(name, true)
+        self.open_keyspace(name, true, true)
     }
 
     fn batch(&self) -> Box<dyn BatchOps> {
@@ -415,7 +386,10 @@ struct SingleTableKeyspace {
     table_name: String,
     /// The `pk` attribute of every row in this keyspace (namespace included).
     pk: String,
+    /// `ConsistentRead` on `GetItem` (`get_raw`, `contains_key`).
     consistent_reads: bool,
+    /// `ConsistentRead` on `Query` (`prefix_iter_raw`).
+    consistent_scans: bool,
 }
 
 /// Convert a raw key (bytes) into a `String` for the `sk` attribute.
@@ -582,7 +556,7 @@ impl KeyspaceOps for SingleTableKeyspace {
                     .client
                     .query()
                     .table_name(&self.table_name)
-                    .consistent_read(self.consistent_reads)
+                    .consistent_read(self.consistent_scans)
                     .expression_attribute_values(":ks", AttributeValue::S(self.pk.clone()));
 
                 if let Some(ref p) = prefix_str {
@@ -876,16 +850,8 @@ fn transact_outcome_known<R>(e: &SdkError<TransactWriteItemsError, R>) -> bool {
 mod tests {
     use super::*;
     use aws_sdk_dynamodb::error::ErrorMetadata;
-    use aws_sdk_dynamodb::operation::get_item::GetItemError;
     use aws_sdk_dynamodb::types::CancellationReason;
     use aws_sdk_dynamodb::types::error::TransactionCanceledException;
-
-    fn get_failure(code: &str) -> SdkError<GetItemError, ()> {
-        SdkError::service_error(
-            GetItemError::generic(ErrorMetadata::builder().code(code).build()),
-            (),
-        )
-    }
 
     fn transact_failure(code: &str) -> SdkError<TransactWriteItemsError, ()> {
         SdkError::service_error(
@@ -895,20 +861,12 @@ mod tests {
     }
 
     #[test]
-    fn throttling_is_rate_limited_and_other_failures_stay_store_errors() {
-        for code in THROTTLING_CODES {
-            let e = request_error("get", get_failure(code));
-            assert!(e.is_store_throttled(), "{code}: {e:?}");
-        }
-        assert!(matches!(
-            request_error("get", get_failure("ResourceNotFoundException")),
-            AppError::Store(_)
-        ));
-    }
-
-    #[test]
     fn a_throttled_transaction_is_rate_limited_not_an_unknown_outcome() {
-        for code in THROTTLING_CODES {
+        for code in [
+            "ProvisionedThroughputExceededException",
+            "ThrottlingException",
+            "RequestLimitExceeded",
+        ] {
             let e = transact_error(transact_failure(code));
             assert!(e.is_store_throttled(), "{code}: {e:?}");
         }
@@ -923,12 +881,7 @@ mod tests {
                 (),
             )
         };
-        for code in THROTTLED_CANCELLATION_CODES {
-            assert!(
-                transact_error(cancelled(code)).is_store_throttled(),
-                "{code}"
-            );
-        }
+        assert!(transact_error(cancelled("ThrottlingError")).is_store_throttled());
         assert!(matches!(
             transact_error(cancelled("ConditionalCheckFailed")),
             AppError::Store(_)
@@ -1311,24 +1264,36 @@ mod tests {
         }
     }
 
-    /// A caller that asks for a consistent keyspace gets one even when the
-    /// operator opted out of strongly consistent reads.
+    /// A caller that asks for a consistent keyspace gets consistent point
+    /// reads even when the operator opted out; its scans follow the opt-out
+    /// unless it asked for consistent scans too.
     #[tokio::test]
-    async fn a_consistent_keyspace_ignores_the_opt_out() {
+    async fn consistent_keyspaces_override_the_opt_out_only_where_asked() {
         let (backend, capture) = capturing_backend(Some(false));
         let (_, ks) = backend.keyspace_consistent("dids").expect("keyspace");
         let _ = ks.get_raw(b"k".to_vec()).await;
         let _ = ks.contains_key(b"k".to_vec()).await;
+        let _ = ks.prefix_iter_raw(b"p".to_vec()).await;
         let (_, ks) = backend
             .keyspace_consistent_with_scans("dids")
             .expect("keyspace");
         let _ = ks.prefix_iter_raw(b"p".to_vec()).await;
 
         let sent = capture.0.lock().expect("capture lock").clone();
-        assert_eq!(sent.len(), 3, "{sent:?}");
-        for (op, body) in &sent {
-            assert_eq!(consistent(body), Some(true), "{op}: {body}");
-        }
+        let flags: Vec<_> = sent
+            .iter()
+            .map(|(op, body)| (op.as_str(), consistent(body) == Some(true)))
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                ("GetItem", true),
+                ("GetItem", true),
+                ("Query", false),
+                ("Query", true)
+            ],
+            "{sent:?}"
+        );
     }
 
     /// An oversized item is refused before anything is sent, on its own and

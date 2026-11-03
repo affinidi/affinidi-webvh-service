@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use aws_sdk_dynamodb::Client;
-use aws_sdk_dynamodb::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
+use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{
@@ -15,6 +15,7 @@ use tracing::{info, warn};
 use crate::server::config::StoreConfig;
 use crate::server::error::AppError;
 
+use super::dynamodb_errors::{self, MAX_ITEM_BYTES};
 use super::{BatchOps, BoxFuture, KeyspaceOps, RawKvPair, StorageBackend};
 
 const PK_ATTR: &str = "pk";
@@ -24,53 +25,23 @@ const VAL_ATTR: &str = "val";
 /// caller stores at the same partition key.
 const CNT_ATTR: &str = "cnt";
 
-/// DynamoDB's error codes for a request refused because the table or the
-/// account is over its throughput, after the SDK's own retries.
-const THROTTLING_CODES: &[&str] = &[
-    "ProvisionedThroughputExceededException",
-    "ThrottlingException",
-    "RequestLimitExceeded",
-];
-
-/// The same, as a reason a cancelled transaction gives for one of its items.
-const THROTTLED_CANCELLATION_CODES: &[&str] = &["ThrottlingError", "ProvisionedThroughputExceeded"];
-
-/// A failed request as an [`AppError`]: throttling is
-/// [`AppError::RateLimited`], so it reaches the client as "retry later"
-/// rather than as a fault; anything else stays [`AppError::Store`].
+/// A failed request as an [`AppError`]; see [`dynamodb_errors::request_error`].
 fn request_error<E, R>(op: &str, e: SdkError<E, R>) -> AppError
 where
     E: ProvideErrorMetadata + std::error::Error + 'static,
     R: std::fmt::Debug,
 {
-    if e.code()
-        .is_some_and(|code| THROTTLING_CODES.contains(&code))
-    {
-        warn!(op, error = %DisplayErrorContext(&e), "dynamodb throttled");
-        return AppError::store_throttled();
-    }
-    AppError::Store(format!("dynamodb {op}: {e}"))
+    dynamodb_errors::request_error("dynamodb", op, e)
 }
 
 /// [`request_error`] for `TransactWriteItems`, whose throttling can also
 /// arrive as a cancelled transaction naming throttling as an item's reason.
 fn transact_error<R: std::fmt::Debug>(e: SdkError<TransactWriteItemsError, R>) -> AppError {
-    if let Some(TransactWriteItemsError::TransactionCanceledException(cancelled)) =
-        e.as_service_error()
-        && cancelled.cancellation_reasons().iter().any(|reason| {
-            reason
-                .code()
-                .is_some_and(|code| THROTTLED_CANCELLATION_CODES.contains(&code))
-        })
-    {
-        warn!(error = %DisplayErrorContext(&e), "dynamodb transaction throttled");
-        return AppError::store_throttled();
+    if dynamodb_errors::cancelled_for_throttling(&e) {
+        return dynamodb_errors::throttled_transaction("dynamodb", &e);
     }
     request_error("transact", e)
 }
-
-/// DynamoDB's item size limit, 400 KB: attribute names and values together.
-const MAX_ITEM_BYTES: usize = 400 * 1024;
 
 /// Refuse a `pk`/`val` item DynamoDB would reject as too large.
 fn check_item_size(key: &[u8], value: &[u8]) -> Result<(), AppError> {
@@ -620,56 +591,8 @@ mod tests {
     use aws_sdk_dynamodb::config::{
         BehaviorVersion, ConfigBag, Credentials, Intercept, Region, RuntimeComponents,
     };
-    use aws_sdk_dynamodb::error::ErrorMetadata;
-    use aws_sdk_dynamodb::operation::get_item::GetItemError;
-    use aws_sdk_dynamodb::types::CancellationReason;
-    use aws_sdk_dynamodb::types::error::TransactionCanceledException;
 
     use super::*;
-
-    fn get_failure(code: &str) -> SdkError<GetItemError, ()> {
-        SdkError::service_error(
-            GetItemError::generic(ErrorMetadata::builder().code(code).build()),
-            (),
-        )
-    }
-
-    #[test]
-    fn throttling_is_rate_limited_and_other_failures_stay_store_errors() {
-        for code in THROTTLING_CODES {
-            let e = request_error("get", get_failure(code));
-            assert!(e.is_store_throttled(), "{code}: {e:?}");
-        }
-        assert!(matches!(
-            request_error("get", get_failure("ResourceNotFoundException")),
-            AppError::Store(_)
-        ));
-    }
-
-    #[test]
-    fn a_transaction_cancelled_for_throttling_is_rate_limited() {
-        let cancelled = |code: &str| {
-            SdkError::<_, ()>::service_error(
-                TransactWriteItemsError::TransactionCanceledException(
-                    TransactionCanceledException::builder()
-                        .cancellation_reasons(CancellationReason::builder().code("None").build())
-                        .cancellation_reasons(CancellationReason::builder().code(code).build())
-                        .build(),
-                ),
-                (),
-            )
-        };
-        for code in THROTTLED_CANCELLATION_CODES {
-            assert!(
-                transact_error(cancelled(code)).is_store_throttled(),
-                "{code}"
-            );
-        }
-        assert!(matches!(
-            transact_error(cancelled("ConditionalCheckFailed")),
-            AppError::Store(_)
-        ));
-    }
 
     /// Records each request body and stops it before it leaves the process.
     #[derive(Debug, Default, Clone)]

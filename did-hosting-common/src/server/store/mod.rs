@@ -4,6 +4,8 @@ pub mod bounded_memory;
 mod cosmosdb;
 #[cfg(feature = "store-dynamodb")]
 mod dynamodb;
+#[cfg(any(feature = "store-dynamodb", feature = "store-dynamodb-single"))]
+mod dynamodb_errors;
 #[cfg(feature = "store-dynamodb-single")]
 mod dynamodb_single;
 #[cfg(feature = "store-firestore")]
