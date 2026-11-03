@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.11.0 (release/0.11)
+
 ### Fixed — the plaintext-secrets warning is logged once
 
 A service on the plaintext secrets backend logged its "secrets are stored in
