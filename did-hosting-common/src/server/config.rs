@@ -481,8 +481,9 @@ impl ReplayConfig {
 ///
 /// Resolution is unauthenticated, and each one costs store reads, so without
 /// a limit one client can use up a metered store's capacity for everyone. A
-/// client past `max_per_window` requests in a `window_secs` fixed window gets
-/// `429 Too Many Requests` with `Retry-After` until the window ends.
+/// client may spend `max_per_window` requests at once and regains one every
+/// `window_secs / max_per_window`; past that it gets `429 Too Many Requests`
+/// with `Retry-After` until its next request.
 ///
 /// The client address is the TCP peer unless `server.trusted_proxies` names
 /// that peer, in which case it is read from `X-Forwarded-For`. Behind a load
@@ -495,7 +496,7 @@ pub struct ResolveRateLimitConfig {
     /// (default) means no limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_per_window: Option<u64>,
-    /// The fixed window, in seconds. Default 10.
+    /// The window the allowance refills over, in seconds. Default 10.
     #[serde(default = "default_resolve_rate_limit_window_secs")]
     pub window_secs: u64,
 }

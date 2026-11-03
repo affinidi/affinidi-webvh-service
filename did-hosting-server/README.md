@@ -142,7 +142,7 @@ max_age_secs = 300                          # max-age; 0 sends no-cache (default
 
 # [server.resolve_rate_limit]               # Per-client limit on resolution (off by default)
 # max_per_window = 500                      # requests per address per window; then 429
-# window_secs = 10                          # fixed window (default 10, at most 3600)
+# window_secs = 10                          # refill window (default 10, at most 3600)
 
 [log]
 level = "info"       # trace, debug, info, warn, error

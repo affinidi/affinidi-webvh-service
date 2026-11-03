@@ -452,6 +452,12 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // Seed registry from static config
     seed_registry(&state).await;
 
+    // Sweep idle clients out of the rate limiters on this runtime, not the
+    // REST thread's: invite redemption is charged over DIDComm and TSP too,
+    // so the sweep runs whether or not the REST API is on.
+    let rate_limit_gc = CancellationToken::new();
+    state.spawn_rate_limit_gc(&rate_limit_gc);
+
     // Log startup configuration
     info!("--- enabled services ---");
     info!(
@@ -655,6 +661,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 
     health_shutdown.cancel();
     didcomm_shutdown.cancel();
+    rate_limit_gc.cancel();
     let _ = purge_shutdown_tx.send(true);
     let _ = identity_shutdown_tx.send(true);
     let _ = outbox_shutdown_tx.send(true);
@@ -957,9 +964,6 @@ fn run_rest_thread(
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .expect("failed to convert std TcpListener to tokio TcpListener");
 
-        let rate_limit_gc = CancellationToken::new();
-        state.spawn_rate_limit_gc(&rate_limit_gc);
-
         let app = routes::router()
             .with_state(state)
             .layer(
@@ -988,7 +992,6 @@ fn run_rest_thread(
         .await
         .expect("axum serve failed");
 
-        rate_limit_gc.cancel();
         info!("REST thread shutting down");
     });
 }

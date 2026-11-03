@@ -37,6 +37,7 @@
 
 use std::hash::Hash;
 use std::net::IpAddr;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use affinidi_rate_limit::{
@@ -249,9 +250,30 @@ pub fn resolve_client_ip(
     headers: &HeaderMap,
     trusted_proxies: &[IpNetwork],
 ) -> Result<IpAddr, AppError> {
-    client_ip_extractor(trusted_proxies)?
+    shared_client_ip_extractor(trusted_proxies)?
         .client_ip(peer, headers)
         .map_err(|e| AppError::Validation(e.to_string()))
+}
+
+/// The extractor for `trusted_proxies`, built once per distinct list and
+/// reused, so every handler shares its once-a-minute log of a proxy's invalid
+/// chain (and the request path skips rebuilding it). A process has one or two
+/// lists (the daemon's services share theirs), so the cache stays tiny.
+fn shared_client_ip_extractor(
+    trusted_proxies: &[IpNetwork],
+) -> Result<Arc<ClientIpExtractor>, AppError> {
+    static EXTRACTORS: Mutex<Vec<(Vec<IpNetwork>, Arc<ClientIpExtractor>)>> =
+        Mutex::new(Vec::new());
+    let mut extractors = EXTRACTORS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((_, extractor)) = extractors
+        .iter()
+        .find(|(proxies, _)| proxies.as_slice() == trusted_proxies)
+    {
+        return Ok(extractor.clone());
+    }
+    let extractor = Arc::new(client_ip_extractor(trusted_proxies)?);
+    extractors.push((trusted_proxies.to_vec(), extractor.clone()));
+    Ok(extractor)
 }
 
 #[cfg(test)]
@@ -305,6 +327,40 @@ mod tests {
         assert_eq!(response.headers()["x-rate-limit-source"], "did-host");
         assert_eq!(response.headers()["retry-after"], "30");
         limiter.try_consume(ip("203.0.113.2")).unwrap();
+    }
+
+    /// The Trust Task listener's limit is its documented allowance per
+    /// address, and refuses the next request.
+    #[test]
+    fn the_trust_task_listener_limit_is_its_documented_allowance() {
+        let limiter = IpRateLimiter::new(
+            TRUST_TASKS_RATE_LIMIT_NAME,
+            TRUST_TASKS_MAX_PER_WINDOW,
+            TRUST_TASKS_WINDOW_SECS,
+        );
+        let client = ip("203.0.113.1");
+        for _ in 0..TRUST_TASKS_MAX_PER_WINDOW {
+            limiter.try_consume(client).unwrap();
+        }
+        assert!(matches!(
+            limiter.try_consume(client),
+            Err(AppError::RateLimited {
+                limiter: TRUST_TASKS_RATE_LIMIT_NAME,
+                ..
+            })
+        ));
+    }
+
+    /// One extractor per trusted-proxy list, so handlers share its log of a
+    /// proxy's invalid chain.
+    #[test]
+    fn handlers_share_one_extractor_per_proxy_list() {
+        let trusted = nets(&["10.0.0.0/8"]);
+        let first = shared_client_ip_extractor(&trusted).unwrap();
+        let again = shared_client_ip_extractor(&trusted).unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        let other = shared_client_ip_extractor(&nets(&["172.16.0.0/12"])).unwrap();
+        assert!(!Arc::ptr_eq(&first, &other));
     }
 
     /// A limit on what a source proves, and one budget for everyone.

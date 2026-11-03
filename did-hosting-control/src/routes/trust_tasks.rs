@@ -87,12 +87,15 @@ pub async fn trust_tasks_endpoint(
     )?;
     let client_ip = Some(ip);
     if is_redeem_start(&body) {
-        let limited = state.redeem_rate_limiter.try_consume(&format!("ip:{ip}"));
+        let source = format!("ip:{ip}");
+        let limited = state.redeem_rate_limiter.try_consume(&source);
         if let Err(AppError::RateLimited {
             retry_after_secs, ..
         }) = limited
         {
-            tracing::warn!(%ip, "invite redemption rate limited");
+            if state.redeem_rate_limiter.first_refusal_in_window(&source) {
+                tracing::warn!(%ip, "invite redemption client over the rate limit; refusing it until its budget refills");
+            }
             // Refused as the task would be — a routed `unavailable` document
             // with its retry time — not as a bare REST 429.
             if let Ok(doc) = serde_json::from_slice::<TrustTask<Value>>(&body) {

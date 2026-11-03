@@ -999,3 +999,52 @@ async fn a_listing_not_signed_by_the_control_plane_does_not_reconcile() {
     assert!(report.is_clean());
     assert!(state.replication.last_reconciled_at().is_some());
 }
+
+/// A trusted proxy's unreadable `X-Forwarded-For` is refused with 400 before
+/// the document is read, rather than charged to the proxy's address; a
+/// readable one from the same proxy reaches the document check.
+#[tokio::test]
+async fn an_unreadable_forwarded_chain_from_a_trusted_proxy_is_refused() {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+
+    let (state, _dir) = edge_state().await;
+    let mut config = (*state.config).clone();
+    config.server.trusted_proxies = vec!["10.0.0.5".parse().unwrap()];
+    let state = AppState {
+        config: Arc::new(config),
+        ..state
+    };
+    let receive = |chain: &'static str| {
+        let state = state.clone();
+        async move {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("x-forwarded-for", chain.parse().unwrap());
+            let response = did_hosting_server::routes::trust_tasks::receive(
+                axum::extract::State(state),
+                axum::extract::ConnectInfo("10.0.0.5:443".parse().unwrap()),
+                headers,
+                axum::body::Bytes::from_static(b"not a document"),
+            )
+            .await
+            .into_response();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (status, body)
+        }
+    };
+
+    let (status, body) = receive("not-an-address").await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_ne!(
+        body["error"], "malformed_request",
+        "refused before the document: {body}"
+    );
+
+    let (_, body) = receive("198.51.100.7").await;
+    assert_eq!(
+        body["error"], "malformed_request",
+        "a readable chain reaches the document check: {body}"
+    );
+}

@@ -1674,9 +1674,13 @@ mod https {
         for n in 0..GLOBAL_REQUEST_MAX_PER_MINUTE {
             assert_eq!(send(n).await, 200, "request {n}");
         }
+        // Bounded, so a test that admits everything fails rather than hangs:
+        // a ceiling that holds refuses well within the allowance again.
         let mut admitted_past_the_ceiling: u32 = 0;
         let mut n = GLOBAL_REQUEST_MAX_PER_MINUTE;
-        while send(n).await == 200 {
+        while admitted_past_the_ceiling < GLOBAL_REQUEST_MAX_PER_MINUTE as u32
+            && send(n).await == 200
+        {
             admitted_past_the_ceiling += 1;
             n += 1;
         }

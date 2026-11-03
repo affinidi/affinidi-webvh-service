@@ -118,10 +118,16 @@ impl SourceRateLimiter {
         Self::default()
     }
 
-    /// Consume one attempt for `source`, or refuse once it has made
-    /// [`REDEEM_MAX_PER_WINDOW`] in the current window.
+    /// Consume one attempt for `source`, or refuse once it has spent its
+    /// [`REDEEM_MAX_PER_WINDOW`].
     pub fn try_consume(&self, source: &str) -> Result<(), AppError> {
         self.0.try_consume(source.to_owned())
+    }
+
+    /// Whether a refusal of `source` is its first in its window, so the
+    /// caller logs once per window.
+    pub fn first_refusal_in_window(&self, source: &str) -> bool {
+        self.0.first_refusal_in_window(&source.to_owned())
     }
 
     /// Sweep idle sources out of memory until `shutdown` fires.

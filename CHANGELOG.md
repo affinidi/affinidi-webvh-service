@@ -14,14 +14,20 @@ client may spend its allowance at once and regains one request every
 to the end of the window, and there is no double burst across a window
 boundary. Refusals are logged once per client per window. Idle clients are
 swept every minute, and at most 250,000 are tracked per limit (previously
-10,000, with the map cleared when full).
+10,000, with the map cleared when full). The `429` keeps its shape, but its
+`message` is now the same generic text for every limit.
 
-Three refusals change. A chain from a trusted proxy that cannot be read (a
-malformed entry, more than 64 entries) is refused with `400` instead of being
-charged to the proxy's address, which handed its sender a second budget and
-hid a misbehaving proxy. `server.trusted_proxies` refuses a range covering
-every address (`0.0.0.0/0`, `::/0`) at startup. A resolution request with no
-peer address, a wiring fault, is refused with `403` instead of `500`.
+Four refusals change. A chain from a trusted proxy that cannot be read (a
+malformed entry, more than 64 entries, or a header that is not visible ASCII)
+is refused with `400` instead of being charged to the proxy's address, which
+handed its sender a second budget and hid a misbehaving proxy; the first such
+chain from a proxy each minute is logged as a warning naming it.
+`server.trusted_proxies` refuses a range covering every address (`0.0.0.0/0`,
+`::/0`) at startup. A resolution request with no peer address, a wiring
+fault, is refused with `403` instead of `500`. And when a limit already
+tracks 250,000 clients that are still within their budget, a new client is
+refused with `429` and `Retry-After: 60` until room frees up, rather than the
+limit forgetting everyone.
 
 ## 0.11.0 (release/0.11)
 
