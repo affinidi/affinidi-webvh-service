@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed — the plaintext-secrets warning is logged once
+
+A service on the plaintext secrets backend logged its "secrets are stored in
+a PLAINTEXT file" warning every minute, because the identity sweep rebuilds
+the secret store on each run. It is now logged once per file per process, at
+the first build.
+
 ### Security — UI build dependencies (15 npm advisories)
 
 All 15 open advisories in `did-hosting-ui`'s lockfile came in through Expo's
