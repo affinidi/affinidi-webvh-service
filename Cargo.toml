@@ -643,6 +643,11 @@ affinidi-messaging-sdk = { version = "0.44.0", features = ["tsp"] }
 # signature-only-when-issuer-absent path.
 affinidi-data-integrity = "0.8"
 
+# TEMPORARY: affinidi-rate-limit 0.1.4 is unpublished (affinidi/affinidi-tdk-rs#982).
+# Remove this patch once 0.1.4 is on crates.io, before merging.
+[patch.crates-io]
+affinidi-rate-limit = { git = "https://github.com/affinidi/affinidi-tdk-rs", branch = "feat/rate-limit-shared-limiters" }
+
 # Argon2 in an unoptimised build takes seconds per hash, and every test that
 # issues or redeems an enrolment invite runs one; optimise just the hash.
 [profile.dev.package.argon2]

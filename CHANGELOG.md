@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Changed — rate limits run on `affinidi-rate-limit`
+
+Every per-address and per-source rate limit (resolution, each Trust Task
+listener, the challenge, invite redemption and wallet sign-in), and the rule
+for which address a request comes from, now use the `affinidi-rate-limit`
+crate the mediator and the DID resolver cache use. Each limit is still stated
+as requests per window, with the same numbers, but is now a token bucket: a
+client may spend its allowance at once and regains one request every
+`window / max`, so `Retry-After` is the time to its next request rather than
+to the end of the window, and there is no double burst across a window
+boundary. Refusals are logged once per client per window. Idle clients are
+swept every minute, and at most 250,000 are tracked per limit (previously
+10,000, with the map cleared when full).
+
+Three refusals change. A chain from a trusted proxy that cannot be read (a
+malformed entry, more than 64 entries) is refused with `400` instead of being
+charged to the proxy's address, which handed its sender a second budget and
+hid a misbehaving proxy. `server.trusted_proxies` refuses a range covering
+every address (`0.0.0.0/0`, `::/0`) at startup. A resolution request with no
+peer address, a wiring fault, is refused with `403` instead of `500`.
+
 ## 0.11.0 (release/0.11)
 
 ### Fixed — the plaintext-secrets warning is logged once

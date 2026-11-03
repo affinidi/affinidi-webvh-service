@@ -184,6 +184,15 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Sweep idle clients out of every rate limiter this state serves (the
+    /// challenge, redemption and wallet sign-in limits) until `shutdown`
+    /// fires. Must run on the runtime serving the requests.
+    pub fn spawn_rate_limit_gc(&self, shutdown: &CancellationToken) {
+        self.ip_rate_limiter.spawn_gc(shutdown.clone());
+        self.redeem_rate_limiter.spawn_gc(shutdown.clone());
+        self.oob.spawn_rate_limit_gc(shutdown);
+    }
+
     /// Unwrap the DIDComm auth components, returning an error if any are not configured.
     pub fn require_didcomm_auth(
         &self,
@@ -948,6 +957,9 @@ fn run_rest_thread(
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .expect("failed to convert std TcpListener to tokio TcpListener");
 
+        let rate_limit_gc = CancellationToken::new();
+        state.spawn_rate_limit_gc(&rate_limit_gc);
+
         let app = routes::router()
             .with_state(state)
             .layer(
@@ -976,6 +988,7 @@ fn run_rest_thread(
         .await
         .expect("axum serve failed");
 
+        rate_limit_gc.cancel();
         info!("REST thread shutting down");
     });
 }

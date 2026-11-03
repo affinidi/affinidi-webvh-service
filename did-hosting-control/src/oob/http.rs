@@ -54,9 +54,10 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use axum::http::{HeaderMap, header};
 use did_hosting_common::server::auth::session::{create_authenticated_session, now_epoch};
-use did_hosting_common::server::rate_limit::IpRateLimiter;
+use did_hosting_common::server::rate_limit::{IpRateLimiter, KeyedRateLimiter};
 use did_hosting_common::server::trust_tasks::{BoundKeyError, TransportBoundVerifier};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 use trust_tasks_proof::affinidi::{CryptoSuite, SignOptions, sign_trust_task};
 use trust_tasks_rs::TrustTask;
 
@@ -85,9 +86,9 @@ pub const OTHER_MAX_PER_MINUTE: u64 = 120;
 /// that holds when the per-address limit is spread over many addresses.
 pub const GLOBAL_REQUEST_MAX_PER_MINUTE: u64 = 600;
 
-/// The single key of the global limiter (an [`IpRateLimiter`] with one
-/// bucket).
-const GLOBAL_KEY: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+/// The address a document is charged to when its transport gave none: every
+/// such document shares this one bucket.
+const NO_ADDRESS: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
 
 /// Per-process state: the service (built on first use, from config), the
 /// limiters and the local GeoIP database.
@@ -95,7 +96,8 @@ pub struct OobRuntime {
     service: OnceLock<Option<OobService>>,
     geoip: Arc<GeoIp>,
     request_limiter: IpRateLimiter,
-    global_request_limiter: IpRateLimiter,
+    /// One budget for every address together.
+    global_request_limiter: KeyedRateLimiter<()>,
     other_limiter: IpRateLimiter,
 }
 
@@ -116,13 +118,21 @@ impl OobRuntime {
                 REQUEST_MAX_PER_MINUTE,
                 60,
             ),
-            global_request_limiter: IpRateLimiter::new(
+            global_request_limiter: KeyedRateLimiter::new(
                 "auth-oob-request-global",
                 GLOBAL_REQUEST_MAX_PER_MINUTE,
                 60,
             ),
             other_limiter: IpRateLimiter::new("auth-oob-per-ip", OTHER_MAX_PER_MINUTE, 60),
         }
+    }
+
+    /// Sweep idle clients out of the sign-in limiters' memory until
+    /// `shutdown` fires.
+    pub fn spawn_rate_limit_gc(&self, shutdown: &CancellationToken) {
+        self.request_limiter.spawn_gc(shutdown.clone());
+        self.global_request_limiter.spawn_gc(shutdown.clone());
+        self.other_limiter.spawn_gc(shutdown.clone());
     }
 
     /// The local GeoIP database, for the process to keep current
@@ -292,18 +302,20 @@ pub(crate) async fn admit(
     if https.body_len > MAX_OOB_DOCUMENT_BYTES {
         return Err(refuse(OobErrorCode::MalformedRequest, "document too large"));
     }
-    let ip = https.ip.unwrap_or(GLOBAL_KEY);
+    let ip = https.ip.unwrap_or(NO_ADDRESS);
     let type_uri = doc.type_uri.to_string();
     let limiter = if type_uri == TYPE_REQUEST {
         &state.oob.request_limiter
     } else {
         &state.oob.other_limiter
     };
-    if limiter.try_consume(ip, now_epoch()).is_err() {
-        // A row's own Type URI, but bounded anyway: a log line never carries
-        // more of a caller's document than it needs.
-        let type_prefix: String = type_uri.chars().take(64).collect();
-        tracing::warn!(%ip, type_uri = %type_prefix, "auth/oob rate limited");
+    if limiter.try_consume(ip).is_err() {
+        if limiter.first_refusal_in_window(&ip) {
+            // A row's own Type URI, but bounded anyway: a log line never
+            // carries more of a caller's document than it needs.
+            let type_prefix: String = type_uri.chars().take(64).collect();
+            tracing::warn!(%ip, type_uri = %type_prefix, "auth/oob client over the rate limit; refusing it until its budget refills");
+        }
         return Err(refuse(OobErrorCode::RateLimited, "too many requests"));
     }
     if type_uri == TYPE_REQUEST {
@@ -334,13 +346,11 @@ pub(crate) async fn admit(
         }
         // Counted after the origin check, so another site's page cannot
         // spend the global budget.
-        if state
-            .oob
-            .global_request_limiter
-            .try_consume(GLOBAL_KEY, now_epoch())
-            .is_err()
-        {
-            tracing::warn!("auth/oob/request refused: global rate limit");
+        let global = &state.oob.global_request_limiter;
+        if global.try_consume(()).is_err() {
+            if global.first_refusal_in_window(&()) {
+                tracing::warn!("auth/oob/request refused: global rate limit");
+            }
             return Err(refuse(
                 OobErrorCode::RateLimited,
                 "too many sign-in requests",

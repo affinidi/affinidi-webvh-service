@@ -769,8 +769,14 @@ fn run_rest_thread(
         // There is no management surface to switch on.
         info!("HTTP thread started (public DID serving + Trust Task listener)");
         let resolve_limit = Arc::new(
-            did_hosting_common::server::rate_limit::ResolveRateLimiter::new(&state.config.server),
+            did_hosting_common::server::rate_limit::ResolveRateLimiter::new(&state.config.server)
+                .expect("server.trusted_proxies was validated when the configuration loaded"),
         );
+        let rate_limit_gc = CancellationToken::new();
+        resolve_limit.spawn_gc(rate_limit_gc.clone());
+        state
+            .trust_tasks_rate_limiter
+            .spawn_gc(rate_limit_gc.clone());
         let base_router = routes::router_with_resolve_limit(upload_body_limit, resolve_limit);
 
         // Cloned before `with_state` consumes `state`: the health route is
@@ -819,6 +825,7 @@ fn run_rest_thread(
         .await
         .expect("axum serve failed");
 
+        rate_limit_gc.cancel();
         info!("REST thread shutting down");
     });
 }

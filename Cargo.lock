@@ -670,13 +670,13 @@ dependencies = [
 
 [[package]]
 name = "affinidi-rate-limit"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96a7eed66d177bae59e3b4174a47eb6e2c6ccfcb3865b280f1b5722da367a660"
+version = "0.1.4"
+source = "git+https://github.com/affinidi/affinidi-tdk-rs?branch=feat%2Frate-limit-shared-limiters#6a61c771b79392f89743823dc861c1509406d2e1"
 dependencies = [
  "axum",
  "governor",
  "http",
+ "ipnet",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -3056,6 +3056,7 @@ dependencies = [
  "affinidi-messaging-didcomm",
  "affinidi-messaging-didcomm-service",
  "affinidi-messaging-sdk",
+ "affinidi-rate-limit",
  "affinidi-secrets-resolver",
  "affinidi-tdk",
  "affinidi-tdk-common",

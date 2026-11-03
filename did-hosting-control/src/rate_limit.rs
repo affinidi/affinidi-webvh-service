@@ -1,4 +1,5 @@
-//! Per-IP rate limiter for unauthenticated endpoints.
+//! The control plane's own rate limits: per client address on
+//! `POST /api/auth/challenge`, and per source on invite redemption.
 //!
 //! `POST /api/auth/challenge` is the only unauthenticated request-shape
 //! exposed by the control plane (everything else requires Bearer
@@ -10,71 +11,43 @@
 //! each individual challenge fits within the per-DID/global counters'
 //! steady state.
 //!
-//! # IP-attribution policy
-//!
-//! Behind a reverse proxy / load balancer / CDN, the TCP peer is the
-//! proxy itself, not the real client — every legitimate request would
-//! attribute to one IP. The `trusted_proxies` config opts in to
-//! parsing `X-Forwarded-For`:
-//!
-//! - Empty `trusted_proxies` (default): always use the direct TCP peer.
-//!   Safe when running on the open internet without a proxy.
-//! - Non-empty `trusted_proxies` (addresses or CIDR ranges): walk
-//!   `X-Forwarded-For` from the right, skip each trusted proxy, and use
-//!   the first entry that isn't one; on any doubt, the TCP peer.
-//!
-//! The rule is shared with every other service —
-//! [`did_hosting_common::server::rate_limit::resolve_client_ip`], re-exported
-//! here — and documented there, foot-guns included.
-//!
-//! # Algorithm
-//!
-//! Per-IP fixed-window counter, refreshed every `WINDOW_SECS`. Each
-//! `try_consume(ip)` increments and refuses past `MAX_PER_WINDOW`. The
-//! window resets lazily on the next call after expiry — no separate
-//! sweep task required. Per-IP HashMap entries persist across the
-//! whole process lifetime; under sustained novel-IP flood the map
-//! grows until eviction kicks in.
+//! Both are [`KeyedRateLimiter`]s: token buckets stated as requests per
+//! window, with the client-address rule
+//! ([`did_hosting_common::server::rate_limit::resolve_client_ip`], re-exported
+//! here) and its foot-guns documented in that module.
 
-use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
+
+use did_hosting_common::server::rate_limit::KeyedRateLimiter;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::AppError;
 
-/// Maximum challenges per IP per window before rejection. Sized to be
-/// generous for legitimate users (a typical browser flow does <10
-/// challenge requests in a minute) while bounding an attacker's
-/// effective throughput by orders of magnitude.
+/// Challenges per IP per window before rejection. Sized to be generous for
+/// legitimate users (a typical browser flow does <10 challenge requests in a
+/// minute) while bounding an attacker's effective throughput by orders of
+/// magnitude.
 pub const MAX_PER_WINDOW: u64 = 30;
 
-/// Fixed-window length in seconds. 60s gives the counter a 1 minute
-/// reset; combined with `MAX_PER_WINDOW = 30` that's ~0.5 challenges
-/// per second steady-state per IP.
+/// Window length in seconds: with [`MAX_PER_WINDOW`], one challenge every
+/// two seconds per IP once the allowance is spent.
 pub const WINDOW_SECS: u64 = 60;
-
-/// Hard cap on tracked-IP HashMap size. Once exceeded, the entire
-/// map is cleared in a single pass — drastic but the alternative is
-/// unbounded memory growth under sustained novel-IP flood. Operators
-/// who don't want this behaviour should put the control plane behind
-/// a CDN or deploy a real DDoS mitigation.
-pub const MAX_TRACKED_IPS: usize = 10_000;
 
 /// The `limiter` this refusal names in its 429 body.
 pub const LIMITER_NAME: &str = "auth-challenge-per-ip";
 
-#[derive(Debug, Clone, Copy)]
-struct Bucket {
-    /// Number of consume attempts in the current window.
-    count: u64,
-    /// `now_epoch()` of the window start.
-    window_start: u64,
-}
-
 /// Per-IP rate limiter for the challenge endpoint.
-#[derive(Debug, Default)]
-pub struct IpRateLimiter {
-    buckets: Mutex<HashMap<IpAddr, Bucket>>,
+#[derive(Debug)]
+pub struct IpRateLimiter(KeyedRateLimiter<IpAddr>);
+
+impl Default for IpRateLimiter {
+    fn default() -> Self {
+        Self(KeyedRateLimiter::new(
+            LIMITER_NAME,
+            MAX_PER_WINDOW,
+            WINDOW_SECS,
+        ))
+    }
 }
 
 impl IpRateLimiter {
@@ -82,52 +55,21 @@ impl IpRateLimiter {
         Self::default()
     }
 
-    /// Attempt to consume one slot for `ip`. Returns `Err` once the
-    /// IP has issued `MAX_PER_WINDOW` challenges within the current
-    /// `WINDOW_SECS` window.
-    pub fn try_consume(&self, ip: IpAddr, now: u64) -> Result<(), AppError> {
-        let mut buckets = self
-            .buckets
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        // Drastic eviction: if the map has grown past the cap, clear
-        // it entirely. Documented in the module doc.
-        if buckets.len() >= MAX_TRACKED_IPS {
-            buckets.clear();
-        }
-
-        let entry = buckets.entry(ip).or_insert(Bucket {
-            count: 0,
-            window_start: now,
-        });
-
-        // Reset on window boundary. Lazy — no sweep task.
-        if now.saturating_sub(entry.window_start) >= WINDOW_SECS {
-            entry.count = 0;
-            entry.window_start = now;
-        }
-
-        if entry.count >= MAX_PER_WINDOW {
-            // The window resets lazily at `window_start + WINDOW_SECS`, so the
-            // time left in it is exactly when the next attempt can succeed.
-            let retry_after_secs = (entry.window_start + WINDOW_SECS).saturating_sub(now);
-            return Err(AppError::RateLimited {
-                limiter: LIMITER_NAME,
-                message: format!(
-                    "IP rate limit exceeded ({MAX_PER_WINDOW} requests per {WINDOW_SECS}s); try again later",
-                ),
-                retry_after_secs,
-            });
-        }
-        entry.count += 1;
-        Ok(())
+    /// Charge one challenge to `ip`, or refuse once it has spent its
+    /// [`MAX_PER_WINDOW`].
+    pub fn try_consume(&self, ip: IpAddr) -> Result<(), AppError> {
+        self.0.try_consume(ip)
     }
 
-    #[cfg(test)]
-    pub fn count(&self, ip: IpAddr) -> u64 {
-        let buckets = self.buckets.lock().unwrap();
-        buckets.get(&ip).map(|b| b.count).unwrap_or(0)
+    /// Whether a refusal of `ip` is its first in its window, so the caller
+    /// logs once per window.
+    pub fn first_refusal_in_window(&self, ip: &IpAddr) -> bool {
+        self.0.first_refusal_in_window(ip)
+    }
+
+    /// Sweep idle clients out of memory until `shutdown` fires.
+    pub fn spawn_gc(&self, shutdown: CancellationToken) {
+        self.0.spawn_gc(shutdown);
     }
 }
 
@@ -150,18 +92,25 @@ pub const REDEEM_LIMITER_NAME: &str = "passkey-redeem-per-source";
 /// `did_hosting_common::server::passkey::invite`). This one keeps a single
 /// source from spraying invites or burning CPU.
 ///
-/// **Per-process, by design.** Unlike the wrong-code counter, this limiter's
-/// buckets are an in-memory `HashMap` — nothing here is shared across
-/// replicas. A source spread across N replicas behind a load balancer gets
-/// effectively `N * REDEEM_MAX_PER_WINDOW` attempts per window, not
-/// `REDEEM_MAX_PER_WINDOW`. That's an accepted tradeoff: this limiter sheds
-/// load and guessing pressure, it isn't the security boundary (the per-invite
-/// wrong-code lockout is), so making it cross-replica would trade a store
-/// round trip on every redemption attempt for a guarantee this limiter
+/// **Per-process, by design.** This limiter's buckets are in memory, not
+/// shared across replicas. A source spread across N replicas behind a load
+/// balancer gets effectively `N * REDEEM_MAX_PER_WINDOW` attempts per window,
+/// not `REDEEM_MAX_PER_WINDOW`. That's an accepted tradeoff: this limiter
+/// sheds load and guessing pressure, it isn't the security boundary (the
+/// per-invite wrong-code lockout is), so making it cross-replica would trade a
+/// store round trip on every redemption attempt for a guarantee this limiter
 /// doesn't need to make.
-#[derive(Debug, Default)]
-pub struct SourceRateLimiter {
-    buckets: Mutex<HashMap<String, Bucket>>,
+#[derive(Debug)]
+pub struct SourceRateLimiter(KeyedRateLimiter<String>);
+
+impl Default for SourceRateLimiter {
+    fn default() -> Self {
+        Self(KeyedRateLimiter::new(
+            REDEEM_LIMITER_NAME,
+            REDEEM_MAX_PER_WINDOW,
+            WINDOW_SECS,
+        ))
+    }
 }
 
 impl SourceRateLimiter {
@@ -171,33 +120,13 @@ impl SourceRateLimiter {
 
     /// Consume one attempt for `source`, or refuse once it has made
     /// [`REDEEM_MAX_PER_WINDOW`] in the current window.
-    pub fn try_consume(&self, source: &str, now: u64) -> Result<(), AppError> {
-        let mut buckets = self
-            .buckets
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if buckets.len() >= MAX_TRACKED_IPS {
-            buckets.clear();
-        }
-        let entry = buckets.entry(source.to_string()).or_insert(Bucket {
-            count: 0,
-            window_start: now,
-        });
-        if now.saturating_sub(entry.window_start) >= WINDOW_SECS {
-            entry.count = 0;
-            entry.window_start = now;
-        }
-        if entry.count >= REDEEM_MAX_PER_WINDOW {
-            return Err(AppError::RateLimited {
-                limiter: REDEEM_LIMITER_NAME,
-                message: format!(
-                    "too many invite redemptions ({REDEEM_MAX_PER_WINDOW} per {WINDOW_SECS}s); try again later"
-                ),
-                retry_after_secs: (entry.window_start + WINDOW_SECS).saturating_sub(now),
-            });
-        }
-        entry.count += 1;
-        Ok(())
+    pub fn try_consume(&self, source: &str) -> Result<(), AppError> {
+        self.0.try_consume(source.to_owned())
+    }
+
+    /// Sweep idle sources out of memory until `shutdown` fires.
+    pub fn spawn_gc(&self, shutdown: CancellationToken) {
+        self.0.spawn_gc(shutdown);
     }
 }
 
@@ -208,88 +137,44 @@ pub use did_hosting_common::server::rate_limit::resolve_client_ip;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
 
-    // --- IpRateLimiter ---
-
-    #[test]
-    fn allows_under_cap() {
-        let l = IpRateLimiter::new();
-        let p = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-        for _ in 0..MAX_PER_WINDOW {
-            l.try_consume(p, 1000).unwrap();
-        }
-        assert_eq!(l.count(p), MAX_PER_WINDOW);
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
     }
 
+    /// The challenge limit is the documented allowance, refused with its own
+    /// name, and per address.
     #[test]
-    fn rejects_over_cap() {
-        let l = IpRateLimiter::new();
-        let p = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    fn the_challenge_limit_refuses_past_its_allowance_by_name() {
+        let limiter = IpRateLimiter::new();
+        let client = ip("203.0.113.1");
         for _ in 0..MAX_PER_WINDOW {
-            l.try_consume(p, 1000).unwrap();
+            limiter.try_consume(client).unwrap();
         }
-        let err = l.try_consume(p, 1000).unwrap_err();
         assert!(matches!(
-            err,
-            AppError::RateLimited {
+            limiter.try_consume(client),
+            Err(AppError::RateLimited {
                 limiter: LIMITER_NAME,
-                retry_after_secs: WINDOW_SECS,
                 ..
-            }
+            })
         ));
+        limiter.try_consume(ip("203.0.113.2")).unwrap();
     }
 
-    /// The retry hint is the time left in the current window, not the whole
-    /// window: a refusal 45s into a 60s window says 15.
+    /// Redemption is limited per source, whichever transport vouched for it.
     #[test]
-    fn retry_after_is_the_remainder_of_the_window() {
-        let l = IpRateLimiter::new();
-        let p = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-        for _ in 0..MAX_PER_WINDOW {
-            l.try_consume(p, 1000).unwrap();
+    fn redemption_is_limited_per_source() {
+        let limiter = SourceRateLimiter::new();
+        for _ in 0..REDEEM_MAX_PER_WINDOW {
+            limiter.try_consume("ip:203.0.113.1").unwrap();
         }
-        let err = l.try_consume(p, 1045).unwrap_err();
         assert!(matches!(
-            err,
-            AppError::RateLimited {
-                retry_after_secs: 15,
+            limiter.try_consume("ip:203.0.113.1"),
+            Err(AppError::RateLimited {
+                limiter: REDEEM_LIMITER_NAME,
                 ..
-            }
+            })
         ));
-    }
-
-    /// Window rolls over: after `WINDOW_SECS` elapsed, a fresh round
-    /// of `MAX_PER_WINDOW` requests is allowed. Pinning this catches
-    /// a regression where the lazy-reset is moved from
-    /// `try_consume` to a sweep task that doesn't run in tests.
-    #[test]
-    fn window_resets_after_expiry() {
-        let l = IpRateLimiter::new();
-        let p = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-        // Fill the first window.
-        for _ in 0..MAX_PER_WINDOW {
-            l.try_consume(p, 1000).unwrap();
-        }
-        // Inside the window — rejected.
-        assert!(l.try_consume(p, 1000).is_err());
-        // After WINDOW_SECS — accepted.
-        l.try_consume(p, 1000 + WINDOW_SECS).unwrap();
-        assert_eq!(l.count(p), 1);
-    }
-
-    /// Distinct IPs share no state — one IP being rate-limited
-    /// doesn't affect another.
-    #[test]
-    fn distinct_ips_independent() {
-        let l = IpRateLimiter::new();
-        let a = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-        let b = IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8));
-        for _ in 0..MAX_PER_WINDOW {
-            l.try_consume(a, 1000).unwrap();
-        }
-        // a is full, b is fresh.
-        assert!(l.try_consume(a, 1000).is_err());
-        l.try_consume(b, 1000).unwrap();
+        limiter.try_consume("vid:did:example:alice").unwrap();
     }
 }

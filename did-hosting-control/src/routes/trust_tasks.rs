@@ -84,13 +84,10 @@ pub async fn trust_tasks_endpoint(
         addr.ip(),
         &headers,
         &state.config.server.trusted_proxies,
-    );
+    )?;
     let client_ip = Some(ip);
     if is_redeem_start(&body) {
-        let limited = state.redeem_rate_limiter.try_consume(
-            &format!("ip:{ip}"),
-            did_hosting_common::server::auth::session::now_epoch(),
-        );
+        let limited = state.redeem_rate_limiter.try_consume(&format!("ip:{ip}"));
         if let Err(AppError::RateLimited {
             retry_after_secs, ..
         }) = limited

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
-use did_hosting_common::server::rate_limit::{ResolveRateLimiter, limit_resolution};
+use did_hosting_common::server::rate_limit::ResolveRateLimiter;
 
 use crate::server::AppState;
 
@@ -42,10 +42,7 @@ pub fn router() -> Router<AppState> {
 pub fn router_public_only_with_resolve_limit(
     resolve_limit: Arc<ResolveRateLimiter>,
 ) -> Router<AppState> {
-    router_public_only().layer(axum::middleware::from_fn_with_state(
-        resolve_limit,
-        limit_resolution,
-    ))
+    router_public_only().layer(resolve_limit.layer())
 }
 
 /// [`router`] with `resolve_limit` on resolution; the Trust Task listener
@@ -123,8 +120,8 @@ mod tests {
             ..crate::config::AppConfig::default()
         };
         let state = AppState::new(store, config, None).unwrap();
-        let app =
-            router_with_resolve_limit(Arc::new(ResolveRateLimiter::new(&server))).with_state(state);
+        let app = router_with_resolve_limit(Arc::new(ResolveRateLimiter::new(&server).unwrap()))
+            .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

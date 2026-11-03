@@ -32,7 +32,6 @@ use serde_json::Value;
 use tracing::{error, warn};
 use trust_tasks_rs::{RejectReason, TrustTask};
 
-use did_hosting_common::server::auth::session::now_epoch;
 use did_hosting_common::server::rate_limit::resolve_client_ip;
 
 use crate::server::AppState;
@@ -77,12 +76,16 @@ pub async fn receive(
 ) -> Response {
     // Per-address rate limit, ahead of parsing and any DID resolution the
     // document's verification would trigger.
-    let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.server.trusted_proxies);
-    if let Err(e) = state
-        .trust_tasks_rate_limiter
-        .try_consume(client_ip, now_epoch())
-    {
-        warn!(ip = %client_ip, error = %e, "trust-tasks request rate limited");
+    let client_ip =
+        match resolve_client_ip(addr.ip(), &headers, &state.config.server.trusted_proxies) {
+            Ok(client_ip) => client_ip,
+            Err(e) => return e.into_response(),
+        };
+    let limiter = &state.trust_tasks_rate_limiter;
+    if let Err(e) = limiter.try_consume(client_ip) {
+        if limiter.first_refusal_in_window(&client_ip) {
+            warn!(ip = %client_ip, "trust-tasks client over the rate limit; refusing it until its budget refills");
+        }
         return e.into_response();
     }
 

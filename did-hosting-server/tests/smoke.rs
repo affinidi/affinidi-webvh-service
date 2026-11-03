@@ -963,7 +963,8 @@ async fn resolve_rate_limit_refuses_one_address_past_the_limit() {
     seed_did(&state, "alice", did_id, &body).await;
 
     let limit = std::sync::Arc::new(
-        did_hosting_common::server::rate_limit::ResolveRateLimiter::new(&state.config.server),
+        did_hosting_common::server::rate_limit::ResolveRateLimiter::new(&state.config.server)
+            .unwrap(),
     );
     let app = did_hosting_server::routes::router_with_resolve_limit(1024 * 1024, limit)
         .with_state(state.clone());

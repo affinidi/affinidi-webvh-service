@@ -383,6 +383,11 @@ fn run_rest_thread(
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .expect("failed to convert std TcpListener to tokio TcpListener");
 
+        let rate_limit_gc = CancellationToken::new();
+        state
+            .trust_tasks_rate_limiter
+            .spawn_gc(rate_limit_gc.clone());
+
         let app = routes::router()
             .with_state(state)
             .layer(
@@ -412,6 +417,7 @@ fn run_rest_thread(
         })
         .await
         .expect("axum serve failed");
+        rate_limit_gc.cancel();
 
         info!("REST thread shutting down");
     });
