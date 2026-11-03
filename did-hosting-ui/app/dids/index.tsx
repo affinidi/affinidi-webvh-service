@@ -6,6 +6,7 @@ import {
   StyleSheet,
   Pressable,
   FlatList,
+  ScrollView,
   ActivityIndicator,
 } from "react-native";
 import { Link, useLocalSearchParams, useRouter } from "expo-router";
@@ -21,6 +22,42 @@ import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showAlert } from "../../lib/alert";
 import type { DidRecord } from "../../lib/api";
 import { matchesDomain } from "../../lib/domain";
+import { DidQrButton } from "../../components/DidQrButton";
+import { TableRow } from "../../components/TableRow";
+import {
+  matchesSearch,
+  nextSort,
+  sortDids,
+  compactDid,
+  didTextWidth,
+  nameColumnWidth,
+  type DidSort,
+  type DidSortKey,
+} from "../../lib/did-table";
+
+/** Copy and QR, with the gaps around them. */
+const DID_ACTIONS_WIDTH = 104;
+
+/** The table's columns: header, sort key, and width. The name and DID
+ *  widths come from the listed DIDs (`nameColumnWidth`, `didTextWidth`);
+ *  the rest are fixed. The name column is exactly its width; the others
+ *  share any spare width equally, so a wide window doesn't strand it in
+ *  one column. */
+const COLUMNS: {
+  key: DidSortKey;
+  label: string;
+  width?: number;
+  align?: "right";
+  /** Extra room after a right-aligned number, before the dates. */
+  gapAfter?: boolean;
+}[] = [
+  { key: "mnemonic", label: "Name" },
+  { key: "didId", label: "DID" },
+  { key: "versions", label: "Versions", width: 100, align: "right", gapAfter: true },
+  { key: "created", label: "Created", width: 150 },
+  { key: "updated", label: "Updated", width: 150 },
+  { key: "resolves", label: "Resolves", width: 100, align: "right" },
+];
 
 type PathStatus = null | "checking" | "available" | "taken" | "error";
 
@@ -42,6 +79,8 @@ export default function DidList() {
 
   const [creatingRoot, setCreatingRoot] = useState(false);
   const [copiedDid, setCopiedDid] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [sort, setSort] = useState<DidSort>({ key: "mnemonic", dir: "asc" });
 
   // Inline create form state
   const [showForm, setShowForm] = useState(false);
@@ -191,6 +230,50 @@ export default function DidList() {
     currentDomain === null
       ? dids
       : dids.filter((d) => matchesDomain(d, currentDomain));
+  const rows = sortDids(
+    visibleDids.filter((d) => matchesSearch(d, search)),
+    sort,
+  );
+  const showOwnerInfo = role === "admin" && !owner;
+  // A badge on every row says nothing. Show the method only when the list
+  // mixes methods (otherwise the DID's own prefix says it), and mark owners
+  // only when the list mixes them.
+  const showMethod =
+    new Set(visibleDids.map((d) => d.method ?? "")).size > 1;
+  const markOwners =
+    showOwnerInfo && visibleDids.some((d) => d.owner !== myDid);
+  // Sized from the domain's DIDs, not the search results, so the columns
+  // hold still while typing.
+  const nameWidth = nameColumnWidth(
+    visibleDids.map((d) => ({
+      name: d.mnemonic,
+      badges: [
+        ...(showMethod && d.method ? [`did:${d.method}`] : []),
+        ...(markOwners && d.owner === myDid ? ["You"] : []),
+        ...(d.disabled ? ["Suspended"] : []),
+      ],
+      chips: servedNames(d.agentNames).map((n) => `@${n}`),
+    })),
+  );
+  const didWidth = didTextWidth(visibleDids.map((d) => d.didId));
+  const columnWidth = (key: DidSortKey, fixed?: number) =>
+    key === "mnemonic"
+      ? nameWidth
+      : key === "didId"
+        ? didWidth + DID_ACTIONS_WIDTH
+        : fixed!;
+  /** A column's width. The name fits its longest name; the others are
+   *  minimums that share any spare width equally. */
+  const columnStyle = (key: DidSortKey, fixed?: number) => ({
+    flexGrow: key === "mnemonic" ? 0 : 1,
+    flexShrink: 0,
+    flexBasis: columnWidth(key, fixed),
+  });
+  // Below the columns' sum the table scrolls sideways instead of squeezing.
+  const tableMinWidth =
+    COLUMNS.reduce((w, c) => w + columnWidth(c.key, c.width), 0) +
+    2 * spacing.sm +
+    3;
 
   return (
     <View style={styles.container}>
@@ -352,111 +435,194 @@ export default function DidList() {
             : "No DIDs yet. Create one to get started."}
         </Text>
       ) : (
-        <FlatList
-          data={visibleDids}
-          keyExtractor={(item) => item.mnemonic}
-          contentContainerStyle={{ gap: spacing.md }}
-          renderItem={({ item }) => {
-            const isOwn = item.owner === myDid;
-            const showOwnerInfo = role === "admin" && !owner;
-            return (
-              <Link href={`/dids/${item.mnemonic}`} asChild>
-                <Pressable
-                  style={StyleSheet.flatten([
-                    styles.card,
-                    showOwnerInfo && (isOwn ? styles.cardOwn : styles.cardOther),
-                  ])}
-                >
-                  <View style={styles.mnemonicRow}>
-                    <Text style={styles.mnemonic}>{item.mnemonic}</Text>
-                    {item.method && (
-                      <View style={styles.methodBadge}>
-                        <Text style={styles.methodBadgeText}>
-                          did:{item.method}
-                        </Text>
-                      </View>
-                    )}
-                    {item.domain && (
-                      <View style={styles.domainBadge}>
-                        <Text style={styles.domainBadgeText}>
-                          {item.domain}
-                        </Text>
-                      </View>
-                    )}
-                    {showOwnerInfo && isOwn && (
-                      <View style={styles.youBadge}>
-                        <Text style={styles.youBadgeText}>You</Text>
-                      </View>
-                    )}
-                  </View>
-                  {item.versionCount === 0 ? (
-                    <Text style={styles.statusPending}>Pending upload</Text>
-                  ) : (
-                    <View style={styles.didIdRow}>
-                      <Text style={styles.statusActive}>
-                        {item.didId ?? "Uploaded"}
+        <>
+          <View style={styles.searchRow}>
+            <TextInput
+              style={styles.searchInput}
+              placeholder="Search by name, DID, method or domain"
+              placeholderTextColor={colors.textTertiary}
+              value={search}
+              onChangeText={setSearch}
+              autoCapitalize="none"
+              autoCorrect={false}
+              accessibilityLabel="Search DIDs"
+            />
+            <Text style={styles.countText}>
+              {rows.length === visibleDids.length
+                ? `${visibleDids.length.toLocaleString()} DID${visibleDids.length === 1 ? "" : "s"}`
+                : `${rows.length.toLocaleString()} of ${visibleDids.length.toLocaleString()}`}
+            </Text>
+          </View>
+          <ScrollView horizontal contentContainerStyle={styles.tableScroll}>
+            <View style={[styles.table, { minWidth: tableMinWidth }]}>
+              <View style={styles.headRow} accessibilityRole="header">
+                {COLUMNS.map((c) => {
+                  const active = sort.key === c.key;
+                  return (
+                    <Pressable
+                      key={c.key}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Sort by ${c.label}`}
+                      onPress={() => setSort(nextSort(sort, c.key))}
+                      style={[
+                        styles.cell,
+                        columnStyle(c.key, c.width),
+                        c.align === "right" && styles.cellRight,
+                        c.gapAfter && styles.cellGapAfter,
+                      ]}
+                    >
+                      <Text
+                        style={[styles.headText, active && styles.headTextActive]}
+                        numberOfLines={1}
+                      >
+                        {c.label}
+                        {active ? (sort.dir === "asc" ? " ▲" : " ▼") : ""}
                       </Text>
-                      {item.didId && (
-                        <Pressable
-                          style={styles.copyButton}
-                          onPress={(e) => {
-                            e.preventDefault();
-                            handleCopyDid(item.didId!);
-                          }}
+                    </Pressable>
+                  );
+                })}
+              </View>
+              {rows.length === 0 ? (
+                <Text style={styles.hint}>No DIDs match “{search.trim()}”.</Text>
+              ) : (
+                <FlatList
+                  data={rows}
+                  keyExtractor={(item) => item.mnemonic}
+                  renderItem={({ item, index }) => {
+                    const isOwn = item.owner === myDid;
+                    const names = servedNames(item.agentNames);
+                    return (
+                      <Link href={`/dids/${item.mnemonic}`} asChild>
+                        <TableRow
+                          hoverStyle={styles.rowHover}
+                          // Flattened: Link's Slot merges a child's style by
+                          // object spread, which breaks an array (see TableRow).
+                          style={StyleSheet.flatten([
+                            styles.row,
+                            index % 2 === 1 && styles.rowAlt,
+                            markOwners &&
+                              (isOwn ? styles.rowOwn : styles.rowOther),
+                          ])}
                         >
-                          <Text style={styles.copyButtonText}>
-                            {copiedDid === item.didId ? "Copied!" : "Copy"}
-                          </Text>
-                        </Pressable>
-                      )}
-                    </View>
-                  )}
-                  {/* Agent names, under the DID rather than above it.
-
-                      The card's heading is already a friendly label (the
-                      mnemonic, which is also the link target and the DID's own
-                      path segment). Leading with the agent name would stack
-                      two friendly labels above the identifier they both point
-                      at, and the eye stops trusting which line is the DID.
-                      Under it, the name reads as what it is: an alias for the
-                      string above. Same placement as the detail page, so a
-                      handle looks the same wherever you meet it.
-
-                      Served names only — the list has no document to read, so
-                      it filters the registry itself. Cached on the record, so
-                      this costs no extra request. */}
-                  {servedNames(item.agentNames).length > 0 && (
-                    <View style={styles.agentNamesRow}>
-                      <AgentNameChips
-                        names={servedNames(item.agentNames)}
-                        domain={item.domain}
-                        didId={item.didId}
-                        size="sm"
-                      />
-                    </View>
-                  )}
-                  {showOwnerInfo && !isOwn && (
-                    <Text style={styles.ownerText} numberOfLines={1}>
-                      Owner: {item.owner}
-                    </Text>
-                  )}
-                  <View style={styles.meta}>
-                    <Text style={styles.metaText}>
-                      Versions: {item.versionCount.toLocaleString()}
-                    </Text>
-                    <Text style={styles.metaText}>
-                      Updated: {formatDate(item.updatedAt)}
-                    </Text>
-                    <View style={{ flex: 1 }} />
-                    <Text style={styles.resolveCount}>
-                      {item.totalResolves.toLocaleString()} resolves
-                    </Text>
-                  </View>
-                </Pressable>
-              </Link>
-            );
-          }}
-        />
+                          <View style={[styles.cell, columnStyle("mnemonic")]}>
+                            <View style={styles.nameRow}>
+                              <Text style={styles.mnemonic} numberOfLines={1}>
+                                {item.mnemonic}
+                              </Text>
+                              {showMethod && item.method && (
+                                <View style={styles.methodBadge}>
+                                  <Text style={styles.methodBadgeText}>
+                                    did:{item.method}
+                                  </Text>
+                                </View>
+                              )}
+                              {markOwners && isOwn && (
+                                <View style={styles.youBadge}>
+                                  <Text style={styles.youBadgeText}>You</Text>
+                                </View>
+                              )}
+                              {item.disabled && (
+                                <View style={styles.disabledBadge}>
+                                  <Text style={styles.disabledBadgeText}>Suspended</Text>
+                                </View>
+                              )}
+                            </View>
+                            {currentDomain === null && item.domain && (
+                              <Text style={styles.subText} numberOfLines={1}>
+                                {item.domain}
+                              </Text>
+                            )}
+                            {/* Served agent names, under the name: an alias
+                                for the DID, as on the detail page. */}
+                            {names.length > 0 && (
+                              <View style={styles.agentNamesRow}>
+                                <AgentNameChips
+                                  names={names}
+                                  domain={item.domain}
+                                  didId={item.didId}
+                                  size="sm"
+                                  showHost={false}
+                                />
+                              </View>
+                            )}
+                            {markOwners && !isOwn && (
+                              <Text style={styles.subText} numberOfLines={1}>
+                                Owner: {item.owner}
+                              </Text>
+                            )}
+                          </View>
+                          <View style={[styles.cell, columnStyle("didId")]}>
+                            {item.versionCount === 0 ? (
+                              <Text style={styles.statusPending}>Pending upload</Text>
+                            ) : item.didId ? (
+                              <View style={styles.didIdRow}>
+                                <Text
+                                  style={[styles.didText, { width: didWidth }]}
+                                  numberOfLines={1}
+                                  accessibilityLabel={item.didId}
+                                  // Full DID on hover (web).
+                                  {...({ title: item.didId } as any)}
+                                >
+                                  {compactDid(item.didId)}
+                                </Text>
+                                <Pressable
+                                  accessibilityRole="button"
+                                  accessibilityLabel="Copy DID"
+                                  style={styles.copyButton}
+                                  onPress={(e: any) => {
+                                    e?.preventDefault?.();
+                                    e?.stopPropagation?.();
+                                    handleCopyDid(item.didId!);
+                                  }}
+                                >
+                                  <Text style={styles.copyButtonText}>
+                                    {copiedDid === item.didId ? "Copied!" : "Copy"}
+                                  </Text>
+                                </Pressable>
+                                <DidQrButton did={item.didId} label={item.mnemonic} />
+                              </View>
+                            ) : (
+                              <Text style={styles.subText}>Uploaded</Text>
+                            )}
+                          </View>
+                          <View
+                            style={[
+                              styles.cell,
+                              styles.cellRight,
+                              styles.cellGapAfter,
+                              columnStyle("versions", 100),
+                            ]}
+                          >
+                            <Text style={styles.numText}>
+                              {item.versionCount.toLocaleString()}
+                            </Text>
+                          </View>
+                          <View style={[styles.cell, columnStyle("created", 150)]}>
+                            <Text style={styles.dateText}>{formatDate(item.createdAt)}</Text>
+                          </View>
+                          <View style={[styles.cell, columnStyle("updated", 150)]}>
+                            {/* One version has never been updated: a dash
+                                lets the DIDs that have changed stand out. */}
+                            {item.versionCount <= 1 ? (
+                              <Text style={styles.dateTextMuted}>—</Text>
+                            ) : (
+                              <Text style={styles.dateText}>{formatDate(item.updatedAt)}</Text>
+                            )}
+                          </View>
+                          <View style={[styles.cell, styles.cellRight, columnStyle("resolves", 100)]}>
+                            <Text style={styles.numText}>
+                              {item.totalResolves.toLocaleString()}
+                            </Text>
+                          </View>
+                        </TableRow>
+                      </Link>
+                    );
+                  }}
+                />
+              )}
+            </View>
+          </ScrollView>
+        </>
       )}
     </View>
   );
@@ -538,26 +704,135 @@ const styles = StyleSheet.create({
     gap: spacing.md,
     marginTop: spacing.sm,
   },
-  card: {
+  searchRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.md,
+    marginBottom: spacing.md,
+  },
+  searchInput: {
+    flex: 1,
+    maxWidth: 520,
+    backgroundColor: colors.bgSecondary,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    paddingVertical: 8,
+    paddingHorizontal: spacing.md,
+    color: colors.textPrimary,
+    fontFamily: fonts.regular,
+    fontSize: 14,
+  },
+  countText: {
+    fontSize: 12,
+    fontFamily: fonts.medium,
+    color: colors.textTertiary,
+  },
+  tableScroll: {
+    flexGrow: 1,
+  },
+  table: {
+    flex: 1,
     backgroundColor: colors.bgSecondary,
     borderRadius: radii.lg,
     borderWidth: 1,
     borderColor: colors.border,
-    padding: spacing.lg,
+    overflow: "hidden",
   },
-  cardOwn: {
-    borderLeftWidth: 4,
-    borderLeftColor: colors.teal,
-  },
-  cardOther: {
-    borderLeftWidth: 4,
-    borderLeftColor: colors.textTertiary,
-  },
-  mnemonicRow: {
+  headRow: {
     flexDirection: "row",
     alignItems: "center",
-    gap: spacing.sm,
-    marginBottom: spacing.sm,
+    backgroundColor: colors.bgHeader,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+    paddingHorizontal: spacing.sm,
+  },
+  headText: {
+    fontSize: 11,
+    fontFamily: fonts.semibold,
+    color: colors.textTertiary,
+    textTransform: "uppercase",
+    letterSpacing: 0.6,
+  },
+  headTextActive: {
+    color: colors.textPrimary,
+  },
+  row: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: spacing.sm,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+    borderLeftWidth: 3,
+    borderLeftColor: "transparent",
+  },
+  rowAlt: {
+    backgroundColor: "rgba(255, 255, 255, 0.015)",
+  },
+  rowHover: {
+    backgroundColor: colors.bgTertiary,
+  },
+  rowOwn: {
+    borderLeftColor: colors.teal,
+  },
+  rowOther: {
+    borderLeftColor: colors.textTertiary,
+  },
+  cell: {
+    paddingVertical: 10,
+    paddingHorizontal: spacing.sm,
+    justifyContent: "center",
+    minWidth: 0,
+  },
+  cellRight: {
+    alignItems: "flex-end",
+  },
+  cellGapAfter: {
+    paddingRight: spacing.xl,
+  },
+  nameRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.xs,
+    flexWrap: "wrap",
+  },
+  subText: {
+    marginTop: 2,
+    fontSize: 11,
+    fontFamily: fonts.mono,
+    color: colors.textTertiary,
+  },
+  didText: {
+    fontSize: 12,
+    fontFamily: fonts.mono,
+    color: colors.success,
+  },
+  numText: {
+    fontSize: 13,
+    fontFamily: fonts.medium,
+    color: colors.textPrimary,
+    fontVariant: ["tabular-nums"],
+  },
+  dateText: {
+    fontSize: 12,
+    fontFamily: fonts.regular,
+    color: colors.textSecondary,
+  },
+  dateTextMuted: {
+    fontSize: 12,
+    fontFamily: fonts.regular,
+    color: colors.textTertiary,
+  },
+  disabledBadge: {
+    backgroundColor: colors.errorBg,
+    borderRadius: radii.sm,
+    paddingVertical: 2,
+    paddingHorizontal: spacing.sm,
+  },
+  disabledBadgeText: {
+    fontSize: 10,
+    fontFamily: fonts.semibold,
+    color: colors.error,
   },
   youBadge: {
     backgroundColor: colors.tealMuted,
@@ -570,42 +845,25 @@ const styles = StyleSheet.create({
     fontFamily: fonts.semibold,
     color: colors.teal,
   },
-  ownerText: {
-    fontSize: 12,
-    fontFamily: fonts.mono,
-    color: colors.textTertiary,
-    marginBottom: spacing.sm,
-  },
   mnemonic: {
-    fontSize: 16,
+    fontSize: 14,
     fontFamily: fonts.mono,
     fontWeight: "600",
     color: colors.accent,
   },
   statusPending: {
-    fontSize: 13,
+    fontSize: 12,
     fontFamily: fonts.medium,
     color: colors.warning,
-    marginBottom: spacing.sm,
   },
   didIdRow: {
     flexDirection: "row",
     alignItems: "center",
-    gap: spacing.sm,
-    marginBottom: spacing.sm,
+    gap: spacing.xs,
   },
   agentNamesRow: {
-    marginBottom: spacing.sm,
+    marginTop: 4,
   },
-  statusActive: {
-    fontSize: 13,
-    fontFamily: fonts.mono,
-    color: colors.success,
-    flexShrink: 1,
-    // Long did:peer values have no whitespace; allow mid-token wrapping
-    // so the row doesn't blow past its container on web.
-    wordBreak: "break-all",
-  } as any,
   copyButton: {
     backgroundColor: colors.bgTertiary,
     borderRadius: radii.sm,
@@ -616,21 +874,6 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontFamily: fonts.medium,
     color: colors.textSecondary,
-  },
-  meta: {
-    flexDirection: "row",
-    gap: spacing.lg,
-    alignItems: "center",
-  },
-  metaText: {
-    fontSize: 13,
-    fontFamily: fonts.regular,
-    color: colors.textTertiary,
-  },
-  resolveCount: {
-    fontSize: 13,
-    fontFamily: fonts.medium,
-    color: colors.textTertiary,
   },
   ownerBanner: {
     flexDirection: "row",
@@ -746,20 +989,6 @@ const styles = StyleSheet.create({
     fontFamily: fonts.semibold,
     fontSize: 10,
     color: colors.teal,
-    letterSpacing: 0.4,
-  },
-  domainBadge: {
-    backgroundColor: colors.bgTertiary,
-    paddingHorizontal: spacing.sm,
-    paddingVertical: 2,
-    borderRadius: radii.sm,
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  domainBadgeText: {
-    fontFamily: fonts.mono,
-    fontSize: 10,
-    color: colors.textSecondary,
     letterSpacing: 0.4,
   },
 });

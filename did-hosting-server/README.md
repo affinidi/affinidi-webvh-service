@@ -133,6 +133,16 @@ didcomm = true
 [server]
 host = "0.0.0.0"    # Bind address
 port = 8530          # Bind port
+# trusted_proxies = ["10.0.0.0/20"]  # load balancer addresses or subnets: read X-Forwarded-For
+
+[server.resolve_cache]                      # Cache-Control on DID resolution
+max_age_secs = 300                          # max-age; 0 sends no-cache (default 300)
+# shared_max_age_secs = 3600                # s-maxage for CDNs/proxies only
+# stale_while_revalidate_secs = 60          # serve stale while refetching
+
+# [server.resolve_rate_limit]               # Per-client limit on resolution (off by default)
+# max_per_window = 500                      # requests per address per window; then 429
+# window_secs = 10                          # fixed window (default 10, at most 3600)
 
 [log]
 level = "info"       # trace, debug, info, warn, error
@@ -289,6 +299,27 @@ external services.
 | Google Firestore          | `store-firestore`        | `store.firestore_project`, `store.firestore_database`                                                        |
 | Azure Cosmos DB           | `store-cosmosdb`         | `store.cosmosdb_endpoint`, `store.cosmosdb_database`, `store.cosmosdb_container`, `store.cosmosdb_region`    |
 
+A DID's whole log is stored as one item, so a backend's item size limit is
+the largest log it can hold: about 400 KB on DynamoDB, and about 750 KB on
+Firestore (1 MiB, with the log stored base64-encoded). The other backends hold
+any log `did/register` accepts (1 MiB). An update that would take a log past
+the limit is refused with the size in its message, and the DID keeps its last
+version; with 2.3 KB entries, a DynamoDB-backed DID takes about 170 updates.
+A DID at its limit takes no further entry, a deactivation or key rotation
+included. An edge whose store holds less than its control plane's refuses
+the larger logs and keeps serving the versions it had (the control plane logs
+a warning), so give edges a store whose limit is at least the control
+plane's.
+
+A change that spans several items (a DID's record, log, witness file and
+agent names) is written atomically. On DynamoDB that is one transaction,
+which takes at most 100 writes and 4 MB, so a single change over either is
+refused with nothing written rather than split. Only a DID with close to 100
+agent names, or with a log and witness file together near 4 MB, comes near
+it. On Firestore it is one commit, of at most 500 writes and about 10 MB.
+`backup restore` is a bulk load and is split across as many transactions as
+it needs.
+
 To build with a non-default storage backend:
 
 ```bash
@@ -337,7 +368,10 @@ cargo install did-hosting-server --locked
 ### Environment Variable Overrides
 
 Every config field can be overridden via environment variables
-with the `DID_HOSTING_` prefix:
+with the `DID_HOSTING_` prefix. Before 0.10.1 the shared settings below
+(`FEATURES_*`, `SERVER_*`, `LOG_*`, `STORE_*`, `AUTH_*`, `SECRETS_*`,
+`CLEANUP_TTL_MINUTES`) were read only under `WEBVH_`. Those names still
+work but are deprecated, and the `DID_HOSTING_` name wins when both are set.
 
 | Variable                              | Description                        |
 | ------------------------------------- | ---------------------------------- |
@@ -365,6 +399,54 @@ with the `DID_HOSTING_` prefix:
 | `DID_HOSTING_LIMITS_UPLOAD_BODY_LIMIT`      | Max upload body size (bytes)       |
 | `DID_HOSTING_LIMITS_DEFAULT_MAX_TOTAL_SIZE` | Per-account total DID size (bytes) |
 | `DID_HOSTING_LIMITS_DEFAULT_MAX_DID_COUNT`  | Per-account max DID count          |
+| `DID_HOSTING_SERVER_RESOLVE_CACHE_MAX_AGE_SECS` | Resolve `max-age` (0 = `no-cache`) |
+| `DID_HOSTING_SERVER_RESOLVE_CACHE_SHARED_MAX_AGE_SECS` | Resolve `s-maxage` (empty clears) |
+| `DID_HOSTING_SERVER_RESOLVE_CACHE_STALE_WHILE_REVALIDATE_SECS` | Resolve `stale-while-revalidate` (empty clears) |
+| `DID_HOSTING_REPLAY_MAX_ENTRIES`            | Replay cache records, all signers (default 1,000,000, about 32 MB) |
+| `DID_HOSTING_REPLAY_MAX_ENTRIES_PER_SIGNER` | Replay cache records per signer (default 250,000, about 600 signed requests a second) |
+| `DID_HOSTING_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW` | Resolution requests per client address per window (empty clears: no limit) |
+| `DID_HOSTING_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS` | Resolution rate-limit window (default 10; empty restores it) |
+| `DID_HOSTING_SERVER_TRUSTED_PROXIES` | Comma-separated proxy addresses or CIDR ranges whose `X-Forwarded-For` is trusted (empty clears) |
+
+The replay settings live in `[replay]` (`max_entries`,
+`max_entries_per_signer`). Every sync document is signed by the control plane, so the per-signer
+bound caps how fast this edge follows DID changes (about 600 a second at
+the default). The deprecated `WEBVH_REPLAY_*` names are still read. The control plane's README explains the
+bounds ("Replay cache bounds").
+
+### Resolution rate limit
+
+Resolution is public and unauthenticated, and each request reads the store.
+`[server.resolve_rate_limit]` caps how many resolution requests one client
+may make per fixed window; past it the client gets `429 Too Many Requests`
+with `Retry-After` until the window ends, and the service logs one warning
+per client per window. It is off by default. The Trust Task listener has its
+own limiter and is not counted.
+
+A client is its address, and an IPv6 client its /64. The address is the TCP
+peer unless the peer is in `server.trusted_proxies`, in which case it is
+read from `X-Forwarded-For`. Behind a load balancer, set `trusted_proxies`
+first, to the load balancer's addresses or subnets (CIDR ranges such as
+`10.0.0.0/20`); otherwise every client shares the load balancer's address
+and one budget, and the service warns at startup. Trust only ranges from
+which nothing but the load balancer can reach the service (a subnet that
+holds only the load balancer, or a wider range when a firewall or security
+group admits only the load balancer): anything else could set
+`X-Forwarded-For` to dodge the limit.
+
+When sizing `max_per_window`:
+
+- The budget is per process. With N replicas behind a load balancer, one
+  client gets up to N times the limit.
+- The window is fixed, so a client can send up to twice the limit across a
+  window boundary.
+- In the daemon one budget covers the server's and watcher's resolution and
+  the root fallback, which also serves the UI; one UI page load takes several
+  dozen requests.
+- At most 10,000 clients are tracked. Clients whose window has ended are
+  dropped first; if more than 7,500 are still live, all counts are cleared,
+  so a flood from that many addresses (or IPv6 /64s) is not held back. A CDN or web application
+  firewall is the defence against that.
 
 ## Building
 

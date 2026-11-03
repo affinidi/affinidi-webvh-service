@@ -77,6 +77,7 @@ impl AppState {
     ) -> Result<Self, AppError> {
         let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
         let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
+        let replay_cache = Arc::new(ReplayCache::with_config(config.replay.clone())?);
         Ok(Self {
             acl_ks: store.keyspace(KS_ACL)?,
             witnesses_ks: store.keyspace(KS_WITNESSES)?,
@@ -89,7 +90,7 @@ impl AppState {
             didcomm_service: Arc::new(OnceLock::new()),
             signer,
             acl_locks: PathLocks::new(),
-            replay_cache: Arc::new(ReplayCache::new()),
+            replay_cache,
             sign_lock: Arc::new(tokio::sync::Mutex::new(())),
             trust_tasks_rate_limiter: Arc::new(
                 did_hosting_common::server::rate_limit::IpRateLimiter::new(

@@ -57,16 +57,11 @@ Standalone mode:                          Daemon mode:
 - Node.js 24.3+ (only if building the management UI)
 
 > **Every build and install here passes `--locked`, and that is not
-> decoration.** `Cargo.lock` is this workspace's tested dependency set, and
-> re-resolving it does not currently produce a working graph: `aws-smithy-types`
-> 1.7.0 replaced `Document::Object`'s payload (`HashMap<String, Document>` ->
-> `DocumentObject`) in a *minor* release, which `aws-smithy-json` 0.63.0 — the
-> version the latest `aws-config` depends on — does not compile against while
-> still declaring it compatible. A build that floats past the lockfile fails
-> with `E0308`/`E0004` errors **inside the registry source**, naming files
-> nobody here wrote. It is only reachable with the optional `aws-secrets` or
-> `store-dynamodb` backends on, which is what makes it easy to hit in
-> deployment and never in development.
+> decoration.** `Cargo.lock` is this workspace's tested dependency set. A
+> build that floats past it can pick up a transitive release that was never
+> tested here; the optional `aws-secrets` and `store-dynamodb` backends have
+> been broken that way before (a breaking `aws-smithy-types` minor release),
+> and because they are optional, an ordinary local check never notices.
 >
 > `cargo build` and `cargo test` honour the lockfile on their own, so `--locked`
 > on those turns a silently stale lock into an error. **`cargo install` is the
@@ -74,7 +69,7 @@ Standalone mode:                          Daemon mode:
 > spelled `cargo install --locked --path did-hosting-control`.
 >
 > See the note beside the AWS dependencies in `did-hosting-common/Cargo.toml`
-> for which versions are held and when the pin can lift.
+> for the builds to run after a dependency bump.
 
 
 ### Option 1: Unified daemon (recommended for getting started)

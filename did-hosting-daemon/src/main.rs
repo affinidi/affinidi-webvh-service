@@ -247,6 +247,21 @@ enum Command {
         #[arg(long)]
         grace: Option<String>,
     },
+    /// List or remove the did:scid alias of the service's own DID.
+    ///
+    /// Publishes a new DID log entry whose `alsoKnownAs` lists (`list`) or no
+    /// longer lists (`remove`) `did:scid:vh:1:<scid>?src=<location>` — the
+    /// listing that makes the DID's did:webvh and did:scid forms one subject
+    /// (VTI-KEY-164). `list` replaces an alias listed for an older location.
+    /// Refused when nothing would change. Signed with the current update key,
+    /// which does not rotate.
+    ///
+    /// The service must be STOPPED (the store is exclusively locked).
+    IdentityScidAlias {
+        /// "list" or "remove".
+        #[arg(value_parser = ["list", "remove"])]
+        action: String,
+    },
     /// Stop honouring a superseded identity generation immediately.
     ///
     /// The offline kill switch, for a compromised key. Messages still addressed
@@ -540,6 +555,12 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Command::IdentityScidAlias { action }) => {
+            if let Err(e) = run_identity_scid_alias(cli.config, action).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
         Some(Command::IdentityRetireNow { generation }) => {
             if let Err(e) = run_identity_retire_now(cli.config, generation).await {
                 eprintln!("Error: {e}");
@@ -746,7 +767,9 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         });
 
     // Open keyspaces early — needed for bootstrap, stats seeding, and builders.
-    let dids_ks = main_store.keyspace(KS_DIDS).unwrap_or_else(|e| {
+    // Strongly consistent: the storage task's DID cleanup re-reads a record
+    // to decide whether to delete it. Resolution does not use this handle.
+    let dids_ks = main_store.keyspace_consistent(KS_DIDS).unwrap_or_else(|e| {
         error!("failed to open dids keyspace: {e}");
         std::process::exit(1);
     });
@@ -957,9 +980,23 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         .build()
         .expect("failed to build HTTP client");
 
+    // One per-address resolution limit for the whole process, so a client's
+    // budget covers the server's routes, the DID-serving fallback and the
+    // watcher's routes together.
+    let resolve_limit =
+        Arc::new(did_hosting_common::server::rate_limit::ResolveRateLimiter::new(&config.server));
+
     // 2a. Server — public DID-serving routes only (.well-known)
     if config.enable.server {
-        match build_server(&config, &main_store, &stats_collector, identity.clone()).await {
+        match build_server(
+            &config,
+            &main_store,
+            &stats_collector,
+            identity.clone(),
+            resolve_limit.clone(),
+        )
+        .await
+        {
             Ok((router, state)) => {
                 combined = combined.merge(router);
                 server_state = Some(state);
@@ -988,7 +1025,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // 2c. Watcher (nested at /watcher)
     if config.enable.watcher {
-        match build_watcher(&config, &main_store).await {
+        match build_watcher(&config, &main_store, resolve_limit.clone()).await {
             Ok(router) => {
                 combined = combined.nest("/watcher", router);
                 enabled_services.push("watcher (/watcher)");
@@ -1010,7 +1047,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             &stats_collector,
             &http_client,
             identity.clone(),
-            server_state.as_ref().map(|s| s.did_cache.clone()),
+            server_state.as_ref(),
         )
         .await
         {
@@ -1030,9 +1067,11 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     combined = match server_state {
         Some(ref state) => combined.fallback({
             let state = state.clone();
+            let resolve_limit = resolve_limit.clone();
             move |request: axum::extract::Request| {
                 let state = state.clone();
-                async move { daemon_fallback(state, request).await }
+                let resolve_limit = resolve_limit.clone();
+                async move { daemon_fallback(state, &resolve_limit, request).await }
             }
         }),
         None => {
@@ -1088,6 +1127,8 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             has_auth: config.server_did.is_some(),
             collector: stats_collector.clone(),
             control_state: control_state.clone(),
+            content_cache: server_state.as_ref().map(|s| s.did_cache.clone()),
+            gate_cache: server_state.as_ref().and_then(|s| s.gate_cache.clone()),
         },
         storage_shutdown_rx,
     ));
@@ -1181,6 +1222,11 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     // handle, and starting it eagerly avoids racing the first
     // `notify_one`.
     let (outbox_shutdown_tx, outbox_shutdown_rx) = watch::channel(false);
+    // 4d. A refreshed GeoIP database is picked up without a restart; stops
+    // on the outbox worker's signal.
+    let geoip_reloader = control_state
+        .as_ref()
+        .and_then(|state| state.oob.geoip().spawn_reloader(outbox_shutdown_rx.clone()));
     let outbox_handle = if let Some(state) = control_state.as_ref() {
         let outbox_state = state.clone();
         let outbox_notify = state.outbox_notify.clone();
@@ -1211,6 +1257,11 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             Ok(()) => info!("outbox worker stopped"),
             Err(e) => warn!("outbox worker didn't shut down cleanly: {e}"),
         }
+    }
+    if let Some(handle) = geoip_reloader
+        && let Err(e) = handle.await
+    {
+        warn!("GeoIP reloader didn't shut down cleanly: {e}");
     }
 
     // 5b. Stop storage task (includes final flush + persist main_store)
@@ -1247,6 +1298,11 @@ struct DaemonStorageParams {
     /// as their own task lands in this unified storage task instead. `None` when
     /// the control plane is disabled — nothing owns the identity then.
     control_state: Option<did_hosting_control::server::AppState>,
+    /// The embedded server's content cache, when it runs: expired entries
+    /// are evicted here, and a purge clears it.
+    content_cache: Option<Arc<did_hosting_server::cache::ContentCache>>,
+    /// Its gate cache, when it keeps one (control plane on): likewise.
+    gate_cache: Option<Arc<did_hosting_server::cache::GateCache>>,
 }
 
 async fn run_daemon_storage_task(
@@ -1263,6 +1319,14 @@ async fn run_daemon_storage_task(
     let mut session_timer = tokio::time::interval(session_interval);
     let mut did_timer = tokio::time::interval(did_interval);
     let mut flush_timer = tokio::time::interval(flush_interval);
+    // A flush that overruns its interval is followed by a full interval, not
+    // an immediate catch-up flush.
+    flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Same recount as the standalone control plane: corrects the count for
+    // paths that do not keep it, such as an offline `remove`.
+    let mut did_count_timer = tokio::time::interval(
+        did_hosting_common::server::stats_collector::DID_COUNT_RECONCILE_INTERVAL,
+    );
     // T30 background purge sweep — 60s tick, processes ripe pending
     // entries (unassign-then-wait-grace) by deleting matching DID
     // records and clearing the pending entry.
@@ -1283,6 +1347,7 @@ async fn run_daemon_storage_task(
     session_timer.tick().await;
     did_timer.tick().await;
     flush_timer.tick().await;
+    did_count_timer.tick().await;
     purge_timer.tick().await;
     identity_expiry_timer.tick().await;
     identity_reload_timer.tick().await;
@@ -1298,18 +1363,27 @@ async fn run_daemon_storage_task(
                 }
             }
             _ = did_timer.tick() => {
+                // The control plane publishes into slots under its path
+                // locks; the cleanup takes the same lock before deleting one.
                 match did_hosting_server::did_ops::cleanup_empty_dids(
                     &params.dids_ks,
                     did_ttl_seconds,
+                    params.control_state.as_ref().map(|s| &s.path_locks),
                 ).await {
                     Ok(0) => {}
                     Ok(n) => {
                         info!(count = n, "cleaned up empty DID records");
-                        for _ in 0..n {
-                            params.collector.decrement_total_dids();
-                        }
+                        params.collector.subtract_total_dids(n);
                     }
                     Err(e) => warn!("DID cleanup error: {e}"),
+                }
+            }
+            _ = did_count_timer.tick() => {
+                if let Err(e) = did_hosting_common::server::stats_collector::reconcile_total_dids(
+                    &params.collector,
+                    &params.dids_ks,
+                ).await {
+                    warn!("DID count reconcile error: {e}");
                 }
             }
             _ = flush_timer.tick() => {
@@ -1317,17 +1391,27 @@ async fn run_daemon_storage_task(
                     &params.collector,
                     &params.stats_ks,
                     &params.timeseries_ks,
-                    &params.dids_ks,
-                    &params.store,
+                    did_hosting_control::server::STATS_FLUSH_MAX_ROWS,
                 ).await {
                     warn!("stats flush error: {e}");
                 }
             }
             _ = purge_timer.tick() => {
-                let purged = did_hosting_server::purge_sweep::run_sweep_once(&params.store).await;
-                if purged > 0 {
-                    info!(count = purged, "purge sweep tick completed");
+                let sweep = did_hosting_server::purge_sweep::run_sweep_once(&params.store).await;
+                if sweep.entries > 0 {
+                    info!(count = sweep.entries, "purge sweep tick completed");
                 }
+                // A purge deletes DIDs or a domain record without the control
+                // plane's hook hearing of it: drop everything. Otherwise this
+                // one-minute tick evicts what has outlived its TTL.
+                let purged = sweep.entries > 0 || sweep.dids_deleted > 0;
+                if let Some(content) = &params.content_cache {
+                    if purged { content.clear() } else { content.evict_expired() }
+                }
+                if let Some(gate) = &params.gate_cache {
+                    if purged { gate.clear() } else { gate.evict_expired() }
+                }
+                params.collector.subtract_total_dids(sweep.dids_deleted);
             }
             _ = identity_expiry_timer.tick() => {
                 if let Some(state) = params.control_state.as_ref() {
@@ -1349,12 +1433,10 @@ async fn run_daemon_storage_task(
     }
 
     // Final flush before exit
-    let _ = did_hosting_control::server::flush_stats_to_store(
+    did_hosting_control::server::flush_remaining_stats(
         &params.collector,
         &params.stats_ks,
         &params.timeseries_ks,
-        &params.dids_ks,
-        &params.store,
     )
     .await;
 
@@ -1381,6 +1463,7 @@ async fn build_server(
     store: &Store,
     stats_collector: &Arc<StatsCollector>,
     identity: Option<Arc<ServiceIdentity>>,
+    resolve_limit: Arc<did_hosting_common::server::rate_limit::ResolveRateLimiter>,
 ) -> Result<(Router, did_hosting_server::server::AppState), AppError> {
     use did_hosting_server::server::AppState;
 
@@ -1393,8 +1476,21 @@ async fn build_server(
     // control plane writes, so there is nothing to replicate to it.
     let mut state = AppState::new(store.clone(), server_config)?.with_identity(identity);
     state.stats_collector = Some(stats_collector.clone());
+    // With its control plane on, every change to a record or domain is made
+    // in this process, which clears the gate cache after each commit
+    // (`build_control`), so a warm resolve can skip the store entirely. With
+    // it off, changes come from elsewhere and nothing would clear it: read
+    // the store on every resolve, as a standalone edge does. Either way this
+    // assumes one daemon per store.
+    if config.enable.control {
+        state.gate_cache = Some(Arc::new(did_hosting_server::cache::GateCache::new(
+            store,
+            did_hosting_server::cache::RESOLUTION_CACHE_TTL,
+        )?));
+    }
 
-    let router = did_hosting_server::routes::router_public_only().with_state(state.clone());
+    let router = did_hosting_server::routes::router_public_only_with_resolve_limit(resolve_limit)
+        .with_state(state.clone());
     info!("server service initialized (public-only, daemon mode)");
 
     Ok((router, state))
@@ -1426,7 +1522,11 @@ async fn build_witness(
     Ok(router)
 }
 
-async fn build_watcher(config: &DaemonConfig, store: &Store) -> ServiceResult {
+async fn build_watcher(
+    config: &DaemonConfig,
+    store: &Store,
+    resolve_limit: Arc<did_hosting_common::server::rate_limit::ResolveRateLimiter>,
+) -> ServiceResult {
     use webvh_watcher::server::AppState;
 
     // Resolution only. The embedded watcher reads the daemon's one store, and
@@ -1434,7 +1534,8 @@ async fn build_watcher(config: &DaemonConfig, store: &Store) -> ServiceResult {
     // ever synced into it. A watcher that mirrors control planes is a
     // standalone `webvh-watcher` with its own DID.
     let state = AppState::new(store.clone(), config.watcher_config(), None)?;
-    let router = webvh_watcher::routes::router_public_only().with_state(state);
+    let router = webvh_watcher::routes::router_public_only_with_resolve_limit(resolve_limit)
+        .with_state(state);
     info!("watcher service initialized (resolution only, daemon mode)");
 
     Ok(router)
@@ -1452,6 +1553,23 @@ fn control_verifier(
     did_hosting_common::server::trust_tasks::build_verifier(did_resolver)
 }
 
+/// The control plane's cache hook in the daemon: each change it commits
+/// clears what the embedded server cached from it, so a resolve that skips
+/// the store never serves a DID or domain state from before the change.
+fn resolution_cache_hook(
+    content: Arc<did_hosting_server::cache::ContentCache>,
+    gate: Arc<did_hosting_server::cache::GateCache>,
+) -> Arc<did_hosting_control::server::CacheInvalidateFn> {
+    use did_hosting_control::server::CacheChange;
+    Arc::new(move |change: CacheChange<'_>| match change {
+        CacheChange::Did(mnemonic) => {
+            content.invalidate_did(mnemonic);
+            gate.forget_did(mnemonic);
+        }
+        CacheChange::Domains => gate.forget_domains(),
+    })
+}
+
 async fn build_control(
     config: &DaemonConfig,
     secrets: &ServerSecrets,
@@ -1459,18 +1577,22 @@ async fn build_control(
     stats_collector: &Arc<StatsCollector>,
     http_client: &reqwest::Client,
     identity: Option<Arc<ServiceIdentity>>,
-    did_cache: Option<Arc<did_hosting_server::cache::ContentCache>>,
+    server: Option<&did_hosting_server::server::AppState>,
 ) -> Result<(Router, did_hosting_control::server::AppState), AppError> {
-    use did_hosting_control::server::{AppState, CacheInvalidateFn};
+    use did_hosting_control::server::AppState;
 
     // Lets the control plane's own mutations (register, publish, disable,
-    // rollback, delete) evict the embedded server's resolved-content cache
-    // in the same process — there is no sync round-trip to do it the way a
-    // standalone edge does on receipt of `webvh/sync/*`. `None` when the
-    // server component isn't enabled in this deployment: nothing serves
-    // resolution, so nothing to invalidate.
-    let cache_invalidate: Option<Arc<CacheInvalidateFn>> = did_cache
-        .map(|cache| Arc::new(move |key: &str| cache.invalidate(key)) as Arc<CacheInvalidateFn>);
+    // rollback, delete, and domain changes) evict what the embedded server
+    // cached from them in the same process — there is no sync round-trip to
+    // do it the way a standalone edge does on receipt of `webvh/sync/*`.
+    // `None` when the server component isn't enabled in this deployment:
+    // nothing serves resolution, so nothing to invalidate.
+    let cache_invalidate = server.and_then(|server| {
+        Some(resolution_cache_hook(
+            server.did_cache.clone(),
+            server.gate_cache.clone()?,
+        ))
+    });
 
     let control_config = config.control_config();
 
@@ -1487,7 +1609,9 @@ async fn build_control(
     let sessions_ks = store.keyspace(KS_SESSIONS)?;
     let acl_ks = store.keyspace(KS_ACL)?;
     let registry_ks = store.keyspace(KS_REGISTRY)?;
-    let dids_ks = store.keyspace(KS_DIDS)?;
+    // Strongly consistent, as in the standalone control plane; the embedded
+    // server opens its own handle and resolves with ordinary reads.
+    let dids_ks = store.keyspace_consistent(KS_DIDS)?;
     let stats_ks = store.keyspace(KS_STATS)?;
     let timeseries_ks = store.keyspace(KS_TIMESERIES)?;
 
@@ -1537,7 +1661,9 @@ async fn build_control(
         stats_ks,
         timeseries_ks,
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
-        replay_cache: Arc::new(did_hosting_control::replay::ReplayCache::new()),
+        replay_cache: Arc::new(did_hosting_control::replay::ReplayCache::with_config(
+            config.replay.clone(),
+        )?),
         path_locks: did_hosting_control::path_locks::PathLocks::new(),
         acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
         pending_challenges: Arc::new(pending_challenges),
@@ -1545,7 +1671,11 @@ async fn build_control(
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
         redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),
         cache_invalidate,
-        oob: Default::default(),
+        // Wallet sign-in locations from the local GeoIP database, if any
+        // (mirrors `did_hosting_control::server`).
+        oob: Arc::new(did_hosting_control::oob::OobRuntime::with_geoip(
+            did_hosting_control::server::open_geoip(&config.geoip).await?,
+        )),
         large_document_budget: Arc::new(
             did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
         ),
@@ -1585,10 +1715,18 @@ async fn build_control(
 /// Tries DID public serving first (e.g. `/{mnemonic}/did.jsonl`).
 /// If that returns 404, falls through to the SPA static handler so that
 /// paths like `/enroll` serve `index.html` for client-side routing.
+///
+/// Every request here counts against `resolve_limit`, the UI's included:
+/// whether a path is a DID is only known after the store lookup the limit
+/// exists to bound.
 async fn daemon_fallback(
     state: did_hosting_server::server::AppState,
+    resolve_limit: &did_hosting_common::server::rate_limit::ResolveRateLimiter,
     request: axum::extract::Request,
 ) -> Response {
+    if let Err(refusal) = resolve_limit.check(&request) {
+        return axum::response::IntoResponse::into_response(refusal);
+    }
     // Snapshot the URI for the SPA fallback (which only needs path
     // routing); the full Request is consumed by serve_public to read
     // ConnectInfo + headers for resolve-side host detection.
@@ -1851,6 +1989,7 @@ async fn run_bootstrap_did(
             config.features.tsp,
             public_url,
             &mnemonic,
+            config.hosting.scid_also_known_as,
         )
         .await?;
 
@@ -1979,6 +2118,7 @@ async fn run_recreate_did(
         config.features.tsp,
         public_url,
         &mnemonic,
+        config.hosting.scid_also_known_as,
     )
     .await?;
 
@@ -2483,6 +2623,22 @@ async fn run_identity_retire_now(
     .await
 }
 
+/// `identity-scid-alias` — list or remove the service DID's did:scid alias, offline.
+async fn run_identity_scid_alias(
+    config_path: Option<PathBuf>,
+    action: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = DaemonConfig::load(config_path)?;
+    did_hosting_common::server::cli_identity::run_identity_scid_alias(
+        &config.store,
+        &config.secrets,
+        &config.config_path,
+        config.server_did.as_deref(),
+        &action,
+    )
+    .await
+}
+
 /// `identity-rotate-keys` — rotate the service's own keys, offline.
 ///
 /// Writes the new DID log entry, the new key material (carrying the outgoing key
@@ -2782,5 +2938,108 @@ mod verifier_tests {
             matches!(err.reject_reason(), RejectReason::Unavailable { .. }),
             "{err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod resolution_cache_hook_tests {
+    //! The hook is what keeps the embedded server's caches honest: a resolve
+    //! that skips the store must not outlive a change the control plane made.
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use did_hosting_common::did_ops::{DidRecord, content_log_key, did_key};
+    use did_hosting_common::server::config::StoreConfig;
+    use did_hosting_common::server::domain::{DomainEntry, DomainStatus, DomainUrlScheme};
+    use did_hosting_common::server::store::{KS_DIDS, KS_DOMAINS, Store};
+    use did_hosting_control::server::CacheChange;
+    use did_hosting_server::cache::{ContentCache, GateCache};
+
+    use super::resolution_cache_hook;
+
+    fn record(disabled: bool) -> DidRecord {
+        DidRecord {
+            owner: "did:example:owner".into(),
+            mnemonic: "alice".into(),
+            created_at: 0,
+            updated_at: 0,
+            version_count: 1,
+            did_id: Some("did:webvh:Q1:a.example:alice".into()),
+            content_size: 0,
+            disabled,
+            deleted_at: None,
+            method: "webvh".into(),
+            domain: "a.example".into(),
+            services: None,
+            agent_names: Vec::new(),
+        }
+    }
+
+    fn domain(status: DomainStatus) -> DomainEntry {
+        DomainEntry {
+            name: "a.example".into(),
+            label: None,
+            scheme: DomainUrlScheme::Https,
+            status,
+            created_at: 0,
+            default_domain: false,
+            branding: None,
+            witnesses: None,
+            watchers: None,
+            quota: None,
+            well_known_enabled: false,
+            disabled_at: None,
+            purge_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn each_change_clears_what_the_embedded_server_cached_from_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .unwrap();
+        let dids = store.keyspace(KS_DIDS).unwrap();
+        let domains = store.keyspace(KS_DOMAINS).unwrap();
+        let content = Arc::new(ContentCache::new(Duration::from_secs(60)));
+        let gate = Arc::new(GateCache::new(&store, Duration::from_secs(60)).unwrap());
+        let hook = resolution_cache_hook(content.clone(), gate.clone());
+
+        // Warm every cache from the store.
+        dids.insert(did_key("alice"), &record(false)).await.unwrap();
+        domains
+            .insert("a.example", &domain(DomainStatus::Active))
+            .await
+            .unwrap();
+        let web_key = ContentCache::did_web_document_key("alice");
+        for key in [content_log_key("alice"), web_key.clone()] {
+            content.insert(content.generation(), key, b"old".to_vec());
+        }
+        assert!(!gate.record("alice").await.unwrap().unwrap().disabled);
+        let allowed = |d: &did_hosting_common::server::domain::ResolutionDomains| {
+            d.assert_allowed(Some("a.example"), "did:webvh:Q1:a.example:alice")
+                .is_ok()
+        };
+        assert!(allowed(&gate.domains().await.unwrap()));
+
+        // A DID change: the store moves on, and the hook names the DID.
+        dids.insert(did_key("alice"), &record(true)).await.unwrap();
+        hook(CacheChange::Did("alice"));
+        assert!(content.get(&content_log_key("alice")).is_none(), "log");
+        assert!(content.get(&web_key).is_none(), "did:web document");
+        assert!(gate.record("alice").await.unwrap().unwrap().disabled);
+
+        // A domain change, likewise.
+        domains
+            .insert("a.example", &domain(DomainStatus::Disabled))
+            .await
+            .unwrap();
+        assert!(allowed(&gate.domains().await.unwrap()), "still cached");
+        hook(CacheChange::Domains);
+        assert!(!allowed(&gate.domains().await.unwrap()));
     }
 }

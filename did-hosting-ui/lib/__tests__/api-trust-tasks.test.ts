@@ -109,8 +109,8 @@ describe("server/info", () => {
 // ---------------------------------------------------------------------------
 
 describe("checkReply", () => {
-  const sent = { id: "urn:uuid:req", type: `${DM}did/list/0.1`, issuer: SUBJECT };
-  const good = () => seal(sent, { records: [], total: 0 });
+  const sent = { id: "urn:uuid:req", type: `${DM}did/list/0.2`, issuer: SUBJECT };
+  const good = () => seal(sent, { records: [] });
 
   it("accepts the service's signed answer to this request", () => {
     expect(() => checkReply(sent, good() as never, SERVICE_DID)).not.toThrow();
@@ -175,9 +175,9 @@ describe("management calls (passkey session)", () => {
       },
     });
     const sent = installControlPlane((req) =>
-      req.payload.offset
-        ? seal(req, { records: [record("c")], total: 3 })
-        : seal(req, { records: [record("a"), record("b")], total: 3 }),
+      req.payload.cursor === "page-2"
+        ? seal(req, { records: [record("c")] })
+        : seal(req, { records: [record("a"), record("b")], nextCursor: "page-2" }),
     );
 
     const dids = await api.listDids();
@@ -190,7 +190,7 @@ describe("management calls (passkey session)", () => {
     });
     const [first, second] = tasks(sent);
     expect(first!.doc).toMatchObject({
-      type: `${DM}did/list/0.1`,
+      type: `${DM}did/list/0.2`,
       issuer: SUBJECT,
       recipient: SERVICE_DID,
       payload: { limit: 1000 },
@@ -200,7 +200,7 @@ describe("management calls (passkey session)", () => {
       },
     });
     expect(first!.bearer).toBe(`Bearer ${TOKEN}`);
-    expect(second!.doc.payload).toEqual({ limit: 1000, offset: 2 });
+    expect(second!.doc.payload).toEqual({ limit: 1000, cursor: "page-2" });
   });
 
   it("refuses an unsigned reply to a management call", async () => {
@@ -293,7 +293,7 @@ describe("management calls (passkey session)", () => {
       seal(req, {
         range: "lastWeek",
         bucketSeconds: 3600,
-        points: [{ at: "2026-01-01T00:00:00Z", resolves: 3, updates: 1 }],
+        points: [{ startsAt: "2026-01-01T00:00:00Z", resolves: 3, updates: 1 }],
       }),
     );
     const points = await api.getServerTimeseries("7d", "example.com");
@@ -451,12 +451,14 @@ describe("resolveAclSubject / createAcl (agent names)", () => {
 
   it("sends a DID straight through, unresolved — no did/list or agent-name/resolve call", async () => {
     const sent = installControlPlane((req) =>
-      req.type === `${TT}acl/grant/0.1`
+      req.type === `${TT}acl/grant/0.2`
         ? seal(req, {
             entry: {
               subject: "did:web:alice.example",
               role: "admin",
-              ext: { "vnd.affinidi.webvh": { domains: { kind: "all" } } },
+              act: { scope: "all" },
+              keys: { scope: "none" },
+              capabilities: { scope: "ceiling" },
             },
           })
         : undefined,
@@ -467,26 +469,36 @@ describe("resolveAclSubject / createAcl (agent names)", () => {
     const sentTasks = tasks(sent);
     expect(sentTasks).toHaveLength(1);
     expect(sentTasks[0]!.doc).toMatchObject({
-      type: `${TT}acl/grant/0.1`,
-      payload: { entry: { subject: "did:web:alice.example" } },
+      type: `${TT}acl/grant/0.2`,
+      // AclEntry 0.2 states every authority member; nothing is implied.
+      payload: {
+        entry: {
+          subject: "did:web:alice.example",
+          act: { scope: "all" },
+          keys: { scope: "none" },
+          capabilities: { scope: "ceiling" },
+        },
+      },
     });
   });
 
   it("resolves an agent name to the DID that currently serves it before granting", async () => {
     const alice = "did:webvh:QmAlice:example.com:alice";
     const sent = installControlPlane((req) => {
-      if (req.type === `${DM}did/list/0.1`) {
-        return seal(req, { records: [record(alice, "example.com", "alice")], total: 1 });
+      if (req.type === `${DM}did/list/0.2`) {
+        return seal(req, { records: [record(alice, "example.com", "alice")] });
       }
       if (req.type === `${DM}agent-name/resolve/0.1`) {
         return seal(req, { entries: [{ did: alice, names: ["example.com/@alice"] }] });
       }
-      if (req.type === `${TT}acl/grant/0.1`) {
+      if (req.type === `${TT}acl/grant/0.2`) {
         return seal(req, {
           entry: {
             subject: alice,
             role: "owner",
-            ext: { "vnd.affinidi.webvh": { domains: { kind: "all" } } },
+            act: { scope: "all" },
+              keys: { scope: "none" },
+              capabilities: { scope: "ceiling" },
           },
         });
       }
@@ -495,19 +507,19 @@ describe("resolveAclSubject / createAcl (agent names)", () => {
 
     await api.createAcl("example.com/@alice", "owner", { domains: { kind: "all" } });
 
-    const grant = tasks(sent).find((s) => s.doc.type === `${TT}acl/grant/0.1`);
+    const grant = tasks(sent).find((s) => s.doc.type === `${TT}acl/grant/0.2`);
     expect(grant!.doc.payload.entry.subject).toBe(alice);
   });
 
   it("refuses an agent name no hosted DID currently serves — no acl/grant is sent", async () => {
     const sent = installControlPlane((req) =>
-      req.type === `${DM}did/list/0.1` ? seal(req, { records: [], total: 0 }) : undefined,
+      req.type === `${DM}did/list/0.2` ? seal(req, { records: [] }) : undefined,
     );
 
     await expect(api.createAcl("example.com/@ghost", "owner")).rejects.toThrow(
       /does not resolve to a DID hosted here/,
     );
-    expect(tasks(sent).some((s) => s.doc.type === `${TT}acl/grant/0.1`)).toBe(false);
+    expect(tasks(sent).some((s) => s.doc.type === `${TT}acl/grant/0.2`)).toBe(false);
   });
 
   it("refuses a candidate whose binding agent-name/resolve does not confirm as still served", async () => {
@@ -516,8 +528,8 @@ describe("resolveAclSubject / createAcl (agent names)", () => {
     // the authoritative check — is asked.
     const alice = "did:webvh:QmAlice:example.com:alice";
     const sent = installControlPlane((req) => {
-      if (req.type === `${DM}did/list/0.1`) {
-        return seal(req, { records: [record(alice, "example.com", "alice")], total: 1 });
+      if (req.type === `${DM}did/list/0.2`) {
+        return seal(req, { records: [record(alice, "example.com", "alice")] });
       }
       if (req.type === `${DM}agent-name/resolve/0.1`) {
         return seal(req, { entries: [] });
@@ -528,7 +540,7 @@ describe("resolveAclSubject / createAcl (agent names)", () => {
     await expect(api.createAcl("example.com/@alice", "owner")).rejects.toThrow(
       /does not resolve to a DID hosted here/,
     );
-    expect(tasks(sent).some((s) => s.doc.type === `${TT}acl/grant/0.1`)).toBe(false);
+    expect(tasks(sent).some((s) => s.doc.type === `${TT}acl/grant/0.2`)).toBe(false);
   });
 
   it("refuses a malformed agent-name-like input without calling the control plane", async () => {
@@ -538,6 +550,78 @@ describe("resolveAclSubject / createAcl (agent names)", () => {
       /not a valid agent name/,
     );
     expect(tasks(sent)).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("updateAcl (AclEntry 0.2: a grant never narrows)", () => {
+  const BOB = "did:web:bob.example";
+  const owner = (act: unknown, defaultDomain?: string) => ({
+    subject: BOB,
+    role: "owner",
+    act,
+    keys: { scope: "none" },
+    capabilities: { scope: "ceiling" },
+    ...(defaultDomain ? { ext: { "vnd.affinidi.webvh": { defaultDomain } } } : {}),
+  });
+
+  it("drops a domain with an acl/revoke act narrowing, then grants the rest", async () => {
+    const held = owner({ scope: "contexts", contexts: ["a.example", "b.example"] }, "b.example");
+    const sent = installControlPlane((req) => {
+      if (req.type === `${TT}acl/show/0.2`) return seal(req, { entry: held });
+      if (req.type === `${TT}acl/revoke/0.2`) {
+        return seal(req, { entry: owner({ scope: "contexts", contexts: ["a.example"] }) });
+      }
+      if (req.type === `${TT}acl/grant/0.2`) return seal(req, { entry: req.payload.entry });
+      return undefined;
+    });
+
+    const entry = await api.updateAcl(BOB, {
+      domains: { kind: "allowed_with_default", domains: ["a.example", "c.example"], default: "c.example" },
+    });
+
+    const [, revoke, grant] = tasks(sent);
+    expect(revoke!.doc).toMatchObject({
+      type: `${TT}acl/revoke/0.2`,
+      payload: { subject: BOB, revocation: { kind: "act", act: { scope: "contexts", contexts: ["a.example"] } } },
+    });
+    expect(grant!.doc.payload.entry).toEqual({
+      subject: BOB,
+      role: "owner",
+      act: { scope: "contexts", contexts: ["a.example", "c.example"] },
+      keys: { scope: "none" },
+      capabilities: { scope: "ceiling" },
+      ext: { "vnd.affinidi.webvh": { defaultDomain: "c.example" } },
+    });
+    expect(entry.domains).toEqual({
+      kind: "allowed_with_default",
+      domains: ["a.example", "c.example"],
+      default: "c.example",
+    });
+  });
+
+  it("widens with a grant alone — no revoke", async () => {
+    const sent = installControlPlane((req) => {
+      if (req.type === `${TT}acl/show/0.2`) {
+        return seal(req, { entry: owner({ scope: "contexts", contexts: ["a.example"] }) });
+      }
+      if (req.type === `${TT}acl/grant/0.2`) return seal(req, { entry: req.payload.entry });
+      return undefined;
+    });
+
+    await api.updateAcl(BOB, { domains: { kind: "all" } });
+
+    expect(tasks(sent).map((s) => s.doc.type)).toEqual([`${TT}acl/show/0.2`, `${TT}acl/grant/0.2`]);
+    expect(tasks(sent)[1]!.doc.payload.entry.act).toEqual({ scope: "all" });
+  });
+
+  it("removes an entry with revocation kind entry", async () => {
+    const sent = installControlPlane((req) =>
+      req.type === `${TT}acl/revoke/0.2` ? seal(req, { entry: null }) : undefined,
+    );
+    await api.deleteAcl(BOB);
+    expect(tasks(sent)[0]!.doc.payload).toEqual({ subject: BOB, revocation: { kind: "entry" } });
   });
 });
 

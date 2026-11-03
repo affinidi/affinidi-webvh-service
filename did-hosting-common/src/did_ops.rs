@@ -158,6 +158,10 @@ pub struct LogMetadata {
     pub watchers: bool,
     pub watcher_count: u32,
     pub watcher_urls: Vec<String>,
+    /// The did:scid alias of the latest document and whether it lists it
+    /// (VTI-KEY-164); `None` when the latest document is not did:webvh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scid_alias: Option<crate::scid::ScidAliasInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +181,7 @@ pub fn content_witness_key(mnemonic: &str) -> String {
 }
 
 pub fn owner_key(did: &str, mnemonic: &str) -> String {
-    format!("owner:{did}:{mnemonic}")
+    format!("owner:{}:{mnemonic}", crate::scid::strip_scid_src(did))
 }
 
 /// Reverse index: an agent name resolves to the mnemonic that owns it.
@@ -1075,6 +1079,8 @@ pub fn extract_log_metadata(jsonl_content: &str) -> LogMetadata {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    meta.scid_alias = entry.get("state").and_then(crate::scid::scid_alias_info);
+
     if let Some(params) = entry.get("parameters") {
         meta.method = params
             .get("method")
@@ -1189,6 +1195,42 @@ pub fn parse_log_entries(jsonl_content: &str) -> Vec<LogEntryInfo> {
 mod tests {
     use super::*;
 
+    /// The did:web bridge rewrites the did:webvh id only: a did:scid alias
+    /// the document lists survives into the did:web document unchanged.
+    #[test]
+    fn the_did_web_bridge_keeps_the_scid_alias() {
+        let line = serde_json::json!({
+            "versionId": "1-Qm",
+            "state": {
+                "id": "did:webvh:Qm1:a.example:alice",
+                "alsoKnownAs": ["did:web:a.example:alice", "did:scid:vh:1:Qm1?src=a.example/alice"]
+            }
+        })
+        .to_string();
+        let doc = extract_did_web_document(&line, "did:web:a.example:alice").expect("bridged");
+        let doc: serde_json::Value = serde_json::from_slice(&doc).unwrap();
+        assert_eq!(doc["id"], "did:web:a.example:alice");
+        assert_eq!(
+            doc["alsoKnownAs"],
+            serde_json::json!([
+                "did:web:a.example:alice",
+                "did:scid:vh:1:Qm1?src=a.example/alice"
+            ])
+        );
+    }
+
+    /// A did:scid alias is not an agent name, and claims none.
+    #[test]
+    fn a_scid_alias_claims_no_agent_name() {
+        let doc = serde_json::json!({
+            "alsoKnownAs": ["did:scid:vh:1:Qm1?src=a.example/alice", "https://a.example/@alice"]
+        });
+        assert_eq!(
+            agent_names_from_document(&doc, "a.example"),
+            vec!["alice".to_string()]
+        );
+    }
+
     // ---- T12: DidRecord new fields backwards-compat ----
 
     #[test]
@@ -1300,6 +1342,21 @@ mod tests {
         assert_eq!(meta.log_entry_count, 1);
         assert_eq!(meta.latest_version_id.as_deref(), Some("1-QmHash"));
         assert!(meta.portable);
+        assert_eq!(meta.scid_alias, None);
+    }
+
+    /// The did:scid alias state is read from the latest entry only.
+    #[test]
+    fn log_metadata_scid_alias_from_latest_state() {
+        use crate::scid::ScidAliasStatus;
+        let jsonl = concat!(
+            r#"{"versionId":"1-a","state":{"id":"did:webvh:Qm1:a.example:alice","alsoKnownAs":["did:scid:vh:1:Qm1?src=a.example/alice"]}}"#,
+            "\n",
+            r#"{"versionId":"2-b","state":{"id":"did:webvh:Qm1:b.example:alice","alsoKnownAs":["did:scid:vh:1:Qm1?src=a.example/alice"]}}"#,
+        );
+        let alias = extract_log_metadata(jsonl).scid_alias.unwrap();
+        assert_eq!(alias.did_url, "did:scid:vh:1:Qm1?src=b.example/alice");
+        assert_eq!(alias.status, ScidAliasStatus::Stale);
     }
 
     #[test]

@@ -234,6 +234,8 @@ mod tests {
             trust_tasks: Default::default(),
             hosting: Default::default(),
             identity: Default::default(),
+            replay: Default::default(),
+            geoip: Default::default(),
             config_path: PathBuf::new(),
         };
         let state = AppState {
@@ -307,14 +309,14 @@ mod tests {
         let (state, _dir) = test_state().await;
         let body = json!({
             "id": "urn:uuid:11111111-1111-1111-1111-111111111111",
-            "type": "https://trusttasks.org/spec/acl/grant/0.1",
+            "type": "https://trusttasks.org/spec/acl/grant/0.2",
             "recipient": SERVICE_DID,
             "issuedAt": "2026-07-06T00:00:00Z",
             "payload": {
                 "entry": {
                     "subject": "did:web:carol.example",
                     "role": "owner",
-                    "ext": { "vnd.affinidi.webvh": { "domains": { "kind": "all" } } }
+                    "act": { "scope": "all" }, "keys": { "scope": "none" }, "capabilities": { "scope": "ceiling" }
                 }
             }
         });
@@ -347,14 +349,14 @@ mod tests {
         let (state, _dir) = test_state().await;
         let body = json!({
             "id": "urn:uuid:22222222-2222-2222-2222-222222222222",
-            "type": "https://trusttasks.org/spec/acl/grant/0.1",
+            "type": "https://trusttasks.org/spec/acl/grant/0.2",
             "recipient": SERVICE_DID,
             "issuedAt": "2026-07-06T00:00:00Z",
             "payload": {
                 "entry": {
                     "subject": "did:web:carol.example",
                     "role": "owner",
-                    "ext": { "vnd.affinidi.webvh": { "domains": { "kind": "all" } } }
+                    "act": { "scope": "all" }, "keys": { "scope": "none" }, "capabilities": { "scope": "ceiling" }
                 }
             }
         });
@@ -376,7 +378,7 @@ mod tests {
         // envelope's own type URI was all the parser ever saw, so no reply
         // could name the task inside it.
         assert_eq!(
-            doc["payload"]["inResponseTo"]["typeUri"], "https://trusttasks.org/spec/acl/grant/0.1",
+            doc["payload"]["inResponseTo"]["typeUri"], "https://trusttasks.org/spec/acl/grant/0.2",
             "the reply answers the task the envelope carried: {doc}"
         );
         assert_eq!(
@@ -416,7 +418,7 @@ mod tests {
         let error_doc = json!({
             "id": "urn:uuid:33333333-3333-3333-3333-333333333333",
             "threadId": "urn:uuid:11111111-1111-1111-1111-111111111111",
-            "type": "https://trusttasks.org/spec/trust-task-error/0.5",
+            "type": "https://trusttasks.org/spec/trust-task-error/0.6",
             "recipient": SERVICE_DID,
             "issuedAt": "2026-07-06T00:00:00Z",
             "payload": {"code": "e.p.did.validation-error", "message": "nope"},
@@ -617,7 +619,7 @@ mod tests {
         use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};
         use did_hosting_common::server::domain::DomainScope;
 
-        // `auth/authenticate/0.2` requires a proof, so the caller is a did:key
+        // `auth/authenticate/0.3` requires a proof, so the caller is a did:key
         // that signs its documents, verified without network I/O.
         let (caller, signer) = crate::signing::test_util::did_key_signer(&[21u8; 32]);
         let (mut state, _dir) = test_state().await;
@@ -657,7 +659,7 @@ mod tests {
         let authenticate = async |challenge: &str| {
             let unsigned = json!({
                 "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-                "type": "https://trusttasks.org/spec/auth/authenticate/0.2",
+                "type": "https://trusttasks.org/spec/auth/authenticate/0.3",
                 "issuer": caller,
                 "recipient": SERVICE_DID,
                 "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -681,7 +683,7 @@ mod tests {
 
         let doc = authenticate(&first.challenge).await;
         assert_eq!(
-            doc["type"], "https://trusttasks.org/spec/auth/authenticate/0.2#response",
+            doc["type"], "https://trusttasks.org/spec/auth/authenticate/0.3#response",
             "{doc}"
         );
         assert_eq!(state.pending_challenges.count_for(&caller), 1);
@@ -767,7 +769,7 @@ mod tests {
         let request = crate::signing::test_util::sign_operational(
             json!({
                 "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-                "type": "https://trusttasks.org/spec/auth/authenticate/0.2",
+                "type": "https://trusttasks.org/spec/auth/authenticate/0.3",
                 "issuer": caller,
                 "recipient": control,
                 "issuedAt": now(),
@@ -783,7 +785,7 @@ mod tests {
         let reply: trust_tasks_rs::TrustTask<Value> = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             reply.type_uri.to_string(),
-            "https://trusttasks.org/spec/auth/authenticate/0.2#response",
+            "https://trusttasks.org/spec/auth/authenticate/0.3#response",
             "{reply:?}"
         );
         verify_sender_bound(&reply, Some(&control), None, &caller, &client_verifier)

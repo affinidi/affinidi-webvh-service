@@ -17,6 +17,7 @@ pub mod health;
 pub mod identity;
 pub mod identity_drain;
 pub mod identity_rotate;
+pub mod identity_scid_alias;
 pub mod init;
 #[cfg(feature = "metrics")]
 pub mod metrics;
@@ -30,6 +31,7 @@ pub mod pending_purge;
 pub mod problem_report;
 pub mod rate_limit;
 pub mod replay;
+pub mod scid_floors;
 pub mod secret_store;
 #[cfg(feature = "setup-wizard")]
 pub mod setup_prompts;

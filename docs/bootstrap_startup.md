@@ -257,7 +257,7 @@ did-hosting-daemon invite --did <ADMIN_DID> --role admin --config config.toml
 
 The URL and the claim code are two halves of one invite: deliver them over different channels when the admin is someone else. Neither is stored — the control plane keeps only their hashes — and five wrong claim codes cancel the invite.
 
-The `invite` subcommand is the operator's bootstrap for admin onboarding; once an admin is signed in, further invites are issued from the console (`auth/passkey/enroll/invite/0.2`). Lost the URL or the code before redeeming? Run `did-hosting-daemon invite` again to mint a new invite.
+The `invite` subcommand is the operator's bootstrap for admin onboarding; once an admin is signed in, further invites are issued from the console (`auth/passkey/enroll/invite/0.3`). Lost the URL or the code before redeeming? Run `did-hosting-daemon invite` again to mint a new invite.
 
 ### Config shape
 

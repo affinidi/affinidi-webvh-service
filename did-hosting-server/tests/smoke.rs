@@ -27,15 +27,19 @@ use did_hosting_common::server::config::{
 use did_hosting_common::server::domain::{
     DomainEntry, DomainStatus, DomainUrlScheme, create_domain,
 };
-use did_hosting_common::server::store::KS_DIDS;
 use did_hosting_common::server::store::Store;
-use did_hosting_server::cache::ContentCache;
+use did_hosting_common::server::store::{KS_DIDS, KS_DOMAINS};
+use did_hosting_server::cache::{ContentCache, GateCache};
 use did_hosting_server::config::{AppConfig, LimitsConfig, StatsConfig};
 use did_hosting_server::server::AppState;
 use std::time::Duration;
 use tower::ServiceExt; // for `oneshot`
 
 async fn make_state() -> (AppState, tempfile::TempDir) {
+    make_state_with(ServerConfig::default()).await
+}
+
+async fn make_state_with(server: ServerConfig) -> (AppState, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("temp dir");
     let store_config = StoreConfig {
         data_dir: PathBuf::from(dir.path()),
@@ -49,7 +53,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         server_did: Some("did:webvh:test:server.example.com".into()),
         mediator_did: None,
         public_url: Some("http://localhost:8530".into()),
-        server: ServerConfig::default(),
+        server,
         log: LogConfig::default(),
         store: store_config.clone(),
         fjall: Default::default(),
@@ -62,6 +66,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         control_did: None,
         vta: VtaConfig::default(),
         identity: Default::default(),
+        replay: Default::default(),
         config_path: PathBuf::new(),
     };
 
@@ -76,6 +81,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         didcomm_service: std::sync::Arc::new(std::sync::OnceLock::new()),
         stats_collector: None,
         did_cache: Arc::new(ContentCache::new(Duration::from_secs(60))),
+        gate_cache: None,
         trusted_proxy_cidrs: Arc::new(Vec::new()),
         replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
             did_hosting_common::server::auth::session::now_epoch(),
@@ -88,6 +94,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
             ),
         ),
         sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+        replay_cache: std::sync::Arc::new(did_hosting_common::server::replay::ReplayCache::new()),
     };
     (state, dir)
 }
@@ -263,6 +270,160 @@ async fn a_deleted_did_stops_resolving_at_once_even_with_a_warm_cache() {
         StatusCode::NOT_FOUND,
         "a deleted DID must not be served from a warm cache"
     );
+}
+
+/// With a gate cache (the daemon), a warm resolve reads nothing from the
+/// store: the record, the domains and the log all come from memory. What
+/// keeps that safe is the forget calls the daemon's control plane makes
+/// after each commit; this checks each one takes effect at once.
+#[tokio::test]
+async fn a_gate_cache_serves_warm_resolves_from_memory_until_told_of_a_change() {
+    let (mut state, _dir) = make_state().await;
+    let gate = Arc::new(GateCache::new(&state.store, Duration::from_secs(60)).unwrap());
+    state.gate_cache = Some(gate.clone());
+
+    let mnemonic = "alice";
+    let did_id = "did:webvh:Q1:domain-a.example:alice";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, mnemonic, did_id, &body).await;
+    let domains = state.store.keyspace(KS_DOMAINS).unwrap();
+    let put_domain = async |status| {
+        domains
+            .insert("domain-a.example", &domain("domain-a.example", status))
+            .await
+            .unwrap();
+    };
+    put_domain(DomainStatus::Active).await;
+    let set_disabled = async |disabled: bool| {
+        let mut record: DidRecord = state.dids_ks.get(did_key(mnemonic)).await.unwrap().unwrap();
+        record.disabled = disabled;
+        state
+            .dids_ks
+            .insert(did_key(mnemonic), &record)
+            .await
+            .unwrap();
+    };
+
+    let app = did_hosting_server::routes::router(1024 * 1024).with_state(state.clone());
+    let resolve = async || {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{mnemonic}/did.jsonl"))
+                    .header("host", "domain-a.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    };
+
+    assert_eq!(resolve().await, StatusCode::OK, "cold resolve");
+
+    // Take everything out of the store behind the caches' back: a resolve
+    // that read any of it would now fail.
+    let record: DidRecord = state.dids_ks.get(did_key(mnemonic)).await.unwrap().unwrap();
+    state.dids_ks.remove(did_key(mnemonic)).await.unwrap();
+    state
+        .dids_ks
+        .remove(content_log_key(mnemonic))
+        .await
+        .unwrap();
+    domains.remove("domain-a.example").await.unwrap();
+    assert_eq!(
+        resolve().await,
+        StatusCode::OK,
+        "warm resolve reads nothing"
+    );
+
+    // Put it back with the DID disabled: the cached record still says
+    // enabled until the control plane's hook names this DID.
+    state
+        .dids_ks
+        .insert(did_key(mnemonic), &record)
+        .await
+        .unwrap();
+    state
+        .dids_ks
+        .insert_raw(content_log_key(mnemonic), body.as_bytes().to_vec())
+        .await
+        .unwrap();
+    put_domain(DomainStatus::Active).await;
+    set_disabled(true).await;
+    gate.forget_did(mnemonic);
+    assert_eq!(resolve().await, StatusCode::NOT_FOUND, "disabled DID");
+
+    set_disabled(false).await;
+    gate.forget_did(mnemonic);
+    assert_eq!(resolve().await, StatusCode::OK, "re-enabled DID");
+
+    // A disabled domain, likewise, once the hook reports a domain change.
+    put_domain(DomainStatus::Disabled).await;
+    assert_eq!(resolve().await, StatusCode::OK, "cached domain state");
+    gate.forget_domains();
+    assert_eq!(
+        resolve().await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "disabled domain"
+    );
+}
+
+/// did:web's `did.json` is cached only behind a gate cache (the daemon),
+/// where the control plane's hook clears it; an edge reads the store every
+/// time, so a change made elsewhere shows on the next resolve.
+#[tokio::test]
+async fn a_did_web_document_is_cached_only_behind_a_gate_cache() {
+    let mnemonic = "alice";
+    let did_web = did_hosting_common::did::build_did_web_id("http://localhost:8530", mnemonic)
+        .expect("did:web id");
+    let did_id = "did:webvh:Q1:localhost%3A8530:alice";
+    let body = format!(
+        "{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\",\"alsoKnownAs\":[\"{did_web}\"]}}}}"
+    );
+
+    for with_gate in [false, true] {
+        let (mut state, _dir) = make_state().await;
+        let gate = Arc::new(GateCache::new(&state.store, Duration::from_secs(60)).unwrap());
+        if with_gate {
+            state.gate_cache = Some(gate.clone());
+        }
+        seed_did(&state, mnemonic, did_id, &body).await;
+        let app = did_hosting_server::routes::router(1024 * 1024).with_state(state.clone());
+        let resolve = async || {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/{mnemonic}/did.json"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        };
+        assert_eq!(resolve().await, StatusCode::OK, "with_gate={with_gate}");
+
+        // The log goes from the store without anyone telling the caches.
+        state
+            .dids_ks
+            .remove(content_log_key(mnemonic))
+            .await
+            .unwrap();
+        let expected = if with_gate {
+            StatusCode::OK
+        } else {
+            StatusCode::NOT_FOUND
+        };
+        assert_eq!(resolve().await, expected, "with_gate={with_gate}");
+
+        if with_gate {
+            // What the daemon's hook does on a change to the DID.
+            state.did_cache.invalidate_did(mnemonic);
+            gate.forget_did(mnemonic);
+            assert_eq!(resolve().await, StatusCode::NOT_FOUND);
+        }
+    }
 }
 
 /// T25: with both `method-webvh` and `method-web` enabled, the
@@ -734,4 +895,128 @@ async fn first_boot_init_seeds_domain_and_backfills_legacy_records() {
         .await
         .expect("list domains after replay");
     assert_eq!(domains.len(), 1, "second run must be a no-op");
+}
+
+/// `[server.resolve_cache]` reaches the wire: an operator's policy replaces
+/// the default on a successful resolve, and a 404 still says `no-store`.
+#[tokio::test]
+async fn resolve_cache_policy_is_configurable() {
+    let server = ServerConfig {
+        resolve_cache: did_hosting_common::server::config::ResolveCacheConfig {
+            max_age_secs: 30,
+            shared_max_age_secs: Some(600),
+            stale_while_revalidate_secs: Some(60),
+        },
+        ..ServerConfig::default()
+    };
+    let (state, _dir) = make_state_with(server).await;
+    let did_id = "did:webvh:test:server.example.com:alice";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, "alice", did_id, &body).await;
+
+    let app = did_hosting_server::routes::router(1024 * 1024)
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn(
+            did_hosting_common::server::security_headers,
+        ));
+
+    let get = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+    };
+
+    let response = get("/alice/did.jsonl").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["cache-control"],
+        "public, max-age=30, s-maxage=600, stale-while-revalidate=60"
+    );
+
+    let response = get("/ghost/did.jsonl").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+}
+
+/// `[server.resolve_rate_limit]` reaches the wire: past the limit a client
+/// address gets 429 with Retry-After on both the DID-serving fallback and the
+/// `.well-known` routes, another address is still served, and the Trust Task
+/// listener is not counted.
+#[tokio::test]
+async fn resolve_rate_limit_refuses_one_address_past_the_limit() {
+    use axum::extract::ConnectInfo;
+    use std::net::SocketAddr;
+
+    let server = ServerConfig {
+        resolve_rate_limit: did_hosting_common::server::config::ResolveRateLimitConfig {
+            max_per_window: Some(2),
+            window_secs: 60,
+        },
+        ..ServerConfig::default()
+    };
+    let (state, _dir) = make_state_with(server).await;
+    let did_id = "did:webvh:test:server.example.com:alice";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, "alice", did_id, &body).await;
+
+    let limit = std::sync::Arc::new(
+        did_hosting_common::server::rate_limit::ResolveRateLimiter::new(&state.config.server),
+    );
+    let app = did_hosting_server::routes::router_with_resolve_limit(1024 * 1024, limit)
+        .with_state(state.clone());
+
+    let send = |method: &'static str, uri: &'static str, peer: &'static str| {
+        let app = app.clone();
+        async move {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+            app.oneshot(request).await.unwrap()
+        }
+    };
+
+    assert_eq!(
+        send("GET", "/alice/did.jsonl", "203.0.113.1:1000")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_ne!(
+        send("GET", "/.well-known/did.jsonl", "203.0.113.1:1000")
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let refused = send("GET", "/alice/did.jsonl", "203.0.113.1:1000").await;
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(refused.headers().contains_key("retry-after"));
+    assert_eq!(
+        send("GET", "/.well-known/did.jsonl", "203.0.113.1:1000")
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    assert_eq!(
+        send("GET", "/alice/did.jsonl", "203.0.113.2:1000")
+            .await
+            .status(),
+        StatusCode::OK,
+        "another address keeps its own budget"
+    );
+    assert_ne!(
+        send("POST", "/api/trust-tasks", "203.0.113.1:1000")
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the Trust Task listener is not counted against resolution"
+    );
 }

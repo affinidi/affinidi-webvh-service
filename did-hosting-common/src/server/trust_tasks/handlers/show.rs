@@ -1,6 +1,6 @@
-//! `acl/show/0.1` handler — look up a single subject by VID.
+//! `acl/show/0.2` handler — look up a single subject by VID.
 //!
-//! Spec contract (from `specs/acl/show/0.1/spec.md`):
+//! Spec contract (from `specs/acl/show/0.2/spec.md`):
 //!
 //! * Returns the canonical `AclEntry` for `payload.subject`, or
 //!   `entry: null` when the subject is absent — "no such entry" is a
@@ -8,14 +8,19 @@
 //! * Self-lookup convention: `issuer == payload.subject` is always
 //!   permitted, even when broader policy denies general lookups. Our
 //!   maintainer policy: Admin may look up anyone; non-Admin callers
-//!   may only look up themselves.
+//!   may only look up themselves (this maintainer has no approvers, so no
+//!   entry's approve scope reaches anyone else).
+//! * The entry is returned whole in the explicit AclEntry 0.2 form; nothing
+//!   is redacted.
 
+use crate::tasks::acl::show::v0_2 as show;
 use trust_tasks_rs::{
     ErrorPayload, ErrorResponse, ProofPolicy, ProofVerifier, ResolvedParties, StandardCode,
-    TransportHandler, TrustTask, specs::acl::show::v0_1 as show,
+    TransportHandler, TrustTask,
 };
 
-use crate::server::acl::{self, AclEntry, Role};
+use crate::server::acl::{self, Role};
+use crate::server::error::AppError;
 use crate::server::trust_tasks::{
     DispatchOutcome, TrustTaskContext, entry::SpecAclEntry, reject_with, run_pipeline,
 };
@@ -30,12 +35,15 @@ where
     V: ProofVerifier + ?Sized,
 {
     let acl_ks = ctx.acl_ks.clone();
+    let signing_oracle = ctx.signing_oracle;
     run_pipeline(
         transport,
         policy,
         doc,
         ctx.my_vid,
-        move |doc, parties| async move { handle_inner(&acl_ks, doc, &parties).await },
+        move |doc, parties| async move {
+            handle_inner(&acl_ks, doc, &parties, signing_oracle).await
+        },
     )
     .await
 }
@@ -44,6 +52,7 @@ async fn handle_inner(
     acl_ks: &crate::server::store::KeyspaceHandle,
     doc: TrustTask<show::Payload>,
     parties: &ResolvedParties,
+    signing_oracle: bool,
 ) -> Result<TrustTask<show::Response>, ErrorResponse> {
     let subject = (*doc.payload.subject).clone();
     let caller = parties.issuer.as_deref().ok_or_else(|| {
@@ -53,13 +62,14 @@ async fn handle_inner(
                 .with_message("inbound document has no in-band or transport-derived issuer"),
         )
     })?;
-    let self_lookup = caller == subject;
+    let self_lookup = crate::scid::same_reference(caller, &subject);
 
     // Authorise: Admin may look up anyone; everyone else only
     // themselves.
     if !self_lookup {
         match acl::check_acl(acl_ks, caller).await {
             Ok(Role::Admin) => {}
+            Err(e) if !acl::is_acl_refusal(&e) => return Err(internal(&doc, e)),
             Ok(_) | Err(_) => {
                 return Err(reject_with(
                     &doc,
@@ -74,7 +84,9 @@ async fn handle_inner(
         .await
         .map_err(|e| internal(&doc, e))?;
 
-    let resp_entry = existing.as_ref().map(into_spec_entry);
+    let resp_entry = existing
+        .as_ref()
+        .map(|e| SpecAclEntry::from_local(e, signing_oracle).into_spec::<show::AclEntry>());
     // The generated payload types are `#[non_exhaustive]` from trust-tasks
     // 0.17 on: built through the generated builder, whose `try_into` can only
     // fail on a field left unset.
@@ -87,19 +99,12 @@ async fn handle_inner(
     Ok(doc.respond_with(resp_id, resp_payload))
 }
 
-fn into_spec_entry(local: &AclEntry) -> show::AclEntry {
-    let neutral = SpecAclEntry::from_local(local);
-    let value = serde_json::to_value(&neutral).expect("SpecAclEntry serialises");
-    serde_json::from_value(value).expect("show::AclEntry from SpecAclEntry value")
-}
-
-fn internal<P>(doc: &TrustTask<P>, err: impl std::fmt::Display) -> ErrorResponse {
+fn internal<P>(doc: &TrustTask<P>, err: AppError) -> ErrorResponse {
+    // A store or internal failure says nothing about the request: the wire
+    // gets `unavailable` with a retry time when the store is over capacity,
+    // else a bare `internalError`; the detail stays in the operator log.
     tracing::error!(error = %err, "acl/show internal failure");
-    reject_with(
-        doc,
-        ErrorPayload::new(StandardCode::InternalError)
-            .with_message("the maintainer encountered an internal failure"),
-    )
+    reject_with(doc, err.failure_reject_reason().into())
 }
 
 #[cfg(test)]
@@ -107,6 +112,7 @@ mod tests {
     use super::*;
     use trust_tasks_rs::{Payload, VerificationError, handlers::InMemoryHandler};
 
+    use crate::server::acl::AclEntry;
     use crate::server::config::StoreConfig;
     use crate::server::domain::DomainScope;
     use crate::server::store::{KS_ACL, Store};
@@ -163,6 +169,7 @@ mod tests {
             acl_ks,
             acl_locks,
             my_vid: SERVICE_DID,
+            signing_oracle: false,
         }
     }
 

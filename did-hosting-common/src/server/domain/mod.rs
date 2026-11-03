@@ -34,7 +34,7 @@ pub mod wire;
 pub use detect::{HostHeaders, parse_forwarded_host, parse_trusted_cidrs, resolve_request_host};
 pub use normalize::normalize_domain_name;
 pub use safety::{
-    assert_acl_allows_host, assert_did_host_allowed,
+    ResolutionDomains, assert_acl_allows_host, assert_did_host_allowed,
     assert_did_host_allowed_when_domains_configured, assert_domain_active_for_resolution,
     assert_host_is_active_domain, assert_request_host_matches_did, assert_resolution_allowed,
     extract_did_host,
@@ -42,7 +42,8 @@ pub use safety::{
 pub use scope::{DomainResolveError, DomainScope, resolve_request_domain};
 pub use seed::{SeedOutcome, SeedTier, seed_domains_first_boot};
 pub use store::{
-    DISABLE_PURGE_REASON, create_domain, delete_domain_record, disable_domain, enable_domain,
-    get_default_domain, get_domain, list_domains, set_default_domain, update_domain,
+    DISABLE_PURGE_REASON, apply_replicated_domain, create_domain, delete_domain_record,
+    disable_domain, enable_domain, get_default_domain, get_domain, list_domains,
+    set_default_domain, update_domain,
 };
 pub use types::{DomainBranding, DomainEntry, DomainQuota, DomainStatus, DomainUrlScheme};

@@ -71,6 +71,8 @@ pub(crate) async fn state() -> (AppState, tempfile::TempDir) {
         trust_tasks: Default::default(),
         hosting: Default::default(),
         identity: Default::default(),
+        replay: Default::default(),
+        geoip: Default::default(),
         config_path: PathBuf::new(),
     };
     let state = AppState {
@@ -78,7 +80,7 @@ pub(crate) async fn state() -> (AppState, tempfile::TempDir) {
         sessions_ks: store.keyspace(KS_SESSIONS).unwrap(),
         acl_ks: store.keyspace(KS_ACL).unwrap(),
         registry_ks: store.keyspace(KS_REGISTRY).unwrap(),
-        dids_ks: store.keyspace(KS_DIDS).unwrap(),
+        dids_ks: store.keyspace_consistent(KS_DIDS).unwrap(),
         config: Arc::new(config),
         did_resolver: None,
         secrets_resolver: None,
@@ -294,7 +296,7 @@ pub(crate) fn code(reply: &Value) -> String {
 /// Assert `reply`'s payload validates against the schema its `type` names.
 pub(crate) fn conforms(reply: &Value) {
     let type_uri = reply["type"].as_str().expect("reply has a type");
-    let schema = trust_tasks_rs::schema_index::schema_for(type_uri)
+    let schema = did_hosting_common::tasks::payload_schema(type_uri)
         .unwrap_or_else(|| panic!("no schema is known for {type_uri}: {reply}"));
     if let Err(e) = trust_tasks_rs::validate::against_schema(schema, &reply["payload"]) {
         panic!("{type_uri} reply does not match its schema: {e:?}\n{reply}");

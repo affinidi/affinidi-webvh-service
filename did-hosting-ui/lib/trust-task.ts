@@ -32,7 +32,7 @@ import {
 import type {
   Response as ServerInfoResponse,
   TYPE_URI as SERVER_INFO_URI,
-} from "@openvtc/trust-tasks/did-management/server/info/0.1/payload";
+} from "./trust-tasks/did-management/server/info/0.1/payload";
 
 /** The Trust Task endpoint on the control plane. */
 export const TRUST_TASKS_PATH = "/api/trust-tasks";
@@ -188,20 +188,20 @@ const ALWAYS_RETRY_CODES = new Set<string>(["unavailable"]);
  * one a no-op?
  */
 const REISSUE_SAFE_TASK_TYPES = new Set<string>([
-  "https://trusttasks.org/spec/acl/list/0.1",
-  "https://trusttasks.org/spec/acl/show/0.1",
-  "https://trusttasks.org/spec/acl/grant/0.1",
-  "https://trusttasks.org/spec/did-management/did/list/0.1",
+  "https://trusttasks.org/spec/acl/list/0.3",
+  "https://trusttasks.org/spec/acl/show/0.2",
+  "https://trusttasks.org/spec/acl/grant/0.2",
+  "https://trusttasks.org/spec/did-management/did/list/0.2",
   "https://trusttasks.org/spec/did-management/did/info/0.1",
   "https://trusttasks.org/spec/did-management/did/log/0.1",
   "https://trusttasks.org/spec/did-management/agent-name/check/0.1",
   "https://trusttasks.org/spec/did-management/agent-name/resolve/0.1",
   "https://trusttasks.org/spec/did-management/domain/list/0.1",
   "https://trusttasks.org/spec/did-management/me/domains/0.1",
-  "https://trusttasks.org/spec/did-management/registry/list/0.1",
-  "https://trusttasks.org/spec/did-management/registry/get/0.1",
+  "https://trusttasks.org/spec/did-management/registry/list/0.2",
+  "https://trusttasks.org/spec/did-management/registry/get/0.2",
   "https://trusttasks.org/spec/did-management/stats/get/0.1",
-  "https://trusttasks.org/spec/did-management/stats/timeseries/0.1",
+  "https://trusttasks.org/spec/did-management/stats/timeseries/0.2",
   "https://trusttasks.org/spec/did-management/server/info/0.1",
   "https://trusttasks.org/spec/did-management/server/config/0.1",
   "https://trusttasks.org/spec/did-management/server/metrics/0.1",

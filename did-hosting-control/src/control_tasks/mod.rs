@@ -68,7 +68,7 @@ pub(crate) mod soft_passkey;
 #[cfg(test)]
 mod tests;
 
-use trust_tasks_rs::specs::{
+use did_hosting_common::tasks::{
     auth::{
         oob as tt_oob,
         passkey::{
@@ -205,7 +205,7 @@ control_tasks! {
     tt_did::check_name::v0_1 => Authentication, did::check_name;
     tt_did::register::v0_1 => Authentication, did::register;
     tt_did::info::v0_1 => Authentication, did::info;
-    tt_did::list::v0_1 => Authentication, did::list;
+    tt_did::list::v0_2 => Authentication, did::list;
     tt_did::delete::v0_1 => Authentication, did::delete;
     tt_did::change_owner::v0_1 => Authentication, did::change_owner;
     tt_did::set_state::v0_1 => Authentication, did::set_state;
@@ -229,10 +229,10 @@ control_tasks! {
     tt_domain::assign::v0_1 => Authentication, domain::assign;
     tt_domain::unassign::v0_1 => Authentication, domain::unassign;
     // The fleet.
-    tt_registry::list::v0_1 => Authentication, registry::list;
-    tt_registry::get::v0_1 => Authentication, registry::get;
-    tt_registry::check::v0_1 => Authentication, registry::check;
-    tt_registry::admin_register::v0_1 => Authentication, registry::admin_register;
+    tt_registry::list::v0_2 => Authentication, registry::list;
+    tt_registry::get::v0_2 => Authentication, registry::get;
+    tt_registry::check::v0_2 => Authentication, registry::check;
+    tt_registry::admin_register::v0_2 => Authentication, registry::admin_register;
     tt_registry::deregister::v0_1 => Authentication, registry::deregister;
     tt_registry::purge_domain::v0_1 => Authentication, registry::purge_domain;
     // The service itself.
@@ -240,13 +240,13 @@ control_tasks! {
     tt_server::config::v0_1 => Authentication, server::config;
     tt_server::metrics::v0_1 => Authentication, server::metrics;
     tt_stats::get::v0_1 => Authentication, server::stats_get;
-    tt_stats::timeseries::v0_1 => Authentication, server::timeseries;
+    tt_stats::timeseries::v0_2 => Authentication, server::timeseries;
     tt_identity::list::v0_1 => Authentication, server::identity_list;
     tt_identity::retire::v0_1 => Authentication, server::identity_retire;
     // Step-up: the start is the session subject's operational request; the
     // decision is the approver's attestation.
-    tt_step_up::start::v0_1 => Authentication, auth::step_up_start;
-    tt_step_up::approve_response::v0_5 => AssertionMethod, auth::approve_response;
+    tt_step_up::start::v0_2 => Authentication, auth::step_up_start;
+    tt_step_up::approve_response::v0_6 => AssertionMethod, auth::approve_response;
     // Logout: end one of the caller's own sessions, and any session key bound
     // to it.
     tt_revoke_session::v0_2 => Authentication, auth::revoke_session;
@@ -259,7 +259,7 @@ control_tasks! {
     // and the separately delivered claim code are the authorisation — so its
     // proof is optional (and verified when present). An authenticated
     // subject's own enrolment is signed as that subject.
-    tt_invite::v0_2 => Authentication, enrol::invite;
+    tt_invite::v0_3 => Authentication, enrol::invite;
     tt_enroll::redeem::start::v0_1 => Optional, enrol::redeem_start;
     tt_enroll::redeem::finish::v0_1 => Optional, enrol::redeem_finish;
     tt_enroll::start::v0_2 => Authentication, enrol::start;
@@ -282,13 +282,15 @@ control_tasks! {
     // carries the member's `identify` and `grant` (verified inside the row,
     // after the ACL check on their issuer, with `TransportBoundVerifier`).
     // `identify` and `grant` are not rows: they are only ever carried, and
-    // one sent by itself is refused as an unsupported type.
+    // one sent by itself is refused as an unsupported type. Only the latest
+    // version of each is served; any other is refused `unsupportedType`
+    // (`messaging::proof_rule`), which is what a wallet falls back on.
     @bound_key(crate::oob::http) {
-        tt_oob::request::v0_1 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
-        tt_oob::claim::v0_1 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
-        tt_oob::prove::v0_1 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
-        tt_oob::respond::v0_1 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
-        tt_oob::redeem::v0_1 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
+        tt_oob::request::v0_2 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
+        tt_oob::claim::v0_2 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
+        tt_oob::prove::v0_3 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
+        tt_oob::respond::v0_3 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
+        tt_oob::redeem::v0_2 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
         tt_oob::cancel::v0_1 => crate::oob::service::KEY_PURPOSES, crate::oob::http::exchange;
     }
 }
@@ -365,7 +367,8 @@ where
         |doc: TrustTask<P>, parties: ResolvedParties| async move {
             let cx = Cx {
                 state,
-                caller: parties.issuer.clone(),
+                // The identity: a did:scid issuer without its `src` locator.
+                caller: parties.issuer.as_deref().map(did_hosting_common::scid::identity),
                 bearer,
                 proof_vm: doc.proof.as_ref().map(|p| p.verification_method.clone()),
                 proof_created: doc.proof.as_ref().map(|p| p.created),
@@ -490,11 +493,17 @@ impl Cx<'_> {
                 "the request carries no verified issuer".into(),
             )
         })?;
-        let role = check_acl(&self.state.acl_ks, did).await.map_err(|_| {
-            TaskError::Standard(
-                StandardCode::PermissionDenied,
-                "caller is not present in the maintainer's ACL".into(),
-            )
+        let role = check_acl(&self.state.acl_ks, did).await.map_err(|e| {
+            // Only an answer from the ACL is a refusal; a failed lookup is
+            // reported as what it is (see `is_acl_refusal`).
+            if did_hosting_common::server::acl::is_acl_refusal(&e) {
+                TaskError::Standard(
+                    StandardCode::PermissionDenied,
+                    "caller is not present in the maintainer's ACL".into(),
+                )
+            } else {
+                TaskError::App(e)
+            }
         })?;
         if let Some(bearer) = self.bearer.filter(|b| b.did == did) {
             return Ok(AuthClaims {
@@ -567,14 +576,9 @@ impl TaskError {
                     .with_message("the maintainer encountered an internal failure")
             }
             Mapped::Standard(StandardCode::Unavailable) => {
-                let retry_after = match &message {
-                    AppError::RateLimited {
-                        retry_after_secs, ..
-                    } => Some(
-                        chrono::Utc::now() + chrono::Duration::seconds(*retry_after_secs as i64),
-                    ),
-                    _ => None,
-                };
+                let retry_after = message
+                    .retry_after_secs()
+                    .map(did_hosting_common::server::error::retry_at);
                 let p = ErrorPayload::new(StandardCode::Unavailable)
                     .with_message(message.user_message());
                 match retry_after {

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 use crate::signing::WitnessSigner;
-use crate::store::KeyspaceHandle;
+use crate::store::{KeyspaceHandle, Store};
 
 /// A witness identity managed by this service.
 #[derive(Clone, Serialize, Deserialize)]
@@ -109,29 +109,47 @@ pub async fn list_witnesses(witnesses_ks: &KeyspaceHandle) -> Result<Vec<Witness
     Ok(records)
 }
 
-/// Delete a witness record by its ID.
+/// Delete a witness record by its ID, with every witnessed mark it holds.
+///
+/// One atomic write: the record and its marks go together, so a crash
+/// mid-delete cannot leave orphaned marks behind a deleted identity.
 pub async fn delete_witness(
+    store: &Store,
     witnesses_ks: &KeyspaceHandle,
     witness_id: &str,
 ) -> Result<(), AppError> {
-    let key = format!("witness:{witness_id}");
-    witnesses_ks.remove(key).await?;
+    let mut batch = store.batch();
+    batch.remove(witnesses_ks, format!("witness:{witness_id}"));
     // The identity's key is gone, so what it witnessed can never be extended.
     for (key, _) in witnesses_ks
         .prefix_iter_raw(format!("witnessed:{witness_id}:"))
         .await?
     {
-        witnesses_ks.remove(key).await?;
+        batch.remove(witnesses_ks, key);
     }
-    Ok(())
+    batch.commit().await
 }
 
-/// Sign a witness proof for a given version ID.
+/// Sign a witness proof for a given version ID, and record it.
+///
+/// The record — the identity's `proofs_signed` counter and, when `advance`
+/// names a DID, the furthest-witnessed mark for it — is one atomic write,
+/// made durable with [`Store::persist`] (an fsync) **before** the proof is
+/// returned. The mark is the witness's anti-equivocation memory: were a
+/// proof released while its mark was still only in the OS page cache, a
+/// power loss would forget it, and the witness would then sign a fork of a
+/// history it had already vouched for. A proof whose record cannot be made
+/// durable is never returned.
+///
+/// The caller holds `sign_lock` across its extends-the-mark check and this
+/// call, so the check, the signature and the record are one step.
 pub async fn sign_witness_proof(
+    store: &Store,
     witnesses_ks: &KeyspaceHandle,
     signer: &dyn WitnessSigner,
     witness_id: &str,
     version_id: &str,
+    advance: Option<(&str, &WitnessedMark)>,
 ) -> Result<(String, DataIntegrityProof), AppError> {
     // Validate version_id format: <number>-<hash>
     if !is_valid_version_id(version_id) {
@@ -146,10 +164,19 @@ pub async fn sign_witness_proof(
 
     let proof = signer.sign_proof(&witness, version_id).await?;
 
-    // Increment proof counter
     let mut updated = witness;
     updated.proofs_signed += 1;
-    store_witness(witnesses_ks, &updated).await?;
+    let mut batch = store.batch();
+    batch.insert(
+        witnesses_ks,
+        format!("witness:{}", updated.witness_id),
+        &updated,
+    )?;
+    if let Some((scid, mark)) = advance {
+        batch.insert(witnesses_ks, witnessed_key(witness_id, scid), mark)?;
+    }
+    batch.commit().await?;
+    store.persist().await?;
 
     Ok((version_id.to_string(), proof))
 }
@@ -219,5 +246,135 @@ mod tests {
         assert!(!is_valid_version_id("1-"));
         assert!(!is_valid_version_id("-hash"));
         assert!(!is_valid_version_id("nohyphen"));
+    }
+
+    async fn temp_store() -> (Store, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = did_hosting_common::server::config::StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        (Store::open(&config).await.unwrap(), dir)
+    }
+
+    /// The counter and the witnessed mark are one write. Read the counter
+    /// first, then the mark: if each proof's record is atomic, the mark
+    /// read afterwards is never behind the count read before it. Two
+    /// separate writes expose "counted, but the mark not yet advanced" —
+    /// the state a crash (or, before the record was fsynced, a power loss)
+    /// would freeze while the proof was already out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn a_signed_proof_is_never_recorded_without_its_mark() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace(crate::store::KS_WITNESSES).unwrap();
+        let record = create_witness(&ks, None).await.unwrap();
+        let witness_id = record.witness_id.clone();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let mut observers = Vec::new();
+        for _ in 0..4 {
+            let (ks, done, witness_id) = (ks.clone(), done.clone(), witness_id.clone());
+            observers.push(tokio::spawn(async move {
+                while !done.load(Ordering::Acquire) {
+                    let counted = get_witness(&ks, &witness_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .proofs_signed;
+                    let marked = get_witnessed_mark(&ks, &witness_id, "scid")
+                        .await
+                        .unwrap()
+                        .map_or(0, |m| m.version_number);
+                    if marked < counted {
+                        return Some(format!("{counted} proofs counted, mark at {marked}"));
+                    }
+                    tokio::task::yield_now().await;
+                }
+                None
+            }));
+        }
+        for n in 1..=150u64 {
+            let version_id = format!("{n}-QmHash{n}");
+            let mark = WitnessedMark {
+                version_number: n,
+                version_id: version_id.clone(),
+            };
+            sign_witness_proof(
+                &store,
+                &ks,
+                &crate::signing::LocalSigner,
+                &witness_id,
+                &version_id,
+                Some(("scid", &mark)),
+            )
+            .await
+            .unwrap();
+        }
+        done.store(true, Ordering::Release);
+        for o in observers {
+            if let Some(v) = o.await.unwrap() {
+                panic!("witness record not atomic: {v}");
+            }
+        }
+        assert_eq!(
+            get_witnessed_mark(&ks, &witness_id, "scid").await.unwrap(),
+            Some(WitnessedMark {
+                version_number: 150,
+                version_id: "150-QmHash150".into()
+            })
+        );
+    }
+
+    /// Deleting an identity takes its marks with it.
+    #[tokio::test]
+    async fn delete_witness_removes_its_marks() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace(crate::store::KS_WITNESSES).unwrap();
+        let record = create_witness(&ks, None).await.unwrap();
+        let other = create_witness(&ks, None).await.unwrap();
+        let mark = WitnessedMark {
+            version_number: 1,
+            version_id: "1-Qm".into(),
+        };
+        for scid in ["a", "b"] {
+            set_witnessed_mark(&ks, &record.witness_id, scid, &mark)
+                .await
+                .unwrap();
+        }
+        set_witnessed_mark(&ks, &other.witness_id, "a", &mark)
+            .await
+            .unwrap();
+
+        delete_witness(&store, &ks, &record.witness_id)
+            .await
+            .unwrap();
+
+        assert!(
+            get_witness(&ks, &record.witness_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            get_witnessed_mark(&ks, &record.witness_id, "a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            get_witnessed_mark(&ks, &record.witness_id, "b")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            get_witnessed_mark(&ks, &other.witness_id, "a")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

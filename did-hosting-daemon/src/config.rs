@@ -59,6 +59,21 @@ pub struct DaemonConfig {
     /// How the daemon obtains its own identity (VTA-provisioned or self-managed).
     #[serde(default)]
     pub identity: IdentityConfig,
+    /// Bounds of the anti-replay cache for signed Trust Tasks (`[replay]`;
+    /// env `DAEMON_REPLAY_*`).
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_common::server::config::ReplayConfig::is_default"
+    )]
+    pub replay: did_hosting_common::server::config::ReplayConfig,
+    /// Local GeoIP database (`[geoip]`; env `DAEMON_GEOIP_DATABASE`) for the
+    /// city and country a wallet shows for a sign-in request. Reaches the
+    /// embedded control plane, which answers wallet sign-in.
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_control::config::GeoIpConfig::is_default"
+    )]
+    pub geoip: did_hosting_control::config::GeoIpConfig,
 
     /// Multi-domain hosting settings (T18). `bootstrap_domains` seeds
     /// the `domains` keyspace on first boot when no entries exist;
@@ -81,6 +96,8 @@ fn default_server() -> ServerConfig {
         port: 8534,
         trusted_proxies: Vec::new(),
         trusted_proxy_cidrs: Vec::new(),
+        resolve_cache: Default::default(),
+        resolve_rate_limit: Default::default(),
     }
 }
 
@@ -157,6 +174,10 @@ impl DaemonConfig {
         env_opt!("DAEMON_MEDIATOR_DID", config.mediator_did);
         env_opt!("DAEMON_PUBLIC_URL", config.public_url);
         env_opt!("DAEMON_DID_HOSTING_URL", config.did_hosting_url);
+        did_hosting_common::server::config::apply_hosting_env_overrides(
+            "DAEMON",
+            &mut config.hosting,
+        );
 
         if let Ok(v) = std::env::var("DID_HOSTING_IDENTITY_MODE") {
             config.identity.mode = match v.to_ascii_lowercase().as_str() {
@@ -181,6 +202,19 @@ impl DaemonConfig {
         if let Ok(v) = std::env::var("DAEMON_LOG_LEVEL") {
             config.log.level = v;
         }
+        // DAEMON_SERVER_TRUSTED_PROXIES — load balancer addresses or ranges.
+        config.server.apply_trusted_proxies_env_override("DAEMON")?;
+        // DAEMON_SERVER_RESOLVE_CACHE_* — Cache-Control on DID resolution.
+        config.server.resolve_cache.apply_env_overrides("DAEMON")?;
+        // DAEMON_REPLAY_* — anti-replay cache bounds. Also validates `[replay]`.
+        config.replay.apply_env_overrides("DAEMON")?;
+        // DAEMON_GEOIP_DATABASE — the local sign-in location database.
+        config.geoip.apply_env_overrides("DAEMON");
+        // DAEMON_SERVER_RESOLVE_RATE_LIMIT_* — per-address limit on resolution.
+        config
+            .server
+            .resolve_rate_limit
+            .apply_env_overrides("DAEMON")?;
 
         did_hosting_common::server::config::apply_store_env_overrides(
             "DAEMON_STORE",
@@ -230,6 +264,7 @@ impl DaemonConfig {
             // DIDComm listener of its own, so its rotation path is inert — the
             // daemon's control plane owns the identity.
             identity: self.identity.clone(),
+            replay: self.replay.clone(),
             config_path: self.config_path.clone(),
         }
     }
@@ -250,6 +285,7 @@ impl DaemonConfig {
             // the only DIDComm listener, so the embedded witness's rotation path
             // is inert — its `didcomm_service` slot is never filled.
             identity: self.identity.clone(),
+            replay: self.replay.clone(),
             config_path: self.config_path.clone(),
         }
     }
@@ -269,6 +305,7 @@ impl DaemonConfig {
             secrets: self.secrets.clone(),
             vta: self.vta.clone(),
             identity: self.identity.clone(),
+            replay: self.replay.clone(),
             sync: Default::default(),
             config_path: self.config_path.clone(),
         }
@@ -296,6 +333,8 @@ impl DaemonConfig {
             // is the one that rotates — it needs the daemon's grace period, not
             // a default.
             identity: self.identity.clone(),
+            replay: self.replay.clone(),
+            geoip: self.geoip.clone(),
             config_path: self.config_path.clone(),
         }
     }
@@ -401,6 +440,88 @@ context_id = "webvh"
             cfg.public_url.as_deref(),
             Some("https://daemon.example.com")
         );
+    }
+
+    /// `[replay]` reaches the embedded control plane, witness and watcher,
+    /// the services that hold a replay cache; without it the defaults apply,
+    /// and an inconsistent table stops the load.
+    #[test]
+    fn replay_bounds_reach_the_embedded_services() {
+        use did_hosting_common::server::config::ReplayConfig;
+
+        let (_dir, path) = write_temp_config(SELF_MANAGED_TOML);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert_eq!(cfg.control_config().replay, ReplayConfig::default());
+
+        let toml = format!(
+            "{SELF_MANAGED_TOML}\n[replay]\nmax_entries = 200000\nmax_entries_per_signer = 50000\n"
+        );
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        let expected = ReplayConfig {
+            max_entries: 200_000,
+            max_entries_per_signer: 50_000,
+        };
+        assert_eq!(cfg.control_config().replay, expected);
+        assert_eq!(cfg.witness_config().replay, expected);
+        assert_eq!(cfg.watcher_config().replay, expected);
+
+        let toml = format!("{SELF_MANAGED_TOML}\n[replay]\nmax_entries_per_signer = 2000000\n");
+        let (_dir, path) = write_temp_config(&toml);
+        assert!(DaemonConfig::load(Some(path)).is_err());
+    }
+
+    /// `[geoip]` reaches the embedded control plane, which answers wallet
+    /// sign-in; without it no database is configured.
+    #[test]
+    fn geoip_database_reaches_the_control_plane() {
+        let (_dir, path) = write_temp_config(SELF_MANAGED_TOML);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert_eq!(cfg.control_config().geoip.database, None);
+
+        let toml = format!(
+            "{SELF_MANAGED_TOML}\n[geoip]\ndatabase = \"/var/lib/did-hosting/geoip/dbip-city-lite.mmdb\"\n"
+        );
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert_eq!(
+            cfg.control_config().geoip.database.as_deref(),
+            Some(std::path::Path::new(
+                "/var/lib/did-hosting/geoip/dbip-city-lite.mmdb"
+            ))
+        );
+    }
+
+    /// `[[geoip.networks]]` reaches the control plane; a bad range or label
+    /// stops the load and says which entry.
+    #[test]
+    fn geoip_named_networks_are_checked_at_load() {
+        let toml = format!(
+            "{SELF_MANAGED_TOML}\n[[geoip.networks]]\ncidr = \"10.20.0.0/16\"\nlocation = \" Sydney office \"\n\n[[geoip.networks]]\ncidr = \"192.0.2.7\"\nlocation = \"VPN\"\n"
+        );
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        let nets = cfg.control_config().geoip.networks;
+        assert_eq!(nets.len(), 2);
+        assert_eq!(nets[0].cidr.to_string(), "10.20.0.0/16");
+        assert_eq!(nets[0].location, "Sydney office");
+        assert_eq!(nets[1].cidr.to_string(), "192.0.2.7/32");
+
+        let long = "x".repeat(129);
+        for (cidr, location, needle) in [
+            ("10.0.0.0/33", "Office", "10.0.0.0/33"),
+            ("office-lan", "Office", "office-lan"),
+            ("10.0.0.0/8", "", "10.0.0.0/8"),
+            ("10.0.0.0/8", "Bad\\u0007", "10.0.0.0/8"),
+            ("10.0.0.0/8", long.as_str(), "128"),
+        ] {
+            let toml = format!(
+                "{SELF_MANAGED_TOML}\n[[geoip.networks]]\ncidr = \"{cidr}\"\nlocation = \"{location}\"\n"
+            );
+            let (_dir, path) = write_temp_config(&toml);
+            let err = DaemonConfig::load(Some(path)).unwrap_err().to_string();
+            assert!(err.contains(needle), "{cidr} / {location}: {err}");
+        }
     }
 
     #[test]

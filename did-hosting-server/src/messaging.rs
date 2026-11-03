@@ -50,7 +50,6 @@ use tracing::{debug, info, warn};
 
 use did_hosting_common::didcomm_types::*;
 use did_hosting_common::server::problem_report::log_problem_report;
-use did_hosting_common::server::replay::ReplayCache;
 use did_hosting_common::server::trust_tasks::{TransportBoundVerifier, verify_sender_bound};
 
 use crate::server::AppState;
@@ -76,7 +75,9 @@ pub const MSG_SERVER_METRICS: &str =
 /// The `notAuthorized` code `type_uri`'s specification declares: its proven
 /// issuer is not this server's configured control plane.
 fn not_authorized_code(type_uri: &str) -> Option<trust_tasks_rs::DeclaredErrorCode> {
-    use trust_tasks_rs::specs::did_management::replica::domain::{assign, purge, unassign, upsert};
+    use did_hosting_common::tasks::did_management::replica::domain::{
+        assign, purge, unassign, upsert,
+    };
     Some(match type_uri {
         MSG_SYNC_UPDATE => sync_update::error_codes::NOT_AUTHORIZED,
         MSG_SYNC_BATCH => sync_batch::error_codes::NOT_AUTHORIZED,
@@ -88,11 +89,6 @@ fn not_authorized_code(type_uri: &str) -> Option<trust_tasks_rs::DeclaredErrorCo
         _ => return None,
     })
 }
-
-/// Documents already applied, keyed on `(issuer, document id)`. Process-wide:
-/// an edge has exactly one control plane, and the cache only needs to outlive
-/// the freshness window.
-static REPLAY_CACHE: std::sync::LazyLock<ReplayCache> = std::sync::LazyLock::new(ReplayCache::new);
 
 /// Proof that a document was signed by the configured control plane, addressed
 /// to this server, fresh, and not previously applied. Constructed only by
@@ -182,7 +178,11 @@ where
     // surface a resolve-then-check order left open: without it, any address
     // could make this server resolve an arbitrary claimed issuer's DID once
     // per request just by naming it here.
-    if doc.issuer.as_deref() != Some(control_did) {
+    if !doc
+        .issuer
+        .as_deref()
+        .is_some_and(|issuer| did_hosting_common::scid::same_reference(issuer, control_did))
+    {
         return Err(Refusal::Unverified(RejectReason::PermissionDenied {
             reason: "issuer is not this server's configured control plane".into(),
         }));
@@ -226,18 +226,20 @@ where
         );
         return Err(Refusal::NotAuthorized { issuer: did });
     }
-    match REPLAY_CACHE.check(&did, &doc.id) {
-        Ok(()) => {}
-        Err(did_hosting_common::server::replay::ReplayError::Duplicate) => {
-            warn!(did, doc_id = %doc.id, "control-plane document rejected: replay");
-            return Err(Refusal::Unverified(RejectReason::IdConflict));
+    if let Err(e) = state.replay_cache.check(&did, &doc.id, doc.issued_at) {
+        use did_hosting_common::server::replay::ReplayError;
+        match e {
+            ReplayError::Duplicate => {
+                warn!(did, doc_id = %doc.id, "control-plane document rejected: replay")
+            }
+            ReplayError::Full => {
+                warn!(did, doc_id = %doc.id, "control-plane document deferred: replay cache full")
+            }
+            ReplayError::Stale => {
+                warn!(did, doc_id = %doc.id, "control-plane document rejected: outside the replay window")
+            }
         }
-        Err(did_hosting_common::server::replay::ReplayError::Full) => {
-            warn!(did, doc_id = %doc.id, "control-plane document deferred: replay cache full");
-            return Err(Refusal::Unverified(RejectReason::Unavailable {
-                retry_after: None,
-            }));
-        }
+        return Err(Refusal::Unverified(e.reject_reason()));
     }
     let issued_at = doc
         .issued_at
@@ -278,6 +280,11 @@ pub(crate) enum OpError {
     Refused(String),
     /// Refused, under a code the op's specification declares.
     Declared(trust_tasks_rs::DeclaredErrorCode, String),
+    /// The op is valid but this server will not apply it (its store's
+    /// per-item size limit refuses the log): `taskFailed`, non-retryable.
+    /// Unlike [`Self::Refused`], a sync batch reports it as `taskFailed`,
+    /// not `invalidLog`, since the log itself verified.
+    Failed(String),
     /// This server could not apply it just now (storage, I/O): reported
     /// retryable, so the control plane keeps it queued.
     Transient(String),
@@ -302,7 +309,11 @@ impl From<crate::error::AppError> for OpError {
             AppError::Io(_)
             | AppError::Store(_)
             | AppError::SecretStore(_)
-            | AppError::Internal(_) => OpError::Transient(e.to_string()),
+            | AppError::Internal(_)
+            // Over capacity (a throttled store): this server can apply it
+            // later, so the control plane keeps it queued.
+            | AppError::RateLimited { .. } => OpError::Transient(e.to_string()),
+            AppError::QuotaExceeded(_) => OpError::Failed(e.to_string()),
             other => OpError::Refused(other.to_string()),
         }
     }
@@ -311,11 +322,13 @@ impl From<crate::error::AppError> for OpError {
 impl OpError {
     fn reject_reason(self) -> trust_tasks_rs::ErrorPayload {
         match self {
-            OpError::Refused(reason) => trust_tasks_rs::RejectReason::TaskFailed {
-                reason,
-                details: None,
+            OpError::Refused(reason) | OpError::Failed(reason) => {
+                trust_tasks_rs::RejectReason::TaskFailed {
+                    reason,
+                    details: None,
+                }
+                .into()
             }
-            .into(),
             OpError::Declared(code, message) => {
                 trust_tasks_rs::ErrorPayload::from(code).with_message(message)
             }
@@ -583,7 +596,7 @@ async fn handle_fallback(
 // Sync message handling
 // ---------------------------------------------------------------------------
 
-use trust_tasks_rs::specs::webvh::sync::{
+use did_hosting_common::tasks::webvh::sync::{
     batch::v0_1 as sync_batch, delete::v0_2 as sync_delete, update::v0_2 as sync_update,
 };
 
@@ -671,6 +684,14 @@ async fn do_sync_batch(
                     "mnemonic": entry.mnemonic,
                     "status": "refused",
                     "code": sync_update::error_codes::INVALID_LOG.code,
+                }));
+            }
+            Err(OpError::Failed(e)) => {
+                warn!(mnemonic = %entry.mnemonic, error = %e, "sync-batch: entry refused");
+                results.push(json!({
+                    "mnemonic": entry.mnemonic,
+                    "status": "refused",
+                    "code": trust_tasks_rs::StandardCode::TaskFailed.as_str(),
                 }));
             }
             Err(OpError::Transient(e)) => {
@@ -830,9 +851,7 @@ async fn do_sync_delete(
             );
         }
         batch.commit().await.map_err(OpError::from)?;
-        state
-            .did_cache
-            .invalidate(&did_ops::content_log_key(mnemonic));
+        state.did_cache.invalidate_did(mnemonic);
         info!(did = %control.did, mnemonic = %mnemonic, "deleted DID via sync from control plane");
         "deleted"
     } else {
@@ -858,7 +877,7 @@ async fn do_sync_delete(
 // signed by the configured control plane reach these cores (see
 // `VerifiedControlPlane`).
 
-use trust_tasks_rs::specs::did_management::replica::domain::{
+use did_hosting_common::tasks::did_management::replica::domain::{
     assign::v0_1 as replica_assign, purge::v0_1 as replica_purge,
     unassign::v0_1 as replica_unassign, upsert::v0_1 as replica_upsert,
 };
@@ -889,24 +908,24 @@ async fn do_domain_assign(
     state: &AppState,
     body: &Value,
 ) -> Result<(String, Value), OpError> {
-    use did_hosting_common::server::assignment::record_assignment;
-    use did_hosting_common::server::pending_purge::{self, CancelOutcome};
+    use did_hosting_common::server::assignment::record_assignment_cancelling_purge;
 
     let directive: replica_assign::Payload = payload(body, "replica/domain/assign")?;
     let domain = canonical_domain(&directive.domain, "replica/domain/assign")?;
 
     let now = did_hosting_common::server::auth::session::now_epoch();
-    record_assignment(&state.store, &domain, &control.did, now)
-        .await
-        .map_err(OpError::from)?;
+    // The assignment and the cancel of any pending purge are one atomic write:
+    // apart, a crash between them left a ripe purge queued against a domain
+    // this server had just been told to serve.
+    let (_, cancelled) =
+        record_assignment_cancelling_purge(&state.store, &domain, &control.did, now)
+            .await
+            .map_err(OpError::from)?;
 
     // A re-assign within the grace window cancels the pending purge. Logged so
     // an operator can answer "did my data survive the unassign / re-assign
     // round trip?".
-    if let CancelOutcome::Removed(prev) = pending_purge::cancel(&state.store, &domain)
-        .await
-        .map_err(OpError::from)?
-    {
+    if let Some(prev) = cancelled {
         info!(
             did = %control.did,
             domain = %domain,
@@ -950,32 +969,30 @@ async fn do_domain_unassign(
     state: &AppState,
     body: &Value,
 ) -> Result<(String, Value), OpError> {
-    use did_hosting_common::server::assignment::{UnassignOutcome, unassign};
+    use did_hosting_common::server::assignment::{UnassignOutcome, unassign_scheduling_purge};
     use did_hosting_common::server::pending_purge;
 
     let directive: replica_unassign::Payload = payload(body, "replica/domain/unassign")?;
     let domain = canonical_domain(&directive.domain, "replica/domain/unassign")?;
 
     let now = did_hosting_common::server::auth::session::now_epoch();
-    let outcome = unassign(&state.store, &domain)
-        .await
-        .map_err(OpError::from)?;
+    let grace_seconds = unassign_grace_seconds(state);
+    // The unassignment and its schedule are one atomic write: a failure writes
+    // neither and is retried, and a crash can never leave the domain
+    // unassigned with nothing scheduled after answering `scheduled`.
+    let (outcome, _) = unassign_scheduling_purge(
+        &state.store,
+        &domain,
+        now,
+        grace_seconds,
+        "grace-expired",
+        &control.did,
+    )
+    .await
+    .map_err(OpError::from)?;
 
     let purge_at = match outcome {
         UnassignOutcome::Removed(_) => {
-            let grace_seconds = unassign_grace_seconds(state);
-            // A failed schedule is retried: answering `scheduled` would settle a
-            // directive whose deletion was never arranged.
-            pending_purge::schedule(
-                &state.store,
-                &domain,
-                now,
-                grace_seconds,
-                "grace-expired",
-                &control.did,
-            )
-            .await
-            .map_err(OpError::from)?;
             info!(did = %control.did, domain = %domain, grace_seconds, "domain unassigned; purge scheduled");
             now.saturating_add(grace_seconds)
         }
@@ -1042,6 +1059,10 @@ async fn do_domain_purge(
     let report = purge_domain_dids(&state.store, &domain, "admin-immediate")
         .await
         .map_err(OpError::from)?;
+    // Uncount what was deleted even if some slots failed and the op is retried.
+    if let Some(collector) = state.stats_collector.as_ref() {
+        collector.subtract_total_dids(report.deleted);
+    }
     if report.failed > 0 {
         return Err(OpError::Transient(format!(
             "{} slot(s) on {domain} could not be deleted just now",
@@ -1082,10 +1103,8 @@ async fn do_domain_upsert(
     body: &Value,
 ) -> Result<(String, Value), OpError> {
     use did_hosting_common::server::domain::{
-        DISABLE_PURGE_REASON, DomainStatus, create_domain, get_domain, normalize_domain_name,
-        update_domain, wire,
+        DomainStatus, apply_replicated_domain, normalize_domain_name, wire,
     };
-    use did_hosting_common::server::pending_purge;
 
     let directive: replica_upsert::Payload = payload(body, "replica/domain/upsert")?;
     let name = directive.entry.name.clone();
@@ -1106,46 +1125,20 @@ async fn do_domain_upsert(
     let entry = wire::from_spec(&entry_value)
         .map_err(|e| OpError::Refused(format!("replica/domain/upsert: {e}")))?;
 
-    let existed = get_domain(&state.store, &canonical)
+    if entry.status == DomainStatus::Disabled
+        && (entry.disabled_at.is_none() || entry.purge_at.is_none())
+    {
+        warn!(
+            domain = %canonical,
+            "replica/domain/upsert: status=disabled without disabledAt/purgeAt — no purge scheduled"
+        );
+    }
+    // The entry and its purge schedule (cancelled on Active, written on
+    // Disabled) are one atomic write, so a crash can never leave a re-enabled
+    // domain with a ripe purge still queued.
+    let (existed, _) = apply_replicated_domain(&state.store, &entry, &control.did)
         .await
-        .map_err(OpError::from)?
-        .is_some();
-    if existed {
-        update_domain(&state.store, &canonical, &entry)
-            .await
-            .map_err(OpError::from)?;
-    } else {
-        create_domain(&state.store, &entry)
-            .await
-            .map_err(OpError::from)?;
-    }
-
-    match entry.status {
-        DomainStatus::Active => {
-            // Re-enable cancels any in-flight grace timer.
-            pending_purge::cancel(&state.store, &canonical)
-                .await
-                .map_err(OpError::from)?;
-        }
-        DomainStatus::Disabled => match (entry.disabled_at, entry.purge_at) {
-            (Some(disabled_at), Some(purge_at)) => {
-                pending_purge::schedule(
-                    &state.store,
-                    &canonical,
-                    disabled_at,
-                    purge_at.saturating_sub(disabled_at),
-                    DISABLE_PURGE_REASON,
-                    &control.did,
-                )
-                .await
-                .map_err(OpError::from)?;
-            }
-            _ => warn!(
-                domain = %canonical,
-                "replica/domain/upsert: status=disabled without disabledAt/purgeAt — no purge scheduled"
-            ),
-        },
-    }
+        .map_err(OpError::from)?;
 
     info!(
         did = %control.did,
@@ -1172,7 +1165,7 @@ async fn do_domain_upsert(
 /// freshness the staleness bound is measured on, and the process counters.
 /// There is no Prometheus endpoint on an edge; this is the only read of them.
 async fn do_server_metrics(state: &AppState, body: &Value) -> Result<(String, Value), OpError> {
-    use trust_tasks_rs::specs::did_management::server::metrics::v0_1 as metrics;
+    use did_hosting_common::tasks::did_management::server::metrics::v0_1 as metrics;
 
     let _: metrics::Payload = payload(body, "server/metrics")?;
     let now = did_hosting_common::server::auth::session::now_epoch();
@@ -1245,6 +1238,7 @@ mod tests {
             AppError::Store("disk full".into()),
             AppError::Internal("lock poisoned".into()),
             AppError::Io(std::io::Error::other("eio")),
+            AppError::store_throttled(),
         ] {
             let err = OpError::from(e);
             assert!(matches!(err, OpError::Transient(_)), "{err:?}");
@@ -1262,5 +1256,18 @@ mod tests {
             assert!(matches!(err, OpError::Refused(_)), "{err:?}");
             assert_eq!(payload_of(err)["retryable"], false);
         }
+    }
+
+    /// A log over this server's store item limit is final but not invalid:
+    /// `taskFailed`, non-retryable, so the control plane stops re-sending it.
+    #[test]
+    fn a_store_size_refusal_is_final_and_not_an_invalid_log() {
+        let err = OpError::from(AppError::QuotaExceeded(
+            "item size 431916 bytes is over the store's per-item limit of 409600 bytes".into(),
+        ));
+        assert!(matches!(err, OpError::Failed(_)), "{err:?}");
+        let payload = payload_of(err);
+        assert_eq!(payload["code"], "taskFailed");
+        assert_eq!(payload["retryable"], false);
     }
 }

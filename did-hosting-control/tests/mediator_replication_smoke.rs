@@ -206,6 +206,8 @@ async fn control_state(
         trust_tasks: Default::default(),
         hosting: Default::default(),
         identity: Default::default(),
+        replay: Default::default(),
+        geoip: Default::default(),
         config_path: PathBuf::new(),
     };
     let state = did_hosting_control::server::AppState {
@@ -284,6 +286,7 @@ async fn edge_state(
         control_did: Some(control_did.to_string()),
         vta: VtaConfig::default(),
         identity: Default::default(),
+        replay: Default::default(),
         config_path: PathBuf::new(),
     };
     let state = did_hosting_server::server::AppState {
@@ -301,6 +304,7 @@ async fn edge_state(
         did_cache: Arc::new(did_hosting_server::cache::ContentCache::new(
             Duration::from_secs(60),
         )),
+        gate_cache: None,
         trusted_proxy_cidrs: Arc::new(Vec::new()),
         replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
             did_hosting_common::server::auth::session::now_epoch(),
@@ -313,6 +317,7 @@ async fn edge_state(
             ),
         ),
         sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+        replay_cache: Arc::new(did_hosting_common::server::replay::ReplayCache::new()),
     };
     (state, dir)
 }

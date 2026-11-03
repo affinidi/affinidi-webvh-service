@@ -28,6 +28,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::error::AppError;
+use super::pending_purge::{self, PendingPurge};
 use super::store::{KS_ASSIGNMENTS, Store};
 
 /// One row in the per-server assignment cache.
@@ -121,6 +122,65 @@ pub async fn record_assignment(
         .insert(assignment_key(domain), &entry)
         .await?;
     Ok(entry)
+}
+
+/// [`record_assignment`] and cancel any purge scheduled for `domain`, in one
+/// atomic write — `replica/domain/assign`'s whole effect on the store.
+///
+/// Written as two, a crash after the assignment but before the cancel left
+/// the domain assigned with a ripe purge still queued, which the sweep would
+/// carry out against the domain the operator had just taken back. Returns
+/// the entry written and the purge that was cancelled, if there was one.
+pub async fn record_assignment_cancelling_purge(
+    store: &Store,
+    domain: &str,
+    assigner: &str,
+    now_epoch: u64,
+) -> Result<(AssignmentEntry, Option<PendingPurge>), AppError> {
+    let ks = store.keyspace(KS_ASSIGNMENTS)?;
+    let cancelled = pending_purge::get(store, domain).await?;
+    let entry = AssignmentEntry {
+        domain: domain.to_string(),
+        assigned_at: now_epoch,
+        assigner: assigner.to_string(),
+    };
+    let mut batch = store.batch();
+    batch.insert(&ks, assignment_key(domain), &entry)?;
+    pending_purge::stage_cancel(store, &mut batch, domain)?;
+    batch.commit().await?;
+    Ok((entry, cancelled))
+}
+
+/// [`unassign`] and, when an assignment was removed, schedule the domain's
+/// purge — in one atomic write. Written as two, a crash between them left
+/// the domain unassigned with no purge ever coming, after the directive had
+/// been answered `scheduled`. Returns the outcome and the schedule written.
+pub async fn unassign_scheduling_purge(
+    store: &Store,
+    domain: &str,
+    now_epoch: u64,
+    grace_seconds: u64,
+    reason: &str,
+    scheduled_by: &str,
+) -> Result<(UnassignOutcome, Option<PendingPurge>), AppError> {
+    let ks = store.keyspace(KS_ASSIGNMENTS)?;
+    let key = assignment_key(domain);
+    let Some(existing) = ks.get::<AssignmentEntry>(key.clone()).await? else {
+        return Ok((UnassignOutcome::Missing, None));
+    };
+    let mut batch = store.batch();
+    batch.remove(&ks, key);
+    let scheduled = pending_purge::stage_schedule(
+        store,
+        &mut batch,
+        domain,
+        now_epoch,
+        grace_seconds,
+        reason,
+        scheduled_by,
+    )?;
+    batch.commit().await?;
+    Ok((UnassignOutcome::Removed(existing), Some(scheduled)))
 }
 
 /// Unassign `domain` from this server. Idempotent.
@@ -243,5 +303,124 @@ mod tests {
     async fn get_returns_none_for_unknown() {
         let store = fjall_store().await;
         assert!(get(&store, "unknown.example").await.unwrap().is_none());
+    }
+
+    /// Crash-ordering guard for `replica/domain/assign`: an assigned domain
+    /// must never be observable with its purge still queued — the state a
+    /// crash between two separate writes would leave for the sweep to act
+    /// on. Read assignment-then-purge so an atomic write cannot false-alarm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn assignment_never_leaves_a_purge_queued() {
+        use crate::server::store::test_support::assert_never_observed;
+        const N: usize = 150;
+        let store = fjall_store().await;
+        for i in 0..N {
+            pending_purge::schedule(
+                &store,
+                &format!("d{i}.example"),
+                1,
+                60,
+                "grace-expired",
+                "did:c",
+            )
+            .await
+            .unwrap();
+        }
+        let check_store = store.clone();
+        assert_never_observed(
+            N,
+            |i| {
+                let store = store.clone();
+                async move {
+                    let (_, cancelled) = record_assignment_cancelling_purge(
+                        &store,
+                        &format!("d{i}.example"),
+                        "did:c",
+                        100,
+                    )
+                    .await
+                    .unwrap();
+                    assert!(cancelled.is_some());
+                }
+            },
+            move |i| {
+                let store = check_store.clone();
+                async move {
+                    let domain = format!("d{i}.example");
+                    get(&store, &domain).await.unwrap()?;
+                    pending_purge::get(&store, &domain)
+                        .await
+                        .unwrap()
+                        .map(|_| format!("{domain} assigned with a purge queued"))
+                }
+            },
+        )
+        .await;
+    }
+
+    /// Crash-ordering guard for `replica/domain/unassign`: once the
+    /// assignment is gone the purge must already be scheduled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn unassignment_never_leaves_a_domain_unscheduled() {
+        use crate::server::store::test_support::assert_never_observed;
+        const N: usize = 150;
+        let store = fjall_store().await;
+        for i in 0..N {
+            record_assignment(&store, &format!("d{i}.example"), "did:c", 1)
+                .await
+                .unwrap();
+        }
+        let check_store = store.clone();
+        assert_never_observed(
+            N,
+            |i| {
+                let store = store.clone();
+                async move {
+                    let (outcome, scheduled) = unassign_scheduling_purge(
+                        &store,
+                        &format!("d{i}.example"),
+                        100,
+                        60,
+                        "grace-expired",
+                        "did:c",
+                    )
+                    .await
+                    .unwrap();
+                    assert!(matches!(outcome, UnassignOutcome::Removed(_)));
+                    assert!(scheduled.is_some());
+                }
+            },
+            move |i| {
+                let store = check_store.clone();
+                async move {
+                    let domain = format!("d{i}.example");
+                    if get(&store, &domain).await.unwrap().is_some() {
+                        return None;
+                    }
+                    match pending_purge::get(&store, &domain).await.unwrap() {
+                        Some(_) => None,
+                        None => Some(format!("{domain} unassigned with no purge")),
+                    }
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unassigning_an_unassigned_domain_schedules_nothing() {
+        let store = fjall_store().await;
+        let (outcome, scheduled) =
+            unassign_scheduling_purge(&store, "x.example", 1, 60, "grace-expired", "did:c")
+                .await
+                .unwrap();
+        assert_eq!(outcome, UnassignOutcome::Missing);
+        assert!(scheduled.is_none());
+        assert!(
+            pending_purge::get(&store, "x.example")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

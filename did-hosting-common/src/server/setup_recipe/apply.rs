@@ -304,6 +304,7 @@ async fn generate_self_managed_keys(recipe: &SetupRecipe) -> Result<VtaSetupOutc
             key_agreement_multibase: Some(&ka_pub_mb),
             mediator_endpoint: if advertise_didcomm { mediator } else { None },
             tsp_endpoint: if advertise_tsp { mediator } else { None },
+            omit_scid_alias: !recipe.identity.scid_also_known_as.unwrap_or(true),
         },
     );
     // Only a hosting daemon advertises hosting (Keyring VTI-18). In practice

@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 const CONTROL: &str = "did:webvh:test:control.example.com";
-const LIST: &str = "https://trusttasks.org/spec/acl/list/0.1";
+const LIST: &str = "https://trusttasks.org/spec/acl/list/0.3";
 
 fn did_key_signer(seed: u8) -> (String, String, Secret) {
     let secret = Secret::generate_ed25519(None, Some(&[seed; 32]));

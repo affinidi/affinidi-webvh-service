@@ -9,7 +9,9 @@
  *
  * Differences from the reference that are deliberate, because contract C9 and
  * the `auth/oob/*` schemas fixed them after it was written:
- *  - `claimDeadline` and `notAfter` are integer epoch seconds only;
+ *  - `request`'s `claimClosesAt` and `redeem`'s `sessionEndsAt` are RFC 3339
+ *    date-times (0.2); the trigger link's `_exp` stays integer epoch seconds,
+ *    converted from `claimClosesAt`;
  *  - error codes are `auth/oob:*` / `auth/oob/<task>:*` (matched here on the
  *    part after the last `:`, so either spelling works);
  *  - `K_b` is this console's session key (`session-key.ts`), so after
@@ -23,6 +25,10 @@
  */
 
 import { clearSessionKeypair, generateSessionKeypair, signEnvelope } from "./session-key";
+import { scidHost } from "./did-scid";
+import type * as OobRequest from "./trust-tasks/auth/oob/request/0.2/payload";
+import type * as OobRedeem from "./trust-tasks/auth/oob/redeem/0.2/payload";
+import type * as OobCancel from "./trust-tasks/auth/oob/cancel/0.1/payload";
 
 // ---- trigger links (VTI spec 07a, contract C1) --------------------------------
 
@@ -35,12 +41,21 @@ export const TRIGGER_LINK_MAX_BYTES = 251;
 /** VTI-LNK-100. */
 export const SIGN_IN_MAX_LIFETIME_SECS = 300;
 
-// TODO: replace with generated trust-tasks types
+/** Checked against the generated modules, which are imported for types only
+ *  so their schemas stay out of the bundle. */
 export const OOB_TYPES = {
-  request: "https://trusttasks.org/spec/auth/oob/request/0.1",
-  redeem: "https://trusttasks.org/spec/auth/oob/redeem/0.1",
-  cancel: "https://trusttasks.org/spec/auth/oob/cancel/0.1",
+  request: "https://trusttasks.org/spec/auth/oob/request/0.2" as const satisfies typeof OobRequest.TYPE_URI,
+  redeem: "https://trusttasks.org/spec/auth/oob/redeem/0.2" as const satisfies typeof OobRedeem.TYPE_URI,
+  cancel: "https://trusttasks.org/spec/auth/oob/cancel/0.1" as const satisfies typeof OobCancel.TYPE_URI,
 } as const;
+
+/** An RFC 3339 instant as integer epoch seconds, rounded down so nothing
+ *  derived from it outlives the instant; `null` when it does not parse. */
+function epochSecondsOf(instant: unknown): number | null {
+  if (typeof instant !== "string") return null;
+  const ms = Date.parse(instant);
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+}
 
 export class TriggerLinkError extends Error {
   constructor(
@@ -103,6 +118,9 @@ export interface ContactMethodCapabilities {
 export const CONTACT_METHOD_CAPABILITIES: Readonly<Record<string, ContactMethodCapabilities>> = {
   "did:webvh": { namesHost: true, listsServices: true, verified: true },
   "did:web": { namesHost: true, listsServices: true, verified: true },
+  // Names its host only as a DID URL with `src` (VTI-LNK-119): a bare
+  // did:scid is refused below, whatever this row says.
+  "did:scid": { namesHost: true, listsServices: true, verified: true },
   // Self-certifying, and named after no host: no domain to show, and nothing
   // ties a portal origin in the document to anyone the person recognises.
   "did:key": { namesHost: false, listsServices: false, verified: true },
@@ -121,6 +139,7 @@ function didMethodOf(did: string): string {
  */
 export function isHostNamedServiceContact(did: string): boolean {
   const method = didMethodOf(did);
+  if (method === "did:scid" && scidHost(did) === null) return false;
   // Own properties only: `did:constructor` must not find Object.prototype.
   const caps = Object.prototype.hasOwnProperty.call(CONTACT_METHOD_CAPABILITIES, method)
     ? CONTACT_METHOD_CAPABILITIES[method]
@@ -267,12 +286,55 @@ export interface SignInOptions {
    * conflict, see the control plane's `oob::http`).
    */
   onRedeemed?: (payload: Record<string, unknown>) => void;
+  /**
+   * Renew an unclaimed code when its claim window closes, instead of ending
+   * on `expired`: a fresh `K_b` and request while the page is visible, or as
+   * soon as it is visible again — never from a hidden tab, which nobody is
+   * looking at. A claimed request that expires still ends on `expired`.
+   * Default: off. Addition to the reference API.
+   */
+  renew?: boolean;
+  /**
+   * Skip "Continue as …?" for the identity this browser last confirmed: a
+   * redeem for that subject goes straight to `signedIn`, and `confirm()`
+   * remembers the subject it confirms. Any other subject is still asked, so
+   * someone signing this browser in as themselves is still caught. Default:
+   * always ask. Mirrors `@openvtc/rp-sdk`'s option of the same name.
+   */
+  knownSubject?: KnownSubjectStore;
   requestTimeoutMs?: number;
   pollTimeoutMs?: number;
   fetch?: typeof fetch;
   document?: Document;
   pageHost?: string;
   keys?: StarterKeys;
+}
+
+/** Where the identity this browser last confirmed is kept. */
+export interface KnownSubjectStore {
+  get(): string | null;
+  set(subject: string): void;
+}
+
+/** A {@link KnownSubjectStore} in `localStorage` under `key`. Storage that is
+ *  missing, blocked or cleared reads as no subject, so the page asks again. */
+export function localStorageKnownSubject(key: string): KnownSubjectStore {
+  return {
+    get() {
+      try {
+        return globalThis.localStorage?.getItem(key) ?? null;
+      } catch {
+        return null;
+      }
+    },
+    set(subject) {
+      try {
+        globalThis.localStorage?.setItem(key, subject);
+      } catch {
+        // The next sign-in asks again.
+      }
+    },
+  };
 }
 
 export class SignInError extends Error {
@@ -311,6 +373,8 @@ export class SignInController {
   private readonly keys: StarterKeys;
   private readonly doc: Document | undefined;
   private readonly onVisibility = () => this.visibilityChanged();
+  /** A start put off until the page is visible ({@link startWhenVisible}). */
+  private startOnVisible = false;
 
   constructor(private readonly opts: SignInOptions) {
     this.keys = opts.keys ?? sessionKeys;
@@ -328,8 +392,22 @@ export class SignInController {
     return () => this.listeners.delete(listener);
   }
 
-  /** "Show sign-in code": a fresh `K_b`, `auth/oob/request`, then the code. */
+  /**
+   * {@link start} now if the page is visible, else as soon as it becomes
+   * visible: the page shows its code without a click, and a hidden tab opens
+   * no request. Addition to the reference API.
+   */
+  startWhenVisible(): void {
+    if (this.doc?.visibilityState === "hidden") {
+      this.startOnVisible = true;
+      return;
+    }
+    void this.start();
+  }
+
+  /** A fresh `K_b`, `auth/oob/request`, then the code. */
   async start(): Promise<void> {
+    this.startOnVisible = false;
     await this.abandon();
     const run = ++this.run;
     this.set({ status: "starting" });
@@ -338,8 +416,9 @@ export class SignInController {
       const res = await this.post(await this.signed(OOB_TYPES.request, { purpose: "login", mode: "scan" }), this.opts.requestTimeoutMs ?? 15_000);
       if (run !== this.run) return;
       if (!res.ok) throw new SignInError(res.code, res.message, res.details);
-      const { requestId, claimDeadline } = res.payload as { requestId?: unknown; claimDeadline?: unknown };
-      if (typeof requestId !== "string" || typeof claimDeadline !== "number" || !Number.isSafeInteger(claimDeadline)) {
+      const { requestId, claimClosesAt } = res.payload as Partial<Record<keyof OobRequest.Response, unknown>>;
+      const claimDeadline = epochSecondsOf(claimClosesAt);
+      if (typeof requestId !== "string" || claimDeadline === null) {
         throw new SignInError("malformedResponse", "the service returned an unusable request");
       }
       const link = buildTriggerLink({
@@ -361,7 +440,9 @@ export class SignInController {
       });
       this.expiryTimer = setTimeout(
         () => {
-          if (run === this.run && this.current.status === "waiting") void this.finish("expired");
+          if (run !== this.run || this.current.status !== "waiting") return;
+          if (this.opts.renew) void this.renew();
+          else void this.finish("expired");
         },
         Math.max(0, claimDeadline * 1000 - Date.now()),
       );
@@ -384,6 +465,7 @@ export class SignInController {
   confirm(): void {
     if (this.current.status !== "confirm") return;
     const { subject, displayName, notAfter } = this.current;
+    this.opts.knownSubject?.set(subject);
     this.set({ status: "signedIn", subject, displayName, notAfter });
   }
 
@@ -395,6 +477,7 @@ export class SignInController {
   /** Forget `K_b` and return to idle. The page ends its own session. */
   async signOut(): Promise<void> {
     this.run++;
+    this.startOnVisible = false;
     this.stopPolling();
     this.dropKey();
     this.requestId = null;
@@ -403,6 +486,7 @@ export class SignInController {
 
   destroy(): void {
     this.run++;
+    this.startOnVisible = false;
     this.stopPolling();
     this.doc?.removeEventListener("visibilitychange", this.onVisibility);
     this.listeners.clear();
@@ -429,14 +513,16 @@ export class SignInController {
         if (typeof body.subject !== "string") {
           return this.fail(new SignInError("malformedResponse", "redeem returned no subject"));
         }
+        const sessionEnds = epochSecondsOf(body.sessionEndsAt);
         this.clearTimers();
         this.requestId = null;
         this.opts.onRedeemed?.(body);
+        const known = this.opts.knownSubject?.get();
         this.set({
-          status: "confirm",
+          status: known && known === body.subject ? "signedIn" : "confirm",
           subject: body.subject,
           displayName: typeof body.displayName === "string" ? body.displayName : undefined,
-          notAfter: typeof body.notAfter === "number" ? new Date(body.notAfter * 1000) : undefined,
+          notAfter: sessionEnds === null ? undefined : new Date(sessionEnds * 1000),
         });
         return;
       }
@@ -461,6 +547,17 @@ export class SignInController {
           return this.fail(new SignInError(res.code, res.message, res.details));
       }
     }
+  }
+
+  /** The unclaimed code's claim window closed: drop it and show a new one
+   *  (see {@link SignInOptions.renew}). Nothing to cancel: it has expired. */
+  private renew(): void {
+    this.run++;
+    this.stopPolling();
+    this.requestId = null;
+    this.dropKey();
+    this.set({ status: "idle" });
+    this.startWhenVisible();
   }
 
   private async finish(status: "declined" | "cancelled" | "expired"): Promise<void> {
@@ -489,12 +586,19 @@ export class SignInController {
   /**
    * C9: on `visibilitychange` to hidden, hide the code but keep the request
    * and keep polling. On a phone, tapping the code opens the wallet and hides
-   * this tab, and that sign-in must still complete.
+   * this tab, and that sign-in must still complete. On visible, show the
+   * still-unclaimed code again, or open the request {@link startWhenVisible}
+   * put off (a renewal of a code that expired while hidden).
    */
   private visibilityChanged(): void {
+    const visible = this.doc?.visibilityState !== "hidden";
+    if (this.startOnVisible && visible) {
+      void this.start();
+      return;
+    }
     if (this.current.status !== "waiting") return;
-    if (this.doc?.visibilityState === "hidden" && this.current.codeVisible) {
-      this.set({ ...this.current, codeVisible: false });
+    if (this.current.codeVisible !== visible) {
+      this.set({ ...this.current, codeVisible: visible });
     }
   }
 
@@ -576,6 +680,23 @@ export class SignInController {
       signal?.removeEventListener("abort", onAbort);
     }
   }
+}
+
+// ---- the number, for a wallet on this device (contract C11) ----------------------
+
+/**
+ * The attributes the element showing the match number carries while the
+ * request is claimed (contract C11), and only then: `data-oob-request-id` and
+ * `data-oob-match-number`. The browser plugin reads them — only on the page
+ * where the person clicked that request's code — and types the number for
+ * them. The page posts nothing and reads nothing back; a phone wallet reads
+ * the number off the screen as before. `undefined` in every other state.
+ */
+export function matchNumberHandOff(
+  state: SignInState,
+): { "data-oob-request-id": string; "data-oob-match-number": string } | undefined {
+  if (state.status !== "claimed") return undefined;
+  return { "data-oob-request-id": state.requestId, "data-oob-match-number": state.matchNumber };
 }
 
 function sleep(ms: number): Promise<void> {

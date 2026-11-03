@@ -268,7 +268,7 @@ pub(crate) fn sync_update_body(
     log_content: String,
     witness_content: Option<String>,
 ) -> Option<serde_json::Value> {
-    use trust_tasks_rs::specs::webvh::sync::update::v0_2 as update;
+    use did_hosting_common::tasks::webvh::sync::update::v0_2 as update;
 
     let did_id = record.did_id.clone().filter(|d| !d.is_empty())?;
     let body = serde_json::to_value(did_hosting_common::DidSyncUpdate {

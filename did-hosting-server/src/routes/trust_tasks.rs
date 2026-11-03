@@ -77,8 +77,7 @@ pub async fn receive(
 ) -> Response {
     // Per-address rate limit, ahead of parsing and any DID resolution the
     // document's verification would trigger.
-    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
-    let client_ip = resolve_client_ip(addr.ip(), xff, &state.config.server.trusted_proxies);
+    let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.server.trusted_proxies);
     if let Err(e) = state
         .trust_tasks_rate_limiter
         .try_consume(client_ip, now_epoch())

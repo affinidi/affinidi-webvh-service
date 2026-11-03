@@ -52,8 +52,108 @@ pub struct AppConfig {
     /// (`identity.rotation_grace_period`).
     #[serde(default)]
     pub identity: did_hosting_common::server::config::IdentityConfig,
+    /// Bounds of the anti-replay cache for signed Trust Tasks (`[replay]`;
+    /// env `CONTROL_REPLAY_*`).
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_common::server::config::ReplayConfig::is_default"
+    )]
+    pub replay: did_hosting_common::server::config::ReplayConfig,
+    /// Local GeoIP database (`[geoip]`; env `CONTROL_GEOIP_DATABASE`) for the
+    /// city and country a wallet shows for a sign-in request.
+    #[serde(default, skip_serializing_if = "GeoIpConfig::is_default")]
+    pub geoip: GeoIpConfig,
     #[serde(skip)]
     pub config_path: PathBuf,
+}
+
+/// Local GeoIP lookups (`[geoip]`) — base design §12.6: a local database only,
+/// never a third-party call. See `docs/geoip.md` and [`crate::geoip`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeoIpConfig {
+    /// Path of a MaxMind DB (`.mmdb`) file with the GeoIP2 City record shape:
+    /// DB-IP "IP to City Lite" (recommended) or MaxMind GeoLite2 City. Unset,
+    /// every sign-in location is `"unknown"`. A file that is missing or not a
+    /// database is a warning at startup, not a boot failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<PathBuf>,
+    /// Operator-named networks (`[[geoip.networks]]`), checked before the
+    /// database: an office LAN, a VPN, or a known egress address, which a
+    /// public database cannot place (private ranges are never looked up in
+    /// it). The most specific range containing the address wins. Works with
+    /// or without `database`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub networks: Vec<NamedNetwork>,
+}
+
+/// One `[[geoip.networks]]` entry: every address in `cidr` is shown as
+/// `location`. Checked at load — a bad range, or a label that is empty, has
+/// control characters, or is over the schema's 128 characters, is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "RawNamedNetwork", into = "RawNamedNetwork")]
+pub struct NamedNetwork {
+    pub cidr: ipnetwork::IpNetwork,
+    pub location: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawNamedNetwork {
+    cidr: String,
+    location: String,
+}
+
+impl TryFrom<RawNamedNetwork> for NamedNetwork {
+    type Error = String;
+
+    fn try_from(raw: RawNamedNetwork) -> Result<Self, String> {
+        let cidr = raw.cidr.trim().parse().map_err(|_| {
+            format!(
+                "[[geoip.networks]] cidr `{}` is not an IP address or CIDR range",
+                raw.cidr
+            )
+        })?;
+        let location = raw.location.trim().to_string();
+        if location.is_empty() || location.chars().any(char::is_control) {
+            return Err(format!(
+                "[[geoip.networks]] location for `{}` must be non-empty text without \
+                 control characters",
+                raw.cidr
+            ));
+        }
+        if location.chars().count() > crate::geoip::MAX_LOCATION_CHARS {
+            return Err(format!(
+                "[[geoip.networks]] location for `{}` is longer than {} characters",
+                raw.cidr,
+                crate::geoip::MAX_LOCATION_CHARS
+            ));
+        }
+        Ok(Self { cidr, location })
+    }
+}
+
+impl From<NamedNetwork> for RawNamedNetwork {
+    fn from(n: NamedNetwork) -> Self {
+        Self {
+            cidr: n.cidr.to_string(),
+            location: n.location,
+        }
+    }
+}
+
+impl GeoIpConfig {
+    pub fn is_default(&self) -> bool {
+        self.database.is_none() && self.networks.is_empty()
+    }
+
+    /// `{prefix}_GEOIP_DATABASE` overrides `[geoip] database`; an empty value
+    /// clears one set in the file.
+    pub fn apply_env_overrides(&mut self, prefix: &str) {
+        if let Ok(path) = std::env::var(format!("{prefix}_GEOIP_DATABASE")) {
+            self.database = (!path.trim().is_empty()).then(|| PathBuf::from(path));
+        }
+    }
 }
 
 /// Trust Tasks framework runtime knobs.
@@ -89,6 +189,8 @@ fn default_server() -> ServerConfig {
         port: 8532,
         trusted_proxies: Vec::new(),
         trusted_proxy_cidrs: Vec::new(),
+        resolve_cache: Default::default(),
+        resolve_rate_limit: Default::default(),
     }
 }
 
@@ -202,6 +304,14 @@ impl AppConfig {
         // _MAX_JOURNAL) — shared, unprefixed names; see
         // `did_hosting_common::server::config::apply_fjall_env_overrides`.
         did_hosting_common::server::config::apply_fjall_env_overrides(&mut config.fjall)?;
+        did_hosting_common::server::config::apply_hosting_env_overrides(
+            "CONTROL",
+            &mut config.hosting,
+        );
+        // CONTROL_REPLAY_* — anti-replay cache bounds. Also validates `[replay]`.
+        config.replay.apply_env_overrides("CONTROL")?;
+        // CONTROL_GEOIP_DATABASE — the local sign-in location database.
+        config.geoip.apply_env_overrides("CONTROL");
 
         // Control-specific env vars
         macro_rules! env_opt {

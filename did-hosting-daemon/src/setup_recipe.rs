@@ -249,6 +249,8 @@ pub async fn apply_recipe(
             port,
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
+            resolve_cache: Default::default(),
+            resolve_rate_limit: Default::default(),
         },
         log: LogConfig {
             level: log_level,
@@ -270,6 +272,8 @@ pub async fn apply_recipe(
             context_id: None,
         },
         registry: did_hosting_control::config::RegistryConfig::default(),
+        replay: Default::default(),
+        geoip: Default::default(),
         features,
         identity: IdentityConfig {
             mode: identity_mode,

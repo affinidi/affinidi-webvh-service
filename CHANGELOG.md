@@ -1,6 +1,586 @@
 # Changelog
 
-## Unreleased
+## 0.11.0 (2026-11-03)
+
+### Fixed — the plaintext-secrets warning is logged once
+
+A service on the plaintext secrets backend logged its "secrets are stored in
+a PLAINTEXT file" warning every minute, because the identity sweep rebuilds
+the secret store on each run. It is now logged once per file per process, at
+the first build.
+
+### Security — UI build dependencies (15 npm advisories)
+
+All 15 open advisories in `did-hosting-ui`'s lockfile came in through Expo's
+build tooling (`@expo/cli`, `@expo/config`, `@expo/fingerprint`), not the
+UI's own code. In-range updates (Expo 58.0.22) cleared 14: `node-forge`
+1.4.0 → 1.4.2 (GHSA-7wch-p9px-956x, GHSA-jc66-7q78-782g, GHSA-8hrf-8g6f-7xwp,
+GHSA-hqq3-7jhf-c5jx, GHSA-5x38-2vff-x55p and six lower), `minimatch`
+10.2.6 → 11.0.4 under the existing override (GHSA-g3hv-75wg-m249), and
+`zod` 3 (GHSA-mrhx-c7xc-m3w5) and `deepmerge` (GHSA-gcqx-w48m-w2h4, no fixed
+release), which current Expo no longer uses. `glob` has no fixed 13.x, so a
+new `>=14.0.2` override moves it to 14 (GHSA-3g3m-2fjr-6pw4); 14 only adds
+options and follows minimatch 11. `npm audit` reports none.
+
+### Fixed — DynamoDB writes that change several items are atomic
+
+A write batch on DynamoDB was sent 100 items at a time, one transaction per
+chunk: a batch over 100 items could land part-way, and a chunk over 4 MB
+(possible in `backup restore`, 1,000 entries at a time) was rejected by
+DynamoDB, so the restore failed. A batch is now one transaction. One over
+DynamoDB's bound (100 writes, 4 MB) is refused before anything is written,
+as `taskFailed` with the size in its message, like an over-size item. A
+batch naming one item twice now sends only that item's last operation,
+since DynamoDB refuses a transaction that touches an item twice.
+`backup restore` loads in as many transactions as it needs, each within both
+bounds, and is not atomic, as before.
+
+### Fixed — Firestore writes that change several items are atomic
+
+A write batch on Firestore was committed 500 writes at a time, so a batch
+over 500 could land part-way, and a commit is one request of at most
+10 MiB, which a few base64-encoded logs together can pass. A batch is now
+one commit. One over 500 writes or about 10 MB is refused before anything
+is written, as `taskFailed` with the size in its message. `backup restore`
+splits on both bounds.
+
+### Changed — the daemon resolves a cached DID without reading the store
+
+Every resolve read the DID's record and scanned the domains keyspace before
+serving, even with the log cached: on DynamoDB, two reads and a scan per
+resolve. A daemon running its control plane now caches the record and the
+domains next to the log (its gate cache), so a warm resolve of `did.jsonl`,
+`did-witness.json`, a did:web `did.json` or a did:webs DID reads nothing from
+the store. Its control plane clears them after each commit that changes a
+DID (agent-name changes included) or a domain, so disabling or deleting a
+DID, or disabling a domain, still takes effect on the next resolve. On a
+cache miss the daemon reads strongly consistent (the domains scan too), and
+a miss that raced a change does not cache what it read, so a just-published
+log or a disable is never hidden behind a cached copy. This assumes one
+daemon per store. A write made from another process (an admin command
+against a running daemon's store), or one the store applied but reported as
+failed, is picked up within five minutes, the caches' TTL. A daemon with its
+control plane off keeps no gate cache: its changes come from elsewhere.
+
+Standalone edges keep reading the record on every resolve, since another
+replica sharing their store could change it without telling them; they drop
+the separate read of the matched domain, which the scan already returned. A
+sync now clears every cached file for its DID, so an edge's witness file no
+longer stays stale until the TTL, and edges evict expired cache entries each
+minute (they never did).
+
+### Added — the did:scid alias of existing DIDs: state, and listing or removing it
+
+A did:webvh log and its `did:scid:vh:1:<scid>` form are one subject only while
+the document lists `did:scid:vh:1:<scid>?src=<location>` in `alsoKnownAs`
+(VTI-KEY-164). New DIDs got it at creation; existing ones now can too.
+
+- `did/info` reports the latest document's alias under
+  `record.ext["vnd.affinidi.webvh"].scidAlias` — the DID URL for the log's
+  current location and whether it is `listed`, `notListed`, or `stale`
+  (listed for an old location). Derived on the server, from the log.
+- The DID page has a **did:scid Alias** card showing that state. For a DID an
+  agent holds, with the wallet's task relay present, it asks the agent to list
+  or remove the alias (`vta/webvh/dids/update/1.1`, `scidAlsoKnownAs`) through
+  the same approval ceremony as agent-name changes, warning that the entry
+  rotates the update key. Without the relay it is read-only and points at the
+  controller (pnm or the browser-plugin console).
+- `identity-scid-alias list|remove` (control, server, daemon; service stopped)
+  lists or removes the alias on the service's own DID — the only log this
+  service signs. A stale `src` is replaced, removal drops every entry of the
+  SCID, and a request that would change nothing is refused. The update key
+  does not rotate.
+
+### Fixed — overload asks the client to retry, instead of looking like a fault
+
+When the store was over capacity, callers could not tell it from a server
+fault or a revoked grant, so they did not back off. Overload now answers the
+way this service's rate limits already do (and as a VTA answers its own
+operation budgets):
+
+- A throttled DynamoDB request (after the SDK's own retries) was a 500
+  `internalError`. Over HTTP it is now **429** with `x-rate-limit-source:
+  did-host`, `Retry-After`, and `{ "error": "rate_limited", "limiter":
+  "store-throughput", ... }`; as a Trust Task refusal, `unavailable` with
+  `retryAfter`, on the control plane and the witness. An edge reports it to
+  its control plane as retryable, as it now does any rate limit (one used to
+  be reported final).
+- A Trust Task refused as `unavailable` before it wrote anything did not
+  run, and sending the same signed document again is now a retry: the
+  control plane and the witness forget its id rather than refusing the
+  resend as a replay. One refused after it attempted a write may have
+  applied part of it, so its id is kept and a retry must be a new document.
+- A failed lookup of the sender's ACL entry was refused as if the sender had
+  no grant: `permissionDenied` "caller is not present in the maintainer's
+  ACL" at the control plane's dispatch gate, in its tasks and in `acl/*`; "not
+  authorised on this witness" at the witness; a final "unauthorized" for an
+  edge's registration and stats sync; and, for a document over 64 KiB,
+  `malformedRequest` "too large". Each now answers `unavailable` with a retry
+  time when the store is throttled, else `internalError`; only an answer
+  from the ACL is a refusal. An edge's acknowledgements and health pongs
+  whose sender's role cannot be read are not recorded (an op stays queued and
+  is re-sent; a pong waits for the next ping).
+- The witness no longer puts internal error text in an `internalError`.
+- A full replay cache answered `unavailable` with no retry time. It now
+  suggests a minute, when its oldest records start to expire, plus up to 30
+  seconds at random, so callers refused together don't all retry at once and
+  fill it again; a retry can still be refused if the cache is still full.
+- The control plane's `POST /api/trust-tasks` sets `Retry-After`, rounded
+  up, on a refusal that carries `retryAfter`.
+- The `check-name` reservation and agent-name tasks no longer take a failed
+  read for "no default domain" (which could store a DID without one) or for
+  "this DID has no names"; the failure is reported.
+
+Not changed: sign-in (`auth/challenge`, `auth/authenticate`, `auth/refresh`,
+`auth/oob/*`) still refuses a store failure the generic way, since the shared
+sign-in library does not pass the store's error through. Only the DynamoDB
+backend recognises its throttling; other backends' store errors are still
+`internalError`.
+
+### Fixed — on DynamoDB, the control plane no longer acts on a stale DID read
+
+The control plane (standalone or in the daemon) now reads its DID keyspace
+with strongly consistent reads on DynamoDB. Its reads decide writes: who owns
+a slot, whether a path is free, which log to push to edges. An eventually
+consistent read can miss a write that just committed, so a register right
+after another owner's could take over that owner's slot, and an edge push
+right after a write could find nothing and skip the edge. The daemon's
+expired-DID cleanup, which re-reads a record before deleting it, reads the
+same way, so it can no longer delete a DID published a moment before. Prefix
+scans (listings, quota counts) stay eventually consistent.
+
+Cost: these reads now use twice the read units. They are management traffic
+plus two reads per `/api/health` probe. DID resolution, on edges and in the
+daemon's embedded server, keeps eventually consistent reads and costs the
+same. Other backends are unchanged.
+
+### Fixed — a DID log over the store's item size limit is refused, not a 500
+
+DynamoDB stores at most 400 KB per item and Firestore 1 MiB per document,
+and a DID's whole log is one item, while `did/register` accepts logs up to
+1 MiB. A larger log failed at the store as an internal error (`500`): the
+caller could not tell why, and an edge or watcher receiving it by sync
+retried it forever.
+
+- The DynamoDB and Firestore backends now check each item against their
+  limit before they write anything, so a refused batch leaves nothing
+  half-written. `did/register` (HTTPS, DIDComm and TSP alike) answers
+  `taskFailed` (HTTPS `422`) with the size and the limit in its message; the
+  backend is logged, not told to the caller. The witness file is checked the
+  same way.
+- An edge or watcher refuses such a sync as `taskFailed` rather than
+  retrying it, alone or in a `sync/batch` (where an edge used to report it as
+  `invalidLog`), and keeps serving the version it had. The control plane
+  logs a warning for each entry an edge refuses in a batch. Give edges a
+  store whose limit is at least the control plane's.
+- The DID keeps its last version. A DynamoDB-backed log holds about
+  400 KB (about 170 updates of 2.3 KB entries); Firestore about 750 KB,
+  because the log is stored base64-encoded. Fjall, Redis and Cosmos DB hold
+  any log `did/register` accepts. A DID at its limit takes no further entry,
+  a deactivation or key rotation included. The server README states the
+  limits.
+
+### Fixed — DID tasks no longer report a write that succeeded as failed
+
+`did/check-name` (with `reserve`), `did/register` and `did/set-state` wrote
+the record, then read it back to build their answer. On an eventually
+consistent store (DynamoDB without `ConsistentRead`) that read could miss
+the write, and the caller got an internal error (`record … missing after
+reservation` / `… after write`) for a slot that was reserved or a DID that
+was stored. A reservation retried after that error found the slot taken
+(`available: false`). All three now answer from the record they wrote,
+with no read-back.
+
+### Added — wallet sign-in locations from a local GeoIP database
+
+The control plane (standalone or in the daemon) now fills in
+`requester.location` for `auth/oob` sign-in requests, which the wallet shows
+its approver (`Vienna, AT`). It was always `unknown`. The lookup follows the
+VTC's: a local MaxMind DB (`.mmdb`) file only, never a third-party call;
+non-public addresses are never looked up; the address is neither logged nor
+stored. Point `[geoip] database` (or `CONTROL_GEOIP_DATABASE` /
+`DAEMON_GEOIP_DATABASE`) at a DB-IP City Lite or MaxMind GeoLite2 City file.
+A missing or bad file is a warning, not a startup failure, and a replaced
+file is re-read within a minute. Without the table nothing changes. See
+`docs/geoip.md`.
+
+`[[geoip.networks]]` names your own ranges (`cidr`, `location`), such as an
+office LAN or VPN that no public database can place. They are checked before
+the database, the most specific range wins, and a bad entry stops startup.
+
+### Changed — `trusted_proxies` takes CIDR ranges and follows the VTC's rules
+
+`[server] trusted_proxies`, on every service, now accepts CIDR ranges
+(`"10.0.0.0/16"`) as well as single addresses, like the VTC's
+`trust_xff_cidrs`. An entry that is neither used to be dropped silently,
+leaving that proxy untrusted; it now stops startup with the entry named.
+
+Client-address resolution from `X-Forwarded-For` now matches the VTC:
+- every header line is read, as one chain;
+- `addr:port`, `[v6]` and IPv4-mapped entries are accepted;
+- a malformed entry reached before the client, a chain of more than 64
+  entries, or a chain trusted end to end falls back to the TCP peer. The last
+  case used to return the leftmost entry, which the client controls.
+
+The control plane's duplicate of this function is gone; every service uses
+the one in `did-hosting-common`.
+
+### Fixed — false "corrupted entry" warnings at startup
+
+The store integrity check reported every agent-name index entry
+(`name:{domain}:{name}`) as invalid JSON. Those entries, and an edge's
+`hw:` high-water logs, hold raw bytes by design and are now skipped. No
+data was affected.
+
+### Security — rustls 0.21 removed from the AWS backends
+
+The DynamoDB store and AWS secret backends no longer build the AWS SDK's
+legacy HTTPS client, which used rustls 0.21 (GHSA-c8m5-c952-6cm4,
+GHSA-w44r-93j7-qv28, GHSA-h2v8-394m-p7vv). They now use the SDK's current
+client on rustls 0.23.46, so the lockfile carries a single rustls.
+
+### Changed — trust-tasks 0.36
+
+The workspace moves to trust-tasks-rs 0.36, with vta-sdk 0.75, vti-common
+0.51, vti-secrets 0.24, affinidi-tdk 0.36, affinidi-messaging-sdk 0.44,
+affinidi-messaging-didcomm-service 0.29 and the test mediator 0.48. The UI's
+`@openvtc/trust-tasks` runtime moves to 0.28.1.
+
+Error documents are now `trust-task-error/0.6`, on every path, routed or not.
+0.6 extends 0.5 with two codes, `unsupportedExtension` and `indeterminate`;
+a consumer that accepts later minors (SPEC §5.2), as the UI does, needs no
+change. No pinned task version changed.
+
+### Changed — BREAKING: every Trust Task moves to its latest version
+
+Old versions are no longer served. A peer that still sends one gets
+`unsupportedType`. Ship this together with the matching VTA, wallet and
+browser-extension releases.
+
+- **acl:**
+  - `grant`, `revoke`, `change-role` and `show` move to 0.2. Entries use
+    AclEntry 0.2 and state their authority explicitly:
+    - the domains an entry may act on are its `act` scope;
+    - `keys` and `capabilities` are stated, never implied.
+  - The webvh `ext` namespace carries only `quota` and `defaultDomain`. The
+    old `ext…domains` member is refused.
+  - Domains are dropped with `revoke` narrowing (`{kind:"act"}`); `grant`
+    can no longer narrow an entry.
+  - `list` moves to 0.3: `limit`/`nextCursor` paging, and
+    `context`+`direction` filters.
+  - `trust-task-discovery` moves to 0.3.
+- **auth/oob** (wallet sign-in):
+  - `request`, `claim` and `redeem` move to 0.2; `prove`, `respond` and
+    `grant` move to 0.3.
+  - Deadlines and session ends are RFC 3339 strings: `claimClosesAt`,
+    `decisionClosesAt`, `sessionEndsAt`.
+  - The prove/respond 0.1↔0.2 fallback is gone.
+- **auth:**
+  - Only `authenticate` 0.3 and `refresh` 0.2 are served. Refreshing a
+    key-bound session now requires the bound key's proof.
+  - `step-up/start` moves to 0.2; it embeds `approve-request` 0.5, which uses
+    `accepts` and `ttlSeconds`.
+  - `step-up/approve-response` moves to 0.6. `approverSigned` evidence is
+    refused with `noGate`.
+  - `passkey/enroll/invite` moves to 0.3 (`ttlSeconds`).
+- **did-management:**
+  - `did/list` moves to 0.2: paging by an opaque, signed cursor, and no
+    `total`. The cursor key lives in the store, so cursors survive restarts
+    and work across replicas.
+  - `registry/*` moves to 0.2 (`lastHealthCheckAt`, `observedAt`) and
+    `stats/timeseries` to 0.2 (`startsAt`).
+  - `server/register` moves to 0.2 and conforms to its schema. The edge's
+    hints travel under `ext["com.affinidi.did-hosting"]`.
+- **Peers that must move with this release:**
+  - The VTA's `webvh_host` sends `did/list/0.1`.
+  - The wallet sends `auth/oob` claim 0.1 / prove 0.2 / respond 0.1.
+  - The browser extension sends `authenticate/0.2`, `refresh/0.1` and
+    `step-up/start/0.1`.
+  - The mobile approver reads `approve-request` only up to 0.2.
+
+### Changed — Trust Task types are generated, not prebuilt
+
+- `trust-tasks-rs` 0.35 deprecates its prebuilt spec modules. Every task this
+  service speaks is now pinned in `did-hosting-common/trust-tasks.lock`, with
+  the bundles vendored under `did-hosting-common/trust-tasks/`.
+  - The Rust types are generated by `trust-tasks-build` into
+    `did_hosting_common::tasks`.
+  - The UI generates its TypeScript types from the same lock
+    (`npm run gen:tasks`).
+  - CI runs `trust-tasks check`.
+- Dependencies:
+  - `trust-tasks-*` 0.35
+  - `vta-sdk` 0.74, `vti-common` 0.50, `vti-secrets` 0.23
+  - `affinidi-tdk` 0.33, `affinidi-messaging-sdk` 0.41, `affinidi-tsp` 0.3
+  - `-didcomm-service` 0.26, test-mediator 0.46
+  - UI: `@openvtc/trust-tasks` 0.28
+
+### Security — TLS certificate trust (RUSTSEC-2026-0382, RUSTSEC-2026-0383)
+
+- **`rustls-webpki` 0.103.16 and `webpki-root-certs` 1.0.10.** Earlier
+  versions could accept certificate chains through distrusted emSign
+  intermediates whose private keys are now public. Lockfile only; the fuzz
+  workspace's lock is updated too.
+
+### Changed — dependencies
+
+- Workspace-wide `cargo update`: `tokio` 1.54, `trust-tasks-*` 0.32.10, and
+  the AWS SDK moves forward (`aws-sdk-dynamodb` 1.131,
+  `aws-sdk-secretsmanager` 1.120). `firestore` 0.61, `serde_json_canonicalizer`
+  0.4 (canonical output unchanged; duplicate object keys are now an error).
+- **The `aws-smithy-types < 1.7` pin is gone.** `aws-smithy-json` 0.63.1
+  compiles against the newer line, so the workspace no longer needs to hold
+  the AWS subtree back. `vti-secrets` 0.21 now bounds it below 1.9 itself,
+  which is what keeps `aws-config` at 1.12.
+
+### Fixed — the server's documented env overrides work
+
+- **`did-hosting-server` reads the shared env overrides under `DID_HOSTING_`**
+  as its README documents (`DID_HOSTING_SERVER_HOST`, `_SERVER_PORT`,
+  `_LOG_LEVEL`, `_STORE_*`, `_AUTH_*`, `_SECRETS_*`, `_FEATURES_*`, …). They
+  were read only under an undocumented `WEBVH_` prefix, so the documented
+  names were silently ignored. `WEBVH_` still works but is deprecated; when
+  both are set, `DID_HOSTING_` wins.
+
+### Added — configurable, compact replay caches
+
+Each service's anti-replay cache for signed Trust Tasks held at most 5,000
+records per signer and 50,000 in all, about 0.4 KB each, and refused new
+requests at either bound. One signer was therefore limited to about 14
+signed requests a second: a VTA creating DIDs on the control plane or
+daemon, a VTA witnessing them, and the control plane's sync to each edge
+server and watcher.
+
+- **Compact records.** A record is now a 128-bit keyed hash of
+  `(signer, id)`, about 32 bytes, filed by the document's signed `issuedAt`
+  in one-minute buckets that are dropped whole as they leave the freshness
+  window. A document whose `issuedAt` is missing or outside the window is
+  refused as stale.
+- **Higher defaults.** 1,000,000 records in all (about 32 MB) and 250,000
+  per signer (about 600 signed requests a second).
+- **A reserve for quiet signers.** The last 10% of the global bound is kept
+  for signers holding fewer than 100 records, so several busy signers
+  together cannot lock out the rest.
+- **Configurable.** A `[replay]` table (`max_entries`,
+  `max_entries_per_signer`) on every binary, or
+  `{CONTROL,DAEMON,DID_HOSTING,WATCHER,WITNESS}_REPLAY_*` (the edge also
+  reads the deprecated `WEBVH_REPLAY_*`). The daemon applies its table to
+  the embedded control plane, witness and watcher, each with its own cache.
+  A zero bound, a per-signer bound above the global one, or more than
+  10,000,000 records is refused at startup, including for a cache built in
+  code. Setup leaves the table out unless it differs from the defaults, so
+  later defaults apply. Wallet sign-in (`auth/oob/*`) keeps its own replay
+  record and is not affected.
+- The edge's cache is now part of its state rather than process-wide, so
+  each edge in one process has its own bounds.
+
+### Added — per-client rate limit on DID resolution
+
+Public DID resolution had no rate limit, so one client could use up a
+metered store's read capacity for every other client.
+
+- **`[server.resolve_rate_limit]`** (`max_per_window`, `window_secs`, default
+  10) caps the resolution requests one client may make per fixed window on
+  the server, watcher and daemon; past it the client gets `429 Too Many
+  Requests` with `Retry-After`, and one warning per client per window is
+  logged. It is off by default. Each setting has a
+  `{DID_HOSTING,WATCHER,DAEMON}_SERVER_RESOLVE_RATE_LIMIT_*` env override; a
+  zero limit or a window outside 1 to 3,600 seconds is refused at startup.
+- A client is its address, an IPv6 client its /64, so rotating addresses
+  inside one block does not escape the limit. The budget is per process. In
+  the daemon one budget covers the server's and watcher's resolution and the
+  root fallback, which also serves the UI.
+- The shared per-address limiter (resolution, the Trust Task listeners and
+  wallet sign-in) now drops addresses whose window has ended when it reaches
+  10,000 tracked addresses, and clears all counts only if
+  more than 7,500 are still live, so a flood does not rescan the map on
+  every request.
+
+### Added — `trusted_proxies` from the environment
+
+- `{CONTROL,DID_HOSTING,WATCHER,WITNESS,DAEMON}_SERVER_TRUSTED_PROXIES` sets
+  `server.trusted_proxies` as a comma-separated list of addresses or CIDR
+  ranges (empty clears it), so a deployment can set it without rewriting the
+  config file. A bad entry is refused at startup.
+- The service warns at startup when the resolution limit is on with no
+  trusted proxies: behind a load balancer every client would share one
+  budget.
+
+### Added — configurable caching for DID resolution
+
+- **`[server.resolve_cache]`** sets the `Cache-Control` sent with every
+  successful resolve (`did.jsonl`, `did-witness.json`, `did.json`,
+  `keri.cesr`, the `/@name` redirect) on the server, watcher and daemon:
+  `max_age_secs` (default 300, as before; `0` sends `no-cache`),
+  `shared_max_age_secs` (`s-maxage`) and `stale_while_revalidate_secs`.
+  Each has a `{DID_HOSTING,WATCHER,DAEMON}_SERVER_RESOLVE_CACHE_*` env
+  override. Durations past one year are refused at startup. Errors keep
+  `no-store`.
+
+### Fixed
+
+- **did:web `did.json` is cacheable.** It carried no `Cache-Control`, so the
+  global default stamped it `no-store`; it now follows `[server.resolve_cache]`
+  like the other resolve paths.
+- **The DID count no longer reads every DID record every 10 seconds.** The
+  control plane and the daemon recounted hosted DIDs from the store on every
+  stats flush, so an idle service's read load grew with the number of DIDs it
+  hosted. Creates, deletes, empty-DID cleanups and domain purges now keep the
+  count, and the control plane, daemon and edge recount hourly to correct
+  paths that bypass them (an edge's synced DIDs, an offline `remove`).
+- **Empty-DID cleanup no longer deletes a slot published into mid-pass.** It
+  deleted from a snapshot of the records; in the daemon a DID published into
+  an expired reserved slot after the scan could be removed. Each record is
+  now re-read and re-checked under the slot's path lock before it is deleted,
+  and one failed delete no longer ends the pass.
+- **A failed stats flush no longer loses that window's statistics.** The
+  control plane and the daemon wrote every stats and time-series row of a
+  flush in one transaction, and dropped the drained counts when any read or
+  write failed, as under store throttling. Each row is now its own write,
+  eight at a time; the first failure ends the flush and the unwritten rows
+  are retried on the next one. A write that reports failure is read back
+  first, so one the store applied before timing out is not counted twice.
+  On DynamoDB, plain writes use half the write units of a transaction, at
+  the cost of one request per row. A flush writes at most 200 rows, so its
+  load on the store is spread across flushes: the server-wide series goes
+  first, then per-DID totals and per-DID buckets alternately, so neither
+  starves the other under load. Time-series buckets that cannot be written
+  within an hour are dropped with a warning. The flush at shutdown writes
+  for at most 15 seconds, so the store is still persisted inside a
+  container's termination grace period, and logs an error saying how many
+  rows it could not write.
+- **Pending statistics are capped.** At most 100,000 DIDs' totals and
+  200,000 per-DID time-series buckets wait to be written, whether they
+  came from local events, a peer's stats sync or a failed flush. Past the
+  caps the per-DID figures are dropped, with a warning at most every five
+  minutes; the server-wide totals and series still count them.
+- **A server's stats sync can no longer write rows outside its DIDs'
+  series.** The control plane used each synced delta's path verbatim in
+  its `stats:` and `ts:` keys, so a path of `_all` added to the server-wide
+  series. A delta is now counted only if its path has a hosted path's
+  shape, or is hosted here (for paths stored before the current path
+  rules), and never contains `:` or is `_all`; skipped deltas are logged
+  with a sample of their paths.
+- **No service keeps every time-series bucket in memory any more.** The
+  collector's per-DID 5-minute buckets were never drained, so they grew for
+  as long as the process ran. The control plane and the daemon now write
+  them, which also puts each local event in the bucket of the time it
+  happened rather than the time it was flushed. A synced edge delta is
+  filed under the edge's latest event time (or the time it arrived, if
+  that is implausible), not the arrival time. An edge no longer keeps
+  buckets at all, since it only syncs per-DID totals.
+- **An edge keeps its statistics when a stats sync fails to send.** It
+  drained them before sending and discarded them on failure; they are now
+  retried on the next sync. A sync carries at most 10,000 DIDs, the most
+  the control plane accepts, and the rest wait for the next one, so a
+  backlog after an outage drains instead of being refused every time.
+
+### Added — did:scid identities
+
+A `did:scid:vh:1` DID is verified by the same did:webvh log as its did:webvh
+form, but is a DID in its own right: `did:scid:vh:1:<scid>`, with
+`?src=<host>/<path>` only a locator for the log (VTI-KEY-160 to VTI-KEY-166
+of the VTI specification). Hosted logs are always did:webvh logs and are
+served exactly as before; a did:scid resolver fetches the same `did.jsonl`.
+
+- **Callers may present a did:scid.** An owner, ACL subject or proof signer
+  is recorded and compared as the bare did:scid DID: ACL and ownership keys,
+  validated DIDs, the dispatch caller and session subjects drop the `src`
+  locator, and issuer, sender, recipient and verification-method bindings
+  compare by DID, ignoring it. A proof whose `verificationMethod` carries
+  `src` is resolved through it and dereferenced by DID and fragment. A
+  did:scid signer whose did:webvh log is deactivated signs nothing. The
+  did:webvh and did:scid forms remain distinct identities.
+- **Self-created DIDs list their did:scid alias.** A DID this service mints
+  for itself (server bootstrap, daemon setup, self-managed recipe,
+  `WebVHClient::create_did`) lists `did:scid:vh:1:<scid>?src=…` in
+  `alsoKnownAs`, linking the two forms. `hosting.scid_also_known_as = false`
+  (env `<PREFIX>_HOSTING_SCID_ALSO_KNOWN_AS`, recipe
+  `identity.scid_also_known_as`) leaves it out. An existing DID keeps what it
+  published. `DidDocumentOptions` gains `omit_scid_alias`, so a struct literal
+  of it no longer compiles without it.
+- **The console shows did:scid.** The DID detail page lists a hosted DID's
+  did:scid alias with a Copy button; the DID table, domain matching and the
+  sign-in contact rule understand did:scid (a contact must carry `src`,
+  VTI-LNK-119).
+
+## 0.10.0 (release/0.10)
+
+### Fixed — wallet sign-in works with the current browser wallet
+
+- **`auth/oob/prove` and `respond` are served at 0.2** beside 0.1. The wallet
+  now tries `prove/0.2` first and falls back to 0.1 only on `unsupportedType`;
+  this service refused the unserved type as `permissionDenied` instead, so
+  every wallet sign-in failed. 0.2's step 2 offers no `signingScope` (this
+  service delegates no signing), and a 0.2 grant that claims one is refused as
+  `contextMismatch`. A `respond` must carry the `grant` of its own version.
+- **An unserved `auth/oob/*` version answers `unsupportedType`** rather than
+  the ACL refusal, so a later wallet version falls back too.
+- `secrets.backend = "encrypted_file"` (new in vti-secrets) is refused as
+  unsupported at startup rather than half-configured.
+
+### Changed — fewer clicks to sign in with a wallet
+
+- **The landing page goes straight to Login** when signed out, and Login shows
+  the sign-in code at once: no "Login" or "Show sign-in code" click. An
+  unclaimed code is renewed when its claim window closes; a hidden tab opens
+  no request until it is visible again, and a code hidden with its tab shows
+  again when the tab does.
+- **The number is handed to a wallet on this device (contract C11):** while a
+  request is claimed, the element showing the number carries
+  `data-oob-request-id` and `data-oob-match-number`. The browser plugin reads
+  them on the page where the code was clicked and types the number in; a
+  phone wallet reads it off the screen as before.
+
+### Changed — dependencies and the management UI
+
+- vta-sdk 0.72 / vti-common 0.48 / vti-secrets 0.21, trust-tasks 0.32,
+  affinidi-tdk 0.27, affinidi-messaging-sdk 0.37, `-didcomm-service` 0.22,
+  bip39 3, utoipa 6, firestore 0.59, azure_data_cosmos 1.0; the UI on Expo SDK
+  58 / react-native 0.88.
+- **Usage chart:** the tooltip shows each series' rate per second beside its
+  count (one decimal below 10/s, `<0.1/s` for a trickle).
+- **All DIDs** is a compact table: search by name, DID, method, domain or
+  agent name, and sort by any column (name, DID, versions, created, updated,
+  resolves). Each DID has a QR code. The DID is shown compactly (method, SCID
+  head, slot; full on hover), the method and "You" badges appear only when
+  the list mixes them, and Updated reads "—" for a DID never updated. The
+  name and DID columns size to the longest entry; the others share the rest.
+- The "Self-contained daemon" note shows an em dash instead of `—`.
+
+### Fixed — multi-row writes are atomic, and the witness's memory is durable
+
+- **A batch is all or nothing on Fjall.** An operation whose keyspace could
+  not be opened was logged and dropped while the rest of the batch committed;
+  the batch now fails and writes nothing. `take`/`incr` (refresh-token
+  rotation, the invite wrong-code lockout) now exclude every handle to a
+  keyspace, not only callers sharing one handle.
+- **A live domain is never purged.** Re-enabling or re-assigning a domain and
+  cancelling its pending purge are one write, as are disabling or unassigning
+  it and scheduling the purge (and a replicated `replica/domain/upsert`). A
+  crash between the two used to leave a ripe purge queued against a live
+  domain, or a domain disabled with no purge coming. Both purge sweeps also
+  re-check, just before deleting, that the row is unchanged and the domain is
+  still disabled or unassigned; a leftover row for a live domain is cleared
+  instead of acted on.
+- **The witness records what it signed before the proof leaves.** The proof
+  counter and the anti-equivocation mark are one write, fsynced before
+  `webvh/witness/sign` answers, so a power loss can no longer make the witness
+  forget an entry it vouched for and sign a fork of it.
+- **DID writes on the control plane hold the per-path lock.** `did/create`
+  (two creates of a free path both succeeded), `did/delete`,
+  `did/set-disabled` (wrote back a stale record) and rollback now read and
+  write under it; a force-replace is a single write.
+- **An edge's reconcile repair** takes `sync_lock` and re-reads the record, so
+  it cannot revert a sync applied while the listing was fetched.
+- **Sessions:** an activity touch updates `last_seen` on the current row only,
+  so it can no longer resurrect a rotated-away session or undo a passkey
+  demotion; session rows, their indexes and refresh indexes change together;
+  step-up retires the previous refresh token.
+- **Passkey invite redemption** that confers a role holds the ACL write lock,
+  so an administrator's concurrent grant is not overwritten.
+- Removing a witness identity with its marks, setting the default domain,
+  invite indexes and empty-DID cleanup are each one write.
 
 ## 0.9.0 (release/0.9)
 

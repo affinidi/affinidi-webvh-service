@@ -17,6 +17,7 @@ pub mod did_ops;
 pub mod error;
 #[cfg(feature = "ui")]
 pub mod frontend;
+pub mod geoip;
 pub mod health;
 pub mod identity_rotation;
 pub mod messaging;

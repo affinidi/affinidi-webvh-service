@@ -10,7 +10,7 @@
     "license": {
       "name": "Apache-2.0"
     },
-    "version": "0.10.0"
+    "version": "0.11.0"
   },
   "paths": {
     "/.well-known/did.jsonl": {
@@ -29,6 +29,12 @@
           },
           "404": {
             "description": "No root DID hosted on this domain"
+          },
+          "429": {
+            "description": "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`",
+            "content": {
+              "application/json": {}
+            }
           }
         }
       }
@@ -131,6 +137,12 @@
           },
           "404": {
             "description": "No DID hosted at this path"
+          },
+          "429": {
+            "description": "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`",
+            "content": {
+              "application/json": {}
+            }
           }
         }
       }

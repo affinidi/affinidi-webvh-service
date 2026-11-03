@@ -26,11 +26,13 @@
 //! (it's a no-op on already-empty records) and then remove the
 //! pending entry on this second pass.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use did_hosting_common::server::domain::{self, DISABLE_PURGE_REASON};
 use did_hosting_common::server::domain_purge::purge_domain_dids;
-use did_hosting_common::server::pending_purge;
+use did_hosting_common::server::pending_purge::{self, PurgeCheck};
+use did_hosting_common::server::stats_collector::StatsCollector;
 use did_hosting_common::server::store::Store;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
@@ -41,27 +43,38 @@ use did_hosting_common::server::auth::session::now_epoch;
 /// integration tests (fast loop) if needed.
 pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Run one sweep cycle synchronously. Returns the number of pending
-/// entries that were ripe and purged. Used both by the background
+/// What one sweep cycle did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Pending entries that were ripe and purged.
+    pub entries: u64,
+    /// DID records those purges deleted.
+    pub dids_deleted: u64,
+}
+
+/// Run one sweep cycle synchronously. Used both by the background
 /// loop and by tests that want to observe one tick's effect without
 /// waiting for the timer.
-pub async fn run_sweep_once(store: &Store) -> u64 {
+pub async fn run_sweep_once(store: &Store) -> SweepReport {
     let pending = match pending_purge::list(store).await {
         Ok(p) => p,
         Err(e) => {
             warn!(error = %e, "purge sweep: failed to list pending entries; skipping tick");
-            return 0;
+            return SweepReport::default();
         }
     };
     if pending.is_empty() {
         debug!("purge sweep: no pending entries");
-        return 0;
+        return SweepReport::default();
     }
 
     let now = now_epoch();
-    let mut purged = 0u64;
+    let mut sweep = SweepReport::default();
     for entry in pending {
         if !entry.is_ripe(now) {
+            continue;
+        }
+        if !still_due(store, &entry).await {
             continue;
         }
         match purge_domain_dids(store, &entry.domain, &entry.reason).await {
@@ -72,12 +85,18 @@ pub async fn run_sweep_once(store: &Store) -> u64 {
                     deleted = report.deleted,
                     "purge sweep: ripe entry processed"
                 );
+                sweep.dids_deleted += report.deleted;
 
                 // Soft-delete-with-grace path: the DomainEntry itself
                 // must be removed too. Unassign-grace (the other
                 // reason) keeps the DomainEntry so the operator can
                 // re-assign the domain to a different server later.
                 if entry.reason == DISABLE_PURGE_REASON {
+                    // Re-checked: the DID purge above takes time, and a
+                    // re-enable landing meanwhile must keep its record.
+                    if !still_due(store, &entry).await {
+                        continue;
+                    }
                     match domain::delete_domain_record(store, &entry.domain).await {
                         Ok(()) => {
                             info!(
@@ -110,7 +129,7 @@ pub async fn run_sweep_once(store: &Store) -> u64 {
                         "purge sweep: failed to clear pending entry; will retry next tick"
                     );
                 }
-                purged += 1;
+                sweep.entries += 1;
             }
             Err(e) => {
                 warn!(
@@ -121,14 +140,49 @@ pub async fn run_sweep_once(store: &Store) -> u64 {
             }
         }
     }
-    purged
+    sweep
+}
+
+/// Re-check a listed ripe row immediately before deleting anything (see
+/// [`pending_purge::check_still_due`]). A row left behind for a domain that
+/// is live again is cleared rather than acted on; one rescheduled or
+/// cancelled since the listing is left alone. Any doubt — a failed lookup —
+/// skips the row until the next tick: deleting is the one irreversible step.
+async fn still_due(store: &Store, entry: &pending_purge::PendingPurge) -> bool {
+    match pending_purge::check_still_due(store, entry).await {
+        Ok(PurgeCheck::Due) => true,
+        Ok(PurgeCheck::Superseded) => {
+            debug!(domain = %entry.domain, "purge sweep: entry changed since listing; skipped");
+            false
+        }
+        Ok(PurgeCheck::Stale(why)) => {
+            warn!(
+                domain = %entry.domain,
+                reason = %entry.reason,
+                why,
+                "purge sweep: ripe entry for a live domain — NOT purging; clearing the leftover"
+            );
+            if let Err(e) = pending_purge::cancel_if_unchanged(store, entry).await {
+                warn!(domain = %entry.domain, error = %e, "purge sweep: failed to clear stale entry");
+            }
+            false
+        }
+        Err(e) => {
+            warn!(domain = %entry.domain, error = %e, "purge sweep: re-check failed; retrying next tick");
+            false
+        }
+    }
 }
 
 /// Long-running background task driving [`run_sweep_once`] on a
 /// 60-second tick until `shutdown` flips. The daemon spawns one of
 /// these per process; standalone servers spawn it in their own
 /// startup chain.
-pub async fn run_purge_sweep_loop(store: Store, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_purge_sweep_loop(
+    store: Store,
+    collector: Arc<StatsCollector>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let mut ticker = tokio::time::interval(DEFAULT_SWEEP_INTERVAL);
     // Skip the immediate first tick — the daemon's startup is busy
     // enough already, and a fresh boot is unlikely to have ripe
@@ -138,10 +192,11 @@ pub async fn run_purge_sweep_loop(store: Store, mut shutdown: watch::Receiver<bo
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let purged = run_sweep_once(&store).await;
-                if purged > 0 {
-                    info!(count = purged, "purge sweep tick completed");
+                let sweep = run_sweep_once(&store).await;
+                if sweep.entries > 0 {
+                    info!(count = sweep.entries, "purge sweep tick completed");
                 }
+                collector.subtract_total_dids(sweep.dids_deleted);
             }
             _ = shutdown.changed() => {
                 info!("purge sweep loop shutting down");
@@ -215,8 +270,15 @@ mod tests {
             .await
             .unwrap();
 
-        let purged = run_sweep_once(&store).await;
-        assert_eq!(purged, 1, "only the ripe entry should be processed");
+        let sweep = run_sweep_once(&store).await;
+        assert_eq!(
+            sweep,
+            SweepReport {
+                entries: 1,
+                dids_deleted: 1
+            },
+            "only the ripe entry should be processed"
+        );
 
         let ks = store.keyspace(KS_DIDS).unwrap();
         // alice (ripe.example) was deleted; bob (fresh.example) survives.
@@ -247,7 +309,7 @@ mod tests {
     #[tokio::test]
     async fn sweep_with_no_pending_entries_is_noop() {
         let store = fjall_store().await;
-        let purged = run_sweep_once(&store).await;
+        let purged = run_sweep_once(&store).await.entries;
         assert_eq!(purged, 0);
     }
 
@@ -262,7 +324,7 @@ mod tests {
             .await
             .unwrap();
 
-        let purged = run_sweep_once(&store).await;
+        let purged = run_sweep_once(&store).await.entries;
         assert_eq!(purged, 1, "stale entry still processed and cleared");
         assert!(
             pending_purge::get(&store, "stale.example")
@@ -320,7 +382,7 @@ mod tests {
         .await
         .unwrap();
 
-        let purged = run_sweep_once(&store).await;
+        let purged = run_sweep_once(&store).await.entries;
         assert_eq!(purged, 1);
 
         // DIDs gone.
@@ -383,7 +445,7 @@ mod tests {
             .await
             .unwrap();
 
-        let purged = run_sweep_once(&store).await;
+        let purged = run_sweep_once(&store).await.entries;
         assert_eq!(purged, 1);
 
         // DomainEntry retained.
@@ -392,6 +454,94 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    fn active_entry(name: &str) -> did_hosting_common::server::domain::DomainEntry {
+        use did_hosting_common::server::domain::{DomainEntry, DomainStatus, DomainUrlScheme};
+        DomainEntry {
+            name: name.into(),
+            label: None,
+            scheme: DomainUrlScheme::Https,
+            status: DomainStatus::Active,
+            created_at: 1,
+            default_domain: false,
+            branding: None,
+            witnesses: None,
+            watchers: None,
+            quota: None,
+            well_known_enabled: false,
+            disabled_at: None,
+            purge_at: None,
+        }
+    }
+
+    /// The state a crash between a re-enable and its purge cancel used to
+    /// leave: the domain Active, a ripe `disable-grace` row still queued.
+    /// The sweep must not wipe the live domain; it clears the leftover.
+    #[tokio::test]
+    async fn sweep_never_purges_a_re_enabled_domain() {
+        let store = fjall_store().await;
+        seed(&store, "alice", "live.example").await;
+        domain::create_domain(&store, &active_entry("live.example"))
+            .await
+            .unwrap();
+        schedule(&store, "live.example", 0, 1, DISABLE_PURGE_REASON, "did:c")
+            .await
+            .unwrap();
+
+        assert_eq!(run_sweep_once(&store).await.entries, 0);
+
+        let ks = store.keyspace(KS_DIDS).unwrap();
+        assert!(
+            ks.get::<DidRecord>(did_key("alice"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            domain::get_domain(&store, "live.example")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            pending_purge::get(&store, "live.example")
+                .await
+                .unwrap()
+                .is_none(),
+            "the stale leftover is cleared, not left to fire later"
+        );
+    }
+
+    /// The state a crash between a re-assignment and its purge cancel used
+    /// to leave: assigned to this server, a ripe `grace-expired` row still
+    /// queued. The sweep must not delete the domain's DIDs.
+    #[tokio::test]
+    async fn sweep_never_purges_a_re_assigned_domain() {
+        let store = fjall_store().await;
+        seed(&store, "bob", "assigned.example").await;
+        did_hosting_common::server::assignment::record_assignment(
+            &store,
+            "assigned.example",
+            "did:c",
+            5,
+        )
+        .await
+        .unwrap();
+        schedule(&store, "assigned.example", 0, 1, "grace-expired", "did:c")
+            .await
+            .unwrap();
+
+        assert_eq!(run_sweep_once(&store).await.entries, 0);
+
+        let ks = store.keyspace(KS_DIDS).unwrap();
+        assert!(ks.get::<DidRecord>(did_key("bob")).await.unwrap().is_some());
+        assert!(
+            pending_purge::get(&store, "assigned.example")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }

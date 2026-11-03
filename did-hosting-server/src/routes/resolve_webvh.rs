@@ -21,11 +21,10 @@
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, request::Parts};
 use axum::response::{IntoResponse, Response};
-use did_hosting_common::server::domain::assert_resolution_allowed;
 use tracing::debug;
 
-use super::resolve_shared::extract_request_host;
-use crate::did_ops::{self, DidRecord};
+use super::resolve_shared::{assert_gate_allows, content_ks, extract_request_host, gate_record};
+use crate::did_ops;
 use crate::error::AppError;
 use crate::mnemonic::validate_mnemonic;
 use crate::server::AppState;
@@ -41,17 +40,13 @@ async fn serve_content(
     track_stats: bool,
     request_host: Option<&str>,
 ) -> Result<Response, AppError> {
-    match state
-        .dids_ks
-        .get::<DidRecord>(did_ops::did_key(mnemonic))
-        .await?
-    {
+    match gate_record(state, mnemonic).await? {
         Some(record) => {
             if record.disabled || record.deleted_at.is_some() {
                 return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
             }
             if let Some(ref did_id) = record.did_id {
-                assert_resolution_allowed(&state.store, request_host, did_id).await?;
+                assert_gate_allows(state, request_host, did_id).await?;
             }
         }
         // No record at all — e.g. `did/delete`, which removes the record
@@ -70,8 +65,8 @@ async fn serve_content(
     } else {
         #[cfg(feature = "metrics")]
         did_hosting_common::server::metrics::inc_cache_miss();
-        let data = state
-            .dids_ks
+        let generation = state.did_cache.generation();
+        let data = content_ks(state)
             .get_raw(key)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?;
@@ -85,8 +80,7 @@ async fn serve_content(
         let data = if content_type == "application/jsonl+json" {
             let log_text = String::from_utf8(data)
                 .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
-            let witness_text = state
-                .dids_ks
+            let witness_text = content_ks(state)
                 .get_raw(did_ops::content_witness_key(mnemonic))
                 .await?
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
@@ -96,7 +90,9 @@ async fn serve_content(
         } else {
             data
         };
-        state.did_cache.insert(key.to_string(), data.clone());
+        state
+            .did_cache
+            .insert(generation, key.to_string(), data.clone());
         std::sync::Arc::new(data)
     };
 
@@ -109,14 +105,16 @@ async fn serve_content(
     debug!(mnemonic = %mnemonic, size = content.len(), content_type, "content resolved");
 
     // DID logs are content-addressed (the SCID prevents content drift) and
-    // safe to cache aggressively. Setting an explicit `Cache-Control` here
-    // overrides the global `no-store` security middleware so CDNs and
-    // browsers can serve hot DIDs without round-tripping the origin.
+    // safe to cache. Setting an explicit `Cache-Control` here overrides the
+    // global `no-store` security middleware so CDNs and browsers can serve
+    // hot DIDs without round-tripping the origin. The policy is
+    // `[server.resolve_cache]`.
+    let cache_control = state.config.server.resolve_cache.header_value();
     Ok((
         StatusCode::OK,
         [
             ("content-type", content_type),
-            ("cache-control", "public, max-age=300"),
+            ("cache-control", cache_control.as_str()),
         ],
         (*content).clone(),
     )
@@ -131,6 +129,7 @@ async fn serve_content(
     responses(
         (status = 200, description = "Root DID's did:webvh log (JSONL)", content_type = "application/jsonl+json"),
         (status = 404, description = "No root DID hosted on this domain"),
+        (status = 429, description = "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`", content_type = "application/json"),
     ),
 ))]
 pub async fn serve_root_did_log(
@@ -210,4 +209,77 @@ pub async fn dispatch(state: &AppState, parts: &Parts) -> Option<Response> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use did_hosting_common::server::config::{
+        AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
+    };
+    use did_hosting_common::server::store::Store;
+    use tower::ServiceExt;
+
+    use crate::config::{AppConfig, LimitsConfig, StatsConfig};
+    use crate::server::AppState;
+
+    /// A throttled store is the store's limit, not a fault: resolution answers
+    /// 429 with `Retry-After` and `x-rate-limit-source: did-host`, the shape a
+    /// client recognises as "wait and retry". (A unit test: the throttling is
+    /// injected, which integration tests do not do.)
+    #[tokio::test]
+    async fn a_throttled_store_answers_429_with_retry_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_config = StoreConfig {
+            data_dir: PathBuf::from(dir.path()),
+            ..StoreConfig::default()
+        };
+        let store = Store::open(&store_config).await.unwrap();
+        let config = AppConfig {
+            fjall: Default::default(),
+            features: FeaturesConfig::default(),
+            server_did: None,
+            mediator_did: None,
+            public_url: None,
+            server: ServerConfig::default(),
+            log: LogConfig::default(),
+            store: store_config,
+            auth: AuthConfig::default(),
+            hosting: Default::default(),
+            secrets: SecretsConfig::default(),
+            limits: LimitsConfig::default(),
+            replication: Default::default(),
+            stats: StatsConfig::default(),
+            control_did: None,
+            vta: VtaConfig::default(),
+            identity: Default::default(),
+            replay: Default::default(),
+            config_path: PathBuf::new(),
+        };
+        let mut state = AppState::new(store, config).unwrap();
+        state.dids_ks = state.dids_ks.throttled_reads();
+
+        let response = crate::routes::router(1024 * 1024)
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/alice/did.jsonl")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let headers = response.headers();
+        assert_eq!(headers.get("x-rate-limit-source").unwrap(), "did-host");
+        assert_eq!(headers.get("retry-after").unwrap(), "2");
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["limiter"], "store-throughput");
+    }
 }

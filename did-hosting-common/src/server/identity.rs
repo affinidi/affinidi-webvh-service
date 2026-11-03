@@ -232,6 +232,10 @@ pub struct ServiceIdentity {
     pub did: String,
     pub did_resolver: DIDCacheClient,
     pub secrets_resolver: Arc<ThreadedSecretsResolver>,
+    /// Keeps the did:scid floors of the identities this service authorises in
+    /// the store, for [`Self::did_resolver`] (VTI-KEY-162). `None` when the
+    /// store could not be opened for it, which leaves the in-memory floor only.
+    pub scid_floors: Option<Arc<super::scid_floors::ScidFloorKeeper>>,
 
     /// Guarded because a rotation replaces it wholesale. Reads are short and
     /// never held across an await.
@@ -320,6 +324,7 @@ impl ServiceIdentity {
             did: did.to_string(),
             did_resolver,
             secrets_resolver: Arc::new(secrets_resolver),
+            scid_floors: None,
             live: RwLock::new(LiveSet {
                 generations: vec![generation],
                 secrets: vec![secret],
@@ -382,6 +387,7 @@ impl ServiceIdentity {
             did: did.to_string(),
             did_resolver,
             secrets_resolver: Arc::new(secrets_resolver),
+            scid_floors: None,
             live: RwLock::new(LiveSet {
                 generations: vec![generation],
                 secrets: vec![signing_secret, ka_secret],
@@ -405,6 +411,7 @@ impl ServiceIdentity {
             did: did.to_string(),
             did_resolver,
             secrets_resolver: Arc::new(secrets_resolver),
+            scid_floors: None,
             live: RwLock::new(LiveSet {
                 generations,
                 secrets: Vec::new(),
@@ -783,6 +790,17 @@ pub async fn load_identity(
         }
     };
 
+    // Before anything resolves through it: the first resolution of an
+    // authorised did:scid must already know the floor it reached last run.
+    let scid_floors = match super::scid_floors::ScidFloorKeeper::install(&did_resolver, store).await
+    {
+        Ok(keeper) => Some(keeper),
+        Err(e) => {
+            warn!("failed to load did:scid floors: {e} — they will not survive a restart");
+            None
+        }
+    };
+
     let identity_ks = match store.keyspace(KS_IDENTITY) {
         Ok(ks) => ks,
         Err(e) => {
@@ -935,6 +953,7 @@ pub async fn load_identity(
         did: did.to_string(),
         did_resolver,
         secrets_resolver: Arc::new(secrets_resolver),
+        scid_floors,
         live: RwLock::new(LiveSet {
             generations,
             secrets: all_secrets,
@@ -1718,6 +1737,7 @@ mod tests {
             did: DID.to_string(),
             did_resolver,
             secrets_resolver: Arc::new(secrets_resolver),
+            scid_floors: None,
             live: RwLock::new(LiveSet {
                 generations,
                 secrets,

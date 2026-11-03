@@ -515,7 +515,7 @@ async fn run_delete_witness(
         return Err(format!("witness not found: {witness_id}").into());
     }
 
-    witness_ops::delete_witness(&witnesses_ks, &witness_id).await?;
+    witness_ops::delete_witness(&store, &witnesses_ks, &witness_id).await?;
 
     eprintln!();
     eprintln!("  Witness deleted: {witness_id}");

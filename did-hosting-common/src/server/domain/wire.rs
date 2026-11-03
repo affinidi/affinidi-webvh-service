@@ -175,7 +175,7 @@ mod tests {
     /// The wire shape is the one `replica/domain/upsert` declares.
     #[test]
     fn fits_the_replica_upsert_schema() {
-        use trust_tasks_rs::specs::did_management::replica::domain::upsert::v0_1 as upsert;
+        use crate::tasks::did_management::replica::domain::upsert::v0_1 as upsert;
         for status in [DomainStatus::Active, DomainStatus::Disabled] {
             let payload = json!({ "entry": to_spec(&entry(status)) });
             serde_json::from_value::<upsert::Payload>(payload).expect("fits the schema");

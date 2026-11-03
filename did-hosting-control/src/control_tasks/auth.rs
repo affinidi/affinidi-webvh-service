@@ -1,4 +1,4 @@
-//! Step-up (`auth/step-up/start`, `auth/step-up/approve-response/0.5`),
+//! Step-up (`auth/step-up/start/0.2`, `auth/step-up/approve-response/0.6`),
 //! and passkey login (`auth/passkey/login/{start,finish}/0.2`). Enrolment is
 //! `enrol`.
 //!
@@ -7,18 +7,18 @@
 //! passkey can never sign anyone in: the two stores are opened by different
 //! code paths, and neither reads the other. `step_up_start`/`approve_response`
 //! below are the ones that open `KS_PASSKEY_STEP_UP` — when the session's
-//! subject holds a step-up passkey, the approve-request offers `webauthn` as
-//! an `acceptableEvidence` alongside `didSigned`, gated on that store; the
+//! subject holds a step-up passkey, the approve-request's `accepts` offers
+//! `webauthn` in place of `didSigned`, gated on that store; the
 //! login family (`login_start`/`login_finish`) never opens it.
 
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use tracing::{info, warn};
-use trust_tasks_rs::specs::auth::{
+use did_hosting_common::tasks::auth::{
     passkey::login::{finish as login_finish, start as login_start},
     revoke_session,
     step_up::{approve_response, start as step_up_start},
 };
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tracing::{info, warn};
 
 use did_hosting_common::server::auth::session::{
     Session, SessionState, create_authenticated_session, delete_session, get_session, now_epoch,
@@ -90,11 +90,11 @@ fn step_up_key(session_id: &str) -> String {
 /// The session row goes, and with it its refresh token and any session key
 /// bound at login. The bearer extractor reads that row on every request, so
 /// the access token and the key stop working at once, not at expiry
-/// (`auth/authenticate/0.2`: the binding ends on revoke or logout).
+/// (`auth/authenticate/0.3`: the binding ends on revoke or logout).
 ///
 /// A session key may sign this, since revoking only reduces authority, but
 /// only for its own session: it speaks for its subject in that session and no
-/// other (`auth/authenticate/0.2` Conformance item 10), so a stolen key cannot
+/// other (`auth/authenticate/0.3` Conformance item 12), so a stolen key cannot
 /// sign its subject out of their other devices.
 ///
 /// A session that does not exist, was already revoked, belongs to someone
@@ -151,8 +151,8 @@ pub(crate) async fn revoke_session(
     revoked(1)
 }
 
-/// `auth/step-up/start/0.1`: bind a fresh challenge to the caller's own
-/// session and answer the signed `approve-request/0.3` the approver will
+/// `auth/step-up/start/0.2`: bind a fresh challenge to the caller's own
+/// session and answer the signed `approve-request/0.5` the approver will
 /// answer. Elevates nothing: only a verified `approve-response` does.
 ///
 /// The session must be live and belong to the proven caller, or the proof must
@@ -160,9 +160,9 @@ pub(crate) async fn revoke_session(
 /// (no such session, someone else's, not live) answer alike.
 pub(crate) async fn step_up_start(
     cx: &Cx<'_>,
-    p: step_up_start::v0_1::Payload,
-) -> Result<step_up_start::v0_1::Response, TaskError> {
-    use step_up_start::v0_1::error_codes;
+    p: step_up_start::v0_2::Payload,
+) -> Result<step_up_start::v0_2::Response, TaskError> {
+    use step_up_start::v0_2::error_codes;
 
     let caller = cx.caller()?.to_string();
     let state = cx.state;
@@ -222,7 +222,7 @@ pub(crate) async fn step_up_start(
         ),
         _ => None,
     };
-    let (challenge, acceptable_evidence, webauthn_options) = match &gate {
+    let (challenge, accepts, webauthn_options) = match &gate {
         Some((rcr, _)) => {
             let options = request_options(rcr)?;
             let challenge = options
@@ -251,14 +251,14 @@ pub(crate) async fn step_up_start(
         "challenge": challenge,
         "reason": "Elevate this session to aal2",
         "targetAcr": STEP_UP_ACR,
-        "acceptableEvidence": acceptable_evidence,
+        "accepts": accepts,
     });
     if let Some(options) = webauthn_options {
         payload["webauthn"] = options;
     }
     let request: trust_tasks_rs::TrustTask<Value> = serde_json::from_value(json!({
         "id": new_id(),
-        "type": <trust_tasks_rs::specs::auth::step_up::approve_request::v0_3::Payload as trust_tasks_rs::Payload>::TYPE_URI,
+        "type": <did_hosting_common::tasks::auth::step_up::approve_request::v0_5::Payload as trust_tasks_rs::Payload>::TYPE_URI,
         "issuer": my_vid,
         "recipient": session.did,
         "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -267,7 +267,7 @@ pub(crate) async fn step_up_start(
     }))?;
     // The approve-request is the approver's to verify on its own terms before
     // surfacing its reason, so it is checked here against its own schema too.
-    typed::<trust_tasks_rs::specs::auth::step_up::approve_request::v0_3::Payload>(
+    typed::<did_hosting_common::tasks::auth::step_up::approve_request::v0_5::Payload>(
         request.payload.clone(),
         "approve-request payload",
     )?;
@@ -297,7 +297,7 @@ pub(crate) async fn step_up_start(
     )
 }
 
-/// `auth/step-up/approve-response/0.5`: the approver's signed decision. The
+/// `auth/step-up/approve-response/0.6`: the approver's signed decision. The
 /// gate has verified it as an attestation (`assertionMethod`); here it must
 /// answer the challenge bound to its session, be made by that session's
 /// subject, and — approved — it raises the session's assurance level. Tokens
@@ -319,9 +319,20 @@ pub(crate) async fn step_up_start(
 /// subject with none keeps `didSigned`.
 pub(crate) async fn approve_response(
     cx: &Cx<'_>,
-    p: approve_response::v0_5::Payload,
-) -> Result<approve_response::v0_5::Response, TaskError> {
-    use approve_response::v0_5::{Evidence, PayloadDecision, error_codes};
+    p: approve_response::v0_6::Payload,
+) -> Result<approve_response::v0_6::Response, TaskError> {
+    use approve_response::v0_6::{Evidence, PayloadDecision, error_codes};
+
+    // `approverSigned` (0.6) is never in the `accepts` this service offers:
+    // it keeps no step-up approvers. Spec step 1 refuses a gate the relying
+    // party did not offer with `noGate`, and it is refused here, before the
+    // pending step-up is looked up, so the document cannot consume it.
+    if matches!(p.evidence, Some(Evidence::ApproverSigned { .. })) {
+        return Err(TaskError::Declared(
+            error_codes::NO_GATE,
+            "this relying party does not accept approverSigned evidence".into(),
+        ));
+    }
 
     let approver = cx.caller()?.to_string();
     let state = cx.state;
@@ -395,7 +406,7 @@ pub(crate) async fn approve_response(
     // *current* enrolment, not at what `step_up_start` offered, since a
     // step-up passkey can land between start and this decision.
     let step_up_ks = state.store.keyspace(KS_PASSKEY_STEP_UP)?;
-    if let Some(Evidence::Webauthn(assertion)) = &p.evidence {
+    if let Some(Evidence::Webauthn { assertion }) = &p.evidence {
         let webauthn_state = pending.webauthn.as_ref().ok_or_else(|| {
             TaskError::Declared(
                 error_codes::NO_GATE,
@@ -470,7 +481,7 @@ pub(crate) async fn approve_response(
     // (or one carrying no evidence at all) no longer counts, however
     // properly it is signed. Evaluated fresh, at this decision, not against
     // what `step_up_start` offered.
-    if !matches!(p.evidence, Some(Evidence::Webauthn(_)))
+    if !matches!(p.evidence, Some(Evidence::Webauthn { .. }))
         && passkey_store::get_passkey_user_by_did(&step_up_ks, &pending.subject)
             .await?
             .is_some_and(|u| !u.credentials.is_empty())
@@ -501,7 +512,7 @@ pub(crate) async fn approve_response(
         })?;
     // The ACL still gates: elevation does not outlive an ACL entry.
     check_acl(&state.acl_ks, &session.did).await?;
-    let factor = if matches!(p.evidence, Some(Evidence::Webauthn(_))) {
+    let factor = if matches!(p.evidence, Some(Evidence::Webauthn { .. })) {
         "passkey"
     } else {
         "did"

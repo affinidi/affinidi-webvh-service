@@ -40,7 +40,7 @@ fn t(slug: &str) -> String {
     format!("https://trusttasks.org/spec/{slug}")
 }
 
-const INVITE: &str = "auth/passkey/enroll/invite/0.2";
+const INVITE: &str = "auth/passkey/enroll/invite/0.3";
 const REDEEM_START: &str = "auth/passkey/enroll/redeem/start/0.1";
 const REDEEM_FINISH: &str = "auth/passkey/enroll/redeem/finish/0.1";
 const START: &str = "auth/passkey/enroll/start/0.2";
@@ -48,8 +48,8 @@ const FINISH: &str = "auth/passkey/enroll/finish/0.2";
 const LOGIN_START: &str = "auth/passkey/login/start/0.2";
 const LOGIN_FINISH: &str = "auth/passkey/login/finish/0.2";
 const LIST: &str = "auth/passkey/enroll/invite/list/0.1";
-const STEP_UP_START: &str = "auth/step-up/start/0.1";
-const STEP_UP_APPROVE: &str = "auth/step-up/approve-response/0.5";
+const STEP_UP_START: &str = "auth/step-up/start/0.2";
+const STEP_UP_APPROVE: &str = "auth/step-up/approve-response/0.6";
 const PK_LIST: &str = "auth/passkey/list/0.1";
 const PK_ADMIN_LIST: &str = "auth/passkey/admin-list/0.1";
 const PK_REVOKE_START: &str = "auth/passkey/revoke/start/0.2";
@@ -311,6 +311,66 @@ async fn a_session_invite_redeems_once_on_every_transport() {
         let body = ok(&reply, &t(LOGIN_FINISH));
         assert_eq!(body["session"]["subject"], subject.as_str(), "{reply}");
     }
+}
+
+/// A role-conferring redemption decides whether to create the subject's ACL
+/// entry from a read of the ACL, so it waits for the ACL write lock the
+/// `acl/*` handlers hold — and, once it has it, keeps an entry an admin
+/// granted meanwhile rather than overwriting it with the invite's role.
+#[tokio::test]
+async fn a_redemption_waits_for_the_acl_write_lock() {
+    use did_hosting_common::server::acl::{AclEntry, store_acl_entry};
+    use did_hosting_common::server::domain::DomainScope;
+
+    let (state, _dir) = state().await;
+    let admin = member(&state, 3, Role::Admin).await;
+    let subject = "did:example:raced-grant";
+    let invitee = stranger(90);
+    let issued = issue(&state, &admin, subject, "session").await;
+    let reply = redeem_start(&state, Via::Tsp, &invitee, &issued.token, &issued.code).await;
+    let start = ok(&reply, &t(REDEEM_START));
+    let mut passkey = SoftPasskey::new();
+    let payload = json!({
+        "enrollmentId": start["enrollmentId"],
+        "credential": passkey.attest(&start["options"]),
+    });
+
+    let acl_lock = state
+        .acl_locks
+        .guard(did_hosting_common::server::trust_tasks::ACL_WRITE_LOCK_KEY)
+        .await;
+    let mut finish = Box::pin(unsigned(&state, Via::Tsp, &invitee, REDEEM_FINISH, payload));
+    tokio::select! {
+        reply = &mut finish => panic!("the redemption wrote the ACL without its lock: {reply}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(150)) => {}
+    }
+    // An admin's grant, committed while the redemption waits.
+    store_acl_entry(
+        &state.acl_ks,
+        &AclEntry {
+            did: subject.into(),
+            role: Role::Admin,
+            label: None,
+            created_at: 1,
+            max_total_size: None,
+            max_did_count: None,
+            domains: DomainScope::All,
+        },
+    )
+    .await
+    .unwrap();
+    drop(acl_lock);
+    let reply = finish.await;
+    ok(&reply, &t(REDEEM_FINISH));
+    assert_eq!(
+        get_acl_entry(&state.acl_ks, subject)
+            .await
+            .unwrap()
+            .unwrap()
+            .role,
+        Role::Admin,
+        "the redemption overwrote an admin's grant"
+    );
 }
 
 /// An expired invite redeems nothing, nor does a ceremony past its expiry,
@@ -901,7 +961,7 @@ async fn step_up_accepts_its_own_passkey_and_refuses_a_login_one() {
     conforms(&reply);
     let request = ok(&reply, &t(STEP_UP_START))["approveRequest"].clone();
     assert_eq!(
-        request["payload"]["acceptableEvidence"],
+        request["payload"]["accepts"],
         json!(["didSigned"]),
         "{request}"
     );
@@ -928,7 +988,7 @@ async fn step_up_accepts_its_own_passkey_and_refuses_a_login_one() {
     conforms(&reply);
     let request = ok(&reply, &t(STEP_UP_START))["approveRequest"].clone();
     assert_eq!(
-        request["payload"]["acceptableEvidence"],
+        request["payload"]["accepts"],
         json!(["webauthn"]),
         "{request}"
     );
@@ -1521,11 +1581,7 @@ async fn step_up_with_a_passkey_refuses_a_no_passkey_decision() {
     let session_id = session_for(&state, &dana).await.session_id;
 
     let payload = step_up_payload(&state, &dana, &session_id).await;
-    assert_eq!(
-        payload["acceptableEvidence"],
-        json!(["webauthn"]),
-        "{payload}"
-    );
+    assert_eq!(payload["accepts"], json!(["webauthn"]), "{payload}");
 
     // A framework-proof-only decision, no evidence at all: refused. The
     // subject's own step-up passkey is the only route left.
@@ -1594,11 +1650,7 @@ async fn enrolling_a_step_up_passkey_revokes_a_prior_non_passkey_elevation() {
 
     // No step-up passkey yet: the old didSigned route elevates the session.
     let payload = step_up_payload(&state, &dana, &session_id).await;
-    assert_eq!(
-        payload["acceptableEvidence"],
-        json!(["didSigned"]),
-        "{payload}"
-    );
+    assert_eq!(payload["accepts"], json!(["didSigned"]), "{payload}");
     let reply = call(
         &state,
         Via::Https,
@@ -1647,7 +1699,7 @@ async fn enrolling_a_step_up_passkey_revokes_a_prior_non_passkey_elevation() {
     conforms(&reply);
     let request = ok(&reply, &t(STEP_UP_START))["approveRequest"].clone();
     assert_eq!(
-        request["payload"]["acceptableEvidence"],
+        request["payload"]["accepts"],
         json!(["webauthn"]),
         "{request}"
     );

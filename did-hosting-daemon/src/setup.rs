@@ -193,6 +193,8 @@ pub async fn run_wizard(
             port,
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
+            resolve_cache: Default::default(),
+            resolve_rate_limit: Default::default(),
         },
         log: LogConfig {
             level: log_level,
@@ -220,6 +222,8 @@ pub async fn run_wizard(
             context_id: None,
         },
         registry: did_hosting_control::config::RegistryConfig::default(),
+        replay: Default::default(),
+        geoip: Default::default(),
         features,
         identity: IdentityConfig::default(),
         enable,
@@ -989,7 +993,11 @@ async fn run_self_managed_setup(
     eprintln!();
     eprintln!("  Generated Ed25519 signing key, X25519 key-agreement key, and JWT signing key.");
 
-    // 7. Build the daemon's own DID document + signed log entry.
+    // 7. Build the daemon's own DID document + signed log entry. It lists its
+    // did:scid alias unless DAEMON_HOSTING_SCID_ALSO_KNOWN_AS says otherwise;
+    // the written config records the same choice.
+    let scid_also_known_as =
+        did_hosting_common::server::config::scid_also_known_as_from_env("DAEMON", true);
     let host_encoded = did_hosting_common::did::encode_host(&public_url)
         .map_err(|e| format!("failed to encode host from public URL: {e}"))?;
     let doc = build_did_document(
@@ -1010,6 +1018,7 @@ async fn run_self_managed_setup(
             } else {
                 None
             },
+            omit_scid_alias: !scid_also_known_as,
         },
     );
     // A hosting daemon serves HTTP whatever else it speaks, so it always
@@ -1052,6 +1061,8 @@ async fn run_self_managed_setup(
             port,
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
+            resolve_cache: Default::default(),
+            resolve_rate_limit: Default::default(),
         },
         log: LogConfig {
             level: log_level,
@@ -1076,12 +1087,17 @@ async fn run_self_managed_setup(
         limits: did_hosting_server::config::LimitsConfig::default(),
         vta: VtaConfig::default(),
         registry: did_hosting_control::config::RegistryConfig::default(),
+        replay: Default::default(),
+        geoip: Default::default(),
         features,
         identity: IdentityConfig {
             mode: IdentityMode::SelfManaged,
             ..Default::default()
         },
-        hosting: did_hosting_common::server::config::HostingConfig::default(),
+        hosting: did_hosting_common::server::config::HostingConfig {
+            scid_also_known_as,
+            ..Default::default()
+        },
         enable,
         config_path: output_path.clone(),
     };
@@ -1419,6 +1435,8 @@ pub async fn run_setup_offline_complete(
             port: state.port,
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
+            resolve_cache: Default::default(),
+            resolve_rate_limit: Default::default(),
         },
         log: LogConfig {
             level: state.log_level.clone(),
@@ -1446,6 +1464,8 @@ pub async fn run_setup_offline_complete(
             context_id: None,
         },
         registry: did_hosting_control::config::RegistryConfig::default(),
+        replay: Default::default(),
+        geoip: Default::default(),
         features: state.features.clone(),
         identity: IdentityConfig::default(),
         hosting: did_hosting_common::server::config::HostingConfig::default(),

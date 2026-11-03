@@ -52,8 +52,9 @@ touch it.
 | Release | Branch | First RC | GA | Latest | Status |
 |---|---|---|---|---|---|
 | ≤ 0.8 | — | — | — | `0.8.x` | tagged from `main` before release branches existed |
-| 0.9 | `release/0.9` | 2026-10-12 (`v0.9.0-rc.0`, from `5d8cfab`) | 2026-10-13 | `0.9.0` | supported (N) |
-| 0.10 | — | TBD | TBD | — | in development on `main` |
+| 0.9 | `release/0.9` | 2026-10-12 (`v0.9.0-rc.0`, from `5d8cfab`) | 2026-10-13 | `0.9.0` | supported (N-1) |
+| 0.10 | `release/0.10` | 2026-10-20 (`v0.10.0-rc.0`, from `95a5dda`) | 2026-10-20 | `0.10.0` | supported (N) |
+| 0.11 | — | TBD | TBD | — | in development on `main` |
 
 Earlier deployments were also tagged with the VTI stack's release names
 (`VTI-Cypress`, `VTI-Dogwood`, `VTI-Eucalyptus`). Those tags stay; new releases
@@ -70,10 +71,13 @@ released. Features never are.
 
 **Fix on `main` first, then backport.** Label the merged PR
 `backport release/<major.minor>` (one label per target branch); `backport.yml`
-opens the cherry-pick as a PR on that branch, as a draft carrying the conflict
-if it does not apply cleanly. A conflict in `CHANGELOG.md` is expected — main's
-`## Unreleased` is not on a GA'd branch — drop that hunk: a patch's changelog is
-generated from the commit subjects it ships.
+opens the cherry-pick as a PR on that branch. `CHANGELOG.md` never conflicts: the workflow
+keeps the release branch's copy (main's `## Unreleased` is not on a GA'd branch,
+and a patch's changelog is generated from the commit subjects it ships). Any
+other conflict currently fails the backport — the action's conflict commit
+(`BACKPORT-CONFLICT`) is rejected by the commit-message rule — so cherry-pick it
+by hand onto a branch named `backport-<pr>-to-release/<major.minor>` and open
+that PR against the release branch.
 
 Only fix on the release branch directly when the code there no longer exists on
 `main`: a maintainer adds the `release-direct` label to that PR, and its

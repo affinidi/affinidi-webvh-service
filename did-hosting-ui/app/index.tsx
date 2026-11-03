@@ -7,7 +7,7 @@ import {
   ActivityIndicator,
   ScrollView,
 } from "react-native";
-import { Link } from "expo-router";
+import { Link, Redirect } from "expo-router";
 import { useAuth } from "../components/AuthProvider";
 import { useApi } from "../components/ApiProvider";
 import { useDomains } from "../components/DomainProvider";
@@ -25,7 +25,7 @@ import type {
 import { matchesDomain } from "../lib/domain";
 
 export default function Dashboard() {
-  const { isAuthenticated, role } = useAuth();
+  const { isAuthenticated, restored, role } = useAuth();
   const api = useApi();
   const { currentDomain, domains } = useDomains();
   const [health, setHealth] = useState<HealthResponse | null>(null);
@@ -128,16 +128,15 @@ export default function Dashboard() {
     };
   }, [api, isAuthenticated, currentDomain]);
 
+  // Signed out: straight to the login page, which shows the sign-in code at
+  // once. Until the saved session has been looked for, show the mark rather
+  // than send a signed-in visitor through the login page.
   if (!isAuthenticated) {
+    if (restored) return <Redirect href="/login" />;
     return (
       <View style={styles.container}>
         <AffinidiLogo size={48} />
         <Text style={styles.subtitle}>Decentralized Identity Hosting</Text>
-        <Link href="/login" asChild>
-          <Pressable style={styles.buttonPrimary}>
-            <Text style={styles.buttonPrimaryText}>Login</Text>
-          </Pressable>
-        </Link>
       </View>
     );
   }
@@ -350,21 +349,6 @@ const styles = StyleSheet.create({
     fontFamily: fonts.medium,
     color: colors.error,
     fontSize: 14,
-  },
-  buttonPrimary: {
-    backgroundColor: colors.accent,
-    borderRadius: radii.md,
-    paddingVertical: 14,
-    paddingHorizontal: spacing.xl,
-    alignItems: "center",
-    // Visual breathing room from the subtitle above — without this
-    // the button hugs "Decentralized Identity Hosting" with no gap.
-    marginTop: spacing.xl,
-  },
-  buttonPrimaryText: {
-    color: colors.textOnAccent,
-    fontSize: 16,
-    fontFamily: fonts.semibold,
   },
   domainCaption: {
     fontSize: 12,

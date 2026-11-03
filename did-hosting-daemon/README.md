@@ -210,6 +210,41 @@ Environment variables use the `DAEMON_` prefix:
 | `DAEMON_SERVER_HOST`  | Bind host               |
 | `DAEMON_SERVER_PORT`  | Bind port               |
 | `DAEMON_LOG_LEVEL`    | Log level               |
+| `DAEMON_SERVER_RESOLVE_CACHE_MAX_AGE_SECS` | DID-resolution `max-age` (0 = `no-cache`; default 300) |
+| `DAEMON_SERVER_RESOLVE_CACHE_SHARED_MAX_AGE_SECS` | DID-resolution `s-maxage` (empty clears) |
+| `DAEMON_SERVER_RESOLVE_CACHE_STALE_WHILE_REVALIDATE_SECS` | DID-resolution `stale-while-revalidate` (empty clears) |
+| `DAEMON_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW` | Resolution requests per client address per window (empty clears: no limit) |
+| `DAEMON_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS` | Resolution rate-limit window (default 10; empty restores it) |
+| `DAEMON_SERVER_TRUSTED_PROXIES` | Comma-separated proxy addresses or CIDR ranges whose `X-Forwarded-For` is trusted (empty clears) |
+
+The same settings live in `[server.resolve_cache]` (`max_age_secs`,
+`shared_max_age_secs`, `stale_while_revalidate_secs`).
+
+| Variable | Description |
+| --- | --- |
+| `DAEMON_REPLAY_MAX_ENTRIES` | Replay cache records, all signers (default 1,000,000, about 32 MB) |
+| `DAEMON_REPLAY_MAX_ENTRIES_PER_SIGNER` | Replay cache records per signer (default 250,000, about 600 signed requests a second) |
+
+These live in `[replay]` and apply to each embedded service that accepts
+signed Trust Tasks: the control plane, the witness and the watcher. Each
+keeps its own cache with these bounds, so the daemon's worst case is up to
+three times `max_entries` records (about 96 MB at the defaults). The
+control plane's README explains the bounds ("Replay cache bounds").
+
+| Variable | Description |
+| --- | --- |
+| `DAEMON_GEOIP_DATABASE` | Local GeoIP `.mmdb` file for wallet sign-in locations (empty clears) |
+
+This lives in `[geoip] database` and reaches the embedded control plane,
+which answers wallet sign-in. See [`docs/geoip.md`](../docs/geoip.md).
+
+The resolution limit lives in `[server.resolve_rate_limit]` (`max_per_window`,
+`window_secs`) and is off by default; the edge server's README explains it
+("Resolution rate limit"), including `server.trusted_proxies`, which must
+list the load balancer's addresses or subnets before the limit is turned on
+behind one.
+In the daemon one budget covers the server's resolution, the watcher's and
+the root fallback, which also serves the UI.
 
 ## CLI Commands
 

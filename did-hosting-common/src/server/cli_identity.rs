@@ -171,3 +171,45 @@ pub async fn run_retire_generation(
 
     Ok(())
 }
+
+/// `identity-scid-alias list|remove` — list or remove the did:scid alias
+/// (`did:scid:vh:1:<scid>?src=…`) in the service's own DID document, as a new
+/// log entry signed by the service's current update key. Offline: the
+/// service must be stopped. See [`crate::server::identity_scid_alias`].
+pub async fn run_identity_scid_alias(
+    store_config: &StoreConfig,
+    secrets_config: &SecretsConfig,
+    config_path: &std::path::Path,
+    server_did: Option<&str>,
+    action: &str,
+) -> CliResult {
+    use crate::scid::ScidAliasStatus;
+    use crate::server::identity_scid_alias::set_identity_scid_alias;
+
+    let list = match action {
+        "list" => true,
+        "remove" => false,
+        other => return Err(format!("unknown action `{other}` — use `list` or `remove`").into()),
+    };
+    let server_did =
+        server_did.ok_or("server_did is not set — this service has no identity to change")?;
+
+    let store = Store::open(store_config).await?;
+    let secret_store = create_secret_store(secrets_config, config_path)?;
+    let report = set_identity_scid_alias(&store, secret_store.as_ref(), server_did, list).await?;
+
+    eprintln!();
+    eprintln!("  {}", report.did);
+    match report.alias.status {
+        ScidAliasStatus::Listed => {
+            eprintln!("    now lists its did:scid alias {}", report.alias.did_url)
+        }
+        _ => eprintln!("    no longer lists a did:scid alias"),
+    }
+    eprintln!("    did.jsonl now has {} entries", report.version_count);
+    eprintln!();
+    eprintln!("  The update key is unchanged. Start the service; edges pick the new");
+    eprintln!("  entry up on their next sync from the control plane.");
+    eprintln!();
+    Ok(())
+}

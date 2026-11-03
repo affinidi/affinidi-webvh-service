@@ -1,8 +1,8 @@
 //! `did-management/agent-name/*`.
 
+use did_hosting_common::tasks::did_management::agent_name::{check, list, remove, resolve, update};
 use serde_json::json;
 use tracing::info;
-use trust_tasks_rs::specs::did_management::agent_name::{check, list, remove, resolve, update};
 
 use super::{Cx, TaskError, at, spec_record, typed};
 use crate::did_ops;

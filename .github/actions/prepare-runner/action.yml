@@ -1,0 +1,37 @@
+name: Prepare runner for a heavy Rust build
+description: >
+  Frees disk and adds swap before a workspace build. A full build here
+  (vta-sdk with every trust-tasks spec, the generated task types, the cloud
+  SDKs) outgrew the standard hosted runner: on PR #304 three jobs were killed
+  mid-compile with a runner shutdown signal (exit 143), not a test failure.
+inputs:
+  swap-gb:
+    description: Size of the swap file to add, in GiB.
+    default: "16"
+runs:
+  using: composite
+  steps:
+    - name: Free disk space
+      shell: bash
+      run: |
+        df -h / /mnt 2>/dev/null || true
+        # Toolchains this workflow never uses. Paths missing on a given image
+        # (e.g. the ARM larger runner) are skipped by rm -f.
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+          /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+          /usr/local/share/powershell /usr/share/swift || true
+        df -h / /mnt 2>/dev/null || true
+    - name: Add swap
+      shell: bash
+      env:
+        SWAP_GB: ${{ inputs.swap-gb }}
+      run: |
+        # Prefer /mnt (the scratch disk on x86 images); fall back to /.
+        if [ -d /mnt ]; then file=/mnt/ci-swapfile; else file=/ci-swapfile; fi
+        sudo swapoff -a || true
+        sudo rm -f /mnt/swapfile /swapfile
+        sudo fallocate -l "${SWAP_GB}G" "$file" || sudo dd if=/dev/zero of="$file" bs=1M count=$((SWAP_GB * 1024)) status=none
+        sudo chmod 600 "$file"
+        sudo mkswap "$file" >/dev/null
+        sudo swapon "$file"
+        free -h

@@ -318,6 +318,8 @@ pub async fn apply_recipe(
                 .unwrap_or_else(|| SetupRecipe::default_port(ServiceKind::Watcher)),
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
+            resolve_cache: Default::default(),
+            resolve_rate_limit: Default::default(),
         },
         log: LogConfig {
             level: recipe
@@ -347,6 +349,7 @@ pub async fn apply_recipe(
             context_id: None,
         },
         identity: Default::default(),
+        replay: Default::default(),
         sync: SyncConfig {
             source_dids: recipe.watcher.source_dids.clone(),
         },

@@ -10,15 +10,15 @@
 //! The witness DID and URL come from configuration, never from a response of
 //! the service being called.
 
+use crate::tasks::webvh::witness::{
+    key::{create::v0_1 as key_create, delete::v0_1 as key_delete, list::v0_1 as key_list},
+    sign::v0_1 as sign,
+};
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_tdk::secrets_resolver::secrets::Secret;
 use didwebvh_rs::host_policy::HostPolicy;
 use serde_json::{Value, json};
 use trust_tasks_rs::Payload;
-use trust_tasks_rs::specs::webvh::witness::{
-    key::{create::v0_1 as key_create, delete::v0_1 as key_delete, list::v0_1 as key_list},
-    sign::v0_1 as sign,
-};
 
 use crate::error::{Result, WebVHError};
 use crate::server::trust_tasks::TransportBoundVerifier;
@@ -208,7 +208,7 @@ mod tests {
         let err = read_reply::<key_delete::Response>(
             key_delete::Payload::TYPE_URI,
             reply(
-                "https://trusttasks.org/spec/trust-task-error/0.5",
+                "https://trusttasks.org/spec/trust-task-error/0.6",
                 json!({
                     "code": "webvh/witness/key/delete:notFound",
                     "message": "no such key",

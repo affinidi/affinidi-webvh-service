@@ -104,6 +104,7 @@ async fn edge_state() -> (AppState, tempfile::TempDir) {
         control_did: Some(control_did),
         vta: VtaConfig::default(),
         identity: Default::default(),
+        replay: Default::default(),
         config_path: PathBuf::new(),
     };
     let state = AppState {
@@ -123,6 +124,7 @@ async fn edge_state() -> (AppState, tempfile::TempDir) {
         didcomm_service: Arc::new(std::sync::OnceLock::new()),
         stats_collector: None,
         did_cache: Arc::new(ContentCache::new(Duration::from_secs(60))),
+        gate_cache: None,
         trusted_proxy_cidrs: Arc::new(Vec::new()),
         replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
             did_hosting_common::server::auth::session::now_epoch(),
@@ -135,6 +137,7 @@ async fn edge_state() -> (AppState, tempfile::TempDir) {
             ),
         ),
         sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+        replay_cache: std::sync::Arc::new(did_hosting_common::server::replay::ReplayCache::new()),
     };
     (state, dir)
 }
@@ -233,7 +236,7 @@ fn signed_by_the_edge(reply: &Value) {
 
 fn conforms(reply: &Value) {
     let type_uri = reply["type"].as_str().expect("reply has a type");
-    let schema = trust_tasks_rs::schema_index::schema_for(type_uri)
+    let schema = did_hosting_common::tasks::payload_schema(type_uri)
         .unwrap_or_else(|| panic!("no schema is known for {type_uri}"));
     if let Err(e) = trust_tasks_rs::validate::against_schema(schema, &reply["payload"]) {
         panic!("{type_uri} reply does not match its schema: {e:?}\n{reply}");
@@ -942,7 +945,7 @@ async fn a_listing_not_signed_by_the_control_plane_does_not_reconcile() {
         OtherThread,
     }
     let (state, _dir) = edge_state().await;
-    let empty = json!({ "records": [], "total": 0 });
+    let empty = json!({ "records": [] });
     for forgery in [Forgery::Stranger, Forgery::Unsigned, Forgery::OtherThread] {
         let outcome = reconcile_once(&state, |request| {
             let empty = empty.clone();

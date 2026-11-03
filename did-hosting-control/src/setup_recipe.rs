@@ -218,6 +218,8 @@ pub async fn apply_recipe(
             port,
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
+            resolve_cache: Default::default(),
+            resolve_rate_limit: Default::default(),
         },
         log: LogConfig {
             level: log_level,
@@ -239,6 +241,8 @@ pub async fn apply_recipe(
         trust_tasks: Default::default(),
         hosting: HostingConfig::default(),
         identity: Default::default(),
+        replay: Default::default(),
+        geoip: Default::default(),
         config_path: recipe.output.config_path.clone(),
     };
 

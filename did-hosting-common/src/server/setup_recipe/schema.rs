@@ -167,6 +167,11 @@ pub struct IdentitySection {
     /// DIDComm; this is only consulted by tooling that pokes the API).
     #[serde(default)]
     pub control_url: Option<String>,
+    /// Self-managed only: whether the service's own DID lists its
+    /// `did:scid:vh:1` alias in `alsoKnownAs`. Absent means `true`. A
+    /// VTA-provisioned DID follows the VTA's setting instead.
+    #[serde(default)]
+    pub scid_also_known_as: Option<bool>,
 }
 
 impl IdentitySection {

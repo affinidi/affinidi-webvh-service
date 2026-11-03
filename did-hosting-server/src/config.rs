@@ -58,6 +58,13 @@ pub struct AppConfig {
     /// (`identity.rotation_grace_period`).
     #[serde(default)]
     pub identity: did_hosting_common::server::config::IdentityConfig,
+    /// Bounds of the anti-replay cache for signed Trust Tasks (`[replay]`;
+    /// env `DID_HOSTING_REPLAY_*`).
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_common::server::config::ReplayConfig::is_default"
+    )]
+    pub replay: did_hosting_common::server::config::ReplayConfig,
     #[serde(skip)]
     pub config_path: PathBuf,
 }
@@ -215,20 +222,29 @@ impl AppConfig {
 
         config.config_path = path.clone();
 
-        // Apply shared env overrides for common config fields
-        did_hosting_common::server::config::apply_env_overrides(
-            "WEBVH",
-            &mut config.features,
-            &mut config.server,
-            &mut config.log,
-            &mut config.store,
-            &mut config.auth,
-            &mut config.secrets,
-        )?;
+        // Shared env overrides (features, server, log, store, auth, secrets).
+        // `DID_HOSTING_` is the documented prefix. `WEBVH_` is what these were
+        // read under before, applied first so a set `DID_HOSTING_` name wins.
+        // Deprecated: drop it once deployments have moved.
+        for prefix in ["WEBVH", "DID_HOSTING"] {
+            did_hosting_common::server::config::apply_env_overrides(
+                prefix,
+                &mut config.features,
+                &mut config.server,
+                &mut config.log,
+                &mut config.store,
+                &mut config.auth,
+                &mut config.secrets,
+            )?;
+        }
         // Fjall memory settings (STORAGE_FJALL_BLOCK_CACHE / _WRITE_BUFFER /
         // _MAX_JOURNAL) — shared, unprefixed names; see
         // `did_hosting_common::server::config::apply_fjall_env_overrides`.
         did_hosting_common::server::config::apply_fjall_env_overrides(&mut config.fjall)?;
+        did_hosting_common::server::config::apply_hosting_env_overrides(
+            "WEBVH",
+            &mut config.hosting,
+        );
 
         // Server identity (did-hosting-server specific env vars)
         macro_rules! env_opt {
@@ -290,6 +306,25 @@ impl AppConfig {
             config.stats.sync_interval_secs
         );
 
+        // DID_HOSTING_SERVER_RESOLVE_CACHE_* — Cache-Control on DID
+        // resolution. Also validates `[server.resolve_cache]`.
+        config
+            .server
+            .resolve_cache
+            .apply_env_overrides("DID_HOSTING")?;
+        // DID_HOSTING_REPLAY_* (and the deprecated WEBVH_REPLAY_*, like the
+        // shared overrides above) — anti-replay cache bounds. Also validates
+        // `[replay]`.
+        config
+            .replay
+            .apply_env_overrides_for(&["WEBVH", "DID_HOSTING"])?;
+        // DID_HOSTING_SERVER_RESOLVE_RATE_LIMIT_* — per-address limit on
+        // resolution. Also validates `[server.resolve_rate_limit]`.
+        config
+            .server
+            .resolve_rate_limit
+            .apply_env_overrides("DID_HOSTING")?;
+
         // Validate configuration
         config.auth.validate()?;
         if let Some(ref did) = config.server_did
@@ -315,5 +350,39 @@ impl AppConfig {
         }
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The documented `DID_HOSTING_` names reach the shared settings, the
+    /// legacy `WEBVH_` names still work, and the documented name wins.
+    #[test]
+    fn shared_env_overrides_read_did_hosting_then_legacy_webvh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+
+        // SAFETY: no other test in this crate loads config or reads these
+        // names, so nothing races these writes.
+        unsafe {
+            std::env::set_var("DID_HOSTING_SERVER_PORT", "9999");
+            std::env::set_var("WEBVH_LOG_LEVEL", "warn");
+        }
+        let config = AppConfig::load(Some(path.clone())).unwrap();
+        assert_eq!(config.server.port, 9999, "documented name applies");
+        assert_eq!(config.log.level, "warn", "legacy name still applies");
+
+        unsafe { std::env::set_var("DID_HOSTING_LOG_LEVEL", "debug") };
+        let config = AppConfig::load(Some(path)).unwrap();
+        assert_eq!(config.log.level, "debug", "documented name wins");
+
+        unsafe {
+            std::env::remove_var("DID_HOSTING_SERVER_PORT");
+            std::env::remove_var("WEBVH_LOG_LEVEL");
+            std::env::remove_var("DID_HOSTING_LOG_LEVEL");
+        }
     }
 }
