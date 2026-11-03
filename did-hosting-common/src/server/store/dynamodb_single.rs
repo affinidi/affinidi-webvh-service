@@ -37,18 +37,19 @@
 //! the multi-table backend's semantics — cross-chunk atomicity is
 //! **not** guaranteed. All existing callers stay well under 100.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use aws_sdk_dynamodb::Client;
+use aws_sdk_dynamodb::error::ProvideErrorMetadata;
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{AttributeValue, Delete, Put, ReturnValue, TransactWriteItem};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::server::config::StoreConfig;
 use crate::server::error::AppError;
 
-use super::{BatchOps, BoxFuture, KeyspaceOps, RawKvPair, StorageBackend};
+use super::{BatchLimits, BatchOps, BoxFuture, KeyspaceOps, RawKvPair, StorageBackend};
 
 const PK_ATTR: &str = "pk";
 const SK_ATTR: &str = "sk";
@@ -66,10 +67,77 @@ const CNT_ATTR: &str = "cnt";
 pub struct SingleTableDynamoDbBackend {
     client: Client,
     table_name: String,
+    namespace: Option<String>,
+    consistent_reads: bool,
 }
 
-impl SingleTableDynamoDbBackend {
-    pub async fn open(config: &StoreConfig) -> Result<Box<dyn StorageBackend>, AppError> {
+/// Longest accepted key namespace.
+const MAX_NAMESPACE_LEN: usize = 32;
+
+/// Separates a namespace from the keyspace in the partition key. Keyspace names
+/// may not contain it (see [`SingleTableDynamoDbBackend::keyspace`]), so
+/// `"witness#acl"` can only ever mean keyspace `acl` in namespace `witness`.
+const NAMESPACE_SEP: char = '#';
+
+/// Check a key namespace against a strict allowlist: ASCII letters, digits,
+/// `_`, `-` and `.`, 1 to [`MAX_NAMESPACE_LEN`] characters. The namespace is an
+/// isolation boundary and part of every partition key, so nothing else is let
+/// through (in particular not [`NAMESPACE_SEP`], whitespace or non-ASCII).
+fn validate_namespace(ns: &str) -> Result<(), String> {
+    if ns.is_empty() || ns.len() > MAX_NAMESPACE_LEN {
+        return Err(format!("must be 1 to {MAX_NAMESPACE_LEN} characters"));
+    }
+    if !ns
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return Err("may contain only ASCII letters, digits, '_', '-' and '.'".into());
+    }
+    Ok(())
+}
+
+/// Reserved keyspace and key the startup probe reads; never written.
+const PROBE_KEYSPACE: &str = "_probe";
+const PROBE_KEY: &str = "_probe";
+
+/// Classify a failed probe. `Err` is a definitive configuration error that must
+/// stop startup; `Ok` means the probe was inconclusive and startup continues.
+fn probe_outcome(code: Option<&str>, message: Option<&str>, table: &str) -> Result<(), AppError> {
+    match code {
+        Some("ResourceNotFoundException") => Err(AppError::Config(format!(
+            "DynamoDB table `{table}` was not found. store-dynamodb-single needs an \
+             existing table with partition key `{PK_ATTR}` (String) and sort key \
+             `{SK_ATTR}` (String); it never creates one"
+        ))),
+        Some("ValidationException") => Err(AppError::Config(format!(
+            "DynamoDB table `{table}` does not match the expected key schema \
+             (partition key `{PK_ATTR}` String, sort key `{SK_ATTR}` String), or its \
+             name is invalid: {}",
+            message.unwrap_or("no detail")
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The `pk` attribute for a keyspace: the bare keyspace name, or
+/// `"{namespace}#{keyspace}"` when a namespace is set.
+fn pk_for(namespace: Option<&str>, keyspace: &str) -> String {
+    match namespace {
+        Some(ns) => format!("{ns}{NAMESPACE_SEP}{keyspace}"),
+        None => keyspace.to_string(),
+    }
+}
+
+/// Validated, normalised settings for the backend, derived from a
+/// [`StoreConfig`] in one place so every rule is checked before any AWS call.
+struct Settings {
+    table_name: String,
+    namespace: Option<String>,
+    consistent_reads: bool,
+}
+
+impl Settings {
+    fn from_config(config: &StoreConfig) -> Result<Self, AppError> {
         let table_name = config.dynamodb_table_name.clone().ok_or_else(|| {
             AppError::Config(
                 "store-dynamodb-single requires `store.dynamodb_table_name` \
@@ -77,6 +145,35 @@ impl SingleTableDynamoDbBackend {
                     .into(),
             )
         })?;
+        if table_name.trim().is_empty() {
+            return Err(AppError::Config(
+                "`store.dynamodb_table_name` is blank \
+                 (env: <PREFIX>_STORE_DYNAMODB_TABLE_NAME)"
+                    .into(),
+            ));
+        }
+        let namespace = config.dynamodb_key_namespace.clone();
+        if let Some(ns) = &namespace {
+            validate_namespace(ns).map_err(|reason| {
+                AppError::Config(format!(
+                    "`store.dynamodb_key_namespace` {reason} \
+                     (env: <PREFIX>_STORE_DYNAMODB_KEY_NAMESPACE)"
+                ))
+            })?;
+        }
+        Ok(Self {
+            table_name,
+            namespace,
+            // Unset means strongly consistent: the store backs sessions, refresh
+            // tokens and lockout counters, which must read their own writes.
+            consistent_reads: config.dynamodb_consistent_reads.unwrap_or(true),
+        })
+    }
+}
+
+impl SingleTableDynamoDbBackend {
+    pub async fn open(config: &StoreConfig) -> Result<Box<dyn StorageBackend>, AppError> {
+        let settings = Settings::from_config(config)?;
 
         let mut aws_config_loader = aws_config::from_env();
         if let Some(ref region) = config.dynamodb_region {
@@ -85,20 +182,112 @@ impl SingleTableDynamoDbBackend {
         let aws_config = aws_config_loader.load().await;
         let client = Client::new(&aws_config);
 
-        info!(table = %table_name, "opening single-table dynamodb store");
+        info!(
+            table = %settings.table_name,
+            namespace = settings.namespace.as_deref().unwrap_or("(none)"),
+            consistent_reads = settings.consistent_reads,
+            "opening single-table dynamodb store"
+        );
 
-        Ok(Box::new(Self { client, table_name }))
+        let backend = Self::new(client, settings);
+        backend.probe().await?;
+        Ok(Box::new(backend))
+    }
+
+    /// Fail at startup, with a message that says what to fix, when the table is
+    /// missing or has the wrong key schema, instead of on the first request deep
+    /// in the service.
+    ///
+    /// A strongly consistent `GetItem` on a reserved key, then a one-row `Query`
+    /// on the same partition: the only permissions the backend already needs (no
+    /// `DescribeTable`). Only a *definitive* answer stops startup; throttling, a
+    /// timeout, or an access error is logged and startup continues, so a
+    /// transient blip never keeps a working service from starting.
+    ///
+    /// The `GetItem` alone is not enough: it names `pk` and `sk` without saying
+    /// which is the partition key, so a table keyed the other way round (`sk`
+    /// HASH, `pk` RANGE) answers it and starts fine, then fails every prefix
+    /// `Query`. The `Query` conditions on `pk` for equality and `sk` with
+    /// `begins_with`, which DynamoDB only accepts when the roles are right.
+    async fn probe(&self) -> Result<(), AppError> {
+        let pk = pk_for(self.namespace.as_deref(), PROBE_KEYSPACE);
+        let got = self
+            .client
+            .get_item()
+            .table_name(&self.table_name)
+            .key(PK_ATTR, AttributeValue::S(pk.clone()))
+            .key(SK_ATTR, AttributeValue::S(PROBE_KEY.to_string()))
+            .projection_expression(PK_ATTR)
+            .consistent_read(true)
+            .send()
+            .await;
+        if let Err(e) = &got {
+            self.probe_failed(e)?;
+        }
+
+        let queried = self
+            .client
+            .query()
+            .table_name(&self.table_name)
+            .key_condition_expression("#pk = :ks AND begins_with(#sk, :pfx)")
+            .expression_attribute_names("#pk", PK_ATTR)
+            .expression_attribute_names("#sk", SK_ATTR)
+            .expression_attribute_values(":ks", AttributeValue::S(pk))
+            .expression_attribute_values(":pfx", AttributeValue::S(PROBE_KEY.to_string()))
+            .projection_expression("#pk")
+            .consistent_read(true)
+            .limit(1)
+            .send()
+            .await;
+        if let Err(e) = &queried {
+            self.probe_failed(e)?;
+        }
+        Ok(())
+    }
+
+    /// What a failed probe call means for startup: a definitive configuration
+    /// error stops it, anything else is logged and let through.
+    fn probe_failed<E: ProvideErrorMetadata + std::fmt::Display>(
+        &self,
+        e: &E,
+    ) -> Result<(), AppError> {
+        let outcome = probe_outcome(e.code(), e.message(), &self.table_name);
+        if outcome.is_ok() {
+            warn!(
+                table = %self.table_name,
+                error = %e,
+                "could not confirm the DynamoDB table at startup; continuing"
+            );
+        }
+        outcome
+    }
+
+    fn new(client: Client, settings: Settings) -> Self {
+        Self {
+            client,
+            table_name: settings.table_name,
+            namespace: settings.namespace,
+            consistent_reads: settings.consistent_reads,
+        }
     }
 }
 
 impl StorageBackend for SingleTableDynamoDbBackend {
     fn keyspace(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
+        // A '#' in a keyspace name would let it alias another namespace's
+        // partition ("witness#acl" is keyspace `acl` in namespace `witness`).
+        if name.contains(NAMESPACE_SEP) {
+            return Err(AppError::Config(format!(
+                "dynamodb-single: keyspace name must not contain '{NAMESPACE_SEP}'"
+            )));
+        }
         Ok((
             name.to_string(),
             Arc::new(SingleTableKeyspace {
                 client: self.client.clone(),
                 table_name: self.table_name.clone(),
-                keyspace: name.to_string(),
+                pk: pk_for(self.namespace.as_deref(), name),
+                consistent_reads: self.consistent_reads,
             }),
         ))
     }
@@ -107,8 +296,19 @@ impl StorageBackend for SingleTableDynamoDbBackend {
         Box::new(SingleTableBatch {
             client: self.client.clone(),
             table_name: self.table_name.clone(),
+            namespace: self.namespace.clone(),
             ops: Vec::new(),
+            invalid: None,
         })
+    }
+
+    fn batch_limits(&self) -> Option<BatchLimits> {
+        Some(BATCH_LIMITS)
+    }
+
+    fn commits_atomically(&self) -> bool {
+        // `TransactWriteItems`: all of the batch or none of it.
+        true
     }
 
     fn persist(&self) -> BoxFuture<'_, Result<(), AppError>> {
@@ -124,7 +324,9 @@ impl StorageBackend for SingleTableDynamoDbBackend {
 struct SingleTableKeyspace {
     client: Client,
     table_name: String,
-    keyspace: String,
+    /// The `pk` attribute of every row in this keyspace (namespace included).
+    pk: String,
+    consistent_reads: bool,
 }
 
 /// Convert a raw key (bytes) into a `String` for the `sk` attribute.
@@ -144,7 +346,7 @@ impl KeyspaceOps for SingleTableKeyspace {
             self.client
                 .put_item()
                 .table_name(&self.table_name)
-                .item(PK_ATTR, AttributeValue::S(self.keyspace.clone()))
+                .item(PK_ATTR, AttributeValue::S(self.pk.clone()))
                 .item(SK_ATTR, AttributeValue::S(sk))
                 .item(VAL_ATTR, AttributeValue::B(Blob::new(value)))
                 .send()
@@ -161,8 +363,9 @@ impl KeyspaceOps for SingleTableKeyspace {
                 .client
                 .get_item()
                 .table_name(&self.table_name)
-                .key(PK_ATTR, AttributeValue::S(self.keyspace.clone()))
+                .key(PK_ATTR, AttributeValue::S(self.pk.clone()))
                 .key(SK_ATTR, AttributeValue::S(sk))
+                .consistent_read(self.consistent_reads)
                 .send()
                 .await
                 .map_err(|e| AppError::Store(format!("dynamodb-single get: {e}")))?;
@@ -177,7 +380,7 @@ impl KeyspaceOps for SingleTableKeyspace {
             self.client
                 .delete_item()
                 .table_name(&self.table_name)
-                .key(PK_ATTR, AttributeValue::S(self.keyspace.clone()))
+                .key(PK_ATTR, AttributeValue::S(self.pk.clone()))
                 .key(SK_ATTR, AttributeValue::S(sk))
                 .send()
                 .await
@@ -193,9 +396,10 @@ impl KeyspaceOps for SingleTableKeyspace {
                 .client
                 .get_item()
                 .table_name(&self.table_name)
-                .key(PK_ATTR, AttributeValue::S(self.keyspace.clone()))
+                .key(PK_ATTR, AttributeValue::S(self.pk.clone()))
                 .key(SK_ATTR, AttributeValue::S(sk))
                 .projection_expression(PK_ATTR)
+                .consistent_read(self.consistent_reads)
                 .send()
                 .await
                 .map_err(|e| AppError::Store(format!("dynamodb-single get: {e}")))?;
@@ -215,7 +419,7 @@ impl KeyspaceOps for SingleTableKeyspace {
                 .client
                 .delete_item()
                 .table_name(&self.table_name)
-                .key(PK_ATTR, AttributeValue::S(self.keyspace.clone()))
+                .key(PK_ATTR, AttributeValue::S(self.pk.clone()))
                 .key(SK_ATTR, AttributeValue::S(sk))
                 .return_values(ReturnValue::AllOld)
                 .send()
@@ -241,7 +445,7 @@ impl KeyspaceOps for SingleTableKeyspace {
                 .client
                 .update_item()
                 .table_name(&self.table_name)
-                .key(PK_ATTR, AttributeValue::S(self.keyspace.clone()))
+                .key(PK_ATTR, AttributeValue::S(self.pk.clone()))
                 .key(SK_ATTR, AttributeValue::S(sk))
                 .update_expression("ADD #cnt :one")
                 .expression_attribute_names("#cnt", CNT_ATTR)
@@ -290,7 +494,8 @@ impl KeyspaceOps for SingleTableKeyspace {
                     .client
                     .query()
                     .table_name(&self.table_name)
-                    .expression_attribute_values(":ks", AttributeValue::S(self.keyspace.clone()));
+                    .consistent_read(self.consistent_reads)
+                    .expression_attribute_values(":ks", AttributeValue::S(self.pk.clone()));
 
                 if let Some(ref p) = prefix_str {
                     req = req
@@ -362,104 +567,234 @@ fn extract_pairs(items: Vec<HashMap<String, AttributeValue>>, out: &mut Vec<RawK
 // SingleTableBatch
 // ---------------------------------------------------------------------------
 
+/// `TransactWriteItems` accepts at most this many actions per call.
+const MAX_TRANSACT_ITEMS: usize = 100;
+/// ... and at most this many bytes across the whole call.
+const MAX_TRANSACT_BYTES: usize = 4 * 1024 * 1024;
+
+/// DynamoDB also counts each item's attribute names (`pk`, `sk`, `val`) and the
+/// namespace prefix of the partition key against the transaction size. The
+/// limit reported to callers counts only keyspace name, key and value bytes (so
+/// a caller can compute it exactly) and reserves this worst-case overhead for
+/// every operation.
+const ATTR_NAME_OVERHEAD: usize =
+    PK_ATTR.len() + SK_ATTR.len() + VAL_ATTR.len() + MAX_NAMESPACE_LEN + NAMESPACE_SEP.len_utf8();
+
+/// What one [`WriteBatch`](super::WriteBatch) can hold on this backend: a batch
+/// is one atomic transaction or it is refused.
+pub(super) const BATCH_LIMITS: BatchLimits = BatchLimits {
+    max_ops: MAX_TRANSACT_ITEMS,
+    max_bytes: MAX_TRANSACT_BYTES - MAX_TRANSACT_ITEMS * ATTR_NAME_OVERHEAD,
+};
+
 enum SingleTableBatchOp {
     Insert {
-        keyspace: String,
+        pk: String,
+        /// Length of the bare keyspace name, for [`BatchLimits::max_bytes`].
+        name_len: usize,
         sk: String,
         value: Vec<u8>,
     },
     Remove {
-        keyspace: String,
+        pk: String,
+        name_len: usize,
         sk: String,
     },
+}
+
+impl SingleTableBatchOp {
+    /// The item this operation targets.
+    fn target(&self) -> (&str, &str) {
+        match self {
+            Self::Insert { pk, sk, .. } | Self::Remove { pk, sk, .. } => (pk, sk),
+        }
+    }
+
+    /// Bytes this operation counts against [`BatchLimits::max_bytes`]: the
+    /// keyspace name, the key and, for an insert, the value.
+    fn size(&self) -> usize {
+        match self {
+            Self::Insert {
+                name_len,
+                sk,
+                value,
+                ..
+            } => name_len
+                .saturating_add(sk.len())
+                .saturating_add(value.len()),
+            Self::Remove { name_len, sk, .. } => name_len.saturating_add(sk.len()),
+        }
+    }
 }
 
 struct SingleTableBatch {
     client: Client,
     table_name: String,
+    namespace: Option<String>,
     ops: Vec<SingleTableBatchOp>,
+    /// Set when an operation named something that cannot be stored (a key that
+    /// is not UTF-8, a keyspace name containing '#'). The batch is then
+    /// refused at `commit()` before anything is written: nothing is altered to
+    /// fit.
+    invalid: Option<&'static str>,
+}
+
+/// Refuse, before any write, a batch that cannot be one atomic transaction.
+fn check_batch(ops: &[SingleTableBatchOp]) -> Result<(), AppError> {
+    if ops.len() > MAX_TRANSACT_ITEMS {
+        return Err(AppError::Validation(format!(
+            "write batch of {} operations exceeds the {MAX_TRANSACT_ITEMS}-operation limit of one atomic write",
+            ops.len()
+        )));
+    }
+    let mut seen = HashSet::with_capacity(ops.len());
+    let mut bytes = 0usize;
+    for op in ops {
+        if !seen.insert(op.target()) {
+            return Err(AppError::Validation(
+                "write batch touches the same key more than once".into(),
+            ));
+        }
+        bytes = bytes.saturating_add(op.size());
+    }
+    if bytes > BATCH_LIMITS.max_bytes {
+        return Err(AppError::Validation(format!(
+            "write batch of {bytes} bytes exceeds the {}-byte limit of one atomic write",
+            BATCH_LIMITS.max_bytes
+        )));
+    }
+    Ok(())
+}
+
+const INVALID_KEY: &str = "write batch contains a key that is not valid UTF-8";
+const INVALID_KEYSPACE: &str = "write batch names a keyspace that is not allowed";
+
+impl SingleTableBatch {
+    /// The partition key for `keyspace`, or `None` for a name that must not be
+    /// used (it would alias another namespace's partition).
+    fn pk(&self, keyspace: &str) -> Option<String> {
+        (!keyspace.contains(NAMESPACE_SEP)).then(|| pk_for(self.namespace.as_deref(), keyspace))
+    }
 }
 
 impl BatchOps for SingleTableBatch {
     fn insert_raw(&mut self, keyspace: &str, key: Vec<u8>, value: Vec<u8>) {
-        // Batch API is fire-and-forget on individual ops; validation errors
-        // surface on commit(). Push a poison-marker op that fails at commit
-        // rather than swallowing the encoding problem here.
-        match key_as_string(&key) {
-            Ok(sk) => self.ops.push(SingleTableBatchOp::Insert {
-                keyspace: keyspace.to_string(),
+        // The batch API cannot return an error per operation, so an unusable
+        // key or keyspace is recorded and the whole batch is refused at commit().
+        match (self.pk(keyspace), key_as_string(&key)) {
+            (Some(pk), Ok(sk)) => self.ops.push(SingleTableBatchOp::Insert {
+                pk,
+                name_len: keyspace.len(),
                 sk,
                 value,
             }),
-            Err(_) => self.ops.push(SingleTableBatchOp::Insert {
-                keyspace: keyspace.to_string(),
-                sk: String::from_utf8_lossy(&key).into_owned(),
-                value,
-            }),
+            (None, _) => self.invalid = Some(INVALID_KEYSPACE),
+            (_, Err(_)) => self.invalid = Some(INVALID_KEY),
         }
     }
 
     fn remove(&mut self, keyspace: &str, key: Vec<u8>) {
-        match key_as_string(&key) {
-            Ok(sk) => self.ops.push(SingleTableBatchOp::Remove {
-                keyspace: keyspace.to_string(),
+        match (self.pk(keyspace), key_as_string(&key)) {
+            (Some(pk), Ok(sk)) => self.ops.push(SingleTableBatchOp::Remove {
+                pk,
+                name_len: keyspace.len(),
                 sk,
             }),
-            Err(_) => self.ops.push(SingleTableBatchOp::Remove {
-                keyspace: keyspace.to_string(),
-                sk: String::from_utf8_lossy(&key).into_owned(),
-            }),
+            (None, _) => self.invalid = Some(INVALID_KEYSPACE),
+            (_, Err(_)) => self.invalid = Some(INVALID_KEY),
         }
     }
 
     fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>> {
         Box::pin(async move {
-            // TransactWriteItems: up to 100 items per request. Cross-chunk
-            // atomicity is not guaranteed — matches the multi-table
-            // backend. All current callers stay under 100.
-            for chunk in self.ops.chunks(100) {
-                let mut items = Vec::with_capacity(chunk.len());
-                for op in chunk {
-                    match op {
-                        SingleTableBatchOp::Insert {
-                            keyspace,
-                            sk,
-                            value,
-                        } => {
-                            let put = Put::builder()
-                                .table_name(&self.table_name)
-                                .item(PK_ATTR, AttributeValue::S(keyspace.clone()))
-                                .item(SK_ATTR, AttributeValue::S(sk.clone()))
-                                .item(VAL_ATTR, AttributeValue::B(Blob::new(value.clone())))
-                                .build()
-                                .map_err(|e| {
-                                    AppError::Store(format!("dynamodb-single put build: {e}"))
-                                })?;
-                            items.push(TransactWriteItem::builder().put(put).build());
-                        }
-                        SingleTableBatchOp::Remove { keyspace, sk } => {
-                            let del = Delete::builder()
-                                .table_name(&self.table_name)
-                                .key(PK_ATTR, AttributeValue::S(keyspace.clone()))
-                                .key(SK_ATTR, AttributeValue::S(sk.clone()))
-                                .build()
-                                .map_err(|e| {
-                                    AppError::Store(format!("dynamodb-single delete build: {e}"))
-                                })?;
-                            items.push(TransactWriteItem::builder().delete(del).build());
-                        }
+            let Self {
+                client,
+                table_name,
+                ops,
+                invalid,
+                ..
+            } = *self;
+
+            if let Some(reason) = invalid {
+                return Err(AppError::Validation(reason.into()));
+            }
+            check_batch(&ops)?;
+            if ops.is_empty() {
+                return Ok(());
+            }
+
+            let mut items = Vec::with_capacity(ops.len());
+            for op in ops {
+                match op {
+                    SingleTableBatchOp::Insert { pk, sk, value, .. } => {
+                        let put = Put::builder()
+                            .table_name(&table_name)
+                            .item(PK_ATTR, AttributeValue::S(pk))
+                            .item(SK_ATTR, AttributeValue::S(sk))
+                            .item(VAL_ATTR, AttributeValue::B(Blob::new(value)))
+                            .build()
+                            .map_err(|e| {
+                                AppError::Store(format!("dynamodb-single put build: {e}"))
+                            })?;
+                        items.push(TransactWriteItem::builder().put(put).build());
+                    }
+                    SingleTableBatchOp::Remove { pk, sk, .. } => {
+                        let del = Delete::builder()
+                            .table_name(&table_name)
+                            .key(PK_ATTR, AttributeValue::S(pk))
+                            .key(SK_ATTR, AttributeValue::S(sk))
+                            .build()
+                            .map_err(|e| {
+                                AppError::Store(format!("dynamodb-single delete build: {e}"))
+                            })?;
+                        items.push(TransactWriteItem::builder().delete(del).build());
                     }
                 }
-
-                self.client
-                    .transact_write_items()
-                    .set_transact_items(Some(items))
-                    .send()
-                    .await
-                    .map_err(|e| AppError::Store(format!("dynamodb-single transact: {e}")))?;
             }
+
+            // One call, one transaction: all of it applies or none of it does.
+            client
+                .transact_write_items()
+                .set_transact_items(Some(items))
+                .send()
+                .await
+                .map_err(|e| {
+                    let msg = format!("dynamodb-single transact: {e}");
+                    if transact_outcome_known(&e) {
+                        AppError::Store(msg)
+                    } else {
+                        AppError::StoreOutcomeUnknown(msg)
+                    }
+                })?;
             Ok(())
         })
+    }
+}
+
+/// Whether a failed `TransactWriteItems` is known not to have been applied.
+///
+/// DynamoDB answered with a refusal (cancelled, throttled, invalid) or the
+/// request was never built: nothing was written. A timeout, a dropped
+/// connection, an unreadable response or an internal error can follow a
+/// commit, so the outcome there is unknown.
+fn transact_outcome_known(
+    e: &aws_sdk_dynamodb::error::SdkError<
+        aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError,
+    >,
+) -> bool {
+    use aws_sdk_dynamodb::error::SdkError;
+    match e {
+        SdkError::ConstructionFailure(_) => true,
+        SdkError::ServiceError(se) => {
+            let err = se.err();
+            err.is_transaction_canceled_exception()
+                || err.is_provisioned_throughput_exceeded_exception()
+                || err.is_request_limit_exceeded()
+                || err.is_resource_not_found_exception()
+                || err.is_transaction_in_progress_exception()
+                || err.is_idempotent_parameter_mismatch_exception()
+        }
+        _ => false,
     }
 }
 
@@ -629,6 +964,410 @@ mod tests {
         assert_eq!(
             key_as_string("path/to/resource".as_bytes()).unwrap(),
             "path/to/resource"
+        );
+    }
+
+    fn insert(sk: &str, value_len: usize) -> SingleTableBatchOp {
+        SingleTableBatchOp::Insert {
+            pk: "ks".into(),
+            name_len: 2,
+            sk: sk.into(),
+            value: vec![0; value_len],
+        }
+    }
+
+    fn remove(sk: &str) -> SingleTableBatchOp {
+        SingleTableBatchOp::Remove {
+            pk: "ks".into(),
+            name_len: 2,
+            sk: sk.into(),
+        }
+    }
+
+    fn is_validation(r: Result<(), AppError>) -> bool {
+        matches!(r, Err(AppError::Validation(_)))
+    }
+
+    #[test]
+    fn the_reported_byte_limit_reserves_attribute_name_overhead() {
+        // 4 MiB minus, per operation (x 100): the attribute names ("pk", "sk",
+        // "val" = 7 bytes) and the longest namespace plus its separator (33).
+        assert_eq!(BATCH_LIMITS.max_ops, 100);
+        assert_eq!(BATCH_LIMITS.max_bytes, 4 * 1024 * 1024 - 100 * (7 + 33));
+    }
+
+    #[test]
+    fn check_batch_accepts_the_limit_and_refuses_one_more() {
+        let at_limit: Vec<_> = (0..100).map(|i| insert(&format!("k{i:03}"), 1)).collect();
+        assert!(check_batch(&at_limit).is_ok());
+        let over: Vec<_> = (0..101).map(|i| insert(&format!("k{i:03}"), 1)).collect();
+        assert!(is_validation(check_batch(&over)));
+    }
+
+    #[test]
+    fn check_batch_counts_keyspace_key_and_value_bytes_against_the_byte_limit() {
+        // One insert of keyspace "ks" (2) + key "k" (1) + value N is N + 3 bytes.
+        let exact = BATCH_LIMITS.max_bytes - 3;
+        assert!(check_batch(&[insert("k", exact)]).is_ok());
+        assert!(is_validation(check_batch(&[insert("k", exact + 1)])));
+    }
+
+    #[test]
+    fn check_batch_counts_removes_by_key_only() {
+        // A remove carries no value: keyspace "ks" (2) + key (3 bytes) = 5.
+        assert_eq!(remove("abc").size(), 5);
+        assert!(check_batch(&[remove("abc"), remove("abd")]).is_ok());
+    }
+
+    #[test]
+    fn check_batch_refuses_the_same_key_twice_but_not_the_same_key_in_two_keyspaces() {
+        assert!(is_validation(check_batch(&[insert("k", 1), remove("k")])));
+        let other = SingleTableBatchOp::Insert {
+            pk: "other".into(),
+            name_len: 5,
+            sk: "k".into(),
+            value: vec![],
+        };
+        assert!(check_batch(&[insert("k", 1), other]).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Request capture: assert what is sent on the wire, with no network.
+    //
+    // dynamodb-local cannot tell us whether a read was strongly consistent, so
+    // the SDK's own interceptor hook records each serialised request and then
+    // aborts before transmission.
+    // -----------------------------------------------------------------------
+
+    use aws_sdk_dynamodb::config::interceptors::BeforeTransmitInterceptorContextRef;
+    use aws_sdk_dynamodb::config::{
+        BehaviorVersion, ConfigBag, Credentials, Intercept, Region, RuntimeComponents,
+    };
+    use aws_sdk_dynamodb::error::BoxError;
+    use std::sync::Mutex;
+
+    /// One captured request: the DynamoDB operation and its JSON body.
+    type Sent = (String, serde_json::Value);
+
+    #[derive(Debug, Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<Sent>>>);
+
+    impl Intercept for Capture {
+        fn name(&self) -> &'static str {
+            "capture"
+        }
+
+        fn read_before_transmit(
+            &self,
+            context: &BeforeTransmitInterceptorContextRef<'_>,
+            _runtime_components: &RuntimeComponents,
+            _cfg: &mut ConfigBag,
+        ) -> Result<(), BoxError> {
+            let request = context.request();
+            let operation = request
+                .headers()
+                .get("x-amz-target")
+                .and_then(|t| t.rsplit('.').next())
+                .unwrap_or_default()
+                .to_string();
+            let body = request
+                .body()
+                .bytes()
+                .and_then(|b| serde_json::from_slice(b).ok())
+                .unwrap_or(serde_json::Value::Null);
+            self.0.lock().expect("capture lock").push((operation, body));
+            // Abort before the network: the call returns an error we ignore.
+            Err("captured".into())
+        }
+    }
+
+    fn capturing_backend(consistent_reads: Option<bool>) -> (SingleTableDynamoDbBackend, Capture) {
+        let capture = Capture::default();
+        let conf = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("k", "s", None, None, "test"))
+            .interceptor(capture.clone())
+            .build();
+        let settings = Settings::from_config(&StoreConfig {
+            dynamodb_table_name: Some("t".into()),
+            dynamodb_consistent_reads: consistent_reads,
+            ..StoreConfig::default()
+        })
+        .expect("settings");
+        (
+            SingleTableDynamoDbBackend::new(Client::from_conf(conf), settings),
+            capture,
+        )
+    }
+
+    /// Run every keyspace operation once and return what was sent, by operation.
+    async fn exercise(backend: &SingleTableDynamoDbBackend, capture: &Capture) -> Vec<Sent> {
+        let (_, ks) = backend.keyspace("meta").expect("keyspace");
+        let _ = ks.get_raw(b"k".to_vec()).await;
+        let _ = ks.contains_key(b"k".to_vec()).await;
+        let _ = ks.prefix_iter_raw(b"p".to_vec()).await;
+        let _ = ks.prefix_iter_raw(Vec::new()).await;
+        let _ = ks.insert_raw(b"k".to_vec(), b"v".to_vec()).await;
+        let _ = ks.remove(b"k".to_vec()).await;
+        let _ = ks.take_raw_atomic(b"k".to_vec()).await;
+        let _ = ks.incr_raw(b"k".to_vec()).await;
+        capture.0.lock().expect("capture lock").clone()
+    }
+
+    fn consistent(body: &serde_json::Value) -> Option<bool> {
+        body.get("ConsistentRead")
+            .and_then(serde_json::Value::as_bool)
+    }
+
+    #[tokio::test]
+    async fn reads_are_strongly_consistent_by_default() {
+        let (backend, capture) = capturing_backend(None);
+        let sent = exercise(&backend, &capture).await;
+
+        let reads: Vec<_> = sent
+            .iter()
+            .filter(|(op, _)| op == "GetItem" || op == "Query")
+            .collect();
+        assert_eq!(
+            reads.len(),
+            4,
+            "two GetItem (get, contains) and two Query (prefix, all): {sent:?}"
+        );
+        for (op, body) in reads {
+            assert_eq!(
+                consistent(body),
+                Some(true),
+                "{op} must be strongly consistent: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_can_opt_out_of_strong_consistency() {
+        let (backend, capture) = capturing_backend(Some(false));
+        let sent = exercise(&backend, &capture).await;
+
+        for (op, body) in sent
+            .iter()
+            .filter(|(op, _)| op == "GetItem" || op == "Query")
+        {
+            assert_ne!(consistent(body), Some(true), "{op} opted out: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn writes_never_carry_a_consistency_flag() {
+        let (backend, capture) = capturing_backend(None);
+        let sent = exercise(&backend, &capture).await;
+
+        for (op, body) in sent
+            .iter()
+            .filter(|(op, _)| matches!(op.as_str(), "PutItem" | "DeleteItem" | "UpdateItem"))
+        {
+            assert!(body.get("ConsistentRead").is_none(), "{op}: {body}");
+        }
+    }
+
+    #[test]
+    fn settings_default_to_strongly_consistent_reads() {
+        let cfg = |reads| StoreConfig {
+            dynamodb_table_name: Some("t".into()),
+            dynamodb_consistent_reads: reads,
+            ..StoreConfig::default()
+        };
+        assert!(Settings::from_config(&cfg(None)).unwrap().consistent_reads);
+        assert!(
+            Settings::from_config(&cfg(Some(true)))
+                .unwrap()
+                .consistent_reads
+        );
+        assert!(
+            !Settings::from_config(&cfg(Some(false)))
+                .unwrap()
+                .consistent_reads
+        );
+    }
+
+    #[test]
+    fn the_partition_key_is_the_bare_keyspace_unless_a_namespace_is_set() {
+        assert_eq!(pk_for(None, "dids"), "dids");
+        assert_eq!(pk_for(Some("witness"), "dids"), "witness#dids");
+    }
+
+    #[test]
+    fn namespaces_use_a_strict_allowlist() {
+        for ok in ["witness", "a", "A1", "a-b_c.d", &"x".repeat(32)] {
+            assert!(validate_namespace(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "a#b",
+            "a b",
+            "a/b",
+            "caf\u{e9}",
+            "a\nb",
+            &"x".repeat(33),
+        ] {
+            assert!(validate_namespace(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn settings_validate_the_namespace_and_name_the_field() {
+        let cfg = |ns: Option<&str>| StoreConfig {
+            dynamodb_table_name: Some("t".into()),
+            dynamodb_key_namespace: ns.map(str::to_string),
+            ..StoreConfig::default()
+        };
+        assert_eq!(Settings::from_config(&cfg(None)).unwrap().namespace, None);
+        assert_eq!(
+            Settings::from_config(&cfg(Some("witness")))
+                .unwrap()
+                .namespace
+                .as_deref(),
+            Some("witness")
+        );
+        let err = Settings::from_config(&cfg(Some("a#b")))
+            .err()
+            .expect("refused");
+        assert!(
+            matches!(&err, AppError::Config(m) if m.contains("dynamodb_key_namespace")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_keyspace_name_with_a_hash_is_refused() {
+        let (backend, _) = capturing_backend(None);
+        assert!(backend.keyspace("dids").is_ok());
+        assert!(backend.keyspace("witness#dids").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Startup probe and table-name validation
+    // -----------------------------------------------------------------------
+
+    fn is_config_error_containing(r: Result<(), AppError>, needle: &str) -> bool {
+        matches!(&r, Err(AppError::Config(m)) if m.contains(needle))
+    }
+
+    #[test]
+    fn a_missing_table_is_a_definitive_configuration_error() {
+        let r = probe_outcome(
+            Some("ResourceNotFoundException"),
+            Some("Requested resource not found"),
+            "my-table",
+        );
+        assert!(is_config_error_containing(r, "my-table"));
+        let r = probe_outcome(Some("ResourceNotFoundException"), None, "my-table");
+        assert!(is_config_error_containing(r, "not found"));
+    }
+
+    #[test]
+    fn a_wrong_key_schema_is_a_definitive_configuration_error() {
+        let r = probe_outcome(
+            Some("ValidationException"),
+            Some("The provided key element does not match the schema"),
+            "my-table",
+        );
+        assert!(
+            is_config_error_containing(r, "key schema"),
+            "names the expected schema"
+        );
+    }
+
+    #[test]
+    fn anything_else_is_inconclusive_and_never_blocks_startup() {
+        for code in [
+            Some("AccessDeniedException"),
+            Some("ThrottlingException"),
+            Some("ProvisionedThroughputExceededException"),
+            Some("InternalServerError"),
+            None, // a dispatch failure or timeout carries no service code
+        ] {
+            assert!(probe_outcome(code, None, "t").is_ok(), "{code:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_probe_is_a_consistent_get_item_then_a_one_row_query_on_a_reserved_key() {
+        let (backend, capture) = capturing_backend(None);
+        // The captured requests are aborted before the network: inconclusive, so Ok.
+        backend
+            .probe()
+            .await
+            .expect("an inconclusive probe must not fail startup");
+
+        let sent = capture.0.lock().expect("capture lock").clone();
+        assert_eq!(sent.len(), 2, "exactly two requests: {sent:?}");
+        let (op, body) = &sent[0];
+        assert_eq!(
+            op, "GetItem",
+            "the only permission the backend already needs"
+        );
+        assert_eq!(body["Key"]["pk"]["S"], "_probe");
+        assert_eq!(consistent(body), Some(true));
+
+        // The query tells the partition key from the sort key: equality on `pk`,
+        // `begins_with` on `sk`, as every prefix listing does.
+        let (op, body) = &sent[1];
+        assert_eq!(op, "Query");
+        assert_eq!(
+            body["KeyConditionExpression"],
+            "#pk = :ks AND begins_with(#sk, :pfx)"
+        );
+        assert_eq!(body["ExpressionAttributeNames"]["#pk"], "pk");
+        assert_eq!(body["ExpressionAttributeNames"]["#sk"], "sk");
+        assert_eq!(body["ExpressionAttributeValues"][":ks"]["S"], "_probe");
+        assert_eq!(body["ExpressionAttributeValues"][":pfx"]["S"], "_probe");
+        assert_eq!(body["Limit"], 1, "one row is enough to prove the schema");
+        assert_eq!(consistent(body), Some(true));
+    }
+
+    #[tokio::test]
+    async fn the_probe_follows_the_namespace() {
+        let capture = Capture::default();
+        let conf = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("k", "s", None, None, "test"))
+            .interceptor(capture.clone())
+            .build();
+        let settings = Settings::from_config(&StoreConfig {
+            dynamodb_table_name: Some("t".into()),
+            dynamodb_key_namespace: Some("witness".into()),
+            ..StoreConfig::default()
+        })
+        .expect("settings");
+        let backend = SingleTableDynamoDbBackend::new(Client::from_conf(conf), settings);
+        backend.probe().await.expect("probe");
+        let sent = capture.0.lock().expect("capture lock").clone();
+        assert_eq!(sent[0].1["Key"]["pk"]["S"], "witness#_probe");
+        assert_eq!(
+            sent[1].1["ExpressionAttributeValues"][":ks"]["S"],
+            "witness#_probe"
+        );
+    }
+
+    #[test]
+    fn a_blank_table_name_is_refused() {
+        for blank in ["", " ", "\t\n"] {
+            let r = Settings::from_config(&StoreConfig {
+                dynamodb_table_name: Some(blank.into()),
+                ..StoreConfig::default()
+            });
+            assert!(
+                matches!(&r, Err(AppError::Config(m)) if m.contains("dynamodb_table_name")),
+                "{blank:?}"
+            );
+        }
+        assert!(
+            Settings::from_config(&StoreConfig {
+                dynamodb_table_name: Some("webvh".into()),
+                ..StoreConfig::default()
+            })
+            .is_ok()
         );
     }
 }

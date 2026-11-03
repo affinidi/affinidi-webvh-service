@@ -308,6 +308,7 @@ impl From<crate::error::AppError> for OpError {
         match e {
             AppError::Io(_)
             | AppError::Store(_)
+            | AppError::StoreOutcomeUnknown(_)
             | AppError::SecretStore(_)
             | AppError::Internal(_)
             // Over capacity (a throttled store): this server can apply it

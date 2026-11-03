@@ -144,6 +144,11 @@ impl StorageBackend for FjallBackend {
         })
     }
 
+    fn commits_atomically(&self) -> bool {
+        // One journalled batch: all of it or none.
+        true
+    }
+
     fn persist(&self) -> BoxFuture<'_, Result<(), AppError>> {
         let db = self.db.clone();
         Box::pin(async move {
@@ -832,5 +837,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ks.verify_integrity().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn fjall_imposes_no_batch_limit() {
+        let (store, _dir) = temp_store().await;
+        assert_eq!(
+            store.batch_limits(),
+            None,
+            "fjall batches are atomic at any size, so callers must not be throttled"
+        );
     }
 }

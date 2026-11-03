@@ -31,11 +31,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use aws_sdk_dynamodb::Client;
+use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, KeySchemaElement, KeyType, ProvisionedThroughput, ScalarAttributeType,
+    AttributeDefinition, AttributeValue, KeySchemaElement, KeyType, ProvisionedThroughput,
+    ScalarAttributeType,
 };
 use did_hosting_common::server::config::StoreConfig;
-use did_hosting_common::server::store::Store;
+use did_hosting_common::server::error::AppError;
+use did_hosting_common::server::store::{BatchLimits, Store, chunk_ranges};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -118,6 +121,11 @@ async fn delete_test_table(client: &Client, name: &str) {
 /// Open a `Store` backed by single-table DynamoDB pointed at `endpoint`
 /// using the given `table_name`.
 async fn open_store(endpoint: &str, table_name: &str) -> Store {
+    open_store_in(endpoint, table_name, None).await
+}
+
+/// [`open_store`] with an optional key namespace.
+async fn open_store_in(endpoint: &str, table_name: &str, namespace: Option<&str>) -> Store {
     // AWS_ENDPOINT_URL is respected by aws_config::from_env() inside
     // SingleTableDynamoDbBackend::open, so set it for this process.
     // SAFETY: test-only, single-threaded per test; no concurrent reads
@@ -133,26 +141,45 @@ async fn open_store(endpoint: &str, table_name: &str) -> Store {
         data_dir: PathBuf::from("/tmp"),
         dynamodb_table_name: Some(table_name.to_string()),
         dynamodb_region: Some("us-east-1".to_string()),
+        dynamodb_key_namespace: namespace.map(str::to_string),
         ..StoreConfig::default()
     };
 
     Store::open(&config).await.expect("open single-table store")
 }
 
-/// Macro that skips the test when `DYNAMODB_SINGLE_TEST_ENDPOINT` is
-/// not set, avoiding a hard failure in environments without local
-/// DynamoDB.
+/// What to do about a missing endpoint: skip locally, fail in CI.
+///
+/// A suite that silently skips when its endpoint variable is unset reports
+/// green having tested nothing (a typo in a CI variable would look like a
+/// pass). Locally a skip is convenient; where `CI` is set it is an error.
+fn endpoint_or_skip(endpoint: Option<String>, in_ci: bool) -> Result<Option<String>, String> {
+    match (endpoint, in_ci) {
+        (Some(ep), _) => Ok(Some(ep)),
+        (None, false) => Ok(None),
+        (None, true) => Err(
+            "DYNAMODB_SINGLE_TEST_ENDPOINT is not set but CI is: refusing to skip the \
+             single-table DynamoDB suite (that would pass having tested nothing)"
+                .to_string(),
+        ),
+    }
+}
+
+/// Macro that skips the test when `DYNAMODB_SINGLE_TEST_ENDPOINT` is not set,
+/// avoiding a hard failure on a developer machine without local DynamoDB, and
+/// fails instead of skipping when `CI` is set (see [`endpoint_or_skip`]).
 macro_rules! require_endpoint {
     () => {
-        match local_endpoint() {
-            Some(ep) => ep,
-            None => {
+        match endpoint_or_skip(local_endpoint(), std::env::var_os("CI").is_some()) {
+            Ok(Some(ep)) => ep,
+            Ok(None) => {
                 eprintln!(
                     "SKIP: DYNAMODB_SINGLE_TEST_ENDPOINT not set — \
                      skipping single-table DynamoDB test"
                 );
                 return;
             }
+            Err(msg) => panic!("{msg}"),
         }
     };
 }
@@ -1946,6 +1973,958 @@ async fn daemon_full_lifecycle_single_table() {
             .contains_key("witness:.well-known:v1")
             .await
             .expect("c")
+    );
+
+    delete_test_table(&client, &table).await;
+}
+
+// ---------------------------------------------------------------------------
+// On-table contract (format freeze)
+//
+// The item shape is what a live deployment already stores, so it is a frozen
+// contract: a change here is a data migration. These tests read the raw item
+// through the AWS SDK (not through the backend) and write rows in today's
+// shape for the backend to read, so neither direction can drift unnoticed.
+// ---------------------------------------------------------------------------
+
+/// Read one raw item (strongly consistent) as `(attribute name, value)` pairs.
+async fn raw_item(
+    client: &Client,
+    table: &str,
+    pk: &str,
+    sk: &str,
+) -> Option<std::collections::BTreeMap<String, AttributeValue>> {
+    client
+        .get_item()
+        .table_name(table)
+        .key("pk", AttributeValue::S(pk.to_string()))
+        .key("sk", AttributeValue::S(sk.to_string()))
+        .consistent_read(true)
+        .send()
+        .await
+        .expect("raw get_item")
+        .item
+        .map(|m| m.into_iter().collect())
+}
+
+/// Write one raw item exactly as a deployment already running this backend
+/// would have written it.
+async fn put_raw_item(
+    client: &Client,
+    table: &str,
+    pk: &str,
+    sk: &str,
+    attrs: &[(&str, AttributeValue)],
+) {
+    let mut req = client
+        .put_item()
+        .table_name(table)
+        .item("pk", AttributeValue::S(pk.to_string()))
+        .item("sk", AttributeValue::S(sk.to_string()));
+    for (name, value) in attrs {
+        req = req.item(*name, value.clone());
+    }
+    req.send().await.expect("raw put_item");
+}
+
+#[tokio::test]
+async fn value_item_shape_is_pk_sk_val() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace("dids").expect("keyspace");
+
+    ks.insert_raw("did:alice", b"payload".to_vec())
+        .await
+        .expect("insert");
+
+    let item = raw_item(&client, &table, "dids", "did:alice")
+        .await
+        .expect("item exists under pk=keyspace, sk=key");
+    assert_eq!(item.len(), 3, "exactly pk, sk, val: {item:?}");
+    assert_eq!(item["pk"], AttributeValue::S("dids".into()));
+    assert_eq!(item["sk"], AttributeValue::S("did:alice".into()));
+    assert_eq!(
+        item["val"],
+        AttributeValue::B(Blob::new(b"payload".to_vec()))
+    );
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn batch_item_shape_matches_single_insert() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace("dids").expect("keyspace");
+
+    let mut batch = store.batch();
+    batch.insert_raw(&ks, "did:bob", b"b".to_vec());
+    batch.commit().await.expect("commit");
+
+    let item = raw_item(&client, &table, "dids", "did:bob")
+        .await
+        .expect("item");
+    assert_eq!(item.len(), 3, "exactly pk, sk, val: {item:?}");
+    assert_eq!(item["val"], AttributeValue::B(Blob::new(b"b".to_vec())));
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn counter_item_shape_is_pk_sk_cnt_without_val() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace("meta").expect("keyspace");
+
+    assert_eq!(ks.incr_raw("lockout:x").await.expect("incr"), 1);
+    assert_eq!(ks.incr_raw("lockout:x").await.expect("incr"), 2);
+
+    let item = raw_item(&client, &table, "meta", "lockout:x")
+        .await
+        .expect("item");
+    assert_eq!(item.len(), 3, "exactly pk, sk, cnt: {item:?}");
+    assert_eq!(item["cnt"], AttributeValue::N("2".into()));
+    assert!(
+        !item.contains_key("val"),
+        "a counter item has no val: {item:?}"
+    );
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn rows_written_in_todays_shape_are_readable() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace("dids").expect("keyspace");
+
+    // A value row, an empty-value row, and a counter-only row, written the way
+    // an already-deployed instance wrote them.
+    put_raw_item(
+        &client,
+        &table,
+        "dids",
+        "did:legacy",
+        &[("val", AttributeValue::B(Blob::new(b"old".to_vec())))],
+    )
+    .await;
+    put_raw_item(
+        &client,
+        &table,
+        "dids",
+        "did:empty",
+        &[("val", AttributeValue::B(Blob::new(Vec::new())))],
+    )
+    .await;
+    put_raw_item(
+        &client,
+        &table,
+        "dids",
+        "lockout:old",
+        &[("cnt", AttributeValue::N("5".into()))],
+    )
+    .await;
+
+    assert_eq!(
+        ks.get_raw("did:legacy").await.expect("get"),
+        Some(b"old".to_vec())
+    );
+    assert_eq!(
+        ks.get_raw("did:empty").await.expect("get"),
+        Some(Vec::new())
+    );
+    assert!(ks.contains_key("did:legacy").await.expect("contains"));
+
+    // A counter-only row is present but has no value; listings skip it.
+    assert!(ks.contains_key("lockout:old").await.expect("contains"));
+    assert_eq!(ks.get_raw("lockout:old").await.expect("get"), None);
+    let listed: Vec<String> = ks
+        .iter_all()
+        .await
+        .expect("iter")
+        .into_iter()
+        .map(|(k, _)| String::from_utf8(k).expect("utf8"))
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["did:empty".to_string(), "did:legacy".to_string()]
+    );
+
+    // The counter continues from its stored value.
+    assert_eq!(ks.incr_raw("lockout:old").await.expect("incr"), 6);
+
+    delete_test_table(&client, &table).await;
+}
+
+// ---------------------------------------------------------------------------
+// BatchOps — one batch is one atomic transaction, or it is refused
+//
+// DynamoDB's TransactWriteItems holds at most 100 operations and 4 MB, and a
+// batch that needed several would not be atomic. The backend refuses it before
+// writing anything, with a client-safe validation error, and never writes a
+// key it had to alter to make it fit a string column.
+// ---------------------------------------------------------------------------
+
+/// Count the items stored under `keyspace` (strongly consistent).
+async fn count_in(store: &Store, keyspace: &str) -> usize {
+    store
+        .keyspace(keyspace)
+        .expect("keyspace")
+        .iter_all()
+        .await
+        .expect("iter_all")
+        .len()
+}
+
+#[tokio::test]
+async fn batch_with_a_non_utf8_key_is_refused_and_writes_nothing() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace("bulk").expect("keyspace");
+
+    let mut batch = store.batch();
+    batch.insert_raw(&ks, "ok:1", b"valid".to_vec());
+    batch.insert_raw(&ks, vec![0xff, 0xfe], b"bad key".to_vec());
+    let err = batch
+        .commit()
+        .await
+        .expect_err("a non-UTF-8 key must be refused");
+    assert!(
+        matches!(err, AppError::Validation(_)),
+        "client-safe error: {err:?}"
+    );
+
+    // Neither the bad key (under a replacement character) nor the valid op landed.
+    assert_eq!(count_in(&store, "bulk").await, 0, "all-or-nothing");
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn batch_with_a_non_utf8_remove_is_refused_and_writes_nothing() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace("bulk").expect("keyspace");
+    ks.insert_raw("keep:me", b"v".to_vec()).await.expect("seed");
+
+    let mut batch = store.batch();
+    batch.remove(&ks, "keep:me");
+    batch.remove(&ks, vec![0xc3, 0x28]);
+    assert!(batch.commit().await.is_err());
+    assert!(
+        ks.contains_key("keep:me").await.expect("contains"),
+        "valid remove must not apply"
+    );
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn batch_of_exactly_100_ops_commits() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace("bulk").expect("keyspace");
+
+    let mut batch = store.batch();
+    for i in 0..100 {
+        batch.insert_raw(&ks, format!("item:{i:03}"), b"v".to_vec());
+    }
+    batch.commit().await.expect("100 ops fit one transaction");
+    assert_eq!(count_in(&store, "bulk").await, 100);
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn batch_of_101_ops_is_refused_and_writes_nothing() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace("bulk").expect("keyspace");
+
+    let mut batch = store.batch();
+    for i in 0..101 {
+        batch.insert_raw(&ks, format!("item:{i:03}"), b"v".to_vec());
+    }
+    let err = batch
+        .commit()
+        .await
+        .expect_err("101 ops cannot be one transaction");
+    assert!(
+        matches!(err, AppError::Validation(_)),
+        "client-safe error: {err:?}"
+    );
+    assert_eq!(count_in(&store, "bulk").await, 0, "no partial write");
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn batch_over_4_mib_is_refused_and_writes_nothing() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace("bulk").expect("keyspace");
+
+    // 14 x 300 KB = 4.2 MB: each item is under DynamoDB's 400 KB item limit,
+    // the transaction is not.
+    let mut batch = store.batch();
+    for i in 0..14 {
+        batch.insert_raw(&ks, format!("big:{i:02}"), vec![0u8; 300 * 1024]);
+    }
+    let err = batch
+        .commit()
+        .await
+        .expect_err("over 4 MiB cannot be one transaction");
+    assert!(
+        matches!(err, AppError::Validation(_)),
+        "client-safe error: {err:?}"
+    );
+    assert_eq!(count_in(&store, "bulk").await, 0, "no partial write");
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn batch_touching_one_key_twice_is_refused_with_a_clear_error() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace("bulk").expect("keyspace");
+
+    let mut batch = store.batch();
+    batch.insert_raw(&ks, "dup", b"one".to_vec());
+    batch.remove(&ks, "dup");
+    let err = batch
+        .commit()
+        .await
+        .expect_err("the same key twice is ambiguous");
+    match err {
+        AppError::Validation(msg) => assert!(msg.contains("same key"), "message: {msg}"),
+        other => panic!("expected a validation error, got {other:?}"),
+    }
+    assert_eq!(count_in(&store, "bulk").await, 0);
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn batch_limits_report_the_transaction_ceiling() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+
+    assert_eq!(
+        store.batch_limits(),
+        Some(BatchLimits {
+            max_ops: 100,
+            // 4 MiB less, per operation (x 100), the attribute names (7 bytes)
+            // and the longest namespace plus its separator (33 bytes).
+            max_bytes: 4 * 1024 * 1024 - 100 * (7 + 33),
+        })
+    );
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn bulk_write_chunked_to_the_limits_commits_every_entry() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace("bulk").expect("keyspace");
+
+    // 250 small entries (more than two transactions by count) plus 30 large
+    // ones (several transactions by bytes), as a restore would write them.
+    let mut entries: Vec<(String, Vec<u8>)> = (0..250)
+        .map(|i| (format!("small:{i:03}"), vec![1u8; 10]))
+        .collect();
+    entries.extend((0..30).map(|i| (format!("large:{i:02}"), vec![2u8; 300_000])));
+    let sizes: Vec<usize> = entries
+        .iter()
+        .map(|(k, v)| ks.name.len() + k.len() + v.len())
+        .collect();
+
+    let chunks = chunk_ranges(store.batch_limits(), 1000, &sizes);
+    assert!(chunks.len() > 3, "the input needs several transactions");
+    for range in chunks {
+        let mut batch = store.batch();
+        for (key, value) in &entries[range] {
+            batch.insert_raw(&ks, key.clone(), value.clone());
+        }
+        batch
+            .commit()
+            .await
+            .expect("each planned chunk is one valid transaction");
+    }
+
+    assert_eq!(
+        count_in(&store, "bulk").await,
+        entries.len(),
+        "nothing dropped"
+    );
+
+    delete_test_table(&client, &table).await;
+}
+
+// ---------------------------------------------------------------------------
+// Key namespace: several stores on one table without sharing rows
+//
+// The daemon runs a main store and a witness store, and both use keyspaces
+// named `acl` and `witnesses`. On one table, without a namespace, they would be
+// the same rows (a revoke through the witness would edit the control plane's
+// ACL). A namespace is part of the partition key; unset it is not.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn namespaced_rows_use_namespace_hash_keyspace_as_the_partition_key() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store_in(&endpoint, &table, Some("witness")).await;
+    let ks = store.keyspace("acl").expect("keyspace");
+
+    ks.insert_raw("acl:did:x", b"v".to_vec())
+        .await
+        .expect("insert");
+
+    let item = raw_item(&client, &table, "witness#acl", "acl:did:x")
+        .await
+        .expect("stored under pk = namespace#keyspace");
+    assert_eq!(item["pk"], AttributeValue::S("witness#acl".into()));
+    assert_eq!(
+        item["sk"],
+        AttributeValue::S("acl:did:x".into()),
+        "the key is not prefixed"
+    );
+    assert!(
+        raw_item(&client, &table, "acl", "acl:did:x")
+            .await
+            .is_none(),
+        "nothing under the bare keyspace"
+    );
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn a_namespaced_store_and_an_unnamespaced_store_share_a_table_without_sharing_rows() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    // The deployed shape: the main store keeps bare keyspaces (existing rows
+    // stay addressable); the witness store gets a namespace.
+    let main = open_store_in(&endpoint, &table, None).await;
+    let witness = open_store_in(&endpoint, &table, Some("witness")).await;
+    let main_acl = main.keyspace("acl").expect("keyspace");
+    let witness_acl = witness.keyspace("acl").expect("keyspace");
+
+    main_acl
+        .insert_raw("acl:did:admin", b"admin".to_vec())
+        .await
+        .expect("seed");
+
+    // The witness cannot see the control plane's ACL...
+    assert_eq!(
+        witness_acl.get_raw("acl:did:admin").await.expect("get"),
+        None
+    );
+    assert!(
+        !witness_acl
+            .contains_key("acl:did:admin")
+            .await
+            .expect("contains")
+    );
+    assert!(witness_acl.iter_all().await.expect("iter").is_empty());
+
+    // ...so a revoke on the witness side does not remove it from the main one.
+    witness_acl
+        .insert_raw("acl:did:admin", b"witness-copy".to_vec())
+        .await
+        .expect("insert");
+    witness_acl
+        .remove("acl:did:admin")
+        .await
+        .expect("revoke on the witness");
+    assert_eq!(
+        main_acl.get_raw("acl:did:admin").await.expect("get"),
+        Some(b"admin".to_vec()),
+        "the control plane's ACL entry is untouched"
+    );
+
+    // Atomic take and counters are isolated too.
+    main_acl
+        .insert_raw("tok", b"main".to_vec())
+        .await
+        .expect("insert");
+    assert_eq!(witness_acl.take_raw("tok").await.expect("take"), None);
+    assert_eq!(
+        main_acl.take_raw("tok").await.expect("take"),
+        Some(b"main".to_vec())
+    );
+    assert_eq!(main_acl.incr_raw("n").await.expect("incr"), 1);
+    assert_eq!(
+        witness_acl.incr_raw("n").await.expect("incr"),
+        1,
+        "independent counters"
+    );
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn namespaces_are_isolated_in_prefix_listings_and_batches() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let a = open_store_in(&endpoint, &table, Some("a")).await;
+    let b = open_store_in(&endpoint, &table, Some("b")).await;
+    let a_ks = a.keyspace("dids").expect("keyspace");
+    let b_ks = b.keyspace("dids").expect("keyspace");
+
+    let mut batch = a.batch();
+    batch.insert_raw(&a_ks, "did:1", b"a1".to_vec());
+    batch.insert_raw(&a_ks, "did:2", b"a2".to_vec());
+    batch.commit().await.expect("commit a");
+    b_ks.insert_raw("did:1", b"b1".to_vec())
+        .await
+        .expect("insert b");
+
+    assert_eq!(a_ks.prefix_iter_raw("did:").await.expect("iter").len(), 2);
+    assert_eq!(b_ks.prefix_iter_raw("did:").await.expect("iter").len(), 1);
+    assert_eq!(
+        b_ks.get_raw("did:1").await.expect("get"),
+        Some(b"b1".to_vec())
+    );
+    assert_eq!(
+        a_ks.get_raw("did:1").await.expect("get"),
+        Some(b"a1".to_vec())
+    );
+
+    let mut batch = a.batch();
+    batch.remove(&a_ks, "did:1");
+    batch.commit().await.expect("remove in a");
+    assert_eq!(
+        b_ks.get_raw("did:1").await.expect("get"),
+        Some(b"b1".to_vec()),
+        "b untouched"
+    );
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn a_namespaced_store_does_not_see_existing_unnamespaced_rows() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    put_raw_item(
+        &client,
+        &table,
+        "witnesses",
+        "witness:w1",
+        &[("val", AttributeValue::B(Blob::new(b"key".to_vec())))],
+    )
+    .await;
+
+    let witness = open_store_in(&endpoint, &table, Some("witness")).await;
+    let ks = witness.keyspace("witnesses").expect("keyspace");
+    assert!(
+        ks.iter_all().await.expect("iter").is_empty(),
+        "starts from empty namespaced keyspaces"
+    );
+
+    // The legacy row is still there for a store without a namespace.
+    let legacy = open_store_in(&endpoint, &table, None).await;
+    assert_eq!(
+        legacy
+            .keyspace("witnesses")
+            .expect("keyspace")
+            .get_raw("witness:w1")
+            .await
+            .expect("get"),
+        Some(b"key".to_vec())
+    );
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn a_keyspace_name_with_a_hash_is_refused() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    // "witness#acl" as a bare keyspace would be the same partition as keyspace
+    // "acl" in namespace "witness".
+    for namespace in [None, Some("witness")] {
+        let store = open_store_in(&endpoint, &table, namespace).await;
+        assert!(
+            store.keyspace("witness#acl").is_err(),
+            "namespace {namespace:?}"
+        );
+    }
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn open_refuses_an_invalid_namespace_before_touching_dynamodb() {
+    // No endpoint needed: validation fires before any AWS call.
+    for bad in ["", "a#b", "has space", "caf\u{e9}", &"x".repeat(33)] {
+        let config = StoreConfig {
+            data_dir: PathBuf::from("/tmp"),
+            dynamodb_table_name: Some("t".into()),
+            dynamodb_key_namespace: Some(bad.to_string()),
+            ..StoreConfig::default()
+        };
+        match Store::open(&config).await {
+            Err(e) => assert!(
+                format!("{e}").contains("dynamodb_key_namespace"),
+                "error should name the field for {bad:?}: {e}"
+            ),
+            Ok(_) => panic!("namespace {bad:?} must be refused"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Startup probe: a misconfigured table fails at open, not on the first request
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn open_fails_clearly_when_the_table_does_not_exist() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let missing = format!("no_such_table_{}", std::process::id());
+    // Make sure it really is absent.
+    delete_test_table(&client, &missing).await;
+
+    // `open_store_in` expects success, so open directly.
+    unsafe {
+        std::env::set_var("AWS_ENDPOINT_URL", &endpoint);
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+    }
+    let config = StoreConfig {
+        data_dir: PathBuf::from("/tmp"),
+        dynamodb_table_name: Some(missing.clone()),
+        dynamodb_region: Some("us-east-1".into()),
+        ..StoreConfig::default()
+    };
+    match Store::open(&config).await {
+        Err(AppError::Config(msg)) => {
+            assert!(msg.contains(&missing), "names the table: {msg}");
+            assert!(
+                msg.contains("pk") && msg.contains("sk"),
+                "says what the table needs: {msg}"
+            );
+        }
+        Err(other) => panic!("expected a Config error, got {other:?}"),
+        Ok(_) => panic!("a missing table must fail at open"),
+    }
+}
+
+#[tokio::test]
+async fn open_fails_clearly_when_the_table_has_the_wrong_key_schema() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    // A table keyed only by `id`, as someone might provision by mistake.
+    let name = format!("wrong_schema_{}", std::process::id());
+    delete_test_table(&client, &name).await;
+    client
+        .create_table()
+        .table_name(&name)
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("id")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("id")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .provisioned_throughput(
+            ProvisionedThroughput::builder()
+                .read_capacity_units(1)
+                .write_capacity_units(1)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("create wrong-schema table");
+
+    unsafe {
+        std::env::set_var("AWS_ENDPOINT_URL", &endpoint);
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+    }
+    let config = StoreConfig {
+        data_dir: PathBuf::from("/tmp"),
+        dynamodb_table_name: Some(name.clone()),
+        dynamodb_region: Some("us-east-1".into()),
+        ..StoreConfig::default()
+    };
+    let result = Store::open(&config).await;
+    delete_test_table(&client, &name).await;
+    match result {
+        Err(AppError::Config(msg)) => assert!(msg.contains("key schema"), "{msg}"),
+        Err(other) => panic!("expected a Config error, got {other:?}"),
+        Ok(_) => panic!("a table with the wrong key schema must fail at open"),
+    }
+}
+
+#[tokio::test]
+async fn open_fails_clearly_when_the_key_roles_are_reversed() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    // Both attributes are the right names and types, but `sk` is the partition
+    // key and `pk` the sort key. A `GetItem` names both and succeeds; only a
+    // `Query` on `pk` shows the roles are wrong.
+    let name = format!("reversed_roles_{}", std::process::id());
+    delete_test_table(&client, &name).await;
+    client
+        .create_table()
+        .table_name(&name)
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("sk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Range)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("sk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .provisioned_throughput(
+            ProvisionedThroughput::builder()
+                .read_capacity_units(1)
+                .write_capacity_units(1)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("create reversed-roles table");
+
+    unsafe {
+        std::env::set_var("AWS_ENDPOINT_URL", &endpoint);
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+    }
+    let config = StoreConfig {
+        data_dir: PathBuf::from("/tmp"),
+        dynamodb_table_name: Some(name.clone()),
+        dynamodb_region: Some("us-east-1".into()),
+        ..StoreConfig::default()
+    };
+    let result = Store::open(&config).await;
+    delete_test_table(&client, &name).await;
+    match result {
+        Err(AppError::Config(msg)) => assert!(msg.contains("key schema"), "{msg}"),
+        Err(other) => panic!("expected a Config error, got {other:?}"),
+        Ok(_) => panic!("a table with reversed key roles must fail at open"),
+    }
+}
+
+#[tokio::test]
+async fn open_refuses_a_blank_table_name() {
+    for blank in ["", "   "] {
+        let config = StoreConfig {
+            data_dir: PathBuf::from("/tmp"),
+            dynamodb_table_name: Some(blank.to_string()),
+            ..StoreConfig::default()
+        };
+        match Store::open(&config).await {
+            Err(e) => assert!(
+                format!("{e}").contains("dynamodb_table_name"),
+                "{blank:?}: {e}"
+            ),
+            Ok(_) => panic!("table name {blank:?} must be refused"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint policy: skip locally, fail in CI
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_missing_endpoint_skips_locally_but_fails_in_ci() {
+    assert_eq!(endpoint_or_skip(None, false), Ok(None));
+    assert!(
+        endpoint_or_skip(None, true).is_err(),
+        "must not pass having tested nothing"
+    );
+    assert_eq!(
+        endpoint_or_skip(Some("http://localhost:8000".into()), true),
+        Ok(Some("http://localhost:8000".into()))
+    );
+    assert_eq!(
+        endpoint_or_skip(Some("http://localhost:8000".into()), false),
+        Ok(Some("http://localhost:8000".into()))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Prefix listing across Query pages, atomic take under contention, counters
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn prefix_listing_follows_query_pages() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace("big").expect("keyspace");
+
+    // 30 x 100 KB = 3 MB across the prefix. A single Query returns at most
+    // 1 MB, so listing it takes at least three pages. (Written one at a time:
+    // a 3 MB write is more than one batch can hold.)
+    for i in 0..30 {
+        ks.insert_raw(format!("page:{i:02}"), vec![i as u8; 100 * 1024])
+            .await
+            .expect("insert");
+    }
+    ks.insert_raw("other:1", b"not in the prefix".to_vec())
+        .await
+        .expect("insert");
+
+    let listed = ks.prefix_iter_raw("page:").await.expect("prefix");
+    assert_eq!(listed.len(), 30, "every page of results is followed");
+    let keys: Vec<_> = listed
+        .iter()
+        .map(|(k, _)| String::from_utf8(k.clone()).expect("utf8"))
+        .collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted, "results stay in sort-key order across pages");
+    assert!(
+        listed.iter().all(|(_, v)| v.len() == 100 * 1024),
+        "values intact"
+    );
+
+    assert_eq!(ks.iter_all().await.expect("iter").len(), 31);
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn concurrent_take_has_exactly_one_winner() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace("sessions").expect("keyspace");
+    ks.insert_raw("refresh:tok", b"session-1".to_vec())
+        .await
+        .expect("insert");
+
+    let mut tasks = Vec::new();
+    for _ in 0..16 {
+        let ks = ks.clone();
+        tasks.push(tokio::spawn(async move {
+            ks.take_raw("refresh:tok").await.expect("take")
+        }));
+    }
+    let mut winners = 0;
+    for task in tasks {
+        if task.await.expect("join") == Some(b"session-1".to_vec()) {
+            winners += 1;
+        }
+    }
+    assert_eq!(
+        winners, 1,
+        "a single-use token must be consumed exactly once"
+    );
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn a_counter_restarts_after_it_is_removed() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace("meta").expect("keyspace");
+
+    assert_eq!(ks.incr_raw("lockout:x").await.expect("incr"), 1);
+    assert_eq!(ks.incr_raw("lockout:x").await.expect("incr"), 2);
+    ks.remove("lockout:x").await.expect("remove");
+    assert!(!ks.contains_key("lockout:x").await.expect("contains"));
+    assert_eq!(
+        ks.incr_raw("lockout:x").await.expect("incr"),
+        1,
+        "starts again from one"
+    );
+
+    delete_test_table(&client, &table).await;
+}
+
+#[tokio::test]
+async fn writing_a_value_over_a_counter_replaces_the_item() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace("meta").expect("keyspace");
+
+    // A key is either a value or a counter. Writing a value replaces the whole
+    // item, so the counter is gone and the value is readable.
+    assert_eq!(ks.incr_raw("k").await.expect("incr"), 1);
+    ks.insert_raw("k", b"now a value".to_vec())
+        .await
+        .expect("insert");
+    assert_eq!(
+        ks.get_raw("k").await.expect("get"),
+        Some(b"now a value".to_vec())
+    );
+    let item = raw_item(&client, &table, "meta", "k").await.expect("item");
+    assert!(
+        !item.contains_key("cnt"),
+        "the counter attribute is replaced: {item:?}"
     );
 
     delete_test_table(&client, &table).await;

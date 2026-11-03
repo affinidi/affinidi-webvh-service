@@ -295,7 +295,7 @@ external services.
 | Fjall (default, embedded) | `store-fjall`            | `store.data_dir`                                                                                             |
 | Redis                     | `store-redis`            | `store.redis_url`                                                                                            |
 | AWS DynamoDB (auto)       | `store-dynamodb`         | `store.dynamodb_table_prefix`, `store.dynamodb_region`                                                       |
-| AWS DynamoDB (single-table, externally provisioned) | `store-dynamodb-single` | `store.dynamodb_table_name` (required), `store.dynamodb_region`. Table must exist with `pk` (S, HASH) + `sk` (S, RANGE). |
+| AWS DynamoDB (single-table, externally provisioned) | `store-dynamodb-single` | `store.dynamodb_table_name` (required), `store.dynamodb_region`, `store.dynamodb_key_namespace`, `store.dynamodb_consistent_reads` (default `true`). Table must exist with `pk` (S, HASH) + `sk` (S, RANGE); see [docs/store-dynamodb-single.md](../docs/store-dynamodb-single.md). |
 | Google Firestore          | `store-firestore`        | `store.firestore_project`, `store.firestore_database`                                                        |
 | Azure Cosmos DB           | `store-cosmosdb`         | `store.cosmosdb_endpoint`, `store.cosmosdb_database`, `store.cosmosdb_container`, `store.cosmosdb_region`    |
 

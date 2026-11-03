@@ -58,7 +58,7 @@ HTTP client for communicating with webvh-witness instances.
 | `store-fjall` | off | Fjall embedded key-value store. |
 | `store-redis` | off | Redis store backend. |
 | `store-dynamodb` | off | AWS DynamoDB store backend (auto-provisions 12 keyspace-per-table layout). |
-| `store-dynamodb-single` | off | AWS DynamoDB store backend using **one externally-provisioned** composite-key (`pk`+`sk`) table. Requires `store.dynamodb_table_name`. No `CreateTable`/`DescribeTable`/`Scan` at runtime. |
+| `store-dynamodb-single` | off | AWS DynamoDB store backend using **one externally-provisioned** composite-key (`pk`+`sk`) table. Requires `store.dynamodb_table_name`. Optional `store.dynamodb_key_namespace`; strongly consistent reads by default. See `docs/store-dynamodb-single.md`. No `CreateTable`/`DescribeTable`/`Scan` at runtime. |
 | `store-firestore` | off | Google Cloud Firestore store backend. |
 | `store-cosmosdb` | off | Azure Cosmos DB (`key_auth`) store backend. |
 | `keyring` | off | OS keyring secret backend (`keyring-core` 1.x). Supported targets: macOS, Windows, Linux. |

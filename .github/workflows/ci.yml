@@ -236,6 +236,22 @@ jobs:
           --features "server-core,store-dynamodb-single,method-webvh,method-web"
           --test dynamodb_single_table
           -- --test-threads=1
+      # The backend's own unit tests (batch limits, key namespace, consistent
+      # reads, startup probe) compile only with this feature, so no other job
+      # runs them. Scoped to the backend module: the rest of the lib suite
+      # needs the fjall store.
+      - name: Run single-table backend unit tests
+        run: >
+          cargo test -p did-hosting-common --lib --no-default-features
+          --features "server-core,store-dynamodb-single,method-webvh,method-web"
+          -- dynamodb_single
+      # The daemon keeps its witness store off the main store's rows when both
+      # share a table; that logic exists only with this feature.
+      - name: Run daemon single-table configuration tests
+        run: >
+          cargo test -p did-hosting-daemon --no-default-features
+          --features store-dynamodb-single --bin did-hosting-daemon
+          -- single_table
 
   test-default:
     name: cargo test (default features)
