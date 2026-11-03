@@ -349,15 +349,6 @@ impl DaemonConfig {
             "DAEMON_WITNESS_STORE",
             &mut config.witness_store,
         );
-
-        did_hosting_common::server::config::apply_store_env_overrides(
-            "DAEMON_STORE",
-            &mut config.store,
-        );
-        did_hosting_common::server::config::apply_store_env_overrides(
-            "DAEMON_WITNESS_STORE",
-            &mut config.witness_store,
-        );
         #[cfg(feature = "store-dynamodb-single")]
         separate_witness_store(&mut config)?;
 
