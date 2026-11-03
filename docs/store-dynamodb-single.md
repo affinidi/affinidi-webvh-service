@@ -187,15 +187,17 @@ Reads (`GetItem`, `Query`) are **strongly consistent by default**, so a read see
 every write that completed before it. This matters for sessions, refresh tokens,
 lockout counters and the outbound queue. Strongly consistent reads use twice the
 read capacity of eventually consistent ones. To trade that guarantee for cost, set
-`dynamodb_consistent_reads = false`. Writes are unaffected.
+`dynamodb_consistent_reads = false`. Writes are unaffected. Reads that decide a
+write stay strongly consistent whatever this says: the control plane's DID records
+(ownership checks, edge sync, the daemon's resolution after a cache miss).
 
 ## 6. Limits
 
 - **A batch is one transaction.** DynamoDB's `TransactWriteItems` holds at most 100
   operations and 4 MB. A batch larger than that is **refused before anything is
   written** with a validation error, rather than split (a split batch is not atomic).
-  Code that writes in bulk chunks to `Store::batch_limits()` itself; the server's
-  backup restore and the control plane's stats flush do.
+  Code that writes in bulk chunks to `Store::batch_limits()` itself, as the server's
+  backup restore does; the control plane's stats flush writes each row on its own.
 - **A DID may claim at most 47 agent names** (`alsoKnownAs`). Publishing a DID writes
   one name-index row per name and removes the rows of names it drops, and an edge
   syncing it adds the record, log, owner, witness and two high-water rows, all in one
@@ -213,7 +215,12 @@ read capacity of eventually consistent ones. To trade that guarantee for cost, s
   what it looks for). A smaller identity is still deleted in one write, as on every
   other backend.
 - A batch that touches the same key twice is refused.
-- An item is limited by DynamoDB to 400 KB.
+- An item is limited by DynamoDB to 400 KB. A write over it is refused before it is
+  sent, as a size quota: `did/register` answers `taskFailed` and the DID keeps its
+  last version.
+- **Throttling.** A request DynamoDB refuses for throughput, after the SDK's own
+  retries, is answered as a rate limit: HTTP 429 with `Retry-After`, or a Trust Task
+  `unavailable` with `retryAfter`. Nothing was written.
 - **Keys must be valid UTF-8** (every key the services write is). A key that is not
   is an error, never altered to fit.
 

@@ -80,7 +80,11 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// the sync as `taskFailed` rather than retrying it. Left to the backend, the
 /// same write failed as a store error (`500`) that no retry could fix. The
 /// backend is logged here, not told to the caller.
-#[cfg(any(feature = "store-dynamodb", feature = "store-firestore"))]
+#[cfg(any(
+    feature = "store-dynamodb",
+    feature = "store-dynamodb-single",
+    feature = "store-firestore"
+))]
 fn check_item_size(backend: &str, size: usize, limit: usize) -> Result<(), AppError> {
     if size > limit {
         tracing::warn!(

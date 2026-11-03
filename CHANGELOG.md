@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — the single-table DynamoDB backend handles overload and large logs like the multi-table one
+
+`store-dynamodb-single` now does what 0.11 does for `store-dynamodb`:
+
+- A throttled request, including a transaction cancelled for throttling, is
+  answered as a rate limit (HTTP 429 with `Retry-After`, or Trust Task
+  `unavailable`), not a store error. A throttled transaction is no longer
+  reported as having an unknown outcome.
+- An item over DynamoDB's 400 KB limit is refused before it is sent, as a size
+  quota, instead of failing at DynamoDB as a store error.
+- The control plane's DID records are read strongly consistent even with
+  `dynamodb_consistent_reads = false`.
+
 ## 0.11.0 (2026-11-03)
 
 ### Fixed — the plaintext-secrets warning is logged once
