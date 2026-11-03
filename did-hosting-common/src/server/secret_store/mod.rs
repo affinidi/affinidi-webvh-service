@@ -523,6 +523,19 @@ pub fn plaintext_path(config_path: &Path) -> PathBuf {
     dir.join(format!("{stem}.secrets.plaintext"))
 }
 
+/// Whether this is the process's first plaintext store on `path`. The store is
+/// rebuilt wherever it is needed (the identity sweep does so every minute), so
+/// its warning is logged once per file rather than on every build.
+fn first_plaintext_open(path: &Path) -> bool {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(path.to_path_buf())
+}
+
 /// Build the secret store `secrets` selects (see [`resolve_backend`]).
 ///
 /// `config_path` is consulted only by the plaintext backend, whose file sits
@@ -540,10 +553,12 @@ pub fn create_secret_store(
         SecretBackend::Keyring => keyring_store(&vti)?,
         SecretBackend::Plaintext => {
             let path = plaintext_path(config_path);
-            tracing::warn!(
-                path = %path.display(),
-                "secrets are stored in a PLAINTEXT file — for tests only, never production"
-            );
+            if first_plaintext_open(&path) {
+                tracing::warn!(
+                    path = %path.display(),
+                    "secrets are stored in a PLAINTEXT file — for tests only, never production"
+                );
+            }
             let dir = path.parent().unwrap_or_else(|| Path::new("."));
             let name = path
                 .file_name()

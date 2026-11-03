@@ -419,3 +419,13 @@ async fn keyring_round_trip_when_backend_available() {
     let entry = keyring_core::Entry::new(&secrets.keyring_service, KEYRING_USER).unwrap();
     let _ = entry.delete_credential();
 }
+
+#[test]
+fn the_plaintext_warning_is_logged_once_per_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.secrets.plaintext");
+    let b = dir.path().join("b.secrets.plaintext");
+    assert!(first_plaintext_open(&a));
+    assert!(!first_plaintext_open(&a));
+    assert!(first_plaintext_open(&b));
+}
