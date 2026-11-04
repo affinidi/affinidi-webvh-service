@@ -192,7 +192,7 @@ async fn sample(state: &AppState, admin: &Caller, n: usize, type_uri: &str) -> V
         "did-management/stats/timeseries/0.2" => json!({ "range": "lastHour" }),
         "did-management/identity/retire/0.1" => json!({ "generationId": 999 }),
         "auth/step-up/start/0.2" => json!({ "sessionId": "no-such-session" }),
-        "auth/step-up/approve-response/0.6" => json!({
+        "auth/step-up/approve-response/0.7" => json!({
             "challenge": "0123456789abcdef0123456789abcdef",
             "decision": "approved",
             "subject": admin.did,
@@ -1320,7 +1320,7 @@ async fn step_up_elevates_the_session_and_refresh_reads_the_new_level() {
     });
     let wrong = signed(
         request_doc(
-            &t("auth/step-up/approve-response/0.6"),
+            &t("auth/step-up/approve-response/0.7"),
             &owner.did,
             decision.clone(),
         ),
@@ -1336,12 +1336,12 @@ async fn step_up_elevates_the_session_and_refresh_reads_the_new_level() {
         &state,
         Via::Https,
         &owner,
-        &t("auth/step-up/approve-response/0.6"),
+        &t("auth/step-up/approve-response/0.7"),
         decision.clone(),
     )
     .await;
     conforms(&reply);
-    let body = ok(&reply, &t("auth/step-up/approve-response/0.6"));
+    let body = ok(&reply, &t("auth/step-up/approve-response/0.7"));
     assert_eq!(body["status"], "elevated");
     assert_eq!(body["session"]["acr"], "aal2");
 
@@ -1350,7 +1350,7 @@ async fn step_up_elevates_the_session_and_refresh_reads_the_new_level() {
         &state,
         Via::Https,
         &owner,
-        &t("auth/step-up/approve-response/0.6"),
+        &t("auth/step-up/approve-response/0.7"),
         decision,
     )
     .await;
@@ -1428,7 +1428,7 @@ async fn approver_signed_evidence_is_refused_without_spending_the_step_up() {
         &state,
         Via::Https,
         &owner,
-        &t("auth/step-up/approve-response/0.6"),
+        &t("auth/step-up/approve-response/0.7"),
         approver_signed,
     )
     .await;
@@ -1442,11 +1442,11 @@ async fn approver_signed_evidence_is_refused_without_spending_the_step_up() {
         &state,
         Via::Https,
         &owner,
-        &t("auth/step-up/approve-response/0.6"),
+        &t("auth/step-up/approve-response/0.7"),
         decision,
     )
     .await;
-    let body = ok(&reply, &t("auth/step-up/approve-response/0.6"));
+    let body = ok(&reply, &t("auth/step-up/approve-response/0.7"));
     assert_eq!(body["status"], "elevated", "{body}");
 }
 
@@ -2521,7 +2521,7 @@ fn existing_rows_keep_their_proof_rules() {
             ProofRule::Authentication,
         ),
         (
-            "https://trusttasks.org/spec/auth/step-up/approve-response/0.6",
+            "https://trusttasks.org/spec/auth/step-up/approve-response/0.7",
             ProofRule::AssertionMethod,
         ),
         (
