@@ -1011,13 +1011,16 @@ fn run_storage_thread(
                     }
                 }
                 _ = flush_timer.tick() => {
+                    // One deadline for the tick: the flush, then the migration
+                    // in what is left of it, so the tick keeps its interval.
+                    let deadline = tokio::time::Instant::now() + crate::config::STATS_FLUSH_INTERVAL;
                     // Flush accumulated per-DID stats deltas to persistent store
-                    if let Err(e) = flush_stats_paced(&collector, &stats_ks, &timeseries_ks, &stats_flush, shutdown_rx.clone()).await {
+                    if let Err(e) = flush_stats_paced_until(&collector, &stats_ks, &timeseries_ks, &stats_flush, shutdown_rx.clone(), deadline).await {
                         warn!("stats flush error: {e}");
                     }
                     // Then the migration to (and clean-up after) the tiered
                     // statistics format, a flush's worth at a time.
-                    if let Err(e) = stats_maintenance.step(&collector, &stats_flush, shutdown_rx.clone()).await {
+                    if let Err(e) = stats_maintenance.step(&collector, &stats_flush, shutdown_rx.clone(), deadline).await {
                         warn!("stats migration error: {e}");
                     }
                 }
@@ -1046,7 +1049,7 @@ fn run_storage_thread(
 
 pub use crate::stats_flush::{
     STATS_BUCKET_MAX_AGE, STATS_FLUSH_CONCURRENCY, STATS_SHUTDOWN_FLUSH_DEADLINE,
-    flush_remaining_stats, flush_stats_paced, flush_stats_to_store,
+    flush_remaining_stats, flush_stats_paced, flush_stats_paced_until, flush_stats_to_store,
 };
 
 /// Ping one trust-task-capable instance, letting its DID document choose the

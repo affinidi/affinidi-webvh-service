@@ -1396,19 +1396,24 @@ async fn run_daemon_storage_task(
                 }
             }
             _ = flush_timer.tick() => {
-                if let Err(e) = did_hosting_control::server::flush_stats_paced(
+                // One deadline for the tick: the flush, then the migration in
+                // what is left of it, so the tick keeps its interval.
+                let deadline = tokio::time::Instant::now()
+                    + did_hosting_control::config::STATS_FLUSH_INTERVAL;
+                if let Err(e) = did_hosting_control::server::flush_stats_paced_until(
                     &params.collector,
                     &params.stats_ks,
                     &params.timeseries_ks,
                     &params.stats_flush,
                     shutdown_rx.clone(),
+                    deadline,
                 ).await {
                     warn!("stats flush error: {e}");
                 }
                 // Parity with the control plane: the migration to (and
                 // clean-up after) the tiered statistics format.
                 if let Err(e) = stats_maintenance
-                    .step(&params.collector, &params.stats_flush, shutdown_rx.clone())
+                    .step(&params.collector, &params.stats_flush, shutdown_rx.clone(), deadline)
                     .await
                 {
                     warn!("stats migration error: {e}");

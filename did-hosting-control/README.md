@@ -202,12 +202,10 @@ The replay settings live in `[replay]` (`max_entries`,
 `[stats_flush] max_rows_per_second` (1 to 10,000, default 20) bounds how fast
 the control plane writes statistics. Every 10 seconds it takes the per-DID
 counters gathered since the last flush and writes at most that many rows a
-second, paced across the interval. Each row is a read and a write. On
-DynamoDB a ring row costs one read and one write unit; a DID's row carries its
-hourly and daily points and grows to about 3 KB for a DID active all week, so
-it costs one read unit and up to about three write units. The budget counts
-rows, so the units it allows are up to about three times the budget for
-writes.
+second, paced across the interval. Each row is a read and a write. The
+budget counts rows, not table units: on DynamoDB a row costs one or more
+units by size, up to about three write units for a DID's row; see "Costs" in
+[`docs/stats-tiers.md`](../docs/stats-tiers.md).
 
 Rows past the budget wait for the next flush. What waits too long is dropped,
 with a warning: time-series buckets older than an hour, and rows past the

@@ -92,9 +92,9 @@ pub const STATS_FLUSH_INTERVAL: std::time::Duration =
 ///
 /// Every [`STATS_FLUSH_INTERVAL`] the control plane takes the per-DID counters
 /// gathered since the last flush and writes them, each row a read and a
-/// write. On DynamoDB a ring row is one read and one write unit; a DID's row
-/// (totals plus its hourly and daily points, up to about 3 KB) is one read
-/// unit and up to about three write units. A flush writes at most `max_rows_per_second` ×
+/// write. The budget counts rows, not table units: on DynamoDB a row costs
+/// one or more units by size ("Costs" in `docs/stats-tiers.md`). A flush
+/// writes at most `max_rows_per_second` ×
 /// [`STATS_FLUSH_INTERVAL_SECS`] rows, paced at `max_rows_per_second`, so the
 /// store sees that rate rather than a burst.
 ///

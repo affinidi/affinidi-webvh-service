@@ -67,6 +67,11 @@ impl Fixture {
     }
 }
 
+/// A tick deadline far enough away not to matter.
+fn later() -> tokio::time::Instant {
+    tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
+}
+
 fn budget() -> StatsFlushConfig {
     StatsFlushConfig {
         max_rows_per_second: 10_000,
@@ -77,9 +82,13 @@ fn budget() -> StatsFlushConfig {
 async fn run(f: &Fixture, collector: &StatsCollector) -> StatsMaintenance {
     let mut m = f.maintenance();
     let (_tx, stop) = watch::channel(false);
-    m.step(collector, &budget(), stop.clone()).await.unwrap();
+    m.step(collector, &budget(), stop.clone(), later())
+        .await
+        .unwrap();
     while m.busy() {
-        m.step(collector, &budget(), stop.clone()).await.unwrap();
+        m.step(collector, &budget(), stop.clone(), later())
+            .await
+            .unwrap();
     }
     m
 }
@@ -291,9 +300,13 @@ async fn purge_now_migrates_first_then_deletes() {
 /// Step `m` until it has nothing in hand.
 async fn drive(mut m: StatsMaintenance, collector: &StatsCollector) {
     let (_tx, stop) = watch::channel(false);
-    m.step(collector, &budget(), stop.clone()).await.unwrap();
+    m.step(collector, &budget(), stop.clone(), later())
+        .await
+        .unwrap();
     while m.busy() {
-        m.step(collector, &budget(), stop.clone()).await.unwrap();
+        m.step(collector, &budget(), stop.clone(), later())
+            .await
+            .unwrap();
     }
 }
 
@@ -349,20 +362,20 @@ async fn a_backend_without_key_order_is_read_whole() {
 }
 
 /// A read that fails part-way (a throttled store) leaves the migration where
-/// it was: the next step reads the same page again, rather than the instance
-/// waiting an hour behind its own lease.
+/// it was: the next step reads on from the last key read, rather than from
+/// the start, and rather than the instance waiting an hour behind its own
+/// lease.
 #[tokio::test]
 async fn a_failed_page_read_is_retried_from_where_it_stopped() {
     let f = fixture().await;
     let now = now_epoch();
-    for (m, n) in [("alice", 2u64), ("bob", 2), ("carol", 1)] {
+    for m in ["bob", "carol", "dave"] {
         f.did(m).await;
-        for i in 0..n {
-            f.legacy(m, bucket_ago(now, (i + 1) * HOUR_SECS), 1).await;
-        }
+        f.legacy(m, bucket_ago(now, HOUR_SECS), 1).await;
     }
     let collector = StatsCollector::new();
-    // Reads allowed: the marker, then the first page; the second page fails.
+    // Reads allowed on the time-series keyspace: the marker, then the first
+    // page (bob, carol); the second page fails. bob is migrated first.
     let mut m = StatsMaintenance::new(
         f.stats_ks.clone(),
         f.ts_ks.failing_reads_after(2, AppError::store_throttled),
@@ -370,21 +383,118 @@ async fn a_failed_page_read_is_retried_from_where_it_stopped() {
     )
     .with_page_rows(2);
     let (_tx, stop) = watch::channel(false);
-    m.step(&collector, &budget(), stop.clone()).await.unwrap();
-    let err = m.step(&collector, &budget(), stop.clone()).await;
+    m.step(&collector, &budget(), stop.clone(), later())
+        .await
+        .unwrap();
+    let err = m.step(&collector, &budget(), stop.clone(), later()).await;
     assert!(err.is_err(), "the second page read fails");
     assert!(m.busy(), "still migrating, not waiting an hour");
+    assert_eq!(resolves(&f.coarse("bob").await.unwrap()), 1, "bob was done");
 
+    // A row behind the cursor: a re-read from the start would pick it up.
+    f.did("aaron").await;
+    f.legacy("aaron", bucket_ago(now, HOUR_SECS), 1).await;
     // The store recovers.
     m.timeseries_ks = f.ts_ks.clone();
     while m.busy() {
-        m.step(&collector, &budget(), stop.clone()).await.unwrap();
+        m.step(&collector, &budget(), stop.clone(), later())
+            .await
+            .unwrap();
     }
 
-    assert_eq!(resolves(&f.coarse("alice").await.unwrap()), 2);
-    assert_eq!(resolves(&f.coarse("bob").await.unwrap()), 2);
-    assert_eq!(resolves(&f.coarse("carol").await.unwrap()), 1);
+    assert!(f.coarse("aaron").await.is_none(), "read on from the cursor");
+    for d in ["bob", "carol", "dave"] {
+        assert_eq!(resolves(&f.coarse(d).await.unwrap()), 1, "{d}");
+    }
     assert!(f.marker().await.unwrap().completed_at.is_some());
+}
+
+/// On a backend without key order a failed read is a failed whole read,
+/// which starts from the beginning again: it waits before retrying rather
+/// than re-reading everything every flush.
+#[tokio::test]
+async fn a_failed_whole_read_waits_before_reading_again() {
+    let f = fixture().await;
+    let now = now_epoch();
+    history(&f, now).await;
+    let collector = StatsCollector::new();
+    // The marker read is allowed; every read after it fails.
+    let mut m = StatsMaintenance::new(
+        f.stats_ks.clone(),
+        // Outermost: answering "no key order" takes no read, as a real
+        // backend without it does.
+        f.ts_ks
+            .failing_reads_after(1, AppError::store_throttled)
+            .without_ordered_pages(),
+        f.dids_ks.clone(),
+    );
+    let (_tx, stop) = watch::channel(false);
+    m.step(&collector, &budget(), stop.clone(), later())
+        .await
+        .unwrap();
+    assert!(
+        m.step(&collector, &budget(), stop.clone(), later())
+            .await
+            .is_err()
+    );
+
+    // The next flush does not read again (a read would fail here).
+    m.step(&collector, &budget(), stop.clone(), later())
+        .await
+        .expect("waits instead of re-reading");
+    assert!(m.busy(), "still migrating");
+}
+
+/// A step starts nothing after its deadline: the flush tick's end, so a
+/// tick that also migrates keeps its interval.
+#[tokio::test]
+async fn a_step_starts_nothing_after_its_deadline() {
+    let f = fixture().await;
+    let now = now_epoch();
+    history(&f, now).await;
+    let collector = StatsCollector::new();
+    let mut m = f.maintenance();
+    let (_tx, stop) = watch::channel(false);
+    m.step(&collector, &budget(), stop.clone(), later())
+        .await
+        .unwrap();
+
+    let passed = tokio::time::Instant::now();
+    m.step(&collector, &budget(), stop.clone(), passed)
+        .await
+        .unwrap();
+
+    assert!(m.busy());
+    assert!(f.coarse("alice").await.is_none(), "nothing migrated");
+}
+
+/// A marker write that fails after this instance took the hour's lease
+/// does not make it wait an hour behind its own lease.
+#[tokio::test]
+async fn a_failed_start_does_not_lock_out_the_instance_holding_the_lease() {
+    let f = fixture().await;
+    let now = now_epoch();
+    history(&f, now).await;
+    let collector = StatsCollector::new();
+    let allowed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    // One write allowed: the lease; the marker write fails.
+    let mut m = StatsMaintenance::new(
+        f.stats_ks.clone(),
+        f.ts_ks.failing_writes_after(allowed.clone()),
+        f.dids_ks.clone(),
+    );
+    let (_tx, stop) = watch::channel(false);
+    assert!(
+        m.step(&collector, &budget(), stop.clone(), later())
+            .await
+            .is_err()
+    );
+
+    allowed.store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+    m.step(&collector, &budget(), stop.clone(), later())
+        .await
+        .unwrap();
+    assert!(m.busy(), "migrating, not idle behind its own lease");
 }
 
 /// The purge reads keys a page at a time too, and reports what it deleted.

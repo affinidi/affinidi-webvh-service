@@ -120,10 +120,10 @@ pub async fn flush_stats_to_store(
 /// written at `max_rows_per_second`, so the store sees the configured rate
 /// rather than the whole budget at once.
 ///
-/// It ends within one [`STATS_FLUSH_INTERVAL`]: when writes are slow (a
-/// throttled store), what would start after that waits for the next flush,
-/// so the flush timer keeps its interval and the rate achieved stays close
-/// to the configured one.
+/// It starts no writes after one [`STATS_FLUSH_INTERVAL`]: when writes are
+/// slow (a throttled store), what would start after that waits for the next
+/// flush instead of delaying it by a whole interval. Writes already started
+/// finish, so a flush can end a write's latency late.
 ///
 /// Once `stop` reads `true` the flush stops pacing and writes nothing more:
 /// what it has not written goes back to the collector, for the shutdown
@@ -141,8 +141,10 @@ pub async fn flush_stats_paced(
     flush_stats_paced_until(collector, stats_ks, timeseries_ks, budget, stop, deadline).await
 }
 
-/// [`flush_stats_paced`], ending at `deadline`.
-pub(crate) async fn flush_stats_paced_until(
+/// [`flush_stats_paced`], ending at `deadline`. The storage loops use it to
+/// give the flush and the migration step that follows it one deadline per
+/// tick ([`crate::stats_migration::StatsMaintenance::step`]).
+pub async fn flush_stats_paced_until(
     collector: &StatsCollector,
     stats_ks: &KeyspaceHandle,
     timeseries_ks: &KeyspaceHandle,

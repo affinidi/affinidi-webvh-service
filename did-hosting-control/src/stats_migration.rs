@@ -38,14 +38,25 @@ use crate::config::StatsFlushConfig;
 use crate::error::AppError;
 use crate::stats_flush::{Pace, write_fine_slot, write_stats_row};
 use crate::store::KeyspaceHandle;
+use did_hosting_common::server::store::RawKvPair;
 
 /// How often the maintenance step looks again when there is nothing to do.
 const IDLE_CHECK_SECS: u64 = HOUR_SECS;
 
-/// Legacy rows read at a time. A page is a few hundred KB however many rows
-/// the deployment has accumulated; a backend that cannot list in key order
-/// is read whole instead (see [`KeyspaceHandle::prefix_page_raw`]).
+/// Legacy rows read at a time, on a backend that lists keys in order (see
+/// [`KeyspaceHandle::prefix_page_raw`]); one that cannot is read whole. Memory
+/// is then bounded by the longest series (it is held until complete), about
+/// 24 bytes a bucket: the server-wide series grows by about 2.5 MB a year.
 pub const LEGACY_PAGE_ROWS: usize = 1_000;
+
+/// Most pages read in one step, so a long series does not hold the storage
+/// task; the next steps read on.
+const MAX_PAGES_PER_STEP: usize = 10;
+
+/// How long to wait after a failed whole read (a backend without key order)
+/// before reading again. Such a read starts from the beginning, so retrying
+/// it every flush would re-read everything against a store already refusing.
+const WHOLE_READ_RETRY_SECS: u64 = 300;
 
 /// One series' legacy buckets, `(epoch, resolves, updates)`, oldest first.
 struct LegacySeries {
@@ -64,23 +75,31 @@ enum Phase {
     Idle(u64),
 }
 
-/// Where a migration is: series read and ready to fold, the series the last
-/// page ended in (it may continue on the next), and where reading resumes.
+/// How far reading the legacy rows has got.
+#[derive(Default)]
+struct LegacyCursor {
+    /// The last key read; the next page starts after it.
+    after: Option<Vec<u8>>,
+    /// Every legacy row has been read.
+    exhausted: bool,
+    /// Do not read before this second (set by a failed whole read).
+    retry_at: u64,
+}
+
+/// Where a migration is: series read and ready to fold, and the series the
+/// last page ended in (it may continue on the next).
 #[derive(Default)]
 struct Migrating {
     ready: VecDeque<LegacySeries>,
     partial: Option<LegacySeries>,
-    after: Option<Vec<u8>>,
-    exhausted: bool,
+    cursor: LegacyCursor,
 }
 
-/// Where a purge is: keys read and not yet deleted, and where reading
-/// resumes.
+/// Where a purge is: keys read and not yet deleted.
 #[derive(Default)]
 struct Purging {
     keys: VecDeque<Vec<u8>>,
-    after: Option<Vec<u8>>,
-    exhausted: bool,
+    cursor: LegacyCursor,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -108,6 +127,10 @@ pub struct StatsMaintenance {
     page_rows: usize,
     /// Legacy rows deleted by this instance (for the CLI's report).
     purged_rows: usize,
+    /// The hour whose migration lease this instance took, so a retry after
+    /// a failure part-way through `start` does not mistake it for another
+    /// instance's.
+    lease_hour: Option<u64>,
 }
 
 fn now_epoch() -> u64 {
@@ -137,6 +160,7 @@ impl StatsMaintenance {
             phase: Phase::Start,
             page_rows: LEGACY_PAGE_ROWS,
             purged_rows: 0,
+            lease_hour: None,
         }
     }
 
@@ -153,13 +177,15 @@ impl StatsMaintenance {
     }
 
     /// Do up to one flush's worth of maintenance (`budget.rows_per_flush()`
-    /// writes), paced at the flush rate, stopping at once when `stop` turns
+    /// writes), paced at the flush rate, starting nothing after `deadline`
+    /// (the end of the flush tick) and stopping at once when `stop` turns
     /// `true`.
     pub async fn step(
         &mut self,
         collector: &StatsCollector,
         budget: &StatsFlushConfig,
         stop: watch::Receiver<bool>,
+        deadline: tokio::time::Instant,
     ) -> Result<(), AppError> {
         let now = now_epoch();
         match &mut self.phase {
@@ -172,8 +198,11 @@ impl StatsMaintenance {
                 Ok(())
             }
             Phase::Idle(_) => Ok(()),
-            Phase::Migrating(_) => self.migrate_some(collector, budget, stop, now).await,
-            Phase::Purging(_) => self.purge_some(budget, stop, now).await,
+            Phase::Migrating(_) => {
+                self.migrate_some(collector, budget, stop, now, deadline)
+                    .await
+            }
+            Phase::Purging(_) => self.purge_some(budget, stop, now, deadline).await,
         }
     }
 
@@ -187,7 +216,7 @@ impl StatsMaintenance {
 
     /// Decide what startup needs: a migration (none yet, one interrupted, or
     /// an older binary has run since), or nothing but a later purge check.
-    async fn start(&self, now: u64) -> Result<Phase, AppError> {
+    async fn start(&mut self, now: u64) -> Result<Phase, AppError> {
         let marker = self.marker().await?;
         let needed = match &marker {
             None => true,
@@ -203,10 +232,14 @@ impl StatsMaintenance {
         // One replica migrates at a time: the first to count this hour's
         // lease. A replica that dies part-way leaves the next hour's lease to
         // another; `migrated_through` makes overlapping work harmless.
-        let lease = format!("meta:stats-migration-lease:{}", now / HOUR_SECS);
-        if self.timeseries_ks.incr_raw(lease.as_str()).await? != 1 {
-            info!("stats migration: another instance holds this hour's lease");
-            return Ok(Phase::Idle(now + IDLE_CHECK_SECS));
+        let hour = now / HOUR_SECS;
+        if self.lease_hour != Some(hour) {
+            let lease = format!("meta:stats-migration-lease:{hour}");
+            if self.timeseries_ks.incr_raw(lease.as_str()).await? != 1 {
+                info!("stats migration: another instance holds this hour's lease");
+                return Ok(Phase::Idle(now + IDLE_CHECK_SECS));
+            }
+            self.lease_hour = Some(hour);
         }
         let mut m = marker.unwrap_or_default();
         m.version = MIGRATION_VERSION;
@@ -244,61 +277,75 @@ impl StatsMaintenance {
         Ok(false)
     }
 
-    /// Every legacy row, grouped by series: the fallback for a backend that
-    /// cannot list a prefix in key order.
-    async fn scan_legacy(&self) -> Result<Vec<LegacySeries>, AppError> {
-        let raw = self.timeseries_ks.prefix_iter_raw("ts:").await?;
-        let mut by_series: BTreeMap<String, Vec<(u64, u64, u64)>> = BTreeMap::new();
-        for (key, value) in raw {
-            if let Some((series, bucket)) = parse_legacy_row(&key, &value) {
-                by_series.entry(series).or_default().push(bucket);
-            }
+    /// The next legacy rows after `cursor`, and whether they are in key
+    /// order: a page, or every row on a backend without key order. The
+    /// cursor moves only on success; a failed whole read sets `retry_at`.
+    async fn next_legacy_rows(
+        &self,
+        cursor: &mut LegacyCursor,
+        now: u64,
+    ) -> Result<(Vec<RawKvPair>, bool), AppError> {
+        let page = self
+            .timeseries_ks
+            .prefix_page_raw("ts:", cursor.after.clone(), self.page_rows)
+            .await?;
+        let Some(page) = page else {
+            return match self.timeseries_ks.prefix_iter_raw("ts:").await {
+                Ok(all) => {
+                    cursor.exhausted = true;
+                    Ok((all, false))
+                }
+                Err(e) => {
+                    cursor.retry_at = now + WHOLE_READ_RETRY_SECS;
+                    Err(e)
+                }
+            };
+        };
+        cursor.exhausted = page.len() < self.page_rows;
+        if let Some((last, _)) = page.last() {
+            cursor.after = Some(last.clone());
         }
-        Ok(by_series
-            .into_iter()
-            .map(|(name, mut buckets)| {
-                buckets.sort_unstable();
-                LegacySeries { name, buckets }
-            })
-            .collect())
+        Ok((page, true))
     }
 
-    /// Read more legacy rows into `m`: one page, or the whole prefix on a
-    /// backend without key order. A series is ready once a row of another
-    /// series follows it, or the rows run out. That relies on one series'
-    /// rows being together in key order, which holds because a mnemonic has
-    /// no `:` (path segments are `[a-z0-9-]`, a `did:webs` AID base64url).
-    async fn read_legacy(&self, m: &mut Migrating) -> Result<(), AppError> {
-        let Some(page) = self
-            .timeseries_ks
-            .prefix_page_raw("ts:", m.after.clone(), self.page_rows)
-            .await?
-        else {
-            m.ready.extend(self.scan_legacy().await?);
-            m.exhausted = true;
-            return Ok(());
-        };
-        m.exhausted = page.len() < self.page_rows;
-        if let Some((last, _)) = page.last() {
-            m.after = Some(last.clone());
-        }
-        for (key, value) in page {
-            let Some((series, bucket)) = parse_legacy_row(&key, &value) else {
-                continue;
-            };
-            match &mut m.partial {
-                Some(p) if p.name == series => p.buckets.push(bucket),
-                partial => {
-                    if let Some(done) = partial.replace(LegacySeries {
-                        name: series,
-                        buckets: vec![bucket],
-                    }) {
-                        m.ready.push_back(done);
+    /// Read more legacy rows into `m`. In key order, a series is ready once
+    /// a row of another series follows it, or the rows run out. That relies
+    /// on one series' rows being together in key order, which holds because
+    /// a mnemonic has no `:` (path segments are `[a-z0-9-]`, a `did:webs` AID
+    /// base64url). A whole read is grouped by series instead.
+    async fn read_legacy(&self, m: &mut Migrating, now: u64) -> Result<(), AppError> {
+        let (rows, ordered) = self.next_legacy_rows(&mut m.cursor, now).await?;
+        if !ordered {
+            let mut by_series: BTreeMap<String, Vec<(u64, u64, u64)>> = BTreeMap::new();
+            for (key, value) in rows {
+                if let Some((series, bucket)) = parse_legacy_row(&key, &value) {
+                    by_series.entry(series).or_default().push(bucket);
+                }
+            }
+            m.ready.extend(
+                by_series
+                    .into_iter()
+                    .map(|(name, buckets)| LegacySeries { name, buckets }),
+            );
+        } else {
+            for (key, value) in rows {
+                let Some((series, bucket)) = parse_legacy_row(&key, &value) else {
+                    continue;
+                };
+                match &mut m.partial {
+                    Some(p) if p.name == series => p.buckets.push(bucket),
+                    partial => {
+                        if let Some(done) = partial.replace(LegacySeries {
+                            name: series,
+                            buckets: vec![bucket],
+                        }) {
+                            m.ready.push_back(done);
+                        }
                     }
                 }
             }
         }
-        if m.exhausted {
+        if m.cursor.exhausted {
             m.ready.extend(m.partial.take());
         }
         for series in &mut m.ready {
@@ -313,25 +360,31 @@ impl StatsMaintenance {
         budget: &StatsFlushConfig,
         stop: watch::Receiver<bool>,
         now: u64,
+        deadline: tokio::time::Instant,
     ) -> Result<(), AppError> {
         let mut pace = Pace {
             rows_per_second: budget.max_rows_per_second.max(1),
             stop,
         };
         let mut spent = 0usize;
+        let mut pages = 0usize;
         let mut next_start = tokio::time::Instant::now();
         loop {
             let Phase::Migrating(m) = &mut self.phase else {
                 return Ok(());
             };
-            if spent >= budget.rows_per_flush() {
+            if spent >= budget.rows_per_flush() || tokio::time::Instant::now() >= deadline {
                 return Ok(());
             }
-            if m.ready.is_empty() && !m.exhausted {
+            if m.ready.is_empty() && !m.cursor.exhausted {
+                if pages >= MAX_PAGES_PER_STEP || now < m.cursor.retry_at {
+                    return Ok(());
+                }
+                pages += 1;
                 // A failed read leaves the phase as it was: the next step
-                // reads the same page again.
+                // reads the same page again (a whole read, after a pause).
                 let mut state = std::mem::take(m);
-                let result = self.read_legacy(&mut state).await;
+                let result = self.read_legacy(&mut state, now).await;
                 self.phase = Phase::Migrating(state);
                 result?;
                 continue;
@@ -344,7 +397,7 @@ impl StatsMaintenance {
                 self.phase = Phase::Idle(now + IDLE_CHECK_SECS);
                 return Ok(());
             };
-            if !pace.wait_until(next_start).await {
+            if next_start >= deadline || !pace.wait_until(next_start).await {
                 m.ready.push_front(series);
                 return Ok(());
             }
@@ -480,28 +533,11 @@ impl StatsMaintenance {
         Ok(Phase::Purging(Purging::default()))
     }
 
-    /// Read more legacy keys into `p`: one page, or every key on a backend
-    /// without key order. Keys are deleted behind the cursor, so the next
-    /// page starts after the last key read.
-    async fn read_purge_keys(&self, p: &mut Purging) -> Result<(), AppError> {
-        match self
-            .timeseries_ks
-            .prefix_page_raw("ts:", p.after.clone(), self.page_rows)
-            .await?
-        {
-            Some(page) => {
-                p.exhausted = page.len() < self.page_rows;
-                if let Some((last, _)) = page.last() {
-                    p.after = Some(last.clone());
-                }
-                p.keys.extend(page.into_iter().map(|(k, _)| k));
-            }
-            None => {
-                let all = self.timeseries_ks.prefix_iter_raw("ts:").await?;
-                p.keys.extend(all.into_iter().map(|(k, _)| k));
-                p.exhausted = true;
-            }
-        }
+    /// Read more legacy keys into `p`. Keys are deleted behind the cursor,
+    /// so the next page starts after the last key read.
+    async fn read_purge_keys(&self, p: &mut Purging, now: u64) -> Result<(), AppError> {
+        let (rows, _) = self.next_legacy_rows(&mut p.cursor, now).await?;
+        p.keys.extend(rows.into_iter().map(|(k, _)| k));
         Ok(())
     }
 
@@ -510,6 +546,7 @@ impl StatsMaintenance {
         budget: &StatsFlushConfig,
         stop: watch::Receiver<bool>,
         now: u64,
+        deadline: tokio::time::Instant,
     ) -> Result<(), AppError> {
         let mut pace = Pace {
             rows_per_second: budget.max_rows_per_second.max(1),
@@ -517,13 +554,18 @@ impl StatsMaintenance {
         };
         let mut next_start = tokio::time::Instant::now();
         let mut spent = 0usize;
-        while spent < budget.rows_per_flush() {
+        let mut pages = 0usize;
+        while spent < budget.rows_per_flush() && tokio::time::Instant::now() < deadline {
             let Phase::Purging(p) = &mut self.phase else {
                 return Ok(());
             };
-            if p.keys.is_empty() && !p.exhausted {
+            if p.keys.is_empty() && !p.cursor.exhausted {
+                if pages >= MAX_PAGES_PER_STEP || now < p.cursor.retry_at {
+                    return Ok(());
+                }
+                pages += 1;
                 let mut state = std::mem::take(p);
-                let result = self.read_purge_keys(&mut state).await;
+                let result = self.read_purge_keys(&mut state, now).await;
                 self.phase = Phase::Purging(state);
                 result?;
                 continue;
@@ -536,7 +578,7 @@ impl StatsMaintenance {
                 self.phase = Phase::Idle(now + IDLE_CHECK_SECS);
                 return Ok(());
             };
-            if !pace.wait_until(next_start).await {
+            if next_start >= deadline || !pace.wait_until(next_start).await {
                 p.keys.push_front(key);
                 return Ok(());
             }
@@ -563,9 +605,11 @@ impl StatsMaintenance {
         budget: &StatsFlushConfig,
     ) -> Result<usize, AppError> {
         let (_tx, stop) = watch::channel(false);
+        // Runs to completion: each round gets a fresh deadline.
+        let round = || tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
         self.phase = self.start(now_epoch()).await?;
         while matches!(self.phase, Phase::Migrating(_)) {
-            self.migrate_some(collector, budget, stop.clone(), now_epoch())
+            self.migrate_some(collector, budget, stop.clone(), now_epoch(), round())
                 .await?;
         }
         if self.marker().await?.and_then(|m| m.completed_at).is_none() {
@@ -576,7 +620,8 @@ impl StatsMaintenance {
         self.phase = self.start_purge().await?;
         let before = self.purged_rows;
         while matches!(self.phase, Phase::Purging(_)) {
-            self.purge_some(budget, stop.clone(), now_epoch()).await?;
+            self.purge_some(budget, stop.clone(), now_epoch(), round())
+                .await?;
         }
         Ok(self.purged_rows - before)
     }

@@ -147,7 +147,8 @@ Automatic, idempotent, and safe to roll back.
 2. **Backfill, once.** At startup, if the marker is missing or incomplete,
    the storage task reads `ts:` once, a page of 1,000 rows at a time in key
    order (a backend that cannot list in key order, a hash-ordered Scan, is
-   read whole), and, a flush's worth at a time between flushes, adds each
+   read whole, and after a failed read waits 5 minutes before reading again),
+   and, a flush's worth at a time between flushes, adds each
    series' legacy buckets to its coarse series (and, for a
    series that is fine, the last day's to its ring). Each series records the
    legacy buckets it has taken (`migrated_through`), so a restart part-way, a
