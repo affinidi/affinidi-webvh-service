@@ -164,22 +164,26 @@ alone.
 If the two stores still resolve to the same partitions (for example both set to the
 same namespace) the daemon **refuses to start** and names the variables to change.
 
-**Upgrading a daemon whose stores already share a table.** The main store is
-unaffected. The witness store starts from empty `witness#acl` and
-`witness#witnesses`: it stops reading (and editing) the control plane's ACL rows, and
-any witness data already written under the bare `witnesses` keyspace is no longer
-visible to it. Before upgrading a deployment that uses the witness, check whether
-that data exists:
+**Upgrading a daemon whose stores already share a table.** Before the namespace, the
+witness read and wrote the bare `acl` and `witnesses` partitions: its ACL was the
+control plane's. On the first boot with the namespace the daemon **copies those rows
+into `witness#acl` and `witness#witnesses`**, before the witness serves, so the
+witness keeps the access and the proofs it had. Then:
 
-```bash
-aws dynamodb query --table-name <table> --select COUNT \
-  --key-condition-expression "pk = :p" \
-  --expression-attribute-values '{":p":{"S":"witnesses"}}'
-```
+- It runs once: a marker, `witness#meta` `migration:applied:witness_namespace_carry_over`,
+  records it, and from then on the two ACLs are separate. An entry added to the
+  control plane's ACL later (`add-acl`) is not the witness's.
+- A keyspace the witness namespace already has rows in is not copied into, so a
+  witness that ran with the namespace keeps its own entries.
+- The bare rows stay: the main store's ACL is its own, and a rollback to a build
+  without the namespace finds the witness's rows where it left them.
+- It runs only for the namespace the daemon assigns. A namespace you set yourself is
+  yours to seed.
+- If the copy fails the daemon stops, and the next start copies again.
 
-A count of `0` means there is nothing to carry over. The daemon has no command to
-seed the witness ACL; until one exists the embedded witness has an empty ACL, as in
-every daemon with separate stores.
+A new daemon on a shared table starts with whatever the control plane's ACL holds at
+its first boot, and an empty witness ACL if that is empty. The daemon has no command
+to seed the witness ACL later.
 
 ## 5. Consistent reads
 

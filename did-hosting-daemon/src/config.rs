@@ -259,6 +259,18 @@ fn separate_witness_store(config: &mut DaemonConfig) -> Result<(), AppError> {
 }
 
 impl DaemonConfig {
+    /// Whether the witness store is on the main store's table under the
+    /// namespace [`separate_witness_store`] gives it, so a daemon from before
+    /// that namespace kept the witness's rows in the main store's partitions
+    /// and they need carrying over (`witness_carry_over`).
+    #[cfg(feature = "store-dynamodb-single")]
+    pub fn witness_rows_were_shared(&self) -> bool {
+        same_single_table(&self.store, &self.witness_store)
+            && self.store.dynamodb_key_namespace.is_none()
+            && self.witness_store.dynamodb_key_namespace.as_deref()
+                == Some(DEFAULT_WITNESS_KEY_NAMESPACE)
+    }
+
     /// The daemon's config file: `--config`, else `DAEMON_CONFIG_PATH`, else
     /// `config.toml`. [`Self::load`] resolves it this way; a caller that hands the
     /// path to code with a different default (the server's backup and restore
@@ -963,6 +975,31 @@ context_id = "webvh"
             assert_eq!(
                 c.store.dynamodb_key_namespace, None,
                 "the main store's rows must not move"
+            );
+        }
+
+        #[test]
+        fn only_the_namespace_the_daemon_assigns_carries_the_shared_rows_over() {
+            let shared = |main, witness| {
+                let mut c = stores(main, witness);
+                separate_witness_store(&mut c).expect("ok");
+                c.witness_rows_were_shared()
+            };
+            assert!(
+                shared((T, None, None), (T, None, None)),
+                "one table, no namespace: the rows were shared"
+            );
+            assert!(
+                !shared((T, None, None), (Some("webvh-witness"), None, None)),
+                "separate tables never shared rows"
+            );
+            assert!(
+                !shared((T, None, None), (T, None, Some("w2"))),
+                "an operator's own namespace is theirs to seed"
+            );
+            assert!(
+                !shared((T, None, Some("main")), (T, None, None)),
+                "a namespaced main store never shared its partitions"
             );
         }
 

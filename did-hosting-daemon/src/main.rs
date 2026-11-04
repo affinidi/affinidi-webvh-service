@@ -2,6 +2,8 @@ mod config;
 mod setup;
 mod setup_key_erase;
 mod setup_recipe;
+#[cfg(any(feature = "store-dynamodb-single", test))]
+mod witness_carry_over;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -876,6 +878,27 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             }
             Err(e) => {
                 error!("migration runner failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // The witness store's rows, once, when it has just been given its own
+    // namespace on the main store's table. Before the witness serves: a
+    // failure stops the daemon rather than run a witness with no ACL.
+    #[cfg(feature = "store-dynamodb-single")]
+    if config.witness_rows_were_shared() {
+        match witness_carry_over::carry_over_witness_rows(&main_store, &witness_store).await {
+            Ok(witness_carry_over::CarryOver::AlreadyDone) => {}
+            Ok(witness_carry_over::CarryOver::Done { copied, skipped }) => {
+                info!(
+                    ?copied,
+                    ?skipped,
+                    "witness rows carried over into the witness store's namespace"
+                );
+            }
+            Err(e) => {
+                error!("carrying the witness rows into its namespace failed: {e}");
                 std::process::exit(1);
             }
         }

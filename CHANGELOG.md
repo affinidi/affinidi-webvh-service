@@ -23,6 +23,10 @@ definition, permissions and settings.
 - Throttling is answered as a rate limit (HTTP 429 with `Retry-After`, or
   Trust Task `unavailable`), and an item over 400 KB is refused as a size
   quota before it is sent, as on `store-dynamodb`.
+- When the daemon's two stores share the table, the witness store gets the
+  key namespace `witness`. A daemon upgraded from a build without it copies
+  the witness's `acl` and `witnesses` rows into the namespace once, on its
+  first boot, so the witness keeps its access and its proofs.
 
 ## 0.11.0 (2026-11-03)
 
