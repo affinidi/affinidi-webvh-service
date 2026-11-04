@@ -61,6 +61,8 @@
 
 use trust_tasks_rs::{ErrorPayload, ErrorResponse, Payload, RejectReason, TrustTask};
 
+use crate::server::rate_limit::KeyedRateLimiter;
+
 /// Every type not in [`DECLARED`] accepts a document of at most 64 KiB —
 /// generous for a handful of identifiers, an ACL entry or a discovery
 /// reply, and small enough that an unauthenticated flood of them is cheap
@@ -138,7 +140,9 @@ pub fn check(body: &[u8], served: &[&str]) -> Result<(), ErrorResponse> {
 /// to hold an attacker to.
 pub const LARGE_DOCUMENT_BUDGET_PER_WINDOW: u64 = 5;
 
-/// Fixed-window length, in seconds, for [`LargeDocumentBudget`].
+/// Window, in seconds, for [`LargeDocumentBudget`]'s limits: token buckets
+/// on `affinidi-rate-limit`, so an address spends its allowance at once and
+/// regains one large document every `window / allowance`.
 pub const LARGE_DOCUMENT_BUDGET_WINDOW_SECS: u64 = 60;
 
 /// Large documents admitted per window across *every* address together.
@@ -151,125 +155,141 @@ pub const LARGE_DOCUMENT_BUDGET_WINDOW_SECS: u64 = 60;
 /// deployment registers far fewer large DIDs than this per minute.
 pub const LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW: u64 = 60;
 
-/// Hard cap on tracked-address map size. Past it, addresses with nothing at
-/// stake — an expired window and no penalty — are evicted; if the map is
-/// still full, a new address is refused rather than tracked. Clearing the map
-/// wholesale, as the per-IP limiters do, would also wipe every penalty, which
-/// a novel-address flood could then trigger on purpose.
+/// The `limiter` the per-address budget logs its refusals under.
+const PER_ADDRESS_LIMITER: &str = "large-document-per-address";
+
+/// The `limiter` the every-address budget logs its refusals under.
+const GLOBAL_LIMITER: &str = "large-document-global";
+
+/// Most addresses tracked at once, by the per-address budget and by the
+/// penalty table each. Past it the budget refuses a new address (after
+/// sweeping the ones whose allowance has refilled) while tracked ones are
+/// unaffected; the penalty table keeps every penalty it holds and records no
+/// new one (see [`LargeDocumentBudget::penalize`]).
 const MAX_TRACKED_ADDRESSES: usize = 10_000;
 
-#[derive(Debug, Clone, Copy)]
-struct Bucket {
-    /// Cost units spent in the current window.
-    spent: u64,
-    /// `now` (epoch seconds) of the window start.
-    window_start: u64,
-    /// The cost of this address's *next* charge — 1 until
-    /// [`LargeDocumentBudget::penalize`] doubles it.
-    cost: u64,
-}
+/// The highest per-document cost a penalty raises an address to: one more
+/// than a whole window's allowance, which no address can ever pay. Doubling
+/// past it would change nothing but the number.
+const MAX_COST: u64 = LARGE_DOCUMENT_BUDGET_PER_WINDOW + 1;
 
 /// Per-address budget for documents [`check_for_known_issuer`] grants the
 /// raised limit to before their claimed issuer is verified. See the module
 /// docs.
-#[derive(Debug, Default)]
+///
+/// Both limits — per address and across every address — are
+/// [`KeyedRateLimiter`]s on `affinidi-rate-limit`, like every other limit in
+/// this workspace. What is this budget's own is the penalty: an address whose
+/// claim did not verify pays double for its next large document, then double
+/// again, until it can pay for none. A penalty is against the address, not the
+/// minute it was earned in, so it outlives the address's bucket.
+#[derive(Debug)]
 pub struct LargeDocumentBudget {
-    inner: std::sync::Mutex<BudgetState>,
+    per_address: KeyedRateLimiter<String>,
+    global: KeyedRateLimiter<()>,
+    /// Each penalised address's cost per large document (always above 1; an
+    /// address that is absent costs 1).
+    penalties: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
-#[derive(Debug, Default)]
-struct BudgetState {
-    buckets: std::collections::HashMap<String, Bucket>,
-    /// The every-address window: see [`LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW`].
-    global_spent: u64,
-    global_window_start: u64,
+impl Default for LargeDocumentBudget {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LargeDocumentBudget {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_max_tracked_addresses(MAX_TRACKED_ADDRESSES)
     }
 
-    /// Charge `address` for one large document, at its current per-charge
-    /// cost. `Err` is the number of seconds until the window rolls over,
-    /// once spending would exceed [`LARGE_DOCUMENT_BUDGET_PER_WINDOW`] for
-    /// the current one.
-    fn try_charge(&self, address: &str, now: u64) -> Result<(), u64> {
-        let mut state = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let state = &mut *state;
-
-        if now.saturating_sub(state.global_window_start) >= LARGE_DOCUMENT_BUDGET_WINDOW_SECS {
-            state.global_spent = 0;
-            state.global_window_start = now;
+    fn with_max_tracked_addresses(max_tracked: usize) -> Self {
+        Self {
+            per_address: KeyedRateLimiter::new(
+                PER_ADDRESS_LIMITER,
+                LARGE_DOCUMENT_BUDGET_PER_WINDOW,
+                LARGE_DOCUMENT_BUDGET_WINDOW_SECS,
+            )
+            .with_max_tracked_keys(max_tracked),
+            global: KeyedRateLimiter::new(
+                GLOBAL_LIMITER,
+                LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW,
+                LARGE_DOCUMENT_BUDGET_WINDOW_SECS,
+            ),
+            penalties: Default::default(),
         }
-        let global_retry =
-            (state.global_window_start + LARGE_DOCUMENT_BUDGET_WINDOW_SECS).saturating_sub(now);
-        if state.global_spent >= LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW {
-            return Err(global_retry);
-        }
-
-        let buckets = &mut state.buckets;
-        if buckets.len() >= MAX_TRACKED_ADDRESSES && !buckets.contains_key(address) {
-            buckets.retain(|_, b| {
-                b.cost > 1 || now.saturating_sub(b.window_start) < LARGE_DOCUMENT_BUDGET_WINDOW_SECS
-            });
-            if buckets.len() >= MAX_TRACKED_ADDRESSES {
-                return Err(global_retry);
-            }
-        }
-
-        let entry = buckets.entry(address.to_string()).or_insert(Bucket {
-            spent: 0,
-            window_start: now,
-            cost: 1,
-        });
-
-        if now.saturating_sub(entry.window_start) >= LARGE_DOCUMENT_BUDGET_WINDOW_SECS {
-            entry.spent = 0;
-            entry.window_start = now;
-        }
-
-        if entry.spent.saturating_add(entry.cost) > LARGE_DOCUMENT_BUDGET_PER_WINDOW {
-            let retry_after_secs =
-                (entry.window_start + LARGE_DOCUMENT_BUDGET_WINDOW_SECS).saturating_sub(now);
-            return Err(retry_after_secs);
-        }
-        entry.spent += entry.cost;
-        state.global_spent += 1;
-        Ok(())
     }
 
-    /// Double `address`'s per-charge cost — called once a claimed issuer
+    /// Sweep addresses whose allowance has refilled out of the budget's
+    /// memory every minute until `shutdown` fires. Penalties are kept. Must
+    /// run on a Tokio runtime.
+    pub fn spawn_gc(&self, shutdown: &tokio_util::sync::CancellationToken) {
+        self.per_address.spawn_gc(shutdown.clone());
+        self.global.spawn_gc(shutdown.clone());
+    }
+
+    /// Charge `address` for one large document, at its current per-document
+    /// cost, then the every-address budget for one. `Err` is the number of
+    /// seconds until a retry can succeed.
+    ///
+    /// The address is charged first, so an address over its own budget never
+    /// spends the shared one. A penalised address that cannot pay its whole
+    /// cost loses what it could pay: it has already been caught once.
+    fn try_charge(&self, address: &str) -> Result<(), u64> {
+        for _ in 0..self.cost(address) {
+            self.per_address
+                .try_consume(address.to_owned())
+                .map_err(retry_after)?;
+        }
+        self.global.try_consume(()).map_err(retry_after)
+    }
+
+    /// Double `address`'s per-document cost — called once a claimed issuer
     /// this budget let through turns out to have failed verification, or
     /// proven to be someone else. Persists across windows (a penalty is
-    /// against the address, not the minute it earned it); capped well
-    /// short of overflow, since a handful of doublings already exhausts the
-    /// window on its own.
+    /// against the address, not the minute it earned it), up to a cost no
+    /// window's allowance covers.
+    ///
+    /// A full table keeps every penalty it holds and records no new one:
+    /// evicting a penalty to make room would let a flood of fresh addresses
+    /// wipe it on purpose, and refusing unpenalised addresses instead would
+    /// let one shut out every large document for good. A fresh address
+    /// still meets both budgets.
     fn penalize(&self, address: &str) {
-        let mut state = self
-            .inner
+        let mut penalties = self
+            .penalties
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let entry = state.buckets.entry(address.to_string()).or_insert(Bucket {
-            spent: 0,
-            window_start: 0,
-            cost: 1,
-        });
-        entry.cost = entry.cost.saturating_mul(2).min(1 << 20);
+        if let Some(cost) = penalties.get_mut(address) {
+            *cost = cost.saturating_mul(2).min(MAX_COST);
+        } else if penalties.len() < MAX_TRACKED_ADDRESSES {
+            penalties.insert(address.to_owned(), 2);
+        } else {
+            tracing::warn!(
+                address,
+                "large-document penalty table full; not recording this address's penalty"
+            );
+        }
     }
 
-    #[cfg(test)]
+    /// `address`'s cost per large document: 1 unless penalised.
     fn cost(&self, address: &str) -> u64 {
-        self.inner
+        self.penalties
             .lock()
-            .unwrap()
-            .buckets
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(address)
-            .map(|b| b.cost)
+            .copied()
             .unwrap_or(1)
+    }
+}
+
+/// The retry hint of a [`KeyedRateLimiter`] refusal.
+fn retry_after(refusal: crate::server::error::AppError) -> u64 {
+    match refusal {
+        crate::server::error::AppError::RateLimited {
+            retry_after_secs, ..
+        } => retry_after_secs,
+        _ => LARGE_DOCUMENT_BUDGET_WINDOW_SECS,
     }
 }
 
@@ -305,7 +325,6 @@ pub async fn check_for_known_issuer(
     acl: &crate::server::store::KeyspaceHandle,
     budget: &LargeDocumentBudget,
     address: &str,
-    now: u64,
 ) -> Result<Option<LargeDocumentCharge>, ErrorResponse> {
     if body.len() <= DEFAULT_MAX_DOCUMENT_BYTES {
         return Ok(None);
@@ -327,7 +346,7 @@ pub async fn check_for_known_issuer(
         check_with(body, |_| DEFAULT_MAX_DOCUMENT_BYTES)?;
         return Ok(None);
     };
-    if let Err(retry_after_secs) = budget.try_charge(address, now) {
+    if let Err(retry_after_secs) = budget.try_charge(address) {
         return Err(unrouted_error(
             RejectReason::Unavailable {
                 retry_after: Some(crate::server::error::retry_at(retry_after_secs)),
@@ -500,13 +519,13 @@ mod tests {
         let budget = LargeDocumentBudget::new();
         let big = register_doc("did:web:admin.example", 200 * 1024);
         assert!(
-            check_for_known_issuer(&big, &served, &acl, &budget, "ip:1.2.3.4", 0)
+            check_for_known_issuer(&big, &served, &acl, &budget, "ip:1.2.3.4")
                 .await
                 .is_ok()
         );
         let stranger = register_doc("did:web:stranger.example", 200 * 1024);
         assert!(
-            check_for_known_issuer(&stranger, &served, &acl, &budget, "ip:5.6.7.8", 0)
+            check_for_known_issuer(&stranger, &served, &acl, &budget, "ip:5.6.7.8")
                 .await
                 .is_err()
         );
@@ -524,7 +543,6 @@ mod tests {
             &acl,
             &LargeDocumentBudget::new(),
             "ip:1.2.3.4",
-            0,
         )
         .await
         .expect_err("deferred");
@@ -543,18 +561,18 @@ mod tests {
         let doc = register_doc("did:web:admin.example", 200 * 1024);
         for _ in 0..LARGE_DOCUMENT_BUDGET_PER_WINDOW {
             assert!(
-                check_for_known_issuer(&doc, &served, &acl, &budget, "ip:9.9.9.9", 0)
+                check_for_known_issuer(&doc, &served, &acl, &budget, "ip:9.9.9.9")
                     .await
                     .is_ok()
             );
         }
-        let err = check_for_known_issuer(&doc, &served, &acl, &budget, "ip:9.9.9.9", 0)
+        let err = check_for_known_issuer(&doc, &served, &acl, &budget, "ip:9.9.9.9")
             .await
             .unwrap_err();
         assert_eq!(refusal(err)["code"], "unavailable");
         // A different address is unaffected.
         assert!(
-            check_for_known_issuer(&doc, &served, &acl, &budget, "ip:1.1.1.1", 0)
+            check_for_known_issuer(&doc, &served, &acl, &budget, "ip:1.1.1.1")
                 .await
                 .is_ok()
         );
@@ -569,7 +587,7 @@ mod tests {
         let served = [DID_REGISTER];
         let budget = LargeDocumentBudget::new();
         let doc = register_doc("did:web:admin.example", 200 * 1024);
-        let charge = check_for_known_issuer(&doc, &served, &acl, &budget, "ip:1.2.3.4", 0)
+        let charge = check_for_known_issuer(&doc, &served, &acl, &budget, "ip:1.2.3.4")
             .await
             .expect("within budget")
             .expect("a large document charges the budget");
@@ -608,61 +626,71 @@ mod tests {
     fn many_addresses_together_are_held_to_the_global_budget() {
         let budget = LargeDocumentBudget::new();
         for i in 0..LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW {
-            assert!(budget.try_charge(&format!("vid:{i}"), 1_000).is_ok());
+            assert!(budget.try_charge(&format!("vid:{i}")).is_ok());
         }
         assert!(
-            budget.try_charge("vid:fresh", 1_000).is_err(),
+            budget.try_charge("vid:fresh").is_err(),
             "a fresh address does not escape the service-wide cap"
-        );
-        assert!(
-            budget
-                .try_charge("vid:fresh", 1_000 + LARGE_DOCUMENT_BUDGET_WINDOW_SECS)
-                .is_ok(),
-            "the next window has room again"
         );
     }
 
+    /// An address over its own budget does not spend the shared one.
     #[test]
-    fn a_full_map_keeps_its_penalties() {
+    fn a_refused_address_spends_none_of_the_global_budget() {
+        let budget = LargeDocumentBudget::new();
+        for _ in 0..LARGE_DOCUMENT_BUDGET_PER_WINDOW {
+            budget.try_charge("ip:busy").unwrap();
+        }
+        for _ in 0..LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW {
+            assert!(budget.try_charge("ip:busy").is_err());
+        }
+        for i in 0..(LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW - LARGE_DOCUMENT_BUDGET_PER_WINDOW) {
+            assert!(budget.try_charge(&format!("vid:{i}")).is_ok());
+        }
+    }
+
+    /// A penalised address pays its raised cost from its allowance, and one
+    /// penalised past the allowance can pay for nothing.
+    #[test]
+    fn a_penalised_address_pays_its_cost() {
+        let budget = LargeDocumentBudget::new();
+        budget.penalize("ip:liar");
+        budget.penalize("ip:liar");
+        assert_eq!(budget.cost("ip:liar"), 4);
+        assert!(budget.try_charge("ip:liar").is_ok(), "4 of its 5");
+        assert!(budget.try_charge("ip:liar").is_err(), "1 left, cost 4");
+
+        for _ in 0..10 {
+            budget.penalize("ip:repeat");
+        }
+        assert_eq!(budget.cost("ip:repeat"), MAX_COST);
+        assert!(budget.try_charge("ip:repeat").is_err());
+    }
+
+    #[test]
+    fn a_full_penalty_table_keeps_its_penalties() {
         let budget = LargeDocumentBudget::new();
         budget.penalize("ip:abuser");
         {
-            let mut state = budget.inner.lock().unwrap();
-            for i in 0..MAX_TRACKED_ADDRESSES {
-                state.buckets.insert(
-                    format!("ip:{i}"),
-                    Bucket {
-                        spent: 0,
-                        window_start: 0,
-                        cost: 1,
-                    },
-                );
+            let mut penalties = budget.penalties.lock().unwrap();
+            for i in 1..MAX_TRACKED_ADDRESSES {
+                penalties.insert(format!("ip:{i}"), 2);
             }
         }
-        // Every filler's window has expired: they are evicted, the penalty is not.
-        assert!(budget.try_charge("ip:new", 10_000).is_ok());
-        assert_eq!(budget.cost("ip:abuser"), 2);
+        budget.penalize("ip:new");
+        assert_eq!(budget.cost("ip:new"), 1, "no room for a new penalty");
+        budget.penalize("ip:abuser");
+        assert_eq!(budget.cost("ip:abuser"), 4, "a held penalty still grows");
     }
 
     #[test]
-    fn a_full_map_of_live_addresses_refuses_a_new_one() {
-        let budget = LargeDocumentBudget::new();
-        {
-            let mut state = budget.inner.lock().unwrap();
-            for i in 0..MAX_TRACKED_ADDRESSES {
-                state.buckets.insert(
-                    format!("ip:{i}"),
-                    Bucket {
-                        spent: 1,
-                        window_start: 10_000,
-                        cost: 1,
-                    },
-                );
-            }
-        }
-        assert!(budget.try_charge("ip:new", 10_000).is_err());
+    fn a_full_budget_of_live_addresses_refuses_a_new_one() {
+        let budget = LargeDocumentBudget::with_max_tracked_addresses(2);
+        budget.try_charge("ip:0").unwrap();
+        budget.try_charge("ip:1").unwrap();
+        assert!(budget.try_charge("ip:new").is_err());
         assert!(
-            budget.try_charge("ip:0", 10_000).is_ok(),
+            budget.try_charge("ip:0").is_ok(),
             "a tracked address still charges"
         );
     }
@@ -675,7 +703,7 @@ mod tests {
         let small = register_doc("did:web:admin.example", 10);
         assert!(small.len() <= DEFAULT_MAX_DOCUMENT_BYTES);
         for _ in 0..(LARGE_DOCUMENT_BUDGET_PER_WINDOW * 3) {
-            let charge = check_for_known_issuer(&small, &served, &acl, &budget, "ip:2.2.2.2", 0)
+            let charge = check_for_known_issuer(&small, &served, &acl, &budget, "ip:2.2.2.2")
                 .await
                 .expect("small document admitted");
             assert!(

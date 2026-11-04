@@ -207,8 +207,9 @@ impl Topology {
             pending_challenges: Arc::new(
                 did_hosting_control::pending_challenges::PendingChallengeTracker::new(),
             ),
-            ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
-            redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),
+            client_ips: Default::default(),
+            ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::challenge_limiter()),
+            redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::redeem_limiter()),
             large_document_budget: Arc::new(
                 did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
             ),
@@ -329,6 +330,7 @@ impl Topology {
             replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
                 did_hosting_common::server::auth::session::now_epoch(),
             )),
+            client_ips: Default::default(),
             trust_tasks_rate_limiter: Arc::new(
                 did_hosting_common::server::rate_limit::IpRateLimiter::new(
                     did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,

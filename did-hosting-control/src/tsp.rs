@@ -117,7 +117,6 @@ pub(crate) async fn run_tsp_trust_task(
             &state.acl_ks,
             &state.large_document_budget,
             &format!("vid:{sender}"),
-            did_hosting_common::server::auth::session::now_epoch(),
         )
         .await
         {
@@ -270,8 +269,9 @@ mod tests {
             path_locks: crate::path_locks::PathLocks::new(),
             acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
             pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
-            ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
-            redeem_rate_limiter: Arc::new(crate::rate_limit::SourceRateLimiter::new()),
+            client_ips: Default::default(),
+            ip_rate_limiter: Arc::new(crate::rate_limit::challenge_limiter()),
+            redeem_rate_limiter: Arc::new(crate::rate_limit::redeem_limiter()),
             large_document_budget: Arc::new(
                 did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
             ),
