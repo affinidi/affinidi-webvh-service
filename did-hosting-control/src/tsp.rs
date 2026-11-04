@@ -236,6 +236,7 @@ mod tests {
             identity: Default::default(),
             replay: Default::default(),
             geoip: Default::default(),
+            stats_flush: Default::default(),
             config_path: PathBuf::new(),
         };
         let state = AppState {

@@ -16,7 +16,7 @@
 use did_hosting_common::did_ops::{self, DidRecord};
 use did_hosting_common::didcomm_types::*;
 use serde_json::json;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::registry::{self, ServiceType};
 use crate::server::AppState;
@@ -380,11 +380,11 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
             warn!(mnemonic = %mnemonic, error = %e, "DID sync: failed to record notified watchers");
         }
 
-        let servers = match get_active_servers(&registry_ks).await {
-            Some(s) => s,
-            None => {
+        let servers = match push_targets(&registry_ks).await {
+            PushTargets::Active(s) => s,
+            other => {
                 if watchers.is_empty() {
-                    warn!(mnemonic = %mnemonic, "DID sync: no active servers in registry");
+                    other.log("DID sync", &mnemonic);
                 } else {
                     notify.notify_one();
                 }
@@ -451,11 +451,11 @@ pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
             warn!(mnemonic = %mnemonic, error = %e, "DID delete sync: failed to clear notified-watchers record");
         }
 
-        let servers = match get_active_servers(&registry_ks).await {
-            Some(s) => s,
-            None => {
+        let servers = match push_targets(&registry_ks).await {
+            PushTargets::Active(s) => s,
+            other => {
                 if watcher_dids.is_empty() {
-                    warn!(mnemonic = %mnemonic, "DID delete sync: no active servers in registry");
+                    other.log("DID delete sync", &mnemonic);
                 } else {
                     notify.notify_one();
                 }
@@ -550,33 +550,100 @@ pub fn is_configured_watcher(state: &AppState, did: &str) -> bool {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Get active server DIDs and instance IDs from the registry.
-async fn get_active_servers(
-    registry_ks: &crate::store::KeyspaceHandle,
-) -> Option<Vec<(String, String)>> {
-    let instances = match registry::list_instances(registry_ks).await {
-        Ok(i) => i,
+/// The edges a DID change is pushed to, as the registry holds them.
+#[derive(Debug, PartialEq, Eq)]
+enum PushTargets {
+    /// Active edges, as (server DID, instance id).
+    Active(Vec<(String, String)>),
+    /// No edge is registered: always so for a daemon, and for a control plane
+    /// until its first edge registers. Nothing is missed.
+    NoneRegistered,
+    /// Edges are registered but none is active (degraded, unreachable, or
+    /// registered without a DID), so this change reaches none of them now.
+    NoneActive,
+    /// The registry could not be read; the failure is already logged.
+    Unknown,
+}
+
+/// Most one "registered but none active" warning per this many seconds: it
+/// is a property of the registry, not of each DID change.
+const NO_ACTIVE_EDGES_WARN_SECS: u64 = 300;
+
+/// Unix second of the last "registered but none active" warning.
+static LAST_NO_ACTIVE_EDGES_WARN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+impl PushTargets {
+    fn from_instances(instances: Vec<registry::ServiceInstance>) -> Self {
+        let registered: Vec<_> = instances
+            .into_iter()
+            .filter(|i| i.service_type == ServiceType::Server)
+            .collect();
+        if registered.is_empty() {
+            return Self::NoneRegistered;
+        }
+        let active: Vec<_> = registered
+            .into_iter()
+            .filter(|i| i.status == registry::ServiceStatus::Active)
+            .filter_map(|i| {
+                let did = i.metadata.get("did")?.as_str()?.to_string();
+                Some((did, i.instance_id))
+            })
+            .collect();
+        if active.is_empty() {
+            Self::NoneActive
+        } else {
+            Self::Active(active)
+        }
+    }
+
+    /// Log why a change was not pushed. An empty registry is the normal
+    /// state of a daemon, so it is debug; registered edges that are all
+    /// down miss this change, so that warns, at most once per
+    /// [`NO_ACTIVE_EDGES_WARN_SECS`].
+    fn log(&self, op: &str, mnemonic: &str) {
+        match self {
+            Self::NoneRegistered => {
+                debug!(mnemonic = %mnemonic, "{op}: no servers registered");
+            }
+            Self::NoneActive => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let last = LAST_NO_ACTIVE_EDGES_WARN.load(std::sync::atomic::Ordering::Relaxed);
+                if now.saturating_sub(last) >= NO_ACTIVE_EDGES_WARN_SECS
+                    && LAST_NO_ACTIVE_EDGES_WARN
+                        .compare_exchange(
+                            last,
+                            now,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        )
+                        .is_ok()
+                {
+                    warn!(
+                        mnemonic = %mnemonic,
+                        "{op}: servers are registered but none is active; changes are not \
+                         reaching them (repeats are logged at debug for {NO_ACTIVE_EDGES_WARN_SECS} s)"
+                    );
+                } else {
+                    debug!(mnemonic = %mnemonic, "{op}: servers are registered but none is active");
+                }
+            }
+            Self::Active(_) | Self::Unknown => {}
+        }
+    }
+}
+
+/// The registry's push targets for a DID change.
+async fn push_targets(registry_ks: &crate::store::KeyspaceHandle) -> PushTargets {
+    match registry::list_instances(registry_ks).await {
+        Ok(instances) => PushTargets::from_instances(instances),
         Err(e) => {
             warn!(error = %e, "server push: failed to list instances");
-            return None;
+            PushTargets::Unknown
         }
-    };
-
-    let servers: Vec<_> = instances
-        .into_iter()
-        .filter(|i| {
-            i.service_type == ServiceType::Server && i.status == registry::ServiceStatus::Active
-        })
-        .filter_map(|i| {
-            let did = i.metadata.get("did")?.as_str()?.to_string();
-            Some((did, i.instance_id))
-        })
-        .collect();
-
-    if servers.is_empty() {
-        None
-    } else {
-        Some(servers)
     }
 }
 
@@ -918,5 +985,58 @@ mod watcher_tests {
         }];
         let l = log(&[json!({ "watchers": ["https://a.example", "https://b.example"] })]);
         assert_eq!(watcher_dids_for(&peers, &l), vec!["did:example:b"]);
+    }
+}
+
+#[cfg(test)]
+mod push_target_tests {
+    use super::*;
+
+    fn instance(
+        id: &str,
+        kind: &str,
+        status: &str,
+        did: Option<&str>,
+    ) -> registry::ServiceInstance {
+        let metadata = did.map_or(json!({}), |d| json!({ "did": d }));
+        serde_json::from_value(json!({
+            "instanceId": id,
+            "serviceType": kind,
+            "url": "https://edge.example",
+            "status": status,
+            "registeredAt": 0,
+            "metadata": metadata,
+        }))
+        .expect("instance")
+    }
+
+    #[test]
+    fn test_push_targets_empty_registry_is_none_registered() {
+        assert_eq!(
+            PushTargets::from_instances(vec![]),
+            PushTargets::NoneRegistered
+        );
+    }
+
+    #[test]
+    fn test_push_targets_registered_edges_that_are_down_are_told_apart_from_none() {
+        let down = vec![
+            instance("a", "server", "degraded", Some("did:example:a")),
+            instance("b", "server", "unreachable", Some("did:example:b")),
+            instance("c", "server", "active", None),
+        ];
+        assert_eq!(PushTargets::from_instances(down), PushTargets::NoneActive);
+    }
+
+    #[test]
+    fn test_push_targets_only_active_servers_with_a_did_are_pushed_to() {
+        let mixed = vec![
+            instance("a", "server", "active", Some("did:example:a")),
+            instance("b", "server", "degraded", Some("did:example:b")),
+        ];
+        assert_eq!(
+            PushTargets::from_instances(mixed),
+            PushTargets::Active(vec![("did:example:a".into(), "a".into())])
+        );
     }
 }

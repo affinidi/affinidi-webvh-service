@@ -234,9 +234,12 @@ control plane's README explains the bounds ("Replay cache bounds").
 | Variable | Description |
 | --- | --- |
 | `DAEMON_GEOIP_DATABASE` | Local GeoIP `.mmdb` file for wallet sign-in locations (empty clears) |
+| `DAEMON_STATS_FLUSH_MAX_ROWS_PER_SECOND` | Statistics rows the periodic flush writes a second, at most (default 20) |
 
-This lives in `[geoip] database` and reaches the embedded control plane,
-which answers wallet sign-in. See [`docs/geoip.md`](../docs/geoip.md).
+`[geoip] database` reaches the embedded control plane, which answers wallet
+sign-in. See [`docs/geoip.md`](../docs/geoip.md). `[stats_flush]
+max_rows_per_second` bounds the statistics flush the storage task runs; the
+control plane's README explains it ("Statistics flush budget").
 
 The resolution limit lives in `[server.resolve_rate_limit]` (`max_per_window`,
 `window_secs`) and is off by default; the edge server's README explains it
