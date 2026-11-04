@@ -64,6 +64,10 @@ pub struct AppState {
     /// address cannot force unbounded DID-resolution work by posting
     /// documents that name a fresh issuer on every request.
     pub trust_tasks_rate_limiter: Arc<did_hosting_common::server::rate_limit::IpRateLimiter>,
+    /// Who an HTTPS request's client is, from `server.trusted_proxies`: built
+    /// once with the state and shared by the Trust Task listener and the
+    /// resolution limit.
+    pub client_ips: did_hosting_common::server::rate_limit::ClientIps,
 }
 
 impl AppState {
@@ -78,6 +82,8 @@ impl AppState {
         let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
         let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
         let replay_cache = Arc::new(ReplayCache::with_config(config.replay.clone())?);
+        let client_ips =
+            did_hosting_common::server::rate_limit::ClientIps::new(&config.server.trusted_proxies)?;
         Ok(Self {
             acl_ks: store.keyspace(KS_ACL)?,
             witnesses_ks: store.keyspace(KS_WITNESSES)?,
@@ -92,6 +98,7 @@ impl AppState {
             acl_locks: PathLocks::new(),
             replay_cache,
             sign_lock: Arc::new(tokio::sync::Mutex::new(())),
+            client_ips,
             trust_tasks_rate_limiter: Arc::new(
                 did_hosting_common::server::rate_limit::IpRateLimiter::new(
                     did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,

@@ -129,6 +129,7 @@ async fn edge_state() -> (AppState, tempfile::TempDir) {
         replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
             did_hosting_common::server::auth::session::now_epoch(),
         )),
+        client_ips: Default::default(),
         trust_tasks_rate_limiter: Arc::new(
             did_hosting_common::server::rate_limit::IpRateLimiter::new(
                 did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
@@ -1012,6 +1013,10 @@ async fn an_unreadable_forwarded_chain_from_a_trusted_proxy_is_refused() {
     let mut config = (*state.config).clone();
     config.server.trusted_proxies = vec!["10.0.0.5".parse().unwrap()];
     let state = AppState {
+        client_ips: did_hosting_common::server::rate_limit::ClientIps::new(
+            &config.server.trusted_proxies,
+        )
+        .unwrap(),
         config: Arc::new(config),
         ..state
     };

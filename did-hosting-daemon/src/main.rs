@@ -937,12 +937,21 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     // One per-address resolution limit for the whole process, so a client's
     // budget covers the server's routes, the DID-serving fallback and the
     // watcher's routes together.
-    let resolve_limit = Arc::new(
-        did_hosting_common::server::rate_limit::ResolveRateLimiter::new(&config.server)
+    //
+    // One client-address rule for the whole process too, shared by that limit
+    // and every handler that charges a client address, so a proxy's invalid
+    // chain is logged once a minute whichever path met it.
+    let client_ips =
+        did_hosting_common::server::rate_limit::ClientIps::new(&config.server.trusted_proxies)
             .unwrap_or_else(|e| {
-                error!("failed to build the resolution rate limit: {e}");
+                error!("failed to build the client-address rule: {e}");
                 std::process::exit(1);
-            }),
+            });
+    let resolve_limit = Arc::new(
+        did_hosting_common::server::rate_limit::ResolveRateLimiter::new(
+            &config.server,
+            &client_ips,
+        ),
     );
     // Sweeps idle clients out of every rate limiter the daemon serves, until
     // the HTTP server stops.
@@ -974,7 +983,15 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // 2b. Witness (nested at /witness)
     if config.enable.witness {
-        match build_witness(&config, &witness_store, identity.clone(), &rate_limit_gc).await {
+        match build_witness(
+            &config,
+            &witness_store,
+            identity.clone(),
+            &client_ips,
+            &rate_limit_gc,
+        )
+        .await
+        {
             Ok(router) => {
                 combined = combined.nest("/witness", router);
                 enabled_services.push("witness (/witness)");
@@ -1011,6 +1028,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             &http_client,
             identity.clone(),
             server_state.as_ref(),
+            &client_ips,
         )
         .await
         {
@@ -1466,6 +1484,7 @@ async fn build_witness(
     config: &DaemonConfig,
     store: &Store,
     identity: Option<Arc<ServiceIdentity>>,
+    client_ips: &did_hosting_common::server::rate_limit::ClientIps,
     rate_limit_gc: &CancellationToken,
 ) -> ServiceResult {
     use webvh_witness::server::AppState;
@@ -1476,12 +1495,13 @@ async fn build_witness(
     // listener is the HTTPS binding, `POST /witness/api/trust-tasks`, under the
     // daemon's DID. Its `didcomm_service` slot stays empty, which is what makes
     // the witness's rotation path an inert no-op here.
-    let state = AppState::new(
+    let mut state = AppState::new(
         store.clone(),
         config.witness_config(),
         identity,
         Arc::new(LocalSigner),
     )?;
+    state.client_ips = client_ips.clone();
     state
         .trust_tasks_rate_limiter
         .spawn_gc(rate_limit_gc.clone());
@@ -1540,6 +1560,7 @@ fn resolution_cache_hook(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_control(
     config: &DaemonConfig,
     secrets: &ServerSecrets,
@@ -1548,6 +1569,7 @@ async fn build_control(
     http_client: &reqwest::Client,
     identity: Option<Arc<ServiceIdentity>>,
     server: Option<&did_hosting_server::server::AppState>,
+    client_ips: &did_hosting_common::server::rate_limit::ClientIps,
 ) -> Result<(Router, did_hosting_control::server::AppState), AppError> {
     use did_hosting_control::server::AppState;
 
@@ -1638,8 +1660,9 @@ async fn build_control(
         acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
         pending_challenges: Arc::new(pending_challenges),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
-        ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
-        redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),
+        client_ips: client_ips.clone(),
+        ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::challenge_limiter()),
+        redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::redeem_limiter()),
         cache_invalidate,
         // Wallet sign-in locations from the local GeoIP database, if any
         // (mirrors `did_hosting_control::server`).

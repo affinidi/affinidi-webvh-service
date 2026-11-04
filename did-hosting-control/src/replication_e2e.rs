@@ -144,6 +144,7 @@ async fn edge_state(
         replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
             did_hosting_common::server::auth::session::now_epoch(),
         )),
+        client_ips: Default::default(),
         trust_tasks_rate_limiter: Arc::new(
             did_hosting_common::server::rate_limit::IpRateLimiter::new(
                 did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,

@@ -140,15 +140,19 @@ pub struct AppState {
     /// surface (review SM3). Members expire with `challenge_ttl`, so a
     /// slot is never held past the life of its challenge.
     pub pending_challenges: Arc<crate::pending_challenges::PendingChallengeTracker>,
+    /// Who an HTTPS request's client is, from `server.trusted_proxies`: built
+    /// once at startup and shared by every handler that charges a client
+    /// address.
+    pub client_ips: did_hosting_common::server::rate_limit::ClientIps,
     /// Per-IP rate limiter for the unauthenticated challenge endpoint.
     /// Network-layer defence-in-depth that complements the per-DID +
     /// global counters above. See `crate::rate_limit` for the
     /// trusted-proxy / X-Forwarded-For policy.
-    pub ip_rate_limiter: Arc<crate::rate_limit::IpRateLimiter>,
+    pub ip_rate_limiter: Arc<did_hosting_common::server::rate_limit::IpRateLimiter>,
     /// Per-source limiter for passkey invite redemption
     /// (`auth/passkey/enroll/redeem/start`). See
-    /// [`crate::rate_limit::SourceRateLimiter`].
-    pub redeem_rate_limiter: Arc<crate::rate_limit::SourceRateLimiter>,
+    /// [`crate::rate_limit::redeem_limiter`].
+    pub redeem_rate_limiter: Arc<did_hosting_common::server::rate_limit::KeyedRateLimiter<String>>,
     /// Per-address budget for large documents (over the framework's default
     /// 64 KiB) a claimed — not yet verified — known issuer is granted a
     /// raised size limit for. See
@@ -185,11 +189,19 @@ pub struct AppState {
 
 impl AppState {
     /// Sweep idle clients out of every rate limiter this state serves (the
-    /// challenge, redemption and wallet sign-in limits) until `shutdown`
-    /// fires. Must run on the runtime serving the requests.
+    /// challenge, redemption, large-document and wallet sign-in limits) until
+    /// `shutdown` fires.
+    ///
+    /// Call it on a runtime that lives as long as the process serves
+    /// requests on *any* transport, not on the REST thread's: invite
+    /// redemption and the large-document budget are charged over DIDComm and
+    /// TSP too, so a sweep tied to the REST runtime would stop (or never
+    /// start) when the REST API is off. The sweep only touches the limiters'
+    /// shared maps, so which runtime runs it does not matter otherwise.
     pub fn spawn_rate_limit_gc(&self, shutdown: &CancellationToken) {
         self.ip_rate_limiter.spawn_gc(shutdown.clone());
         self.redeem_rate_limiter.spawn_gc(shutdown.clone());
+        self.large_document_budget.spawn_gc(shutdown);
         self.oob.spawn_rate_limit_gc(shutdown);
     }
 
@@ -352,6 +364,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // a file that cannot be read is a warning, and sign-in locations show as
     // "unknown". Read off the runtime's workers — it can be 100+ MB.
     let geoip = open_geoip(&config.geoip).await?;
+    let client_ips =
+        did_hosting_common::server::rate_limit::ClientIps::new(&config.server.trusted_proxies)?;
 
     let state = AppState {
         store: store.clone(),
@@ -429,8 +443,9 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         path_locks: crate::path_locks::PathLocks::new(),
         acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
         pending_challenges: Arc::new(pending_challenges),
-        ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
-        redeem_rate_limiter: Arc::new(crate::rate_limit::SourceRateLimiter::new()),
+        client_ips,
+        ip_rate_limiter: Arc::new(crate::rate_limit::challenge_limiter()),
+        redeem_rate_limiter: Arc::new(crate::rate_limit::redeem_limiter()),
         large_document_budget: Arc::new(
             did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
         ),

@@ -120,8 +120,11 @@ mod tests {
             ..crate::config::AppConfig::default()
         };
         let state = AppState::new(store, config, None).unwrap();
-        let app = router_with_resolve_limit(Arc::new(ResolveRateLimiter::new(&server).unwrap()))
-            .with_state(state);
+        let app = router_with_resolve_limit(Arc::new(ResolveRateLimiter::new(
+            &server,
+            &state.client_ips,
+        )))
+        .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

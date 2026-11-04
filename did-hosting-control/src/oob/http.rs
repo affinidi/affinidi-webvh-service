@@ -310,12 +310,6 @@ pub(crate) async fn admit(
         &state.oob.other_limiter
     };
     if limiter.try_consume(ip).is_err() {
-        if limiter.first_refusal_in_window(&ip) {
-            // A row's own Type URI, but bounded anyway: a log line never
-            // carries more of a caller's document than it needs.
-            let type_prefix: String = type_uri.chars().take(64).collect();
-            tracing::warn!(%ip, type_uri = %type_prefix, "auth/oob client over the rate limit; refusing it until its budget refills");
-        }
         return Err(refuse(OobErrorCode::RateLimited, "too many requests"));
     }
     if type_uri == TYPE_REQUEST {
@@ -346,11 +340,7 @@ pub(crate) async fn admit(
         }
         // Counted after the origin check, so another site's page cannot
         // spend the global budget.
-        let global = &state.oob.global_request_limiter;
-        if global.try_consume(()).is_err() {
-            if global.first_refusal_in_window(&()) {
-                tracing::warn!("auth/oob/request refused: global rate limit");
-            }
+        if state.oob.global_request_limiter.try_consume(()).is_err() {
             return Err(refuse(
                 OobErrorCode::RateLimited,
                 "too many sign-in requests",

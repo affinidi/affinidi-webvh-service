@@ -27,8 +27,6 @@ use serde_json::Value;
 use tracing::error;
 use trust_tasks_rs::{RejectReason, TrustTask};
 
-use did_hosting_common::server::rate_limit::admit_trust_task;
-
 use crate::server::AppState;
 use crate::trust_tasks::{Via, dispatch_inbound_document};
 
@@ -59,12 +57,11 @@ pub async fn receive(
 ) -> Response {
     // Per-address rate limit, ahead of parsing and any DID resolution the
     // document's verification would trigger.
-    if let Err(refusal) = admit_trust_task(
-        &state.trust_tasks_rate_limiter,
-        addr.ip(),
-        &headers,
-        &state.config.server.trusted_proxies,
-    ) {
+    if let Err(refusal) =
+        state
+            .trust_tasks_rate_limiter
+            .admit(&state.client_ips, addr.ip(), &headers)
+    {
         return refusal.into_response();
     }
 

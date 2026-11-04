@@ -64,33 +64,44 @@ async fn per_ip_challenge_limit_answers_429_with_retry_after_to_the_next_request
     let ts = TestServer::start().await;
     let app = ts.router();
 
-    // Distinct DIDs, so the per-DID pending cap never bites first.
-    for i in 0..MAX_PER_WINDOW {
+    // Distinct DIDs, so the per-DID pending cap never bites first. Sent until
+    // the first refusal rather than exactly `MAX_PER_WINDOW + 1` times: the
+    // allowance refills one challenge every `WINDOW_SECS / MAX_PER_WINDOW`
+    // seconds, so on a slow runner a request or two may land in what refilled
+    // while the burst ran. Every request of the allowance is admitted, and no
+    // more than refilled on top of it.
+    let refill = Duration::from_secs(WINDOW_SECS) / MAX_PER_WINDOW as u32;
+    let started = Instant::now();
+    let mut admitted = 0u64;
+    let response = loop {
         let response = app
             .clone()
-            .oneshot(challenge_request(&format!("did:example:ip-{i}")))
+            .oneshot(challenge_request(&format!("did:example:ip-{admitted}")))
             .await
             .unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "request {i} under the cap"
+        if response.status() != StatusCode::OK {
+            break response;
+        }
+        admitted += 1;
+        let refilled = (started.elapsed().as_nanos() / refill.as_nanos()) as u64 + 1;
+        assert!(
+            admitted <= MAX_PER_WINDOW + refilled,
+            "{admitted} admitted, allowance {MAX_PER_WINDOW}, {refilled} refilled"
         );
-    }
-
-    let response = app
-        .oneshot(challenge_request("did:example:ip-over"))
-        .await
-        .unwrap();
+    };
+    assert!(
+        admitted >= MAX_PER_WINDOW,
+        "only {admitted} of the {MAX_PER_WINDOW}-request allowance admitted"
+    );
     let body = assert_rate_limited(response, "auth-challenge-per-ip").await;
     // The allowance refills one challenge every `WINDOW_SECS / MAX_PER_WINDOW`
     // seconds, so the hint is the wait for the next one, rounded up: not the
     // rest of a window.
     let retry = body["retryAfterSecs"].as_u64().unwrap();
-    let refill = WINDOW_SECS.div_ceil(MAX_PER_WINDOW);
+    let refill_secs = WINDOW_SECS.div_ceil(MAX_PER_WINDOW);
     assert!(
-        (1..=refill).contains(&retry),
-        "retry {retry}, refill {refill}"
+        (1..=refill_secs).contains(&retry),
+        "retry {retry}, refill {refill_secs}"
     );
 }
 
@@ -276,4 +287,65 @@ async fn abandoned_challenges_free_the_global_cap_on_expiry() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// A trusted proxy's unreadable `X-Forwarded-For` leaves a request with no
+/// client to charge. The challenge endpoint refuses it with the same `400` the
+/// resolution limit sends; `POST /api/trust-tasks` refuses it as it refuses
+/// everything, with a `trust-task-error` document.
+#[tokio::test]
+async fn an_unreadable_forwarded_chain_is_refused_in_each_routes_own_shape() {
+    let mut ts = TestServer::start().await;
+    // The router's mock peer is 127.0.0.1: make it a trusted proxy.
+    ts.state.client_ips =
+        did_hosting_common::server::rate_limit::ClientIps::new(&["127.0.0.1/32".parse().unwrap()])
+            .unwrap();
+    let app = ts.router();
+
+    let mut challenge = challenge_request("did:example:proxied");
+    challenge
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            40000,
+        ))));
+    challenge
+        .headers_mut()
+        .insert("x-forwarded-for", "not-an-ip".parse().unwrap());
+    let response = app.clone().oneshot(challenge).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.headers()["x-rate-limit-source"], "did-host");
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["error"], "invalid_forwarded_for");
+    assert_eq!(body["limiter"], "auth-challenge-per-ip");
+
+    let task = Request::builder()
+        .method("POST")
+        .uri("/api/trust-tasks")
+        .header("content-type", "application/json")
+        .header("x-forwarded-for", "not-an-ip")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "id": "urn:uuid:5b3c5e2a-1b81-4d3e-9b51-7a3c89e3d1f2",
+                "type": "https://trusttasks.org/spec/server/info/0.1",
+                "payload": {},
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(task).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        body["type"],
+        did_hosting_common::server::trust_tasks::framework_error_type_uri().to_string(),
+        "{body}"
+    );
+    assert_eq!(body["payload"]["code"], "malformedRequest", "{body}");
+    assert_eq!(
+        body["threadId"], "urn:uuid:5b3c5e2a-1b81-4d3e-9b51-7a3c89e3d1f2",
+        "routed to the refused document: {body}"
+    );
 }

@@ -16,10 +16,12 @@
 //!
 //! Behind a reverse proxy / load balancer / CDN, the TCP peer is the proxy,
 //! not the client. `server.trusted_proxies` opts in to reading
-//! `X-Forwarded-For` from the peers it names; [`resolve_client_ip`] applies
-//! the crate's rule (`ClientIpExtractor`), the same one the mediator and the
-//! DID resolver cache use. A chain from a trusted proxy that cannot be
-//! attributed is refused with `400` rather than charged to the proxy.
+//! `X-Forwarded-For` from the peers it names; [`ClientIps`], built once from it
+//! and held in each service's state, applies the crate's rule
+//! (`ClientIpExtractor`), the same one the mediator and the DID resolver cache
+//! use. A chain from a trusted proxy that cannot be attributed is refused with
+//! `400` (`invalid_forwarded_for`, the same body on every path) rather than
+//! charged to the proxy.
 //!
 //! Configuring `trusted_proxies` with the wrong value is a foot-gun: trust too
 //! much and an attacker can spoof XFF to bypass the limit; trust too little
@@ -35,14 +37,15 @@
 //! Every limiter's memory is bounded by the crate; [`KeyedRateLimiter::spawn_gc`]
 //! sweeps idle clients out of it.
 
+use std::fmt;
 use std::hash::Hash;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use affinidi_rate_limit::{
-    ClientIpExtractor, IpNet, KeyedRateLimiterState, RateLimitLayer, RateLimiterState,
-    TooManyRequests,
+    ClientIpExtractor, InvalidForwardedFor, IpNet, KeyedRateLimiterState, RateLimitLayer,
+    RateLimiterState, TooManyRequests,
 };
 use axum::http::HeaderMap;
 use ipnetwork::IpNetwork;
@@ -89,7 +92,7 @@ pub struct KeyedRateLimiter<K: Hash + Eq + Clone> {
 /// A [`KeyedRateLimiter`] per client address.
 pub type IpRateLimiter = KeyedRateLimiter<IpAddr>;
 
-impl<K: Hash + Eq + Clone> KeyedRateLimiter<K> {
+impl<K: Hash + Eq + Clone + fmt::Debug> KeyedRateLimiter<K> {
     /// `max_per_window` requests per `window_secs` for each key, refusals
     /// naming `limiter`. A limit above `u32::MAX` is held at `u32::MAX`,
     /// which no client reaches in a window.
@@ -108,27 +111,41 @@ impl<K: Hash + Eq + Clone> KeyedRateLimiter<K> {
         }
     }
 
-    /// Charge one request to `key`, or refuse it with
-    /// [`AppError::RateLimited`] (`429` with `Retry-After`).
-    pub fn try_consume(&self, key: K) -> Result<(), AppError> {
-        self.state
-            .charge(key)
-            .map_err(
-                |TooManyRequests { retry_after_secs }| AppError::RateLimited {
-                    limiter: self.limiter,
-                    message: format!(
-                        "rate limit exceeded ({} requests per {}s); try again later",
-                        self.max_per_window, self.window_secs
-                    ),
-                    retry_after_secs,
-                },
-            )
+    /// Track at most `max_tracked_keys` keys at once rather than the crate's
+    /// default; a new key past that is refused. Set while building.
+    pub fn with_max_tracked_keys(mut self, max_tracked_keys: usize) -> Self {
+        self.state = self.state.with_max_tracked_keys(max_tracked_keys);
+        self
     }
 
-    /// Whether a refusal of `key` is its first in its window, recording it,
-    /// so a caller logs once per window rather than once per request.
-    pub fn first_refusal_in_window(&self, key: &K) -> bool {
-        self.state.first_refusal_in_window(key)
+    /// The name this limiter's refusals carry.
+    pub fn name(&self) -> &'static str {
+        self.limiter
+    }
+
+    /// Charge one request to `key`, or refuse it with
+    /// [`AppError::RateLimited`] (`429` with `Retry-After`). A key's first
+    /// refusal in each window is logged, naming the limiter, so a flood
+    /// costs one log line a window rather than one a request.
+    pub fn try_consume(&self, key: K) -> Result<(), AppError> {
+        let Err(TooManyRequests { retry_after_secs }) = self.state.charge(key.clone()) else {
+            return Ok(());
+        };
+        if self.state.first_refusal_in_window(&key) {
+            warn!(
+                limiter = self.limiter,
+                client = ?key,
+                "client over the rate limit; refusing it until its budget refills"
+            );
+        }
+        Err(AppError::RateLimited {
+            limiter: self.limiter,
+            message: format!(
+                "rate limit exceeded ({} requests per {}s); try again later",
+                self.max_per_window, self.window_secs
+            ),
+            retry_after_secs,
+        })
     }
 }
 
@@ -137,6 +154,28 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> KeyedRateLimiter<K> {
     /// every minute until `shutdown` fires. Must run on a Tokio runtime.
     pub fn spawn_gc(&self, shutdown: CancellationToken) {
         self.state.spawn_gc(shutdown);
+    }
+}
+
+impl IpRateLimiter {
+    /// Admit one request from `peer` carrying `headers`, charged to its client
+    /// address ([`ClientIps::client_ip`]): the client address, or the refusal
+    /// to send — [`AppError::InvalidForwardedFor`] (`400`, the same body the
+    /// resolution limit sends) for an unreadable chain from a trusted proxy,
+    /// [`AppError::RateLimited`] (`429`) past the limit.
+    pub fn admit(
+        &self,
+        clients: &ClientIps,
+        peer: IpAddr,
+        headers: &HeaderMap,
+    ) -> Result<IpAddr, AppError> {
+        let client_ip = clients
+            .client_ip(peer, headers)
+            .map_err(|InvalidForwardedFor| AppError::InvalidForwardedFor {
+                limiter: self.limiter,
+            })?;
+        self.try_consume(client_ip)?;
+        Ok(client_ip)
     }
 }
 
@@ -154,18 +193,14 @@ pub struct ResolveRateLimiter {
 
 impl ResolveRateLimiter {
     /// The limiter `server.resolve_rate_limit` describes, attributing
-    /// requests through `server.trusted_proxies`. Warns when a limit is set
-    /// with no trusted proxies: behind a load balancer every client would
-    /// then share one budget.
-    ///
-    /// # Errors
-    ///
-    /// [`AppError::Config`] for a trusted proxy range covering every address,
-    /// which configuration loading already refuses.
-    pub fn new(server: &ServerConfig) -> Result<Self, AppError> {
+    /// requests through `clients` (the service's own, built from the same
+    /// `server.trusted_proxies`). Warns when a limit is set with no trusted
+    /// proxies: behind a load balancer every client would then share one
+    /// budget.
+    pub fn new(server: &ServerConfig, clients: &ClientIps) -> Self {
         let config = &server.resolve_rate_limit;
         let Some(max) = config.max_per_window else {
-            return Ok(Self::disabled());
+            return Self::disabled();
         };
         if server.trusted_proxies.is_empty() {
             warn!(
@@ -184,14 +219,14 @@ impl ResolveRateLimiter {
         )
         .with_source(RATE_LIMIT_SOURCE)
         .with_limiter_name(RESOLVE_RATE_LIMIT_NAME);
-        // A clone of the handlers' shared extractor, so a proxy's invalid
-        // chain is logged once a minute whichever path met it.
-        let clients = (*shared_client_ip_extractor(&server.trusted_proxies)?)
+        // A clone of the handlers' extractor, so a proxy's invalid chain is
+        // logged once a minute whichever path met it.
+        let clients = (*clients.0)
             .clone()
             .ipv6_prefix(RESOLVE_IPV6_PREFIX)
             .expect("64 is a valid IPv6 prefix length");
         let layer = RateLimitLayer::new(state.clone()).client_ip_extractor(clients);
-        Ok(Self { state, layer })
+        Self { state, layer }
     }
 
     /// A limiter that lets everything through.
@@ -220,82 +255,53 @@ impl ResolveRateLimiter {
     }
 }
 
-/// The crate's client-address rule for `trusted_proxies`.
+/// Who the client is: the crate's client-address rule for
+/// `server.trusted_proxies`, built once from configuration and held in each
+/// service's state. Clones share one extractor, so a proxy's invalid chain is
+/// logged once a minute whichever path met it.
 ///
-/// # Errors
-///
-/// [`AppError::Config`] for a range covering every address.
-pub fn client_ip_extractor(trusted_proxies: &[IpNetwork]) -> Result<ClientIpExtractor, AppError> {
-    let ranges = trusted_proxies
-        .iter()
-        .map(|network| {
-            IpNet::new(network.network(), network.prefix())
-                .expect("an IpNetwork's prefix is valid for its address family")
-        })
-        .collect();
-    ClientIpExtractor::trusted_proxies(ranges)
-        .map_err(|e| AppError::Config(format!("server.trusted_proxies: {e}")))
-}
+/// The default trusts no proxy: every request is its TCP peer.
+#[derive(Clone, Debug, Default)]
+pub struct ClientIps(Arc<ClientIpExtractor>);
 
-/// The client address of a request from `peer` carrying `headers`: `peer`
-/// unless it is one of `trusted_proxies`, in which case the client its
-/// `X-Forwarded-For` names. IPv4-mapped addresses are unwrapped.
-///
-/// # Errors
-///
-/// [`AppError::Validation`] (`400`) for a chain from a trusted proxy that
-/// cannot be attributed: a malformed entry where the proxies wrote, more than
-/// 64 entries, or a header that is not visible ASCII. Charging it to the
-/// proxy instead would hand the sender a second budget and hide a misbehaving
-/// proxy.
-pub fn resolve_client_ip(
-    peer: IpAddr,
-    headers: &HeaderMap,
-    trusted_proxies: &[IpNetwork],
-) -> Result<IpAddr, AppError> {
-    shared_client_ip_extractor(trusted_proxies)?
-        .client_ip(peer, headers)
-        .map_err(|e| AppError::Validation(e.to_string()))
-}
-
-/// Admit one request from `peer` to a Trust Task listener, charged to its
-/// client address: the client address, or the refusal to send (`400` for an
-/// unreadable chain from a trusted proxy, `429` past the limit). A client's
-/// first refusal in each window is logged.
-pub fn admit_trust_task(
-    limiter: &IpRateLimiter,
-    peer: IpAddr,
-    headers: &HeaderMap,
-    trusted_proxies: &[IpNetwork],
-) -> Result<IpAddr, AppError> {
-    let client_ip = resolve_client_ip(peer, headers, trusted_proxies)?;
-    limiter.try_consume(client_ip).inspect_err(|_| {
-        if limiter.first_refusal_in_window(&client_ip) {
-            warn!(ip = %client_ip, "trust-tasks client over the rate limit; refusing it until its budget refills");
-        }
-    })?;
-    Ok(client_ip)
-}
-
-/// The extractor for `trusted_proxies`, built once per distinct list and
-/// reused, so every handler shares its once-a-minute log of a proxy's invalid
-/// chain (and the request path skips rebuilding it). A process has one or two
-/// lists (the daemon's services share theirs), so the cache stays tiny.
-fn shared_client_ip_extractor(
-    trusted_proxies: &[IpNetwork],
-) -> Result<Arc<ClientIpExtractor>, AppError> {
-    static EXTRACTORS: Mutex<Vec<(Vec<IpNetwork>, Arc<ClientIpExtractor>)>> =
-        Mutex::new(Vec::new());
-    let mut extractors = EXTRACTORS.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some((_, extractor)) = extractors
-        .iter()
-        .find(|(proxies, _)| proxies.as_slice() == trusted_proxies)
-    {
-        return Ok(extractor.clone());
+impl ClientIps {
+    /// The rule for `trusted_proxies`.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::Config`] for a range covering every address, which
+    /// configuration loading already refuses.
+    pub fn new(trusted_proxies: &[IpNetwork]) -> Result<Self, AppError> {
+        let ranges = trusted_proxies
+            .iter()
+            .map(|network| {
+                IpNet::new(network.network(), network.prefix())
+                    .expect("an IpNetwork's prefix is valid for its address family")
+            })
+            .collect();
+        ClientIpExtractor::trusted_proxies(ranges)
+            .map(|extractor| Self(Arc::new(extractor)))
+            .map_err(|e| AppError::Config(format!("server.trusted_proxies: {e}")))
     }
-    let extractor = Arc::new(client_ip_extractor(trusted_proxies)?);
-    extractors.push((trusted_proxies.to_vec(), extractor.clone()));
-    Ok(extractor)
+
+    /// The client address of a request from `peer` carrying `headers`:
+    /// `peer` unless it is a trusted proxy, in which case the client its
+    /// `X-Forwarded-For` names. IPv4-mapped addresses are unwrapped.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidForwardedFor`] for a chain from a trusted proxy that cannot
+    /// be attributed: a malformed entry where the proxies wrote, more than 64
+    /// entries, or a header that is not visible ASCII. Charging it to the
+    /// proxy instead would hand the sender a second budget and hide a
+    /// misbehaving proxy.
+    pub fn client_ip(
+        &self,
+        peer: IpAddr,
+        headers: &HeaderMap,
+    ) -> Result<IpAddr, InvalidForwardedFor> {
+        self.0.client_ip(peer, headers)
+    }
 }
 
 #[cfg(test)]
@@ -373,16 +379,12 @@ mod tests {
         ));
     }
 
-    /// One extractor per trusted-proxy list, so handlers share its log of a
-    /// proxy's invalid chain.
+    /// Clones of one [`ClientIps`] share its extractor, so the handlers and
+    /// the resolution layer share its log of a proxy's invalid chain.
     #[test]
-    fn handlers_share_one_extractor_per_proxy_list() {
-        let trusted = nets(&["10.0.0.0/8"]);
-        let first = shared_client_ip_extractor(&trusted).unwrap();
-        let again = shared_client_ip_extractor(&trusted).unwrap();
-        assert!(Arc::ptr_eq(&first, &again));
-        let other = shared_client_ip_extractor(&nets(&["172.16.0.0/12"])).unwrap();
-        assert!(!Arc::ptr_eq(&first, &other));
+    fn clones_of_client_ips_share_one_extractor() {
+        let clients = ClientIps::new(&nets(&["10.0.0.0/8"])).unwrap();
+        assert!(Arc::ptr_eq(&clients.0, &clients.clone().0));
     }
 
     /// A limit on what a source proves, and one budget for everyone.
@@ -398,15 +400,30 @@ mod tests {
         assert!(global.try_consume(()).is_err());
     }
 
+    /// A key's first refusal in a window is recorded (and logged) once.
     #[test]
     fn a_refusal_is_reported_once_per_window() {
         let limiter = IpRateLimiter::new("test-limiter", 1, 60);
         let client = ip("203.0.113.1");
-        assert!(limiter.first_refusal_in_window(&client));
-        assert!(!limiter.first_refusal_in_window(&client));
+        limiter.try_consume(client).unwrap();
+        assert!(limiter.try_consume(client).is_err());
+        assert!(
+            !limiter.state.first_refusal_in_window(&client),
+            "try_consume already recorded this window's refusal"
+        );
     }
 
-    // --- resolve_client_ip ---
+    // --- ClientIps ---
+
+    fn resolve_client_ip(
+        peer: IpAddr,
+        headers: &HeaderMap,
+        trusted_proxies: &[IpNetwork],
+    ) -> Result<IpAddr, InvalidForwardedFor> {
+        ClientIps::new(trusted_proxies)
+            .unwrap()
+            .client_ip(peer, headers)
+    }
 
     #[test]
     fn resolve_no_trusted_proxies_returns_peer() {
@@ -443,19 +460,75 @@ mod tests {
         );
     }
 
-    /// A chain a trusted proxy sent that cannot be attributed is a 400, not
-    /// the proxy's address.
+    /// A chain a trusted proxy sent that cannot be attributed is refused,
+    /// not charged to the proxy's address.
     #[test]
     fn resolve_refuses_an_unattributable_chain_from_a_trusted_proxy() {
         let trusted = nets(&["10.0.0.0/8"]);
-        let refusal =
-            resolve_client_ip(ip("10.0.0.1"), &xff(&["not-an-ip"]), &trusted).unwrap_err();
-        assert_eq!(refusal.into_response().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resolve_client_ip(ip("10.0.0.1"), &xff(&["not-an-ip"]), &trusted),
+            Err(InvalidForwardedFor)
+        );
         assert_eq!(
             resolve_client_ip(ip("10.0.0.1"), &HeaderMap::new(), &trusted).unwrap(),
             ip("10.0.0.1"),
             "no header is the peer"
         );
+    }
+
+    /// A handler's refusal of an unattributable chain is the same `400` the
+    /// resolution layer sends: `invalid_forwarded_for`, naming the limiter,
+    /// attributed to this service.
+    #[tokio::test]
+    async fn admit_refuses_an_unattributable_chain_as_the_layer_does() {
+        let limiter = IpRateLimiter::new("test-limiter", 10, 60);
+        let clients = ClientIps::new(&nets(&["10.0.0.0/8"])).unwrap();
+        let refusal = limiter
+            .admit(&clients, ip("10.0.0.1"), &xff(&["not-an-ip"]))
+            .unwrap_err();
+        let response = refusal.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()["x-rate-limit-source"], "did-host");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": affinidi_rate_limit::INVALID_FORWARDED_FOR_ERROR,
+                "limiter": "test-limiter",
+                "message": "Invalid X-Forwarded-For header; request rejected.",
+            })
+        );
+        assert_eq!(
+            limiter
+                .admit(&clients, ip("10.0.0.1"), &xff(&["198.51.100.7"]))
+                .unwrap(),
+            ip("198.51.100.7")
+        );
+    }
+
+    /// The resolution layer's own refusal of the same chain, for comparison
+    /// with the handlers' above.
+    #[tokio::test]
+    async fn the_resolution_layer_refuses_an_unattributable_chain_with_the_same_body() {
+        let app = app(&resolve_limiter(Some(10), &["10.0.0.0/8"]));
+        let response = app
+            .oneshot(request("10.0.0.1", Some("not-an-ip")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()["x-rate-limit-source"], "did-host");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["error"],
+            affinidi_rate_limit::INVALID_FORWARDED_FOR_ERROR
+        );
+        assert_eq!(body["limiter"], RESOLVE_RATE_LIMIT_NAME);
     }
 
     // --- ResolveRateLimiter ---
@@ -467,7 +540,7 @@ mod tests {
         let mut server = ServerConfig::default();
         server.resolve_rate_limit.max_per_window = max_per_window;
         server.trusted_proxies = nets(trusted_proxies);
-        ResolveRateLimiter::new(&server).unwrap()
+        ResolveRateLimiter::new(&server, &ClientIps::new(&server.trusted_proxies).unwrap())
     }
 
     fn app(limiter: &ResolveRateLimiter) -> axum::Router {

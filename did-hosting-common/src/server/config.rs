@@ -187,7 +187,7 @@ pub struct ServerConfig {
     /// behind a CDN that strips XFF, but wrong behind a load balancer
     /// (every request appears to come from the LB, so per-IP rate limits
     /// become a global cap). List only your actual reverse proxies: see
-    /// [`crate::server::rate_limit::resolve_client_ip`]. An entry that is
+    /// [`crate::server::rate_limit::ClientIps`]. An entry that is
     /// neither an address nor a CIDR, or a range covering every address, is
     /// refused at load.
     #[serde(default, with = "ip_networks")]
