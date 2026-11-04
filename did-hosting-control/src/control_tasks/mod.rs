@@ -246,7 +246,7 @@ control_tasks! {
     // Step-up: the start is the session subject's operational request; the
     // decision is the approver's attestation.
     tt_step_up::start::v0_2 => Authentication, auth::step_up_start;
-    tt_step_up::approve_response::v0_6 => AssertionMethod, auth::approve_response;
+    tt_step_up::approve_response::v0_7 => AssertionMethod, auth::approve_response;
     // Logout: end one of the caller's own sessions, and any session key bound
     // to it.
     tt_revoke_session::v0_2 => Authentication, auth::revoke_session;

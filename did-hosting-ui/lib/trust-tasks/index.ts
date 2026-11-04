@@ -35,7 +35,7 @@ export * as AuthPasskeyRevokeStart_v0_2 from "./auth/passkey/revoke/start/0.2/pa
 export * as AuthRefresh_v0_2 from "./auth/refresh/0.2/payload.js";
 export * as AuthRevokeSession_v0_2 from "./auth/revoke-session/0.2/payload.js";
 export * as AuthStepUpApproveRequest_v0_5 from "./auth/step-up/approve-request/0.5/payload.js";
-export * as AuthStepUpApproveResponse_v0_6 from "./auth/step-up/approve-response/0.6/payload.js";
+export * as AuthStepUpApproveResponse_v0_7 from "./auth/step-up/approve-response/0.7/payload.js";
 export * as AuthStepUpStart_v0_2 from "./auth/step-up/start/0.2/payload.js";
 export * as AuthWhoami_v0_1 from "./auth/whoami/0.1/payload.js";
 export * as DidManagementAgentNameCheck_v0_1 from "./did-management/agent-name/check/0.1/payload.js";
