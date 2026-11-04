@@ -183,7 +183,14 @@ Environment variables use the `CONTROL_` prefix:
 | `CONTROL_SERVER_HOST`                      | Bind host                    |
 | `CONTROL_SERVER_PORT`                      | Bind port                    |
 | `CONTROL_LOG_LEVEL`                        | Log level                    |
+| `CONTROL_SERVER_TRUSTED_PROXIES`           | Comma-separated proxy addresses or CIDR ranges whose `X-Forwarded-For` is trusted |
 | `CONTROL_REGISTRY_HEALTH_CHECK_INTERVAL`   | Health check interval (sec)  |
+| `CONTROL_REPLAY_MAX_ENTRIES`               | Replay cache records, all signers (default 1,000,000, about 32 MB) |
+| `CONTROL_REPLAY_MAX_ENTRIES_PER_SIGNER`    | Replay cache records per signer (default 250,000, about 600 signed requests a second) |
+| `CONTROL_GEOIP_DATABASE`                   | Local GeoIP `.mmdb` file for wallet sign-in locations (empty clears) |
+
+The replay settings live in `[replay]` (`max_entries`,
+`max_entries_per_signer`); see "Replay cache bounds" below.
 
 ## CLI Commands
 
@@ -220,6 +227,72 @@ providing browser-based passwordless authentication alongside DIDComm
 challenge-response auth. Without a `public_url`, WebAuthn is not
 initialised and authentication falls back to DID challenge-response.
 
+### Replay cache bounds
+
+Every service that accepts signed Trust Tasks (control plane, edge server,
+watcher, witness and daemon) remembers each one as `(signer, id)` for as
+long as its `issuedAt` is inside the freshness window (up to about 7
+minutes), so a captured request cannot be submitted again. A record is a
+fixed-size hash, about 32 bytes whatever the DID and id, filed by the
+document's signed `issuedAt` so whole minutes are dropped as they leave the
+window.
+
+At a bound the cache refuses new requests (`unavailable`, retryable) rather
+than forget a record:
+
+- `max_entries` (default 1,000,000, about 32 MB) bounds all signers
+  together, and so the cache's memory. It may be at most 10,000,000
+  (about 320 MB).
+- `max_entries_per_signer` (default 250,000) bounds one signer, so one
+  authorised signer cannot fill the cache for the others. It caps that
+  signer's sustained rate at about `max_entries_per_signer / 420` requests
+  a second: about 600 at the default.
+- The last 10% of `max_entries` is kept for signers holding fewer than 100
+  records, so several busy signers together cannot lock out a quiet one.
+
+The defaults suit most deployments. Raise `max_entries_per_signer` wherever
+one signer sends faster than that:
+
+- On the control plane, for a VTA that creates DIDs at a high rate, and for
+  each edge's sync acknowledgements, which are counted against that edge.
+- On each edge server and watcher, by the same rate: every DID change
+  reaches them as a sync document signed by the control plane, so their
+  per-signer bound caps how fast they can follow it.
+- On a witness, for a VTA that has each new DID witnessed.
+
+```toml
+[replay]
+max_entries = 4000000             # all signers, about 128 MB
+max_entries_per_signer = 1000000  # about 2,400 signed requests a second per signer
+```
+
+Leave the table out to take the defaults; setup does not write it, so a
+later release's defaults apply. Wallet sign-in (`auth/oob/*`) keeps its own,
+separate replay record, because its signers are fresh keys anyone can mint;
+`[replay]` does not change it.
+
+### Wallet sign-in locations (GeoIP)
+
+When someone signs in with their wallet (`auth/oob`), the wallet shows where
+the request came from, for example `Vienna, AT`. The control plane looks the
+browser's address up in a **local** MaxMind DB (`.mmdb`) file and never calls
+a third-party service. Without one every location is `unknown`, which the
+wallet shows as a warning.
+
+```toml
+[geoip]
+database = "/var/lib/did-hosting/geoip/dbip-city-lite.mmdb"
+```
+
+Private ranges (an office LAN, a VPN) can be named with
+`[[geoip.networks]]` (`cidr`, `location`). Behind a reverse proxy, list it in
+`[server] trusted_proxies` (addresses or CIDR ranges) so the real client
+address is used. A missing or unreadable file is a warning, not a startup
+failure, and a replaced file is picked up within a minute without a restart.
+See
+[`docs/geoip.md`](../docs/geoip.md) for choosing a database (DB-IP City Lite
+or MaxMind GeoLite2 City), attribution and a monthly update job.
+
 ### Health Checking
 
 Registered service instances are periodically health-checked.
@@ -240,10 +313,10 @@ The control plane has no REST management API. Its HTTP surface is:
 | `GET` | `/*` | The management UI (`ui` feature), for any path outside `/api` |
 
 The three `/api/auth/*` routes are the one sign-in with no Trust Task form:
-`auth/authenticate/0.2` carries no `id_token`, and a browser session does not
+`auth/authenticate/0.3` carries no `id_token`, and a browser session does not
 hold the subject key a Trust Task `auth/refresh` must be signed with. A peer
 that signs its own documents signs in with `auth/challenge/0.1` and
-`auth/authenticate/0.2` on `POST /api/trust-tasks`.
+`auth/authenticate/0.3` on `POST /api/trust-tasks`.
 
 Operational metrics are the admin-only `did-management/server/metrics/0.1`
 Trust Task; there is no Prometheus scrape endpoint.
@@ -255,7 +328,7 @@ DIDComm), with WebAuthn's ceremony data inside their payloads:
 
 | Trust Task | Proof | Purpose |
 | --- | --- | --- |
-| `auth/passkey/enroll/invite/0.2` | administrator | Issue an invite: a URL token and a separate claim code, stored only as hashes |
+| `auth/passkey/enroll/invite/0.3` | administrator | Issue an invite: a URL token and a separate claim code, stored only as hashes |
 | `auth/passkey/enroll/redeem/start/0.1` | optional | Present token + claim code; get creation options (and `uvOptions` over existing passkeys of the purpose) |
 | `auth/passkey/enroll/redeem/finish/0.1` | optional | Bind the passkey to the invite's subject and consume the invite |
 | `auth/passkey/enroll/start/0.2`, `finish/0.2` | the subject | Add a login passkey to your own VID (re-verified with an existing one) |

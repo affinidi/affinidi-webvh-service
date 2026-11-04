@@ -9,7 +9,7 @@ use crate::acl::{AclEntry, Role};
 use crate::auth::session::now_epoch;
 use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, HostingConfig, LogConfig, LogFormat, RegistryConfig,
-    SecretsConfig, ServerConfig, StoreConfig, TransportSelection, VtaConfig,
+    SecretsConfig, ServerConfig, TransportSelection, VtaConfig,
 };
 use crate::error::AppError;
 use crate::secret_store::{ServerSecrets, create_secret_store};
@@ -245,15 +245,14 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
             port,
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
+            resolve_cache: Default::default(),
+            resolve_rate_limit: Default::default(),
         },
         log: LogConfig {
             level: log_level,
             format: log_format,
         },
-        store: StoreConfig {
-            data_dir: PathBuf::from(&data_dir),
-            ..StoreConfig::default()
-        },
+        store: crate::config::setup_store_config(PathBuf::from(&data_dir)),
         fjall: Default::default(),
         auth: AuthConfig::default(),
         secrets: secrets_config,
@@ -266,6 +265,8 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         trust_tasks: Default::default(),
         hosting: HostingConfig::default(),
         identity: Default::default(),
+        replay: Default::default(),
+        geoip: Default::default(),
         config_path: output_path.clone(),
     };
 
@@ -929,15 +930,14 @@ pub async fn run_setup_offline_complete(
             port: state.port,
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
+            resolve_cache: Default::default(),
+            resolve_rate_limit: Default::default(),
         },
         log: LogConfig {
             level: state.log_level.clone(),
             format: state.log_format.clone(),
         },
-        store: StoreConfig {
-            data_dir: PathBuf::from(&state.data_dir),
-            ..StoreConfig::default()
-        },
+        store: crate::config::setup_store_config(PathBuf::from(&state.data_dir)),
         fjall: Default::default(),
         auth: AuthConfig::default(),
         secrets: state.secrets.clone(),
@@ -950,6 +950,8 @@ pub async fn run_setup_offline_complete(
         trust_tasks: Default::default(),
         hosting: HostingConfig::default(),
         identity: Default::default(),
+        replay: Default::default(),
+        geoip: Default::default(),
         config_path: state.config_output.clone(),
     };
 

@@ -284,7 +284,7 @@ impl DeactivationCache {
 /// relationship check ([`CachedDidResolver`]: the key must be listed under the
 /// relationship the purpose names, and controlled by the DID naming it), after
 /// telling an unreachable signer apart from a bad proof, and refusing a
-/// deactivated `did:webvh` signer.
+/// deactivated `did:webvh` signer, or a `did:scid` one whose log is.
 struct SignerKeyResolver {
     client: DIDCacheClient,
     decode: CachedDidResolver,
@@ -299,16 +299,20 @@ impl ProofPurposeResolver for SignerKeyResolver {
         vm: &str,
         purpose: ProofPurpose,
     ) -> Result<ResolvedKey, DataIntegrityError> {
+        // A did:scid reference may carry the `src` its recipient needs to
+        // resolve it (VTI-KEY-163): resolve through it, so the source is known,
+        // then dereference by DID and fragment, as the document lists its keys.
         let did = controller_did(vm);
         let resolved = match self.client.resolve(did).await {
             Ok(resolved) => resolved,
             Err(e) => {
                 // The cache SDK (0.8.39+) refuses to resolve a deactivated
-                // did:webvh. That is final, not an unreachable signer: ask the
-                // DID's own log, so it is not retried as if it might come back.
-                if did.starts_with("did:webvh:")
+                // did:webvh (and did:scid). That is final, not an unreachable
+                // signer: ask the DID's own log, so it is not retried as if it
+                // might come back.
+                if let Some(log_did) = crate::scid::webvh_log_did(did, None)
                     && let Some(deactivation) = &self.deactivation
-                    && let Ok(true) = deactivation.is_deactivated(did, false).await
+                    && let Ok(true) = deactivation.is_deactivated(&log_did, false).await
                 {
                     return Err(DataIntegrityError::Resolver(format!("{did} {DEACTIVATED}")));
                 }
@@ -319,11 +323,18 @@ impl ProofPurposeResolver for SignerKeyResolver {
             }
         };
         // The relationship check (and key decoding) is the library's.
-        let key = self.decode.resolve_vm_for_purpose(vm, purpose).await?;
-        // A deactivated DID's keys sign nothing.
-        if did.starts_with("did:webvh:")
+        let key = self
+            .decode
+            .resolve_vm_for_purpose(&crate::scid::strip_scid_src(vm), purpose)
+            .await?;
+        // A deactivated DID's keys sign nothing — a did:scid's no more than
+        // the did:webvh log that verifies it.
+        let document = serde_json::to_value(&resolved.doc).ok();
+        if let Some(log_did) = crate::scid::webvh_log_did(did, document.as_ref())
             && let Some(deactivation) = &self.deactivation
-            && deactivation.is_deactivated(did, resolved.cache_hit).await?
+            && deactivation
+                .is_deactivated(&log_did, resolved.cache_hit)
+                .await?
         {
             return Err(DataIntegrityError::Resolver(format!("{did} {DEACTIVATED}")));
         }
@@ -494,8 +505,8 @@ impl TransportBoundVerifier {
     /// that has not deactivated its DID.
     ///
     /// **Never by a session delegate.** A session key stands in for its
-    /// subject on ordinary requests only (`auth/authenticate/0.2` Conformance
-    /// item 11). An approval must be signed by a key under the approver's *own*
+    /// subject on ordinary requests only (`auth/authenticate/0.3` Conformance
+    /// item 13). An approval must be signed by a key under the approver's *own*
     /// `assertionMethod` relationship. A `did:key` document lists its one key
     /// under every relationship, so without this refusal a session key could
     /// approve its own session's step-up.
@@ -615,7 +626,8 @@ impl TransportBoundVerifier {
             ));
         };
         let vm = proof.verification_method.as_str();
-        let self_signed = controller_did(vm) == issuer;
+        // By identity: a did:scid issuer or key reference may carry `src`.
+        let self_signed = crate::scid::same_reference(controller_did(vm), issuer);
         let delegated = delegation == Delegation::Allowed
             && self
                 .delegate
@@ -729,7 +741,7 @@ mod tests {
     fn base_body() -> Value {
         json!({
             "id": "urn:uuid:24f1b27f-36d9-49af-9a20-751def9000aa",
-            "type": "https://trusttasks.org/spec/acl/grant/0.1",
+            "type": "https://trusttasks.org/spec/acl/grant/0.2",
             "recipient": "did:web:server.example",
             "issuedAt": "2026-06-09T08:51:03Z",
             "payload": { "entry": { "subject": "did:web:alice.example", "role": "owner" } },
@@ -827,7 +839,7 @@ mod tests {
         assert!(matches!(err, VerificationError::IssuerMismatch(_)));
     }
 
-    /// GUARD (`auth/authenticate/0.2` Conformance item 11): a session key never
+    /// GUARD (`auth/authenticate/0.3` Conformance item 13): a session key never
     /// signs an approval, even for its own principal.
     ///
     /// The first assertion shows why the refusal has to be explicit. A

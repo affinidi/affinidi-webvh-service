@@ -82,7 +82,7 @@ pub const DID_REGISTER_MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
 /// much. Keyed by the full Type URI, so a new version of a task takes the
 /// default until it declares its own.
 pub const DECLARED: &[(&str, usize)] = &[(
-    <trust_tasks_rs::specs::did_management::did::register::v0_1::Payload as Payload>::TYPE_URI,
+    <crate::tasks::did_management::did::register::v0_1::Payload as Payload>::TYPE_URI,
     DID_REGISTER_MAX_DOCUMENT_BYTES,
 )];
 
@@ -311,15 +311,17 @@ pub async fn check_for_known_issuer(
         return Ok(None);
     }
     let claimed_issuer = match peek_issuer(body) {
-        Some(issuer)
-            if matches!(
-                crate::server::acl::get_acl_entry(acl, &issuer).await,
-                Ok(Some(_))
-            ) =>
-        {
-            Some(issuer)
-        }
-        _ => None,
+        Some(issuer) => match crate::server::acl::get_acl_entry(acl, &issuer).await {
+            Ok(Some(_)) => Some(issuer),
+            Ok(None) => None,
+            // A failed lookup says nothing about the issuer: refusing the
+            // document as oversized for a stranger would be final, and wrong.
+            Err(e) => {
+                tracing::warn!(error = %e, "large document deferred: ACL lookup failed");
+                return Err(unrouted_error(e.failure_reject_reason().into()));
+            }
+        },
+        None => None,
     };
     let Some(claimed_issuer) = claimed_issuer else {
         check_with(body, |_| DEFAULT_MAX_DOCUMENT_BYTES)?;
@@ -328,9 +330,7 @@ pub async fn check_for_known_issuer(
     if let Err(retry_after_secs) = budget.try_charge(address, now) {
         return Err(unrouted_error(
             RejectReason::Unavailable {
-                retry_after: Some(
-                    chrono::Utc::now() + chrono::Duration::seconds(retry_after_secs as i64),
-                ),
+                retry_after: Some(crate::server::error::retry_at(retry_after_secs)),
             }
             .into(),
         ));
@@ -451,8 +451,8 @@ mod tests {
     use super::*;
 
     const DID_REGISTER: &str =
-        <trust_tasks_rs::specs::did_management::did::register::v0_1::Payload as Payload>::TYPE_URI;
-    const ACL_SHOW: &str = <trust_tasks_rs::specs::acl::show::v0_1::Payload as Payload>::TYPE_URI;
+        <crate::tasks::did_management::did::register::v0_1::Payload as Payload>::TYPE_URI;
+    const ACL_SHOW: &str = <crate::tasks::acl::show::v0_2::Payload as Payload>::TYPE_URI;
 
     fn register_doc(issuer: &str, bytes: usize) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
@@ -510,6 +510,26 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// A failed ACL read says nothing about the issuer: the large document is
+    /// deferred with a retry time, not refused as oversized for a stranger.
+    #[tokio::test]
+    async fn a_throttled_acl_read_defers_a_large_document() {
+        let acl = acl_with("did:web:admin.example").await.throttled_reads();
+        let big = register_doc("did:web:admin.example", 200 * 1024);
+        let err = check_for_known_issuer(
+            &big,
+            &[DID_REGISTER],
+            &acl,
+            &LargeDocumentBudget::new(),
+            "ip:1.2.3.4",
+            0,
+        )
+        .await
+        .expect_err("deferred");
+        assert_eq!(err.payload.code.to_string(), "unavailable");
+        assert!(err.payload.retry_after.is_some());
     }
 
     /// Repeated large documents from one address, all naming the same known

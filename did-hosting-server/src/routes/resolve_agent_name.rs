@@ -192,6 +192,8 @@ async fn resolve(state: &AppState, raw_name: &str, parts: &Parts) -> Result<Resp
 
     let location = HeaderValue::from_str(&target)
         .map_err(|_| AppError::NotFound(format!("no such agent name: @{name}")))?;
+    let cache_control = HeaderValue::from_str(&state.config.server.resolve_cache.header_value())
+        .map_err(|e| AppError::Internal(format!("invalid cache-control: {e}")))?;
     Ok((
         StatusCode::FOUND,
         [
@@ -201,12 +203,9 @@ async fn resolve(state: &AppState, raw_name: &str, parts: &Parts) -> Result<Resp
             // to a resolver, or vice versa.
             (header::VARY, HeaderValue::from_static("accept")),
         ],
-        // A short public cache: a name mapping changes rarely, but it CAN
-        // change (rename, disable), so it is not immutable.
-        [(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("public, max-age=300"),
-        )],
+        // A public cache per `[server.resolve_cache]`: a name mapping changes
+        // rarely, but it CAN change (rename, disable), so it is not immutable.
+        [(header::CACHE_CONTROL, cache_control)],
     )
         .into_response())
 }

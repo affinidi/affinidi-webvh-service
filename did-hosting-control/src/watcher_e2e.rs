@@ -417,7 +417,7 @@ async fn a_watcher_may_only_acknowledge() {
     let p = pair().await;
     let (_, watcher_key) = crate::signing::test_util::did_key_signer(&[93; 32]);
     let doc = did_hosting_common::server::trust_tasks::send::build_signed_request(
-        "https://trusttasks.org/spec/acl/list/0.1",
+        "https://trusttasks.org/spec/acl/list/0.3",
         &p.watcher_did,
         &p.control_did,
         json!({}),

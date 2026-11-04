@@ -32,7 +32,7 @@ pub const KS_ACL: &str = "acl";
 pub const KS_SESSIONS: &str = "sessions";
 
 /// `pk_user:<uuid>`, `pk_did:<did>`, `pk_cred:<cred_id_hex>` — **step-up-only**
-/// passkeys (`auth/passkey/enroll/invite/0.2` `purpose: stepUp`), in the same
+/// passkeys (`auth/passkey/enroll/invite/0.3` `purpose: stepUp`), in the same
 /// layout [`KS_SESSIONS`] holds login passkeys in.
 ///
 /// A separate keyspace so the separation holds by construction: the passkey
@@ -118,3 +118,10 @@ pub const KS_OUTBOUND_QUEUE: &str = "outbox";
 /// node from forgetting every peer and silently dropping their application
 /// traffic until a re-handshake.
 pub const KS_TSP_RELATIONSHIPS: &str = "tsp_relationships";
+/// `scid_floor:<bare did:scid>` — the did:scid sources and latest verified
+/// log version (`ScidSourceRecord`) of every did:scid identity this service
+/// authorises (ACL subjects, DID owners, a configured control plane), so the
+/// resolver's rollback floor survives a restart (VTI-KEY-162). Seeded into
+/// the service identity's resolver at boot; see
+/// [`crate::server::scid_floors`].
+pub const KS_SCID_FLOORS: &str = "scid_floors";

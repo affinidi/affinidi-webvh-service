@@ -1,11 +1,11 @@
 //! `did-management/registry/*`: the control plane's fleet of registered
 //! service instances. Every task here is an administrator's.
 
-use serde_json::{Value, json};
-use tracing::info;
-use trust_tasks_rs::specs::did_management::registry::{
+use did_hosting_common::tasks::did_management::registry::{
     admin_register, check, deregister, get, list, purge_domain,
 };
+use serde_json::{Value, json};
+use tracing::info;
 
 use did_hosting_common::server::didcomm_profile::ObservedTransport;
 use did_hosting_common::server::domain::normalize_domain_name;
@@ -30,7 +30,7 @@ fn transport(t: ObservedTransport) -> &'static str {
     }
 }
 
-/// A registry entry in the shared `ServiceInstance` 0.2 wire shape, or `None`
+/// A registry entry in the shared `ServiceInstance` 0.3 wire shape, or `None`
 /// for an entry with no DID to name it by (the schema requires one; such an
 /// entry predates DID-addressed registration and cannot be acted on).
 pub(crate) fn spec_instance(instance: &ServiceInstance) -> Option<Value> {
@@ -69,27 +69,27 @@ pub(crate) fn spec_instance(instance: &ServiceInstance) -> Option<Value> {
     if let (Some(t), Some(when)) = (instance.last_inbound_transport, instance.last_inbound_at) {
         out.insert(
             "lastInbound".into(),
-            json!({ "transport": transport(t), "at": at(when) }),
+            json!({ "transport": transport(t), "observedAt": at(when) }),
         );
     }
     if let (Some(t), Some(when)) = (instance.last_outbound_transport, instance.last_outbound_at) {
         out.insert(
             "lastOutbound".into(),
-            json!({ "transport": transport(t), "at": at(when) }),
+            json!({ "transport": transport(t), "observedAt": at(when) }),
         );
     }
     if let Some(checked) = instance.last_health_check {
-        out.insert("lastHealthCheck".into(), json!(at(checked)));
+        out.insert("lastHealthCheckAt".into(), json!(at(checked)));
     }
     out.insert("registeredAt".into(), json!(at(instance.registered_at)));
     Some(Value::Object(out))
 }
 
-/// `registry/list/0.1`: every entry matching the filters, by `instanceId`.
+/// `registry/list/0.2`: every entry matching the filters, by `instanceId`.
 pub(crate) async fn list(
     cx: &Cx<'_>,
-    p: list::v0_1::Payload,
-) -> Result<list::v0_1::Response, TaskError> {
+    p: list::v0_2::Payload,
+) -> Result<list::v0_2::Response, TaskError> {
     cx.admin().await?;
     let mut instances = registry::list_instances(&cx.state.registry_ks).await?;
     instances.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
@@ -125,26 +125,26 @@ async fn wire_instance(
         .ok_or_else(|| TaskError::Declared(code, format!("no instance `{instance_id}`")))
 }
 
-/// `registry/get/0.1`.
+/// `registry/get/0.2`.
 pub(crate) async fn get(
     cx: &Cx<'_>,
-    p: get::v0_1::Payload,
-) -> Result<get::v0_1::Response, TaskError> {
+    p: get::v0_2::Payload,
+) -> Result<get::v0_2::Response, TaskError> {
     cx.admin().await?;
-    let instance = wire_instance(cx, &p.instance_id, get::v0_1::error_codes::NOT_FOUND).await?;
+    let instance = wire_instance(cx, &p.instance_id, get::v0_2::error_codes::NOT_FOUND).await?;
     typed(json!({ "instance": instance }), "registry get response")
 }
 
-/// `registry/check/0.1`: recompute the verdict and re-resolve the advertised
+/// `registry/check/0.2`: recompute the verdict and re-resolve the advertised
 /// services — a failed resolution keeps the previous observation and does not
 /// fail the task — then answer the entry as stored.
 pub(crate) async fn check(
     cx: &Cx<'_>,
-    p: check::v0_1::Payload,
-) -> Result<check::v0_1::Response, TaskError> {
+    p: check::v0_2::Payload,
+) -> Result<check::v0_2::Response, TaskError> {
     cx.admin().await?;
     let state = cx.state;
-    let code = check::v0_1::error_codes::NOT_FOUND;
+    let code = check::v0_2::error_codes::NOT_FOUND;
     let instance = registry::get_instance(&state.registry_ks, &p.instance_id)
         .await?
         .ok_or_else(|| {
@@ -168,12 +168,12 @@ pub(crate) async fn check(
     typed(json!({ "instance": instance }), "registry check response")
 }
 
-/// `registry/admin-register/0.1`: add a hosting server to the registry by
+/// `registry/admin-register/0.2`: add a hosting server to the registry by
 /// hand. An existing `instanceId` is refused, never overwritten.
 pub(crate) async fn admin_register(
     cx: &Cx<'_>,
-    p: admin_register::v0_1::Payload,
-) -> Result<admin_register::v0_1::Response, TaskError> {
+    p: admin_register::v0_2::Payload,
+) -> Result<admin_register::v0_2::Response, TaskError> {
     let auth = cx.admin().await?;
     let state = cx.state;
     if registry::get_instance(&state.registry_ks, &p.instance_id)
@@ -181,7 +181,7 @@ pub(crate) async fn admin_register(
         .is_some()
     {
         return Err(TaskError::Declared(
-            admin_register::v0_1::error_codes::INSTANCE_EXISTS,
+            admin_register::v0_2::error_codes::INSTANCE_EXISTS,
             format!(
                 "instance `{}` is already registered",
                 p.instance_id.as_str()

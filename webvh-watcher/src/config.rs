@@ -39,6 +39,13 @@ pub struct AppConfig {
     /// How the watcher's own identity is produced.
     #[serde(default)]
     pub identity: IdentityConfig,
+    /// Bounds of the anti-replay cache for signed Trust Tasks (`[replay]`;
+    /// env `WATCHER_REPLAY_*`).
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_common::server::config::ReplayConfig::is_default"
+    )]
+    pub replay: did_hosting_common::server::config::ReplayConfig,
     #[serde(default)]
     pub sync: SyncConfig,
     #[serde(skip)]
@@ -67,6 +74,8 @@ impl Default for AppConfig {
                 port: 8533,
                 trusted_proxies: Vec::new(),
                 trusted_proxy_cidrs: Vec::new(),
+                resolve_cache: Default::default(),
+                resolve_rate_limit: Default::default(),
             },
             log: LogConfig::default(),
             store: StoreConfig {
@@ -77,10 +86,18 @@ impl Default for AppConfig {
             secrets: SecretsConfig::default(),
             vta: VtaConfig::default(),
             identity: IdentityConfig::default(),
+            replay: Default::default(),
             sync: SyncConfig::default(),
             config_path: PathBuf::new(),
         }
     }
+}
+
+/// The store config setup starts from: `data_dir`, with the same `*_STORE_*`
+/// environment overrides [`AppConfig::load`] applies at runtime, so setup opens
+/// the backend the service will use.
+pub fn setup_store_config(data_dir: PathBuf) -> StoreConfig {
+    did_hosting_common::server::config::store_config_with_env(data_dir, &["WATCHER_STORE"])
 }
 
 impl AppConfig {
@@ -121,6 +138,15 @@ impl AppConfig {
             &mut AuthConfig::default(),
             &mut config.secrets,
         )?;
+        // WATCHER_SERVER_RESOLVE_CACHE_* — Cache-Control on DID resolution.
+        config.server.resolve_cache.apply_env_overrides("WATCHER")?;
+        // WATCHER_REPLAY_* — anti-replay cache bounds. Also validates `[replay]`.
+        config.replay.apply_env_overrides("WATCHER")?;
+        // WATCHER_SERVER_RESOLVE_RATE_LIMIT_* — per-address limit on resolution.
+        config
+            .server
+            .resolve_rate_limit
+            .apply_env_overrides("WATCHER")?;
         if let Ok(v) = std::env::var("WATCHER_SERVER_DID") {
             config.server_did = Some(v);
         }
@@ -141,5 +167,27 @@ impl AppConfig {
         did_hosting_common::server::config::apply_fjall_env_overrides(&mut config.fjall)?;
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod setup_store_tests {
+    use super::*;
+
+    #[test]
+    fn setup_starts_from_the_store_environment_the_service_reads_at_runtime() {
+        // SAFETY: the only test in this crate that touches these variables.
+        unsafe {
+            std::env::set_var("WATCHER_STORE_DYNAMODB_TABLE_NAME", "watcher_store-table");
+        }
+        let store = setup_store_config(PathBuf::from("/data"));
+        unsafe {
+            std::env::remove_var("WATCHER_STORE_DYNAMODB_TABLE_NAME");
+        }
+        assert_eq!(
+            store.dynamodb_table_name.as_deref(),
+            Some("watcher_store-table")
+        );
+        assert_eq!(store.data_dir, PathBuf::from("/data"));
     }
 }

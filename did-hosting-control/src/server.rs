@@ -33,9 +33,18 @@ use tokio::sync::{oneshot, watch};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, debug, error, info, warn};
 
-/// A cache-eviction hook: takes the store key whose cached content is now
-/// stale. See `AppState::cache_invalidate`.
-pub type CacheInvalidateFn = dyn Fn(&str) + Send + Sync;
+/// What a cache-eviction hook is told has changed in the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheChange<'a> {
+    /// One DID's record, log or witness file, by mnemonic.
+    Did(&'a str),
+    /// A domain entry (created, updated, enabled, disabled or purged).
+    Domains,
+}
+
+/// A cache-eviction hook: told what changed, so whatever it cached from
+/// that is now stale. See `AppState::cache_invalidate`.
+pub type CacheInvalidateFn = dyn Fn(CacheChange<'_>) + Send + Sync;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -43,6 +52,7 @@ pub struct AppState {
     pub sessions_ks: KeyspaceHandle,
     pub acl_ks: KeyspaceHandle,
     pub registry_ks: KeyspaceHandle,
+    /// Opened with [`Store::keyspace_consistent`]: its reads decide writes.
     pub dids_ks: KeyspaceHandle,
     pub config: Arc<AppConfig>,
     pub did_resolver: Option<DIDCacheClient>,
@@ -152,10 +162,10 @@ pub struct AppState {
     /// this notify so delivery happens promptly in the happy path.
     /// On notify-miss the worker still runs on its 30 s tick.
     pub outbox_notify: Arc<tokio::sync::Notify>,
-    /// Evicts a resolved-content cache entry (keyed by
-    /// `did_ops::content_log_key(mnemonic)`) when this process also serves
-    /// resolution from the same store — the unified `did-hosting-daemon`,
-    /// which wires this to its embedded server's `did_cache`.
+    /// Evicts what resolution cached about a DID or the domains when this
+    /// process also serves resolution from the same store — the unified
+    /// `did-hosting-daemon`, which wires this to its embedded server's
+    /// content cache and gate cache.
     ///
     /// `None` for a standalone control plane: it holds no content cache of
     /// its own, and a registered edge's cache is kept in step independently,
@@ -164,7 +174,10 @@ pub struct AppState {
     /// mutation here (register, publish, disable, rollback, delete) would
     /// leave the daemon's embedded server serving a stale or since-deleted
     /// cache entry for up to its TTL — there is no sync round-trip within a
-    /// single process to invalidate it the way a standalone edge does.
+    /// single process to invalidate it the way a standalone edge does. The
+    /// daemon also caches each DID's record and the domains (its gate
+    /// cache), so a DID disabled or a domain disabled here without this
+    /// call would keep resolving.
     pub cache_invalidate: Option<Arc<CacheInvalidateFn>>,
     /// Wallet sign-in with a trigger link (`auth/oob/*`): the open requests
     /// and their limiters. See [`crate::oob`].
@@ -223,6 +236,20 @@ impl AuthState for AppState {
     }
 }
 
+/// Open the configured GeoIP database and named networks (see
+/// [`crate::geoip`]). Never fails on the file itself — only if the blocking
+/// read task cannot be joined.
+pub async fn open_geoip(
+    config: &crate::config::GeoIpConfig,
+) -> Result<Arc<crate::geoip::GeoIp>, AppError> {
+    let path = config.database.clone();
+    let networks = config.networks.iter().map(|n| (n.cidr, n.location.clone()));
+    tokio::task::spawn_blocking(move || crate::geoip::GeoIp::open(path))
+        .await
+        .map(|geoip| Arc::new(geoip.with_networks(networks)))
+        .map_err(|e| AppError::Internal(format!("GeoIP database load task: {e}")))
+}
+
 pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
     // Validate that at least one management interface is enabled
     if !config.features.rest_api && !config.features.didcomm && !config.features.tsp {
@@ -240,7 +267,10 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let sessions_ks = store.keyspace(KS_SESSIONS)?;
     let acl_ks = store.keyspace(KS_ACL)?;
     let registry_ks = store.keyspace(KS_REGISTRY)?;
-    let dids_ks = store.keyspace(KS_DIDS)?;
+    // Strongly consistent: the control plane's DID reads decide writes
+    // (ownership, slot existence, what to push to edges), so a read that
+    // missed a just-committed write could hand one owner's slot to another.
+    let dids_ks = store.keyspace_consistent(KS_DIDS)?;
     let stats_ks = store.keyspace(KS_STATS)?;
     // Time-series buckets live in their own keyspace from v0.7 — see
     // the `timeseries_ks` field doc on `AppState`.
@@ -296,6 +326,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // Gather storage thread inputs before moving config into Arc
     let storage_sessions_ks = sessions_ks.clone();
     let storage_auth_config = config.auth.clone();
+    let replay_config = config.replay.clone();
     let has_auth = jwt_keys.is_some();
 
     let stats_dids_ks = dids_ks.clone();
@@ -308,6 +339,11 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 
     let pending_challenges =
         crate::pending_challenges::PendingChallengeTracker::for_auth_config(&config.auth);
+
+    // The local GeoIP database, if configured (base design §12.6). Advisory:
+    // a file that cannot be read is a warning, and sign-in locations show as
+    // "unknown". Read off the runtime's workers — it can be 100+ MB.
+    let geoip = open_geoip(&config.geoip).await?;
 
     let state = AppState {
         store: store.clone(),
@@ -381,7 +417,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         stats_ks: stats_ks.clone(),
         timeseries_ks: timeseries_ks.clone(),
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
-        replay_cache: Arc::new(crate::replay::ReplayCache::new()),
+        replay_cache: Arc::new(crate::replay::ReplayCache::with_config(replay_config)?),
         path_locks: crate::path_locks::PathLocks::new(),
         acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
         pending_challenges: Arc::new(pending_challenges),
@@ -394,7 +430,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         // Standalone control plane: no content cache of its own to
         // invalidate. See the field doc.
         cache_invalidate: None,
-        oob: Arc::default(),
+        oob: Arc::new(crate::oob::OobRuntime::with_geoip(geoip)),
     };
 
     // Reload challenges issued before a restart, so the caps hold across it.
@@ -590,6 +626,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let (outbox_shutdown_tx, outbox_shutdown_rx) = tokio::sync::watch::channel(false);
     let outbox_state = state.clone();
     let outbox_notify = state.outbox_notify.clone();
+    // The GeoIP reloader (step 8) stops on the same signal.
+    let geoip_shutdown_rx = outbox_shutdown_rx.clone();
     let outbox_handle = tokio::spawn(async move {
         crate::outbox::run_outbox_loop(outbox_state, outbox_notify, outbox_shutdown_rx).await;
     });
@@ -597,6 +635,9 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // 7. Check, in the background, that our own DID lists the services
     // wallet sign-in needs; warn once with the fix if not. Never blocks.
     crate::sign_in_readiness::spawn(&state);
+
+    // 8. A refreshed GeoIP database is picked up without a restart.
+    let geoip_reloader = state.oob.geoip().spawn_reloader(geoip_shutdown_rx);
 
     // Wait for shutdown signal
     init::shutdown_signal().await;
@@ -649,6 +690,12 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 
     if let Err(e) = outbox_handle.await {
         warn!("outbox worker didn't shut down cleanly: {e}");
+    }
+
+    if let Some(handle) = geoip_reloader
+        && let Err(e) = handle.await
+    {
+        warn!("GeoIP reloader didn't shut down cleanly: {e}");
     }
 
     if any_panic {
@@ -976,10 +1023,17 @@ fn run_storage_thread(
 
         let mut session_timer = tokio::time::interval(session_interval);
         let mut flush_timer = tokio::time::interval(flush_interval);
+        // A flush that overruns its interval is followed by a full interval,
+        // not an immediate catch-up flush.
+        flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut did_count_timer = tokio::time::interval(
+            did_hosting_common::server::stats_collector::DID_COUNT_RECONCILE_INTERVAL,
+        );
 
         // Skip first tick (immediate)
         session_timer.tick().await;
         flush_timer.tick().await;
+        did_count_timer.tick().await;
 
         loop {
             tokio::select! {
@@ -990,8 +1044,13 @@ fn run_storage_thread(
                 }
                 _ = flush_timer.tick() => {
                     // Flush accumulated per-DID stats deltas to persistent store
-                    if let Err(e) = flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, &dids_ks, &store).await {
+                    if let Err(e) = flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, STATS_FLUSH_MAX_ROWS).await {
                         warn!("stats flush error: {e}");
+                    }
+                }
+                _ = did_count_timer.tick() => {
+                    if let Err(e) = did_hosting_common::server::stats_collector::reconcile_total_dids(&collector, &dids_ks).await {
+                        warn!("DID count reconcile error: {e}");
                     }
                 }
                 _ = shutdown_rx.changed() => {
@@ -1002,7 +1061,7 @@ fn run_storage_thread(
         }
 
         // Final flush before shutdown
-        let _ = flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, &dids_ks, &store).await;
+        flush_remaining_stats(&collector, &stats_ks, &timeseries_ks).await;
 
         if let Err(e) = store.persist().await {
             error!("failed to persist store on shutdown: {e}");
@@ -1012,96 +1071,284 @@ fn run_storage_thread(
     });
 }
 
-/// Flush accumulated stats deltas from the in-memory collector to the store.
+/// Most rows one periodic stats flush writes, about 20 a second at the
+/// 10-second flush interval. Each row is a read and a write, so this bounds
+/// the flush's share of the store's capacity and how long it holds the
+/// storage task; rows beyond it wait for the next flush, in the order
+/// [`stats_flush_order`] gives them.
+pub const STATS_FLUSH_MAX_ROWS: usize = 200;
+
+/// Rows a flush writes at once. The rows are independent keys, so writing
+/// several together takes the same store capacity in a fraction of the
+/// time the storage task would otherwise spend waiting on round trips.
+pub const STATS_FLUSH_CONCURRENCY: usize = 8;
+
+/// Oldest time-series bucket a flush still writes. Older buckets are counts
+/// the store has refused or the flush could not reach for this long; they
+/// are dropped with a warning so a long outage cannot grow the backlog
+/// without bound. Per-DID totals are never dropped by age: there is one row
+/// per DID.
+pub const STATS_BUCKET_MAX_AGE: Duration = Duration::from_secs(3600);
+
+/// How long the shutdown flush may write before giving up, well inside a
+/// container's usual 30-second termination grace period so the store is
+/// still persisted afterwards.
+pub const STATS_SHUTDOWN_FLUSH_DEADLINE: Duration = Duration::from_secs(15);
+
+/// How often a warning about rows dropped at the collector's caps may repeat.
+const STATS_DROP_WARN_SECS: u64 = 300;
+
+/// One row a stats flush writes.
+enum StatsRow {
+    /// A DID's `stats:{mnemonic}` totals.
+    Total(did_hosting_common::DidStatsDelta),
+    /// A `ts:{mnemonic}:{epoch}` time-series bucket.
+    Bucket(did_hosting_common::server::stats_collector::DrainedBucket),
+}
+
+/// Flush accumulated stats deltas from the in-memory collector to the store,
+/// writing at most `max_rows` rows.
 ///
 /// `stats_ks` receives `stats:{mnemonic}` aggregate rows;
 /// `timeseries_ks` receives `ts:{mnemonic}:{bucket}` and
 /// `ts:_all:{bucket}` time-series rows. The split came in v0.7 so a
 /// future scan over either keyspace returns homogeneous-shaped values.
-/// fjall batches span keyspaces, so atomicity is preserved.
+///
+/// Each row is its own read-modify-write, not one transaction over the
+/// whole flush: on a metered store a transaction costs twice the write
+/// units, and one throttled row would fail every row with it. Rows are
+/// written [`STATS_FLUSH_CONCURRENCY`] at a time. The first failed batch
+/// ends the flush; failed rows and every row not yet written go back to the
+/// collector, as do rows past `max_rows`, so a failed flush loses no counts
+/// while the process runs. A write that reports failure is read back first,
+/// and counted as written if the store applied it (a timeout after the
+/// write landed), so the retry does not count it twice.
 pub async fn flush_stats_to_store(
     collector: &did_hosting_common::server::stats_collector::StatsCollector,
     stats_ks: &KeyspaceHandle,
     timeseries_ks: &KeyspaceHandle,
-    dids_ks: &KeyspaceHandle,
-    store: &Store,
+    max_rows: usize,
 ) -> Result<(), AppError> {
-    let deltas = collector.drain_for_sync();
-    if deltas.is_empty() {
-        // Update total DID count even if no deltas
-        if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
-            collector.set_total_dids(dids.len() as u64);
-        }
-        return Ok(());
+    flush_stats_rows(collector, stats_ks, timeseries_ks, max_rows, None).await
+}
+
+/// Flush every pending stats row, for shutdown, for at most
+/// [`STATS_SHUTDOWN_FLUSH_DEADLINE`]. Rows that cannot be written by then
+/// are lost with the process, so that is logged as an error.
+pub async fn flush_remaining_stats(
+    collector: &did_hosting_common::server::stats_collector::StatsCollector,
+    stats_ks: &KeyspaceHandle,
+    timeseries_ks: &KeyspaceHandle,
+) {
+    let deadline = tokio::time::Instant::now() + STATS_SHUTDOWN_FLUSH_DEADLINE;
+    let result = flush_stats_rows(
+        collector,
+        stats_ks,
+        timeseries_ks,
+        usize::MAX,
+        Some(deadline),
+    )
+    .await;
+    let lost = collector.pending_rows();
+    match result {
+        Err(e) => error!(
+            lost,
+            "final stats flush failed; unwritten statistics are lost: {e}"
+        ),
+        Ok(()) if lost > 0 => error!(
+            lost,
+            "final stats flush ran out of time; unwritten statistics are lost"
+        ),
+        Ok(()) => {}
+    }
+}
+
+async fn flush_stats_rows(
+    collector: &did_hosting_common::server::stats_collector::StatsCollector,
+    stats_ks: &KeyspaceHandle,
+    timeseries_ks: &KeyspaceHandle,
+    max_rows: usize,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), AppError> {
+    if let Some(dropped) = collector.take_dropped(STATS_DROP_WARN_SECS) {
+        warn!(
+            dropped,
+            "stats backlog full; per-DID statistics were dropped (the server-wide totals and series still count them)"
+        );
     }
 
-    // Current 5-minute time-series bucket
+    let mut rows = stats_flush_order(
+        collector.drain_for_sync(),
+        recent_buckets(collector.drain_buckets()),
+    );
+    let mut failed = Vec::new();
+    let mut failure = None;
+    let mut written = 0usize;
+
+    while written < max_rows
+        && !rows.is_empty()
+        && deadline.is_none_or(|d| tokio::time::Instant::now() < d)
+    {
+        let n = STATS_FLUSH_CONCURRENCY
+            .min(max_rows - written)
+            .min(rows.len());
+        let mut set = tokio::task::JoinSet::new();
+        for row in rows.drain(..n) {
+            let stats_ks = stats_ks.clone();
+            let timeseries_ks = timeseries_ks.clone();
+            set.spawn(async move {
+                let result = match &row {
+                    StatsRow::Total(d) => write_did_stats(&stats_ks, d).await,
+                    StatsRow::Bucket(b) => write_timeseries_bucket(&timeseries_ks, b).await,
+                };
+                (row, result)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((_, Ok(()))) => written += 1,
+                Ok((row, Err(e))) => {
+                    failed.push(row);
+                    failure.get_or_insert(e);
+                }
+                Err(e) => error!("stats row write task failed; its counts are lost: {e}"),
+            }
+        }
+        if failure.is_some() {
+            break;
+        }
+    }
+
+    let deferred = failed.len() + rows.len();
+    let mut deltas = Vec::new();
+    let mut buckets = Vec::new();
+    for row in failed.into_iter().chain(rows) {
+        match row {
+            StatsRow::Total(d) => deltas.push(d),
+            StatsRow::Bucket(b) => buckets.push(b),
+        }
+    }
+    collector.requeue_deltas(deltas);
+    collector.requeue_buckets(buckets);
+
+    match failure {
+        Some(e) => {
+            warn!(
+                written,
+                deferred, "stats flush stopped; unwritten rows requeued"
+            );
+            Err(e)
+        }
+        None => {
+            if written > 0 || deferred > 0 {
+                debug!(written, deferred, "flushed stats rows to store");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The order a flush writes rows in, so a flush budget smaller than the
+/// backlog still makes progress on everything: the server-wide series first
+/// (one bucket per 5 minutes, and what the dashboard charts), then per-DID
+/// totals and per-DID buckets alternately, buckets newest first. Neither
+/// kind can starve the other under sustained load.
+fn stats_flush_order(
+    deltas: Vec<did_hosting_common::DidStatsDelta>,
+    buckets: Vec<did_hosting_common::server::stats_collector::DrainedBucket>,
+) -> std::collections::VecDeque<StatsRow> {
+    use did_hosting_common::server::stats_collector::ALL_SERIES;
+
+    let (all, per_did): (Vec<_>, Vec<_>) =
+        buckets.into_iter().partition(|b| b.mnemonic == ALL_SERIES);
+    let mut order: std::collections::VecDeque<StatsRow> =
+        all.into_iter().map(StatsRow::Bucket).collect();
+    let mut deltas = deltas.into_iter();
+    let mut per_did = per_did.into_iter();
+    loop {
+        let d = deltas.next();
+        let b = per_did.next();
+        if d.is_none() && b.is_none() {
+            break;
+        }
+        order.extend(d.map(StatsRow::Total));
+        order.extend(b.map(StatsRow::Bucket));
+    }
+    order
+}
+
+/// Drop drained buckets older than [`STATS_BUCKET_MAX_AGE`] and order the
+/// rest newest first.
+fn recent_buckets(
+    buckets: Vec<did_hosting_common::server::stats_collector::DrainedBucket>,
+) -> Vec<did_hosting_common::server::stats_collector::DrainedBucket> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let bucket_epoch = now / 300 * 300;
-
-    // Aggregate totals for the server-wide (_all) time-series bucket
-    let mut all_resolve_delta = 0u64;
-    let mut all_update_delta = 0u64;
-
-    let mut batch = store.batch();
-    for d in &deltas {
-        // Aggregate stats (totals) — stats_ks
-        let key = format!("stats:{}", d.mnemonic);
-        let mut stats: did_hosting_common::DidStats =
-            stats_ks.get(key.as_str()).await?.unwrap_or_default();
-        stats.total_resolves += d.resolve_delta;
-        stats.total_updates += d.update_delta;
-        if let Some(t) = d.last_resolved_at {
-            stats.last_resolved_at = Some(stats.last_resolved_at.map_or(t, |prev| prev.max(t)));
-        }
-        if let Some(t) = d.last_updated_at {
-            stats.last_updated_at = Some(stats.last_updated_at.map_or(t, |prev| prev.max(t)));
-        }
-        batch.insert(stats_ks, key, &stats)?;
-
-        // Time-series bucket (per-DID) — timeseries_ks
-        if d.resolve_delta > 0 || d.update_delta > 0 {
-            let ts_key = format!("ts:{}:{bucket_epoch}", d.mnemonic);
-            let existing: serde_json::Value = timeseries_ks
-                .get(ts_key.as_str())
-                .await?
-                .unwrap_or(serde_json::json!({"r": 0, "u": 0}));
-            let r = existing.get("r").and_then(|v| v.as_u64()).unwrap_or(0) + d.resolve_delta;
-            let u = existing.get("u").and_then(|v| v.as_u64()).unwrap_or(0) + d.update_delta;
-            batch.insert(timeseries_ks, ts_key, &serde_json::json!({"r": r, "u": u}))?;
-
-            all_resolve_delta += d.resolve_delta;
-            all_update_delta += d.update_delta;
-        }
+    let cutoff = now.saturating_sub(STATS_BUCKET_MAX_AGE.as_secs());
+    let (mut recent, old): (Vec<_>, Vec<_>) = buckets.into_iter().partition(|b| b.epoch >= cutoff);
+    if !old.is_empty() {
+        warn!(
+            rows = old.len(),
+            "dropping time-series buckets that could not be written within the maximum age"
+        );
     }
+    recent.sort_by_key(|b| std::cmp::Reverse(b.epoch));
+    recent
+}
 
-    // Server-wide time-series bucket (_all) — timeseries_ks
-    if all_resolve_delta > 0 || all_update_delta > 0 {
-        let all_key = format!("ts:_all:{bucket_epoch}");
-        let existing: serde_json::Value = timeseries_ks
-            .get(all_key.as_str())
-            .await?
-            .unwrap_or(serde_json::json!({"r": 0, "u": 0}));
-        let r = existing.get("r").and_then(|v| v.as_u64()).unwrap_or(0) + all_resolve_delta;
-        let u = existing.get("u").and_then(|v| v.as_u64()).unwrap_or(0) + all_update_delta;
-        batch.insert(timeseries_ks, all_key, &serde_json::json!({"r": r, "u": u}))?;
+/// Write `value` to `key`. If the write reports failure, read the row back:
+/// only the storage task writes stats rows, so finding exactly `value`
+/// means the store applied the write (a timeout after it landed) and it
+/// must not be retried, or the retry would count it twice.
+async fn write_stats_row(
+    ks: &KeyspaceHandle,
+    key: String,
+    value: serde_json::Value,
+) -> Result<(), AppError> {
+    match ks.insert(key.as_str(), &value).await {
+        Ok(()) => Ok(()),
+        Err(e) => match ks.get::<serde_json::Value>(key.as_str()).await {
+            Ok(Some(stored)) if stored == value => {
+                debug!(key, "stats write reported failure but was applied");
+                Ok(())
+            }
+            _ => Err(e),
+        },
     }
+}
 
-    batch.commit().await?;
+/// Add one DID's deltas to its `stats:{mnemonic}` row.
+async fn write_did_stats(
+    stats_ks: &KeyspaceHandle,
+    d: &did_hosting_common::DidStatsDelta,
+) -> Result<(), AppError> {
+    let key = format!("stats:{}", d.mnemonic);
+    let mut stats: did_hosting_common::DidStats =
+        stats_ks.get(key.as_str()).await?.unwrap_or_default();
+    stats.total_resolves += d.resolve_delta;
+    stats.total_updates += d.update_delta;
+    stats.last_resolved_at = stats.last_resolved_at.max(d.last_resolved_at);
+    stats.last_updated_at = stats.last_updated_at.max(d.last_updated_at);
+    let value = serde_json::to_value(&stats).map_err(|e| AppError::Internal(e.to_string()))?;
+    write_stats_row(stats_ks, key, value).await
+}
 
-    // Update total DID count (periodic reconciliation)
-    if let Ok(dids) = dids_ks.prefix_iter_raw("did:").await {
-        collector.set_total_dids(dids.len() as u64);
-    }
-    // Note: control plane still does the full scan because DIDs are managed
-    // from external sources (REST API, sync) making incremental tracking complex.
-    // This runs every 10s and is acceptable at 10K DIDs.
-
-    debug!(count = deltas.len(), "flushed stats deltas to store");
-    Ok(())
+/// Add one bucket's counts to its `ts:{mnemonic}:{epoch}` row (`_all` for
+/// the server-wide series).
+async fn write_timeseries_bucket(
+    timeseries_ks: &KeyspaceHandle,
+    b: &did_hosting_common::server::stats_collector::DrainedBucket,
+) -> Result<(), AppError> {
+    let key = format!("ts:{}:{}", b.mnemonic, b.epoch);
+    let existing: serde_json::Value = timeseries_ks
+        .get(key.as_str())
+        .await?
+        .unwrap_or(serde_json::json!({"r": 0, "u": 0}));
+    let r = existing.get("r").and_then(|v| v.as_u64()).unwrap_or(0) + b.resolves;
+    let u = existing.get("u").and_then(|v| v.as_u64()).unwrap_or(0) + b.updates;
+    write_stats_row(timeseries_ks, key, serde_json::json!({"r": r, "u": u})).await
 }
 
 /// Ping one trust-task-capable instance, letting its DID document choose the
@@ -1268,4 +1515,198 @@ pub async fn run_health_checks(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use did_hosting_common::DidStats;
+    use did_hosting_common::server::config::StoreConfig;
+    use did_hosting_common::server::stats_collector::StatsCollector;
+
+    use super::*;
+
+    /// A flush whose writes start failing part-way keeps every row it did
+    /// not write, and the next flush writes them without counting any
+    /// event twice.
+    #[tokio::test]
+    async fn failed_stats_flush_loses_no_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open fjall");
+        let allowed = Arc::new(AtomicUsize::new(1));
+        let stats_ks = store
+            .keyspace("stats")
+            .unwrap()
+            .failing_writes_after(allowed.clone());
+        let timeseries_ks = store
+            .keyspace("timeseries")
+            .unwrap()
+            .failing_writes_after(allowed.clone());
+
+        let collector = StatsCollector::new();
+        for mnemonic in ["alice", "bob", "carol"] {
+            collector.record_resolve(mnemonic);
+        }
+        collector.record_resolve("alice");
+
+        flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, usize::MAX)
+            .await
+            .expect_err("writes fail after the first");
+
+        // Events recorded between the failed flush and the retry merge with
+        // the retained rows.
+        collector.record_update("bob");
+        allowed.store(usize::MAX, Ordering::SeqCst);
+        flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, usize::MAX)
+            .await
+            .expect("retry flushes everything");
+
+        let stats = |m: &str| {
+            let ks = stats_ks.clone();
+            let key = format!("stats:{m}");
+            async move {
+                let s: DidStats = ks.get(key.as_str()).await.unwrap().unwrap();
+                (s.total_resolves, s.total_updates)
+            }
+        };
+        assert_eq!(stats("alice").await, (2, 0));
+        assert_eq!(stats("bob").await, (1, 1));
+        assert_eq!(stats("carol").await, (1, 0));
+
+        let rows = timeseries_ks.prefix_iter_raw("ts:_all:").await.unwrap();
+        let (r, u) = rows
+            .iter()
+            .map(|(_, v)| serde_json::from_slice::<serde_json::Value>(v).unwrap())
+            .fold((0, 0), |(r, u), v| {
+                (r + v["r"].as_u64().unwrap(), u + v["u"].as_u64().unwrap())
+            });
+        assert_eq!((r, u), (4, 1), "server-wide series counts each event once");
+    }
+
+    async fn fjall_keyspaces() -> (tempfile::TempDir, KeyspaceHandle, KeyspaceHandle) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open fjall");
+        let stats_ks = store.keyspace("stats").unwrap();
+        let timeseries_ks = store.keyspace("timeseries").unwrap();
+        (dir, stats_ks, timeseries_ks)
+    }
+
+    /// Rows past the flush's budget wait for the next flush; the server-wide
+    /// series goes first, then per-DID totals and buckets alternately.
+    #[tokio::test]
+    async fn stats_flush_defers_rows_past_its_budget() {
+        let (_dir, stats_ks, timeseries_ks) = fjall_keyspaces().await;
+        let collector = StatsCollector::new();
+        for mnemonic in ["alice", "bob"] {
+            collector.record_resolve(mnemonic);
+        }
+        // Two totals, two per-DID buckets and one `_all` bucket.
+        assert_eq!(collector.pending_rows(), 5);
+
+        flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, 2)
+            .await
+            .unwrap();
+        assert_eq!(collector.pending_rows(), 3, "only the budget is written");
+        assert_eq!(
+            timeseries_ks
+                .prefix_iter_raw("ts:_all:")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(stats_ks.prefix_iter_raw("stats:").await.unwrap().len(), 1);
+
+        flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, 2)
+            .await
+            .unwrap();
+        flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, 2)
+            .await
+            .unwrap();
+        assert_eq!(collector.pending_rows(), 0);
+        assert_eq!(timeseries_ks.prefix_iter_raw("ts:").await.unwrap().len(), 3);
+    }
+
+    /// A write the store applied but reported as failed is not retried, so
+    /// it is not counted twice.
+    #[tokio::test]
+    async fn an_applied_write_reported_as_failed_is_not_counted_twice() {
+        let (_dir, stats_ks, timeseries_ks) = fjall_keyspaces().await;
+        let allowed = Arc::new(AtomicUsize::new(0));
+        let stats_ks = stats_ks.failing_acks_after(allowed.clone());
+        let timeseries_ks = timeseries_ks.failing_acks_after(allowed.clone());
+
+        let collector = StatsCollector::new();
+        collector.record_resolve("alice");
+        flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, usize::MAX)
+            .await
+            .expect("every failed write is found applied on read-back");
+        assert_eq!(collector.pending_rows(), 0, "nothing is requeued");
+
+        let s: DidStats = stats_ks.get("stats:alice").await.unwrap().unwrap();
+        assert_eq!(s.total_resolves, 1);
+    }
+
+    /// A flush budget far below the backlog still writes the server-wide
+    /// series and per-DID buckets, not only per-DID totals.
+    #[tokio::test]
+    async fn a_small_budget_does_not_starve_the_timeseries() {
+        let (_dir, stats_ks, timeseries_ks) = fjall_keyspaces().await;
+        let collector = StatsCollector::new();
+        for i in 0..50 {
+            collector.record_resolve(&format!("did-{i}"));
+        }
+
+        flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, 10)
+            .await
+            .unwrap();
+
+        let all = timeseries_ks.prefix_iter_raw("ts:_all:").await.unwrap();
+        assert_eq!(all.len(), 1, "the server-wide series is written first");
+        let per_did_ts = timeseries_ks.prefix_iter_raw("ts:did-").await.unwrap();
+        let totals = stats_ks.prefix_iter_raw("stats:").await.unwrap();
+        assert_eq!(totals.len() + per_did_ts.len(), 9);
+        assert!(!per_did_ts.is_empty() && !totals.is_empty());
+    }
+
+    /// A bucket older than the maximum age is dropped, not written or kept.
+    #[tokio::test]
+    async fn stats_flush_drops_buckets_past_the_maximum_age() {
+        use did_hosting_common::server::stats_collector::DrainedBucket;
+
+        let (_dir, stats_ks, timeseries_ks) = fjall_keyspaces().await;
+        let collector = StatsCollector::new();
+        collector.requeue_buckets(vec![DrainedBucket {
+            mnemonic: "alice".into(),
+            epoch: 300,
+            resolves: 1,
+            updates: 0,
+        }]);
+        collector.record_resolve("bob");
+
+        flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(collector.pending_rows(), 0);
+        assert!(
+            timeseries_ks
+                .get_raw("ts:alice:300")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(timeseries_ks.prefix_iter_raw("ts:").await.unwrap().len(), 2);
+    }
 }

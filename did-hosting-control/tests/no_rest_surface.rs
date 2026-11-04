@@ -87,7 +87,7 @@ const REMOVED: &[(&str, &str)] = &[
     ("GET", "/api/proxy/server/srv-1/api/health"),
     ("POST", "/api/proxy/witness/wit-1/api/trust-tasks"),
     // Sign-in and refresh moved onto the Trust Task surface
-    // (`auth/authenticate/0.2`/`0.3`, `auth/refresh/0.1`/`0.2` over
+    // (`auth/authenticate/0.3`, `auth/refresh/0.2` over
     // `/api/trust-tasks`); only `/api/auth/challenge` stays plain REST.
     ("POST", "/api/auth/"),
     ("POST", "/api/auth/refresh"),

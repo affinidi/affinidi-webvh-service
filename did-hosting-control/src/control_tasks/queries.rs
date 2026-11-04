@@ -33,10 +33,8 @@ pub(crate) async fn resolve_agent_name_domain(
             Some(e) => e.domains,
             None => did_hosting_common::server::domain::DomainScope::All,
         };
-    let system_default = did_hosting_common::server::domain::get_default_domain(&state.store)
-        .await
-        .ok()
-        .flatten();
+    let system_default =
+        did_hosting_common::server::domain::get_default_domain(&state.store).await?;
     did_hosting_common::server::domain::resolve_request_domain(
         requested,
         &acl_scope,

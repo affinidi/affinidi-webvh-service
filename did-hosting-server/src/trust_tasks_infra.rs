@@ -93,8 +93,9 @@ pub(crate) async fn do_health_ping(state: &AppState) -> Value {
 
 /// Transport-agnostic core of the registration ack — informational only.
 pub(crate) fn do_register_ack(body: &Value) {
+    // `server/register/0.2`'s response.
     let instance_id = body
-        .get("instance_id")
+        .get("instanceId")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
     info!(instance_id, "registration acknowledged by control plane");

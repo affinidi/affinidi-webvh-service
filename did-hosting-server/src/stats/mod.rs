@@ -53,9 +53,15 @@ pub async fn sync_to_control_messaging(
         }
     };
 
-    let deltas = collector.drain_for_sync();
+    let mut deltas = collector.drain_for_sync();
     if deltas.is_empty() {
         return;
+    }
+    // The control plane refuses an oversized sync; send what fits and keep
+    // the rest (a backlog after an outage) for the next tick.
+    let max = did_hosting_common::server::stats_collector::MAX_STATS_SYNC_DELTAS;
+    if deltas.len() > max {
+        collector.requeue_deltas(deltas.split_off(max));
     }
 
     let seq = SYNC_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -99,6 +105,10 @@ pub async fn sync_to_control_messaging(
             Err(e) => Err(e),
         };
     if let Err(e) = sent {
-        debug!(error = %e, "failed to sync stats to control plane (trust task)");
+        // Keep the deltas for the next tick. A send that failed after the
+        // control plane accepted it is counted twice; one that is dropped is
+        // lost for good, which is the worse error for a counter.
+        let dropped = collector.requeue_deltas(deltas);
+        debug!(error = %e, dropped, "failed to sync stats to control plane (trust task); deltas requeued");
     }
 }

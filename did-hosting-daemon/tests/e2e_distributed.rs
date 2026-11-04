@@ -35,11 +35,11 @@ use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 use affinidi_messaging_test_mediator::TestMediator;
+use did_hosting_common::tasks::did_management::{did, domain};
+use did_hosting_common::tasks::webvh::witness::publish::v0_1 as witness_publish;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use trust_tasks_rs::Payload;
-use trust_tasks_rs::specs::did_management::{did, domain};
-use trust_tasks_rs::specs::webvh::witness::publish::v0_1 as witness_publish;
 
 use did_hosting_common::WitnessClient;
 use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};
@@ -173,6 +173,8 @@ impl Topology {
             trust_tasks: Default::default(),
             hosting: Default::default(),
             identity: Default::default(),
+            replay: Default::default(),
+            geoip: Default::default(),
             config_path: PathBuf::new(),
         };
         let control = did_hosting_control::server::AppState {
@@ -303,6 +305,7 @@ impl Topology {
             control_did: Some(control_did.clone()),
             vta: VtaConfig::default(),
             identity: Default::default(),
+            replay: Default::default(),
             config_path: PathBuf::new(),
         };
         let edge = did_hosting_server::server::AppState {
@@ -320,6 +323,7 @@ impl Topology {
             did_cache: Arc::new(did_hosting_server::cache::ContentCache::new(
                 Duration::from_secs(60),
             )),
+            gate_cache: None,
             trusted_proxy_cidrs: Arc::new(Vec::new()),
             replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
                 did_hosting_common::server::auth::session::now_epoch(),
@@ -332,6 +336,9 @@ impl Topology {
                 ),
             ),
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            replay_cache: std::sync::Arc::new(
+                did_hosting_common::server::replay::ReplayCache::new(),
+            ),
         };
         dirs.push(edge_dir);
         let edge_router = did_hosting_server::routes::router(1024 * 1024).with_state(edge.clone());
@@ -366,6 +373,7 @@ impl Topology {
             secrets: SecretsConfig::default(),
             vta: VtaConfig::default(),
             identity: Default::default(),
+            replay: Default::default(),
             config_path: PathBuf::new(),
         };
         let witness_identity = ServiceIdentity::from_signing_secret(&witness_did, witness_key)

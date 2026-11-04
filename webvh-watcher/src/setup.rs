@@ -24,9 +24,7 @@ use did_hosting_common::server::setup_recipe::{
 use did_hosting_common::server::vta_setup;
 use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages};
 
-use crate::config::{
-    AppConfig, FeaturesConfig, LogConfig, ServerConfig, StoreConfig, SyncConfig, VtaConfig,
-};
+use crate::config::{AppConfig, FeaturesConfig, LogConfig, ServerConfig, SyncConfig, VtaConfig};
 use crate::error::AppError;
 
 type BoxError = Box<dyn std::error::Error>;
@@ -318,6 +316,8 @@ pub async fn apply_recipe(
                 .unwrap_or_else(|| SetupRecipe::default_port(ServiceKind::Watcher)),
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
+            resolve_cache: Default::default(),
+            resolve_rate_limit: Default::default(),
         },
         log: LogConfig {
             level: recipe
@@ -331,14 +331,13 @@ pub async fn apply_recipe(
                 .map(to_log_format)
                 .unwrap_or_default(),
         },
-        store: StoreConfig {
-            data_dir: recipe
+        store: crate::config::setup_store_config(
+            recipe
                 .server
                 .data_dir
                 .clone()
                 .unwrap_or_else(|| SetupRecipe::default_data_dir(ServiceKind::Watcher)),
-            ..StoreConfig::default()
-        },
+        ),
         fjall: Default::default(),
         secrets: secrets_config.clone(),
         vta: VtaConfig {
@@ -347,6 +346,7 @@ pub async fn apply_recipe(
             context_id: None,
         },
         identity: Default::default(),
+        replay: Default::default(),
         sync: SyncConfig {
             source_dids: recipe.watcher.source_dids.clone(),
         },

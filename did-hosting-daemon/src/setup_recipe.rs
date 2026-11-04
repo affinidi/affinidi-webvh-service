@@ -41,6 +41,21 @@ pub async fn run_from_recipe(
     apply_recipe(recipe, setup_key_file, force_reprovision).await
 }
 
+/// The main and witness store configs a recipe-driven setup records in
+/// `config.toml`: the given data directories, with `DAEMON_STORE_*` and
+/// `DAEMON_WITNESS_STORE_*` applied so setup opens (and records) the same backend
+/// the runtime will use, e.g. a pre-provisioned DynamoDB single table.
+pub(crate) fn store_configs(
+    store_path: std::path::PathBuf,
+    witness_store_path: std::path::PathBuf,
+) -> (StoreConfig, StoreConfig) {
+    use did_hosting_common::server::config::store_config_with_env;
+    (
+        store_config_with_env(store_path, &["DAEMON_STORE"]),
+        store_config_with_env(witness_store_path, &["DAEMON_WITNESS_STORE"]),
+    )
+}
+
 pub async fn apply_recipe(
     mut recipe: SetupRecipe,
     setup_key_file: Option<PathBuf>,
@@ -205,25 +220,7 @@ pub async fn apply_recipe(
         .unwrap_or_else(|| SetupRecipe::default_data_dir(ServiceKind::Daemon));
     let store_path = data_dir_root.join("store");
     let witness_store_path = data_dir_root.join("witness");
-    // Honour `DAEMON_STORE_*` / `DAEMON_WITNESS_STORE_*` so setup opens (and
-    // records in config.toml) the same backend the runtime will use, e.g. a
-    // pre-provisioned DynamoDB single table.
-    let mut store_config = StoreConfig {
-        data_dir: store_path,
-        ..StoreConfig::default()
-    };
-    did_hosting_common::server::config::apply_store_env_overrides(
-        "DAEMON_STORE",
-        &mut store_config,
-    );
-    let mut witness_store_config = StoreConfig {
-        data_dir: witness_store_path,
-        ..StoreConfig::default()
-    };
-    did_hosting_common::server::config::apply_store_env_overrides(
-        "DAEMON_WITNESS_STORE",
-        &mut witness_store_config,
-    );
+    let (store_config, witness_store_config) = store_configs(store_path, witness_store_path);
 
     let enable = EnableConfig {
         control: recipe.daemon.enable_control.unwrap_or(true),
@@ -249,6 +246,8 @@ pub async fn apply_recipe(
             port,
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
+            resolve_cache: Default::default(),
+            resolve_rate_limit: Default::default(),
         },
         log: LogConfig {
             level: log_level,
@@ -270,6 +269,8 @@ pub async fn apply_recipe(
             context_id: None,
         },
         registry: did_hosting_control::config::RegistryConfig::default(),
+        replay: Default::default(),
+        geoip: Default::default(),
         features,
         identity: IdentityConfig {
             mode: identity_mode,
@@ -573,8 +574,14 @@ mod force_reprovision_tests {
     /// leaving both the failed setup AND the old identity behind (Keyring
     /// VTI-17). The store ends up with exactly the new DID, servable, and
     /// the local-resolution health check agrees.
+    // Holds `ENV_LOCK` across the awaits on purpose: setup reads `DAEMON_STORE_*`, which
+    // other tests set, and a store opened at the wrong path collides on its lock.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn reprovision_to_a_new_url_replaces_the_stale_did() {
+        let _guard = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let data_dir = dir.path().join("data");
@@ -651,8 +658,14 @@ mod force_reprovision_tests {
     /// The same `public_url` reprovisioned still succeeds (a credential
     /// rotation with no host change) — `.well-known` ends up matching
     /// whatever `server_did` the reprovision recorded, and health agrees.
+    // Holds `ENV_LOCK` across the awaits on purpose: setup reads `DAEMON_STORE_*`, which
+    // other tests set, and a store opened at the wrong path collides on its lock.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn reprovision_to_the_same_url_still_succeeds_and_stays_healthy() {
+        let _guard = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let data_dir = dir.path().join("data");
@@ -692,5 +705,76 @@ mod force_reprovision_tests {
             )
             .await
         );
+    }
+
+    /// Every variable `store_configs` reads, so a test starts from a clean slate.
+    const STORE_ENV: [&str; 8] = [
+        "DAEMON_STORE_DYNAMODB_TABLE_NAME",
+        "DAEMON_STORE_DYNAMODB_REGION",
+        "DAEMON_STORE_DYNAMODB_KEY_NAMESPACE",
+        "DAEMON_STORE_DYNAMODB_CONSISTENT_READS",
+        "DAEMON_WITNESS_STORE_DYNAMODB_TABLE_NAME",
+        "DAEMON_WITNESS_STORE_DYNAMODB_REGION",
+        "DAEMON_WITNESS_STORE_DYNAMODB_KEY_NAMESPACE",
+        "DAEMON_WITNESS_STORE_DYNAMODB_CONSISTENT_READS",
+    ];
+
+    fn clear_store_env() {
+        for name in STORE_ENV {
+            // SAFETY: callers hold `crate::config::ENV_LOCK`.
+            unsafe { std::env::remove_var(name) };
+        }
+    }
+
+    #[test]
+    fn store_configs_default_to_the_data_directories_alone() {
+        let _guard = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_store_env();
+
+        let (store, witness) = store_configs("/d/store".into(), "/d/witness".into());
+
+        assert_eq!(store.data_dir, std::path::PathBuf::from("/d/store"));
+        assert_eq!(witness.data_dir, std::path::PathBuf::from("/d/witness"));
+        for s in [&store, &witness] {
+            assert_eq!(s.dynamodb_table_name, None);
+            assert_eq!(s.dynamodb_key_namespace, None);
+            assert_eq!(s.dynamodb_consistent_reads, None);
+        }
+    }
+
+    #[test]
+    fn store_configs_honour_the_daemon_store_environment_independently() {
+        let _guard = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_store_env();
+        // SAFETY: serialised by ENV_LOCK; cleared again below.
+        unsafe {
+            std::env::set_var("DAEMON_STORE_DYNAMODB_TABLE_NAME", "main-table");
+            std::env::set_var("DAEMON_STORE_DYNAMODB_REGION", "ap-southeast-1");
+            std::env::set_var("DAEMON_WITNESS_STORE_DYNAMODB_TABLE_NAME", "witness-table");
+            std::env::set_var("DAEMON_WITNESS_STORE_DYNAMODB_KEY_NAMESPACE", "w");
+            std::env::set_var("DAEMON_WITNESS_STORE_DYNAMODB_CONSISTENT_READS", "false");
+        }
+
+        let (store, witness) = store_configs("/d/store".into(), "/d/witness".into());
+        clear_store_env();
+
+        assert_eq!(store.dynamodb_table_name.as_deref(), Some("main-table"));
+        assert_eq!(store.dynamodb_region.as_deref(), Some("ap-southeast-1"));
+        assert_eq!(
+            store.dynamodb_key_namespace, None,
+            "witness variables do not leak"
+        );
+        assert_eq!(store.dynamodb_consistent_reads, None);
+        assert_eq!(
+            witness.dynamodb_table_name.as_deref(),
+            Some("witness-table")
+        );
+        assert_eq!(witness.dynamodb_region, None, "main variables do not leak");
+        assert_eq!(witness.dynamodb_key_namespace.as_deref(), Some("w"));
+        assert_eq!(witness.dynamodb_consistent_reads, Some(false));
     }
 }

@@ -20,7 +20,7 @@ use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages};
 
 use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, LimitsConfig, LogConfig, LogFormat, ServerConfig,
-    StatsConfig, StoreConfig, VtaConfig,
+    StatsConfig, VtaConfig,
 };
 use crate::error::AppError;
 use crate::secret_store::{ServerSecrets, create_secret_store};
@@ -253,15 +253,14 @@ pub async fn apply_recipe(
             port,
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
+            resolve_cache: Default::default(),
+            resolve_rate_limit: Default::default(),
         },
         log: LogConfig {
             level: log_level,
             format: log_format,
         },
-        store: StoreConfig {
-            data_dir,
-            ..StoreConfig::default()
-        },
+        store: crate::config::setup_store_config(data_dir),
         fjall: Default::default(),
         auth: AuthConfig::default(),
         hosting: crate::config::HostingConfig::default(),
@@ -276,6 +275,7 @@ pub async fn apply_recipe(
         },
         stats: StatsConfig::default(),
         identity: Default::default(),
+        replay: Default::default(),
         config_path: recipe.output.config_path.clone(),
     };
 

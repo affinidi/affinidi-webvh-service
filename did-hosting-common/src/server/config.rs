@@ -1,4 +1,5 @@
 use super::error::AppError;
+use ipnetwork::IpNetwork;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -123,22 +124,65 @@ impl TransportSelection {
     }
 }
 
+/// Serde for a list of networks written as strings: an address
+/// (`"10.0.0.1"`, its own one-address network) or a CIDR (`"10.0.0.0/8"`).
+/// A bad entry is a load error that names it, not a silently dropped one.
+pub mod ip_networks {
+    use ipnetwork::IpNetwork;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(nets: &[IpNetwork], s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(nets.iter().map(|n| match n.prefix() {
+            // A one-address network reads back as the address it was written as.
+            p if p == max_prefix(n) => n.ip().to_string(),
+            _ => n.to_string(),
+        }))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<IpNetwork>, D::Error> {
+        Vec::<String>::deserialize(d)?
+            .iter()
+            .map(|entry| parse(entry).map_err(serde::de::Error::custom))
+            .collect()
+    }
+
+    /// One entry: an address or a CIDR range, surrounding whitespace ignored.
+    /// The error names the entry.
+    pub fn parse(entry: &str) -> Result<IpNetwork, String> {
+        entry.trim().parse::<IpNetwork>().map_err(|_| {
+            format!(
+                "invalid network `{entry}`: expected an IP address (`10.0.0.1`) \
+                 or a CIDR range (`10.0.0.0/8`, `2001:db8::/32`)"
+            )
+        })
+    }
+
+    fn max_prefix(n: &IpNetwork) -> u8 {
+        match n {
+            IpNetwork::V4(_) => 32,
+            IpNetwork::V6(_) => 128,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
     #[serde(default = "default_host")]
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
-    /// Trusted reverse-proxy IPs whose `X-Forwarded-For` header is
-    /// honoured for client-IP attribution. Empty (default) =
-    /// X-Forwarded-For is ignored and the direct TCP peer is used —
-    /// safe behind nothing or behind a CDN that strips XFF, but
-    /// wrong behind a load balancer (every request appears to come
-    /// from the LB, so per-IP rate limits become a global cap).
-    /// Configure with the IPs of your reverse proxies (e.g.
-    /// `["10.0.0.1", "10.0.0.2"]`) to opt in.
-    #[serde(default)]
-    pub trusted_proxies: Vec<String>,
+    /// Trusted reverse proxies whose `X-Forwarded-For` header is
+    /// honoured for client-IP attribution — addresses or CIDR ranges
+    /// (`"10.0.0.1"`, `"10.20.0.0/16"`, `"2001:db8::/48"`), the same shape
+    /// as the VTC's `trust_xff_cidrs`. Empty (default) = X-Forwarded-For is
+    /// ignored and the direct TCP peer is used — safe behind nothing or
+    /// behind a CDN that strips XFF, but wrong behind a load balancer
+    /// (every request appears to come from the LB, so per-IP rate limits
+    /// become a global cap). List only your actual reverse proxies: see
+    /// [`crate::server::rate_limit::resolve_client_ip`]. An entry that is
+    /// neither an address nor a CIDR is refused at load.
+    #[serde(default, with = "ip_networks")]
+    pub trusted_proxies: Vec<IpNetwork>,
     /// Trusted reverse-proxy CIDRs whose `Forwarded` (RFC 7239) and
     /// `X-Forwarded-Host` headers are honoured for **request host /
     /// domain detection** (multi-domain feature, T19). Distinct from
@@ -152,6 +196,373 @@ pub struct ServerConfig {
     /// proxy. CIDRs accept `1.2.3.0/24` or `2001:db8::/32`.
     #[serde(default)]
     pub trusted_proxy_cidrs: Vec<String>,
+    /// `Cache-Control` policy for public DID-resolution responses
+    /// (`[server.resolve_cache]`). Read only by the binaries that serve
+    /// resolution — the server, the watcher and the daemon.
+    #[serde(default)]
+    pub resolve_cache: ResolveCacheConfig,
+    /// Per-client-address limit on public DID resolution
+    /// (`[server.resolve_rate_limit]`). Off by default. Read only by the
+    /// binaries that serve resolution — the server, the watcher and the
+    /// daemon.
+    #[serde(default)]
+    pub resolve_rate_limit: ResolveRateLimitConfig,
+}
+
+impl ServerConfig {
+    /// Apply `{prefix}_SERVER_TRUSTED_PROXIES` (comma-separated addresses or
+    /// CIDR ranges; an empty value clears the list), refusing any entry that
+    /// is neither.
+    pub fn apply_trusted_proxies_env_override(&mut self, prefix: &str) -> Result<(), AppError> {
+        self.apply_trusted_proxies_override(prefix, |var| std::env::var(var).ok())
+    }
+
+    /// [`Self::apply_trusted_proxies_env_override`] reading variables through
+    /// `lookup`.
+    fn apply_trusted_proxies_override(
+        &mut self,
+        prefix: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), AppError> {
+        let var = format!("{prefix}_SERVER_TRUSTED_PROXIES");
+        if let Some(v) = lookup(&var) {
+            self.trusted_proxies = v
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|entry| {
+                    ip_networks::parse(entry).map_err(|e| AppError::Config(format!("{var}: {e}")))
+                })
+                .collect::<Result<_, _>>()?;
+        }
+        Ok(())
+    }
+}
+
+/// The `Cache-Control` header sent with successful DID-resolution responses
+/// (`did.jsonl`, `did-witness.json`, `did.json`, `keri.cesr`, and the
+/// `/@name` redirect).
+///
+/// Every value is in seconds. The trade-off is staleness: a resolver or CDN
+/// holding a cached copy will not see an update, key rotation or deactivation
+/// until its copy expires. Lower `max_age_secs` when that window matters more
+/// than origin load.
+///
+/// Error responses are unaffected: they keep the global `no-store`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveCacheConfig {
+    /// `max-age` — how long any cache (browser, resolver, CDN) may reuse a
+    /// response. `0` sends `no-cache`: caches must revalidate every time.
+    /// Default 300.
+    #[serde(default = "default_resolve_max_age_secs")]
+    pub max_age_secs: u32,
+    /// `s-maxage` — overrides `max_age_secs` for shared caches (CDNs,
+    /// proxies) only. Unset (default) omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_max_age_secs: Option<u32>,
+    /// `stale-while-revalidate` — how long a cache may keep serving an
+    /// expired copy while it refetches in the background. Unset (default)
+    /// omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_while_revalidate_secs: Option<u32>,
+}
+
+fn default_resolve_max_age_secs() -> u32 {
+    300
+}
+
+/// The longest any resolve-cache duration may be: one year, the ceiling
+/// RFC 9111 suggests for "never expires".
+const RESOLVE_CACHE_MAX_SECS: u32 = 31_536_000;
+
+impl Default for ResolveCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_age_secs: default_resolve_max_age_secs(),
+            shared_max_age_secs: None,
+            stale_while_revalidate_secs: None,
+        }
+    }
+}
+
+impl ResolveCacheConfig {
+    /// The `Cache-Control` header value for a successful resolve.
+    pub fn header_value(&self) -> String {
+        if self.max_age_secs == 0 && self.shared_max_age_secs.is_none() {
+            return "no-cache".to_string();
+        }
+        let mut value = format!("public, max-age={}", self.max_age_secs);
+        if let Some(s) = self.shared_max_age_secs {
+            value.push_str(&format!(", s-maxage={s}"));
+        }
+        if let Some(s) = self.stale_while_revalidate_secs {
+            value.push_str(&format!(", stale-while-revalidate={s}"));
+        }
+        value
+    }
+
+    /// Refuse durations past one year.
+    pub fn validate(&self) -> Result<(), AppError> {
+        let fields = [
+            ("max_age_secs", Some(self.max_age_secs)),
+            ("shared_max_age_secs", self.shared_max_age_secs),
+            (
+                "stale_while_revalidate_secs",
+                self.stale_while_revalidate_secs,
+            ),
+        ];
+        for (name, value) in fields {
+            if let Some(v) = value
+                && v > RESOLVE_CACHE_MAX_SECS
+            {
+                return Err(AppError::Config(format!(
+                    "server.resolve_cache.{name} ({v}) must be at most \
+                     {RESOLVE_CACHE_MAX_SECS} (one year)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply `{prefix}_SERVER_RESOLVE_CACHE_*` env overrides, then validate.
+    ///
+    /// For the optional fields an empty value clears the setting.
+    pub fn apply_env_overrides(&mut self, prefix: &str) -> Result<(), AppError> {
+        fn parse(var: &str, v: &str) -> Result<u32, AppError> {
+            v.trim()
+                .parse()
+                .map_err(|e| AppError::Config(format!("invalid {var}: {e}")))
+        }
+        let var = format!("{prefix}_SERVER_RESOLVE_CACHE_MAX_AGE_SECS");
+        if let Ok(v) = std::env::var(&var) {
+            self.max_age_secs = parse(&var, &v)?;
+        }
+        for (suffix, field) in [
+            ("SHARED_MAX_AGE_SECS", &mut self.shared_max_age_secs),
+            (
+                "STALE_WHILE_REVALIDATE_SECS",
+                &mut self.stale_while_revalidate_secs,
+            ),
+        ] {
+            let var = format!("{prefix}_SERVER_RESOLVE_CACHE_{suffix}");
+            if let Ok(v) = std::env::var(&var) {
+                *field = if v.trim().is_empty() {
+                    None
+                } else {
+                    Some(parse(&var, &v)?)
+                };
+            }
+        }
+        self.validate()
+    }
+}
+
+/// Bounds of the anti-replay cache for signed inbound requests
+/// (`[replay]`; see [`crate::server::replay`]).
+///
+/// The cache remembers every accepted `(signer, id)` pair for as long as
+/// the freshness window would accept its document (about 7 minutes,
+/// with margin) and refuses new signed requests at either bound rather than
+/// forget one, so the per-signer bound caps one signer's sustained rate at
+/// about `max_entries_per_signer / 420` requests a second. Each record holds
+/// about 32 bytes ([`crate::server::replay::BYTES_PER_RECORD`]), so
+/// `max_entries` also bounds the cache's memory. Every service has its own
+/// cache; a daemon has up to three (control plane, witness, watcher), each
+/// with these bounds.
+///
+/// Leave the table out to take the defaults, which may rise in later
+/// releases; generated configs omit it unless it differs from them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReplayConfig {
+    /// Records held across all signers. Default
+    /// [`MAX_ENTRIES`](crate::server::replay::MAX_ENTRIES), 1,000,000 (about
+    /// 32 MB).
+    pub max_entries: usize,
+    /// Records held for any one signer, so one authorised signer cannot
+    /// exhaust the cache for the others. Default
+    /// [`MAX_ENTRIES_PER_SIGNER`](crate::server::replay::MAX_ENTRIES_PER_SIGNER),
+    /// 250,000 (about 600 signed requests a second, sustained).
+    pub max_entries_per_signer: usize,
+}
+
+/// The most records `[replay] max_entries` may allow: about 320 MB.
+const REPLAY_MAX_ENTRIES_CEILING: usize = 10_000_000;
+
+impl Default for ReplayConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: crate::server::replay::MAX_ENTRIES,
+            max_entries_per_signer: crate::server::replay::MAX_ENTRIES_PER_SIGNER,
+        }
+    }
+}
+
+impl ReplayConfig {
+    /// Whether this is the default, so a generated config can leave the
+    /// table out and pick up later defaults.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Refuse a zero bound, a per-signer bound above the global one, and a
+    /// global bound above the ceiling.
+    pub fn validate(&self) -> Result<(), AppError> {
+        if self.max_entries == 0 || self.max_entries_per_signer == 0 {
+            return Err(AppError::Config(
+                "replay.max_entries and replay.max_entries_per_signer must be at least 1".into(),
+            ));
+        }
+        if self.max_entries_per_signer > self.max_entries {
+            return Err(AppError::Config(format!(
+                "replay.max_entries_per_signer ({}) must not exceed replay.max_entries ({})",
+                self.max_entries_per_signer, self.max_entries
+            )));
+        }
+        if self.max_entries > REPLAY_MAX_ENTRIES_CEILING {
+            return Err(AppError::Config(format!(
+                "replay.max_entries ({}) must not exceed {REPLAY_MAX_ENTRIES_CEILING}",
+                self.max_entries
+            )));
+        }
+        Ok(())
+    }
+
+    /// Apply `{prefix}_REPLAY_MAX_ENTRIES` and
+    /// `{prefix}_REPLAY_MAX_ENTRIES_PER_SIGNER` env overrides, then validate.
+    pub fn apply_env_overrides(&mut self, prefix: &str) -> Result<(), AppError> {
+        self.apply_env_overrides_for(&[prefix])
+    }
+
+    /// [`Self::apply_env_overrides`] for several prefixes in turn (a later
+    /// one wins), validating once after all of them, so a pair of values
+    /// split across a deprecated and a current prefix is judged together.
+    pub fn apply_env_overrides_for(&mut self, prefixes: &[&str]) -> Result<(), AppError> {
+        self.apply_overrides(prefixes, |var| std::env::var(var).ok())
+    }
+
+    /// [`Self::apply_env_overrides_for`] reading variables through `lookup`.
+    fn apply_overrides(
+        &mut self,
+        prefixes: &[&str],
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), AppError> {
+        for prefix in prefixes {
+            for (suffix, field) in [
+                ("MAX_ENTRIES", &mut self.max_entries),
+                ("MAX_ENTRIES_PER_SIGNER", &mut self.max_entries_per_signer),
+            ] {
+                let var = format!("{prefix}_REPLAY_{suffix}");
+                if let Some(v) = lookup(&var) {
+                    *field = v
+                        .trim()
+                        .parse()
+                        .map_err(|e| AppError::Config(format!("invalid {var}: {e}")))?;
+                }
+            }
+        }
+        self.validate()
+    }
+}
+
+/// A per-client-address limit on public DID resolution (`did.jsonl`,
+/// `did-witness.json`, `did.json`, `keri.cesr`, `.well-known` and the
+/// `/@name` redirect).
+///
+/// Resolution is unauthenticated, and each one costs store reads, so without
+/// a limit one client can use up a metered store's capacity for everyone. A
+/// client past `max_per_window` requests in a `window_secs` fixed window gets
+/// `429 Too Many Requests` with `Retry-After` until the window ends.
+///
+/// The client address is the TCP peer unless `server.trusted_proxies` names
+/// that peer, in which case it is read from `X-Forwarded-For`. Behind a load
+/// balancer, set `trusted_proxies` before turning this on: otherwise every
+/// client shares the load balancer's address and one limit.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveRateLimitConfig {
+    /// Resolution requests one client address may make per window. Unset
+    /// (default) means no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_per_window: Option<u64>,
+    /// The fixed window, in seconds. Default 10.
+    #[serde(default = "default_resolve_rate_limit_window_secs")]
+    pub window_secs: u64,
+}
+
+fn default_resolve_rate_limit_window_secs() -> u64 {
+    10
+}
+
+/// The longest resolve rate-limit window: one hour.
+const RESOLVE_RATE_LIMIT_MAX_WINDOW_SECS: u64 = 3600;
+
+impl Default for ResolveRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_per_window: None,
+            window_secs: default_resolve_rate_limit_window_secs(),
+        }
+    }
+}
+
+impl ResolveRateLimitConfig {
+    /// Refuse a zero limit and a window outside 1 second to one hour.
+    pub fn validate(&self) -> Result<(), AppError> {
+        if self.max_per_window == Some(0) {
+            return Err(AppError::Config(
+                "server.resolve_rate_limit.max_per_window must be at least 1; \
+                 leave it unset for no limit"
+                    .into(),
+            ));
+        }
+        if !(1..=RESOLVE_RATE_LIMIT_MAX_WINDOW_SECS).contains(&self.window_secs) {
+            return Err(AppError::Config(format!(
+                "server.resolve_rate_limit.window_secs ({}) must be between 1 and \
+                 {RESOLVE_RATE_LIMIT_MAX_WINDOW_SECS}",
+                self.window_secs
+            )));
+        }
+        Ok(())
+    }
+
+    /// Apply `{prefix}_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW` (an empty
+    /// value clears it) and `{prefix}_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS`
+    /// (an empty value restores the default) env overrides, then validate.
+    pub fn apply_env_overrides(&mut self, prefix: &str) -> Result<(), AppError> {
+        self.apply_overrides(prefix, |var| std::env::var(var).ok())
+    }
+
+    /// [`Self::apply_env_overrides`] reading variables through `lookup`.
+    fn apply_overrides(
+        &mut self,
+        prefix: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), AppError> {
+        fn parse(var: &str, v: &str) -> Result<u64, AppError> {
+            v.trim()
+                .parse()
+                .map_err(|e| AppError::Config(format!("invalid {var}: {e}")))
+        }
+        let var = format!("{prefix}_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW");
+        if let Some(v) = lookup(&var) {
+            self.max_per_window = if v.trim().is_empty() {
+                None
+            } else {
+                Some(parse(&var, &v)?)
+            };
+        }
+        let var = format!("{prefix}_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS");
+        if let Some(v) = lookup(&var) {
+            self.window_secs = if v.trim().is_empty() {
+                default_resolve_rate_limit_window_secs()
+            } else {
+                parse(&var, &v)?
+            };
+        }
+        self.validate()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -176,6 +587,15 @@ pub struct StoreConfig {
     /// Required when the `store-dynamodb-single` feature is enabled. The table must exist —
     /// the backend does not call `CreateTable` / `DescribeTable`.
     pub dynamodb_table_name: Option<String>,
+    /// Optional namespace for `store-dynamodb-single`. When set, every row's
+    /// partition key is `"{namespace}#{keyspace}"`, so several stores can share
+    /// one table without sharing rows. When unset the partition key is the bare
+    /// keyspace name. Letters, digits, `_`, `-` and `.`; at most 32 characters.
+    pub dynamodb_key_namespace: Option<String>,
+    /// Strongly consistent reads for `store-dynamodb-single`. Unset means
+    /// `true`; `false` opts into eventually consistent reads (half the read
+    /// capacity, but a read may miss a write that just completed).
+    pub dynamodb_consistent_reads: Option<bool>,
     /// GCP project ID for Firestore. Used by `store-firestore` backend.
     pub firestore_project: Option<String>,
     /// Firestore database name (default: `"(default)"`). Used by `store-firestore` backend.
@@ -202,6 +622,8 @@ impl std::fmt::Debug for StoreConfig {
             .field("dynamodb_table_prefix", &self.dynamodb_table_prefix)
             .field("dynamodb_region", &self.dynamodb_region)
             .field("dynamodb_table_name", &self.dynamodb_table_name)
+            .field("dynamodb_key_namespace", &self.dynamodb_key_namespace)
+            .field("dynamodb_consistent_reads", &self.dynamodb_consistent_reads)
             .field("firestore_project", &self.firestore_project)
             .field("firestore_database", &self.firestore_database)
             .field(
@@ -582,7 +1004,7 @@ pub struct AuthConfig {
     #[serde(default = "default_max_pending_challenges_per_did")]
     pub max_pending_challenges_per_did: usize,
     /// The absolute ceiling on a session's life, in seconds from
-    /// authentication (`auth/authenticate/0.2` or `/0.3`'s `Session.issuedAt`).
+    /// authentication (`auth/authenticate/0.3`'s `Session.issuedAt`).
     /// No `auth/refresh/0.2` may advance `Session.expiresAt` — nor, in this
     /// implementation, the underlying refresh-token deadline — past
     /// `issuedAt + absolute_session_lifetime`; a session that has already
@@ -758,6 +1180,8 @@ impl Default for ServerConfig {
             port: default_port(),
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
+            resolve_cache: Default::default(),
+            resolve_rate_limit: Default::default(),
         }
     }
 }
@@ -802,6 +1226,14 @@ pub struct HostingConfig {
     /// short enough that abandoned domains don't accumulate forever.
     #[serde(default = "default_disable_purge_grace")]
     pub disable_purge_grace: String,
+
+    /// Whether a DID this service creates for itself lists its
+    /// `did:scid:vh:1:<scid>?src=…` alias in `alsoKnownAs`, linking its
+    /// did:webvh and did:scid forms as one subject (VTI-KEY-166 of the VTI
+    /// specification). Applies when the log is created; an existing DID keeps
+    /// what it published. Default: `true`. Env: `<PREFIX>_HOSTING_SCID_ALSO_KNOWN_AS`.
+    #[serde(default = "default_true")]
+    pub scid_also_known_as: bool,
 }
 
 fn default_unassigned_purge_grace() -> String {
@@ -818,7 +1250,24 @@ impl Default for HostingConfig {
             bootstrap_domains: Vec::new(),
             unassigned_purge_grace: default_unassigned_purge_grace(),
             disable_purge_grace: default_disable_purge_grace(),
+            scid_also_known_as: true,
         }
+    }
+}
+
+/// Apply environment variable overrides to [`HostingConfig`]. `prefix` is the
+/// same namespace [`apply_env_overrides`] takes.
+pub fn apply_hosting_env_overrides(prefix: &str, hosting: &mut HostingConfig) {
+    hosting.scid_also_known_as = scid_also_known_as_from_env(prefix, hosting.scid_also_known_as);
+}
+
+/// `<PREFIX>_HOSTING_SCID_ALSO_KNOWN_AS` when set (`1`/`true` or anything
+/// else for false), `default` otherwise. For setup paths that mint the
+/// service's DID before any config file exists.
+pub fn scid_also_known_as_from_env(prefix: &str, default: bool) -> bool {
+    match std::env::var(format!("{prefix}_HOSTING_SCID_ALSO_KNOWN_AS")) {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => default,
     }
 }
 
@@ -839,6 +1288,8 @@ impl Default for StoreConfig {
             dynamodb_table_prefix: None,
             dynamodb_region: None,
             dynamodb_table_name: None,
+            dynamodb_key_namespace: None,
+            dynamodb_consistent_reads: None,
             firestore_project: None,
             firestore_database: None,
             cosmosdb_connection_string: None,
@@ -1127,12 +1578,43 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Parse an environment boolean: `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off`
+/// (case-insensitive, no surrounding whitespace). Anything else is `None`.
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// A [`StoreConfig`] for `data_dir` with the store environment overrides
+/// applied, the way a service's `load()` would apply them at runtime.
+///
+/// Setup builds a fresh config (it has no config file yet), so without this it
+/// would open, and record, a store that ignores the same variables the running
+/// service honours: a backend that needs its table or project name from the
+/// environment would fail setup before the service ever starts. Each of
+/// `var_prefixes` is a full prefix as [`apply_store_env_overrides`] takes it,
+/// applied in order so a later one wins.
+pub fn store_config_with_env(data_dir: PathBuf, var_prefixes: &[&str]) -> StoreConfig {
+    let mut store = StoreConfig {
+        data_dir,
+        ..StoreConfig::default()
+    };
+    for prefix in var_prefixes {
+        apply_store_env_overrides(prefix, &mut store);
+    }
+    store
+}
+
 /// Apply `<var_prefix>_*` environment overrides to a [`StoreConfig`].
 ///
 /// `var_prefix` is the full variable prefix including the store namespace, e.g.
 /// `"WEBVH_STORE"` for the main store or `"DAEMON_WITNESS_STORE"` for the
 /// daemon's witness store. Recognised suffixes: `DATA_DIR`, `REDIS_URL`,
 /// `DYNAMODB_TABLE_PREFIX`, `DYNAMODB_REGION`, `DYNAMODB_TABLE_NAME`,
+/// `DYNAMODB_KEY_NAMESPACE`, `DYNAMODB_CONSISTENT_READS`,
 /// `FIRESTORE_PROJECT`, `FIRESTORE_DATABASE`, `COSMOSDB_CONNECTION_STRING`,
 /// `COSMOSDB_DATABASE`, `COSMOSDB_REGION`.
 pub fn apply_store_env_overrides(var_prefix: &str, store: &mut StoreConfig) {
@@ -1160,6 +1642,22 @@ pub fn apply_store_env_overrides(var_prefix: &str, store: &mut StoreConfig) {
         format!("{var_prefix}_DYNAMODB_TABLE_NAME"),
         store.dynamodb_table_name
     );
+    env_opt!(
+        format!("{var_prefix}_DYNAMODB_KEY_NAMESPACE"),
+        store.dynamodb_key_namespace
+    );
+    let reads_var = format!("{var_prefix}_DYNAMODB_CONSISTENT_READS");
+    if let Ok(v) = std::env::var(&reads_var) {
+        match parse_bool(&v) {
+            Some(b) => store.dynamodb_consistent_reads = Some(b),
+            // A typo must not silently weaken consistency: leave the field
+            // unset (strongly consistent) and say so.
+            None => tracing::warn!(
+                var = %reads_var,
+                "ignoring unparseable boolean; reads stay strongly consistent"
+            ),
+        }
+    }
     env_opt!(
         format!("{var_prefix}_FIRESTORE_PROJECT"),
         store.firestore_project
@@ -1239,6 +1737,7 @@ pub fn apply_env_overrides(
     // Server
     env_str!(&format!("{prefix}_SERVER_HOST"), server.host);
     env_parse!(&format!("{prefix}_SERVER_PORT"), server.port);
+    server.apply_trusted_proxies_env_override(prefix)?;
 
     // Logging
     env_str!(&format!("{prefix}_LOG_LEVEL"), log.level);
@@ -1423,6 +1922,213 @@ pub fn init_tracing(log: &LogConfig) {
 mod tests {
     use super::*;
 
+    /// An absent `[replay]` table keeps today's bounds; a set one replaces
+    /// them, and an inconsistent one is refused.
+    #[test]
+    fn replay_bounds_parse_and_validate() {
+        let parsed: ReplayConfig = toml::from_str("").unwrap();
+        assert_eq!(parsed, ReplayConfig::default());
+        assert_eq!(parsed.max_entries, 1_000_000);
+        assert_eq!(parsed.max_entries_per_signer, 250_000);
+        assert!(parsed.is_default());
+
+        // A partial table takes the default for the other bound.
+        let parsed: ReplayConfig = toml::from_str("max_entries = 2000000").unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(parsed.max_entries_per_signer, 250_000);
+        assert!(!parsed.is_default());
+
+        let parsed: ReplayConfig =
+            toml::from_str("max_entries = 200000\nmax_entries_per_signer = 50000").unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(parsed.max_entries_per_signer, 50_000);
+
+        assert!(toml::from_str::<ReplayConfig>("max_entrys = 1").is_err());
+        for (max_entries, max_entries_per_signer) in [(0, 0), (10, 0), (10, 20), (20_000_000, 1)] {
+            let config = ReplayConfig {
+                max_entries,
+                max_entries_per_signer,
+            };
+            assert!(config.validate().is_err(), "{config:?} should be refused");
+        }
+    }
+
+    /// `{prefix}_REPLAY_*` replace the file's bounds, and the result is
+    /// validated; an unparseable or inconsistent value is refused.
+    #[test]
+    fn replay_env_overrides_replace_and_validate() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |var: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == var)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+
+        let mut config = ReplayConfig::default();
+        config
+            .apply_overrides(
+                &["DAEMON"],
+                env(&[
+                    ("DAEMON_REPLAY_MAX_ENTRIES", "200000"),
+                    ("DAEMON_REPLAY_MAX_ENTRIES_PER_SIGNER", " 50000 "),
+                    ("CONTROL_REPLAY_MAX_ENTRIES", "1"),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(
+            (config.max_entries, config.max_entries_per_signer),
+            (200_000, 50_000)
+        );
+
+        // A deprecated prefix still applies; the current one wins, and the
+        // pair is validated only once both are in.
+        let mut config = ReplayConfig::default();
+        config
+            .apply_overrides(
+                &["WEBVH", "DID_HOSTING"],
+                env(&[
+                    ("WEBVH_REPLAY_MAX_ENTRIES_PER_SIGNER", "3000000"),
+                    ("WEBVH_REPLAY_MAX_ENTRIES", "1"),
+                    ("DID_HOSTING_REPLAY_MAX_ENTRIES", "5000000"),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(
+            (config.max_entries, config.max_entries_per_signer),
+            (5_000_000, 3_000_000)
+        );
+
+        let mut config = ReplayConfig::default();
+        config.apply_overrides(&["DAEMON"], env(&[])).unwrap();
+        assert_eq!(config, ReplayConfig::default());
+
+        for pairs in [
+            &[("DAEMON_REPLAY_MAX_ENTRIES", "lots")][..],
+            &[("DAEMON_REPLAY_MAX_ENTRIES_PER_SIGNER", "2000000")][..],
+        ] {
+            let mut config = ReplayConfig::default();
+            assert!(
+                config.apply_overrides(&["DAEMON"], env(pairs)).is_err(),
+                "{pairs:?} should be refused"
+            );
+        }
+    }
+
+    /// `{prefix}_SERVER_TRUSTED_PROXIES` takes addresses and CIDR ranges,
+    /// an empty value clears the list, and anything else is refused.
+    #[test]
+    fn trusted_proxies_env_override_takes_addresses_and_ranges() {
+        let mut server: ServerConfig = toml::from_str("trusted_proxies = [\"10.0.0.1\"]").unwrap();
+        server
+            .apply_trusted_proxies_override("DAEMON", |var| {
+                (var == "DAEMON_SERVER_TRUSTED_PROXIES")
+                    .then(|| " 10.0.0.0/20, 2001:db8::/32 ,".into())
+            })
+            .unwrap();
+        assert_eq!(
+            server.trusted_proxies,
+            [
+                "10.0.0.0/20".parse::<IpNetwork>().unwrap(),
+                "2001:db8::/32".parse().unwrap()
+            ]
+        );
+
+        server
+            .apply_trusted_proxies_override("DAEMON", |_| Some(String::new()))
+            .unwrap();
+        assert!(
+            server.trusted_proxies.is_empty(),
+            "an empty value clears the list"
+        );
+
+        for bad in ["load-balancer", "10.0.0.0/33"] {
+            let result = server.apply_trusted_proxies_override("DAEMON", |_| Some(bad.into()));
+            assert!(result.is_err(), "{bad} should be refused");
+        }
+    }
+
+    /// An absent `[server.resolve_rate_limit]` means no limit; a set one is
+    /// read from the file and the env, and a zero limit or window is refused.
+    #[test]
+    fn resolve_rate_limit_parses_overrides_and_validates() {
+        let parsed: ResolveRateLimitConfig = toml::from_str("").unwrap();
+        assert_eq!(parsed, ResolveRateLimitConfig::default());
+        assert_eq!(parsed.max_per_window, None);
+
+        let parsed: ResolveRateLimitConfig =
+            toml::from_str("max_per_window = 500\nwindow_secs = 60").unwrap();
+        parsed.validate().unwrap();
+        assert_eq!((parsed.max_per_window, parsed.window_secs), (Some(500), 60));
+        assert!(toml::from_str::<ResolveRateLimitConfig>("max_per_windw = 1").is_err());
+
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |var: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == var)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let mut config = ResolveRateLimitConfig::default();
+        config
+            .apply_overrides(
+                "DAEMON",
+                env(&[
+                    ("DAEMON_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW", " 200 "),
+                    ("DAEMON_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS", "5"),
+                ]),
+            )
+            .unwrap();
+        assert_eq!((config.max_per_window, config.window_secs), (Some(200), 5));
+        config
+            .apply_overrides(
+                "DAEMON",
+                env(&[("DAEMON_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW", "")]),
+            )
+            .unwrap();
+        assert_eq!(
+            config.max_per_window, None,
+            "an empty value clears the limit"
+        );
+        config
+            .apply_overrides(
+                "DAEMON",
+                env(&[("DAEMON_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS", " ")]),
+            )
+            .unwrap();
+        assert_eq!(
+            config.window_secs,
+            default_resolve_rate_limit_window_secs(),
+            "an empty value restores the default window"
+        );
+
+        for pairs in [
+            &[("DAEMON_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW", "0")][..],
+            &[("DAEMON_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS", "0")][..],
+            &[("DAEMON_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS", "3601")][..],
+            &[("DAEMON_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW", "many")][..],
+        ] {
+            let mut config = ResolveRateLimitConfig::default();
+            assert!(
+                config.apply_overrides("DAEMON", env(pairs)).is_err(),
+                "{pairs:?} should be refused"
+            );
+        }
+    }
+
+    /// The did:scid alias is listed unless an operator turns it off; a config
+    /// written before the setting existed reads as on.
+    #[test]
+    fn hosting_lists_the_scid_alias_by_default() {
+        assert!(HostingConfig::default().scid_also_known_as);
+        let parsed: HostingConfig = toml::from_str("bootstrap_domains = []").unwrap();
+        assert!(parsed.scid_also_known_as);
+        let parsed: HostingConfig = toml::from_str("scid_also_known_as = false").unwrap();
+        assert!(!parsed.scid_also_known_as);
+    }
+
     #[test]
     fn store_env_overrides_apply_dynamodb_single_fields() {
         // Unique prefix so parallel tests never observe these vars.
@@ -1454,6 +2160,102 @@ mod tests {
         };
         apply_store_env_overrides("TEST_STORE_ENV_UNSET", &mut store);
         assert_eq!(store.dynamodb_table_name.as_deref(), Some("keep"));
+    }
+
+    #[test]
+    fn store_env_overrides_apply_namespace_and_consistent_reads() {
+        let p = "TEST_STORE_ENV_B";
+        // SAFETY: unique prefix, only this test touches these vars.
+        unsafe {
+            std::env::set_var(format!("{p}_DYNAMODB_KEY_NAMESPACE"), "witness");
+            std::env::set_var(format!("{p}_DYNAMODB_CONSISTENT_READS"), "false");
+        }
+        let mut store = StoreConfig::default();
+        apply_store_env_overrides(p, &mut store);
+        assert_eq!(store.dynamodb_key_namespace.as_deref(), Some("witness"));
+        assert_eq!(store.dynamodb_consistent_reads, Some(false));
+        unsafe {
+            std::env::remove_var(format!("{p}_DYNAMODB_KEY_NAMESPACE"));
+            std::env::remove_var(format!("{p}_DYNAMODB_CONSISTENT_READS"));
+        }
+    }
+
+    #[test]
+    fn store_config_with_env_is_the_data_dir_alone_when_nothing_is_set() {
+        let store = store_config_with_env(PathBuf::from("/d"), &["TEST_STORE_ENV_NONE"]);
+        assert_eq!(store.data_dir, PathBuf::from("/d"));
+        assert_eq!(store.dynamodb_table_name, None);
+        assert_eq!(store.dynamodb_key_namespace, None);
+    }
+
+    #[test]
+    fn store_config_with_env_applies_the_prefixes_in_order() {
+        let (first, second) = ("TEST_STORE_ENV_FIRST", "TEST_STORE_ENV_SECOND");
+        // SAFETY: unique prefixes, only this test touches these vars.
+        unsafe {
+            std::env::set_var(format!("{first}_DYNAMODB_TABLE_NAME"), "from-first");
+            std::env::set_var(format!("{first}_DYNAMODB_REGION"), "eu-west-1");
+            std::env::set_var(format!("{second}_DYNAMODB_TABLE_NAME"), "from-second");
+        }
+        let store = store_config_with_env(PathBuf::from("/d"), &[first, second]);
+        unsafe {
+            std::env::remove_var(format!("{first}_DYNAMODB_TABLE_NAME"));
+            std::env::remove_var(format!("{first}_DYNAMODB_REGION"));
+            std::env::remove_var(format!("{second}_DYNAMODB_TABLE_NAME"));
+        }
+        assert_eq!(store.dynamodb_table_name.as_deref(), Some("from-second"));
+        assert_eq!(store.dynamodb_region.as_deref(), Some("eu-west-1"));
+        assert_eq!(store.data_dir, PathBuf::from("/d"));
+    }
+
+    #[test]
+    fn parse_bool_accepts_the_usual_spellings_and_nothing_else() {
+        for yes in ["true", "TRUE", "True", "1", "yes", "on"] {
+            assert_eq!(parse_bool(yes), Some(true), "{yes}");
+        }
+        for no in ["false", "FALSE", "0", "no", "off"] {
+            assert_eq!(parse_bool(no), Some(false), "{no}");
+        }
+        for bad in ["", "flase", "2", "maybe", " true"] {
+            assert_eq!(parse_bool(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_unparseable_consistent_reads_env_var_keeps_the_safe_default() {
+        let p = "TEST_STORE_ENV_C";
+        // SAFETY: unique prefix, only this test touches this var.
+        unsafe { std::env::set_var(format!("{p}_DYNAMODB_CONSISTENT_READS"), "flase") };
+        let mut store = StoreConfig::default();
+        apply_store_env_overrides(p, &mut store);
+        // None means "unset", which the backend treats as strongly consistent:
+        // a typo must never silently weaken consistency.
+        assert_eq!(store.dynamodb_consistent_reads, None);
+        unsafe { std::env::remove_var(format!("{p}_DYNAMODB_CONSISTENT_READS")) };
+    }
+
+    #[test]
+    fn store_config_reads_the_single_table_fields_from_toml() {
+        let store: StoreConfig = toml::from_str(
+            r#"
+            dynamodb_table_name = "webvh"
+            dynamodb_region = "ap-southeast-1"
+            dynamodb_key_namespace = "witness"
+            dynamodb_consistent_reads = false
+            "#,
+        )
+        .expect("parse");
+        assert_eq!(store.dynamodb_table_name.as_deref(), Some("webvh"));
+        assert_eq!(store.dynamodb_key_namespace.as_deref(), Some("witness"));
+        assert_eq!(store.dynamodb_consistent_reads, Some(false));
+    }
+
+    #[test]
+    fn store_config_without_the_new_fields_still_parses_as_unset() {
+        // An existing deployment's config.toml has neither field.
+        let store: StoreConfig = toml::from_str(r#"dynamodb_table_name = "webvh""#).expect("parse");
+        assert_eq!(store.dynamodb_key_namespace, None);
+        assert_eq!(store.dynamodb_consistent_reads, None);
     }
 
     #[test]
@@ -1886,5 +2688,153 @@ mod fjall_config_tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(64 * 1024 * 1024), "64.00 MiB");
         assert_eq!(human_bytes(1024 * 1024 * 1024), "1.00 GiB");
+    }
+}
+
+#[cfg(test)]
+mod resolve_cache_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_five_minutes_public() {
+        let c = ResolveCacheConfig::default();
+        assert_eq!(c.header_value(), "public, max-age=300");
+    }
+
+    #[test]
+    fn optional_directives_are_appended() {
+        let c = ResolveCacheConfig {
+            max_age_secs: 60,
+            shared_max_age_secs: Some(600),
+            stale_while_revalidate_secs: Some(30),
+        };
+        assert_eq!(
+            c.header_value(),
+            "public, max-age=60, s-maxage=600, stale-while-revalidate=30"
+        );
+    }
+
+    #[test]
+    fn zero_max_age_means_no_cache() {
+        let c = ResolveCacheConfig {
+            max_age_secs: 0,
+            ..Default::default()
+        };
+        assert_eq!(c.header_value(), "no-cache");
+        // A CDN-only policy still caches at the edge, not in clients.
+        let c = ResolveCacheConfig {
+            max_age_secs: 0,
+            shared_max_age_secs: Some(120),
+            stale_while_revalidate_secs: None,
+        };
+        assert_eq!(c.header_value(), "public, max-age=0, s-maxage=120");
+    }
+
+    #[test]
+    fn durations_past_a_year_are_refused() {
+        let c = ResolveCacheConfig {
+            stale_while_revalidate_secs: Some(RESOLVE_CACHE_MAX_SECS + 1),
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+        let c = ResolveCacheConfig {
+            max_age_secs: RESOLVE_CACHE_MAX_SECS,
+            ..Default::default()
+        };
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn toml_table_parses_and_defaults_when_absent() {
+        let s: ServerConfig = toml::from_str("host = \"0.0.0.0\"").unwrap();
+        assert_eq!(s.resolve_cache, ResolveCacheConfig::default());
+
+        let s: ServerConfig = toml::from_str(
+            "[resolve_cache]\nmax_age_secs = 30\nstale_while_revalidate_secs = 60\n",
+        )
+        .unwrap();
+        assert_eq!(s.resolve_cache.max_age_secs, 30);
+        assert_eq!(s.resolve_cache.stale_while_revalidate_secs, Some(60));
+        assert_eq!(s.resolve_cache.shared_max_age_secs, None);
+
+        // A typo is an error, not a silently ignored setting.
+        assert!(toml::from_str::<ServerConfig>("[resolve_cache]\nmax_age = 30\n").is_err());
+    }
+
+    #[test]
+    fn env_overrides_set_clear_and_validate() {
+        // A prefix no other test uses, so this test owns these vars.
+        const MAX: &str = "RCTEST_SERVER_RESOLVE_CACHE_MAX_AGE_SECS";
+        const SHARED: &str = "RCTEST_SERVER_RESOLVE_CACHE_SHARED_MAX_AGE_SECS";
+        const SWR: &str = "RCTEST_SERVER_RESOLVE_CACHE_STALE_WHILE_REVALIDATE_SECS";
+        // SAFETY: only this test reads or writes the `RCTEST_*` names.
+        unsafe {
+            std::env::set_var(MAX, "45");
+            std::env::set_var(SHARED, "900");
+            std::env::set_var(SWR, "");
+        }
+        let mut c = ResolveCacheConfig {
+            stale_while_revalidate_secs: Some(10),
+            ..Default::default()
+        };
+        c.apply_env_overrides("RCTEST").unwrap();
+        assert_eq!(c.max_age_secs, 45);
+        assert_eq!(c.shared_max_age_secs, Some(900));
+        assert_eq!(c.stale_while_revalidate_secs, None, "empty clears");
+
+        unsafe { std::env::set_var(MAX, "soon") };
+        assert!(c.apply_env_overrides("RCTEST").is_err());
+        unsafe { std::env::set_var(MAX, "99999999") };
+        assert!(c.apply_env_overrides("RCTEST").is_err(), "past a year");
+
+        unsafe {
+            std::env::remove_var(MAX);
+            std::env::remove_var(SHARED);
+            std::env::remove_var(SWR);
+        }
+    }
+}
+
+#[cfg(test)]
+mod trusted_proxies_tests {
+    use super::*;
+
+    /// Addresses and CIDR ranges both parse; an address is its own
+    /// one-address network and is written back as it was given.
+    #[test]
+    fn addresses_and_ranges_parse_and_round_trip() {
+        let s: ServerConfig = toml::from_str(
+            "trusted_proxies = [\"10.0.0.1\", \"10.20.0.0/16\", \"2001:db8::/48\", \" 192.0.2.7 \"]\n",
+        )
+        .unwrap();
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert!(s.trusted_proxies[0].contains(ip("10.0.0.1")));
+        assert!(!s.trusted_proxies[0].contains(ip("10.0.0.2")));
+        assert!(s.trusted_proxies[1].contains(ip("10.20.255.1")));
+        assert!(s.trusted_proxies[2].contains(ip("2001:db8:0:1::5")));
+
+        let written = toml::to_string(&s).unwrap();
+        assert!(
+            written.contains(
+                r#"trusted_proxies = ["10.0.0.1", "10.20.0.0/16", "2001:db8::/48", "192.0.2.7"]"#
+            ),
+            "{written}"
+        );
+        let back: ServerConfig = toml::from_str(&written).unwrap();
+        assert_eq!(back.trusted_proxies, s.trusted_proxies);
+    }
+
+    /// A bad entry stops the load and is named, rather than being dropped
+    /// (which left the proxy untrusted and every client in one bucket).
+    #[test]
+    fn a_bad_entry_is_refused_by_name() {
+        for bad in ["proxy.internal", "10.0.0.0/33", "10.0.0.0/"] {
+            let err = toml::from_str::<ServerConfig>(&format!("trusted_proxies = [\"{bad}\"]\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(bad), "{err}");
+        }
+        let s: ServerConfig = toml::from_str("host = \"0.0.0.0\"").unwrap();
+        assert!(s.trusted_proxies.is_empty());
     }
 }

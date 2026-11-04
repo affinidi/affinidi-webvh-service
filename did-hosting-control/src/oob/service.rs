@@ -152,7 +152,7 @@ pub struct ApprovedSession {
     pub subject: String,
     /// `K_b`, the only key that may sign as `subject` in this session.
     pub session_key: String,
-    /// Epoch seconds: the earlier of the grant's `notAfter` and the limit.
+    /// Epoch seconds: the earlier of the grant's `sessionEndsAt` and the limit.
     pub not_after: u64,
     pub display_name: Option<String>,
     /// The signed grant, for the audit record.
@@ -242,8 +242,8 @@ impl OobService {
         }
     }
 
-    /// The signed `redeem` response: `{ subject, displayName, notAfter, amr }`
-    /// (C9), plus a vendor-namespaced `ext` the binding may add (the schema's
+    /// The signed `redeem` response: `{ subject, displayName, sessionEndsAt,
+    /// amr }`, plus a vendor-namespaced `ext` the binding may add (the schema's
     /// only open member).
     pub async fn redeem_response(
         &self,
@@ -255,7 +255,7 @@ impl OobService {
         let mut body = json!({
             "subject": session.subject,
             "displayName": display_name_or_did(session.display_name.as_deref(), &session.subject),
-            "notAfter": session.not_after,
+            "sessionEndsAt": rfc3339(session.not_after),
             "amr": OOB_AMR,
         });
         if let Some(ext) = ext {
@@ -328,7 +328,7 @@ impl OobService {
         tracing::info!(audit = true, op = "auth/oob/request", request_id = %request_id, "sign-in request opened");
         let body = response::<RequestResponse>(json!({
             "requestId": request_id,
-            "claimDeadline": claim_deadline,
+            "claimClosesAt": rfc3339(claim_deadline),
         }))?;
         let recipient = doc.issuer.clone().unwrap_or_default();
         self.signed(env, &doc, &recipient, body, OPERATIONAL).await
@@ -387,8 +387,8 @@ impl OobService {
         raw: &Value,
         conn: &Connection,
     ) -> Result<Value, OobError> {
-        let (doc, payload) = self.key_doc::<ProvePayload>(env, raw, TYPE_PROVE).await?;
-        let identify_raw = Value::Object(payload.identify);
+        let (doc, p) = self.key_doc::<ProvePayload>(env, raw, TYPE_PROVE).await?;
+        let identify_raw = Value::Object(p.identify);
         let request_id = carried_request_id(&identify_raw)?;
         same_thread(&doc, &request_id)?;
         // 1. The outer issuer holds the lock; the request is claimed and in
@@ -433,11 +433,14 @@ impl OobService {
             "sameNetwork": same_network,
         });
         step2["identifiedAs"] = json!(identify_did);
+        // No `signingScope`: this service delegates no signing.
         let step2 = response::<Step2Response>(step2)?;
         let signed = self.signed(env, &doc, &issuer, step2, ATTESTATION).await?;
         let now = env.now();
         let mut next = rec.next(OobState::Identified, now);
-        next.identified_did = Some(identify_did.clone());
+        // Recorded as the identity; `identifiedAs` above echoes the DID as the
+        // member presented it, `src` included where it carried one.
+        next.identified_did = Some(did_hosting_common::scid::identity(&identify_did));
         next.step2_digest = Some(context_digest(&signed));
         if !self.store.compare_and_set(rec.version, next) {
             return Err(OobError::new(
@@ -483,7 +486,12 @@ impl OobService {
         }
         if self
             .store
-            .remember_document(&did, &identify.id, env.now() + SEEN_ID_TTL_SECS, env.now())
+            .remember_document(
+                &did_hosting_common::scid::identity(&did),
+                &identify.id,
+                env.now() + SEEN_ID_TTL_SECS,
+                env.now(),
+            )
             .is_err()
         {
             return Err(OobError::not_authorized());
@@ -494,10 +502,10 @@ impl OobService {
     // ---- respond (7.5) ------------------------------------------------------
 
     async fn respond(&self, env: &dyn OobEnv, raw: &Value) -> Result<Value, OobError> {
-        let (doc, payload) = self
+        let (doc, p) = self
             .key_doc::<RespondPayload>(env, raw, TYPE_RESPOND)
             .await?;
-        let grant_raw = Value::Object(payload.grant);
+        let grant_raw = Value::Object(p.grant);
         let request_id = carried_request_id(&grant_raw)?;
         same_thread(&doc, &request_id)?;
         let issuer = doc.issuer.clone().unwrap_or_default();
@@ -550,9 +558,14 @@ impl OobService {
             serde_json::from_value(grant_raw.clone()).map_err(|_| OobError::not_authorized())?;
         // 2. Issued by the DID that proved, against `assertionMethod`.
         let did = rec.identified_did.clone().unwrap_or_default();
-        if grant.issuer.as_deref() != Some(did.as_str()) {
+        if !grant
+            .issuer
+            .as_deref()
+            .is_some_and(|issuer| did_hosting_common::scid::same_reference(issuer, &did))
+        {
             return Err(OobError::not_authorized());
         }
+        // `respond/0.3` carries a `grant/0.3`, and nothing else.
         self.envelope(env, &grant, TYPE_GRANT)
             .map_err(|_| OobError::not_authorized())?;
         let verifier = env.member_verifier().ok_or_else(OobError::not_authorized)?;
@@ -568,8 +581,19 @@ impl OobService {
             return Err(OobError::not_authorized());
         }
         let p = read::<GrantPayload>(&grant.payload).map_err(|_| OobError::not_authorized())?;
+        // The grant's `signingScope` is step 2's. Step 2 here never offers
+        // one, so a grant that claims one asks for a delegation nobody
+        // offered.
+        if p.signing_scope.is_some() {
+            return Err(OobError::new(
+                OobErrorCode::ContextMismatch,
+                "the grant delegates signing this service did not offer",
+            ));
+        }
         let approve = p.decision == GrantDecision::Approve;
-        let not_after = p.not_after;
+        // `sessionEndsAt` is an RFC 3339 instant; the state machine keeps
+        // epoch seconds. One before the epoch can never be in the future.
+        let not_after = u64::try_from(p.session_ends_at.timestamp()).unwrap_or(0);
         // 3. and 4. The bindings.
         let mismatch = || OobError::new(OobErrorCode::ContextMismatch, "context mismatch");
         if p.request_id.as_str() != rec.request_id
@@ -927,7 +951,7 @@ impl OobService {
             },
             "origin": rec.origin,
             "purpose": rec.purpose,
-            "decisionDeadline": rec.decision_deadline.unwrap_or_default(),
+            "decisionClosesAt": rfc3339(rec.decision_deadline.unwrap_or_default()),
         })
     }
 

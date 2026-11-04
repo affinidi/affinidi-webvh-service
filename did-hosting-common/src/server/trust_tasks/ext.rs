@@ -1,5 +1,5 @@
 //! `vnd.affinidi.webvh` — webvh-specific extension shape carried in the
-//! `ext` slot of every `acl/*` AclEntry document we emit or accept.
+//! `ext` slot of every `acl/*` AclEntry 0.2 document we emit or accept.
 //!
 //! See SPEC.md §4.5.1 (Trust Tasks framework). The `ext` slot is the
 //! sanctioned extension point for ecosystem-defined fields that the
@@ -11,27 +11,26 @@
 //! ```json
 //! "ext": {
 //!   "vnd.affinidi.webvh": {
-//!     "quota":   { "maxTotalSize": 1048576, "maxDidCount": 50 },
-//!     "domains": { "kind": "allowed_with_default",
-//!                  "domains": ["a.example"],
-//!                  "default": "a.example" }
+//!     "quota":         { "maxTotalSize": 1048576, "maxDidCount": 50 },
+//!     "defaultDomain": "a.example"
 //!   }
 //! }
 //! ```
 //!
-//! Both `quota.*` members are individually optional; an absent value
-//! means "inherit the deployment-wide default" (the same semantics our
-//! v0.7 `AclEntry.max_total_size: Option<u64>` already encodes).
-//! `domains` is **required** when this namespace is present, because
-//! domain scope is auth-path load-bearing on every request and silent
-//! defaults would mask configuration mistakes.
+//! Nothing here confers authority: AclEntry 0.2 forbids reading an
+//! extension member as a grant. Where an entry may act — its domains — is
+//! the entry's `act` scope (see [`super::entry`]). This namespace carries
+//! only the two things that are not authority:
+//!
+//! - `quota` — per-entry limits. Both members are individually optional; an
+//!   absent value means "inherit the deployment-wide default".
+//! - `defaultDomain` — the domain used when a request names none. It must be
+//!   one of the entry's `act` contexts, and is meaningless otherwise.
 //!
 //! Consumers that do not implement webvh **MUST** ignore this namespace
 //! per the framework's unrecognized-member rule.
 
 use serde::{Deserialize, Serialize};
-
-use crate::server::domain::DomainScope;
 
 /// Reverse-DNS key under which webvh-specific ACL extensions land.
 pub const WEBVH_EXT_KEY: &str = "vnd.affinidi.webvh";
@@ -40,22 +39,27 @@ pub const WEBVH_EXT_KEY: &str = "vnd.affinidi.webvh";
 /// AclEntry's `ext` member.
 ///
 /// Deserialised on the way in and serialised on the way out; the rest
-/// of the `ext` object (other vendor namespaces) is preserved verbatim
-/// by the caller — this struct only models the slice that belongs to
-/// us.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// of the `ext` object (other vendor namespaces) is ignored — this struct
+/// only models the slice that belongs to us.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct WebvhAclEntryExt {
     /// Quota knobs (max bytes per DID, max DID count). Both members are
     /// optional; an absent value means "use the deployment default."
     #[serde(default, skip_serializing_if = "WebvhQuota::is_empty")]
     pub quota: WebvhQuota,
 
-    /// Per-entry domain scope. Required when this namespace appears.
-    /// `DomainScope::All` is a valid value (no per-domain restriction);
-    /// the field can't be omitted because we need an explicit signal
-    /// distinguishing "default-broad" from "default-narrow" entries.
-    pub domains: DomainScope,
+    /// The domain a request that names none is served on. One of the
+    /// entry's `act` contexts; absent when the entry has no default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_domain: Option<String>,
+}
+
+impl WebvhAclEntryExt {
+    /// Whether the namespace says nothing, so it can be left off the wire.
+    pub fn is_empty(&self) -> bool {
+        self.quota.is_empty() && self.default_domain.is_none()
+    }
 }
 
 /// Quota knobs on a per-AclEntry basis. Both members are individually
@@ -97,21 +101,14 @@ mod tests {
                 max_total_size: Some(1_048_576),
                 max_did_count: Some(50),
             },
-            domains: DomainScope::AllowedWithDefault {
-                domains: vec!["a.example".into()],
-                default: "a.example".into(),
-            },
+            default_domain: Some("a.example".into()),
         };
         let value = serde_json::to_value(&ext).unwrap();
         assert_eq!(
             value,
             json!({
                 "quota": { "maxTotalSize": 1_048_576, "maxDidCount": 50 },
-                "domains": {
-                    "kind": "allowed_with_default",
-                    "domains": ["a.example"],
-                    "default": "a.example"
-                }
+                "defaultDomain": "a.example"
             })
         );
         let back: WebvhAclEntryExt = serde_json::from_value(value).unwrap();
@@ -119,19 +116,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_quota_is_omitted_on_serialise() {
-        let ext = WebvhAclEntryExt {
-            quota: WebvhQuota::default(),
-            domains: DomainScope::All,
-        };
-        let value = serde_json::to_value(&ext).unwrap();
-        // No "quota" key on the wire when both members are None — keeps
-        // documents minimal and lets receivers distinguish "explicitly
-        // empty quota" from "deployment default" without ambiguity.
-        assert!(value.get("quota").is_none());
-        // `domains` is always serialised even for All (its presence is
-        // the signal that this namespace is in use).
-        assert_eq!(value["domains"]["kind"], "all");
+    fn empty_namespace_serialises_as_empty_object() {
+        let ext = WebvhAclEntryExt::default();
+        assert!(ext.is_empty());
+        assert_eq!(serde_json::to_value(&ext).unwrap(), json!({}));
     }
 
     #[test]
@@ -141,20 +129,15 @@ mod tests {
         // silently dropped. The framework requires consumers to ignore
         // unknown *namespaces*, but inside our namespace we control
         // the shape and can be strict.
-        let bad = json!({
-            "qouta": {},
-            "domains": { "kind": "all" }
-        });
-        assert!(serde_json::from_value::<WebvhAclEntryExt>(bad).is_err());
+        assert!(serde_json::from_value::<WebvhAclEntryExt>(json!({ "qouta": {} })).is_err());
     }
 
     #[test]
-    fn deserialise_requires_domains() {
-        // `domains` is not Option — omitting it on the wire is a parse
-        // error. Mirrors the load-bearing nature of the field on the
-        // auth path.
-        let bad = json!({ "quota": {} });
-        assert!(serde_json::from_value::<WebvhAclEntryExt>(bad).is_err());
+    fn the_0_1_domains_member_is_refused() {
+        // Domain authority moved to the entry's `act` scope with AclEntry
+        // 0.2; a producer still sending it here must not have it ignored.
+        let legacy = json!({ "domains": { "kind": "all" } });
+        assert!(serde_json::from_value::<WebvhAclEntryExt>(legacy).is_err());
     }
 
     #[test]

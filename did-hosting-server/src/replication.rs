@@ -7,7 +7,7 @@
 //! exhausted its retry budget while the edge was down, say:
 //!
 //! 1. Every [`ReplicationConfig::reconcile_interval_secs`] the edge asks its
-//!    control plane for the full `did-management/did/list/0.1`, as a signed
+//!    control plane for the full `did-management/did/list/0.2`, as a signed
 //!    Trust Task over the binding the control plane's DID document advertises.
 //!    The reply must itself be signed by the configured control plane and
 //!    addressed to this edge, exactly as a directive must.
@@ -36,16 +36,22 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
-use did_hosting_common::did_ops::{DidRecord, content_log_key, did_key};
+use did_hosting_common::did_ops::{DidRecord, did_key};
 use did_hosting_common::server::auth::session::now_epoch;
 
 use crate::server::AppState;
 
-/// `did-management/did/list/0.1`.
-pub const MSG_DID_LIST: &str = "https://trusttasks.org/spec/did-management/did/list/0.1";
+/// `did-management/did/list/0.2`.
+pub const MSG_DID_LIST: &str =
+    <did_hosting_common::tasks::did_management::did::list::v0_2::Payload as trust_tasks_rs::Payload>::TYPE_URI;
 
 /// The spec's page ceiling.
 const PAGE_LIMIT: u64 = 1000;
+
+/// The most pages one reconcile follows. At [`PAGE_LIMIT`] slots a page that
+/// is ten million slots — far past any deployment — and it bounds a control
+/// plane that keeps answering with a `nextCursor`.
+const MAX_PAGES: usize = 10_000;
 
 /// How long one page of the listing may take to come back.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -241,10 +247,11 @@ impl ReconcileReport {
 }
 
 /// A signed `did/list` request for one page, from this edge to its control
-/// plane.
+/// plane: the first page with no `cursor`, a later one with the previous
+/// page's `nextCursor`.
 pub async fn list_request(
     state: &AppState,
-    offset: u64,
+    cursor: Option<&str>,
 ) -> Result<trust_tasks_rs::TrustTask<Value>, String> {
     use did_hosting_common::server::trust_tasks::send::build_signed_request;
 
@@ -262,7 +269,10 @@ pub async fn list_request(
         MSG_DID_LIST,
         server_did,
         control_did,
-        json!({ "limit": PAGE_LIMIT, "offset": offset }),
+        match cursor {
+            Some(cursor) => json!({ "limit": PAGE_LIMIT, "cursor": cursor }),
+            None => json!({ "limit": PAGE_LIMIT }),
+        },
         &signer,
     )
     .await
@@ -275,7 +285,7 @@ async fn verified_page(
     state: &AppState,
     request_id: &str,
     reply: trust_tasks_rs::TrustTask<Value>,
-) -> Result<(Vec<(String, Listed)>, u64), String> {
+) -> Result<(Vec<(String, Listed)>, Option<String>), String> {
     let verifier =
         crate::messaging::state_verifier(state).ok_or("no DID resolver to verify the reply")?;
     crate::messaging::verify_control_plane(state, None, &reply, &verifier)
@@ -293,14 +303,14 @@ async fn verified_page(
             .unwrap_or("?");
         return Err(format!("the control plane refused the listing: {code}"));
     }
-    use trust_tasks_rs::specs::did_management::did::list::v0_1 as list;
+    use did_hosting_common::tasks::did_management::did::list::v0_2 as list;
     let _typed: list::Response = serde_json::from_value(reply.payload.clone())
         .map_err(|e| format!("the listing does not fit its schema: {e}"))?;
-    let total = reply
+    let next_cursor = reply
         .payload
-        .get("total")
-        .and_then(Value::as_u64)
-        .ok_or("the listing has no total")?;
+        .get("nextCursor")
+        .and_then(Value::as_str)
+        .map(String::from);
     let records = reply
         .payload
         .get("records")
@@ -318,7 +328,7 @@ async fn verified_page(
             ))
         })
         .collect();
-    Ok((records, total))
+    Ok((records, next_cursor))
 }
 
 /// One reconcile, with `exchange` carrying each request to the control plane
@@ -333,24 +343,30 @@ where
     Fut: std::future::Future<Output = Result<trust_tasks_rs::TrustTask<Value>, String>>,
 {
     // The whole listing, page by page.
+    // The last page is the one with no `nextCursor`; only a listing read to
+    // it is complete, so anything short of that fails the reconcile rather
+    // than reading slots the control plane did not get to as extra.
     let mut listed: HashMap<String, Listed> = HashMap::new();
-    let mut offset = 0u64;
+    let mut cursor: Option<String> = None;
+    let mut pages = 0usize;
     loop {
-        let request = list_request(state, offset).await?;
+        if pages == MAX_PAGES {
+            return Err(format!("the listing did not end within {MAX_PAGES} pages"));
+        }
+        pages += 1;
+        let request = list_request(state, cursor.as_deref()).await?;
         let request_id = request.id.clone();
         let reply = exchange(request).await?;
-        let (page, total) = verified_page(state, &request_id, reply).await?;
-        let got = page.len() as u64;
+        let (page, next) = verified_page(state, &request_id, reply).await?;
+        let got = page.len();
         listed.extend(page);
-        offset += got;
-        if got == 0 || offset >= total {
-            if (listed.len() as u64) < total {
-                return Err(format!(
-                    "the listing ended at {} of {total} slots",
-                    listed.len()
-                ));
+        match next {
+            None => break,
+            // A further page promised after an empty one would never end.
+            Some(_) if got == 0 => {
+                return Err("the listing offered another page after an empty one".into());
             }
-            break;
+            Some(next) => cursor = Some(next),
         }
     }
 
@@ -403,7 +419,7 @@ async fn apply_listing(
             report.behind.push(mnemonic.clone());
         }
     }
-    for mut record in held {
+    for record in held {
         let Some(want) = listed.get(&record.mnemonic) else {
             report.extra.push(record.mnemonic.clone());
             continue;
@@ -418,15 +434,31 @@ async fn apply_listing(
             // control plane has said the DID must not resolve.
         }
         if want.disabled != record.disabled {
-            record.disabled = want.disabled;
+            // The repair writes the whole record back, so it is made under
+            // `sync_lock` on a fresh read, like every other record writer on
+            // an edge. The snapshot above may be minutes old by now (the
+            // listing is paged over the network); writing it back would
+            // revert a `sync/update` applied since, or resurrect a slot a
+            // `sync/delete` removed.
+            let _guard = state.sync_lock.lock().await;
+            let Some(mut current) = state
+                .dids_ks
+                .get::<DidRecord>(did_key(&record.mnemonic))
+                .await
+                .map_err(|e| e.to_string())?
+            else {
+                continue;
+            };
+            if current.disabled == want.disabled {
+                continue;
+            }
+            current.disabled = want.disabled;
             state
                 .dids_ks
-                .insert(did_key(&record.mnemonic), &record)
+                .insert(did_key(&record.mnemonic), &current)
                 .await
                 .map_err(|e| e.to_string())?;
-            state
-                .did_cache
-                .invalidate(&content_log_key(&record.mnemonic));
+            state.did_cache.invalidate_did(&record.mnemonic);
             warn!(
                 mnemonic = %record.mnemonic,
                 disabled = want.disabled,
@@ -462,5 +494,111 @@ pub async fn run_reconcile_loop(
             Ok(_) => crate::control_register::register_via_didcomm(&state, &svc).await,
             Err(e) => warn!(error = %e, "reconcile with the control plane failed"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AppConfig, LimitsConfig, StatsConfig};
+    use crate::server::AppState;
+    use did_hosting_common::server::config::{
+        AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
+    };
+    use did_hosting_common::server::store::Store;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    async fn edge() -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store_config = StoreConfig {
+            data_dir: PathBuf::from(dir.path()),
+            ..StoreConfig::default()
+        };
+        let store = Store::open(&store_config).await.unwrap();
+        let config = AppConfig {
+            fjall: Default::default(),
+            features: FeaturesConfig::default(),
+            server_did: None,
+            mediator_did: None,
+            public_url: None,
+            server: ServerConfig::default(),
+            log: LogConfig::default(),
+            store: store_config,
+            auth: AuthConfig::default(),
+            hosting: Default::default(),
+            secrets: SecretsConfig::default(),
+            limits: LimitsConfig::default(),
+            replication: Default::default(),
+            stats: StatsConfig::default(),
+            control_did: None,
+            vta: VtaConfig::default(),
+            identity: Default::default(),
+            replay: Default::default(),
+            config_path: PathBuf::new(),
+        };
+        (AppState::new(store, config).unwrap(), dir)
+    }
+
+    fn record(version_count: u64, disabled: bool) -> DidRecord {
+        DidRecord {
+            owner: "did:example:owner".into(),
+            mnemonic: "slot".into(),
+            created_at: 1,
+            updated_at: 1,
+            version_count,
+            did_id: Some("did:webvh:Q1:example.com:slot".into()),
+            content_size: 0,
+            disabled,
+            deleted_at: None,
+            method: "webvh".into(),
+            domain: "example.com".into(),
+            services: None,
+            agent_names: Vec::new(),
+        }
+    }
+
+    /// A reconcile's disabled-state repair must not write back the snapshot
+    /// it listed: a `sync/update` holding `sync_lock` commits version 2 after
+    /// the reconcile read version 1. The repair must land on version 2, and
+    /// version 2 must survive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_repair_never_reverts_a_concurrent_sync() {
+        let (state, _dir) = edge().await;
+        let state = Arc::new(state);
+        state
+            .dids_ks
+            .insert(did_key("slot"), &record(1, false))
+            .await
+            .unwrap();
+        let listed = HashMap::from([(
+            "slot".to_string(),
+            Listed {
+                did_id: Some("did:webvh:Q1:example.com:slot".into()),
+                version_count: 1,
+                disabled: true,
+            },
+        )]);
+
+        let sync_guard = state.sync_lock.lock().await;
+        let reconcile = {
+            let state = state.clone();
+            tokio::spawn(async move { apply_listing(&state, &listed).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The concurrent sync commits the version it built before the
+        // reconcile's repair arrived.
+        state
+            .dids_ks
+            .insert(did_key("slot"), &record(2, false))
+            .await
+            .unwrap();
+        drop(sync_guard);
+        let report = reconcile.await.unwrap().unwrap();
+        assert_eq!(report.repaired, vec!["slot".to_string()]);
+
+        let stored: DidRecord = state.dids_ks.get(did_key("slot")).await.unwrap().unwrap();
+        assert_eq!(stored.version_count, 2, "the concurrent sync was reverted");
+        assert!(stored.disabled, "the repair was lost");
     }
 }

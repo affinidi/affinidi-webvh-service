@@ -17,9 +17,9 @@
 //! credential (freeing the subject to enrol a replacement) or, for a locked-
 //! out subject with none left, by re-inviting them (`enrol::invite`).
 
+use did_hosting_common::tasks::auth::passkey::{admin_list, list, revoke};
 use serde_json::{Value, json};
 use tracing::{info, warn};
-use trust_tasks_rs::specs::auth::passkey::{admin_list, list, revoke};
 use webauthn_rs::prelude::{CredentialID, Passkey, PublicKeyCredential};
 
 use did_hosting_common::server::acl::{Role, get_acl_entry};

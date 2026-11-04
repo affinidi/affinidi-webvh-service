@@ -1,44 +1,32 @@
-//! `trust-task-discovery/0.1` handler — advertise the set of Type URIs
-//! this maintainer routes for, plus per-type `requiredExt` annotations
-//! so producers know our `vnd.affinidi.webvh` namespace is expected on
-//! the entry-emitting operations.
+//! `trust-task-discovery/0.3` handler — advertise the set of Type URIs
+//! this maintainer routes for.
 //!
-//! ## What we advertise as `requiredExt`
+//! Nothing is advertised as `requiredExt`: with AclEntry 0.2 an entry's
+//! domains are its `act` scope, and the `vnd.affinidi.webvh` namespace
+//! carries only optional members (quota, default domain), so a producer
+//! that omits it is accepted.
 //!
-//! `acl/grant/0.1` and `acl/change-role/0.1` produce or transition
-//! entries; both touch the `domains` scope that lives in
-//! `ext.vnd.affinidi.webvh`. Strictly the namespace is only required
-//! for Owner entries (Admin/Service entries fall back to
-//! `DomainScope::All`), but advertising it on these two types is the
-//! safe hint to clients — a producer who populates it will always be
-//! accepted, and an Admin-targeted grant that omits it still works.
+//! Only 0.3 is served: the service speaks the latest version of each task
+//! it serves. A discoverer that asks in 0.1 or 0.2 is refused
+//! `unsupportedType` and may retry in 0.3.
 //!
-//! `acl/revoke/0.1`, `acl/show/0.1`, `acl/list/0.1`, and the
-//! discovery spec itself do NOT require our namespace — they are
-//! read-only or carry no entry — so we list them as plain Type URI
-//! strings.
-//!
-//! ## Why we use `DiscoveryRegistry::respond_to`
+//! ## Why we use `DiscoveryRegistry::respond_to_v0_3`
 //!
 //! The trust-tasks-rs `DiscoveryRegistry` already encodes the
-//! slug-glob matcher, requiredExt expansion, and lexicographic
-//! ordering. Wrapping it in our pipeline keeps the §7.2 framework
-//! checks consistent with the ACL handlers above.
+//! slug-glob matcher and lexicographic ordering. Wrapping it in our
+//! pipeline keeps the §7.2 framework checks consistent with the ACL
+//! handlers above. `frameworkVersion` is the registry's default: the
+//! framework release the runtime targets, in its three-part form.
 
 use trust_tasks_rs::{
-    ErrorResponse, Payload, ProofPolicy, ProofVerifier, TransportHandler, TrustTask,
-    discovery::DiscoveryRegistry,
-    specs::{
-        acl::{
-            change_role::v0_1 as change_role, grant::v0_1 as grant, list::v0_1 as list,
-            revoke::v0_1 as revoke, show::v0_1 as show,
-        },
-        trust_task_discovery::v0_1 as discovery,
-    },
+    ErrorResponse, ProofPolicy, ProofVerifier, TransportHandler, TrustTask,
+    discovery::DiscoveryRegistry, specs::trust_task_discovery::v0_3 as discovery,
 };
 
-use crate::server::trust_tasks::{
-    DispatchOutcome, TrustTaskContext, ext::WEBVH_EXT_KEY, run_pipeline,
+use crate::server::trust_tasks::{DispatchOutcome, TrustTaskContext, run_pipeline};
+use crate::tasks::acl::{
+    change_role::v0_2 as change_role, grant::v0_2 as grant, list::v0_3 as list,
+    revoke::v0_2 as revoke, show::v0_2 as show,
 };
 
 /// Build the [`DiscoveryRegistry`] this maintainer advertises.
@@ -46,20 +34,13 @@ use crate::server::trust_tasks::{
 /// Public so tests / docs / external callers can introspect what the
 /// service announces without going through a wire round-trip.
 pub fn registry() -> DiscoveryRegistry {
-    let mut reg = DiscoveryRegistry::new()
-        .framework_version("0.1")
+    DiscoveryRegistry::new()
         .with::<grant::Payload>()
         .with::<revoke::Payload>()
         .with::<change_role::Payload>()
         .with::<show::Payload>()
         .with::<list::Payload>()
-        .with::<discovery::Payload>();
-
-    // Annotate the two entry-emitting types so producers know to
-    // include our namespace.
-    reg.require_ext(grant::Payload::type_uri(), [WEBVH_EXT_KEY]);
-    reg.require_ext(change_role::Payload::type_uri(), [WEBVH_EXT_KEY]);
-    reg
+        .with::<discovery::Payload>()
 }
 
 pub async fn handle<V>(
@@ -87,10 +68,8 @@ async fn handle_inner(
     // No auth check: discovery is non-authoritative metadata. SPEC.md
     // §11 + the spec's Privacy considerations note that a maintainer
     // MAY return a filtered subset (or no response) for unknown
-    // discoverers; for v0.7.0 we publish the full set. A future tighten
-    // (admin-only discovery) lands as a thin wrapper that checks the
-    // ACL before calling registry().respond_to.
-    let response = registry().respond_to(&doc.payload);
+    // discoverers; we publish the full set.
+    let response = registry().respond_to_v0_3(&doc.payload);
     let resp_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
     Ok(doc.respond_with(resp_id, response))
 }
@@ -98,10 +77,7 @@ async fn handle_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trust_tasks_rs::{
-        Payload, VerificationError, handlers::InMemoryHandler,
-        specs::trust_task_discovery::v0_1::ResponseSupportedTypesItem,
-    };
+    use trust_tasks_rs::{Payload, VerificationError, handlers::InMemoryHandler};
 
     const SERVICE_DID: &str = "did:web:maintainer.example";
     const CALLER_DID: &str = "did:web:caller.example";
@@ -176,6 +152,7 @@ mod tests {
             acl_ks: &ks,
             acl_locks: &acl_locks,
             my_vid: SERVICE_DID,
+            signing_oracle: false,
         };
         let resp = unwrap_response(handle(&ctx, &transport(), no_verifier(), request(&[])).await);
         assert_eq!(
@@ -207,7 +184,12 @@ mod tests {
                 "missing {expected} in {uris:?}"
             );
         }
-        assert_eq!(resp.payload["frameworkVersion"], "0.1");
+        assert_eq!(uris.len(), 6, "only the latest version of each: {uris:?}");
+        // The framework release, in the three-part form 0.2+ requires.
+        let fv = resp.payload["frameworkVersion"]
+            .as_str()
+            .expect("frameworkVersion");
+        assert_eq!(fv.split('.').count(), 3, "{fv}");
     }
 
     #[tokio::test]
@@ -218,66 +200,19 @@ mod tests {
             acl_ks: &ks,
             acl_locks: &acl_locks,
             my_vid: SERVICE_DID,
+            signing_oracle: false,
         };
         let resp =
             unwrap_response(handle(&ctx, &transport(), no_verifier(), request(&["acl/*"])).await);
 
         let types = resp.payload["supportedTypes"].as_array().unwrap();
         for t in types {
-            let uri = match t {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Object(o) => o["type"].as_str().unwrap().to_string(),
-                _ => panic!(),
-            };
+            let uri = t
+                .as_str()
+                .expect("no expanded entries: nothing requires ext");
             assert!(uri.contains("/spec/acl/"), "expected acl/* type, got {uri}");
         }
         // Five acl/* types.
         assert_eq!(types.len(), 5);
-    }
-
-    #[tokio::test]
-    async fn grant_advertises_required_ext_namespace() {
-        let (_dir, _store, ks) = ctx_storage().await;
-        let acl_locks = crate::server::path_locks::PathLocks::new();
-        let ctx = TrustTaskContext {
-            acl_ks: &ks,
-            acl_locks: &acl_locks,
-            my_vid: SERVICE_DID,
-        };
-        let resp = unwrap_response(
-            handle(&ctx, &transport(), no_verifier(), request(&["acl/grant"])).await,
-        );
-        let types = resp.payload["supportedTypes"].as_array().unwrap();
-        assert_eq!(types.len(), 1);
-        let entry = &types[0];
-        // Expanded form with requiredExt
-        assert!(
-            entry.is_object(),
-            "expanded entry expected for grant: {entry}"
-        );
-        assert_eq!(entry["type"], grant::Payload::TYPE_URI);
-        assert_eq!(entry["requiredExt"], serde_json::json!([WEBVH_EXT_KEY]));
-    }
-
-    #[test]
-    fn registry_includes_change_role_required_ext() {
-        let reg = registry();
-        let payload: discovery::Payload = discovery::Payload::builder()
-            .patterns(vec!["acl/change-role".to_string().try_into().unwrap()])
-            .try_into()
-            .expect("discovery payload is well formed");
-        let resp = reg.respond_to(&payload);
-        assert_eq!(resp.supported_types.len(), 1);
-        match &resp.supported_types[0] {
-            ResponseSupportedTypesItem::Object {
-                type_,
-                required_ext,
-            } => {
-                assert_eq!(type_, change_role::Payload::TYPE_URI);
-                let ext = required_ext.as_ref().expect("change-role has requiredExt");
-                assert!(ext.iter().any(|n| **n == *WEBVH_EXT_KEY));
-            }
-            other => panic!("expected expanded form, got {other:?}"),
-        }
     }
 }

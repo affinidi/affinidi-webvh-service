@@ -64,6 +64,10 @@ pub struct AppState {
     pub stats_collector: Option<Arc<stats::StatsCollector>>,
     /// In-memory cache for DID content (did.jsonl). TTL-based eviction on read.
     pub did_cache: Arc<crate::cache::ContentCache>,
+    /// The records and domains resolution checks, cached. `None` (read the
+    /// store on every resolve) unless every change to them is made in this
+    /// process: only the daemon sets it. See [`crate::cache::GateCache`].
+    pub gate_cache: Option<Arc<crate::cache::GateCache>>,
     /// Parsed `server.trusted_proxy_cidrs` — peers inside this set
     /// have their `Forwarded` / `X-Forwarded-Host` headers honoured
     /// for request-host detection (multi-domain, T19/T21).
@@ -82,6 +86,11 @@ pub struct AppState {
     /// operations running at once could each pass their read-check against
     /// the same stale state. Mirrors the watcher's `sync_lock`.
     pub sync_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Control-plane documents already applied, keyed on `(issuer, id)`,
+    /// with this edge's `[replay]` bounds. Every sync document is signed by
+    /// the control plane, so its per-signer bound caps how fast the edge
+    /// can follow DID changes.
+    pub replay_cache: Arc<did_hosting_common::server::replay::ReplayCache>,
 }
 
 impl AppState {
@@ -96,17 +105,24 @@ impl AppState {
                 "server.trusted_proxy_cidrs contains unparseable entries; ignoring them"
             );
         }
+        let replay_cache = Arc::new(
+            did_hosting_common::server::replay::ReplayCache::with_config(config.replay.clone())?,
+        );
         Ok(Self {
             dids_ks: store.keyspace(KS_DIDS)?,
             store,
             config: Arc::new(config),
+            replay_cache,
             did_resolver: None,
             trust_tasks_verifier: None,
             secrets_resolver: None,
             identity: None,
             didcomm_service: Arc::new(OnceLock::new()),
             stats_collector: None,
-            did_cache: Arc::new(crate::cache::ContentCache::new(Duration::from_secs(300))),
+            did_cache: Arc::new(crate::cache::ContentCache::new(
+                crate::cache::RESOLUTION_CACHE_TTL,
+            )),
+            gate_cache: None,
             trusted_proxy_cidrs: Arc::new(parsed_cidrs),
             replication: Arc::new(crate::replication::ReplicationStatus::new(
                 did_hosting_common::server::auth::session::now_epoch(),
@@ -211,6 +227,14 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         &store,
     )
     .await;
+    // The control plane is authorised here by configuration, not by an ACL
+    // entry, so its did:scid floor is kept on that ground (VTI-KEY-162).
+    if let (Some(keeper), Some(control_did)) = (
+        identity.as_ref().and_then(|i| i.scid_floors.as_ref()),
+        config.control_did.as_deref(),
+    ) {
+        keeper.authorise(control_did);
+    }
     // Bind TCP before anything else: public resolution and the Trust Task
     // listener's HTTPS binding are served from it.
     let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -230,7 +254,9 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 
     // Initialize in-memory stats collector (starts at zero — no disk persistence)
     let stats_collector = {
-        let collector = stats::StatsCollector::new();
+        // An edge syncs only per-DID deltas, so it keeps no time-series
+        // buckets: nothing would ever drain them.
+        let collector = stats::StatsCollector::without_timeseries();
         let total_dids = storage_dids_ks
             .prefix_iter_raw("did:")
             .await
@@ -289,6 +315,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let mut storage_shutdown = storage_shutdown_rx.clone();
     let storage_collector = stats_collector.clone();
     let storage_stats_config = stats_config;
+    let storage_did_cache = state.did_cache.clone();
     let storage_handle = std::thread::Builder::new()
         .name("webvh-storage".into())
         .spawn(move || {
@@ -299,6 +326,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
                     auth_config: storage_auth_config,
                     collector: storage_collector,
                     stats_config: storage_stats_config,
+                    did_cache: storage_did_cache,
                 },
                 &mut storage_shutdown,
             )
@@ -748,7 +776,10 @@ fn run_rest_thread(
         // Public DID resolution and the Trust Task listener's HTTPS binding.
         // There is no management surface to switch on.
         info!("HTTP thread started (public DID serving + Trust Task listener)");
-        let base_router = routes::router(upload_body_limit);
+        let resolve_limit = Arc::new(
+            did_hosting_common::server::rate_limit::ResolveRateLimiter::new(&state.config.server),
+        );
+        let base_router = routes::router_with_resolve_limit(upload_body_limit, resolve_limit);
 
         // Cloned before `with_state` consumes `state`: the health route is
         // added below the router's state type has already collapsed to
@@ -811,6 +842,7 @@ struct StorageThreadParams {
     auth_config: AuthConfig,
     collector: Arc<stats::StatsCollector>,
     stats_config: crate::config::StatsConfig,
+    did_cache: Arc<crate::cache::ContentCache>,
 }
 
 fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Receiver<bool>) {
@@ -820,6 +852,7 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
         auth_config,
         collector,
         stats_config,
+        did_cache,
     } = params;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -836,23 +869,45 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
         let did_interval = Duration::from_secs(did_ttl_seconds.max(60));
         let mut did_timer = tokio::time::interval(did_interval);
 
+        // DIDs reach an edge by sync, which does not count them; the
+        // recount keeps the edge's figure in step.
+        let mut did_count_timer = tokio::time::interval(
+            did_hosting_common::server::stats_collector::DID_COUNT_RECONCILE_INTERVAL,
+        );
+
+        // Drop expired content cache entries each minute (they live
+        // `RESOLUTION_CACHE_TTL`), so DIDs nobody asks for again do not stay
+        // in memory.
+        let mut evict_timer = tokio::time::interval(Duration::from_secs(60));
+
         // First tick completes immediately; skip so cleanup doesn't run at startup
         did_timer.tick().await;
+        did_count_timer.tick().await;
+        evict_timer.tick().await;
 
         loop {
             tokio::select! {
                 _ = did_timer.tick() => {
-                    match cleanup_empty_dids(&dids_ks, did_ttl_seconds).await {
+                    // An edge writes DID records only from its control
+                    // plane's directives, which take no path lock.
+                    match cleanup_empty_dids(&dids_ks, did_ttl_seconds, None).await {
                         Ok(0) => {}
                         Ok(n) => {
                             info!(count = n, "cleaned up empty DID records");
-                            for _ in 0..n {
-                                collector.decrement_total_dids();
-                            }
+                            collector.subtract_total_dids(n);
                         }
                         Err(e) => warn!("DID cleanup error: {e}"),
                     }
                 }
+                _ = did_count_timer.tick() => {
+                    if let Err(e) = did_hosting_common::server::stats_collector::reconcile_total_dids(
+                        &collector,
+                        &dids_ks,
+                    ).await {
+                        warn!("DID count reconcile error: {e}");
+                    }
+                }
+                _ = evict_timer.tick() => did_cache.evict_expired(),
                 _ = shutdown_rx.changed() => {
                     info!("storage thread shutting down");
                     break;

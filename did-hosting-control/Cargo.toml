@@ -1,7 +1,7 @@
 [package]
 name = "did-hosting-control"
 description = "DID Hosting Control Plane — Unified management UI and service registry"
-version = "0.10.0"
+version = "0.11.0"
 edition.workspace = true
 authors.workspace = true
 readme = "README.md"
@@ -40,7 +40,7 @@ metrics = ["did-hosting-common/metrics"]
 method-webs = ["did-hosting-common/method-webs"]
 ui = ["dep:rust-embed", "dep:mime_guess"]
 keyring = ["did-hosting-common/keyring"]
-aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "dep:aws-smithy-types", "did-hosting-common/aws-secrets"]
+aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "did-hosting-common/aws-secrets"]
 gcp-secrets = [
   "dep:google-cloud-secretmanager-v1",
   "dep:google-cloud-auth",
@@ -63,8 +63,8 @@ store-redis = ["dep:redis", "did-hosting-common/store-redis"]
 # hand-assembling `AppState`. Enable via a `[dev-dependencies]` `features =
 # ["test-support"]` entry. Off by default — never compiled into a release.
 test-support = ["dep:tempfile"]
-store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "dep:aws-smithy-types", "did-hosting-common/store-dynamodb"]
-store-dynamodb-single = ["dep:aws-sdk-dynamodb", "dep:aws-config", "dep:aws-smithy-types", "did-hosting-common/store-dynamodb-single"]
+store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "did-hosting-common/store-dynamodb"]
+store-dynamodb-single = ["dep:aws-sdk-dynamodb", "dep:aws-config", "did-hosting-common/store-dynamodb-single"]
 store-firestore = ["dep:firestore", "dep:futures", "did-hosting-common/store-firestore"]
 store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures", "did-hosting-common/store-cosmosdb"]
 # NOTE: passkey/WebAuthn is always compiled into the control plane — it is
@@ -85,7 +85,7 @@ path = "src/main.rs"
 
 [dependencies]
 agent-names = { workspace = true }
-did-hosting-common = { version = "0.10", path = "../did-hosting-common", features = ["server-core", "passkey", "setup-wizard"] }
+did-hosting-common = { version = "0.11", path = "../did-hosting-common", features = ["server-core", "passkey", "setup-wizard"] }
 # vti-common consumed transitively via did-hosting-common, but
 # this crate also references `vti_common::auth::handlers::*` +
 # `AuthenticateInput` directly when dispatching to canonical
@@ -93,8 +93,13 @@ did-hosting-common = { version = "0.10", path = "../did-hosting-common", feature
 # declarations (did-hosting-common/-server, webvh-witness) and to
 # the workspace `vta-sdk = "0.38"` — see the lockstep note in
 # did-hosting-common/Cargo.toml.
-vti-common = { version = "0.41", default-features = false }
+vti-common = { version = "0.51", default-features = false }
 async-trait = "0.1"
+# Local `.mmdb` GeoIP reader (`crate::geoip`) — never a third-party call.
+maxminddb = { workspace = true }
+# `[[geoip.networks]]` ranges; the same crate and line `did-hosting-common`
+# parses `trusted_proxies` with.
+ipnetwork = "0.21"
 # Trust Tasks framework — used by routes/trust_tasks.rs (the
 # /api/trust-tasks endpoint introduced in v0.7.1).
 #
@@ -125,7 +130,7 @@ affinidi-tdk-common = { workspace = true }
 affinidi-messaging-didcomm = { workspace = true }
 affinidi-secrets-resolver = { workspace = true }
 tokio-util = { workspace = true }
-affinidi-did-resolver-cache-sdk = "0.8.38"
+affinidi-did-resolver-cache-sdk = "0.8.43"
 # Egress address-class guard for the registry URL validation (SSRF default-deny).
 affinidi-net-guard = "0.1"
 axum = "0.8"
@@ -137,7 +142,7 @@ fjall = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true }
 multibase = { workspace = true }
 rand = { workspace = true }
-bip39 = "2"
+bip39 = "3"
 reqwest = { workspace = true }
 url = { workspace = true }
 rust-embed = { workspace = true, optional = true }
@@ -155,24 +160,19 @@ tower-http = { version = "0.7", features = ["trace"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
-aws-sdk-secretsmanager = { version = "1", optional = true }
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 aws-config = { version = "1", features = [
   "behavior-version-latest",
 ], optional = true }
 
-# Not called from this crate — a resolver bound, explained in the workspace
-# manifest. Named here because a `[workspace.dependencies]` entry constrains
-# nothing on its own: only a crate that declares the dependency contributes its
-# version requirement, and this is a subtree that pulls `aws-config`.
-aws-smithy-types = { workspace = true, optional = true }
 google-cloud-secretmanager-v1 = { version = "1", optional = true }
 google-cloud-auth = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
 redis = { version = "1.0", features = ["tokio-comp", "aio"], optional = true }
-aws-sdk-dynamodb = { version = "1", optional = true }
-firestore = { version = "0.54", optional = true }
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+firestore = { version = "0.61", optional = true }
 futures = { version = "0.3", optional = true }
-azure_data_cosmos = { version = "0.38", features = [
+azure_data_cosmos = { version = "1", features = [
   "key_auth",
 ], optional = true }
 azure_core = { version = "1.0", optional = true }
@@ -205,9 +205,9 @@ openssl = "0.10"
 # graph on trust-tasks 0.17 puts a second copy of both in the dev graph. See the
 # dev-graph note beside `vta-sdk` in the workspace Cargo.toml.
 #
-# 0.20.0 is the line built on affinidi-tdk 0.24 / trust-tasks-rs 0.28, the same
+# 0.48.0 is the line built on affinidi-tdk 0.36 / trust-tasks-rs 0.36, the same
 # the root manifest now pins.
-affinidi-messaging-test-mediator = "0.20.0"
+affinidi-messaging-test-mediator = "0.48.0"
 # Self-dependency with `test-support` on, so this crate's own integration
 # tests compile the `test_support` module (and get `tempfile`) exactly as a
 # downstream consumer would via `features = ["test-support"]`.

@@ -80,9 +80,11 @@ pub async fn trust_tasks_endpoint(
             "no connection address for this request".into(),
         ));
     };
-    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
-    let ip =
-        crate::rate_limit::resolve_client_ip(addr.ip(), xff, &state.config.server.trusted_proxies);
+    let ip = crate::rate_limit::resolve_client_ip(
+        addr.ip(),
+        &headers,
+        &state.config.server.trusted_proxies,
+    );
     let client_ip = Some(ip);
     if is_redeem_start(&body) {
         let limited = state.redeem_rate_limiter.try_consume(
@@ -120,7 +122,7 @@ fn is_redeem_start(body: &[u8]) -> bool {
     use trust_tasks_rs::Payload;
     serde_json::from_slice::<TrustTask<Value>>(body).is_ok_and(|doc| {
         doc.type_uri.to_string()
-            == trust_tasks_rs::specs::auth::passkey::enroll::redeem::start::v0_1::Payload::TYPE_URI
+            == did_hosting_common::tasks::auth::passkey::enroll::redeem::start::v0_1::Payload::TYPE_URI
     })
 }
 
@@ -228,7 +230,7 @@ pub async fn dispatch_trust_task(
     //     the session's DID. Always accepted. It is what a wallet signs an
     //     approval or a refresh with, even in a session that has a key bound.
     //
-    // (b) The session key bound at login (`auth/authenticate/0.2`
+    // (b) The session key bound at login (`auth/authenticate/0.3`
     //     `sessionKey`, or a passkey login's browser key): exactly
     //     `did:key:{pk}#{pk}`, and only for a task a session key may sign
     //     (`session_key_may_sign`). Never an approval, and never the auth
@@ -244,9 +246,12 @@ pub async fn dispatch_trust_task(
         .filter(|_| crate::messaging::session_key_may_sign(&doc.type_uri.to_string()))
         .map(|pk| format!("did:key:{pk}#{pk}"));
     if let (Some(auth), Some(proof)) = (auth.as_ref(), doc.proof.as_ref()) {
-        let own_key = did_hosting_common::server::trust_tasks::verifier::controller_did(
-            &proof.verification_method,
-        ) == auth.did;
+        let own_key = did_hosting_common::scid::same_reference(
+            did_hosting_common::server::trust_tasks::verifier::controller_did(
+                &proof.verification_method,
+            ),
+            &auth.did,
+        );
         let session_key = session_key_vm.as_deref() == Some(proof.verification_method.as_str());
         if !own_key && !session_key {
             tracing::warn!(
@@ -326,12 +331,21 @@ pub async fn dispatch_trust_task(
             // line, before ever reading the body, that its login or refresh
             // succeeded. Map it through the same table `into_response` uses.
             let status = document_status(&value);
-            Ok((
+            // Only a refusal carries a retry hint; a success payload's own
+            // field of that name is not one.
+            let retry_after = (!status.is_success())
+                .then(|| value["payload"]["retryAfter"].as_str())
+                .flatten()
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.with_timezone(&chrono::Utc));
+            let mut response = (
                 status,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
                 serde_json::to_vec(&value).expect("Trust Task response serialises"),
             )
-                .into_response())
+                .into_response();
+            set_retry_after(&mut response, retry_after);
+            Ok(response)
         }
         crate::messaging::RoutedReply::Suppressed => Ok(StatusCode::NO_CONTENT.into_response()),
         crate::messaging::RoutedReply::Sealed(sealed) => Ok(sealed_response(sealed)),
@@ -419,12 +433,14 @@ fn into_response(outcome: DispatchOutcome) -> Response {
             });
             let body =
                 serde_json::to_vec(&err_doc).expect("error document serialises (trust-task-error)");
-            (
+            let mut response = (
                 status,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
                 body,
             )
-                .into_response()
+                .into_response();
+            set_retry_after(&mut response, err_doc.payload.retry_after);
+            response
         }
         DispatchOutcome::Suppressed => {
             // SPEC.md §8.1: identity-mismatch with no transport
@@ -438,6 +454,20 @@ fn into_response(outcome: DispatchOutcome) -> Response {
             StatusCode::NO_CONTENT.into_response()
         }
     }
+}
+
+/// A refusal carrying `retryAfter` says what an HTTP client reads from
+/// `Retry-After`: give it both. Rounded up, since a hint rounded down invites
+/// a retry too soon.
+fn set_retry_after(response: &mut Response, at: Option<chrono::DateTime<chrono::Utc>>) {
+    let Some(at) = at else {
+        return;
+    };
+    let millis = (at - chrono::Utc::now()).num_milliseconds().max(0) as u64;
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(millis.div_ceil(1000).max(1)),
+    );
 }
 
 /// The status for a bare serialised reply document from
@@ -478,7 +508,8 @@ mod tests {
     //! tested exhaustively in
     //! `did_hosting_common::server::trust_tasks::handlers::*`.
 
-    use trust_tasks_rs::{Payload, specs::acl::grant::v0_1 as grant};
+    use did_hosting_common::tasks::acl::grant::v0_2 as grant;
+    use trust_tasks_rs::Payload;
 
     /// Unit test of [`body_parse_error`] — pins the wire shape clients
     /// depend on (code, type URI, unrouted issuer/recipient).
@@ -521,11 +552,9 @@ mod tests {
                 "entry": {
                     "subject": "did:web:alice.example",
                     "role": "owner",
-                    "ext": {
-                        "vnd.affinidi.webvh": {
-                            "domains": { "kind": "all" }
-                        }
-                    }
+                    "act": { "scope": "all" },
+                    "keys": { "scope": "none" },
+                    "capabilities": { "scope": "ceiling" }
                 }
             }
         });

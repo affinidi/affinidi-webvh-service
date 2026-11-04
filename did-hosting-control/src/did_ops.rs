@@ -16,13 +16,13 @@ use did_hosting_common::server::identity::mnemonic_from_did;
 use did_hosting_common::server::mnemonic::{
     validate_agent_name, validate_agent_name_binding, validate_custom_path, validate_mnemonic,
 };
-use did_hosting_common::{CheckNameResponse, DidListEntry, RequestUriResponse};
+use did_hosting_common::{CheckNameResponse, DidListEntry};
 use rand::random_range;
 use tracing::{debug, info, warn};
 
 use crate::auth::AuthClaims;
 use crate::error::AppError;
-use crate::server::AppState;
+use crate::server::{AppState, CacheChange};
 use crate::store::KeyspaceHandle;
 
 /// Run the T20 safety check before any storage write on an inbound
@@ -34,19 +34,19 @@ use crate::store::KeyspaceHandle;
 /// permissive when the `domains` keyspace is empty (legacy / test
 /// state) and strict otherwise.
 ///
-/// Evict `mnemonic`'s resolved-content cache entry, if this process also
-/// serves resolution from the same store (the unified daemon).
+/// Evict what resolution cached about `mnemonic` (its log, witness file
+/// and record), if this process also serves resolution from the same store
+/// (the unified daemon).
 ///
 /// Call this after every commit that changes or removes `content_log_key`,
-/// or the record's `disabled`/`deleted_at` state — register, publish,
-/// disable, rollback, delete. A no-op for a standalone control plane; see
-/// `AppState::cache_invalidate`'s doc.
+/// `content_witness_key`, or the record's `disabled`/`deleted_at`/`did_id`
+/// — create (replacing a slot), register, publish, agent-name set/remove,
+/// witness publish, disable, rollback, delete. A
+/// no-op for a standalone control plane; see `AppState::cache_invalidate`'s
+/// doc.
 fn invalidate_cached_content(state: &AppState, mnemonic: &str) {
     if let Some(invalidate) = &state.cache_invalidate {
-        invalidate(&content_log_key(mnemonic));
-        // The witness file is served from the same cache, keyed the same
-        // way — `webvh/witness/publish` and rollback both change it.
-        invalidate(&content_witness_key(mnemonic));
+        invalidate(CacheChange::Did(mnemonic));
     }
 }
 
@@ -264,33 +264,33 @@ async fn check_total_size_limit(
 
 /// Resolve a custom path during create, applying force-replace semantics.
 ///
-/// If the path is free, returns it unchanged. If taken and `force` is false,
+/// The caller must hold `state.path_locks.guard(custom_path)`, so the slot
+/// read here is still the slot when the caller commits.
+///
+/// If the path is free, returns `None`. If taken and `force` is false,
 /// returns `Conflict(conflict_msg)`. If taken and `force` is true, the caller
-/// must be an admin or the current owner of that path; the existing log
-/// content, witness, and owner-index are removed so the slot can be
-/// reused. Stats are left intact (separate keyspace).
+/// must be an admin or the current owner of that path, and the existing
+/// record is returned: the caller removes its log content, witness and (for
+/// another owner) owner-index **in the same batch** that writes the new
+/// record. Committed separately, a failure or crash in between left the
+/// slot's old record pointing at content that was already gone. Stats are
+/// left intact (separate keyspace).
 async fn resolve_path_for_create(
     state: &AppState,
     custom_path: &str,
     auth: &AuthClaims,
     force: bool,
     conflict_msg: &str,
-) -> Result<String, AppError> {
+) -> Result<Option<DidRecord>, AppError> {
     use crate::acl::Role;
 
-    if is_path_available(&state.dids_ks, custom_path).await? {
-        return Ok(custom_path.to_string());
-    }
+    let Some(existing) = state.dids_ks.get::<DidRecord>(did_key(custom_path)).await? else {
+        return Ok(None);
+    };
 
     if !force {
         return Err(AppError::Conflict(conflict_msg.to_string()));
     }
-
-    let existing: DidRecord = state
-        .dids_ks
-        .get(did_key(custom_path))
-        .await?
-        .ok_or_else(|| AppError::Internal("path conflict but record missing".into()))?;
 
     if existing.owner != auth.did && auth.role != Role::Admin {
         warn!(
@@ -304,22 +304,7 @@ async fn resolve_path_for_create(
         ));
     }
 
-    let mut batch = state.store.batch();
-    batch.remove(&state.dids_ks, content_log_key(custom_path));
-    batch.remove(&state.dids_ks, content_witness_key(custom_path));
-    if existing.owner != auth.did {
-        batch.remove(&state.dids_ks, owner_key(&existing.owner, custom_path));
-    }
-    batch.commit().await?;
-
-    info!(
-        caller = %auth.did,
-        prev_owner = %existing.owner,
-        mnemonic = %custom_path,
-        "force-replacing existing DID"
-    );
-
-    Ok(custom_path.to_string())
+    Ok(Some(existing))
 }
 
 // ---------------------------------------------------------------------------
@@ -343,32 +328,49 @@ pub async fn create_did(
     path: Option<&str>,
     force: bool,
     domain: Option<&str>,
-) -> Result<RequestUriResponse, AppError> {
+) -> Result<DidRecord, AppError> {
     use crate::acl::Role;
     use crate::auth::session::now_epoch;
 
-    let mnemonic = match path {
-        Some(custom_path) if custom_path == ".well-known" => {
-            if auth.role != Role::Admin {
-                return Err(AppError::Forbidden(
-                    "only admins can create the root DID".into(),
-                ));
-            }
-            resolve_path_for_create(
-                state,
-                custom_path,
-                auth,
-                force,
-                "root DID (.well-known) already exists",
-            )
-            .await?
-        }
+    // Every branch returns holding the slot's per-path write lock — the same
+    // one `register_did_atomic` and `publish_did` take — so the availability
+    // check (or the force-replace read) and the commit below are one step.
+    // Without it, two creates of one free path both saw it free and both
+    // committed: the later silently replaced the earlier caller's slot and
+    // left the earlier owner's index entry pointing at a DID it no longer
+    // owned.
+    let (mnemonic, _path_guard, replaced) = match path {
         Some(custom_path) => {
-            validate_custom_path(custom_path)?;
-            let conflict_msg = format!("path '{custom_path}' is already taken");
-            resolve_path_for_create(state, custom_path, auth, force, &conflict_msg).await?
+            let conflict_msg = if custom_path == ".well-known" {
+                if auth.role != Role::Admin {
+                    return Err(AppError::Forbidden(
+                        "only admins can create the root DID".into(),
+                    ));
+                }
+                "root DID (.well-known) already exists".to_string()
+            } else {
+                validate_custom_path(custom_path)?;
+                format!("path '{custom_path}' is already taken")
+            };
+            let guard = state.path_locks.guard(custom_path).await;
+            let replaced =
+                resolve_path_for_create(state, custom_path, auth, force, &conflict_msg).await?;
+            (custom_path.to_string(), guard, replaced)
         }
-        None => generate_unique_mnemonic(&state.dids_ks).await?,
+        None => {
+            let mut claimed = None;
+            for _ in 0..8 {
+                let candidate = generate_unique_mnemonic(&state.dids_ks).await?;
+                let guard = state.path_locks.guard(&candidate).await;
+                // Re-checked under the lock: another create may have taken
+                // the random name between generation and locking.
+                if is_path_available(&state.dids_ks, &candidate).await? {
+                    claimed = Some((candidate, guard, None));
+                    break;
+                }
+            }
+            claimed.ok_or_else(|| AppError::Internal("failed to claim a unique mnemonic".into()))?
+        }
     };
 
     let now = now_epoch();
@@ -401,15 +403,23 @@ pub async fn create_did(
     // Per-account DID-count quota (SEC-4045 W3). Only a slot this owner does not
     // already hold counts against the cap — a force-replace of the caller's own
     // slot is not a net-new DID, so it must not be refused at the cap.
-    let adds_slot = match state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
-        Some(existing) => existing.owner != auth.did,
-        None => true,
-    };
+    let adds_slot = replaced
+        .as_ref()
+        .is_none_or(|existing| existing.owner != auth.did);
     if adds_slot {
         check_did_count_limit(auth, state).await?;
     }
 
+    // The force-replace's removal of the old slot's content and the new
+    // record are one atomic write.
     let mut batch = state.store.batch();
+    if let Some(existing) = replaced.as_ref() {
+        batch.remove(&state.dids_ks, content_log_key(&mnemonic));
+        batch.remove(&state.dids_ks, content_witness_key(&mnemonic));
+        if existing.owner != auth.did {
+            batch.remove(&state.dids_ks, owner_key(&existing.owner, &mnemonic));
+        }
+    }
     batch.insert(&state.dids_ks, did_key(&mnemonic), &record)?;
     batch.insert_raw(
         &state.dids_ks,
@@ -417,19 +427,23 @@ pub async fn create_did(
         mnemonic.as_bytes().to_vec(),
     );
     batch.commit().await?;
-
-    // Build the DID URL using the did_hosting_url if configured, else public_url
-    let base_url = state
-        .config
-        .did_hosting_url
-        .as_deref()
-        .or(state.config.public_url.as_deref())
-        .unwrap_or("http://localhost");
-    let did_url = format!("{base_url}/{mnemonic}/did.jsonl");
+    if replaced.is_none() {
+        state.stats_collector.increment_total_dids();
+    }
+    if let Some(existing) = replaced.as_ref() {
+        invalidate_cached_content(state, &mnemonic);
+        info!(
+            caller = %auth.did,
+            prev_owner = %existing.owner,
+            mnemonic = %mnemonic,
+            "force-replaced existing DID"
+        );
+    }
 
     info!(did = %auth.did, mnemonic = %mnemonic, "DID URI created on control plane");
 
-    Ok(RequestUriResponse { mnemonic, did_url })
+    // The record as written, so the caller need not read it back.
+    Ok(record)
 }
 
 /// Atomic claim-and-publish for a DID at a known path.
@@ -467,7 +481,7 @@ pub async fn register_did_atomic(
     did_log: &str,
     force: bool,
     domain: Option<&str>,
-) -> Result<RequestUriResponse, AppError> {
+) -> Result<DidRecord, AppError> {
     use crate::acl::Role;
     use crate::auth::session::now_epoch;
 
@@ -693,6 +707,7 @@ pub async fn register_did_atomic(
     // submitted document may claim.
     let reg_domain =
         did_hosting_common::server::domain::extract_did_host(&did_id).unwrap_or_default();
+    check_agent_name_count(state, publication.agent_names(&reg_domain).len())?;
     let (claimed, released) = reconcile_agent_names(
         state,
         &mut new_record,
@@ -739,13 +754,14 @@ pub async fn register_did_atomic(
     }
     batch.commit().await?;
     invalidate_cached_content(state, path);
+    if existing.is_none() {
+        state.stats_collector.increment_total_dids();
+    }
 
     // Same rationale as `publish_did`: the atomic register path commits
     // a new log entry, so it must advance the update counters when the
     // control plane is authoritative for stats.
     state.stats_collector.record_update(path);
-
-    let did_url = format!("{}/{path}/did.jsonl", server_base_url.trim_end_matches('/'));
 
     info!(
         did = %auth.did,
@@ -755,10 +771,10 @@ pub async fn register_did_atomic(
         "DID atomically registered on control plane"
     );
 
-    Ok(RequestUriResponse {
-        mnemonic: path.to_string(),
-        did_url,
-    })
+    // The record as written. Answer from it rather than reading it back: on an
+    // eventually consistent store that read can miss the write, and the caller
+    // would be told a stored DID failed.
+    Ok(new_record)
 }
 
 /// Shared front-half of a new-version publish: authorize the caller, verify
@@ -917,7 +933,48 @@ async fn prepare_republish(
             .unwrap_or_default()
     };
 
+    check_agent_name_count(state, publication.agent_names(&domain).len())?;
+
     Ok((record, domain, publication))
+}
+
+/// Refuse a document that claims more agent names than every write its
+/// publication causes can carry in one atomic batch.
+///
+/// Publishing writes an index row per claimed name, and an edge it is synced to
+/// writes the record, log, owner, witness and high-water rows alongside them,
+/// all in one batch that must stay atomic. A backend with a batch ceiling
+/// (DynamoDB single table: 100) cannot take a document with more names than
+/// [`did_hosting_common::server::store::BatchLimits::max_agent_names`]
+/// allows: it could be registered here and then never synced, an edge refusing it
+/// on every attempt. Refuse it up front, where the publisher can act on it. A
+/// backend without a ceiling has no cap.
+fn check_agent_name_count(state: &AppState, claimed: usize) -> Result<(), AppError> {
+    match state.store.max_agent_names() {
+        Some(max) if claimed > max => Err(AppError::Validation(format!(
+            "the document claims {claimed} agent names; this store holds at most {max} per DID"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Refuse a registry that holds more agent names than one atomic batch can
+/// carry.
+///
+/// [`check_agent_name_count`] bounds what a document claims, but the registry
+/// also holds parked names the document does not, and an `activate` leaves the
+/// DID's other names enabled. Publishing or purging a DID rewrites or removes an
+/// index row for every entry, so the whole registry must stay within the same
+/// bound or a later publish (or the purge of its domain) is refused by the
+/// backend. Check the registry as it will be after the change.
+fn check_agent_name_registry(state: &AppState, held: usize) -> Result<(), AppError> {
+    match state.store.max_agent_names() {
+        Some(max) if held > max => Err(AppError::Validation(format!(
+            "this DID would hold {held} agent names, including parked ones; \
+             this store holds at most {max} per DID. Remove a name first"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Publish (upload) a did.jsonl log for an existing DID slot.
@@ -1112,6 +1169,7 @@ pub async fn publish_did(
         now,
     )
     .await?;
+    check_agent_name_registry(state, record.agent_names.len())?;
 
     let mut batch = state.store.batch();
     batch.insert_raw(
@@ -1329,6 +1387,7 @@ async fn apply_agent_name_op(
                 return Err(AgentNameError::Taken.into());
             }
             upsert_agent_name(&mut record.agent_names, &name, now_epoch());
+            check_agent_name_registry(state, record.agent_names.len())?;
             IndexWrite::Insert
         }
         AgentNameOp::Park => {
@@ -1373,6 +1432,7 @@ async fn apply_agent_name_op(
         IndexWrite::Keep => {}
     }
     batch.commit().await?;
+    invalidate_cached_content(state, mnemonic);
 
     state.stats_collector.record_update(mnemonic);
 
@@ -1694,14 +1754,16 @@ async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> 
 }
 
 /// One page of the slots a caller may see, with each slot's lifetime resolve
-/// count, and the size of the whole (unpaged) set.
+/// count, and whether more slots follow it.
 ///
 /// The scoping rule is [`list_dids`]'s: an admin sees every slot, or one
 /// owner's when `requested_owner` names one; anyone else sees their own.
 /// Refusing a non-admin who names another owner is the caller's job — this
 /// never widens a non-admin's view, whatever it is passed. `domain` (already
-/// canonical) keeps only slots hosted under it. Ordered by mnemonic so paging
-/// is stable.
+/// canonical) keeps only slots hosted under it. Ordered by mnemonic, and the
+/// page starts strictly after `after` (the last mnemonic of the previous
+/// page), so paging is stable under concurrent writes: a slot added or removed
+/// between pages is seen or not, but no present slot is repeated or skipped.
 ///
 /// `replica` is set when the caller is a hosting server this control plane
 /// drives, reconciling against the full listing (see
@@ -1714,8 +1776,8 @@ pub async fn list_dids_page(
     requested_owner: Option<&str>,
     domain: Option<&str>,
     limit: Option<usize>,
-    offset: Option<usize>,
-) -> Result<(Vec<(DidRecord, u64)>, u64), AppError> {
+    after: Option<&str>,
+) -> Result<(Vec<(DidRecord, u64)>, bool), AppError> {
     use crate::acl::Role;
 
     const MAX_LIST_LIMIT: usize = 1000;
@@ -1765,11 +1827,14 @@ pub async fn list_dids_page(
     }
     records.sort_by(|a, b| a.mnemonic.cmp(&b.mnemonic));
 
-    let total = records.len() as u64;
-    let offset = offset.unwrap_or(0);
-    let limit = limit.unwrap_or(MAX_LIST_LIMIT).min(MAX_LIST_LIMIT);
+    let total = records.len();
+    let limit = limit.unwrap_or(MAX_LIST_LIMIT).clamp(1, MAX_LIST_LIMIT);
+    if let Some(after) = after {
+        records.retain(|r| r.mnemonic.as_str() > after);
+    }
+    let has_more = records.len() > limit;
     let mut page = Vec::with_capacity(limit.min(records.len()));
-    for record in records.into_iter().skip(offset).take(limit) {
+    for record in records.into_iter().take(limit) {
         let stats: did_hosting_common::DidStats = state
             .stats_ks
             .get(format!("stats:{}", record.mnemonic))
@@ -1777,8 +1842,8 @@ pub async fn list_dids_page(
             .unwrap_or_default();
         page.push((record, stats.total_resolves));
     }
-    info!(did = %auth.did, total, returned = page.len(), "DID page listed on control plane");
-    Ok((page, total))
+    info!(did = %auth.did, total, returned = page.len(), has_more, "DID page listed on control plane");
+    Ok((page, has_more))
 }
 
 /// Cross-check a caller's explicit domain against the slot's own domain.
@@ -1822,6 +1887,10 @@ pub async fn delete_did(
     request_domain: Option<&str>,
 ) -> Result<Option<String>, AppError> {
     validate_mnemonic(mnemonic)?;
+    // The per-path write lock, held from the read through the commit: the
+    // record is re-read under it, so the owner-index entry removed is the
+    // current owner's even if a transfer committed just before.
+    let _path_guard = state.path_locks.guard(mnemonic).await;
     let record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
     let did_id = record.did_id.clone();
@@ -1843,6 +1912,7 @@ pub async fn delete_did(
     batch.remove(&state.dids_ks, owner_key(&record.owner, mnemonic));
     batch.commit().await?;
     invalidate_cached_content(state, mnemonic);
+    state.stats_collector.decrement_total_dids();
 
     info!(did = %auth.did, mnemonic = %mnemonic, "DID deleted on control plane");
 
@@ -1936,8 +2006,12 @@ pub async fn set_did_disabled(
     state: &AppState,
     mnemonic: &str,
     disabled: bool,
-) -> Result<(), AppError> {
+) -> Result<DidRecord, AppError> {
     validate_mnemonic(mnemonic)?;
+    // This writes the whole record back, so it must be read under the same
+    // per-path lock every other record writer holds — otherwise a publish
+    // committing in between is silently reverted to the stale copy.
+    let _path_guard = state.path_locks.guard(mnemonic).await;
     let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
     // Re-check DomainScope at time-of-use (SEC-4045 W7).
     if let Some(did_id) = record.did_id.as_deref() {
@@ -1952,7 +2026,8 @@ pub async fn set_did_disabled(
         disabled,
         "DID disabled state updated on control plane"
     );
-    Ok(())
+    // The record as written, so the caller need not read it back.
+    Ok(record)
 }
 
 /// Roll back (remove) the last log entry from a DID's JSONL content.
@@ -1978,6 +2053,10 @@ pub async fn rollback_did_to(
     use crate::auth::session::now_epoch;
 
     validate_mnemonic(mnemonic)?;
+    // Held from the record and log reads through the commit: a publish
+    // landing in between would otherwise be overwritten by a truncation of
+    // the log as it stood before it.
+    let _path_guard = state.path_locks.guard(mnemonic).await;
     let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
     // Re-check DomainScope at time-of-use (SEC-4045 W7).
@@ -2335,13 +2414,9 @@ pub async fn resolve_agent_names(
         let Some(mnemonic) = mnemonic_from_did(did) else {
             continue;
         };
-        let Some(record) = state
-            .dids_ks
-            .get::<DidRecord>(did_key(&mnemonic))
-            .await
-            .ok()
-            .flatten()
-        else {
+        // A failed read is reported, not taken for "no names": a throttled
+        // store would otherwise answer success with the names missing.
+        let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? else {
             continue;
         };
         // The slot must hold *this* DID. `mnemonic_from_did` yields the slot a
@@ -2377,6 +2452,7 @@ pub async fn resolve_agent_names(
 #[cfg(test)]
 mod tests_atomic {
     use super::*;
+    use did_hosting_common::server::store::bounded_memory::BoundedMemory;
     use did_hosting_common::server::store::{
         KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
     };
@@ -2449,6 +2525,7 @@ mod tests_atomic {
                 key_agreement_multibase: None,
                 mediator_endpoint: didcomm.then_some(MED),
                 tsp_endpoint: tsp.then_some(MED),
+                omit_scid_alias: false,
             },
         );
         let (_scid, jsonl) = create_log_entry(&doc, &signing)
@@ -2468,12 +2545,20 @@ mod tests_atomic {
     }
 
     async fn test_state() -> (AppState, tempfile::TempDir) {
+        test_state_on(None).await
+    }
+
+    /// [`test_state`] over `store` when given, else a fresh fjall one.
+    async fn test_state_on(store: Option<Store>) -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("temp dir");
         let store_config = StoreConfig {
             data_dir: PathBuf::from(dir.path()),
             ..StoreConfig::default()
         };
-        let store = Store::open(&store_config).await.expect("open store");
+        let store = match store {
+            Some(store) => store,
+            None => Store::open(&store_config).await.expect("open store"),
+        };
         let sessions_ks = store.keyspace(KS_SESSIONS).expect("sessions ks");
         let acl_ks = store.keyspace(KS_ACL).expect("acl ks");
         let registry_ks = store.keyspace(KS_REGISTRY).expect("registry ks");
@@ -2497,6 +2582,8 @@ mod tests_atomic {
             trust_tasks: Default::default(),
             hosting: Default::default(),
             identity: Default::default(),
+            replay: Default::default(),
+            geoip: Default::default(),
             config_path: PathBuf::new(),
         };
 
@@ -2558,6 +2645,51 @@ mod tests_atomic {
         }
     }
 
+    /// Reserve, register and set-state return the record they committed, so a caller
+    /// can answer from it rather than read it back: on an eventually consistent
+    /// store that read can miss a write that succeeded.
+    #[tokio::test]
+    async fn writers_return_the_record_they_committed() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "alpha";
+        let did_log = build_test_did_log("scid-alpha", "control.test", path).await;
+        let stored = |state: &AppState| {
+            let ks = state.dids_ks.clone();
+            async move {
+                let record: DidRecord = ks.get(did_key(path)).await.unwrap().expect("record");
+                serde_json::to_value(record).unwrap()
+            }
+        };
+
+        // Reserve, then register, as the VTA does.
+        let reserved = create_did(&owner_auth(owner), &state, Some(path), false, None)
+            .await
+            .expect("reserve");
+        assert_eq!(
+            serde_json::to_value(&reserved).unwrap(),
+            stored(&state).await
+        );
+
+        let registered =
+            register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
+                .await
+                .expect("register");
+        assert_eq!(
+            serde_json::to_value(&registered).unwrap(),
+            stored(&state).await
+        );
+
+        let disabled = set_did_disabled(&owner_auth(owner), &state, path, true)
+            .await
+            .expect("disable");
+        assert!(disabled.disabled);
+        assert_eq!(
+            serde_json::to_value(&disabled).unwrap(),
+            stored(&state).await
+        );
+    }
+
     /// Fresh slot, well-formed did.jsonl, caller becomes owner.
     #[tokio::test]
     async fn fresh_slot_succeeds_and_writes_atomically() {
@@ -2570,7 +2702,6 @@ mod tests_atomic {
             .await
             .expect("fresh-slot register should succeed");
         assert_eq!(result.mnemonic, path);
-        assert_eq!(result.did_url, "http://control.test/alpha/did.jsonl");
 
         // Record + log + owner-index all present after the single batch commit.
         let record: DidRecord = state
@@ -2614,67 +2745,215 @@ mod tests_atomic {
         let (mut state, _dir) = test_state().await;
         let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = calls.clone();
-        state.cache_invalidate = Some(Arc::new(move |key: &str| {
-            recorded.lock().unwrap().push(key.to_string());
+        state.cache_invalidate = Some(Arc::new(move |change: CacheChange<'_>| {
+            recorded.lock().unwrap().push(format!("{change:?}"));
         }));
 
         let owner = "did:example:owner";
         let path = "cache-hook";
         let did_log = build_test_did_log("scid-cache-hook", "control.test", path).await;
-        let expected_log_key = content_log_key(path);
-        let expected_witness_key = content_witness_key(path);
-        // Every mutation invalidates both the log and the witness cache
-        // entries — the same `serve_content` serves each, keyed the same
-        // way.
-        let count_of = |calls: &[String], key: &str| calls.iter().filter(|k| *k == key).count();
-
-        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
-            .await
-            .expect("register");
-        {
-            let calls = calls.lock().unwrap();
-            assert_eq!(count_of(&calls, &expected_log_key), 1, "register: log key");
-            assert_eq!(
-                count_of(&calls, &expected_witness_key),
-                1,
-                "register: witness key"
-            );
-        }
-
-        publish_did(&owner_auth(owner), &state, path, &did_log, None)
-            .await
-            .expect("publish");
-        assert_eq!(
-            count_of(&calls.lock().unwrap(), &expected_log_key),
-            2,
-            "publish must invalidate too"
-        );
-
-        set_did_disabled(&owner_auth(owner), &state, path, true)
-            .await
-            .expect("disable");
-        assert_eq!(
-            count_of(&calls.lock().unwrap(), &expected_log_key),
-            3,
-            "disable must invalidate too"
-        );
-
-        delete_did(&owner_auth(owner), &state, path, None)
-            .await
-            .expect("delete");
-        assert_eq!(
-            count_of(&calls.lock().unwrap(), &expected_log_key),
-            4,
-            "delete must invalidate too"
-        );
-        assert!(
+        let expected = format!("{:?}", CacheChange::Did(path));
+        let count = |calls: &std::sync::Mutex<Vec<String>>| {
             calls
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|k| *k == expected_log_key || *k == expected_witness_key),
-            "every call must invalidate this mnemonic's own content keys"
+                .filter(|c| **c == expected)
+                .count()
+        };
+
+        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
+            .await
+            .expect("register");
+        assert_eq!(count(&calls), 1, "register must invalidate");
+
+        publish_did(&owner_auth(owner), &state, path, &did_log, None)
+            .await
+            .expect("publish");
+        assert_eq!(count(&calls), 2, "publish must invalidate too");
+
+        set_did_disabled(&owner_auth(owner), &state, path, true)
+            .await
+            .expect("disable");
+        assert_eq!(count(&calls), 3, "disable must invalidate too");
+
+        delete_did(&owner_auth(owner), &state, path, None)
+            .await
+            .expect("delete");
+        assert_eq!(count(&calls), 4, "delete must invalidate too");
+        assert!(
+            calls.lock().unwrap().iter().all(|c| *c == expected),
+            "every call must name this mnemonic"
         );
+    }
+
+    /// Two creates of one free path must not both succeed: the check that
+    /// the path is free and the write are one step under the per-path lock.
+    /// Unlocked, every racer saw the path free, each overwrote the last, and
+    /// the losers' owner-index entries were left pointing at a slot they no
+    /// longer owned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_creates_of_one_path_admit_exactly_one() {
+        let (state, _dir) = test_state().await;
+        let state = Arc::new(state);
+        const RACERS: usize = 16;
+        let mut handles = Vec::new();
+        for i in 0..RACERS {
+            let state = state.clone();
+            handles.push(tokio::spawn(async move {
+                let owner = format!("did:example:racer-{i}");
+                create_did(&owner_auth(&owner), &state, Some("contested"), false, None).await
+            }));
+        }
+        let mut created = 0;
+        for h in handles {
+            match h.await.unwrap() {
+                Ok(_) => created += 1,
+                Err(AppError::Conflict(_)) => {}
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert_eq!(created, 1, "exactly one create may claim the path");
+        let owner_entries = state
+            .dids_ks
+            .prefix_iter_raw(b"owner:".to_vec())
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|(k, _)| k.ends_with(b":contested"))
+            .count();
+        assert_eq!(owner_entries, 1, "no orphaned owner-index entries");
+    }
+
+    /// A force-replace commits the old slot's removal and the new record
+    /// in one write: after it, the slot has the new owner, no old content,
+    /// and only the new owner's index entry.
+    #[tokio::test]
+    async fn force_replace_is_a_single_write() {
+        let (state, _dir) = test_state().await;
+        let path = "replaced";
+        let log = build_test_did_log("scid-replaced", "control.test", path).await;
+        register_did_atomic(
+            &owner_auth("did:example:old"),
+            &state,
+            path,
+            &log,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        create_did(
+            &admin_auth("did:example:admin"),
+            &state,
+            Some(path),
+            true,
+            None,
+        )
+        .await
+        .expect("admin force-replace");
+
+        let record: DidRecord = state.dids_ks.get(did_key(path)).await.unwrap().unwrap();
+        assert_eq!(record.owner, "did:example:admin");
+        assert_eq!(record.version_count, 0);
+        assert!(
+            state
+                .dids_ks
+                .get_raw(content_log_key(path))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .dids_ks
+                .get_raw(owner_key("did:example:old", path))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .dids_ks
+                .get_raw(owner_key("did:example:admin", path))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// `set_did_disabled` writes the whole record back, so it must read it
+    /// under the per-path lock. Here a publish-like writer holds the lock,
+    /// has read the record, and commits a new version after the disable
+    /// request arrives: the disable must apply on top of that version, not
+    /// revert it — and the publish must not revert the disable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn set_did_disabled_never_writes_back_a_stale_record() {
+        let (state, _dir) = test_state().await;
+        let state = Arc::new(state);
+        let owner = "did:example:owner";
+        let path = "stale-disable";
+        create_did(&owner_auth(owner), &state, Some(path), false, None)
+            .await
+            .unwrap();
+
+        let guard = state.path_locks.guard(path).await;
+        let mut read: DidRecord = state.dids_ks.get(did_key(path)).await.unwrap().unwrap();
+        let disabler = {
+            let state = state.clone();
+            tokio::spawn(
+                async move { set_did_disabled(&owner_auth(owner), &state, path, true).await },
+            )
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        read.version_count = 7;
+        state.dids_ks.insert(did_key(path), &read).await.unwrap();
+        drop(guard);
+        disabler.await.unwrap().unwrap();
+
+        let record: DidRecord = state.dids_ks.get(did_key(path)).await.unwrap().unwrap();
+        assert!(record.disabled, "the disable was lost");
+        assert_eq!(
+            record.version_count, 7,
+            "the concurrent publish was reverted"
+        );
+    }
+
+    /// `delete_did` and `rollback_did_to` wait for the per-path lock before
+    /// reading the record they act on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_and_rollback_wait_for_the_path_lock() {
+        let (state, _dir) = test_state().await;
+        let state = Arc::new(state);
+        let owner = "did:example:owner";
+        let path = "locked";
+        create_did(&owner_auth(owner), &state, Some(path), false, None)
+            .await
+            .unwrap();
+
+        let guard = state.path_locks.guard(path).await;
+        let rollback = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                rollback_did_to(&owner_auth(owner), &state, path, None)
+                    .await
+                    .map(|_| ())
+            })
+        };
+        let delete = {
+            let state = state.clone();
+            tokio::spawn(async move { delete_did(&owner_auth(owner), &state, path, None).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !rollback.is_finished(),
+            "rollback ran without the path lock"
+        );
+        assert!(!delete.is_finished(), "delete ran without the path lock");
+        drop(guard);
+        let _ = rollback.await.unwrap();
+        let _ = delete.await.unwrap();
     }
 
     /// Same owner re-registering: idempotent path. Slot stays owned by the
@@ -3208,6 +3487,50 @@ mod tests_atomic {
         );
     }
 
+    /// The hosted-DID count follows creates and deletes without a store scan:
+    /// a new slot counts once, publishing or replacing an existing slot does
+    /// not count again, and a delete uncounts it.
+    #[tokio::test]
+    async fn did_count_follows_creates_and_deletes() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let total = || state.stats_collector.get_aggregate().total_dids;
+        assert_eq!(total(), 0);
+
+        create_did(&owner_auth(owner), &state, Some("reserved"), false, None)
+            .await
+            .unwrap();
+        assert_eq!(total(), 1, "a reserved slot is a hosted DID");
+
+        let log = build_test_did_log("scid-reserved", "control.test", "reserved").await;
+        register_did_atomic(&owner_auth(owner), &state, "reserved", &log, false, None)
+            .await
+            .unwrap();
+        assert_eq!(total(), 1, "publishing into a reserved slot adds no DID");
+
+        let log = build_test_did_log("scid-fresh", "control.test", "fresh").await;
+        register_did_atomic(&owner_auth(owner), &state, "fresh", &log, false, None)
+            .await
+            .unwrap();
+        assert_eq!(total(), 2, "registering a fresh path adds a DID");
+
+        create_did(
+            &admin_auth("did:example:admin"),
+            &state,
+            Some("fresh"),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total(), 2, "a force-replace reuses the slot");
+
+        delete_did(&owner_auth(owner), &state, "reserved", None)
+            .await
+            .unwrap();
+        assert_eq!(total(), 1, "a delete removes the DID");
+    }
+
     /// Mirror coverage for the `publish_did` path. Pre-create a slot via
     /// `create_did` (which does NOT bump update stats — it only reserves
     /// the mnemonic), then publish a log against it and assert the counter
@@ -3718,6 +4041,178 @@ mod tests_atomic {
         jsonl
     }
 
+    fn name_list(prefix: &str, n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{prefix}{i:02}")).collect()
+    }
+
+    async fn log_claiming(path: &str, names: &[String]) -> String {
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        build_test_did_log_with_names("control.test", path, &names).await
+    }
+
+    /// On a store whose atomic write holds 100 operations a document may claim
+    /// 47 agent names, so that publishing it, and syncing it to an edge that
+    /// also writes the record, log, owner, witness and high-water rows and
+    /// removes the names it replaces, always fits one batch.
+    #[tokio::test]
+    async fn a_document_over_the_agent_name_cap_is_refused_on_a_bounded_store() {
+        let backend = BoundedMemory::new(100);
+        let (state, _dir) = test_state_on(Some(backend.store())).await;
+        let log = log_claiming("slot-over", &name_list("n", 48)).await;
+
+        let err = register_did_atomic(
+            &owner_auth("did:example:o"),
+            &state,
+            "slot-over",
+            &log,
+            false,
+            None,
+        )
+        .await
+        .expect_err("48 names do not fit");
+
+        assert!(
+            matches!(&err, AppError::Validation(m) if m.contains("48") && m.contains("47")),
+            "{err:?}"
+        );
+        assert!(
+            state
+                .dids_ks
+                .get_raw(did_key("slot-over"))
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing is committed"
+        );
+        assert!(backend.committed_batch_sizes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_document_at_the_agent_name_cap_registers_and_republishes_with_every_name_replaced() {
+        let backend = BoundedMemory::new(100);
+        let (state, _dir) = test_state_on(Some(backend.store())).await;
+        let owner = "did:example:o";
+        let path = "slot-at";
+
+        let first = log_claiming(path, &name_list("old", 47)).await;
+        register_did_atomic(&owner_auth(owner), &state, path, &first, false, None)
+            .await
+            .expect("47 names register");
+        assert_eq!(get_record(&state, path).await.agent_names.len(), 47);
+
+        // Every name dropped and 47 others claimed: the control plane's own
+        // batch is the log, the record, 47 inserts and 47 removals.
+        let second = log_claiming(path, &name_list("new", 47)).await;
+        publish_did(&owner_auth(owner), &state, path, &second, None)
+            .await
+            .expect("replacing all 47 names publishes");
+
+        let record = get_record(&state, path).await;
+        assert!(record.agent_names.iter().all(|e| e.name.starts_with("new")));
+        assert_eq!(record.agent_names.len(), 47);
+        assert!(
+            index_target(&state, "control.test", "old00")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            index_target(&state, "control.test", "new46")
+                .await
+                .as_deref(),
+            Some(path)
+        );
+        assert!(backend.committed_batch_sizes().iter().all(|n| *n <= 100));
+    }
+
+    #[tokio::test]
+    async fn publishing_over_the_agent_name_cap_is_refused_and_changes_nothing() {
+        let backend = BoundedMemory::new(100);
+        let (state, _dir) = test_state_on(Some(backend.store())).await;
+        let owner = "did:example:o";
+        let path = "slot-pub";
+        register_owned(&state, owner, path).await;
+        let before = get_record(&state, path).await.version_count;
+
+        let log = log_claiming(path, &name_list("n", 48)).await;
+        let err = publish_did(&owner_auth(owner), &state, path, &log, None)
+            .await
+            .expect_err("48 names do not fit");
+
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        assert_eq!(get_record(&state, path).await.version_count, before);
+    }
+
+    #[tokio::test]
+    async fn the_agent_name_verbs_also_refuse_a_document_over_the_cap() {
+        let backend = BoundedMemory::new(100);
+        let (state, _dir) = test_state_on(Some(backend.store())).await;
+        let owner = "did:example:o";
+        let path = "slot-verb";
+        register_owned(&state, owner, path).await;
+
+        let names = name_list("n", 48);
+        let log = log_claiming(path, &names).await;
+        let err = set_agent_name(&owner_auth(owner), &state, path, "n00", &log, None)
+            .await
+            .expect_err("the document claims too many names");
+
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn activating_names_one_by_one_cannot_grow_the_registry_past_the_cap() {
+        // Each `activate` carries a one-name document, so the document cap never
+        // trips, but the earlier names stay enabled in the registry.
+        let backend = BoundedMemory::new(100);
+        let (state, _dir) = test_state_on(Some(backend.store())).await;
+        let owner = "did:example:o";
+        let path = "slot-grow";
+        register_owned(&state, owner, path).await;
+
+        for i in 0..47 {
+            let log = log_claiming(path, &[format!("n{i:02}")]).await;
+            set_agent_name(
+                &owner_auth(owner),
+                &state,
+                path,
+                &format!("n{i:02}"),
+                &log,
+                None,
+            )
+            .await
+            .expect("within the cap");
+        }
+        let log = log_claiming(path, &["n47".to_string()]).await;
+        let err = set_agent_name(&owner_auth(owner), &state, path, "n47", &log, None)
+            .await
+            .expect_err("the 48th entry does not fit");
+
+        assert!(
+            matches!(&err, AppError::Validation(m) if m.contains("48") && m.contains("47")),
+            "{err:?}"
+        );
+        assert_eq!(get_record(&state, path).await.agent_names.len(), 47);
+    }
+
+    #[tokio::test]
+    async fn a_store_without_a_batch_ceiling_has_no_agent_name_cap() {
+        let (state, _dir) = test_state().await;
+        let log = log_claiming("slot-free", &name_list("n", 60)).await;
+
+        register_did_atomic(
+            &owner_auth("did:example:o"),
+            &state,
+            "slot-free",
+            &log,
+            false,
+            None,
+        )
+        .await
+        .expect("fjall takes as many names as the document claims");
+
+        assert_eq!(get_record(&state, "slot-free").await.agent_names.len(), 60);
+    }
+
     async fn get_record(state: &AppState, path: &str) -> DidRecord {
         state
             .dids_ks
@@ -3801,6 +4296,31 @@ mod tests_atomic {
 
     /// Happy path: the document claims the name, so it binds — the entry is
     /// enabled, the index points at the slot, and the version advances.
+    /// An agent-name change commits a new log and may change the record, so
+    /// it must clear what the daemon's embedded server cached for the DID.
+    #[tokio::test]
+    async fn agent_name_changes_call_the_cache_invalidate_hook() {
+        let (mut state, _dir) = test_state().await;
+        let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        state.cache_invalidate = Some(Arc::new(move |change: CacheChange<'_>| {
+            recorded.lock().unwrap().push(format!("{change:?}"));
+        }));
+        let owner = "did:example:owner";
+        let path = "slot-hook";
+        register_owned(&state, owner, path).await;
+        calls.lock().unwrap().clear();
+
+        let log = build_test_did_log_with_names("control.test", path, &["alice"]).await;
+        set_agent_name(&owner_auth(owner), &state, path, "alice", &log, None)
+            .await
+            .expect("set");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![format!("{:?}", CacheChange::Did(path))]
+        );
+    }
+
     #[tokio::test]
     async fn set_agent_name_binds_when_document_claims_it() {
         let (state, _dir) = test_state().await;

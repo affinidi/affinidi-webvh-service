@@ -15,7 +15,7 @@ use dialoguer::{Confirm, Input, MultiSelect, Select};
 use did_hosting_common::did::{DidDocumentOptions, build_did_document, create_log_entry};
 use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, IdentityConfig, IdentityMode, LogConfig, LogFormat, ServerConfig,
-    StoreConfig, TransportSelection, VtaConfig,
+    TransportSelection, VtaConfig,
 };
 use did_hosting_common::server::operator_messages::WebvhDaemonMessages;
 use did_hosting_common::server::secret_store::{ServerSecrets, create_secret_store};
@@ -187,12 +187,16 @@ pub async fn run_wizard(
     eprintln!("  Generated JWT signing key.");
 
     // 9. Build + write config
+    let (store, witness_store) =
+        crate::setup_recipe::store_configs(store_path.clone(), witness_store_path.clone());
     let config = DaemonConfig {
         server: ServerConfig {
             host: host.clone(),
             port,
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
+            resolve_cache: Default::default(),
+            resolve_rate_limit: Default::default(),
         },
         log: LogConfig {
             level: log_level,
@@ -204,14 +208,8 @@ pub async fn run_wizard(
         mediator_did: mediator_did.clone(),
         public_url: Some(public_url.clone()),
         did_hosting_url: Some(public_url.clone()),
-        store: StoreConfig {
-            data_dir: store_path,
-            ..StoreConfig::default()
-        },
-        witness_store: StoreConfig {
-            data_dir: witness_store_path,
-            ..StoreConfig::default()
-        },
+        store,
+        witness_store,
         fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
         vta: VtaConfig {
@@ -220,6 +218,8 @@ pub async fn run_wizard(
             context_id: None,
         },
         registry: did_hosting_control::config::RegistryConfig::default(),
+        replay: Default::default(),
+        geoip: Default::default(),
         features,
         identity: IdentityConfig::default(),
         enable,
@@ -989,7 +989,11 @@ async fn run_self_managed_setup(
     eprintln!();
     eprintln!("  Generated Ed25519 signing key, X25519 key-agreement key, and JWT signing key.");
 
-    // 7. Build the daemon's own DID document + signed log entry.
+    // 7. Build the daemon's own DID document + signed log entry. It lists its
+    // did:scid alias unless DAEMON_HOSTING_SCID_ALSO_KNOWN_AS says otherwise;
+    // the written config records the same choice.
+    let scid_also_known_as =
+        did_hosting_common::server::config::scid_also_known_as_from_env("DAEMON", true);
     let host_encoded = did_hosting_common::did::encode_host(&public_url)
         .map_err(|e| format!("failed to encode host from public URL: {e}"))?;
     let doc = build_did_document(
@@ -1010,6 +1014,7 @@ async fn run_self_managed_setup(
             } else {
                 None
             },
+            omit_scid_alias: !scid_also_known_as,
         },
     );
     // A hosting daemon serves HTTP whatever else it speaks, so it always
@@ -1046,12 +1051,16 @@ async fn run_self_managed_setup(
         .map_err(|e| format!("failed to create DID log entry: {e}"))?;
 
     // 8. Build DaemonConfig with self-managed identity + empty VTA.
+    let (store, witness_store) =
+        crate::setup_recipe::store_configs(store_path.clone(), witness_store_path.clone());
     let config = DaemonConfig {
         server: ServerConfig {
             host: host.clone(),
             port,
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
+            resolve_cache: Default::default(),
+            resolve_rate_limit: Default::default(),
         },
         log: LogConfig {
             level: log_level,
@@ -1064,24 +1073,23 @@ async fn run_self_managed_setup(
         mediator_did: mediator_did.clone(),
         public_url: Some(public_url.clone()),
         did_hosting_url: Some(public_url.clone()),
-        store: StoreConfig {
-            data_dir: store_path,
-            ..StoreConfig::default()
-        },
-        witness_store: StoreConfig {
-            data_dir: witness_store_path,
-            ..StoreConfig::default()
-        },
+        store,
+        witness_store,
         fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
         vta: VtaConfig::default(),
         registry: did_hosting_control::config::RegistryConfig::default(),
+        replay: Default::default(),
+        geoip: Default::default(),
         features,
         identity: IdentityConfig {
             mode: IdentityMode::SelfManaged,
             ..Default::default()
         },
-        hosting: did_hosting_common::server::config::HostingConfig::default(),
+        hosting: did_hosting_common::server::config::HostingConfig {
+            scid_also_known_as,
+            ..Default::default()
+        },
         enable,
         config_path: output_path.clone(),
     };
@@ -1413,12 +1421,16 @@ pub async fn run_setup_offline_complete(
     let store_path = PathBuf::from(&state.data_dir).join("store");
     let witness_store_path = PathBuf::from(&state.data_dir).join("witness");
 
+    let (store, witness_store) =
+        crate::setup_recipe::store_configs(store_path.clone(), witness_store_path.clone());
     let config = DaemonConfig {
         server: ServerConfig {
             host: state.host.clone(),
             port: state.port,
             trusted_proxies: Vec::new(),
             trusted_proxy_cidrs: Vec::new(),
+            resolve_cache: Default::default(),
+            resolve_rate_limit: Default::default(),
         },
         log: LogConfig {
             level: state.log_level.clone(),
@@ -1430,14 +1442,8 @@ pub async fn run_setup_offline_complete(
         mediator_did: state.mediator_did.clone(),
         public_url: Some(state.public_url.clone()),
         did_hosting_url: Some(state.public_url.clone()),
-        store: StoreConfig {
-            data_dir: store_path,
-            ..StoreConfig::default()
-        },
-        witness_store: StoreConfig {
-            data_dir: witness_store_path,
-            ..StoreConfig::default()
-        },
+        store,
+        witness_store,
         fjall: Default::default(),
         limits: did_hosting_server::config::LimitsConfig::default(),
         vta: VtaConfig {
@@ -1446,6 +1452,8 @@ pub async fn run_setup_offline_complete(
             context_id: None,
         },
         registry: did_hosting_control::config::RegistryConfig::default(),
+        replay: Default::default(),
+        geoip: Default::default(),
         features: state.features.clone(),
         identity: IdentityConfig::default(),
         hosting: did_hosting_common::server::config::HostingConfig::default(),

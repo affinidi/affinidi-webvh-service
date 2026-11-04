@@ -8,7 +8,9 @@
 //!
 //! - `webvh/witness/key/create|list|delete/0.1` — administer witness identities;
 //! - `webvh/witness/sign/0.1` — witness one log entry, after verifying the log;
-//! - `acl/grant|revoke|change-role|show|list/0.1` — the witness's own ACL.
+//! - `acl/grant|revoke|change-role|show/0.2`, `acl/list/0.3` — the witness's
+//!   own ACL. An `Admin` may have the witness sign with any of its keys, so
+//!   the witness's entries state `keys: all` for an `Admin` (AclEntry 0.2).
 //!
 //! ## Every request is a document its issuer signed
 //!
@@ -36,13 +38,13 @@
 
 use std::sync::Arc;
 
-use serde_json::{Value, json};
-use tracing::{info, warn};
-use trust_tasks_rs::specs::acl::{change_role, grant, list, revoke, show};
-use trust_tasks_rs::specs::webvh::witness::{
+use did_hosting_common::tasks::acl::{change_role, grant, list, revoke, show};
+use did_hosting_common::tasks::webvh::witness::{
     key::{create::v0_1 as key_create, delete::v0_1 as key_delete, list::v0_1 as key_list},
     sign::v0_1 as sign,
 };
+use serde_json::{Value, json};
+use tracing::{info, warn};
 use trust_tasks_rs::{ErrorPayload, Payload, ProofPolicy, RejectReason, TrustTask};
 
 use did_hosting_common::did_ops::{WitnessLogRefusal, verify_log_for_witnessing};
@@ -53,6 +55,7 @@ use did_hosting_common::server::trust_tasks::{
     dispatch_inbound, identity_signing_secret, sign_document, verify_sender_bound,
 };
 
+use crate::error::AppError;
 use crate::server::AppState;
 use crate::witness_ops::{self, WitnessRecord};
 
@@ -74,11 +77,11 @@ pub const WITNESS_TASKS: &[&str] = &[
 
 /// The shared ACL family, served on the witness's own ACL.
 pub const ACL_TASKS: &[&str] = &[
-    grant::v0_1::Payload::TYPE_URI,
-    revoke::v0_1::Payload::TYPE_URI,
-    change_role::v0_1::Payload::TYPE_URI,
-    show::v0_1::Payload::TYPE_URI,
-    list::v0_1::Payload::TYPE_URI,
+    grant::v0_2::Payload::TYPE_URI,
+    revoke::v0_2::Payload::TYPE_URI,
+    change_role::v0_2::Payload::TYPE_URI,
+    show::v0_2::Payload::TYPE_URI,
+    list::v0_3::Payload::TYPE_URI,
 ];
 
 /// Build the proof verifier the witness checks requests with: the workspace's
@@ -133,7 +136,16 @@ pub async fn dispatch_inbound_document(
     // gets, not a weaker one: only a claimed issuer the ACL would actually
     // authorise goes on to have its proof checked.
     let claimed_role = match doc.issuer.as_deref() {
-        Some(issuer) => crate::acl::check_acl(&state.acl_ks, issuer).await.ok(),
+        Some(issuer) => match crate::acl::check_acl(&state.acl_ks, issuer).await {
+            Ok(role) => Some(role),
+            Err(e) if crate::acl::is_acl_refusal(&e) => None,
+            // Still no reply to an unverified document; its sender times out
+            // and sends it again, which is the retry a failed lookup needs.
+            Err(e) => {
+                warn!(%type_uri, error = %e, "trust task dropped: ACL lookup failed");
+                return None;
+            }
+        },
         None => None,
     };
     if !task_authorised(&type_uri, claimed_role) {
@@ -164,7 +176,18 @@ pub async fn dispatch_inbound_document(
     // the *proven* one, which is what a reply may safely attribute the
     // refusal to.
     let reply_id = || format!("urn:uuid:{}", uuid::Uuid::new_v4());
-    let role = crate::acl::check_acl(&state.acl_ks, &principal).await.ok();
+    let role = match crate::acl::check_acl(&state.acl_ks, &principal).await {
+        Ok(role) => Some(role),
+        Err(e) if crate::acl::is_acl_refusal(&e) => None,
+        // A failed lookup is no answer about the issuer: say so, rather than
+        // that it is not authorised. Nothing is remembered yet, so the same
+        // document can be sent again.
+        Err(e) => {
+            warn!(issuer = %principal, %type_uri, error = %e, "trust task deferred: ACL lookup failed");
+            let refusal = doc.reject_with(reply_id(), e.failure_reject_reason());
+            return seal(state, my_did, &principal, error_value(refusal)).await;
+        }
+    };
     let authorised = task_authorised(&type_uri, role);
     if !authorised {
         warn!(issuer = %principal, %type_uri, "trust task refused: the issuer is not authorised");
@@ -177,69 +200,84 @@ pub async fn dispatch_inbound_document(
         return seal(state, my_did, &principal, error_value(refusal)).await;
     }
 
-    match state.replay_cache.check(&principal, &doc.id) {
+    let (doc_id, issued_at) = (doc.id.clone(), doc.issued_at);
+    match state.replay_cache.check(&principal, &doc.id, doc.issued_at) {
         Ok(()) => {}
         Err(ReplayError::Duplicate) => {
             warn!(issuer = %principal, doc_id = %doc.id, "trust task not answered: replay");
             return None;
         }
-        Err(ReplayError::Full) => {
-            let refusal =
-                doc.reject_with(reply_id(), RejectReason::Unavailable { retry_after: None });
+        Err(e @ (ReplayError::Full | ReplayError::Stale)) => {
+            let refusal = doc.reject_with(reply_id(), e.reject_reason());
             return seal(state, my_did, &principal, error_value(refusal)).await;
         }
     }
 
-    let reply = if WITNESS_TASKS.contains(&type_uri.as_str()) {
-        let result = match type_uri.as_str() {
-            t if t == key_create::Payload::TYPE_URI => key_create_task(state, &doc).await,
-            t if t == key_list::Payload::TYPE_URI => key_list_task(state, &doc).await,
-            t if t == key_delete::Payload::TYPE_URI => key_delete_task(state, &doc).await,
-            _ => sign_task(state, &principal, &doc).await,
-        };
-        match result {
-            Ok(payload) => doc.respond_with(reply_id(), payload),
-            Err(e) => error_value(doc.reject_with(reply_id(), e)),
-        }
-    } else if ACL_TASKS.contains(&type_uri.as_str()) {
-        let ctx = TrustTaskContext {
-            acl_ks: &state.acl_ks,
-            acl_locks: &state.acl_locks,
-            my_vid: my_did,
-        };
-        // The proof was verified above, on the document as it arrived.
-        let policy = ProofPolicy::<TransportBoundVerifier>::AcceptUnverified;
-        let outcome = match via {
-            Via::Tsp => {
-                let t = TspTransportHandler::new(my_did.to_string(), principal.clone());
-                dispatch_inbound(&ctx, &t, policy, doc).await
+    let (reply, wrote) = did_hosting_common::server::store::track_writes(Box::pin(async {
+        let reply = if WITNESS_TASKS.contains(&type_uri.as_str()) {
+            let result = match type_uri.as_str() {
+                t if t == key_create::Payload::TYPE_URI => key_create_task(state, &doc).await,
+                t if t == key_list::Payload::TYPE_URI => key_list_task(state, &doc).await,
+                t if t == key_delete::Payload::TYPE_URI => key_delete_task(state, &doc).await,
+                _ => sign_task(state, &principal, &doc).await,
+            };
+            match result {
+                Ok(payload) => doc.respond_with(reply_id(), payload),
+                Err(e) => error_value(doc.reject_with(reply_id(), e)),
             }
-            Via::Didcomm => {
-                let t =
-                    trust_tasks_didcomm::DidcommHandler::new(my_did.to_string(), principal.clone());
-                dispatch_inbound(&ctx, &t, policy, doc).await
+        } else if ACL_TASKS.contains(&type_uri.as_str()) {
+            let ctx = TrustTaskContext {
+                acl_ks: &state.acl_ks,
+                acl_locks: &state.acl_locks,
+                my_vid: my_did,
+                signing_oracle: true,
+            };
+            // The proof was verified above, on the document as it arrived.
+            let policy = ProofPolicy::<TransportBoundVerifier>::AcceptUnverified;
+            let outcome = match via {
+                Via::Tsp => {
+                    let t = TspTransportHandler::new(my_did.to_string(), principal.clone());
+                    dispatch_inbound(&ctx, &t, policy, doc).await
+                }
+                Via::Didcomm => {
+                    let t = trust_tasks_didcomm::DidcommHandler::new(
+                        my_did.to_string(),
+                        principal.clone(),
+                    );
+                    dispatch_inbound(&ctx, &t, policy, doc).await
+                }
+                Via::Https => {
+                    let t = trust_tasks_https::HttpsHandler::new(
+                        my_did.to_string(),
+                        Some(principal.clone()),
+                    );
+                    dispatch_inbound(&ctx, &t, policy, doc).await
+                }
+            };
+            match outcome {
+                DispatchOutcome::Handled(reply) => reply,
+                DispatchOutcome::Rejected(err) => error_value(err),
+                DispatchOutcome::Suppressed => return None,
             }
-            Via::Https => {
-                let t = trust_tasks_https::HttpsHandler::new(
-                    my_did.to_string(),
-                    Some(principal.clone()),
-                );
-                dispatch_inbound(&ctx, &t, policy, doc).await
-            }
+        } else {
+            error_value(doc.reject_with(
+                reply_id(),
+                RejectReason::UnsupportedType {
+                    type_uri: type_uri.clone(),
+                },
+            ))
         };
-        match outcome {
-            DispatchOutcome::Handled(reply) => reply,
-            DispatchOutcome::Rejected(err) => error_value(err),
-            DispatchOutcome::Suppressed => return None,
-        }
-    } else {
-        error_value(doc.reject_with(
-            reply_id(),
-            RejectReason::UnsupportedType {
-                type_uri: type_uri.clone(),
-            },
-        ))
-    };
+        Some(reply)
+    }))
+    .await;
+    let reply = reply?;
+    // Refused as over capacity before it wrote anything: the task did not
+    // run, so the same document can be sent again as a retry rather than
+    // refused as a replay. One that attempted a write may have applied part
+    // of it, so its record stays.
+    if !wrote && reply.payload.get("code").and_then(Value::as_str) == Some("unavailable") {
+        state.replay_cache.release(&principal, &doc_id, issued_at);
+    }
     seal(state, my_did, &principal, reply).await
 }
 
@@ -304,11 +342,24 @@ fn invalid_log(reason: String) -> ErrorPayload {
         .with_details(json!({ "reason": reason }))
 }
 
+/// A failure that is not the request's: the detail goes in the operator log,
+/// never on the wire.
 fn internal(e: impl std::fmt::Display) -> ErrorPayload {
+    tracing::error!(error = %e, "witness trust task: internal failure");
     RejectReason::InternalError {
-        reason: e.to_string(),
+        reason: "the witness encountered an internal failure".into(),
     }
     .into()
+}
+
+/// A store failure: `unavailable` with a retry time when the store is over
+/// capacity, else [`internal`].
+fn store_failure(e: AppError) -> ErrorPayload {
+    if e.retry_after_secs().is_some() {
+        warn!(error = %e, "witness trust task deferred: store over capacity");
+        return e.failure_reject_reason().into();
+    }
+    internal(e)
 }
 
 fn rfc3339(secs: u64) -> String {
@@ -337,7 +388,7 @@ async fn key_create_task(state: &AppState, doc: &TrustTask<Value>) -> Result<Val
     let p: key_create::Payload = payload(doc)?;
     let record = witness_ops::create_witness(&state.witnesses_ks, p.label.map(|l| l.to_string()))
         .await
-        .map_err(internal)?;
+        .map_err(store_failure)?;
     info!(audit = true, witness_id = %record.witness_id, did = %record.did, "witness identity created");
     reply::<key_create::Response>(json!({ "key": witness_key(&record) }))
 }
@@ -347,7 +398,7 @@ async fn key_list_task(state: &AppState, doc: &TrustTask<Value>) -> Result<Value
     let _: key_list::Payload = payload(doc)?;
     let mut records = witness_ops::list_witnesses(&state.witnesses_ks)
         .await
-        .map_err(internal)?;
+        .map_err(store_failure)?;
     records.sort_by(|a, b| {
         a.created_at
             .cmp(&b.created_at)
@@ -363,15 +414,15 @@ async fn key_delete_task(state: &AppState, doc: &TrustTask<Value>) -> Result<Val
     let witness_id = p.witness_id.as_str();
     if witness_ops::get_witness(&state.witnesses_ks, witness_id)
         .await
-        .map_err(internal)?
+        .map_err(store_failure)?
         .is_none()
     {
         return Err(ErrorPayload::from(key_delete::error_codes::NOT_FOUND)
             .with_message(format!("no witness identity {witness_id}")));
     }
-    witness_ops::delete_witness(&state.witnesses_ks, witness_id)
+    witness_ops::delete_witness(&state.store, &state.witnesses_ks, witness_id)
         .await
-        .map_err(internal)?;
+        .map_err(store_failure)?;
     info!(audit = true, witness_id, "witness identity deleted");
     reply::<key_delete::Response>(json!({
         "witnessId": witness_id,
@@ -395,7 +446,7 @@ async fn sign_task(
     let version_id = p.version_id.as_str();
     let Some(record) = witness_ops::get_witness(&state.witnesses_ks, witness_id)
         .await
-        .map_err(internal)?
+        .map_err(store_failure)?
     else {
         return Err(ErrorPayload::from(sign::error_codes::NOT_FOUND)
             .with_message(format!("no witness identity {witness_id}")));
@@ -442,7 +493,7 @@ async fn sign_task(
     let version_number = witnessed.version_ids.len() as u64;
     let mark = witness_ops::get_witnessed_mark(&state.witnesses_ks, witness_id, &witnessed.scid)
         .await
-        .map_err(internal)?;
+        .map_err(store_failure)?;
     if let Some(mark) = mark.as_ref() {
         let extends = version_number >= mark.version_number
             && usize::try_from(mark.version_number)
@@ -466,30 +517,26 @@ async fn sign_task(
         }
     }
 
+    // The mark only ever moves forward; re-witnessing an entry already
+    // witnessed leaves it as it is. It is recorded — and made durable —
+    // inside `sign_witness_proof`, before the proof can leave this function.
+    let advance = mark
+        .as_ref()
+        .is_none_or(|m| version_number > m.version_number)
+        .then(|| witness_ops::WitnessedMark {
+            version_number,
+            version_id: version_id.to_string(),
+        });
     let (version_id, proof) = witness_ops::sign_witness_proof(
+        &state.store,
         &state.witnesses_ks,
         state.signer.as_ref(),
         witness_id,
         version_id,
+        advance.as_ref().map(|m| (witnessed.scid.as_str(), m)),
     )
     .await
-    .map_err(internal)?;
-    if mark
-        .as_ref()
-        .is_none_or(|m| version_number > m.version_number)
-    {
-        witness_ops::set_witnessed_mark(
-            &state.witnesses_ks,
-            witness_id,
-            &witnessed.scid,
-            &witness_ops::WitnessedMark {
-                version_number,
-                version_id: version_id.clone(),
-            },
-        )
-        .await
-        .map_err(internal)?;
-    }
+    .map_err(store_failure)?;
     drop(_guard);
     let did = did_hosting_common::did_ops::extract_did_id(&p.log_content).unwrap_or_default();
     info!(
@@ -505,4 +552,21 @@ async fn sign_task(
         "versionId": version_id,
         "proof": serde_json::to_value(&proof).map_err(internal)?,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_throttled_store_asks_for_a_retry_and_nothing_internal_reaches_the_wire() {
+        let payload = store_failure(AppError::store_throttled());
+        assert_eq!(payload.code.to_string(), "unavailable");
+        assert!(payload.retry_after.is_some());
+
+        let payload = store_failure(AppError::Store("table witnesses: disk full".into()));
+        assert_eq!(payload.code.to_string(), "internalError");
+        let wire = serde_json::to_string(&payload).unwrap();
+        assert!(!wire.contains("disk full"), "{wire}");
+    }
 }

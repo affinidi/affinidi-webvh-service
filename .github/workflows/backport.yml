@@ -4,10 +4,12 @@ name: Backport
 # that release branch as a new PR (RELEASES.md: fix on main first, then
 # backport). Add the label before or after merging; one label per branch.
 #
-# A cherry-pick that conflicts still opens a PR, as a draft carrying the
-# conflict, for a person to resolve — never silently dropped. A conflict in
-# CHANGELOG.md is expected (main's `## Unreleased` is not on the branch): drop
-# the hunk; the patch's changelog is generated from commit subjects.
+# CHANGELOG.md never conflicts: the release branch's copy is kept (main's
+# `## Unreleased` is not on the branch, and the patch's changelog is generated
+# from commit subjects). Any other conflict fails the push — the action commits
+# it as `BACKPORT-CONFLICT`, which the commit-message rule rejects — and the
+# action comments on the source PR; backport it by hand on a branch named
+# `backport-<pr>-to-release/<name>`.
 #
 # pull_request_target, so it runs with this repository's token even for a PR
 # from a fork. It checks out no PR code to run: the action only cherry-picks
@@ -37,6 +39,17 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           token: ${{ secrets.RELEASE_TOKEN || github.token }}
+      # Every backport conflicts on CHANGELOG.md (main's `## Unreleased` is not
+      # on a GA'd branch), and the fix is always the same: keep the release
+      # branch's copy. Do that in the cherry-pick itself. Left to the action, a
+      # conflict is committed as `BACKPORT-CONFLICT`, which the repository's
+      # commit-message rule rejects, so the push fails and no PR is opened.
+      # A merge driver of `true` keeps "ours", which during a cherry-pick is the
+      # release branch.
+      - name: Keep the release branch's CHANGELOG.md when cherry-picking
+        run: |
+          git config merge.keep-release-changelog.driver true
+          echo "CHANGELOG.md merge=keep-release-changelog" >> "$(git rev-parse --git-path info/attributes)"
       - uses: korthout/backport-action@8560fb503c275d433c56f05a2f64850093baa9f7 # v4.7.0
         with:
           github_token: ${{ secrets.RELEASE_TOKEN || github.token }}

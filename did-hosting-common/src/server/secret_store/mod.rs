@@ -342,6 +342,9 @@ pub fn backend_label(secrets: &SecretsConfig) -> &'static str {
         SecretBackend::Kubernetes => "Kubernetes Secret",
         SecretBackend::Plaintext => "Plaintext file",
         SecretBackend::ConfigSeed => "config_seed (unsupported)",
+        // `vti_secrets::SecretBackend` is `#[non_exhaustive]`; a backend added
+        // there (`encrypted_file`, so far) has no `[secrets]` surface here.
+        _ => "unsupported backend",
     }
 }
 
@@ -446,6 +449,15 @@ pub fn to_vti_config(secrets: &SecretsConfig) -> Result<vti_secrets::SecretsConf
                     .into(),
             ));
         }
+        // `encrypted_file`, and anything `vti_secrets` adds later: there is no
+        // `[secrets]` field to configure it from, so refuse rather than hand
+        // the store a backend with none of its settings.
+        other => {
+            return Err(AppError::Config(format!(
+                "secrets.backend = {other:?} is not supported by this service. Choose one of \
+                 keyring, aws, gcp, azure, vault, kubernetes."
+            )));
+        }
     }
     Ok(out)
 }
@@ -511,6 +523,19 @@ pub fn plaintext_path(config_path: &Path) -> PathBuf {
     dir.join(format!("{stem}.secrets.plaintext"))
 }
 
+/// Whether this is the process's first plaintext store on `path`. The store is
+/// rebuilt wherever it is needed (the identity sweep does so every minute), so
+/// its warning is logged once per file rather than on every build.
+fn first_plaintext_open(path: &Path) -> bool {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(path.to_path_buf())
+}
+
 /// Build the secret store `secrets` selects (see [`resolve_backend`]).
 ///
 /// `config_path` is consulted only by the plaintext backend, whose file sits
@@ -528,10 +553,12 @@ pub fn create_secret_store(
         SecretBackend::Keyring => keyring_store(&vti)?,
         SecretBackend::Plaintext => {
             let path = plaintext_path(config_path);
-            tracing::warn!(
-                path = %path.display(),
-                "secrets are stored in a PLAINTEXT file — for tests only, never production"
-            );
+            if first_plaintext_open(&path) {
+                tracing::warn!(
+                    path = %path.display(),
+                    "secrets are stored in a PLAINTEXT file — for tests only, never production"
+                );
+            }
             let dir = path.parent().unwrap_or_else(|| Path::new("."));
             let name = path
                 .file_name()
