@@ -310,6 +310,10 @@ export interface TimeSeriesPoint {
   timestamp: number;
   resolves: number;
   updates: number;
+  /** Width of the point, in seconds: the response's `bucketSeconds`. A DID
+   *  without 5-minute statistics is charted hourly (or daily over 30 days),
+   *  so this is not fixed by the range. */
+  seconds: number;
 }
 
 export type TimeRange = "1h" | "24h" | "7d" | "30d";

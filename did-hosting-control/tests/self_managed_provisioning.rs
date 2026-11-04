@@ -70,6 +70,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         replay: Default::default(),
         geoip: Default::default(),
         stats_flush: Default::default(),
+        stats: Default::default(),
         config_path: PathBuf::new(),
     };
 

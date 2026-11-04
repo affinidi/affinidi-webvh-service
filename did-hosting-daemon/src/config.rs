@@ -81,6 +81,13 @@ pub struct DaemonConfig {
         skip_serializing_if = "did_hosting_control::config::StatsFlushConfig::is_default"
     )]
     pub stats_flush: did_hosting_control::config::StatsFlushConfig,
+    /// Which DIDs keep 5-minute statistics (`[stats]`; env `DAEMON_STATS_*`).
+    /// Reaches the embedded control plane, which writes the statistics.
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_control::config::StatsTierConfig::is_default"
+    )]
+    pub stats: did_hosting_control::config::StatsTierConfig,
 
     /// Multi-domain hosting settings (T18). `bootstrap_domains` seeds
     /// the `domains` keyspace on first boot when no entries exist;
@@ -219,6 +226,9 @@ impl DaemonConfig {
         config.geoip.apply_env_overrides("DAEMON");
         // DAEMON_STATS_FLUSH_MAX_ROWS_PER_SECOND. Also validates `[stats_flush]`.
         config.stats_flush.apply_env_overrides("DAEMON")?;
+        // DAEMON_STATS_MODE / _PROMOTE_PER_HOUR / _DEMOTE_PER_HOUR /
+        // _MAX_FINE_DIDS. Also validates `[stats]`.
+        config.stats.apply_env_overrides("DAEMON")?;
         // DAEMON_SERVER_RESOLVE_RATE_LIMIT_* — per-address limit on resolution.
         config
             .server
@@ -336,6 +346,7 @@ impl DaemonConfig {
             replay: self.replay.clone(),
             geoip: self.geoip.clone(),
             stats_flush: self.stats_flush,
+            stats: self.stats,
             config_path: self.config_path.clone(),
         }
     }
@@ -514,6 +525,24 @@ context_id = "webvh"
         let (_dir, path) = write_temp_config(&toml);
         let err = DaemonConfig::load(Some(path)).expect_err("zero defers every row");
         assert!(err.to_string().contains("max_rows_per_second"), "{err}");
+    }
+
+    /// `[stats]` reaches the embedded control plane; thresholds without a
+    /// gap stop the load.
+    #[test]
+    fn stats_tiers_are_read_from_the_file() {
+        let toml = format!("{SELF_MANAGED_TOML}\n[stats]\nmode = \"coarse\"\nmax_fine_dids = 5\n");
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        let stats = cfg.control_config().stats;
+        assert_eq!(stats.mode, did_hosting_control::config::StatsMode::Coarse);
+        assert_eq!(stats.max_fine_dids, 5);
+
+        let toml =
+            format!("{SELF_MANAGED_TOML}\n[stats]\npromote_per_hour = 10\ndemote_per_hour = 10\n");
+        let (_dir, path) = write_temp_config(&toml);
+        let err = DaemonConfig::load(Some(path)).expect_err("no gap");
+        assert!(err.to_string().contains("demote_per_hour"), "{err}");
     }
 
     /// `[[geoip.networks]]` reaches the control plane; a bad range or label

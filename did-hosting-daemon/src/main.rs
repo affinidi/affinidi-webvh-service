@@ -132,6 +132,29 @@ enum Command {
     },
     /// List all ACL entries
     ListAcl,
+    /// Show a DID's statistics resolution, recorded tier and totals
+    /// (offline; stop the service first).
+    StatsShow {
+        /// The DID's path (mnemonic).
+        #[arg(long)]
+        mnemonic: String,
+    },
+    /// Set a DID's statistics resolution (offline; stop the service first):
+    /// `auto` (by traffic), `fine` (always 5-minute detail), `coarse` (never
+    /// promoted) or `off` (totals only). Applied at the next start.
+    StatsSet {
+        /// The DID's path (mnemonic).
+        #[arg(long)]
+        mnemonic: String,
+        /// auto, fine, coarse or off.
+        #[arg(long, value_parser = ["auto", "fine", "coarse", "off"])]
+        resolution: String,
+    },
+    /// Finish the move to tiered statistics and delete the legacy time-series
+    /// rows now, instead of 30 days after the migration (offline; stop the
+    /// service first). An older version rolled back to afterwards has no
+    /// time-series history.
+    StatsPurgeLegacy,
     /// Read the service's own counters via the authenticated
     /// `server/metrics/0.1` Trust Task and print them as JSON.
     ///
@@ -450,6 +473,55 @@ async fn main() {
         }
         Some(Command::AddAcl { did, role, label }) => {
             if let Err(e) = run_add_acl(cli.config, did, role, label).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::StatsShow { mnemonic }) => {
+            let result = match DaemonConfig::load(cli.config) {
+                Ok(config) => {
+                    did_hosting_control::stats_cli::run_stats_show(&config.store, &mnemonic).await
+                }
+                Err(e) => Err(e.into()),
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::StatsSet {
+            mnemonic,
+            resolution,
+        }) => {
+            let result = match DaemonConfig::load(cli.config) {
+                Ok(config) => {
+                    did_hosting_control::stats_cli::run_stats_set(
+                        &config.store,
+                        &mnemonic,
+                        &resolution,
+                    )
+                    .await
+                }
+                Err(e) => Err(e.into()),
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::StatsPurgeLegacy) => {
+            let result = match DaemonConfig::load(cli.config) {
+                Ok(config) => {
+                    did_hosting_control::stats_cli::run_stats_purge_legacy(
+                        &config.store,
+                        &config.stats_flush,
+                        &config.stats,
+                    )
+                    .await
+                }
+                Err(e) => Err(e.into()),
+            };
+            if let Err(e) = result {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -845,45 +917,20 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         }
     }
 
-    // 1c. Seed stats collector from persisted store
+    // 1c. Seed stats collector from persisted store: the aggregate, the DID
+    // count and the per-DID statistics overrides; then the `[stats]` policy.
     let stats_collector = {
-        use did_hosting_common::server::stats_collector::StatsAggregate;
         let collector = StatsCollector::new();
-        let mut total_resolves = 0u64;
-        let mut total_updates = 0u64;
-        let mut last_resolved_at: Option<u64> = None;
-        let mut last_updated_at: Option<u64> = None;
-        if let Ok(raw) = stats_ks.prefix_iter_raw("stats:").await {
-            for (_key, value) in raw {
-                if let Ok(s) = serde_json::from_slice::<did_hosting_common::DidStats>(&value) {
-                    total_resolves += s.total_resolves;
-                    total_updates += s.total_updates;
-                    last_resolved_at = match (last_resolved_at, s.last_resolved_at) {
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                        (a, b) => a.or(b),
-                    };
-                    last_updated_at = match (last_updated_at, s.last_updated_at) {
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                        (a, b) => a.or(b),
-                    };
-                }
-            }
-        }
-        let total_dids = dids_ks
-            .prefix_iter_raw("did:")
-            .await
-            .map(|v| v.len())
-            .unwrap_or(0) as u64;
-        collector.seed_aggregate(&StatsAggregate {
-            total_dids,
-            total_resolves,
-            total_updates,
-            last_resolved_at,
-            last_updated_at,
-        });
+        let agg = did_hosting_common::server::stats_collector::seed_from_store(
+            &collector, &stats_ks, &dids_ks,
+        )
+        .await;
+        collector.configure_tiers(config.stats);
         info!(
-            total_dids,
-            total_resolves, total_updates, "stats collector seeded from store"
+            total_dids = agg.total_dids,
+            total_resolves = agg.total_resolves,
+            total_updates = agg.total_updates,
+            "stats collector seeded from store"
         );
         Arc::new(collector)
     };
@@ -1278,6 +1325,12 @@ async fn run_daemon_storage_task(
     // A flush that overruns its interval is followed by a full interval, not
     // an immediate catch-up flush.
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The migration to the tiered statistics format, stepped after each flush.
+    let mut stats_maintenance = did_hosting_control::stats_migration::StatsMaintenance::new(
+        params.stats_ks.clone(),
+        params.timeseries_ks.clone(),
+        params.dids_ks.clone(),
+    );
     // Same recount as the standalone control plane: corrects the count for
     // paths that do not keep it, such as an offline `remove`.
     let mut did_count_timer = tokio::time::interval(
@@ -1351,6 +1404,14 @@ async fn run_daemon_storage_task(
                     shutdown_rx.clone(),
                 ).await {
                     warn!("stats flush error: {e}");
+                }
+                // Parity with the control plane: the migration to (and
+                // clean-up after) the tiered statistics format.
+                if let Err(e) = stats_maintenance
+                    .step(&params.collector, &params.stats_flush, shutdown_rx.clone())
+                    .await
+                {
+                    warn!("stats migration error: {e}");
                 }
             }
             _ = purge_timer.tick() => {

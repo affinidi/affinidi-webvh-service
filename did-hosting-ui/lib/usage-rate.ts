@@ -1,15 +1,17 @@
 /**
  * Per-second rates for the usage chart.
  *
- * `stats/timeseries` answers one point per display step, summing the 5-minute
- * buckets the step covers (`did-hosting-control` `query_timeseries`): 5 min
- * for 1h, 15 min for 24h, 1 h for 7d, 4 h for 30d. The newest point is still
- * filling, so its rate is over the time it has actually covered.
+ * `stats/timeseries` answers one point per step and says how wide each is
+ * (`bucketSeconds`). With 5-minute detail that is 5 min for 1h, 15 min for
+ * 24h, 1 h for 7d and 4 h for 30d; a DID without it is charted hourly, or
+ * daily over 30 days (`did-hosting-control` `stats_query`). The newest point
+ * is still filling, so its rate is over the time it has actually covered.
  */
 
 import type { TimeRange } from "./api";
 
-/** The width of one point, in seconds, for each range. */
+/** The width of one point with 5-minute detail, in seconds, for each range:
+ *  the fallback when a point does not carry its own. */
 export const STEP_SECS: Record<TimeRange, number> = {
   "1h": 300,
   "24h": 900,
@@ -17,10 +19,9 @@ export const STEP_SECS: Record<TimeRange, number> = {
   "30d": 14400,
 };
 
-/** Seconds a point starting at `start` covers: a full step, or up to `now`
- *  for the newest one. Never less than one second. */
-export function pointSeconds(start: number, range: TimeRange, now: number): number {
-  const step = STEP_SECS[range];
+/** Seconds a point starting at `start` covers: a full step of `step`
+ *  seconds, or up to `now` for the newest one. Never less than one second. */
+export function pointSeconds(start: number, step: number, now: number): number {
   return Math.max(1, Math.min(step, now - start));
 }
 

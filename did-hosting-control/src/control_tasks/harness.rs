@@ -74,6 +74,7 @@ pub(crate) async fn state() -> (AppState, tempfile::TempDir) {
         replay: Default::default(),
         geoip: Default::default(),
         stats_flush: Default::default(),
+        stats: Default::default(),
         config_path: PathBuf::new(),
     };
     let state = AppState {

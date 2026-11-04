@@ -67,9 +67,15 @@ pub struct AppConfig {
     /// `CONTROL_STATS_FLUSH_MAX_ROWS_PER_SECOND`).
     #[serde(default, skip_serializing_if = "StatsFlushConfig::is_default")]
     pub stats_flush: StatsFlushConfig,
+    /// Which DIDs keep 5-minute statistics (`[stats]`; env `CONTROL_STATS_*`).
+    /// See `docs/stats-tiers.md`.
+    #[serde(default, skip_serializing_if = "StatsTierConfig::is_default")]
+    pub stats: StatsTierConfig,
     #[serde(skip)]
     pub config_path: PathBuf,
 }
+
+pub use did_hosting_common::server::stats_tiers::{StatsMode, StatsTierConfig};
 
 /// Largest `[stats_flush] max_rows_per_second` accepted: far above any table
 /// it would be sized for, low enough that a typo is caught.
@@ -94,9 +100,10 @@ pub const STATS_FLUSH_INTERVAL: std::time::Duration =
 /// Rows past the budget wait for the next flush. Two limits drop what waits
 /// too long, each with a warning: time-series buckets older than an hour
 /// (`server::STATS_BUCKET_MAX_AGE`), and rows past the collector's caps of
-/// 100,000 DIDs and 200,000 buckets. So the budget should exceed the rows
-/// produced each second: about two per distinct DID resolved in an interval,
-/// divided by the interval. Per-DID totals are never dropped by age.
+/// 100,000 DIDs and 200,000 buckets. A DID's row is written once per closed
+/// 5-minute bucket, plus a ring row per bucket for a DID with 5-minute
+/// statistics (`docs/stats-tiers.md`), so the budget should exceed those
+/// rows over 300 seconds. Per-DID totals are never dropped by age.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatsFlushConfig {
@@ -403,6 +410,9 @@ impl AppConfig {
         config.geoip.apply_env_overrides("CONTROL");
         // CONTROL_STATS_FLUSH_MAX_ROWS_PER_SECOND. Also validates `[stats_flush]`.
         config.stats_flush.apply_env_overrides("CONTROL")?;
+        // CONTROL_STATS_MODE / _PROMOTE_PER_HOUR / _DEMOTE_PER_HOUR /
+        // _MAX_FINE_DIDS. Also validates `[stats]`.
+        config.stats.apply_env_overrides("CONTROL")?;
 
         // Control-specific env vars
         macro_rules! env_opt {
