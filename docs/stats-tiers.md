@@ -127,6 +127,16 @@ Per DID-hour with activity, on a store where every row is a read and a write:
 | Storage per DID | grows forever | one row; plus 288 small rows when fine |
 | Chart read | a full-table Scan (one per DID for a domain) | one `GET`; 12 or 288 `GET`s for a fine window |
 
+On DynamoDB, units follow item size: a write is one unit per KB. A ring slot
+and a new DID's row are about 100 bytes, one unit each. A DID's row grows with
+its points, to about 3 KB for a DID active in every hour of the week (168
+hourly and 30 daily points), so writing it costs up to about three units; the
+server-wide `c:_all` row (720 hourly points) is about 13 KB, written once per
+5 minutes. A read is one unit per 4 KB, strongly consistent. So for a DID
+resolved about once per 5 minutes all week the write units are similar to or
+somewhat above the previous format's (two one-unit rows); the saving is for
+busier DIDs, and in reads and storage.
+
 ## Migration
 
 Automatic, idempotent, and safe to roll back.
@@ -135,8 +145,10 @@ Automatic, idempotent, and safe to roll back.
    (`coarse`) that older readers ignore. Nothing writes `ts:` any more. Edges
    are unaffected: they keep no time series.
 2. **Backfill, once.** At startup, if the marker is missing or incomplete,
-   the storage task scans `ts:` once and, a flush's worth at a time between
-   flushes, adds each series' legacy buckets to its coarse series (and, for a
+   the storage task reads `ts:` once, a page of 1,000 rows at a time in key
+   order (a backend that cannot list in key order, a hash-ordered Scan, is
+   read whole), and, a flush's worth at a time between flushes, adds each
+   series' legacy buckets to its coarse series (and, for a
    series that is fine, the last day's to its ring). Each series records the
    legacy buckets it has taken (`migrated_through`), so a restart part-way, a
    second run, or two replicas overlapping never count a bucket twice. Series
@@ -146,7 +158,7 @@ Automatic, idempotent, and safe to roll back.
 3. **Charts during the backfill** are read from the legacy rows; once the
    marker records completion they are read from the new rows.
 4. **Legacy rows are kept for 30 days** after completion, then deleted, paced
-   and resumably. `stats-purge-legacy` deletes them at once.
+   and resumably, reading their keys a page at a time. `stats-purge-legacy` deletes them at once.
 5. **Rollback.** An older binary rolled back to within the 30 days finds its
    `ts:` rows, missing only what was counted since the upgrade, and its
    rewrites of `stats:` rows drop their `coarse` series. On the next upgrade

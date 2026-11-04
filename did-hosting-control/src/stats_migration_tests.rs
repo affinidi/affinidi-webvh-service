@@ -288,6 +288,124 @@ async fn purge_now_migrates_first_then_deletes() {
     assert!(f.marker().await.unwrap().legacy_purged_at.is_some());
 }
 
+/// Step `m` until it has nothing in hand.
+async fn drive(mut m: StatsMaintenance, collector: &StatsCollector) {
+    let (_tx, stop) = watch::channel(false);
+    m.step(collector, &budget(), stop.clone()).await.unwrap();
+    while m.busy() {
+        m.step(collector, &budget(), stop.clone()).await.unwrap();
+    }
+}
+
+/// Several series with several buckets each, for the paging tests.
+async fn history(f: &Fixture, now: u64) {
+    for (m, n) in [("alice", 3u64), ("bob", 1), ("carol", 4)] {
+        f.did(m).await;
+        for i in 0..n {
+            f.legacy(m, bucket_ago(now, (i + 1) * HOUR_SECS), i + 1)
+                .await;
+        }
+    }
+    f.legacy(ALL_SERIES, bucket_ago(now, HOUR_SECS), 6).await;
+    f.legacy(ALL_SERIES, bucket_ago(now, 2 * HOUR_SECS), 9)
+        .await;
+}
+
+/// Read two rows at a time, so series cross page boundaries: the result is
+/// the same as reading them all at once.
+#[tokio::test]
+async fn a_migration_read_a_page_at_a_time_counts_every_bucket_once() {
+    let f = fixture().await;
+    let now = now_epoch();
+    history(&f, now).await;
+
+    drive(f.maintenance().with_page_rows(2), &StatsCollector::new()).await;
+
+    assert_eq!(resolves(&f.coarse("alice").await.unwrap()), 1 + 2 + 3);
+    assert_eq!(resolves(&f.coarse("bob").await.unwrap()), 1);
+    assert_eq!(resolves(&f.coarse("carol").await.unwrap()), 1 + 2 + 3 + 4);
+    assert_eq!(resolves(&f.all().await), 15);
+    assert!(f.marker().await.unwrap().completed_at.is_some());
+}
+
+/// A backend that cannot list in key order is read whole, as before.
+#[tokio::test]
+async fn a_backend_without_key_order_is_read_whole() {
+    let f = fixture().await;
+    let now = now_epoch();
+    history(&f, now).await;
+
+    let m = StatsMaintenance::new(
+        f.stats_ks.clone(),
+        f.ts_ks.without_ordered_pages(),
+        f.dids_ks.clone(),
+    )
+    .with_page_rows(2);
+    drive(m, &StatsCollector::new()).await;
+
+    assert_eq!(resolves(&f.coarse("alice").await.unwrap()), 6);
+    assert_eq!(resolves(&f.coarse("carol").await.unwrap()), 10);
+    assert_eq!(resolves(&f.all().await), 15);
+}
+
+/// A read that fails part-way (a throttled store) leaves the migration where
+/// it was: the next step reads the same page again, rather than the instance
+/// waiting an hour behind its own lease.
+#[tokio::test]
+async fn a_failed_page_read_is_retried_from_where_it_stopped() {
+    let f = fixture().await;
+    let now = now_epoch();
+    for (m, n) in [("alice", 2u64), ("bob", 2), ("carol", 1)] {
+        f.did(m).await;
+        for i in 0..n {
+            f.legacy(m, bucket_ago(now, (i + 1) * HOUR_SECS), 1).await;
+        }
+    }
+    let collector = StatsCollector::new();
+    // Reads allowed: the marker, then the first page; the second page fails.
+    let mut m = StatsMaintenance::new(
+        f.stats_ks.clone(),
+        f.ts_ks.failing_reads_after(2, AppError::store_throttled),
+        f.dids_ks.clone(),
+    )
+    .with_page_rows(2);
+    let (_tx, stop) = watch::channel(false);
+    m.step(&collector, &budget(), stop.clone()).await.unwrap();
+    let err = m.step(&collector, &budget(), stop.clone()).await;
+    assert!(err.is_err(), "the second page read fails");
+    assert!(m.busy(), "still migrating, not waiting an hour");
+
+    // The store recovers.
+    m.timeseries_ks = f.ts_ks.clone();
+    while m.busy() {
+        m.step(&collector, &budget(), stop.clone()).await.unwrap();
+    }
+
+    assert_eq!(resolves(&f.coarse("alice").await.unwrap()), 2);
+    assert_eq!(resolves(&f.coarse("bob").await.unwrap()), 2);
+    assert_eq!(resolves(&f.coarse("carol").await.unwrap()), 1);
+    assert!(f.marker().await.unwrap().completed_at.is_some());
+}
+
+/// The purge reads keys a page at a time too, and reports what it deleted.
+#[tokio::test]
+async fn purge_now_deletes_a_page_at_a_time() {
+    let f = fixture().await;
+    let now = now_epoch();
+    history(&f, now).await;
+
+    let deleted = f
+        .maintenance()
+        .with_page_rows(3)
+        .purge_legacy_now(&StatsCollector::new(), &budget())
+        .await
+        .unwrap();
+
+    assert_eq!(deleted, 10);
+    assert!(f.ts_ks.prefix_iter_raw("ts:").await.unwrap().is_empty());
+    assert_eq!(resolves(&f.all().await), 15);
+}
+
 #[test]
 fn legacy_keys_parse() {
     assert_eq!(parse_legacy_key(b"ts:alice:300"), Some(("alice", 300)));

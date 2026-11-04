@@ -30,6 +30,7 @@ use did_hosting_common::server::stats_tiers::{
 use tokio::sync::watch;
 use tracing::{debug, error, warn};
 
+use crate::config::STATS_FLUSH_INTERVAL;
 use crate::error::AppError;
 use crate::store::KeyspaceHandle;
 
@@ -119,6 +120,11 @@ pub async fn flush_stats_to_store(
 /// written at `max_rows_per_second`, so the store sees the configured rate
 /// rather than the whole budget at once.
 ///
+/// It ends within one [`STATS_FLUSH_INTERVAL`]: when writes are slow (a
+/// throttled store), what would start after that waits for the next flush,
+/// so the flush timer keeps its interval and the rate achieved stays close
+/// to the configured one.
+///
 /// Once `stop` reads `true` the flush stops pacing and writes nothing more:
 /// what it has not written goes back to the collector, for the shutdown
 /// flush ([`flush_remaining_stats`]) to write without waiting.
@@ -131,6 +137,19 @@ pub async fn flush_stats_paced(
     budget: &crate::config::StatsFlushConfig,
     stop: watch::Receiver<bool>,
 ) -> Result<(), AppError> {
+    let deadline = tokio::time::Instant::now() + STATS_FLUSH_INTERVAL;
+    flush_stats_paced_until(collector, stats_ks, timeseries_ks, budget, stop, deadline).await
+}
+
+/// [`flush_stats_paced`], ending at `deadline`.
+pub(crate) async fn flush_stats_paced_until(
+    collector: &StatsCollector,
+    stats_ks: &KeyspaceHandle,
+    timeseries_ks: &KeyspaceHandle,
+    budget: &crate::config::StatsFlushConfig,
+    stop: watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+) -> Result<(), AppError> {
     let pace = Pace {
         rows_per_second: budget.max_rows_per_second.max(1),
         stop,
@@ -140,7 +159,7 @@ pub async fn flush_stats_paced(
         stats_ks,
         timeseries_ks,
         budget.rows_per_flush(),
-        None,
+        Some(deadline),
         Some(pace),
         Drain::Due(now_epoch()),
     )
@@ -243,7 +262,10 @@ async fn flush_stats_rows(
             .min(max_rows - written)
             .min(rows.len());
         if let Some(pace) = pace.as_mut() {
-            if !pace.wait_until(next_start).await {
+            // A group that could only start after the deadline waits for
+            // the next flush instead: overrunning the interval would delay
+            // that flush by a whole interval and halve the rate achieved.
+            if deadline.is_some_and(|d| next_start >= d) || !pace.wait_until(next_start).await {
                 break;
             }
             n = n.min(pace.rows_per_second as usize);

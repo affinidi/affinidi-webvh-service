@@ -348,6 +348,40 @@ async fn shutdown_cuts_a_paced_flush_short_and_loses_nothing() {
     assert_eq!(stats_ks.prefix_iter_raw("stats:").await.unwrap().len(), 2);
 }
 
+/// A paced flush ends at its deadline (the flush interval in production):
+/// a group that could only start after it waits for the next flush, so a
+/// slow store cannot stretch one flush over the next one's turn.
+#[tokio::test]
+async fn a_paced_flush_ends_at_its_deadline_and_requeues_the_rest() {
+    let (_dir, _store, stats_ks, ts_ks) = keyspaces().await;
+    let collector = StatsCollector::new();
+    let now = now_epoch();
+    for m in ["alice", "bob"] {
+        resolved(&collector, m, 1, now);
+    }
+    // Four rows at one a second start at 0, 1, 2 and 3 s; the deadline
+    // leaves room for two.
+    let budget = crate::config::StatsFlushConfig {
+        max_rows_per_second: 1,
+    };
+    let (_tx, stop) = watch::channel(false);
+    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1_500);
+    flush_stats_paced_until(&collector, &stats_ks, &ts_ks, &budget, stop, deadline)
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "did not wait past the deadline, took {:?}",
+        started.elapsed()
+    );
+    assert!(collector.pending_rows() > 0, "the rest is requeued");
+
+    flush_remaining_stats(&collector, &stats_ks, &ts_ks).await;
+    assert_eq!(collector.pending_rows(), 0);
+    assert_eq!(stats_ks.prefix_iter_raw("stats:").await.unwrap().len(), 2);
+}
+
 /// The shutdown flush also writes the open bucket.
 #[tokio::test]
 async fn the_shutdown_flush_writes_the_open_bucket() {

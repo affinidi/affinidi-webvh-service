@@ -22,12 +22,17 @@ once per 5 minutes, when its bucket closes, rather than every 10 seconds.
 - **The chart's `bucketSeconds` now varies**: a DID without 5-minute detail
   is charted hourly (daily over 30 days). The UI uses the value it is sent.
 - **Migration is automatic.** At startup the legacy `ts:` rows are folded into
-  the new rows, a flush's worth at a time; charts read the legacy rows until
+  the new rows, a flush's worth at a time, reading them 1,000 at a time on a
+  store that lists keys in order (fjall), so memory does not grow with the
+  deployment's history; a store that cannot (a hash-ordered scan) reads them
+  whole. A failed read is retried from where it stopped. Charts read the legacy rows until
   it completes. It can run again safely, and picks up rows an older version
   wrote after a rollback. Legacy rows are kept for 30 days, then deleted;
   `stats-purge-legacy` deletes them at once.
 - Deleting a DID deletes its statistics rows.
 - Displayed totals include counts not yet written.
+- A paced statistics flush ends within its 10-second interval; under a slow
+  store, what is left waits for the next flush instead of delaying it.
 
 See `docs/stats-tiers.md`.
 

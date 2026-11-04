@@ -105,6 +105,23 @@ pub trait KeyspaceOps: Send + Sync {
     fn contains_key(&self, key: Vec<u8>) -> BoxFuture<'_, Result<bool, AppError>>;
     fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>>;
 
+    /// Up to `limit` pairs whose key starts with `prefix` and sorts after
+    /// `after`, in key order: one page of [`Self::prefix_iter_raw`], so a
+    /// caller can walk a large prefix without holding all of it.
+    ///
+    /// `Ok(None)` when the backend cannot list a prefix in key order (its
+    /// listing is a hash-ordered scan); the caller then reads the whole
+    /// prefix with [`Self::prefix_iter_raw`]. That is the default.
+    fn prefix_page_raw(
+        &self,
+        prefix: Vec<u8>,
+        after: Option<Vec<u8>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Option<Vec<RawKvPair>>, AppError>> {
+        let _ = (prefix, after, limit);
+        Box::pin(async { Ok(None) })
+    }
+
     /// Atomically read a key's value and remove it in one operation.
     ///
     /// Returns `Some(value)` if the key existed and was removed; `None` if
@@ -478,6 +495,20 @@ impl KeyspaceHandle {
         self.inner.prefix_iter_raw(prefix.into()).await
     }
 
+    /// One page of [`Self::prefix_iter_raw`]: up to `limit` pairs after
+    /// `after`, in key order, or `None` when this backend cannot list in key
+    /// order (read the whole prefix instead).
+    pub async fn prefix_page_raw(
+        &self,
+        prefix: impl Into<Vec<u8>>,
+        after: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<Option<Vec<RawKvPair>>, AppError> {
+        self.inner
+            .prefix_page_raw(prefix.into(), after, limit)
+            .await
+    }
+
     /// Returns the approximate number of items in the keyspace.
     pub async fn approximate_len(&self) -> Result<usize, AppError> {
         Ok(self.prefix_iter_raw(b"").await?.len())
@@ -676,6 +707,14 @@ impl KeyspaceOps for FailingWrites {
     fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
         self.inner.prefix_iter_raw(prefix)
     }
+    fn prefix_page_raw(
+        &self,
+        prefix: Vec<u8>,
+        after: Option<Vec<u8>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Option<Vec<RawKvPair>>, AppError>> {
+        self.inner.prefix_page_raw(prefix, after, limit)
+    }
     fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
         Box::pin(async move {
             self.take_write()?;
@@ -733,6 +772,67 @@ impl KeyspaceOps for FailingReads {
             self.take_read()?;
             self.inner.prefix_iter_raw(prefix).await
         })
+    }
+    fn prefix_page_raw(
+        &self,
+        prefix: Vec<u8>,
+        after: Option<Vec<u8>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Option<Vec<RawKvPair>>, AppError>> {
+        Box::pin(async move {
+            self.take_read()?;
+            self.inner.prefix_page_raw(prefix, after, limit).await
+        })
+    }
+    fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        self.inner.take_raw_atomic(key)
+    }
+    fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
+        self.inner.incr_raw(key)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test support: a keyspace that cannot list a prefix in key order
+// ---------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "test-support"))]
+impl KeyspaceHandle {
+    /// Wrap this keyspace so [`Self::prefix_page_raw`] answers `None`, as a
+    /// backend whose listing is a hash-ordered scan does. Everything else is
+    /// untouched.
+    pub fn without_ordered_pages(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            inner: Arc::new(Unordered {
+                inner: self.inner.clone(),
+            }),
+            backend: self.backend.clone(),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct Unordered {
+    inner: Arc<dyn KeyspaceOps>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl KeyspaceOps for Unordered {
+    fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
+        self.inner.insert_raw(key, value)
+    }
+    fn get_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        self.inner.get_raw(key)
+    }
+    fn remove(&self, key: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
+        self.inner.remove(key)
+    }
+    fn contains_key(&self, key: Vec<u8>) -> BoxFuture<'_, Result<bool, AppError>> {
+        self.inner.contains_key(key)
+    }
+    fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
+        self.inner.prefix_iter_raw(prefix)
     }
     fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
         self.inner.take_raw_atomic(key)
