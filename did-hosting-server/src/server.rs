@@ -79,6 +79,10 @@ pub struct AppState {
     /// single address cannot force unbounded DID-resolution work by posting
     /// documents that name a fresh issuer on every request.
     pub trust_tasks_rate_limiter: Arc<did_hosting_common::server::rate_limit::IpRateLimiter>,
+    /// Who an HTTPS request's client is, from `server.trusted_proxies`: built
+    /// once with the state and shared by the Trust Task listener and the
+    /// resolution limit.
+    pub client_ips: did_hosting_common::server::rate_limit::ClientIps,
     /// Serialises `sync/update`, `sync/batch` and `sync/delete`: each reads
     /// what this edge holds for a slot, checks the new log extends it (or, for
     /// a delete, reads the record to remove), and writes — two such
@@ -107,6 +111,8 @@ impl AppState {
         let replay_cache = Arc::new(
             did_hosting_common::server::replay::ReplayCache::with_config(config.replay.clone())?,
         );
+        let client_ips =
+            did_hosting_common::server::rate_limit::ClientIps::new(&config.server.trusted_proxies)?;
         Ok(Self {
             dids_ks: store.keyspace(KS_DIDS)?,
             store,
@@ -126,6 +132,7 @@ impl AppState {
             replication: Arc::new(crate::replication::ReplicationStatus::new(
                 did_hosting_common::server::auth::session::now_epoch(),
             )),
+            client_ips,
             trust_tasks_rate_limiter: Arc::new(
                 did_hosting_common::server::rate_limit::IpRateLimiter::new(
                     did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
@@ -769,8 +776,16 @@ fn run_rest_thread(
         // There is no management surface to switch on.
         info!("HTTP thread started (public DID serving + Trust Task listener)");
         let resolve_limit = Arc::new(
-            did_hosting_common::server::rate_limit::ResolveRateLimiter::new(&state.config.server),
+            did_hosting_common::server::rate_limit::ResolveRateLimiter::new(
+                &state.config.server,
+                &state.client_ips,
+            ),
         );
+        let rate_limit_gc = CancellationToken::new();
+        resolve_limit.spawn_gc(rate_limit_gc.clone());
+        state
+            .trust_tasks_rate_limiter
+            .spawn_gc(rate_limit_gc.clone());
         let base_router = routes::router_with_resolve_limit(upload_body_limit, resolve_limit);
 
         // Cloned before `with_state` consumes `state`: the health route is
@@ -819,6 +834,7 @@ fn run_rest_thread(
         .await
         .expect("axum serve failed");
 
+        rate_limit_gc.cancel();
         info!("REST thread shutting down");
     });
 }

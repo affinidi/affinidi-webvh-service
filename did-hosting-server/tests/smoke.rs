@@ -86,6 +86,7 @@ async fn make_state_with(server: ServerConfig) -> (AppState, tempfile::TempDir) 
         replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
             did_hosting_common::server::auth::session::now_epoch(),
         )),
+        client_ips: Default::default(),
         trust_tasks_rate_limiter: Arc::new(
             did_hosting_common::server::rate_limit::IpRateLimiter::new(
                 did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
@@ -963,7 +964,10 @@ async fn resolve_rate_limit_refuses_one_address_past_the_limit() {
     seed_did(&state, "alice", did_id, &body).await;
 
     let limit = std::sync::Arc::new(
-        did_hosting_common::server::rate_limit::ResolveRateLimiter::new(&state.config.server),
+        did_hosting_common::server::rate_limit::ResolveRateLimiter::new(
+            &state.config.server,
+            &state.client_ips,
+        ),
     );
     let app = did_hosting_server::routes::router_with_resolve_limit(1024 * 1024, limit)
         .with_state(state.clone());

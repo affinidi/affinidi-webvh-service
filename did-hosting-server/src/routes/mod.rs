@@ -18,7 +18,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
-use did_hosting_common::server::rate_limit::{ResolveRateLimiter, limit_resolution};
+use did_hosting_common::server::rate_limit::ResolveRateLimiter;
 
 use crate::server::AppState;
 
@@ -118,10 +118,7 @@ pub fn router_public_only() -> Router<AppState> {
 pub fn router_public_only_with_resolve_limit(
     resolve_limit: Arc<ResolveRateLimiter>,
 ) -> Router<AppState> {
-    router_public_only().layer(axum::middleware::from_fn_with_state(
-        resolve_limit,
-        limit_resolution,
-    ))
+    router_public_only().layer(resolve_limit.layer())
 }
 
 /// The edge's full router, with the DID-serving fallback and no resolution
@@ -147,9 +144,6 @@ pub fn router_with_resolve_limit(
     // other directive.
     router_public_only()
         .fallback(did_public::serve_public)
-        .layer(axum::middleware::from_fn_with_state(
-            resolve_limit,
-            limit_resolution,
-        ))
+        .layer(resolve_limit.layer())
         .merge(trust_task_listener(body_limit))
 }
