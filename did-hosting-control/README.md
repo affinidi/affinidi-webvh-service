@@ -188,9 +188,26 @@ Environment variables use the `CONTROL_` prefix:
 | `CONTROL_REPLAY_MAX_ENTRIES`               | Replay cache records, all signers (default 1,000,000, about 32 MB) |
 | `CONTROL_REPLAY_MAX_ENTRIES_PER_SIGNER`    | Replay cache records per signer (default 250,000, about 600 signed requests a second) |
 | `CONTROL_GEOIP_DATABASE`                   | Local GeoIP `.mmdb` file for wallet sign-in locations (empty clears) |
+| `CONTROL_STATS_FLUSH_MAX_ROWS_PER_SECOND`  | Statistics rows the periodic flush writes a second, at most (default 20) |
 
 The replay settings live in `[replay]` (`max_entries`,
 `max_entries_per_signer`); see "Replay cache bounds" below.
+
+### Statistics flush budget
+
+`[stats_flush] max_rows_per_second` (1 to 10,000, default 20) bounds how fast
+the control plane writes statistics. Every 10 seconds it takes the per-DID
+counters gathered since the last flush and writes at most that many rows a
+second, paced across the interval. Each row is a read and a write, so on
+DynamoDB each row a second costs about one read and one write unit a second.
+
+Rows past the budget wait for the next flush. What waits too long is dropped,
+with a warning: time-series buckets older than an hour, and rows past the
+collector's caps (100,000 DIDs, 200,000 buckets). Per-DID totals are never
+dropped by age. So set the budget above the rows produced: about two per
+distinct DID resolved in 10 seconds, divided by 10. Lower it to leave a small
+table's capacity for resolutions and creations; raise it to drain a backlog
+sooner.
 
 ## CLI Commands
 

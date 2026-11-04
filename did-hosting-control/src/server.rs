@@ -500,6 +500,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let storage_timeseries_ks = state.timeseries_ks.clone();
     let storage_dids_ks = state.dids_ks.clone();
     let storage_collector = state.stats_collector.clone();
+    let stats_flush = state.config.stats_flush;
     let storage_handle = std::thread::Builder::new()
         .name("control-storage".into())
         .spawn(move || {
@@ -512,6 +513,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
                 storage_auth_config,
                 has_auth,
                 storage_collector,
+                stats_flush,
                 &mut storage_shutdown,
             )
         })
@@ -1008,6 +1010,7 @@ fn run_storage_thread(
     auth_config: AuthConfig,
     has_auth: bool,
     collector: Arc<did_hosting_common::server::stats_collector::StatsCollector>,
+    stats_flush: crate::config::StatsFlushConfig,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1019,7 +1022,7 @@ fn run_storage_thread(
         info!("storage thread started");
 
         let session_interval = Duration::from_secs(auth_config.session_cleanup_interval);
-        let flush_interval = Duration::from_secs(10);
+        let flush_interval = crate::config::STATS_FLUSH_INTERVAL;
 
         let mut session_timer = tokio::time::interval(session_interval);
         let mut flush_timer = tokio::time::interval(flush_interval);
@@ -1044,7 +1047,7 @@ fn run_storage_thread(
                 }
                 _ = flush_timer.tick() => {
                     // Flush accumulated per-DID stats deltas to persistent store
-                    if let Err(e) = flush_stats_to_store(&collector, &stats_ks, &timeseries_ks, STATS_FLUSH_MAX_ROWS).await {
+                    if let Err(e) = flush_stats_paced(&collector, &stats_ks, &timeseries_ks, &stats_flush, shutdown_rx.clone()).await {
                         warn!("stats flush error: {e}");
                     }
                 }
@@ -1070,13 +1073,6 @@ fn run_storage_thread(
         }
     });
 }
-
-/// Most rows one periodic stats flush writes, about 20 a second at the
-/// 10-second flush interval. Each row is a read and a write, so this bounds
-/// the flush's share of the store's capacity and how long it holds the
-/// storage task; rows beyond it wait for the next flush, in the order
-/// [`stats_flush_order`] gives them.
-pub const STATS_FLUSH_MAX_ROWS: usize = 200;
 
 /// Rows a flush writes at once. The rows are independent keys, so writing
 /// several together takes the same store capacity in a fraction of the
@@ -1129,7 +1125,58 @@ pub async fn flush_stats_to_store(
     timeseries_ks: &KeyspaceHandle,
     max_rows: usize,
 ) -> Result<(), AppError> {
-    flush_stats_rows(collector, stats_ks, timeseries_ks, max_rows, None).await
+    flush_stats_rows(collector, stats_ks, timeseries_ks, max_rows, None, None).await
+}
+
+/// The periodic flush: at most [`StatsFlushConfig::rows_per_flush`] rows,
+/// written at `max_rows_per_second`, so the store sees the configured rate
+/// rather than the whole budget at once.
+///
+/// Once `stop` reads `true` the flush stops pacing and writes nothing more:
+/// what it has not written goes back to the collector, for the shutdown
+/// flush ([`flush_remaining_stats`]) to write without waiting.
+///
+/// [`StatsFlushConfig::rows_per_flush`]: crate::config::StatsFlushConfig::rows_per_flush
+pub async fn flush_stats_paced(
+    collector: &did_hosting_common::server::stats_collector::StatsCollector,
+    stats_ks: &KeyspaceHandle,
+    timeseries_ks: &KeyspaceHandle,
+    budget: &crate::config::StatsFlushConfig,
+    stop: watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    let pace = Pace {
+        rows_per_second: budget.max_rows_per_second.max(1),
+        stop,
+    };
+    flush_stats_rows(
+        collector,
+        stats_ks,
+        timeseries_ks,
+        budget.rows_per_flush(),
+        None,
+        Some(pace),
+    )
+    .await
+}
+
+/// How a paced flush spaces its writes.
+struct Pace {
+    rows_per_second: u32,
+    stop: watch::Receiver<bool>,
+}
+
+impl Pace {
+    /// Wait until `at`. Returns `false`, at once, when `stop` is or turns
+    /// `true` (or its sender is gone): the flush should end.
+    async fn wait_until(&mut self, at: tokio::time::Instant) -> bool {
+        if *self.stop.borrow() {
+            return false;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep_until(at) => true,
+            _ = self.stop.wait_for(|stopping| *stopping) => false,
+        }
+    }
 }
 
 /// Flush every pending stats row, for shutdown, for at most
@@ -1147,6 +1194,7 @@ pub async fn flush_remaining_stats(
         timeseries_ks,
         usize::MAX,
         Some(deadline),
+        None,
     )
     .await;
     let lost = collector.pending_rows();
@@ -1169,6 +1217,7 @@ async fn flush_stats_rows(
     timeseries_ks: &KeyspaceHandle,
     max_rows: usize,
     deadline: Option<tokio::time::Instant>,
+    mut pace: Option<Pace>,
 ) -> Result<(), AppError> {
     if let Some(dropped) = collector.take_dropped(STATS_DROP_WARN_SECS) {
         warn!(
@@ -1184,14 +1233,24 @@ async fn flush_stats_rows(
     let mut failed = Vec::new();
     let mut failure = None;
     let mut written = 0usize;
+    // When the next group of writes may start, for a paced flush.
+    let mut next_start = tokio::time::Instant::now();
 
     while written < max_rows
         && !rows.is_empty()
         && deadline.is_none_or(|d| tokio::time::Instant::now() < d)
     {
-        let n = STATS_FLUSH_CONCURRENCY
+        let mut n = STATS_FLUSH_CONCURRENCY
             .min(max_rows - written)
             .min(rows.len());
+        if let Some(pace) = pace.as_mut() {
+            if !pace.wait_until(next_start).await {
+                break;
+            }
+            n = n.min(pace.rows_per_second as usize);
+            next_start = tokio::time::Instant::now()
+                + Duration::from_secs_f64(n as f64 / f64::from(pace.rows_per_second));
+        }
         let mut set = tokio::task::JoinSet::new();
         for row in rows.drain(..n) {
             let stats_ks = stats_ks.clone();
@@ -1636,6 +1695,86 @@ mod tests {
             .unwrap();
         assert_eq!(collector.pending_rows(), 0);
         assert_eq!(timeseries_ks.prefix_iter_raw("ts:").await.unwrap().len(), 3);
+        // Deferred, not lost: every DID's totals arrive with their counts.
+        for mnemonic in ["alice", "bob"] {
+            let total: did_hosting_common::DidStats = stats_ks
+                .get(format!("stats:{mnemonic}"))
+                .await
+                .unwrap()
+                .expect("totals written");
+            assert_eq!(total.total_resolves, 1, "{mnemonic}");
+        }
+    }
+
+    /// A paced flush writes at the configured rate: five rows at two a
+    /// second start at 0, 1 and 2 seconds, rather than all at once.
+    #[tokio::test]
+    async fn a_paced_flush_spreads_its_rows_at_the_configured_rate() {
+        let (_dir, stats_ks, timeseries_ks) = fjall_keyspaces().await;
+        let collector = StatsCollector::new();
+        for mnemonic in ["alice", "bob"] {
+            collector.record_resolve(mnemonic);
+        }
+        assert_eq!(collector.pending_rows(), 5);
+        let budget = crate::config::StatsFlushConfig {
+            max_rows_per_second: 2,
+        };
+        let (_tx, stop) = watch::channel(false);
+
+        let started = std::time::Instant::now();
+        flush_stats_paced(&collector, &stats_ks, &timeseries_ks, &budget, stop)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            collector.pending_rows(),
+            0,
+            "within the budget, all written"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(1900),
+            "five rows at two a second take two seconds, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Shutdown ends a paced flush at once; what it did not write goes back
+    /// to the collector, and the shutdown flush writes it.
+    #[tokio::test]
+    async fn shutdown_cuts_a_paced_flush_short_and_loses_nothing() {
+        let (_dir, stats_ks, timeseries_ks) = fjall_keyspaces().await;
+        let collector = StatsCollector::new();
+        for mnemonic in ["alice", "bob"] {
+            collector.record_resolve(mnemonic);
+        }
+        let budget = crate::config::StatsFlushConfig {
+            max_rows_per_second: 1,
+        };
+        let (tx, stop) = watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = tx.send(true);
+        });
+
+        let started = std::time::Instant::now();
+        flush_stats_paced(&collector, &stats_ks, &timeseries_ks, &budget, stop)
+            .await
+            .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stopped instead of pacing the rest, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            collector.pending_rows(),
+            4,
+            "one row written, four requeued"
+        );
+
+        flush_remaining_stats(&collector, &stats_ks, &timeseries_ks).await;
+        assert_eq!(collector.pending_rows(), 0);
+        assert_eq!(stats_ks.prefix_iter_raw("stats:").await.unwrap().len(), 2);
     }
 
     /// A write the store applied but reported as failed is not retried, so
