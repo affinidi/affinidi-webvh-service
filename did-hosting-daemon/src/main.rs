@@ -1109,6 +1109,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             auth_config: config.auth.clone(),
             has_auth: config.server_did.is_some(),
             collector: stats_collector.clone(),
+            stats_flush: config.stats_flush,
             control_state: control_state.clone(),
             content_cache: server_state.as_ref().map(|s| s.did_cache.clone()),
             gate_cache: server_state.as_ref().and_then(|s| s.gate_cache.clone()),
@@ -1276,6 +1277,8 @@ struct DaemonStorageParams {
     auth_config: did_hosting_common::server::config::AuthConfig,
     has_auth: bool,
     collector: Arc<StatsCollector>,
+    /// The statistics flush budget (`[stats_flush]`).
+    stats_flush: did_hosting_control::config::StatsFlushConfig,
     /// The control plane's state, for the identity sweep.
     ///
     /// Daemon parity (CLAUDE.md): periodic work that standalone services spawn
@@ -1298,7 +1301,7 @@ async fn run_daemon_storage_task(
     let session_interval = Duration::from_secs(params.auth_config.session_cleanup_interval);
     let did_ttl_seconds = params.auth_config.cleanup_ttl_minutes * 60;
     let did_interval = Duration::from_secs(did_ttl_seconds.max(60));
-    let flush_interval = Duration::from_secs(10);
+    let flush_interval = did_hosting_control::config::STATS_FLUSH_INTERVAL;
 
     let mut session_timer = tokio::time::interval(session_interval);
     let mut did_timer = tokio::time::interval(did_interval);
@@ -1371,11 +1374,12 @@ async fn run_daemon_storage_task(
                 }
             }
             _ = flush_timer.tick() => {
-                if let Err(e) = did_hosting_control::server::flush_stats_to_store(
+                if let Err(e) = did_hosting_control::server::flush_stats_paced(
                     &params.collector,
                     &params.stats_ks,
                     &params.timeseries_ks,
-                    did_hosting_control::server::STATS_FLUSH_MAX_ROWS,
+                    &params.stats_flush,
+                    shutdown_rx.clone(),
                 ).await {
                     warn!("stats flush error: {e}");
                 }

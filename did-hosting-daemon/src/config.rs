@@ -74,6 +74,13 @@ pub struct DaemonConfig {
         skip_serializing_if = "did_hosting_control::config::GeoIpConfig::is_default"
     )]
     pub geoip: did_hosting_control::config::GeoIpConfig,
+    /// How fast the periodic statistics flush may write (`[stats_flush]`; env
+    /// `DAEMON_STATS_FLUSH_MAX_ROWS_PER_SECOND`).
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_control::config::StatsFlushConfig::is_default"
+    )]
+    pub stats_flush: did_hosting_control::config::StatsFlushConfig,
 
     /// Multi-domain hosting settings (T18). `bootstrap_domains` seeds
     /// the `domains` keyspace on first boot when no entries exist;
@@ -210,6 +217,8 @@ impl DaemonConfig {
         config.replay.apply_env_overrides("DAEMON")?;
         // DAEMON_GEOIP_DATABASE — the local sign-in location database.
         config.geoip.apply_env_overrides("DAEMON");
+        // DAEMON_STATS_FLUSH_MAX_ROWS_PER_SECOND. Also validates `[stats_flush]`.
+        config.stats_flush.apply_env_overrides("DAEMON")?;
         // DAEMON_SERVER_RESOLVE_RATE_LIMIT_* — per-address limit on resolution.
         config
             .server
@@ -326,6 +335,7 @@ impl DaemonConfig {
             identity: self.identity.clone(),
             replay: self.replay.clone(),
             geoip: self.geoip.clone(),
+            stats_flush: self.stats_flush,
             config_path: self.config_path.clone(),
         }
     }
@@ -481,6 +491,29 @@ context_id = "webvh"
                 "/var/lib/did-hosting/geoip/dbip-city-lite.mmdb"
             ))
         );
+    }
+
+    /// `[stats_flush]` sets the daemon's own flush budget and reaches the
+    /// embedded control plane; a zero budget stops the load. (The
+    /// `DAEMON_STATS_FLUSH_MAX_ROWS_PER_SECOND` parsing is the control plane's
+    /// `StatsFlushConfig::apply_env_overrides`, tested there: setting a
+    /// `DAEMON_*` variable here would race the other load tests.)
+    #[test]
+    fn stats_flush_budget_is_read_from_the_file() {
+        let (_dir, path) = write_temp_config(SELF_MANAGED_TOML);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert_eq!(cfg.stats_flush.rows_per_flush(), 200, "default unchanged");
+
+        let toml = format!("{SELF_MANAGED_TOML}\n[stats_flush]\nmax_rows_per_second = 5\n");
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert_eq!(cfg.stats_flush.rows_per_flush(), 50);
+        assert_eq!(cfg.control_config().stats_flush.max_rows_per_second, 5);
+
+        let toml = format!("{SELF_MANAGED_TOML}\n[stats_flush]\nmax_rows_per_second = 0\n");
+        let (_dir, path) = write_temp_config(&toml);
+        let err = DaemonConfig::load(Some(path)).expect_err("zero defers every row");
+        assert!(err.to_string().contains("max_rows_per_second"), "{err}");
     }
 
     /// `[[geoip.networks]]` reaches the control plane; a bad range or label

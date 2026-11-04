@@ -56,6 +56,28 @@ proof (a relying party may be stricter than the specification) and emits
 no `details.reason`, so neither change alters what it does. The UI's
 generated types follow the lock.
 
+### Added — a budget for the statistics flush
+
+The control plane and the daemon flush per-DID statistics every 10 seconds:
+at most 200 rows, each a read and a write, all at once. On a small DynamoDB
+table that burst could take most of the capacity.
+`[stats_flush] max_rows_per_second` (env
+`CONTROL_STATS_FLUSH_MAX_ROWS_PER_SECOND`, `DAEMON_STATS_FLUSH_MAX_ROWS_PER_SECOND`)
+now sets the rate, from 1 to 10,000, and the flush is paced at it across the
+interval instead of written in one burst. The default, 20, keeps today's
+volume. Rows past the budget wait for the next flush; as before, time-series
+buckets older than an hour and rows past the collector's caps are dropped
+with a warning, so a budget below the rows produced loses series data.
+Shutdown stops the pacing, and the final flush writes the rest.
+
+### Fixed — no warning per DID change when no edge is registered
+
+"DID sync: no active servers in registry" (and its delete counterpart) was
+logged at warn on every DID change whenever no edge was active, which for a
+daemon is always. With no edge registered it is now logged at debug. With
+edges registered but none active, so the change reaches none of them, it is
+a warning at most once every 5 minutes.
+
 ## 0.11.0 (release/0.11)
 
 ### Fixed — the plaintext-secrets warning is logged once
