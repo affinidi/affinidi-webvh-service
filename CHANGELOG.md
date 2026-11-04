@@ -14,8 +14,10 @@ client may spend its allowance at once and regains one request every
 to the end of the window, and there is no double burst across a window
 boundary. Refusals are logged once per client per window. Idle clients are
 swept every minute, and at most 250,000 are tracked per limit (previously
-10,000, with the map cleared when full). The `429` keeps its shape, but its
-`message` is now the same generic text for every limit.
+10,000, with the map cleared when full). The `429` keeps its shape. Its `message`
+changes: the resolution limit sends the crate's generic text, and the other
+limits share one template naming their numbers, replacing the challenge's and
+redemption's own wording.
 
 Four refusals change. A chain from a trusted proxy that cannot be read (a
 malformed entry, more than 64 entries, or a header that is not visible ASCII)

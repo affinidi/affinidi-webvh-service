@@ -184,7 +184,10 @@ impl ResolveRateLimiter {
         )
         .with_source(RATE_LIMIT_SOURCE)
         .with_limiter_name(RESOLVE_RATE_LIMIT_NAME);
-        let clients = client_ip_extractor(&server.trusted_proxies)?
+        // A clone of the handlers' shared extractor, so a proxy's invalid
+        // chain is logged once a minute whichever path met it.
+        let clients = (*shared_client_ip_extractor(&server.trusted_proxies)?)
+            .clone()
             .ipv6_prefix(RESOLVE_IPV6_PREFIX)
             .expect("64 is a valid IPv6 prefix length");
         let layer = RateLimitLayer::new(state.clone()).client_ip_extractor(clients);
@@ -253,6 +256,25 @@ pub fn resolve_client_ip(
     shared_client_ip_extractor(trusted_proxies)?
         .client_ip(peer, headers)
         .map_err(|e| AppError::Validation(e.to_string()))
+}
+
+/// Admit one request from `peer` to a Trust Task listener, charged to its
+/// client address: the client address, or the refusal to send (`400` for an
+/// unreadable chain from a trusted proxy, `429` past the limit). A client's
+/// first refusal in each window is logged.
+pub fn admit_trust_task(
+    limiter: &IpRateLimiter,
+    peer: IpAddr,
+    headers: &HeaderMap,
+    trusted_proxies: &[IpNetwork],
+) -> Result<IpAddr, AppError> {
+    let client_ip = resolve_client_ip(peer, headers, trusted_proxies)?;
+    limiter.try_consume(client_ip).inspect_err(|_| {
+        if limiter.first_refusal_in_window(&client_ip) {
+            warn!(ip = %client_ip, "trust-tasks client over the rate limit; refusing it until its budget refills");
+        }
+    })?;
+    Ok(client_ip)
 }
 
 /// The extractor for `trusted_proxies`, built once per distinct list and

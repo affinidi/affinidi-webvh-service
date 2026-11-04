@@ -29,10 +29,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
-use tracing::{error, warn};
+use tracing::error;
 use trust_tasks_rs::{RejectReason, TrustTask};
 
-use did_hosting_common::server::rate_limit::resolve_client_ip;
+use did_hosting_common::server::rate_limit::admit_trust_task;
 
 use crate::server::AppState;
 
@@ -76,17 +76,13 @@ pub async fn receive(
 ) -> Response {
     // Per-address rate limit, ahead of parsing and any DID resolution the
     // document's verification would trigger.
-    let client_ip =
-        match resolve_client_ip(addr.ip(), &headers, &state.config.server.trusted_proxies) {
-            Ok(client_ip) => client_ip,
-            Err(e) => return e.into_response(),
-        };
-    let limiter = &state.trust_tasks_rate_limiter;
-    if let Err(e) = limiter.try_consume(client_ip) {
-        if limiter.first_refusal_in_window(&client_ip) {
-            warn!(ip = %client_ip, "trust-tasks client over the rate limit; refusing it until its budget refills");
-        }
-        return e.into_response();
+    if let Err(refusal) = admit_trust_task(
+        &state.trust_tasks_rate_limiter,
+        addr.ip(),
+        &headers,
+        &state.config.server.trusted_proxies,
+    ) {
+        return refusal.into_response();
     }
 
     let doc: TrustTask<Value> = match serde_json::from_slice(&body) {

@@ -60,7 +60,7 @@ async fn assert_rate_limited(response: Response, limiter: &str) -> Value {
 }
 
 #[tokio::test]
-async fn per_ip_challenge_limit_answers_429_with_retry_after_from_the_window() {
+async fn per_ip_challenge_limit_answers_429_with_retry_after_to_the_next_request() {
     let ts = TestServer::start().await;
     let app = ts.router();
 
@@ -83,10 +83,15 @@ async fn per_ip_challenge_limit_answers_429_with_retry_after_from_the_window() {
         .await
         .unwrap();
     let body = assert_rate_limited(response, "auth-challenge-per-ip").await;
-    // The refusal lands inside the window that opened moments ago, so the hint
-    // is the window's remainder: positive and never more than the window.
+    // The allowance refills one challenge every `WINDOW_SECS / MAX_PER_WINDOW`
+    // seconds, so the hint is the wait for the next one, rounded up: not the
+    // rest of a window.
     let retry = body["retryAfterSecs"].as_u64().unwrap();
-    assert!((1..=WINDOW_SECS).contains(&retry), "retry {retry}");
+    let refill = WINDOW_SECS.div_ceil(MAX_PER_WINDOW);
+    assert!(
+        (1..=refill).contains(&retry),
+        "retry {retry}, refill {refill}"
+    );
 }
 
 /// At the per-DID cap the oldest challenge is evicted, not the new one
