@@ -1,3 +1,4 @@
+# Transitional, used only by cut-release.py: see the comment at its top.
 """Shared helpers for the release tooling (RELEASES.md).
 
 A release is named `major.minor` (`0.9`) and lives on `release/<major.minor>`.
@@ -35,16 +36,8 @@ def members(root):
     return [root / m / "Cargo.toml" for m in data["workspace"]["members"]]
 
 
-def crate_versions(root):
-    out = {}
-    for manifest in members(root):
-        pkg = tomllib.loads(manifest.read_text())["package"]
-        out[pkg["name"]] = pkg["version"]
-    return out
-
-
 def set_version(root, version):
-    """Set every workspace crate to `version` and its internal pins to `major.minor`.
+    """Set `[workspace.package] version`, which every crate inherits, and its internal pins to `version`.
 
     The pins rewritten are those naming a workspace member only: an external
     crate that happens to share the number (`tower-http`, `tokio-util`) is
@@ -59,24 +52,23 @@ def set_version(root, version):
     m = RELEASE_VERSION.fullmatch(version)
     if not m:
         raise SystemExit(f"{version!r} is not major.minor.patch[-rc.N]")
-    pin = f"{m.group(1)}.{m.group(2)}"
     names = [tomllib.loads(m.read_text())["package"]["name"] for m in members(root)]
     pin_re = re.compile(
         r'^(\s*(?:' + "|".join(map(re.escape, names)) + r')\s*=\s*\{\s*version\s*=\s*")[^"]*(")',
         re.M,
     )
+    cargo_toml = root / "Cargo.toml"
+    text = cargo_toml.read_text()
+    head, sep, rest = text.partition("[workspace.package]")
+    if not sep:
+        raise SystemExit(f"{cargo_toml}: no [workspace.package] section")
+    rest, n = re.subn(r'^version\s*=\s*"[^"]*"', lambda _: f'version = "{version}"', rest, count=1, flags=re.M)
+    if n != 1:
+        raise SystemExit(f"{cargo_toml}: no [workspace.package] version line")
+    cargo_toml.write_text(head + sep + rest)
     for manifest in members(root):
         text = manifest.read_text()
-        # The first `version =` at the start of a line inside [package].
-        head, sep, rest = text.partition("[package]")
-        if not sep:
-            raise SystemExit(f"{manifest}: no [package] section")
-        rest, n = re.subn(r'^version\s*=\s*"[^"]*"', lambda _: f'version = "{version}"', rest, count=1, flags=re.M)
-        if n != 1:
-            raise SystemExit(f"{manifest}: no [package] version line")
-        text = head + sep + rest
-        text = pin_re.sub(lambda m: f"{m.group(1)}{pin}{m.group(2)}", text)
-        manifest.write_text(text)
+        manifest.write_text(pin_re.sub(lambda m: f"{m.group(1)}{version}{m.group(2)}", text))
     # The committed OpenAPI snapshot embeds did-hosting-server's version, and
     # `openapi_snapshot_in_sync` fails CI on any drift.
     openapi = root / "docs" / "openapi.json"
