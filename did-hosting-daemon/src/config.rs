@@ -74,6 +74,21 @@ pub struct DaemonConfig {
         skip_serializing_if = "did_hosting_control::config::GeoIpConfig::is_default"
     )]
     pub geoip: did_hosting_control::config::GeoIpConfig,
+    /// How fast the periodic statistics flush may write (`[stats_flush]`; env
+    /// `DAEMON_STATS_FLUSH_MAX_ROWS_PER_SECOND`).
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_control::config::StatsFlushConfig::is_default"
+    )]
+    pub stats_flush: did_hosting_control::config::StatsFlushConfig,
+    /// Which DIDs keep 5-minute statistics (`[stats]`; env `DAEMON_STATS_*`).
+    /// Reaches the embedded control plane, which writes the statistics.
+    #[serde(
+        default,
+        deserialize_with = "stats_tiers_ignoring_the_servers_keys",
+        skip_serializing_if = "did_hosting_control::config::StatsTierConfig::is_default"
+    )]
+    pub stats: did_hosting_control::config::StatsTierConfig,
 
     /// Multi-domain hosting settings (T18). `bootstrap_domains` seeds
     /// the `domains` keyspace on first boot when no entries exist;
@@ -347,6 +362,11 @@ impl DaemonConfig {
         config.replay.apply_env_overrides("DAEMON")?;
         // DAEMON_GEOIP_DATABASE — the local sign-in location database.
         config.geoip.apply_env_overrides("DAEMON");
+        // DAEMON_STATS_FLUSH_MAX_ROWS_PER_SECOND. Also validates `[stats_flush]`.
+        config.stats_flush.apply_env_overrides("DAEMON")?;
+        // DAEMON_STATS_MODE / _PROMOTE_PER_HOUR / _DEMOTE_PER_HOUR /
+        // _MAX_FINE_DIDS. Also validates `[stats]`.
+        config.stats.apply_env_overrides("DAEMON")?;
         // DAEMON_SERVER_RESOLVE_RATE_LIMIT_* — per-address limit on resolution.
         config
             .server
@@ -483,6 +503,8 @@ impl DaemonConfig {
             identity: self.identity.clone(),
             replay: self.replay.clone(),
             geoip: self.geoip.clone(),
+            stats_flush: self.stats_flush,
+            stats: self.stats,
             config_path: self.config_path.clone(),
         }
     }
@@ -496,6 +518,31 @@ impl DaemonConfig {
             deployment_mode: "daemon".to_string(),
         }
     }
+}
+
+/// The keys of the embedded server's `[stats]`
+/// ([`did_hosting_server::config::StatsConfig`]).
+const SERVER_STATS_KEYS: [&str; 2] = ["flush_interval_secs", "sync_interval_secs"];
+
+/// Read `[stats]`, dropping the embedded server's keys.
+///
+/// A daemon backup stores the embedded server's configuration, whose
+/// `[stats]` carries [`SERVER_STATS_KEYS`], and a restore writes it back.
+/// The daemon never used them, and before `[stats]` held the statistics
+/// tiers it ignored the whole section. Any other unknown key is still refused.
+fn stats_tiers_ignoring_the_servers_keys<'de, D>(
+    deserializer: D,
+) -> Result<did_hosting_control::config::StatsTierConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut table = toml::Table::deserialize(deserializer)?;
+    for key in SERVER_STATS_KEYS {
+        table.remove(key);
+    }
+    toml::Value::Table(table)
+        .try_into()
+        .map_err(serde::de::Error::custom)
 }
 
 #[cfg(test)]
@@ -639,6 +686,72 @@ context_id = "webvh"
                 "/var/lib/did-hosting/geoip/dbip-city-lite.mmdb"
             ))
         );
+    }
+
+    /// `[stats_flush]` sets the daemon's own flush budget and reaches the
+    /// embedded control plane; a zero budget stops the load. (The
+    /// `DAEMON_STATS_FLUSH_MAX_ROWS_PER_SECOND` parsing is the control plane's
+    /// `StatsFlushConfig::apply_env_overrides`, tested there: setting a
+    /// `DAEMON_*` variable here would race the other load tests.)
+    #[test]
+    fn stats_flush_budget_is_read_from_the_file() {
+        let (_dir, path) = write_temp_config(SELF_MANAGED_TOML);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert_eq!(cfg.stats_flush.rows_per_flush(), 200, "default unchanged");
+
+        let toml = format!("{SELF_MANAGED_TOML}\n[stats_flush]\nmax_rows_per_second = 5\n");
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert_eq!(cfg.stats_flush.rows_per_flush(), 50);
+        assert_eq!(cfg.control_config().stats_flush.max_rows_per_second, 5);
+
+        let toml = format!("{SELF_MANAGED_TOML}\n[stats_flush]\nmax_rows_per_second = 0\n");
+        let (_dir, path) = write_temp_config(&toml);
+        let err = DaemonConfig::load(Some(path)).expect_err("zero defers every row");
+        assert!(err.to_string().contains("max_rows_per_second"), "{err}");
+    }
+
+    /// `[stats]` reaches the embedded control plane; thresholds without a
+    /// gap stop the load.
+    #[test]
+    fn stats_tiers_are_read_from_the_file() {
+        let toml = format!("{SELF_MANAGED_TOML}\n[stats]\nmode = \"coarse\"\nmax_fine_dids = 5\n");
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        let stats = cfg.control_config().stats;
+        assert_eq!(stats.mode, did_hosting_control::config::StatsMode::Coarse);
+        assert_eq!(stats.max_fine_dids, 5);
+
+        let toml =
+            format!("{SELF_MANAGED_TOML}\n[stats]\npromote_per_hour = 10\ndemote_per_hour = 10\n");
+        let (_dir, path) = write_temp_config(&toml);
+        let err = DaemonConfig::load(Some(path)).expect_err("no gap");
+        assert!(err.to_string().contains("demote_per_hour"), "{err}");
+    }
+
+    /// A config restored from a backup carries the embedded server's
+    /// `[stats]` keys; it still loads, and a typo does not.
+    #[test]
+    fn stats_section_from_a_restored_backup_still_loads() {
+        let toml = format!(
+            "{SELF_MANAGED_TOML}\n[stats]\nflush_interval_secs = 5\nsync_interval_secs = 1\n"
+        );
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert!(cfg.stats.is_default());
+
+        let toml =
+            format!("{SELF_MANAGED_TOML}\n[stats]\nflush_interval_secs = 5\nmode = \"coarse\"\n");
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert_eq!(
+            cfg.stats.mode,
+            did_hosting_control::config::StatsMode::Coarse
+        );
+
+        let toml = format!("{SELF_MANAGED_TOML}\n[stats]\nmod = \"coarse\"\n");
+        let (_dir, path) = write_temp_config(&toml);
+        assert!(DaemonConfig::load(Some(path)).is_err(), "a typo is refused");
     }
 
     /// `[[geoip.networks]]` reaches the control plane; a bad range or label

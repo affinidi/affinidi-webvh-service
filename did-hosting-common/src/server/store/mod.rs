@@ -107,6 +107,20 @@ fn check_item_size(backend: &str, size: usize, limit: usize) -> Result<(), AppEr
 // Traits
 // ---------------------------------------------------------------------------
 
+/// One page of a prefix walk ([`KeyspaceOps::prefix_page_raw`]).
+#[derive(Debug, Default)]
+pub struct PrefixPage {
+    /// The page's pairs within the prefix.
+    pub rows: Vec<RawKvPair>,
+    /// Where the next page starts, or `None` when the walk is complete.
+    /// Opaque: pass it back unchanged.
+    pub next: Option<Vec<u8>>,
+    /// Whether pages come in key order, so the rows sharing a key prefix
+    /// arrive together. A hash-ordered scan (DynamoDB) pages too, but a
+    /// caller grouping rows must then hold them until the walk completes.
+    pub ordered: bool,
+}
+
 /// Per-keyspace CRUD + prefix scan over raw bytes.
 pub trait KeyspaceOps: Send + Sync {
     fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>>;
@@ -114,6 +128,26 @@ pub trait KeyspaceOps: Send + Sync {
     fn remove(&self, key: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>>;
     fn contains_key(&self, key: Vec<u8>) -> BoxFuture<'_, Result<bool, AppError>>;
     fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>>;
+
+    /// One page of [`Self::prefix_iter_raw`], so a caller can walk a large
+    /// prefix without holding all of it: the pairs whose key starts with
+    /// `prefix`, from where `cursor` (a previous page's
+    /// [`PrefixPage::next`]) left off, reading about `limit` keys.
+    ///
+    /// A page may be empty while more follow (a scan whose `limit` keys all
+    /// fell outside the prefix); the walk ends when `next` is `None`.
+    ///
+    /// `Ok(None)` when the backend cannot page at all; the caller then reads
+    /// the whole prefix with [`Self::prefix_iter_raw`]. That is the default.
+    fn prefix_page_raw(
+        &self,
+        prefix: Vec<u8>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Option<PrefixPage>, AppError>> {
+        let _ = (prefix, cursor, limit);
+        Box::pin(async { Ok(None) })
+    }
 
     /// Atomically read a key's value and remove it in one operation.
     ///
@@ -609,6 +643,20 @@ impl KeyspaceHandle {
         self.inner.prefix_iter_raw(prefix.into()).await
     }
 
+    /// One page of [`Self::prefix_iter_raw`], from `cursor` (a previous
+    /// page's `next`), or `None` when this backend cannot page (read the
+    /// whole prefix instead). See [`KeyspaceOps::prefix_page_raw`].
+    pub async fn prefix_page_raw(
+        &self,
+        prefix: impl Into<Vec<u8>>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<Option<PrefixPage>, AppError> {
+        self.inner
+            .prefix_page_raw(prefix.into(), cursor, limit)
+            .await
+    }
+
     /// Returns the approximate number of items in the keyspace.
     pub async fn approximate_len(&self) -> Result<usize, AppError> {
         Ok(self.prefix_iter_raw(b"").await?.len())
@@ -812,6 +860,14 @@ impl KeyspaceOps for FailingWrites {
     fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
         self.inner.prefix_iter_raw(prefix)
     }
+    fn prefix_page_raw(
+        &self,
+        prefix: Vec<u8>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Option<PrefixPage>, AppError>> {
+        self.inner.prefix_page_raw(prefix, cursor, limit)
+    }
     fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
         Box::pin(async move {
             self.take_write()?;
@@ -868,6 +924,156 @@ impl KeyspaceOps for FailingReads {
         Box::pin(async move {
             self.take_read()?;
             self.inner.prefix_iter_raw(prefix).await
+        })
+    }
+    fn prefix_page_raw(
+        &self,
+        prefix: Vec<u8>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Option<PrefixPage>, AppError>> {
+        Box::pin(async move {
+            self.take_read()?;
+            self.inner.prefix_page_raw(prefix, cursor, limit).await
+        })
+    }
+    fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        self.inner.take_raw_atomic(key)
+    }
+    fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
+        self.inner.incr_raw(key)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test support: a keyspace that cannot list a prefix in key order
+// ---------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "test-support"))]
+impl KeyspaceHandle {
+    /// Wrap this keyspace so [`Self::prefix_page_raw`] answers `None`, as a
+    /// backend whose listing is a hash-ordered scan does. Everything else is
+    /// untouched.
+    pub fn without_ordered_pages(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            inner: Arc::new(Unordered {
+                inner: self.inner.clone(),
+            }),
+            backend: self.backend.clone(),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct Unordered {
+    inner: Arc<dyn KeyspaceOps>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl KeyspaceOps for Unordered {
+    fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
+        self.inner.insert_raw(key, value)
+    }
+    fn get_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        self.inner.get_raw(key)
+    }
+    fn remove(&self, key: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
+        self.inner.remove(key)
+    }
+    fn contains_key(&self, key: Vec<u8>) -> BoxFuture<'_, Result<bool, AppError>> {
+        self.inner.contains_key(key)
+    }
+    fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
+        self.inner.prefix_iter_raw(prefix)
+    }
+    fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        self.inner.take_raw_atomic(key)
+    }
+    fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
+        self.inner.incr_raw(key)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test support: a keyspace that pages like a hash-ordered scan
+// ---------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "test-support"))]
+impl KeyspaceHandle {
+    /// Wrap this keyspace so [`Self::prefix_page_raw`] pages the way
+    /// DynamoDB's `Scan` does: the whole keyspace in hash order, `limit`
+    /// keys evaluated a page and then filtered to the prefix (so a page can
+    /// be empty while more follow), the cursor the last key evaluated, and
+    /// `ordered: false`. Everything else is untouched.
+    pub fn with_hash_ordered_pages(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            inner: Arc::new(HashOrdered {
+                inner: self.inner.clone(),
+            }),
+            backend: self.backend.clone(),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct HashOrdered {
+    inner: Arc<dyn KeyspaceOps>,
+}
+
+/// FNV-1a: a stable, well-mixed order unrelated to key order.
+#[cfg(any(test, feature = "test-support"))]
+fn scan_order(key: &[u8]) -> (u64, Vec<u8>) {
+    let h = key.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    (h, key.to_vec())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl KeyspaceOps for HashOrdered {
+    fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
+        self.inner.insert_raw(key, value)
+    }
+    fn get_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        self.inner.get_raw(key)
+    }
+    fn remove(&self, key: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
+        self.inner.remove(key)
+    }
+    fn contains_key(&self, key: Vec<u8>) -> BoxFuture<'_, Result<bool, AppError>> {
+        self.inner.contains_key(key)
+    }
+    fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
+        self.inner.prefix_iter_raw(prefix)
+    }
+    fn prefix_page_raw(
+        &self,
+        prefix: Vec<u8>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Option<PrefixPage>, AppError>> {
+        Box::pin(async move {
+            let mut all = self.inner.prefix_iter_raw(Vec::new()).await?;
+            all.sort_by_cached_key(|(k, _)| scan_order(k));
+            let start = cursor.map(|c| scan_order(&c));
+            let mut evaluated = all
+                .into_iter()
+                .filter(|(k, _)| start.as_ref().is_none_or(|s| scan_order(k) > *s))
+                .peekable();
+            let mut page = PrefixPage::default();
+            let mut last = None;
+            for (k, v) in evaluated.by_ref().take(limit.max(1)) {
+                last = Some(k.clone());
+                if k.starts_with(&prefix) {
+                    page.rows.push((k, v));
+                }
+            }
+            if evaluated.peek().is_some() {
+                page.next = last;
+            }
+            Ok(Some(page))
         })
     }
     fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {

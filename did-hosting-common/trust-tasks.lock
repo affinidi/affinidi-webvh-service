@@ -465,6 +465,12 @@ type_uri = "https://trusttasks.org/spec/did-management/stats/get/0.1"
 digest = "sha256:4d0549a19d2a0c21ab5157e41320b522b817d027bd80a3994367c8e16b05e22a"
 
 [[task]]
+slug = "did-management/stats/set-resolution"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/stats/set-resolution/0.1"
+digest = "sha256:8330a5e4b6eb3b5699d34901508bb76a74c88c62992e1ea6b03bf0d27beb5505"
+
+[[task]]
 slug = "did-management/stats/timeseries"
 version = "0.2"
 type_uri = "https://trusttasks.org/spec/did-management/stats/timeseries/0.2"

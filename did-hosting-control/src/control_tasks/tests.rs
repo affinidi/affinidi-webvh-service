@@ -108,6 +108,10 @@ async fn sample(state: &AppState, admin: &Caller, n: usize, type_uri: &str) -> V
             seed_did(state, &admin.did, &slot).await;
             json!({ "mnemonic": slot })
         }
+        "did-management/stats/set-resolution/0.1" => {
+            seed_did(state, &admin.did, &slot).await;
+            json!({ "mnemonic": slot, "resolution": "coarse" })
+        }
         "did-management/did/list/0.2"
         | "did-management/me/domains/0.1"
         | "did-management/domain/list/0.1"
@@ -2123,6 +2127,95 @@ async fn the_service_describes_itself_to_administrators_only() {
     assert_eq!(code(&reply), "permissionDenied");
 }
 
+/// `stats/set-resolution`: an owner may choose less detail for their own
+/// slot, never `fine`; an admin may set anything on any slot; a stranger's
+/// request is the same `notFound` as a slot that does not exist. The
+/// response reports the tier that applies and why.
+#[tokio::test]
+async fn an_owner_lowers_their_statistics_and_only_an_admin_sets_fine() {
+    use did_hosting_common::server::stats_tiers::StatsResolution;
+
+    let (state, _dir) = state().await;
+    let admin = member(&state, 55, Role::Admin).await;
+    let owner = member(&state, 56, Role::Owner).await;
+    let stranger = member(&state, 57, Role::Owner).await;
+    seed_did(&state, &owner.did, "mine").await;
+    let uri = t("did-management/stats/set-resolution/0.1");
+    let set = |who, resolution: &str| {
+        let body = json!({ "mnemonic": "mine", "resolution": resolution });
+        let (state, uri) = (&state, &uri);
+        async move { call(state, Via::Tsp, who, uri, body).await }
+    };
+
+    let reply = set(&owner, "off").await;
+    conforms(&reply);
+    let body = ok(&reply, &uri);
+    assert_eq!(body["resolution"], "off");
+    assert_eq!(body["previousResolution"], "auto");
+    assert_eq!(body["changed"], true);
+    assert_eq!(body["tier"], "off");
+    assert_eq!(body["tierReason"], "override");
+    assert_eq!(
+        state.stats_collector.tiers().pin("mine"),
+        StatsResolution::Off
+    );
+
+    let reply = set(&owner, "off").await;
+    assert_eq!(
+        ok(&reply, &uri)["changed"],
+        false,
+        "a repeat changes nothing"
+    );
+
+    let reply = set(&owner, "fine").await;
+    assert_eq!(code(&reply), "permissionDenied", "{reply}");
+    assert_eq!(
+        state.stats_collector.tiers().pin("mine"),
+        StatsResolution::Off,
+        "a refused request changes nothing"
+    );
+
+    let reply = set(&stranger, "off").await;
+    assert_eq!(
+        code(&reply),
+        "did-management/stats/set-resolution:notFound",
+        "{reply}"
+    );
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &uri,
+        json!({ "mnemonic": "ghost", "resolution": "off" }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "did-management/stats/set-resolution:notFound",
+        "{reply}"
+    );
+
+    let reply = set(&admin, "fine").await;
+    conforms(&reply);
+    let body = ok(&reply, &uri);
+    assert_eq!(body["previousResolution"], "off");
+    assert_eq!(body["tier"], "fine");
+    assert_eq!(body["tierReason"], "override");
+
+    // Back to the service's own choice: a quiet slot is coarse by traffic.
+    let reply = set(&owner, "auto").await;
+    conforms(&reply);
+    let body = ok(&reply, &uri);
+    assert_eq!(body["resolution"], "auto");
+    assert_eq!(body["previousResolution"], "fine");
+    assert_eq!(body["tier"], "coarse");
+    assert_eq!(body["tierReason"], "traffic");
+    assert_eq!(
+        state.stats_collector.tiers().pin("mine"),
+        StatsResolution::Auto
+    );
+}
+
 /// `MetricsReader` is a counters-only credential. It reads `server/metrics/0.1`
 /// — counters present, gauges empty, since replication gauges stay Admin-only —
 /// and is refused by the ordinary authenticated task surface, including a
@@ -2502,6 +2595,10 @@ fn existing_rows_keep_their_proof_rules() {
         ),
         (
             "https://trusttasks.org/spec/did-management/stats/get/0.1",
+            ProofRule::Authentication,
+        ),
+        (
+            "https://trusttasks.org/spec/did-management/stats/set-resolution/0.1",
             ProofRule::Authentication,
         ),
         (

@@ -12,7 +12,7 @@ import { useApi } from "./ApiProvider";
 import { useDomains } from "./DomainProvider";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 import type { TimeSeriesPoint, TimeRange } from "../lib/api";
-import { formatRate, pointSeconds } from "../lib/usage-rate";
+import { formatRate, pointSeconds, STEP_SECS } from "../lib/usage-rate";
 
 const RANGES: { label: string; value: TimeRange }[] = [
   { label: "1h", value: "1h" },
@@ -131,12 +131,14 @@ export function UsageChart({ mnemonic }: { mnemonic?: string }) {
               />
               <Tooltip
                 labelFormatter={formatTooltipLabel}
-                // Each point sums its step's 5-minute buckets; the rate is
-                // over the time the point covers (`lib/usage-rate`).
+                // Each point carries its own width (hourly for a DID without
+                // 5-minute detail); the rate is over the time it covers
+                // (`lib/usage-rate`).
                 formatter={(value: any, name: any, item: any) => {
                   const count = Number(value) || 0;
                   const start = Number(item?.payload?.timestamp) || 0;
-                  const secs = pointSeconds(start, range, Math.floor(Date.now() / 1000));
+                  const step = Number(item?.payload?.seconds) || STEP_SECS[range];
+                  const secs = pointSeconds(start, step, Math.floor(Date.now() / 1000));
                   return [`${count.toLocaleString()} (${formatRate(count, secs)})`, name];
                 }}
                 contentStyle={{

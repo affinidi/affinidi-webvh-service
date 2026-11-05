@@ -50,6 +50,9 @@ use crate::did_ops::{
 pub struct PurgeReport {
     /// Number of DID records whose `domain` matched and were deleted.
     pub deleted: u64,
+    /// Their mnemonics, so a caller holding their statistics can delete
+    /// those too.
+    pub purged: Vec<String>,
     /// Number of records skipped because they had no `domain` field
     /// (legacy / pre-M01 state). Operators should run the M-01
     /// migration if this is non-zero on a production deployment.
@@ -80,6 +83,7 @@ pub async fn purge_domain_dids(
     let mut skipped_no_domain = 0u64;
     let mut skipped_other_domain = 0u64;
     let mut failed = 0u64;
+    let mut purged = Vec::new();
 
     for (_key, value) in raw {
         let record: DidRecord = match serde_json::from_slice(&value) {
@@ -132,6 +136,7 @@ pub async fn purge_domain_dids(
                     reason,
                     "DID record purged"
                 );
+                purged.push(record.mnemonic.clone());
             }
             Err(e) => {
                 warn!(
@@ -156,6 +161,7 @@ pub async fn purge_domain_dids(
     Ok(PurgeReport {
         failed,
         deleted,
+        purged,
         skipped_no_domain,
         skipped_other_domain,
     })
@@ -213,6 +219,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.deleted, 2);
+        let mut purged = report.purged.clone();
+        purged.sort();
+        assert_eq!(purged, ["alice", "bob"], "names what it deleted");
         assert_eq!(report.skipped_other_domain, 1);
         assert_eq!(report.skipped_no_domain, 0);
 

@@ -236,9 +236,20 @@ control plane's README explains the bounds ("Replay cache bounds").
 | Variable | Description |
 | --- | --- |
 | `DAEMON_GEOIP_DATABASE` | Local GeoIP `.mmdb` file for wallet sign-in locations (empty clears) |
+| `DAEMON_STATS_FLUSH_MAX_ROWS_PER_SECOND` | Statistics rows the periodic flush writes a second, at most (default 20) |
+| `DAEMON_STATS_MODE` | Which DIDs keep 5-minute statistics: `auto` (busy ones, default), `fine` (all), `coarse` (none) |
+| `DAEMON_STATS_PROMOTE_PER_HOUR` | Resolves in an hour that promote a DID to 5-minute statistics (default 60) |
+| `DAEMON_STATS_DEMOTE_PER_HOUR` | Hourly resolves below which it is demoted (default 20) |
+| `DAEMON_STATS_MAX_FINE_DIDS` | Most DIDs promoted automatically (default 1,000) |
 
-This lives in `[geoip] database` and reaches the embedded control plane,
-which answers wallet sign-in. See [`docs/geoip.md`](../docs/geoip.md).
+`[geoip] database` reaches the embedded control plane, which answers wallet
+sign-in. See [`docs/geoip.md`](../docs/geoip.md). `[stats_flush]
+max_rows_per_second` bounds the statistics flush the storage task runs; the
+control plane's README explains it ("Statistics flush budget"). `[stats]`
+chooses which DIDs keep 5-minute statistics, and the storage task migrates
+legacy statistics at startup, as the control plane does; the `stats-show`,
+`stats-set` and `stats-purge-legacy` commands are the same. See
+[`docs/stats-tiers.md`](../docs/stats-tiers.md).
 
 The resolution limit lives in `[server.resolve_rate_limit]` (`max_per_window`,
 `window_secs`) and is off by default; the edge server's README explains it

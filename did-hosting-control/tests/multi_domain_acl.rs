@@ -71,6 +71,8 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         identity: Default::default(),
         replay: Default::default(),
         geoip: Default::default(),
+        stats_flush: Default::default(),
+        stats: Default::default(),
         config_path: PathBuf::new(),
     };
 

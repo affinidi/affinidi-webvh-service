@@ -63,8 +63,105 @@ pub struct AppConfig {
     /// city and country a wallet shows for a sign-in request.
     #[serde(default, skip_serializing_if = "GeoIpConfig::is_default")]
     pub geoip: GeoIpConfig,
+    /// How fast the periodic statistics flush may write (`[stats_flush]`; env
+    /// `CONTROL_STATS_FLUSH_MAX_ROWS_PER_SECOND`).
+    #[serde(default, skip_serializing_if = "StatsFlushConfig::is_default")]
+    pub stats_flush: StatsFlushConfig,
+    /// Which DIDs keep 5-minute statistics (`[stats]`; env `CONTROL_STATS_*`).
+    /// See `docs/stats-tiers.md`.
+    #[serde(default, skip_serializing_if = "StatsTierConfig::is_default")]
+    pub stats: StatsTierConfig,
     #[serde(skip)]
     pub config_path: PathBuf,
+}
+
+pub use did_hosting_common::server::stats_tiers::{StatsMode, StatsTierConfig};
+
+/// Largest `[stats_flush] max_rows_per_second` accepted: far above any table
+/// it would be sized for, low enough that a typo is caught.
+pub const STATS_FLUSH_MAX_ROWS_PER_SECOND_LIMIT: u32 = 10_000;
+
+/// Seconds between statistics flushes.
+pub const STATS_FLUSH_INTERVAL_SECS: u64 = 10;
+
+/// How often the storage task flushes statistics.
+pub const STATS_FLUSH_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(STATS_FLUSH_INTERVAL_SECS);
+
+/// The periodic statistics flush (`[stats_flush]`).
+///
+/// Every [`STATS_FLUSH_INTERVAL`] the control plane takes the per-DID counters
+/// gathered since the last flush and writes them, each row a read and a
+/// write. The budget counts rows, not table units: on DynamoDB a row costs
+/// one or more units by size ("Costs" in `docs/stats-tiers.md`). A flush
+/// writes at most `max_rows_per_second` ×
+/// [`STATS_FLUSH_INTERVAL_SECS`] rows, paced at `max_rows_per_second`, so the
+/// store sees that rate rather than a burst.
+///
+/// Rows past the budget wait for the next flush. Two limits drop what waits
+/// too long, each with a warning: time-series buckets older than an hour
+/// (`server::STATS_BUCKET_MAX_AGE`), and rows past the collector's caps of
+/// 100,000 DIDs and 200,000 buckets. A DID's row is written once per closed
+/// 5-minute bucket, plus a ring row per bucket for a DID with 5-minute
+/// statistics (`docs/stats-tiers.md`), so the budget should exceed those
+/// rows over 300 seconds. Per-DID totals are never dropped by age.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatsFlushConfig {
+    /// Most statistics rows written a second, averaged over the flush
+    /// interval. From 1 to [`STATS_FLUSH_MAX_ROWS_PER_SECOND_LIMIT`].
+    ///
+    /// Default: `20`
+    #[serde(default = "default_stats_flush_max_rows_per_second")]
+    pub max_rows_per_second: u32,
+}
+
+fn default_stats_flush_max_rows_per_second() -> u32 {
+    20
+}
+
+impl Default for StatsFlushConfig {
+    fn default() -> Self {
+        Self {
+            max_rows_per_second: default_stats_flush_max_rows_per_second(),
+        }
+    }
+}
+
+impl StatsFlushConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Most rows one flush writes, every [`STATS_FLUSH_INTERVAL`].
+    pub fn rows_per_flush(&self) -> usize {
+        self.max_rows_per_second as usize * STATS_FLUSH_INTERVAL_SECS as usize
+    }
+
+    /// Refuse a budget outside 1 to [`STATS_FLUSH_MAX_ROWS_PER_SECOND_LIMIT`]:
+    /// zero would defer every row forever.
+    pub fn validate(&self) -> Result<(), AppError> {
+        if !(1..=STATS_FLUSH_MAX_ROWS_PER_SECOND_LIMIT).contains(&self.max_rows_per_second) {
+            return Err(AppError::Config(format!(
+                "stats_flush.max_rows_per_second ({}) must be from 1 to \
+                 {STATS_FLUSH_MAX_ROWS_PER_SECOND_LIMIT}",
+                self.max_rows_per_second
+            )));
+        }
+        Ok(())
+    }
+
+    /// Apply `{prefix}_STATS_FLUSH_MAX_ROWS_PER_SECOND`, then validate.
+    pub fn apply_env_overrides(&mut self, prefix: &str) -> Result<(), AppError> {
+        let var = format!("{prefix}_STATS_FLUSH_MAX_ROWS_PER_SECOND");
+        if let Ok(v) = std::env::var(&var) {
+            self.max_rows_per_second = v
+                .trim()
+                .parse()
+                .map_err(|e| AppError::Config(format!("invalid {var}: {e}")))?;
+        }
+        self.validate()
+    }
 }
 
 /// Local GeoIP lookups (`[geoip]`) — base design §12.6: a local database only,
@@ -319,6 +416,11 @@ impl AppConfig {
         config.replay.apply_env_overrides("CONTROL")?;
         // CONTROL_GEOIP_DATABASE — the local sign-in location database.
         config.geoip.apply_env_overrides("CONTROL");
+        // CONTROL_STATS_FLUSH_MAX_ROWS_PER_SECOND. Also validates `[stats_flush]`.
+        config.stats_flush.apply_env_overrides("CONTROL")?;
+        // CONTROL_STATS_MODE / _PROMOTE_PER_HOUR / _DEMOTE_PER_HOUR /
+        // _MAX_FINE_DIDS. Also validates `[stats]`.
+        config.stats.apply_env_overrides("CONTROL")?;
 
         // Control-specific env vars
         macro_rules! env_opt {
@@ -385,5 +487,56 @@ mod setup_store_tests {
             Some("control_store-table")
         );
         assert_eq!(store.data_dir, PathBuf::from("/data"));
+    }
+}
+
+#[cfg(test)]
+mod stats_flush_tests {
+    use super::*;
+
+    #[test]
+    fn test_stats_flush_default_keeps_todays_rate() {
+        assert_eq!(StatsFlushConfig::default().max_rows_per_second, 20);
+        assert!(StatsFlushConfig::default().is_default());
+    }
+
+    #[test]
+    fn test_stats_flush_zero_and_out_of_range_budgets_are_refused() {
+        for bad in [0, STATS_FLUSH_MAX_ROWS_PER_SECOND_LIMIT + 1] {
+            let err = StatsFlushConfig {
+                max_rows_per_second: bad,
+            }
+            .validate()
+            .expect_err("out of range");
+            assert!(
+                err.to_string().contains("stats_flush.max_rows_per_second"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stats_flush_env_override_is_read_and_checked() {
+        // A prefix no other test uses, so no lock is needed.
+        let mut config = StatsFlushConfig::default();
+        // SAFETY: test-only; the variable name is unique to this test.
+        unsafe { std::env::set_var("SFTEST_STATS_FLUSH_MAX_ROWS_PER_SECOND", "7") };
+        config.apply_env_overrides("SFTEST").expect("valid");
+        assert_eq!(config.max_rows_per_second, 7);
+
+        unsafe { std::env::set_var("SFTEST_STATS_FLUSH_MAX_ROWS_PER_SECOND", "0") };
+        assert!(config.apply_env_overrides("SFTEST").is_err());
+        unsafe { std::env::set_var("SFTEST_STATS_FLUSH_MAX_ROWS_PER_SECOND", "many") };
+        assert!(config.apply_env_overrides("SFTEST").is_err());
+        unsafe { std::env::remove_var("SFTEST_STATS_FLUSH_MAX_ROWS_PER_SECOND") };
+    }
+
+    #[test]
+    fn test_stats_flush_unknown_keys_are_refused() {
+        let parsed: Result<StatsFlushConfig, _> = toml::from_str("max_rows = 5");
+        assert!(
+            parsed.is_err(),
+            "a misspelt key must not silently keep the default"
+        );
     }
 }

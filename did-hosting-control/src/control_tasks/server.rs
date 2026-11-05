@@ -4,7 +4,7 @@
 use did_hosting_common::tasks::did_management::{
     identity::{list as identity_list, retire as identity_retire},
     server::{config, info, metrics},
-    stats::{get as stats_get, timeseries},
+    stats::{get as stats_get, set_resolution, timeseries},
 };
 use serde_json::{Value, json};
 use tracing::warn;
@@ -232,6 +232,68 @@ pub(crate) async fn replication_gauges(state: &AppState) -> Result<Vec<Value>, T
 /// `stats/get/0.1`: one slot's counters (owner or admin — a slot the caller
 /// may not read answers exactly as a missing one), or, with no `mnemonic`, the
 /// server-wide aggregate (admin).
+/// `stats/set-resolution/0.1`: set how much statistical detail is kept for a
+/// slot. An owner may choose less (`auto`, `coarse`, `off`); only an admin
+/// may set `fine` (`stats_admin::set_stats_resolution`). A slot that does not
+/// exist and one the caller does not own are the same `notFound`, as in
+/// `stats/get`; an owner asking for `fine` is `permissionDenied`.
+pub(crate) async fn stats_set_resolution(
+    cx: &Cx<'_>,
+    p: set_resolution::v0_1::Payload,
+) -> Result<set_resolution::v0_1::Response, TaskError> {
+    use did_hosting_common::server::stats_tiers::{StatsResolution, Tier, TierReason};
+
+    let auth = cx.auth().await?;
+    let state = cx.state;
+    let mnemonic = p.mnemonic.as_str();
+    let (record, _) = did_ops::get_did_info(&auth, state, mnemonic)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound(_) | AppError::Forbidden(_) => TaskError::Declared(
+                set_resolution::v0_1::error_codes::NOT_FOUND,
+                "no such slot".into(),
+            ),
+            other => other.into(),
+        })?;
+    did_ops::ensure_slot_domain_matches(&record, p.domain.as_deref().map(|d| d.as_str()))?;
+
+    // The schema's enum and ours share their wire spelling.
+    let wire = serde_json::to_value(p.resolution)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let resolution: StatsResolution = wire
+        .parse()
+        .map_err(|_| AppError::Validation(format!("unknown resolution `{wire}`")))?;
+
+    // Ownership is settled above, so a refusal here is an owner asking for
+    // `fine`: `permissionDenied`.
+    let previous =
+        crate::stats_admin::set_stats_resolution(&auth, state, mnemonic, resolution).await?;
+    let info = crate::stats_admin::stats_tier(&auth, state, mnemonic).await?;
+    let tier = match info.tier {
+        Tier::Fine => "fine",
+        Tier::Coarse => "coarse",
+        Tier::Off => "off",
+    };
+    let reason = match info.reason {
+        TierReason::Pinned => "override",
+        TierReason::Mode => "policy",
+        TierReason::Traffic => "traffic",
+    };
+    typed(
+        json!({
+            "mnemonic": mnemonic,
+            "resolution": resolution.as_str(),
+            "previousResolution": previous.as_str(),
+            "changed": previous != resolution,
+            "tier": tier,
+            "tierReason": reason,
+        }),
+        "stats/set-resolution response",
+    )
+}
+
 pub(crate) async fn stats_get(
     cx: &Cx<'_>,
     p: stats_get::v0_1::Payload,
@@ -267,11 +329,7 @@ pub(crate) async fn stats_get(
             other => other.into(),
         })?;
     did_ops::ensure_slot_domain_matches(&record, p.domain.as_deref().map(|d| d.as_str()))?;
-    let stats: did_hosting_common::DidStats = state
-        .stats_ks
-        .get(format!("stats:{mnemonic}"))
-        .await?
-        .unwrap_or_default();
+    let stats = crate::stats_admin::live_did_stats(state, mnemonic).await?;
     let mut body = serde_json::Map::new();
     body.insert("mnemonic".into(), json!(mnemonic.as_str()));
     body.insert("totalResolves".into(), json!(stats.total_resolves));
@@ -303,7 +361,15 @@ pub(crate) async fn timeseries(
         PayloadRange::Last30Days => ("30d", "last30Days", 14400),
         _ => ("24h", "lastDay", 900),
     };
-    let points = match (p.mnemonic.as_deref(), p.domain.as_deref()) {
+    // Charts come from the tiered rows once the migration has completed,
+    // from the legacy `ts:` rows until then (`stats_query`).
+    let tiered = crate::stats_query::tiered_ready(&state.timeseries_ks).await?;
+    let chart_range = crate::stats_query::Range::from_name(range);
+    let legacy = |points| crate::stats_query::Chart {
+        points,
+        bucket_seconds,
+    };
+    let chart = match (p.mnemonic.as_deref(), p.domain.as_deref()) {
         (Some(mnemonic), domain) => {
             let (record, _) = did_ops::get_did_info(&auth, state, mnemonic)
                 .await
@@ -314,7 +380,19 @@ pub(crate) async fn timeseries(
                     other => other.into(),
                 })?;
             did_ops::ensure_slot_domain_matches(&record, domain.map(|d| d.as_str()))?;
-            super::queries::query_timeseries(&state.timeseries_ks, mnemonic, range).await?
+            if tiered {
+                crate::stats_query::did_chart(
+                    &state.stats_ks,
+                    &state.timeseries_ks,
+                    mnemonic,
+                    chart_range,
+                )
+                .await?
+            } else {
+                legacy(
+                    super::queries::query_timeseries(&state.timeseries_ks, mnemonic, range).await?,
+                )
+            }
         }
         (None, Some(domain)) => {
             let unknown = || {
@@ -343,18 +421,33 @@ pub(crate) async fn timeseries(
                     return Err(unknown());
                 }
             }
-            super::queries::query_timeseries_by_domain(state, &canonical, range).await?
+            if tiered {
+                let mnemonics = super::queries::domain_mnemonics(state, &canonical).await?;
+                crate::stats_query::domain_chart(&state.stats_ks, &mnemonics, chart_range).await?
+            } else {
+                legacy(super::queries::query_timeseries_by_domain(state, &canonical, range).await?)
+            }
         }
         (None, None) => {
             cx.admin().await?;
-            super::queries::query_timeseries(
-                &state.timeseries_ks,
-                did_hosting_common::server::stats_collector::ALL_SERIES,
-                range,
-            )
-            .await?
+            if tiered {
+                crate::stats_query::server_chart(&state.timeseries_ks, chart_range).await?
+            } else {
+                legacy(
+                    super::queries::query_timeseries(
+                        &state.timeseries_ks,
+                        did_hosting_common::server::stats_collector::ALL_SERIES,
+                        range,
+                    )
+                    .await?,
+                )
+            }
         }
     };
+    let crate::stats_query::Chart {
+        points,
+        bucket_seconds,
+    } = chart;
     let points: Vec<Value> = points
         .iter()
         .map(|pt| json!({ "startsAt": at(pt.timestamp), "resolves": pt.resolves, "updates": pt.updates }))

@@ -16,7 +16,7 @@ use crate::DidStatsDelta;
 use crate::server::error::AppError;
 use crate::server::store::KeyspaceHandle;
 
-const BUCKET_SECS: u64 = 300; // 5-minute buckets
+use crate::server::stats_tiers::{BUCKET_SECS, StatsResolution, StatsTierConfig, TierState};
 
 /// Series name of the server-wide time-series (`ts:_all:{epoch}`). Not a
 /// valid DID path, so no DID's series can collide with it.
@@ -106,6 +106,12 @@ pub struct StatsCollector {
     dropped: AtomicU64,
     /// When `take_dropped` last reported, for rate-limiting the warning.
     dropped_reported_at: AtomicU64,
+    /// Fine-ring buckets whose write failed after their DID's coarse row
+    /// was written: retried on their own, so the coarse row does not count
+    /// them twice.
+    slot_retry: Mutex<HashMap<BucketKey, (u64, u64)>>,
+    /// Which DIDs keep 5-minute detail (`stats_tiers`).
+    tiers: std::sync::Arc<Mutex<TierState>>,
     /// Running aggregate counters (lock-free).
     agg_total_resolves: AtomicU64,
     agg_total_updates: AtomicU64,
@@ -122,6 +128,8 @@ impl StatsCollector {
             track_timeseries: true,
             dropped: AtomicU64::new(0),
             dropped_reported_at: AtomicU64::new(0),
+            slot_retry: Mutex::new(HashMap::new()),
+            tiers: std::sync::Arc::new(Mutex::new(TierState::default())),
             agg_total_resolves: AtomicU64::new(0),
             agg_total_updates: AtomicU64::new(0),
             agg_last_resolved_at: AtomicU64::new(0),
@@ -328,9 +336,141 @@ impl StatsCollector {
             .collect()
     }
 
-    /// Rows waiting to be written: per-DID deltas plus time-series buckets.
+    /// Rows waiting to be written: per-DID deltas, time-series buckets, and
+    /// fine-ring writes being retried.
     pub fn pending_rows(&self) -> usize {
-        self.deltas.lock().unwrap().len() + self.buckets.lock().unwrap().len()
+        self.deltas.lock().unwrap().len()
+            + self.buckets.lock().unwrap().len()
+            + self.slot_retry.lock().unwrap().len()
+    }
+
+    /// Drain what is due for writing at `now`: every bucket that has closed
+    /// (so a busy DID is written once per bucket, not once per flush), the
+    /// deltas of the DIDs those buckets belong to, and deltas with no bucket
+    /// pending at all (their bucket was dropped at the cap, or this
+    /// collector keeps no time series). Open buckets, and the deltas of DIDs
+    /// whose only activity is in them, wait.
+    pub fn drain_due(&self, now: u64) -> (Vec<DidStatsDelta>, Vec<DrainedBucket>) {
+        let open_from = now / BUCKET_SECS * BUCKET_SECS;
+        let (due_buckets, open_dids) = {
+            let mut buckets = self.buckets.lock().unwrap();
+            let closed: Vec<BucketKey> = buckets
+                .keys()
+                .filter(|(_, epoch)| *epoch < open_from)
+                .cloned()
+                .collect();
+            let due: Vec<DrainedBucket> = closed
+                .into_iter()
+                .filter_map(|key| {
+                    let (r, u) = buckets.remove(&key)?;
+                    Some(DrainedBucket {
+                        mnemonic: key.0,
+                        epoch: key.1,
+                        resolves: r,
+                        updates: u,
+                    })
+                })
+                .collect();
+            let open: std::collections::HashSet<String> =
+                buckets.keys().map(|(m, _)| m.clone()).collect();
+            (due, open)
+        };
+        let closed_dids: std::collections::HashSet<&str> =
+            due_buckets.iter().map(|b| b.mnemonic.as_str()).collect();
+        let mut deltas = self.deltas.lock().unwrap();
+        let due_dids: Vec<String> = deltas
+            .keys()
+            .filter(|m| closed_dids.contains(m.as_str()) || !open_dids.contains(*m))
+            .cloned()
+            .collect();
+        let due_deltas = due_dids
+            .into_iter()
+            .filter_map(|m| {
+                let d = deltas.remove(&m)?;
+                Some(DidStatsDelta {
+                    mnemonic: m,
+                    resolve_delta: d.resolves,
+                    update_delta: d.updates,
+                    last_resolved_at: d.last_resolved_at,
+                    last_updated_at: d.last_updated_at,
+                })
+            })
+            .collect();
+        (due_deltas, due_buckets)
+    }
+
+    /// A DID's counts not yet written, so a reader can add them to the
+    /// stored totals and show live numbers whatever the flush cadence.
+    pub fn pending_for(&self, mnemonic: &str) -> Option<DidStatsDelta> {
+        let deltas = self.deltas.lock().unwrap();
+        deltas.get(mnemonic).map(|d| DidStatsDelta {
+            mnemonic: mnemonic.to_string(),
+            resolve_delta: d.resolves,
+            update_delta: d.updates,
+            last_resolved_at: d.last_resolved_at,
+            last_updated_at: d.last_updated_at,
+        })
+    }
+
+    /// Keep fine-ring writes that failed, for the next flush to retry on
+    /// their own. Not subject to the bucket cap: there is at most one per
+    /// fine DID per bucket, and fine DIDs are capped.
+    pub fn requeue_slots(&self, failed: Vec<DrainedBucket>) {
+        let mut slots = self.slot_retry.lock().unwrap();
+        for b in failed {
+            let entry = slots.entry((b.mnemonic, b.epoch)).or_insert((0, 0));
+            entry.0 += b.resolves;
+            entry.1 += b.updates;
+        }
+    }
+
+    /// Fine-ring writes to retry.
+    pub fn drain_slot_retry(&self) -> Vec<DrainedBucket> {
+        self.slot_retry
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|((mnemonic, epoch), (r, u))| DrainedBucket {
+                mnemonic,
+                epoch,
+                resolves: r,
+                updates: u,
+            })
+            .collect()
+    }
+
+    /// Forget a deleted DID: drop its counts not yet written, its buckets,
+    /// its fine-ring retries and its tiering state, so the next flush does
+    /// not write its rows back. The aggregate and the server-wide series
+    /// keep what they counted. A flush already writing the DID can still
+    /// land one row after this; the caller deletes the rows afterwards.
+    pub fn forget_did(&self, mnemonic: &str) {
+        self.deltas.lock().unwrap().remove(mnemonic);
+        self.buckets
+            .lock()
+            .unwrap()
+            .retain(|(m, _), _| m != mnemonic);
+        self.slot_retry
+            .lock()
+            .unwrap()
+            .retain(|(m, _), _| m != mnemonic);
+        self.tiers().forget(mnemonic);
+    }
+
+    /// The tiering state: policy, overrides, and promoted DIDs.
+    pub fn tiers(&self) -> std::sync::MutexGuard<'_, TierState> {
+        self.tiers.lock().unwrap()
+    }
+
+    /// A shared handle on the tiering state, for a writer that runs on its
+    /// own task.
+    pub fn tier_state(&self) -> std::sync::Arc<Mutex<TierState>> {
+        self.tiers.clone()
+    }
+
+    /// Set the `[stats]` policy, keeping overrides and promotions.
+    pub fn configure_tiers(&self, config: StatsTierConfig) {
+        self.tiers().config = config;
     }
 
     /// Return drained per-DID deltas that could not be written or sent, so
@@ -442,6 +582,86 @@ pub async fn reconcile_total_dids(
     let dids = dids_ks.prefix_iter_raw("did:").await?;
     collector.set_total_dids(dids.len() as u64);
     Ok(())
+}
+
+/// Delete a deleted DID's statistics: its `stats:` row, its override and,
+/// when it had one, its fine ring, after [`StatsCollector::forget_did`] so
+/// the flush does not write them back. Every path that removes a DID record
+/// calls it: an explicit delete, the empty-slot cleanup and the domain
+/// purge.
+///
+/// Stops at the first failed delete and returns it; the rows left are read
+/// by nothing (a DID created later with the same mnemonic starts from its
+/// own first flush, which replaces the `stats:` row).
+pub async fn delete_did_stats(
+    collector: &StatsCollector,
+    stats_ks: &KeyspaceHandle,
+    timeseries_ks: &KeyspaceHandle,
+    mnemonic: &str,
+) -> Result<(), AppError> {
+    use crate::server::stats_tiers::{FINE_SLOTS, StoredDidStats, fine_key, pin_key, stats_key};
+
+    let had_fine = collector.tiers().pin(mnemonic) == StatsResolution::Fine;
+    collector.forget_did(mnemonic);
+    let row: Option<StoredDidStats> = stats_ks.get(stats_key(mnemonic)).await?;
+    let had_fine = had_fine
+        || row
+            .as_ref()
+            .and_then(|r| r.coarse.as_ref())
+            .is_some_and(|c| c.fine_since.is_some());
+    stats_ks.remove(stats_key(mnemonic)).await?;
+    stats_ks.remove(pin_key(mnemonic)).await?;
+    if had_fine {
+        for slot in 0..FINE_SLOTS {
+            timeseries_ks
+                .remove(fine_key(mnemonic, slot * BUCKET_SECS))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Seed a control plane's collector from the store at startup: the
+/// aggregate from every `stats:` row, the DID count from the `did:` records,
+/// and the per-DID overrides from `statspin:` rows. One scan of the stats
+/// keyspace serves both of its prefixes.
+pub async fn seed_from_store(
+    collector: &StatsCollector,
+    stats_ks: &KeyspaceHandle,
+    dids_ks: &KeyspaceHandle,
+) -> StatsAggregate {
+    let mut agg = StatsAggregate::default();
+    let mut pins = Vec::new();
+    if let Ok(raw) = stats_ks.prefix_iter_raw("stats").await {
+        for (key, value) in raw {
+            if let Some(m) = key.strip_prefix(crate::server::stats_tiers::PIN_PREFIX.as_bytes()) {
+                if let (Ok(m), Ok(pin)) = (
+                    std::str::from_utf8(m),
+                    serde_json::from_slice::<StatsResolution>(&value),
+                ) {
+                    pins.push((m.to_string(), pin));
+                }
+                continue;
+            }
+            if !key.starts_with(b"stats:") {
+                continue;
+            }
+            if let Ok(s) = serde_json::from_slice::<crate::DidStats>(&value) {
+                agg.total_resolves += s.total_resolves;
+                agg.total_updates += s.total_updates;
+                agg.last_resolved_at = agg.last_resolved_at.max(s.last_resolved_at);
+                agg.last_updated_at = agg.last_updated_at.max(s.last_updated_at);
+            }
+        }
+    }
+    agg.total_dids = dids_ks
+        .prefix_iter_raw("did:")
+        .await
+        .map(|v| v.len())
+        .unwrap_or(0) as u64;
+    collector.seed_aggregate(&agg);
+    collector.tiers().load_pins(pins);
+    agg
 }
 
 impl Default for StatsCollector {
@@ -618,6 +838,81 @@ mod tests {
         );
     }
 
+    /// Only closed buckets, and the DIDs they belong to, are due; a DID
+    /// whose only activity is in the open bucket waits for it to close.
+    #[test]
+    fn drain_due_takes_closed_buckets_and_their_dids() {
+        let collector = StatsCollector::new();
+        let now = 1_000 * BUCKET_SECS + 7;
+        let open = now / BUCKET_SECS * BUCKET_SECS;
+        let delta = |m: &str| DidStatsDelta {
+            mnemonic: m.into(),
+            resolve_delta: 1,
+            update_delta: 0,
+            last_resolved_at: None,
+            last_updated_at: None,
+        };
+        let bucket = |m: &str, epoch| DrainedBucket {
+            mnemonic: m.into(),
+            epoch,
+            resolves: 1,
+            updates: 0,
+        };
+        collector.requeue_deltas(vec![delta("old"), delta("new")]);
+        collector.requeue_buckets(vec![bucket("old", open - BUCKET_SECS), bucket("new", open)]);
+
+        let (deltas, buckets) = collector.drain_due(now);
+        let due: Vec<_> = deltas.iter().map(|d| d.mnemonic.as_str()).collect();
+        let closed: Vec<_> = buckets
+            .iter()
+            .map(|b| (b.mnemonic.as_str(), b.epoch))
+            .collect();
+        assert_eq!(due, ["old"]);
+        assert_eq!(closed, [("old", open - BUCKET_SECS)]);
+
+        let (deltas, buckets) = collector.drain_due(open + BUCKET_SECS);
+        assert_eq!(deltas.len(), 1, "`new` once its bucket closes");
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(collector.pending_rows(), 0);
+    }
+
+    #[test]
+    fn a_delta_without_a_bucket_is_due_at_once() {
+        let collector = StatsCollector::without_timeseries();
+        collector.record_resolve("alice");
+        let (deltas, buckets) = collector.drain_due(now_epoch());
+        assert_eq!(deltas.len(), 1);
+        assert!(buckets.is_empty());
+    }
+
+    #[test]
+    fn pending_counts_are_visible_before_the_flush() {
+        let collector = StatsCollector::new();
+        collector.record_resolve("alice");
+        collector.record_resolve("alice");
+        assert_eq!(
+            collector.pending_for("alice").map(|d| d.resolve_delta),
+            Some(2)
+        );
+        assert!(collector.pending_for("bob").is_none());
+    }
+
+    #[test]
+    fn retried_slots_merge_and_count_as_pending() {
+        let collector = StatsCollector::new();
+        let b = |r| DrainedBucket {
+            mnemonic: "a".into(),
+            epoch: 300,
+            resolves: r,
+            updates: 0,
+        };
+        collector.requeue_slots(vec![b(1), b(2)]);
+        assert_eq!(collector.pending_rows(), 1);
+        let slots = collector.drain_slot_retry();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].resolves, 3);
+    }
+
     #[test]
     fn decrement_total_dids_stops_at_zero() {
         let collector = StatsCollector::new();
@@ -635,5 +930,93 @@ mod tests {
         assert_eq!(collector.get_aggregate().total_dids, 2);
         collector.subtract_total_dids(10);
         assert_eq!(collector.get_aggregate().total_dids, 0);
+    }
+}
+
+#[cfg(all(test, feature = "store-fjall"))]
+mod store_tests {
+    use super::*;
+    use crate::server::config::StoreConfig;
+    use crate::server::stats_tiers::{
+        CoarseSeries, FineSlot, SeriesKind, StoredDidStats, fine_key, pin_key, stats_key,
+    };
+    use crate::server::store::Store;
+
+    /// Deleting a DID's statistics removes every row it had (its `stats:`
+    /// row, its override and its fine ring) and the counts not yet written,
+    /// so the next flush has nothing of it to write back. Another DID's rows
+    /// are untouched.
+    #[tokio::test]
+    async fn delete_did_stats_removes_every_row_and_what_is_pending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open fjall");
+        let stats_ks = store.keyspace("stats").unwrap();
+        let ts_ks = store.keyspace("timeseries").unwrap();
+        let now = now_epoch();
+
+        let mut coarse = CoarseSeries::default();
+        coarse.add(SeriesKind::Did, now, 1, 0);
+        coarse.fine_since = Some(now);
+        for m in ["gone", "kept"] {
+            let row = StoredDidStats {
+                coarse: Some(coarse.clone()),
+                ..StoredDidStats::default()
+            };
+            stats_ks.insert(stats_key(m).as_str(), &row).await.unwrap();
+            stats_ks
+                .insert(pin_key(m).as_str(), &StatsResolution::Fine)
+                .await
+                .unwrap();
+            ts_ks
+                .insert(fine_key(m, now).as_str(), &FineSlot { e: now, r: 1, u: 0 })
+                .await
+                .unwrap();
+        }
+        let collector = StatsCollector::new();
+        collector.tiers().set_pin("gone", StatsResolution::Fine);
+        collector.record_resolve("gone");
+        collector.record_resolve("kept");
+
+        delete_did_stats(&collector, &stats_ks, &ts_ks, "gone")
+            .await
+            .unwrap();
+
+        for key in [stats_key("gone"), pin_key("gone")] {
+            assert!(
+                stats_ks.get_raw(key.as_str()).await.unwrap().is_none(),
+                "{key}"
+            );
+        }
+        assert!(ts_ks.prefix_iter_raw("t5:gone:").await.unwrap().is_empty());
+        assert_eq!(collector.tiers().pin("gone"), StatsResolution::Auto);
+        assert!(collector.pending_for("gone").is_none());
+        let (rows, buckets) = collector.drain_due(now + 10 * BUCKET_SECS);
+        assert!(rows.iter().all(|d| d.mnemonic != "gone"));
+        assert!(buckets.iter().all(|b| b.mnemonic != "gone"));
+
+        assert!(
+            stats_ks
+                .get_raw(stats_key("kept").as_str())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            stats_ks
+                .get_raw(pin_key("kept").as_str())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(ts_ks.prefix_iter_raw("t5:kept:").await.unwrap().len(), 1);
+        assert!(
+            rows.iter().any(|d| d.mnemonic == "kept"),
+            "another DID's counts are kept"
+        );
     }
 }

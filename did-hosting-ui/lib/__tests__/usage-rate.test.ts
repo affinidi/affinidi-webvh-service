@@ -3,15 +3,15 @@ import { formatPerSecond, formatRate, pointSeconds, STEP_SECS } from "../usage-r
 
 describe("pointSeconds", () => {
   it("is the full step for a closed point", () => {
-    expect(pointSeconds(1_000, "24h", 1_000 + 5_000)).toBe(STEP_SECS["24h"]);
-    expect(pointSeconds(0, "30d", 1e9)).toBe(14400);
+    expect(pointSeconds(1_000, STEP_SECS["24h"], 1_000 + 5_000)).toBe(STEP_SECS["24h"]);
+    expect(pointSeconds(0, 86_400, 1e9)).toBe(86_400);
   });
   it("is the elapsed time for the newest, filling point", () => {
-    expect(pointSeconds(1_000, "24h", 1_120)).toBe(120);
+    expect(pointSeconds(1_000, 900, 1_120)).toBe(120);
   });
   it("is never below one second", () => {
-    expect(pointSeconds(1_000, "1h", 1_000)).toBe(1);
-    expect(pointSeconds(1_000, "1h", 900)).toBe(1);
+    expect(pointSeconds(1_000, 300, 1_000)).toBe(1);
+    expect(pointSeconds(1_000, 300, 900)).toBe(1);
   });
 });
 

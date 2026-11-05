@@ -81,6 +81,7 @@
 "did-management/server/register" = "0.2"
 "did-management/server/stats-sync" = "0.1"
 "did-management/stats/get" = "0.1"
+"did-management/stats/set-resolution" = "0.1"
 "did-management/stats/timeseries" = "0.2"
 "webvh/sync/batch" = "0.1"
 "webvh/sync/delete" = "0.2"

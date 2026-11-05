@@ -1679,9 +1679,7 @@ pub async fn list_dids(
             if record.owner != target_owner {
                 continue;
             }
-            let stats_key = format!("stats:{mnemonic}");
-            let did_stats: did_hosting_common::DidStats =
-                state.stats_ks.get(stats_key).await?.unwrap_or_default();
+            let did_stats = crate::stats_admin::live_did_stats(state, &mnemonic).await?;
             let agent_names = record.agent_names.clone();
             entries.push(DidListEntry {
                 mnemonic: record.mnemonic,
@@ -1725,9 +1723,7 @@ async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> 
             Ok(r) => r,
             Err(_) => continue,
         };
-        let stats_key = format!("stats:{}", record.mnemonic);
-        let did_stats: did_hosting_common::DidStats =
-            state.stats_ks.get(stats_key).await?.unwrap_or_default();
+        let did_stats = crate::stats_admin::live_did_stats(state, &record.mnemonic).await?;
         let agent_names = record.agent_names.clone();
         entries.push(DidListEntry {
             mnemonic: record.mnemonic,
@@ -1835,11 +1831,7 @@ pub async fn list_dids_page(
     let has_more = records.len() > limit;
     let mut page = Vec::with_capacity(limit.min(records.len()));
     for record in records.into_iter().take(limit) {
-        let stats: did_hosting_common::DidStats = state
-            .stats_ks
-            .get(format!("stats:{}", record.mnemonic))
-            .await?
-            .unwrap_or_default();
+        let stats = crate::stats_admin::live_did_stats(state, &record.mnemonic).await?;
         page.push((record, stats.total_resolves));
     }
     info!(did = %auth.did, total, returned = page.len(), has_more, "DID page listed on control plane");
@@ -1913,6 +1905,7 @@ pub async fn delete_did(
     batch.commit().await?;
     invalidate_cached_content(state, mnemonic);
     state.stats_collector.decrement_total_dids();
+    crate::stats_admin::delete_did_stats(state, mnemonic).await;
 
     info!(did = %auth.did, mnemonic = %mnemonic, "DID deleted on control plane");
 
@@ -2584,6 +2577,8 @@ mod tests_atomic {
             identity: Default::default(),
             replay: Default::default(),
             geoip: Default::default(),
+            stats_flush: Default::default(),
+            stats: Default::default(),
             config_path: PathBuf::new(),
         };
 

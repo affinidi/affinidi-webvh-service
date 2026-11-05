@@ -77,6 +77,29 @@ enum Command {
     },
     /// List all ACL entries
     ListAcl,
+    /// Show a DID's statistics resolution, recorded tier and totals
+    /// (offline; stop the service first).
+    StatsShow {
+        /// The DID's path (mnemonic).
+        #[arg(long)]
+        mnemonic: String,
+    },
+    /// Set a DID's statistics resolution (offline; stop the service first):
+    /// `auto` (by traffic), `fine` (always 5-minute detail), `coarse` (never
+    /// promoted) or `off` (totals only). Applied at the next start.
+    StatsSet {
+        /// The DID's path (mnemonic).
+        #[arg(long)]
+        mnemonic: String,
+        /// auto, fine, coarse or off.
+        #[arg(long, value_parser = ["auto", "fine", "coarse", "off"])]
+        resolution: String,
+    },
+    /// Finish the move to tiered statistics and delete the legacy time-series
+    /// rows now, instead of 30 days after the migration (offline; stop the
+    /// service first). An older version rolled back to afterwards has no
+    /// time-series history.
+    StatsPurgeLegacy,
     /// List the service's own identity generations (key material still honoured).
     IdentityList,
     /// List this service's established TSP relationships (offline; stop the
@@ -408,6 +431,55 @@ async fn main() {
         }
         Some(Command::AddAcl { did, role, label }) => {
             if let Err(e) = run_add_acl(cli.config, did, role, label).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::StatsShow { mnemonic }) => {
+            let result = match AppConfig::load(cli.config) {
+                Ok(config) => {
+                    did_hosting_control::stats_cli::run_stats_show(&config.store, &mnemonic).await
+                }
+                Err(e) => Err(e.into()),
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::StatsSet {
+            mnemonic,
+            resolution,
+        }) => {
+            let result = match AppConfig::load(cli.config) {
+                Ok(config) => {
+                    did_hosting_control::stats_cli::run_stats_set(
+                        &config.store,
+                        &mnemonic,
+                        &resolution,
+                    )
+                    .await
+                }
+                Err(e) => Err(e.into()),
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::StatsPurgeLegacy) => {
+            let result = match AppConfig::load(cli.config) {
+                Ok(config) => {
+                    did_hosting_control::stats_cli::run_stats_purge_legacy(
+                        &config.store,
+                        &config.stats_flush,
+                        &config.stats,
+                    )
+                    .await
+                }
+                Err(e) => Err(e.into()),
+            };
+            if let Err(e) = result {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }

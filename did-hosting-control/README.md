@@ -188,9 +188,43 @@ Environment variables use the `CONTROL_` prefix:
 | `CONTROL_REPLAY_MAX_ENTRIES`               | Replay cache records, all signers (default 1,000,000, about 32 MB) |
 | `CONTROL_REPLAY_MAX_ENTRIES_PER_SIGNER`    | Replay cache records per signer (default 250,000, about 600 signed requests a second) |
 | `CONTROL_GEOIP_DATABASE`                   | Local GeoIP `.mmdb` file for wallet sign-in locations (empty clears) |
+| `CONTROL_STATS_FLUSH_MAX_ROWS_PER_SECOND`  | Statistics rows the periodic flush writes a second, at most (default 20) |
+| `CONTROL_STATS_MODE`                       | Which DIDs keep 5-minute statistics: `auto` (busy ones, default), `fine` (all), `coarse` (none) |
+| `CONTROL_STATS_PROMOTE_PER_HOUR`           | Resolves in an hour that promote a DID to 5-minute statistics (default 60) |
+| `CONTROL_STATS_DEMOTE_PER_HOUR`            | Hourly resolves (last hour and day's average) below which it is demoted (default 20) |
+| `CONTROL_STATS_MAX_FINE_DIDS`              | Most DIDs promoted automatically (default 1,000) |
 
 The replay settings live in `[replay]` (`max_entries`,
 `max_entries_per_signer`); see "Replay cache bounds" below.
+
+### Statistics flush budget
+
+`[stats_flush] max_rows_per_second` (1 to 10,000, default 20) bounds how fast
+the control plane writes statistics. Every 10 seconds it takes the per-DID
+counters gathered since the last flush and writes at most that many rows a
+second, paced across the interval. Each row is a read and a write. The
+budget counts rows, not table units: on DynamoDB a row costs one or more
+units by size, up to about three write units for a DID's row; see "Costs" in
+[`docs/stats-tiers.md`](../docs/stats-tiers.md).
+
+Rows past the budget wait for the next flush. What waits too long is dropped,
+with a warning: time-series buckets older than an hour, and rows past the
+collector's caps (100,000 DIDs, 200,000 buckets). Per-DID totals are never
+dropped by age. A DID's row is written once per 5-minute bucket it was active
+in, plus one ring row per bucket if it keeps 5-minute statistics, so set the
+budget above the rows produced: about the distinct DIDs resolved in 5
+minutes, plus the fine ones among them, divided by 300. Lower it to leave a
+small table's capacity for resolutions and creations; raise it to drain a
+backlog sooner.
+
+### Tiered statistics
+
+Every DID keeps hourly (7 days) and daily (30 days) statistics in one row;
+busy DIDs also keep a 5-minute ring for the last day. `[stats]` sets who is
+busy (`mode`, `promote_per_hour`, `demote_per_hour`, `max_fine_dids`), and a
+per-DID override (`auto`, `fine`, `coarse`, `off`; `fine` is admin only)
+overrides it. Legacy statistics are migrated automatically at startup. See
+[`docs/stats-tiers.md`](../docs/stats-tiers.md).
 
 ## CLI Commands
 
@@ -199,6 +233,9 @@ did-hosting-control                                    # Run control plane (defa
 did-hosting-control setup                              # Interactive config wizard
 did-hosting-control add-acl --did <DID> [--role admin|owner] [--label <name>]  # Add ACL entry
 did-hosting-control list-acl                           # List ACL entries
+did-hosting-control stats-show --mnemonic <m>          # A DID's statistics tier (offline)
+did-hosting-control stats-set --mnemonic <m> --resolution auto|fine|coarse|off  # (offline)
+did-hosting-control stats-purge-legacy                 # Delete migrated legacy statistics now (offline)
 ```
 
 ## Features

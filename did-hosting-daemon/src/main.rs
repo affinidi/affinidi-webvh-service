@@ -157,6 +157,29 @@ enum Command {
         #[arg(long, requires = "url")]
         token: Option<String>,
     },
+    /// Show a DID's statistics resolution, recorded tier and totals
+    /// (offline; stop the service first).
+    StatsShow {
+        /// The DID's path (mnemonic).
+        #[arg(long)]
+        mnemonic: String,
+    },
+    /// Set a DID's statistics resolution (offline; stop the service first):
+    /// `auto` (by traffic), `fine` (always 5-minute detail), `coarse` (never
+    /// promoted) or `off` (totals only). Applied at the next start.
+    StatsSet {
+        /// The DID's path (mnemonic).
+        #[arg(long)]
+        mnemonic: String,
+        /// auto, fine, coarse or off.
+        #[arg(long, value_parser = ["auto", "fine", "coarse", "off"])]
+        resolution: String,
+    },
+    /// Finish the move to tiered statistics and delete the legacy time-series
+    /// rows now, instead of 30 days after the migration (offline; stop the
+    /// service first). An older version rolled back to afterwards has no
+    /// time-series history.
+    StatsPurgeLegacy,
     /// Read the service's own counters via the authenticated
     /// `server/metrics/0.1` Trust Task and print them as JSON.
     ///
@@ -499,6 +522,55 @@ async fn main() {
             )
             .await
             {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::StatsShow { mnemonic }) => {
+            let result = match DaemonConfig::load(cli.config) {
+                Ok(config) => {
+                    did_hosting_control::stats_cli::run_stats_show(&config.store, &mnemonic).await
+                }
+                Err(e) => Err(e.into()),
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::StatsSet {
+            mnemonic,
+            resolution,
+        }) => {
+            let result = match DaemonConfig::load(cli.config) {
+                Ok(config) => {
+                    did_hosting_control::stats_cli::run_stats_set(
+                        &config.store,
+                        &mnemonic,
+                        &resolution,
+                    )
+                    .await
+                }
+                Err(e) => Err(e.into()),
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::StatsPurgeLegacy) => {
+            let result = match DaemonConfig::load(cli.config) {
+                Ok(config) => {
+                    did_hosting_control::stats_cli::run_stats_purge_legacy(
+                        &config.store,
+                        &config.stats_flush,
+                        &config.stats,
+                    )
+                    .await
+                }
+                Err(e) => Err(e.into()),
+            };
+            if let Err(e) = result {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -934,45 +1006,20 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         }
     }
 
-    // 1c. Seed stats collector from persisted store
+    // 1c. Seed stats collector from persisted store: the aggregate, the DID
+    // count and the per-DID statistics overrides; then the `[stats]` policy.
     let stats_collector = {
-        use did_hosting_common::server::stats_collector::StatsAggregate;
         let collector = StatsCollector::new();
-        let mut total_resolves = 0u64;
-        let mut total_updates = 0u64;
-        let mut last_resolved_at: Option<u64> = None;
-        let mut last_updated_at: Option<u64> = None;
-        if let Ok(raw) = stats_ks.prefix_iter_raw("stats:").await {
-            for (_key, value) in raw {
-                if let Ok(s) = serde_json::from_slice::<did_hosting_common::DidStats>(&value) {
-                    total_resolves += s.total_resolves;
-                    total_updates += s.total_updates;
-                    last_resolved_at = match (last_resolved_at, s.last_resolved_at) {
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                        (a, b) => a.or(b),
-                    };
-                    last_updated_at = match (last_updated_at, s.last_updated_at) {
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                        (a, b) => a.or(b),
-                    };
-                }
-            }
-        }
-        let total_dids = dids_ks
-            .prefix_iter_raw("did:")
-            .await
-            .map(|v| v.len())
-            .unwrap_or(0) as u64;
-        collector.seed_aggregate(&StatsAggregate {
-            total_dids,
-            total_resolves,
-            total_updates,
-            last_resolved_at,
-            last_updated_at,
-        });
+        let agg = did_hosting_common::server::stats_collector::seed_from_store(
+            &collector, &stats_ks, &dids_ks,
+        )
+        .await;
+        collector.configure_tiers(config.stats);
         info!(
-            total_dids,
-            total_resolves, total_updates, "stats collector seeded from store"
+            total_dids = agg.total_dids,
+            total_resolves = agg.total_resolves,
+            total_updates = agg.total_updates,
+            "stats collector seeded from store"
         );
         Arc::new(collector)
     };
@@ -1168,6 +1215,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             auth_config: config.auth.clone(),
             has_auth: config.server_did.is_some(),
             collector: stats_collector.clone(),
+            stats_flush: config.stats_flush,
             control_state: control_state.clone(),
             content_cache: server_state.as_ref().map(|s| s.did_cache.clone()),
             gate_cache: server_state.as_ref().and_then(|s| s.gate_cache.clone()),
@@ -1334,6 +1382,8 @@ struct DaemonStorageParams {
     auth_config: did_hosting_common::server::config::AuthConfig,
     has_auth: bool,
     collector: Arc<StatsCollector>,
+    /// The statistics flush budget (`[stats_flush]`).
+    stats_flush: did_hosting_control::config::StatsFlushConfig,
     /// The control plane's state, for the identity sweep.
     ///
     /// Daemon parity (CLAUDE.md): periodic work that standalone services spawn
@@ -1347,6 +1397,26 @@ struct DaemonStorageParams {
     gate_cache: Option<Arc<did_hosting_server::cache::GateCache>>,
 }
 
+/// Delete the statistics of DIDs the empty-slot cleanup or the domain purge
+/// removed. Neither knows about statistics (on an edge there are none); the
+/// daemon holds them in the same store, and an explicit delete already
+/// clears them (`stats_admin::delete_did_stats`). Runs on the storage task,
+/// between flushes, so no flush is writing these rows meanwhile.
+async fn delete_removed_dids_stats(params: &DaemonStorageParams, mnemonics: &[String]) {
+    for mnemonic in mnemonics {
+        if let Err(e) = did_hosting_common::server::stats_collector::delete_did_stats(
+            &params.collector,
+            &params.stats_ks,
+            &params.timeseries_ks,
+            mnemonic,
+        )
+        .await
+        {
+            warn!(mnemonic, error = %e, "could not delete a removed DID's statistics rows");
+        }
+    }
+}
+
 async fn run_daemon_storage_task(
     params: DaemonStorageParams,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -1356,7 +1426,7 @@ async fn run_daemon_storage_task(
     let session_interval = Duration::from_secs(params.auth_config.session_cleanup_interval);
     let did_ttl_seconds = params.auth_config.cleanup_ttl_minutes * 60;
     let did_interval = Duration::from_secs(did_ttl_seconds.max(60));
-    let flush_interval = Duration::from_secs(10);
+    let flush_interval = did_hosting_control::config::STATS_FLUSH_INTERVAL;
 
     let mut session_timer = tokio::time::interval(session_interval);
     let mut did_timer = tokio::time::interval(did_interval);
@@ -1364,6 +1434,12 @@ async fn run_daemon_storage_task(
     // A flush that overruns its interval is followed by a full interval, not
     // an immediate catch-up flush.
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The migration to the tiered statistics format, stepped after each flush.
+    let mut stats_maintenance = did_hosting_control::stats_migration::StatsMaintenance::new(
+        params.stats_ks.clone(),
+        params.timeseries_ks.clone(),
+        params.dids_ks.clone(),
+    );
     // Same recount as the standalone control plane: corrects the count for
     // paths that do not keep it, such as an offline `remove`.
     let mut did_count_timer = tokio::time::interval(
@@ -1412,10 +1488,11 @@ async fn run_daemon_storage_task(
                     did_ttl_seconds,
                     params.control_state.as_ref().map(|s| &s.path_locks),
                 ).await {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        info!(count = n, "cleaned up empty DID records");
-                        params.collector.subtract_total_dids(n);
+                    Ok(removed) if removed.is_empty() => {}
+                    Ok(removed) => {
+                        info!(count = removed.len(), "cleaned up empty DID records");
+                        params.collector.subtract_total_dids(removed.len() as u64);
+                        delete_removed_dids_stats(&params, &removed).await;
                     }
                     Err(e) => warn!("DID cleanup error: {e}"),
                 }
@@ -1429,13 +1506,27 @@ async fn run_daemon_storage_task(
                 }
             }
             _ = flush_timer.tick() => {
-                if let Err(e) = did_hosting_control::server::flush_stats_to_store(
+                // One deadline for the tick: the flush, then the migration in
+                // what is left of it, so the tick keeps its interval.
+                let deadline = tokio::time::Instant::now()
+                    + did_hosting_control::config::STATS_FLUSH_INTERVAL;
+                if let Err(e) = did_hosting_control::server::flush_stats_paced_until(
                     &params.collector,
                     &params.stats_ks,
                     &params.timeseries_ks,
-                    did_hosting_control::server::STATS_FLUSH_MAX_ROWS,
+                    &params.stats_flush,
+                    shutdown_rx.clone(),
+                    deadline,
                 ).await {
                     warn!("stats flush error: {e}");
+                }
+                // Parity with the control plane: the migration to (and
+                // clean-up after) the tiered statistics format.
+                if let Err(e) = stats_maintenance
+                    .step(&params.collector, &params.stats_flush, shutdown_rx.clone(), deadline)
+                    .await
+                {
+                    warn!("stats migration error: {e}");
                 }
             }
             _ = purge_timer.tick() => {
@@ -1454,6 +1545,7 @@ async fn run_daemon_storage_task(
                     if purged { gate.clear() } else { gate.evict_expired() }
                 }
                 params.collector.subtract_total_dids(sweep.dids_deleted);
+                delete_removed_dids_stats(&params, &sweep.purged_dids).await;
             }
             _ = identity_expiry_timer.tick() => {
                 if let Some(state) = params.control_state.as_ref() {
