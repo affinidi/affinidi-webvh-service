@@ -39,6 +39,8 @@ jobs:
         with:
           app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
       # Every backport conflicts on CHANGELOG.md, and the fix is always the same:
       # keep the release branch's copy ("ours" during a cherry-pick). Global, as
       # the action makes its own checkout.
