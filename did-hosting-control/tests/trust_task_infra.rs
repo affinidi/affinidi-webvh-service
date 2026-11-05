@@ -66,6 +66,7 @@ async fn make_harness() -> Harness {
         replay: Default::default(),
         geoip: Default::default(),
         stats_flush: Default::default(),
+        stats: Default::default(),
         config_path: PathBuf::new(),
     };
 

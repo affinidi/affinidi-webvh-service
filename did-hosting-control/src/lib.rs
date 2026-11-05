@@ -39,6 +39,11 @@ pub mod setup;
 pub mod setup_recipe;
 pub mod sign_in_readiness;
 pub mod signing;
+pub mod stats_admin;
+pub mod stats_cli;
+pub mod stats_flush;
+pub mod stats_migration;
+pub mod stats_query;
 pub mod store;
 #[cfg(feature = "test-support")]
 pub mod test_support;

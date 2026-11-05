@@ -1875,6 +1875,7 @@ mod tests {
             replay: Default::default(),
             geoip: Default::default(),
             stats_flush: Default::default(),
+            stats: Default::default(),
             config_path: PathBuf::new(),
         };
 
@@ -2738,6 +2739,7 @@ mod tests {
             replay: Default::default(),
             geoip: Default::default(),
             stats_flush: Default::default(),
+            stats: Default::default(),
             config_path: state.config.config_path.clone(),
         };
         state.config = Arc::new(cfg);

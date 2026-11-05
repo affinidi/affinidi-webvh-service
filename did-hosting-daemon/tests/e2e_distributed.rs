@@ -176,6 +176,7 @@ impl Topology {
             replay: Default::default(),
             geoip: Default::default(),
             stats_flush: Default::default(),
+            stats: Default::default(),
             config_path: PathBuf::new(),
         };
         let control = did_hosting_control::server::AppState {
