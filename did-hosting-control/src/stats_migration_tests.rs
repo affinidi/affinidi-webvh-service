@@ -516,6 +516,131 @@ async fn purge_now_deletes_a_page_at_a_time() {
     assert_eq!(resolves(&f.all().await), 15);
 }
 
+/// Pages in hash order, as DynamoDB's `Scan` returns them: a series' rows
+/// are spread across pages, and some pages hold no legacy rows at all. The
+/// result is the same as reading every row at once.
+#[tokio::test]
+async fn a_migration_read_in_hash_order_counts_every_bucket_once() {
+    let f = fixture().await;
+    let now = now_epoch();
+    history(&f, now).await;
+
+    let m = StatsMaintenance::new(
+        f.stats_ks.clone(),
+        f.ts_ks.with_hash_ordered_pages(),
+        f.dids_ks.clone(),
+    )
+    .with_page_rows(2);
+    drive(m, &StatsCollector::new()).await;
+
+    assert_eq!(resolves(&f.coarse("alice").await.unwrap()), 1 + 2 + 3);
+    assert_eq!(resolves(&f.coarse("bob").await.unwrap()), 1);
+    assert_eq!(resolves(&f.coarse("carol").await.unwrap()), 1 + 2 + 3 + 4);
+    assert_eq!(resolves(&f.all().await), 15);
+    assert!(f.marker().await.unwrap().completed_at.is_some());
+}
+
+/// A hash-ordered walk that fails part-way resumes from its cursor with
+/// what it held so far, rather than reading from the start or waiting.
+#[tokio::test]
+async fn a_failed_hash_ordered_read_resumes_from_its_cursor() {
+    let f = fixture().await;
+    let now = now_epoch();
+    history(&f, now).await;
+    let collector = StatsCollector::new();
+    // Reads: the marker, then one page; the next page fails.
+    let mut m = StatsMaintenance::new(
+        f.stats_ks.clone(),
+        f.ts_ks
+            .with_hash_ordered_pages()
+            .failing_reads_after(2, AppError::store_throttled),
+        f.dids_ks.clone(),
+    )
+    .with_page_rows(2);
+    let (_tx, stop) = watch::channel(false);
+    m.step(&collector, &budget(), stop.clone(), later())
+        .await
+        .unwrap();
+    assert!(
+        m.step(&collector, &budget(), stop.clone(), later())
+            .await
+            .is_err()
+    );
+    assert!(m.busy(), "still migrating");
+
+    m.timeseries_ks = f.ts_ks.with_hash_ordered_pages();
+    // The very next step reads on: no pause after a failed page.
+    m.step(&collector, &budget(), stop.clone(), later())
+        .await
+        .unwrap();
+    while m.busy() {
+        m.step(&collector, &budget(), stop.clone(), later())
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(resolves(&f.coarse("alice").await.unwrap()), 6);
+    assert_eq!(resolves(&f.coarse("carol").await.unwrap()), 10);
+    assert_eq!(resolves(&f.all().await), 15);
+}
+
+/// The purge deletes behind a hash-ordered cursor and still finds every row.
+#[tokio::test]
+async fn purge_now_in_hash_order_deletes_every_row() {
+    let f = fixture().await;
+    let now = now_epoch();
+    history(&f, now).await;
+
+    let deleted = StatsMaintenance::new(
+        f.stats_ks.clone(),
+        f.ts_ks.with_hash_ordered_pages(),
+        f.dids_ks.clone(),
+    )
+    .with_page_rows(3)
+    .purge_legacy_now(&StatsCollector::new(), &budget())
+    .await
+    .unwrap();
+
+    assert_eq!(deleted, 10);
+    assert!(f.ts_ks.prefix_iter_raw("ts:").await.unwrap().is_empty());
+    assert_eq!(resolves(&f.all().await), 15);
+}
+
+/// Buckets older than any chart shows are not migrated (or held in memory
+/// while reading), but are still deleted with the rest.
+#[tokio::test]
+async fn buckets_past_the_horizon_are_not_migrated_but_are_purged() {
+    let f = fixture().await;
+    let now = now_epoch();
+    f.did("alice").await;
+    f.legacy("alice", bucket_ago(now, HOUR_SECS), 2).await;
+    f.legacy("alice", bucket_ago(now, LEGACY_HORIZON_SECS + DAY_SECS), 50)
+        .await;
+    f.did("old").await;
+    f.legacy("old", bucket_ago(now, 90 * DAY_SECS), 7).await;
+
+    let deleted = f
+        .maintenance()
+        .purge_legacy_now(&StatsCollector::new(), &budget())
+        .await
+        .unwrap();
+
+    assert_eq!(resolves(&f.coarse("alice").await.unwrap()), 2);
+    let alice_daily: u64 = f
+        .coarse("alice")
+        .await
+        .unwrap()
+        .daily()
+        .map(|(_, r, _)| r)
+        .sum();
+    assert_eq!(
+        alice_daily, 2,
+        "the old bucket is not in the daily series either"
+    );
+    assert!(f.coarse("old").await.is_none(), "nothing recent to migrate");
+    assert_eq!(deleted, 3, "every legacy row is deleted");
+}
+
 #[test]
 fn legacy_keys_parse() {
     assert_eq!(parse_legacy_key(b"ts:alice:300"), Some(("alice", 300)));

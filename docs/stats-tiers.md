@@ -145,12 +145,18 @@ Automatic, idempotent, and safe to roll back.
    (`coarse`) that older readers ignore. Nothing writes `ts:` any more. Edges
    are unaffected: they keep no time series.
 2. **Backfill, once.** At startup, if the marker is missing or incomplete,
-   the storage task reads `ts:` once, a page of 1,000 rows at a time in key
-   order (a backend that cannot list in key order, a hash-ordered Scan, is
-   read whole, and after a failed read waits 5 minutes before reading again),
-   and, a flush's worth at a time between flushes, adds each
-   series' legacy buckets to its coarse series (and, for a
-   series that is fine, the last day's to its ring). Each series records the
+   the storage task reads `ts:` once and, a flush's worth at a time between
+   flushes, adds each series' legacy buckets to its coarse series (and, for a
+   series that is fine, the last day's to its ring). Only buckets from the
+   last 31 days are kept: no chart shows older. How it reads:
+
+   | Backend | Read | Held in memory | After a failed read |
+   |---|---|---|---|
+   | fjall | pages of 1,000 keys, in key order | one series at a time | resumes from the cursor |
+   | DynamoDB | a paged `Scan`, 1,000 items a request, in hash order | every series, until the scan ends | resumes from the cursor |
+   | Redis, Firestore, Cosmos DB | the whole prefix at once | every series | reads again after 5 minutes |
+
+   Each series records the
    legacy buckets it has taken (`migrated_through`), so a restart part-way, a
    second run, or two replicas overlapping never count a bucket twice. Series
    for DIDs that no longer exist are skipped. Totals are not touched: the old
@@ -159,7 +165,8 @@ Automatic, idempotent, and safe to roll back.
 3. **Charts during the backfill** are read from the legacy rows; once the
    marker records completion they are read from the new rows.
 4. **Legacy rows are kept for 30 days** after completion, then deleted, paced
-   and resumably, reading their keys a page at a time. `stats-purge-legacy` deletes them at once.
+   and resumably, reading their keys a page at a time where the backend
+   pages. `stats-purge-legacy` deletes them at once.
 5. **Rollback.** An older binary rolled back to within the 30 days finds its
    `ts:` rows, missing only what was counted since the upgrade, and its
    rewrites of `stats:` rows drop their `coarse` series. On the next upgrade
@@ -180,11 +187,20 @@ Offline (stop the service first), on both `did-hosting-control` and
 
 ## Limits
 
-- Rows are still a read and a write each. DynamoDB's `ADD` (the store already
-  uses it for `incr_raw`) would make them one write and safe for several
-  writers; that needs a multi-field increment in the store trait.
-- The flush assumes one writer per stats row, as before: two control-plane
-  replicas flushing the same DID can lose an update.
-- DIDs removed by the domain purge sweep or the empty-slot cleanup leave their
-  `stats:` row behind, as before; an explicit delete removes all of a DID's
-  statistics rows.
+- **Rows are a read and a write each.** Writing them with DynamoDB's
+  `UpdateItem … ADD` instead would not pay for itself:
+  - an `UpdateItem` is charged for the item's full size, like a `PutItem`, so
+    it saves only the read: half a read unit, against the one to three write
+    units the row costs (about 10% of a row's units, less in price, since a
+    read unit costs a fifth of a write unit);
+  - a DID's row holds its coarse series, sparse points that `ADD` cannot
+    merge, so only the totals could use it.
+- **The flush assumes one writer per stats row.** Two control-plane replicas
+  flushing the same DID can lose an update. Several control-plane replicas
+  on one store are not a supported deployment; if they become one, the fix
+  is a conditional write (compare-and-swap on the row) in the store trait,
+  not `ADD`.
+- **Removing a DID removes its statistics rows** on every path that removes
+  the record: an explicit delete, and on the daemon the empty-slot cleanup
+  and the domain purge sweep. A standalone control plane runs neither
+  cleanup, and an edge keeps no statistics rows.

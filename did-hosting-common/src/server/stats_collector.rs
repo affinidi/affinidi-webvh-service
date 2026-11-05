@@ -439,6 +439,24 @@ impl StatsCollector {
             .collect()
     }
 
+    /// Forget a deleted DID: drop its counts not yet written, its buckets,
+    /// its fine-ring retries and its tiering state, so the next flush does
+    /// not write its rows back. The aggregate and the server-wide series
+    /// keep what they counted. A flush already writing the DID can still
+    /// land one row after this; the caller deletes the rows afterwards.
+    pub fn forget_did(&self, mnemonic: &str) {
+        self.deltas.lock().unwrap().remove(mnemonic);
+        self.buckets
+            .lock()
+            .unwrap()
+            .retain(|(m, _), _| m != mnemonic);
+        self.slot_retry
+            .lock()
+            .unwrap()
+            .retain(|(m, _), _| m != mnemonic);
+        self.tiers().forget(mnemonic);
+    }
+
     /// The tiering state: policy, overrides, and promoted DIDs.
     pub fn tiers(&self) -> std::sync::MutexGuard<'_, TierState> {
         self.tiers.lock().unwrap()
@@ -563,6 +581,43 @@ pub async fn reconcile_total_dids(
 ) -> Result<(), AppError> {
     let dids = dids_ks.prefix_iter_raw("did:").await?;
     collector.set_total_dids(dids.len() as u64);
+    Ok(())
+}
+
+/// Delete a deleted DID's statistics: its `stats:` row, its override and,
+/// when it had one, its fine ring, after [`StatsCollector::forget_did`] so
+/// the flush does not write them back. Every path that removes a DID record
+/// calls it: an explicit delete, the empty-slot cleanup and the domain
+/// purge.
+///
+/// Stops at the first failed delete and returns it; the rows left are read
+/// by nothing (a DID created later with the same mnemonic starts from its
+/// own first flush, which replaces the `stats:` row).
+pub async fn delete_did_stats(
+    collector: &StatsCollector,
+    stats_ks: &KeyspaceHandle,
+    timeseries_ks: &KeyspaceHandle,
+    mnemonic: &str,
+) -> Result<(), AppError> {
+    use crate::server::stats_tiers::{FINE_SLOTS, StoredDidStats, fine_key, pin_key, stats_key};
+
+    let had_fine = collector.tiers().pin(mnemonic) == StatsResolution::Fine;
+    collector.forget_did(mnemonic);
+    let row: Option<StoredDidStats> = stats_ks.get(stats_key(mnemonic)).await?;
+    let had_fine = had_fine
+        || row
+            .as_ref()
+            .and_then(|r| r.coarse.as_ref())
+            .is_some_and(|c| c.fine_since.is_some());
+    stats_ks.remove(stats_key(mnemonic)).await?;
+    stats_ks.remove(pin_key(mnemonic)).await?;
+    if had_fine {
+        for slot in 0..FINE_SLOTS {
+            timeseries_ks
+                .remove(fine_key(mnemonic, slot * BUCKET_SECS))
+                .await?;
+        }
+    }
     Ok(())
 }
 
@@ -875,5 +930,93 @@ mod tests {
         assert_eq!(collector.get_aggregate().total_dids, 2);
         collector.subtract_total_dids(10);
         assert_eq!(collector.get_aggregate().total_dids, 0);
+    }
+}
+
+#[cfg(all(test, feature = "store-fjall"))]
+mod store_tests {
+    use super::*;
+    use crate::server::config::StoreConfig;
+    use crate::server::stats_tiers::{
+        CoarseSeries, FineSlot, SeriesKind, StoredDidStats, fine_key, pin_key, stats_key,
+    };
+    use crate::server::store::Store;
+
+    /// Deleting a DID's statistics removes every row it had (its `stats:`
+    /// row, its override and its fine ring) and the counts not yet written,
+    /// so the next flush has nothing of it to write back. Another DID's rows
+    /// are untouched.
+    #[tokio::test]
+    async fn delete_did_stats_removes_every_row_and_what_is_pending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open fjall");
+        let stats_ks = store.keyspace("stats").unwrap();
+        let ts_ks = store.keyspace("timeseries").unwrap();
+        let now = now_epoch();
+
+        let mut coarse = CoarseSeries::default();
+        coarse.add(SeriesKind::Did, now, 1, 0);
+        coarse.fine_since = Some(now);
+        for m in ["gone", "kept"] {
+            let row = StoredDidStats {
+                coarse: Some(coarse.clone()),
+                ..StoredDidStats::default()
+            };
+            stats_ks.insert(stats_key(m).as_str(), &row).await.unwrap();
+            stats_ks
+                .insert(pin_key(m).as_str(), &StatsResolution::Fine)
+                .await
+                .unwrap();
+            ts_ks
+                .insert(fine_key(m, now).as_str(), &FineSlot { e: now, r: 1, u: 0 })
+                .await
+                .unwrap();
+        }
+        let collector = StatsCollector::new();
+        collector.tiers().set_pin("gone", StatsResolution::Fine);
+        collector.record_resolve("gone");
+        collector.record_resolve("kept");
+
+        delete_did_stats(&collector, &stats_ks, &ts_ks, "gone")
+            .await
+            .unwrap();
+
+        for key in [stats_key("gone"), pin_key("gone")] {
+            assert!(
+                stats_ks.get_raw(key.as_str()).await.unwrap().is_none(),
+                "{key}"
+            );
+        }
+        assert!(ts_ks.prefix_iter_raw("t5:gone:").await.unwrap().is_empty());
+        assert_eq!(collector.tiers().pin("gone"), StatsResolution::Auto);
+        assert!(collector.pending_for("gone").is_none());
+        let (rows, buckets) = collector.drain_due(now + 10 * BUCKET_SECS);
+        assert!(rows.iter().all(|d| d.mnemonic != "gone"));
+        assert!(buckets.iter().all(|b| b.mnemonic != "gone"));
+
+        assert!(
+            stats_ks
+                .get_raw(stats_key("kept").as_str())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            stats_ks
+                .get_raw(pin_key("kept").as_str())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(ts_ks.prefix_iter_raw("t5:kept:").await.unwrap().len(), 1);
+        assert!(
+            rows.iter().any(|d| d.mnemonic == "kept"),
+            "another DID's counts are kept"
+        );
     }
 }

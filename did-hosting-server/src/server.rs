@@ -899,10 +899,11 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
                     // An edge writes DID records only from its control
                     // plane's directives, which take no path lock.
                     match cleanup_empty_dids(&dids_ks, did_ttl_seconds, None).await {
-                        Ok(0) => {}
-                        Ok(n) => {
-                            info!(count = n, "cleaned up empty DID records");
-                            collector.subtract_total_dids(n);
+                        Ok(removed) if removed.is_empty() => {}
+                        // An edge keeps no statistics rows to delete with them.
+                        Ok(removed) => {
+                            info!(count = removed.len(), "cleaned up empty DID records");
+                            collector.subtract_total_dids(removed.len() as u64);
                         }
                         Err(e) => warn!("DID cleanup error: {e}"),
                     }
