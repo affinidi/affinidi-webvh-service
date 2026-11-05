@@ -109,12 +109,22 @@ Environment: `CONTROL_STATS_MODE`, `CONTROL_STATS_PROMOTE_PER_HOUR`,
 `fine` is admin-only because it costs writes and bypasses the cap; an owner
 can only ask for less detail about their own DID.
 
-The override is set by `stats_admin::set_stats_resolution` (the authorisation
-lives there) and, offline, by the `stats-set` command. A Trust Task for it,
-`did-management/did/set-stats-resolution`, needs its spec in the trust-tasks
-registry first; until then the CLI is the operator's path. The running
-service loads overrides at startup; another control-plane replica sees a
-change at its next start.
+The override is set online with the
+[`did-management/stats/set-resolution/0.1`](https://trusttasks.org/spec/did-management/stats/set-resolution/0.1)
+Trust Task and offline with the `stats-set` command; both go through
+`stats_admin::set_stats_resolution`, where the authorisation lives. The task
+answers a slot that does not exist and one the caller does not own alike
+(`notFound`), and an owner asking for `fine` with `permissionDenied`. Its
+response reports the tier that now applies and why (`tierReason`):
+
+| `tierReason` | Meaning |
+|---|---|
+| `override` | the slot's resolution |
+| `policy` | `[stats] mode` is `fine` or `coarse` |
+| `traffic` | promoted or demoted automatically |
+
+The running service applies a change at once; another control-plane replica
+sees it at its next start.
 
 ## Costs
 

@@ -240,6 +240,7 @@ control_tasks! {
     tt_server::config::v0_1 => Authentication, server::config;
     tt_server::metrics::v0_1 => Authentication, server::metrics;
     tt_stats::get::v0_1 => Authentication, server::stats_get;
+    tt_stats::set_resolution::v0_1 => Authentication, server::stats_set_resolution;
     tt_stats::timeseries::v0_2 => Authentication, server::timeseries;
     tt_identity::list::v0_1 => Authentication, server::identity_list;
     tt_identity::retire::v0_1 => Authentication, server::identity_retire;
