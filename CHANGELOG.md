@@ -16,9 +16,10 @@ once per 5 minutes, when its bucket closes, rather than every 10 seconds.
   `fine`, `coarse`), `promote_per_hour` (60), `demote_per_hour` (20),
   `max_fine_dids` (1,000).
 - **A per-DID override**, `auto`, `fine`, `coarse` or `off`. Only an admin
-  may set `fine`; an owner may set the others for their own DID. Set offline
-  with the new `stats-set` command; a Trust Task follows once its spec is
-  agreed. `stats-show` reports a DID's tier.
+  may set `fine`; an owner may set the others for their own DID. Set it with
+  the new `did-management/stats/set-resolution/0.1` Trust Task, which also
+  reports the tier that applies and why, or offline with the new `stats-set`
+  command. `stats-show` reports a DID's tier.
 - **The chart's `bucketSeconds` now varies**: a DID without 5-minute detail
   is charted hourly (daily over 30 days). The UI uses the value it is sent.
 - **Migration is automatic.** At startup the legacy `ts:` rows are folded into

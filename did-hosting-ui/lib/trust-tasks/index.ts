@@ -80,6 +80,7 @@ export * as DidManagementServerMetrics_v0_1 from "./did-management/server/metric
 export * as DidManagementServerRegister_v0_2 from "./did-management/server/register/0.2/payload.js";
 export * as DidManagementServerStatsSync_v0_1 from "./did-management/server/stats-sync/0.1/payload.js";
 export * as DidManagementStatsGet_v0_1 from "./did-management/stats/get/0.1/payload.js";
+export * as DidManagementStatsSetResolution_v0_1 from "./did-management/stats/set-resolution/0.1/payload.js";
 export * as DidManagementStatsTimeseries_v0_2 from "./did-management/stats/timeseries/0.2/payload.js";
 export * as WebvhSyncBatch_v0_1 from "./webvh/sync/batch/0.1/payload.js";
 export * as WebvhSyncDelete_v0_2 from "./webvh/sync/delete/0.2/payload.js";
