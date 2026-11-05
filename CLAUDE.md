@@ -445,11 +445,17 @@ Also worth knowing before you go looking for them:
 - **Never edit a `version =` by hand.** Releases are `major.minor`, live on
   `release/<major.minor>` branches cut from `nightly`, and every crate carries
   the release's version; patches happen only on the release branch. Versions
-  move only through `scripts/cut-release.py` (the cut; `main` goes to the next
-  minor) and the *Prepare a release* workflow (rc / GA / patch), and the
-  `branch rules` check fails any other PR that changes one. A fix for a
-  supported release lands on `main` first, then gets a `backport
-  release/<major.minor>` label. See `RELEASES.md`.
+  move only through the release workflows, and the `branch rules` check fails
+  any other PR that changes one. Trigger them rather than running the scripts:
+  - cut (`main` goes to the next minor): `gh workflow run release-cut.yml
+    --ref main -f name=0.42` (a dry run; add `-f dry-run=false` to cut);
+  - rc, GA or patch: `gh workflow run release-prep.yml --ref release/0.42
+    -f kind=rc` (or `ga`, `patch`);
+  - backport: a fix lands on `main` first, then gets a `backport
+    release/<major.minor>` label.
+
+  `scripts/cut-release.py` is a maintainer's local fallback only. See
+  `RELEASES.md`.
 
   The version is `[workspace.package] version`, inherited by every crate; the
   tooling also moves the internal path-dep pins, and
