@@ -22,15 +22,17 @@ once per 5 minutes, when its bucket closes, rather than every 10 seconds.
 - **The chart's `bucketSeconds` now varies**: a DID without 5-minute detail
   is charted hourly (daily over 30 days). The UI uses the value it is sent.
 - **Migration is automatic.** At startup the legacy `ts:` rows are folded into
-  the new rows, a flush's worth at a time. On a store that lists keys in
-  order (fjall) they are read 1,000 at a time, so memory is bounded by the
-  longest series rather than the whole history, and a failed read is retried
-  from where it stopped. A store that cannot (a hash-ordered scan) reads them
-  whole, and after a failed read waits 5 minutes before reading again.
-  Charts read the legacy rows until it completes. It can run again safely, and picks up rows an older version
-  wrote after a rollback. Legacy rows are kept for 30 days, then deleted;
-  `stats-purge-legacy` deletes them at once.
-- Deleting a DID deletes its statistics rows.
+  the new rows, a flush's worth at a time. Only the last 31 days are
+  migrated, as no chart shows older, so memory is bounded by a month of
+  history rather than the deployment's age. fjall and DynamoDB read them a
+  page of 1,000 keys at a time (DynamoDB as a paged `Scan`), and a failed
+  read is retried from where it stopped. Redis, Firestore and Cosmos DB read
+  them whole, and after a failed read wait 5 minutes before reading again.
+  Charts read the legacy rows until it completes. It can run again safely,
+  and picks up rows an older version wrote after a rollback. Legacy rows are
+  kept for 30 days, then deleted; `stats-purge-legacy` deletes them at once.
+- Removing a DID deletes its statistics rows: an explicit delete, and on the
+  daemon also the empty-slot cleanup and the domain purge sweep.
 - Displayed totals include counts not yet written.
 - A flush tick (the paced flush, then the migration step) starts no writes
   after its 10-second interval; under a slow store, what is left waits for

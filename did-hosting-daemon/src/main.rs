@@ -1397,6 +1397,26 @@ struct DaemonStorageParams {
     gate_cache: Option<Arc<did_hosting_server::cache::GateCache>>,
 }
 
+/// Delete the statistics of DIDs the empty-slot cleanup or the domain purge
+/// removed. Neither knows about statistics (on an edge there are none); the
+/// daemon holds them in the same store, and an explicit delete already
+/// clears them (`stats_admin::delete_did_stats`). Runs on the storage task,
+/// between flushes, so no flush is writing these rows meanwhile.
+async fn delete_removed_dids_stats(params: &DaemonStorageParams, mnemonics: &[String]) {
+    for mnemonic in mnemonics {
+        if let Err(e) = did_hosting_common::server::stats_collector::delete_did_stats(
+            &params.collector,
+            &params.stats_ks,
+            &params.timeseries_ks,
+            mnemonic,
+        )
+        .await
+        {
+            warn!(mnemonic, error = %e, "could not delete a removed DID's statistics rows");
+        }
+    }
+}
+
 async fn run_daemon_storage_task(
     params: DaemonStorageParams,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -1468,10 +1488,11 @@ async fn run_daemon_storage_task(
                     did_ttl_seconds,
                     params.control_state.as_ref().map(|s| &s.path_locks),
                 ).await {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        info!(count = n, "cleaned up empty DID records");
-                        params.collector.subtract_total_dids(n);
+                    Ok(removed) if removed.is_empty() => {}
+                    Ok(removed) => {
+                        info!(count = removed.len(), "cleaned up empty DID records");
+                        params.collector.subtract_total_dids(removed.len() as u64);
+                        delete_removed_dids_stats(&params, &removed).await;
                     }
                     Err(e) => warn!("DID cleanup error: {e}"),
                 }
@@ -1524,6 +1545,7 @@ async fn run_daemon_storage_task(
                     if purged { gate.clear() } else { gate.evict_expired() }
                 }
                 params.collector.subtract_total_dids(sweep.dids_deleted);
+                delete_removed_dids_stats(&params, &sweep.purged_dids).await;
             }
             _ = identity_expiry_timer.tick() => {
                 if let Some(state) = params.control_state.as_ref() {

@@ -16,7 +16,7 @@ use crate::server::config::StoreConfig;
 use crate::server::error::AppError;
 
 use super::dynamodb_errors::{self, MAX_ITEM_BYTES};
-use super::{BatchOps, BoxFuture, KeyspaceOps, RawKvPair, StorageBackend};
+use super::{BatchOps, BoxFuture, KeyspaceOps, PrefixPage, RawKvPair, StorageBackend};
 
 const PK_ATTR: &str = "pk";
 const VAL_ATTR: &str = "val";
@@ -378,6 +378,45 @@ impl KeyspaceOps for DynamoDbKeyspace {
             Ok(results)
         })
     }
+
+    /// One `Scan` request: `limit` items evaluated from where the last page
+    /// stopped, filtered to `prefix` as [`Self::prefix_iter_raw`] filters.
+    /// The table has only a hash key, so pages come in hash order
+    /// (`ordered: false`) and may be empty while more follow. The cursor is
+    /// the `pk` of the last item evaluated (`LastEvaluatedKey`), which
+    /// stays a valid start even once that item is deleted, so a caller can
+    /// delete behind it.
+    fn prefix_page_raw(
+        &self,
+        prefix: Vec<u8>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Option<PrefixPage>, AppError>> {
+        Box::pin(async move {
+            ensure_table(&self.client, &self.table, &self.verified).await?;
+            let mut req = self
+                .client
+                .scan()
+                .table_name(&self.table)
+                .consistent_read(self.consistent_scan)
+                .limit(i32::try_from(limit.max(1)).unwrap_or(i32::MAX));
+            if let Some(pk) = cursor {
+                req = req.exclusive_start_key(PK_ATTR, AttributeValue::B(Blob::new(pk)));
+            }
+            let resp = req.send().await.map_err(|e| request_error("scan", e))?;
+            let mut page = PrefixPage::default();
+            if let Some(items) = resp.items {
+                filter_items_by_prefix(items, &prefix, &mut page.rows);
+            }
+            page.next = resp
+                .last_evaluated_key
+                .and_then(|key| match key.get(PK_ATTR) {
+                    Some(AttributeValue::B(pk)) => Some(pk.as_ref().to_vec()),
+                    _ => None,
+                });
+            Ok(Some(page))
+        })
+    }
 }
 
 /// Reduce one page of scanned items to the `(pk, val)` byte pairs whose key
@@ -674,6 +713,38 @@ mod tests {
         assert!(scan(backend.keyspace_consistent_with_scans("dids").unwrap().1).await);
         assert!(!scan(backend.keyspace_consistent("dids").unwrap().1).await);
         assert!(!scan(backend.keyspace("dids").unwrap().1).await);
+    }
+
+    /// A page is one `Scan` request of `limit` items, resumed from the
+    /// cursor as its `ExclusiveStartKey`, never a whole-table read.
+    #[tokio::test]
+    async fn a_prefix_page_is_one_scan_request_from_the_cursor() {
+        let capture = CaptureBodies::default();
+        let backend = offline_backend(&capture);
+        let (_, ops) = backend.keyspace("dids").unwrap();
+
+        assert!(
+            ops.prefix_page_raw(b"ts:".to_vec(), None, 50)
+                .await
+                .is_err()
+        );
+        assert!(
+            ops.prefix_page_raw(b"ts:".to_vec(), Some(b"ts:a:300".to_vec()), 50)
+                .await
+                .is_err()
+        );
+        let bodies = std::mem::take(&mut *capture.0.lock().unwrap());
+        assert_eq!(bodies.len(), 2, "one scan a page: {bodies:?}");
+        for body in &bodies {
+            assert!(body.contains(r#""Limit":50"#), "{body}");
+        }
+        assert!(!bodies[0].contains("ExclusiveStartKey"), "{}", bodies[0]);
+        // base64("ts:a:300")
+        assert!(
+            bodies[1].contains(r#""ExclusiveStartKey":{"pk":{"B":"dHM6YTozMDA="}}"#),
+            "{}",
+            bodies[1]
+        );
     }
 
     fn batch_of(backend: &DynamoDbBackend, ops: &[(&[u8], Option<usize>)]) -> Box<dyn BatchOps> {

@@ -29,8 +29,9 @@ pub fn validate_did_jsonl(content: &str) -> Result<(), AppError> {
 // ---------------------------------------------------------------------------
 
 /// Remove DID records that have `version_count == 0` and are older than `ttl_seconds`,
-/// or soft-deleted records past the 30-day retention period. Returns how many
-/// records were removed.
+/// or soft-deleted records past the 30-day retention period. Returns the
+/// mnemonics removed, so a caller holding their statistics can delete those
+/// too.
 ///
 /// `locks` is the per-path lock the service's writers take (the daemon's
 /// control plane). Each candidate is re-read and re-checked under its lock
@@ -38,12 +39,12 @@ pub fn validate_did_jsonl(content: &str) -> Result<(), AppError> {
 /// Pass `None` where nothing else writes DID records under a path lock.
 ///
 /// A failed delete is logged and skipped rather than ending the pass, so the
-/// count returned always matches what was removed.
+/// list returned always matches what was removed.
 pub async fn cleanup_empty_dids(
     dids_ks: &KeyspaceHandle,
     ttl_seconds: u64,
     locks: Option<&PathLocks>,
-) -> Result<u64, AppError> {
+) -> Result<Vec<String>, AppError> {
     const SOFT_DELETE_RETENTION: u64 = 30 * 24 * 3600; // 30 days
     let now = now_epoch();
     let should_remove = |record: &DidRecord| {
@@ -56,7 +57,7 @@ pub async fn cleanup_empty_dids(
     };
 
     let raw = dids_ks.prefix_iter_raw("did:").await?;
-    let mut removed = 0u64;
+    let mut removed = Vec::new();
 
     for (_key, value) in raw {
         let Ok(snapshot) = serde_json::from_slice::<DidRecord>(&value) else {
@@ -90,7 +91,7 @@ pub async fn cleanup_empty_dids(
         batch.remove(dids_ks, content_witness_key(&record.mnemonic));
         batch.remove(dids_ks, owner_key(&record.owner, &record.mnemonic));
         match batch.commit().await {
-            Ok(()) => removed += 1,
+            Ok(()) => removed.push(record.mnemonic),
             Err(e) => {
                 warn!(mnemonic = %mnemonic, error = %e, "DID cleanup: delete failed; will retry next pass");
             }
@@ -210,7 +211,7 @@ mod tests {
 
         let removed = cleanup_empty_dids(&ks, 60, None).await.unwrap();
 
-        assert_eq!(removed, 1);
+        assert_eq!(removed.len(), 1);
         assert_eq!(ks.prefix_iter_raw("did:").await.unwrap().len(), 2);
     }
 
@@ -262,7 +263,7 @@ mod tests {
         ks.insert(did_key("slot"), &record).await.unwrap();
         drop(publish_guard);
 
-        assert_eq!(cleanup.await.unwrap().unwrap(), 0);
+        assert!(cleanup.await.unwrap().unwrap().is_empty());
         assert!(
             ks.get::<DidRecord>(did_key("slot"))
                 .await

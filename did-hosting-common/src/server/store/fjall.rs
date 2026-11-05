@@ -8,7 +8,7 @@ use tracing::info;
 use crate::server::config::{FjallTuning, StoreConfig, human_bytes};
 use crate::server::error::AppError;
 
-use super::{BatchOps, BoxFuture, KeyspaceOps, RawKvPair, StorageBackend};
+use super::{BatchOps, BoxFuture, KeyspaceOps, PrefixPage, RawKvPair, StorageBackend};
 
 // ---------------------------------------------------------------------------
 // FjallBackend
@@ -245,31 +245,38 @@ impl KeyspaceOps for FjallKeyspace {
     fn prefix_page_raw(
         &self,
         prefix: Vec<u8>,
-        after: Option<Vec<u8>>,
+        cursor: Option<Vec<u8>>,
         limit: usize,
-    ) -> BoxFuture<'_, Result<Option<Vec<RawKvPair>>, AppError>> {
+    ) -> BoxFuture<'_, Result<Option<PrefixPage>, AppError>> {
         let (db, ks) = (self.db.clone(), self.keyspace.clone());
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || -> Result<Option<Vec<RawKvPair>>, AppError> {
+            tokio::task::spawn_blocking(move || -> Result<Option<PrefixPage>, AppError> {
                 use std::ops::Bound;
-                let start = match after {
+                // The cursor is the last key of the previous page.
+                let start = match cursor {
                     Some(a) if a.as_slice() >= prefix.as_slice() => Bound::Excluded(a),
                     _ => Bound::Included(prefix.clone()),
                 };
-                let mut results = Vec::new();
+                let limit = limit.max(1);
+                let mut page = PrefixPage {
+                    ordered: true,
+                    ..PrefixPage::default()
+                };
                 for guard in db.snapshot().range(&ks, (start, Bound::Unbounded)) {
-                    if results.len() >= limit {
-                        break;
-                    }
                     let (key, value) = guard
                         .into_inner()
                         .map_err(|e| AppError::Store(e.to_string()))?;
                     if !key.starts_with(&prefix) {
                         break;
                     }
-                    results.push((key.to_vec(), value.to_vec()));
+                    if page.rows.len() == limit {
+                        // One more within the prefix: the walk goes on.
+                        page.next = page.rows.last().map(|(k, _)| k.clone());
+                        break;
+                    }
+                    page.rows.push((key.to_vec(), value.to_vec()));
                 }
-                Ok(Some(results))
+                Ok(Some(page))
             })
             .await
             .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
@@ -700,25 +707,28 @@ mod tests {
         for k in ["a:0", "p:3", "p:1", "p:2", "q:0"] {
             ks.insert_raw(k, k.as_bytes().to_vec()).await.unwrap();
         }
-        let keys = |page: Vec<RawKvPair>| -> Vec<String> {
-            page.into_iter()
-                .map(|(k, _)| String::from_utf8(k).unwrap())
+        let keys = |page: &PrefixPage| -> Vec<String> {
+            page.rows
+                .iter()
+                .map(|(k, _)| String::from_utf8(k.clone()).unwrap())
                 .collect()
         };
         let first = ks.prefix_page_raw("p:", None, 2).await.unwrap().unwrap();
-        assert_eq!(keys(first), ["p:1", "p:2"]);
+        assert_eq!(keys(&first), ["p:1", "p:2"]);
+        assert!(first.ordered);
+        assert_eq!(first.next.as_deref(), Some(&b"p:2"[..]));
         let rest = ks
-            .prefix_page_raw("p:", Some(b"p:2".to_vec()), 2)
+            .prefix_page_raw("p:", first.next, 2)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(keys(rest), ["p:3"], "stops at the end of the prefix");
-        let done = ks
-            .prefix_page_raw("p:", Some(b"p:3".to_vec()), 2)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(done.is_empty());
+        assert_eq!(keys(&rest), ["p:3"], "stops at the end of the prefix");
+        assert_eq!(rest.next, None, "the walk is complete");
+
+        // A page that ends exactly at the end of the prefix is the last.
+        let exact = ks.prefix_page_raw("p:", None, 3).await.unwrap().unwrap();
+        assert_eq!(keys(&exact), ["p:1", "p:2", "p:3"]);
+        assert_eq!(exact.next, None);
     }
 
     #[tokio::test]
