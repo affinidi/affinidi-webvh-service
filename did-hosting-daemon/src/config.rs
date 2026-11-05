@@ -85,6 +85,7 @@ pub struct DaemonConfig {
     /// Reaches the embedded control plane, which writes the statistics.
     #[serde(
         default,
+        deserialize_with = "stats_tiers_ignoring_the_servers_keys",
         skip_serializing_if = "did_hosting_control::config::StatsTierConfig::is_default"
     )]
     pub stats: did_hosting_control::config::StatsTierConfig,
@@ -519,6 +520,31 @@ impl DaemonConfig {
     }
 }
 
+/// The keys of the embedded server's `[stats]`
+/// ([`did_hosting_server::config::StatsConfig`]).
+const SERVER_STATS_KEYS: [&str; 2] = ["flush_interval_secs", "sync_interval_secs"];
+
+/// Read `[stats]`, dropping the embedded server's keys.
+///
+/// A daemon backup stores the embedded server's configuration, whose
+/// `[stats]` carries [`SERVER_STATS_KEYS`], and a restore writes it back.
+/// The daemon never used them, and before `[stats]` held the statistics
+/// tiers it ignored the whole section. Any other unknown key is still refused.
+fn stats_tiers_ignoring_the_servers_keys<'de, D>(
+    deserializer: D,
+) -> Result<did_hosting_control::config::StatsTierConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut table = toml::Table::deserialize(deserializer)?;
+    for key in SERVER_STATS_KEYS {
+        table.remove(key);
+    }
+    toml::Value::Table(table)
+        .try_into()
+        .map_err(serde::de::Error::custom)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,6 +727,31 @@ context_id = "webvh"
         let (_dir, path) = write_temp_config(&toml);
         let err = DaemonConfig::load(Some(path)).expect_err("no gap");
         assert!(err.to_string().contains("demote_per_hour"), "{err}");
+    }
+
+    /// A config restored from a backup carries the embedded server's
+    /// `[stats]` keys; it still loads, and a typo does not.
+    #[test]
+    fn stats_section_from_a_restored_backup_still_loads() {
+        let toml = format!(
+            "{SELF_MANAGED_TOML}\n[stats]\nflush_interval_secs = 5\nsync_interval_secs = 1\n"
+        );
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert!(cfg.stats.is_default());
+
+        let toml =
+            format!("{SELF_MANAGED_TOML}\n[stats]\nflush_interval_secs = 5\nmode = \"coarse\"\n");
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert_eq!(
+            cfg.stats.mode,
+            did_hosting_control::config::StatsMode::Coarse
+        );
+
+        let toml = format!("{SELF_MANAGED_TOML}\n[stats]\nmod = \"coarse\"\n");
+        let (_dir, path) = write_temp_config(&toml);
+        assert!(DaemonConfig::load(Some(path)).is_err(), "a typo is refused");
     }
 
     /// `[[geoip.networks]]` reaches the control plane; a bad range or label
