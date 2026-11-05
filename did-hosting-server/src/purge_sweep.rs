@@ -44,12 +44,15 @@ use did_hosting_common::server::auth::session::now_epoch;
 pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// What one sweep cycle did.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SweepReport {
     /// Pending entries that were ripe and purged.
     pub entries: u64,
     /// DID records those purges deleted.
     pub dids_deleted: u64,
+    /// Their mnemonics, so a caller holding their statistics (the daemon)
+    /// can delete those too.
+    pub purged_dids: Vec<String>,
 }
 
 /// Run one sweep cycle synchronously. Used both by the background
@@ -86,6 +89,7 @@ pub async fn run_sweep_once(store: &Store) -> SweepReport {
                     "purge sweep: ripe entry processed"
                 );
                 sweep.dids_deleted += report.deleted;
+                sweep.purged_dids.extend(report.purged);
 
                 // Soft-delete-with-grace path: the DomainEntry itself
                 // must be removed too. Unassign-grace (the other
@@ -275,7 +279,8 @@ mod tests {
             sweep,
             SweepReport {
                 entries: 1,
-                dids_deleted: 1
+                dids_deleted: 1,
+                purged_dids: vec!["alice".into()],
             },
             "only the ripe entry should be processed"
         );

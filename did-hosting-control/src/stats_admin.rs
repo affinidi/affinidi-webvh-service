@@ -11,7 +11,7 @@
 //! `auto`, `coarse` or `off`: less detail about their own DID, never more.
 
 use did_hosting_common::server::stats_tiers::{
-    FINE_SLOTS, StatsResolution, StoredDidStats, Tier, TierReason, pin_key, stats_key,
+    StatsResolution, StoredDidStats, Tier, TierReason, pin_key, stats_key,
 };
 use tracing::{info, warn};
 
@@ -109,32 +109,15 @@ pub async fn live_did_stats(
 /// it had one. Best effort, after the DID itself is gone: a failure leaves
 /// rows that nothing reads, and is logged.
 pub async fn delete_did_stats(state: &AppState, mnemonic: &str) {
-    let row: Option<StoredDidStats> = state
-        .stats_ks
-        .get(stats_key(mnemonic))
-        .await
-        .unwrap_or_default();
-    let had_fine = row
-        .as_ref()
-        .and_then(|r| r.coarse.as_ref())
-        .is_some_and(|c| c.fine_since.is_some())
-        || state.stats_collector.tiers().pin(mnemonic) == StatsResolution::Fine;
-    state.stats_collector.tiers().forget(mnemonic);
-    let mut keys = vec![
-        (state.stats_ks.clone(), stats_key(mnemonic)),
-        (state.stats_ks.clone(), pin_key(mnemonic)),
-    ];
-    if had_fine {
-        keys.extend(
-            (0..FINE_SLOTS)
-                .map(|slot| (state.timeseries_ks.clone(), format!("t5:{mnemonic}:{slot}"))),
-        );
-    }
-    for (ks, key) in keys {
-        if let Err(e) = ks.remove(key.clone()).await {
-            warn!(mnemonic, key, error = %e, "could not delete a deleted DID's statistics row");
-            return;
-        }
+    if let Err(e) = did_hosting_common::server::stats_collector::delete_did_stats(
+        &state.stats_collector,
+        &state.stats_ks,
+        &state.timeseries_ks,
+        mnemonic,
+    )
+    .await
+    {
+        warn!(mnemonic, error = %e, "could not delete a deleted DID's statistics rows");
     }
 }
 

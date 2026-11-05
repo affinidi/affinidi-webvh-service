@@ -5,8 +5,9 @@
 //!
 //! - **Migrate.** Once, at startup, when the marker
 //!   ([`MIGRATION_MARKER_KEY`]) is missing or incomplete: `ts:` is read a
-//!   page at a time ([`LEGACY_PAGE_ROWS`] rows, in key order, so one series'
-//!   rows are together), and for each series, its legacy buckets are added to its coarse series
+//!   page at a time ([`LEGACY_PAGE_ROWS`] keys), keeping only buckets within
+//!   [`LEGACY_HORIZON_SECS`], and for each series, its legacy buckets are
+//!   added to its coarse series
 //!   (`stats:{mnemonic}`, or `c:_all`) and, for a series in the fine tier,
 //!   the last day's into its fine ring. Each series records the legacy
 //!   buckets it has taken (`migrated_through`), so a restart part-way, or a
@@ -43,17 +44,29 @@ use did_hosting_common::server::store::RawKvPair;
 /// How often the maintenance step looks again when there is nothing to do.
 const IDLE_CHECK_SECS: u64 = HOUR_SECS;
 
-/// Legacy rows read at a time, on a backend that lists keys in order (see
-/// [`KeyspaceHandle::prefix_page_raw`]); one that cannot is read whole. Memory
-/// is then bounded by the longest series (it is held until complete), about
-/// 24 bytes a bucket: the server-wide series grows by about 2.5 MB a year.
+/// Keys read a page (see [`KeyspaceHandle::prefix_page_raw`]).
+///
+/// What is held in memory meanwhile, about 24 bytes a bucket kept:
+/// - pages in key order (fjall): one series at a time, until its rows end;
+/// - pages in hash order (DynamoDB): every series, until the walk ends,
+///   since a series' rows are spread across it;
+/// - a backend that cannot page (Redis, Firestore, Cosmos DB): the whole
+///   prefix, read at once.
+///
+/// In each case only buckets within [`LEGACY_HORIZON_SECS`] are kept, so the
+/// bound is a month of history, not the deployment's age.
 pub const LEGACY_PAGE_ROWS: usize = 1_000;
+
+/// How far back legacy buckets are migrated. The longest chart is 30 days,
+/// and a bucket older than that is never shown, so it is not kept; the
+/// extra day covers a daily point straddling the window's start.
+pub const LEGACY_HORIZON_SECS: u64 = 31 * DAY_SECS;
 
 /// Most pages read in one step, so a long series does not hold the storage
 /// task; the next steps read on.
 const MAX_PAGES_PER_STEP: usize = 10;
 
-/// How long to wait after a failed whole read (a backend without key order)
+/// How long to wait after a failed whole read (a backend that cannot page)
 /// before reading again. Such a read starts from the beginning, so retrying
 /// it every flush would re-read everything against a store already refusing.
 const WHOLE_READ_RETRY_SECS: u64 = 300;
@@ -78,20 +91,24 @@ enum Phase {
 /// How far reading the legacy rows has got.
 #[derive(Default)]
 struct LegacyCursor {
-    /// The last key read; the next page starts after it.
-    after: Option<Vec<u8>>,
+    /// Where the next page starts (the last page's `next`).
+    next: Option<Vec<u8>>,
     /// Every legacy row has been read.
     exhausted: bool,
     /// Do not read before this second (set by a failed whole read).
     retry_at: u64,
 }
 
-/// Where a migration is: series read and ready to fold, and the series the
-/// last page ended in (it may continue on the next).
+/// Where a migration is: series read and ready to fold, and those whose
+/// rows may continue on a later page.
 #[derive(Default)]
 struct Migrating {
     ready: VecDeque<LegacySeries>,
+    /// Pages in key order: the series the last page ended in.
     partial: Option<LegacySeries>,
+    /// Pages in hash order: every series read so far, all held until the
+    /// walk ends, since any later page may hold more of any of them.
+    held: BTreeMap<String, Vec<(u64, u64, u64)>>,
     cursor: LegacyCursor,
 }
 
@@ -111,9 +128,12 @@ struct LegacyBucket {
 }
 
 /// A legacy row as `(series, (epoch, resolves, updates))`, or `None` if it
-/// is not one.
-fn parse_legacy_row(key: &[u8], value: &[u8]) -> Option<(String, (u64, u64, u64))> {
+/// is not one or is older than `oldest`.
+fn parse_legacy_row(key: &[u8], value: &[u8], oldest: u64) -> Option<(String, (u64, u64, u64))> {
     let (series, epoch) = parse_legacy_key(key)?;
+    if epoch < oldest {
+        return None;
+    }
     let b: LegacyBucket = serde_json::from_slice(value).ok()?;
     Some((series.to_string(), (epoch, b.r, b.u)))
 }
@@ -277,8 +297,8 @@ impl StatsMaintenance {
         Ok(false)
     }
 
-    /// The next legacy rows after `cursor`, and whether they are in key
-    /// order: a page, or every row on a backend without key order. The
+    /// The next legacy rows from `cursor`, and whether they are in key
+    /// order: a page, or every row on a backend that cannot page. The
     /// cursor moves only on success; a failed whole read sets `retry_at`.
     async fn next_legacy_rows(
         &self,
@@ -287,7 +307,7 @@ impl StatsMaintenance {
     ) -> Result<(Vec<RawKvPair>, bool), AppError> {
         let page = self
             .timeseries_ks
-            .prefix_page_raw("ts:", cursor.after.clone(), self.page_rows)
+            .prefix_page_raw("ts:", cursor.next.clone(), self.page_rows)
             .await?;
         let Some(page) = page else {
             return match self.timeseries_ks.prefix_iter_raw("ts:").await {
@@ -301,35 +321,32 @@ impl StatsMaintenance {
                 }
             };
         };
-        cursor.exhausted = page.len() < self.page_rows;
-        if let Some((last, _)) = page.last() {
-            cursor.after = Some(last.clone());
-        }
-        Ok((page, true))
+        cursor.exhausted = page.next.is_none();
+        cursor.next = page.next;
+        Ok((page.rows, page.ordered))
     }
 
-    /// Read more legacy rows into `m`. In key order, a series is ready once
-    /// a row of another series follows it, or the rows run out. That relies
-    /// on one series' rows being together in key order, which holds because
-    /// a mnemonic has no `:` (path segments are `[a-z0-9-]`, a `did:webs` AID
-    /// base64url). A whole read is grouped by series instead.
+    /// Read more legacy rows into `m`, keeping buckets within
+    /// [`LEGACY_HORIZON_SECS`] of `now`.
+    ///
+    /// In key order, a series is ready once a row of another series follows
+    /// it, or the rows run out. That relies on one series' rows being
+    /// together in key order, which holds because a mnemonic has no `:`
+    /// (path segments are `[a-z0-9-]`, a `did:webs` AID base64url). Out of
+    /// key order (hash-ordered pages, or a whole read), every series is held
+    /// until the rows run out.
     async fn read_legacy(&self, m: &mut Migrating, now: u64) -> Result<(), AppError> {
         let (rows, ordered) = self.next_legacy_rows(&mut m.cursor, now).await?;
+        let oldest = now.saturating_sub(LEGACY_HORIZON_SECS);
         if !ordered {
-            let mut by_series: BTreeMap<String, Vec<(u64, u64, u64)>> = BTreeMap::new();
             for (key, value) in rows {
-                if let Some((series, bucket)) = parse_legacy_row(&key, &value) {
-                    by_series.entry(series).or_default().push(bucket);
+                if let Some((series, bucket)) = parse_legacy_row(&key, &value, oldest) {
+                    m.held.entry(series).or_default().push(bucket);
                 }
             }
-            m.ready.extend(
-                by_series
-                    .into_iter()
-                    .map(|(name, buckets)| LegacySeries { name, buckets }),
-            );
         } else {
             for (key, value) in rows {
-                let Some((series, bucket)) = parse_legacy_row(&key, &value) else {
+                let Some((series, bucket)) = parse_legacy_row(&key, &value, oldest) else {
                     continue;
                 };
                 match &mut m.partial {
@@ -347,6 +364,11 @@ impl StatsMaintenance {
         }
         if m.cursor.exhausted {
             m.ready.extend(m.partial.take());
+            m.ready.extend(
+                std::mem::take(&mut m.held)
+                    .into_iter()
+                    .map(|(name, buckets)| LegacySeries { name, buckets }),
+            );
         }
         for series in &mut m.ready {
             series.buckets.sort_unstable();
@@ -383,6 +405,8 @@ impl StatsMaintenance {
                 pages += 1;
                 // A failed read leaves the phase as it was: the next step
                 // reads the same page again (a whole read, after a pause).
+                // Pages may be empty while more follow (a scan's keys outside
+                // `ts:`), so pages, not rows, bound a step's reads.
                 let mut state = std::mem::take(m);
                 let result = self.read_legacy(&mut state, now).await;
                 self.phase = Phase::Migrating(state);
@@ -533,8 +557,9 @@ impl StatsMaintenance {
         Ok(Phase::Purging(Purging::default()))
     }
 
-    /// Read more legacy keys into `p`. Keys are deleted behind the cursor,
-    /// so the next page starts after the last key read.
+    /// Read more legacy keys into `p`, every bucket whatever its age. Keys
+    /// are deleted behind the cursor, which stays a valid place to resume
+    /// once the key it names is gone, in key order and in hash order alike.
     async fn read_purge_keys(&self, p: &mut Purging, now: u64) -> Result<(), AppError> {
         let (rows, _) = self.next_legacy_rows(&mut p.cursor, now).await?;
         p.keys.extend(rows.into_iter().map(|(k, _)| k));
