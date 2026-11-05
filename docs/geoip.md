@@ -146,9 +146,12 @@ trusted_proxies = ["10.0.0.0/16", "2001:db8:100::/48"]
 
 When a request comes from one of them, the service walks `X-Forwarded-For`
 from the right, skips every hop that is itself a trusted proxy, and uses the
-first address that isn't. Anything doubtful — no header, a malformed entry,
-a chain of more than 64 entries, or one trusted end to end — falls back to
-the proxy's own address. List only proxies that append to (or overwrite)
+first address that isn't. No header, or a chain trusted end to end, means
+the proxy's own address. A chain the proxies wrote that cannot be read — a
+malformed entry, more than 64 entries — is refused with `400`, rather than
+charged to the proxy's address, which would hand its sender a second budget.
+A range covering every address (`0.0.0.0/0`, `::/0`) is refused at startup.
+List only proxies that append to (or overwrite)
 `X-Forwarded-For`, and never a layer-4 (TCP) forwarder, which passes the
 client's own header through: that lets anyone choose their address. The
 same setting drives every per-address rate limit, on every service.

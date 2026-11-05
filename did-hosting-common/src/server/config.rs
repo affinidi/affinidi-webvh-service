@@ -147,14 +147,22 @@ pub mod ip_networks {
     }
 
     /// One entry: an address or a CIDR range, surrounding whitespace ignored.
-    /// The error names the entry.
+    /// The error names the entry. A range covering every address
+    /// (`0.0.0.0/0`, `::/0`) is refused: trusting every peer lets any client
+    /// name its own client address.
     pub fn parse(entry: &str) -> Result<IpNetwork, String> {
-        entry.trim().parse::<IpNetwork>().map_err(|_| {
+        let network = entry.trim().parse::<IpNetwork>().map_err(|_| {
             format!(
                 "invalid network `{entry}`: expected an IP address (`10.0.0.1`) \
                  or a CIDR range (`10.0.0.0/8`, `2001:db8::/32`)"
             )
-        })
+        })?;
+        if network.prefix() == 0 {
+            return Err(format!(
+                "network `{entry}` covers every address; list the proxies' own ranges"
+            ));
+        }
+        Ok(network)
     }
 
     fn max_prefix(n: &IpNetwork) -> u8 {
@@ -179,8 +187,9 @@ pub struct ServerConfig {
     /// behind a CDN that strips XFF, but wrong behind a load balancer
     /// (every request appears to come from the LB, so per-IP rate limits
     /// become a global cap). List only your actual reverse proxies: see
-    /// [`crate::server::rate_limit::resolve_client_ip`]. An entry that is
-    /// neither an address nor a CIDR is refused at load.
+    /// [`crate::server::rate_limit::ClientIps`]. An entry that is
+    /// neither an address nor a CIDR, or a range covering every address, is
+    /// refused at load.
     #[serde(default, with = "ip_networks")]
     pub trusted_proxies: Vec<IpNetwork>,
     /// Trusted reverse-proxy CIDRs whose `Forwarded` (RFC 7239) and
@@ -472,8 +481,9 @@ impl ReplayConfig {
 ///
 /// Resolution is unauthenticated, and each one costs store reads, so without
 /// a limit one client can use up a metered store's capacity for everyone. A
-/// client past `max_per_window` requests in a `window_secs` fixed window gets
-/// `429 Too Many Requests` with `Retry-After` until the window ends.
+/// client may spend `max_per_window` requests at once and regains one every
+/// `window_secs / max_per_window`; past that it gets `429 Too Many Requests`
+/// with `Retry-After` until its next request.
 ///
 /// The client address is the TCP peer unless `server.trusted_proxies` names
 /// that peer, in which case it is read from `X-Forwarded-For`. Behind a load
@@ -486,7 +496,7 @@ pub struct ResolveRateLimitConfig {
     /// (default) means no limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_per_window: Option<u64>,
-    /// The fixed window, in seconds. Default 10.
+    /// The window the allowance refills over, in seconds. Default 10.
     #[serde(default = "default_resolve_rate_limit_window_secs")]
     pub window_secs: u64,
 }
@@ -1954,10 +1964,20 @@ mod tests {
             "an empty value clears the list"
         );
 
-        for bad in ["load-balancer", "10.0.0.0/33"] {
+        for bad in ["load-balancer", "10.0.0.0/33", "0.0.0.0/0", "::/0"] {
             let result = server.apply_trusted_proxies_override("DAEMON", |_| Some(bad.into()));
             assert!(result.is_err(), "{bad} should be refused");
         }
+    }
+
+    /// A range trusting every peer is refused in the file too, not only in
+    /// the environment.
+    #[test]
+    fn trusted_proxies_refuse_a_catch_all_range() {
+        let error = toml::from_str::<ServerConfig>("trusted_proxies = [\"0.0.0.0/0\"]")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("covers every address"), "{error}");
     }
 
     /// An absent `[server.resolve_rate_limit]` means no limit; a set one is

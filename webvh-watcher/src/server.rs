@@ -48,6 +48,10 @@ pub struct AppState {
     /// so a single address cannot force unbounded DID-resolution work by
     /// posting documents that name a fresh issuer on every request.
     pub trust_tasks_rate_limiter: Arc<did_hosting_common::server::rate_limit::IpRateLimiter>,
+    /// Who an HTTPS request's client is, from `server.trusted_proxies`: built
+    /// once with the state and shared by the Trust Task listener and the
+    /// resolution limit.
+    pub client_ips: did_hosting_common::server::rate_limit::ClientIps,
 }
 
 impl AppState {
@@ -60,6 +64,8 @@ impl AppState {
         let did_resolver: Option<DIDCacheClient> =
             identity.as_ref().map(|i| i.did_resolver.clone());
         let replay_cache = Arc::new(ReplayCache::with_config(config.replay.clone())?);
+        let client_ips =
+            did_hosting_common::server::rate_limit::ClientIps::new(&config.server.trusted_proxies)?;
         Ok(Self {
             dids_ks: store.keyspace(KS_DIDS)?,
             store,
@@ -69,6 +75,7 @@ impl AppState {
             replay_cache,
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
             didcomm_service: Arc::new(OnceLock::new()),
+            client_ips,
             trust_tasks_rate_limiter: Arc::new(
                 did_hosting_common::server::rate_limit::IpRateLimiter::new(
                     did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
@@ -286,8 +293,16 @@ fn run_rest_thread(
         let listener =
             tokio::net::TcpListener::from_std(std_listener).expect("failed to convert TcpListener");
         let resolve_limit = Arc::new(
-            did_hosting_common::server::rate_limit::ResolveRateLimiter::new(&state.config.server),
+            did_hosting_common::server::rate_limit::ResolveRateLimiter::new(
+                &state.config.server,
+                &state.client_ips,
+            ),
         );
+        let rate_limit_gc = CancellationToken::new();
+        resolve_limit.spawn_gc(rate_limit_gc.clone());
+        state
+            .trust_tasks_rate_limiter
+            .spawn_gc(rate_limit_gc.clone());
         let app = routes::router_with_resolve_limit(resolve_limit)
             .with_state(state)
             .layer(
@@ -314,5 +329,6 @@ fn run_rest_thread(
         })
         .await
         .expect("axum serve failed");
+        rate_limit_gc.cancel();
     });
 }

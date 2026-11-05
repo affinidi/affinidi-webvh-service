@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use axum::handler::Handler;
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
@@ -983,8 +984,26 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     // One per-address resolution limit for the whole process, so a client's
     // budget covers the server's routes, the DID-serving fallback and the
     // watcher's routes together.
-    let resolve_limit =
-        Arc::new(did_hosting_common::server::rate_limit::ResolveRateLimiter::new(&config.server));
+    //
+    // One client-address rule for the whole process too, shared by that limit
+    // and every handler that charges a client address, so a proxy's invalid
+    // chain is logged once a minute whichever path met it.
+    let client_ips =
+        did_hosting_common::server::rate_limit::ClientIps::new(&config.server.trusted_proxies)
+            .unwrap_or_else(|e| {
+                error!("failed to build the client-address rule: {e}");
+                std::process::exit(1);
+            });
+    let resolve_limit = Arc::new(
+        did_hosting_common::server::rate_limit::ResolveRateLimiter::new(
+            &config.server,
+            &client_ips,
+        ),
+    );
+    // Sweeps idle clients out of every rate limiter the daemon serves, until
+    // the HTTP server stops.
+    let rate_limit_gc = CancellationToken::new();
+    resolve_limit.spawn_gc(rate_limit_gc.clone());
 
     // 2a. Server — public DID-serving routes only (.well-known)
     if config.enable.server {
@@ -1011,7 +1030,15 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // 2b. Witness (nested at /witness)
     if config.enable.witness {
-        match build_witness(&config, &witness_store, identity.clone()).await {
+        match build_witness(
+            &config,
+            &witness_store,
+            identity.clone(),
+            &client_ips,
+            &rate_limit_gc,
+        )
+        .await
+        {
             Ok(router) => {
                 combined = combined.nest("/witness", router);
                 enabled_services.push("witness (/witness)");
@@ -1048,11 +1075,13 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             &http_client,
             identity.clone(),
             server_state.as_ref(),
+            &client_ips,
         )
         .await
         {
             Ok((router, state)) => {
                 combined = combined.merge(router);
+                state.spawn_rate_limit_gc(&rate_limit_gc);
                 control_state = Some(state);
                 enabled_services.push("control (/)");
             }
@@ -1065,15 +1094,16 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // Combined fallback: try DID public serving first, then the SPA UI.
     combined = match server_state {
-        Some(ref state) => combined.fallback({
-            let state = state.clone();
-            let resolve_limit = resolve_limit.clone();
-            move |request: axum::extract::Request| {
+        Some(ref state) => combined.fallback(
+            {
                 let state = state.clone();
-                let resolve_limit = resolve_limit.clone();
-                async move { daemon_fallback(state, &resolve_limit, request).await }
+                move |request: axum::extract::Request| {
+                    let state = state.clone();
+                    async move { daemon_fallback(state, request).await }
+                }
             }
-        }),
+            .layer(resolve_limit.layer()),
+        ),
         None => {
             #[cfg(feature = "ui")]
             {
@@ -1245,6 +1275,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // Wait for HTTP server to complete (shutdown signal received)
     let _ = http_handle.await;
+    rate_limit_gc.cancel();
 
     // ── Phase 5: Ordered shutdown ─────────────────────────────────────
 
@@ -1523,6 +1554,8 @@ async fn build_witness(
     config: &DaemonConfig,
     store: &Store,
     identity: Option<Arc<ServiceIdentity>>,
+    client_ips: &did_hosting_common::server::rate_limit::ClientIps,
+    rate_limit_gc: &CancellationToken,
 ) -> ServiceResult {
     use webvh_witness::server::AppState;
     use webvh_witness::signing::LocalSigner;
@@ -1532,12 +1565,16 @@ async fn build_witness(
     // listener is the HTTPS binding, `POST /witness/api/trust-tasks`, under the
     // daemon's DID. Its `didcomm_service` slot stays empty, which is what makes
     // the witness's rotation path an inert no-op here.
-    let state = AppState::new(
+    let mut state = AppState::new(
         store.clone(),
         config.witness_config(),
         identity,
         Arc::new(LocalSigner),
     )?;
+    state.client_ips = client_ips.clone();
+    state
+        .trust_tasks_rate_limiter
+        .spawn_gc(rate_limit_gc.clone());
 
     let router = webvh_witness::routes::router().with_state(state);
     info!("witness service initialized");
@@ -1593,6 +1630,7 @@ fn resolution_cache_hook(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_control(
     config: &DaemonConfig,
     secrets: &ServerSecrets,
@@ -1601,6 +1639,7 @@ async fn build_control(
     http_client: &reqwest::Client,
     identity: Option<Arc<ServiceIdentity>>,
     server: Option<&did_hosting_server::server::AppState>,
+    client_ips: &did_hosting_common::server::rate_limit::ClientIps,
 ) -> Result<(Router, did_hosting_control::server::AppState), AppError> {
     use did_hosting_control::server::AppState;
 
@@ -1691,8 +1730,9 @@ async fn build_control(
         acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
         pending_challenges: Arc::new(pending_challenges),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
-        ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
-        redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),
+        client_ips: client_ips.clone(),
+        ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::challenge_limiter()),
+        redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::redeem_limiter()),
         cache_invalidate,
         // Wallet sign-in locations from the local GeoIP database, if any
         // (mirrors `did_hosting_control::server`).
@@ -1739,17 +1779,13 @@ async fn build_control(
 /// If that returns 404, falls through to the SPA static handler so that
 /// paths like `/enroll` serve `index.html` for client-side routing.
 ///
-/// Every request here counts against `resolve_limit`, the UI's included:
-/// whether a path is a DID is only known after the store lookup the limit
-/// exists to bound.
+/// The caller layers the resolution limit on it, so every request here
+/// counts against it, the UI's included: whether a path is a DID is only
+/// known after the store lookup the limit exists to bound.
 async fn daemon_fallback(
     state: did_hosting_server::server::AppState,
-    resolve_limit: &did_hosting_common::server::rate_limit::ResolveRateLimiter,
     request: axum::extract::Request,
 ) -> Response {
-    if let Err(refusal) = resolve_limit.check(&request) {
-        return axum::response::IntoResponse::into_response(refusal);
-    }
     // Snapshot the URI for the SPA fallback (which only needs path
     // routing); the full Request is consumed by serve_public to read
     // ConnectInfo + headers for resolve-side host detection.
