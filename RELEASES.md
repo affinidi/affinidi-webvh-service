@@ -89,7 +89,7 @@ The `branch rules` check (the shared `release-branch-rules` action from
 affinidi/pipeline-rust) holds all of this: a PR into `release/**` is a backport
 or prep PR the release bot opened, or is labelled `release-direct`; only the
 release tooling changes versions or `RELEASE`, on any branch (a cut PR from the
-bot or, for now, from a maintainer).
+bot or, for the local fallback, from a maintainer).
 
 The release workflows here are thin callers of the shared `release-*` actions
 in affinidi/pipeline-rust. What is specific to this repository stays here:
@@ -101,27 +101,28 @@ in affinidi/pipeline-rust. What is specific to this repository stays here:
 
 ### Cut
 
+Actions → **Cut a release** (`release-cut.yml`) on `main`, with the
+`major.minor`, or:
+
 ```sh
-python3 scripts/cut-release.py 0.9 --dry-run   # builds both commits, pushes nothing
-python3 scripts/cut-release.py 0.9
+gh workflow run release-cut.yml --ref main -f name=0.9                     # dry run: builds both commits, pushes nothing
+gh workflow run release-cut.yml --ref main -f name=0.9 -f dry-run=false
 ```
 
-From a clean checkout with push access and `gh` authenticated, as a maintainer
-or admin (`branch rules` accepts their cut PR for now). It pushes
-`release/0.9` (every crate at `0.9.0`, `RELEASE` = `0.9.0-rc.0`, which
-`release-tag.yml` tags), creates the `backport release/0.9` label, and opens
-the `release-cut/0.9` PR that moves `main` to `0.10.0` and closes `main`'s
-`## Unreleased` changelog section under `## 0.9.0`. Merge it, then update the
-schedule table above.
+With the release bot's token it pushes `release/0.9` (every crate at `0.9.0`,
+`RELEASE` = `0.9.0-rc.0`, which `release-tag.yml` tags), creates the
+`backport release/0.9` label, and opens the `release-cut/0.9` PR that moves
+`main` to `0.10.0`, closes `main`'s `## Unreleased` changelog section under
+`## 0.9.0`, and carries the new version into `docs/openapi.json` and
+`fuzz/Cargo.lock`. Merge it, then update the schedule table above.
 
-`--from <rev>` cuts from something other than `origin/nightly` — the first cut,
-before `nightly` exists, is `--from origin/main`.
+`from` (`-f from=<rev>`) cuts from something other than `origin/nightly` — the
+first cut, before `nightly` exists, is `origin/main`.
 
-Cuts are moving to the release bot: Actions → **Cut a release** on `main` does
-the same with the bot's token (dry run by default), and adds a commit carrying
-the new version into `docs/openapi.json` and `fuzz/Cargo.lock`. Once cuts use
-it, `scripts/cut-release.py` and `scripts/release_lib.py` go, and so does
-`maintainer-releases` in `branch-rules.yml`.
+Fallback, when the workflow cannot run: a maintainer or admin runs
+`python3 scripts/cut-release.py 0.9 [--dry-run] [--from <rev>]` from a clean
+checkout with push access and `gh` authenticated (`maintainer-releases` lets
+`branch rules` accept their cut PR).
 
 ### Release candidate, GA, patch
 
