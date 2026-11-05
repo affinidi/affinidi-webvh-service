@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: affinidi/pipeline-rust/.github/actions/release-branch-rules@feat/release-branch-actions
+      - uses: affinidi/pipeline-rust/.github/actions/release-branch-rules@main
         with:
           # Transitional: maintainers may still cut or prep locally; drop once both use the release workflows.
           maintainer-releases: "true"

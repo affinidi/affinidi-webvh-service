@@ -47,6 +47,6 @@ jobs:
           git config --global merge.keep-release-changelog.driver true
           echo "CHANGELOG.md merge=keep-release-changelog" > "$RUNNER_TEMP/backport.gitattributes"
           git config --global core.attributesFile "$RUNNER_TEMP/backport.gitattributes"
-      - uses: affinidi/pipeline-rust/.github/actions/release-backport@feat/release-branch-actions
+      - uses: affinidi/pipeline-rust/.github/actions/release-backport@main
         with:
           token: ${{ steps.app.outputs.token }}
