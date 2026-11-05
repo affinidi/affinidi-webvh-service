@@ -51,7 +51,7 @@ use crate::server::config::StoreConfig;
 use crate::server::error::AppError;
 
 use super::dynamodb_errors::{self, MAX_ITEM_BYTES};
-use super::{BatchLimits, BatchOps, BoxFuture, KeyspaceOps, RawKvPair, StorageBackend};
+use super::{BatchLimits, BatchOps, BoxFuture, KeyspaceOps, PrefixPage, RawKvPair, StorageBackend};
 
 const PK_ATTR: &str = "pk";
 const SK_ATTR: &str = "sk";
@@ -552,25 +552,7 @@ impl KeyspaceOps for SingleTableKeyspace {
             let mut last_key: Option<HashMap<String, AttributeValue>> = None;
 
             loop {
-                let mut req = self
-                    .client
-                    .query()
-                    .table_name(&self.table_name)
-                    .consistent_read(self.consistent_scans)
-                    .expression_attribute_values(":ks", AttributeValue::S(self.pk.clone()));
-
-                if let Some(ref p) = prefix_str {
-                    req = req
-                        .key_condition_expression("#pk = :ks AND begins_with(#sk, :pfx)")
-                        .expression_attribute_names("#pk", PK_ATTR)
-                        .expression_attribute_names("#sk", SK_ATTR)
-                        .expression_attribute_values(":pfx", AttributeValue::S(p.clone()));
-                } else {
-                    req = req
-                        .key_condition_expression("#pk = :ks")
-                        .expression_attribute_names("#pk", PK_ATTR);
-                }
-
+                let mut req = self.prefix_query(prefix_str.as_deref());
                 if let Some(ref lk) = last_key {
                     req = req.set_exclusive_start_key(Some(lk.clone()));
                 }
@@ -589,6 +571,71 @@ impl KeyspaceOps for SingleTableKeyspace {
 
             Ok(results)
         })
+    }
+
+    /// One `Query` request of `limit` items on the keyspace's partition,
+    /// resumed from the cursor (the last sort key read). The sort key orders
+    /// the partition, so pages arrive in key order.
+    fn prefix_page_raw(
+        &self,
+        prefix: Vec<u8>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Option<PrefixPage>, AppError>> {
+        Box::pin(async move {
+            let prefix_str = if prefix.is_empty() {
+                None
+            } else {
+                Some(key_as_string(&prefix)?)
+            };
+            let mut req = self
+                .prefix_query(prefix_str.as_deref())
+                .limit(i32::try_from(limit.max(1)).unwrap_or(i32::MAX));
+            if let Some(sk) = cursor {
+                req = req
+                    .exclusive_start_key(PK_ATTR, AttributeValue::S(self.pk.clone()))
+                    .exclusive_start_key(SK_ATTR, AttributeValue::S(key_as_string(&sk)?));
+            }
+            let resp = req.send().await.map_err(|e| request_error("query", e))?;
+            let mut page = PrefixPage {
+                ordered: true,
+                ..PrefixPage::default()
+            };
+            if let Some(items) = resp.items {
+                extract_pairs(items, &mut page.rows);
+            }
+            page.next = resp
+                .last_evaluated_key
+                .and_then(|key| match key.get(SK_ATTR) {
+                    Some(AttributeValue::S(sk)) => Some(sk.as_bytes().to_vec()),
+                    _ => None,
+                });
+            Ok(Some(page))
+        })
+    }
+}
+
+impl SingleTableKeyspace {
+    /// A `Query` on this keyspace's partition, narrowed to the sort keys
+    /// starting with `prefix` when there is one.
+    fn prefix_query(
+        &self,
+        prefix: Option<&str>,
+    ) -> aws_sdk_dynamodb::operation::query::builders::QueryFluentBuilder {
+        let req = self
+            .client
+            .query()
+            .table_name(&self.table_name)
+            .consistent_read(self.consistent_scans)
+            .expression_attribute_values(":ks", AttributeValue::S(self.pk.clone()))
+            .expression_attribute_names("#pk", PK_ATTR);
+        match prefix {
+            Some(p) => req
+                .key_condition_expression("#pk = :ks AND begins_with(#sk, :pfx)")
+                .expression_attribute_names("#sk", SK_ATTR)
+                .expression_attribute_values(":pfx", AttributeValue::S(p.to_owned())),
+            None => req.key_condition_expression("#pk = :ks"),
+        }
     }
 }
 
@@ -1298,6 +1345,36 @@ mod tests {
 
     /// An oversized item is refused before anything is sent, on its own and
     /// in a batch.
+    /// A page is one `Query` of `limit` items on the keyspace's partition,
+    /// resumed from the cursor's sort key, never a walk of the whole prefix.
+    #[tokio::test]
+    async fn a_prefix_page_is_one_query_from_the_cursor() {
+        let (backend, capture) = capturing_backend(None);
+        let (_, ks) = backend.keyspace("timeseries").expect("keyspace");
+        let _ = ks.prefix_page_raw(b"ts:".to_vec(), None, 50).await;
+        let _ = ks
+            .prefix_page_raw(b"ts:".to_vec(), Some(b"ts:a:300".to_vec()), 50)
+            .await;
+
+        let sent = capture.0.lock().expect("capture lock").clone();
+        assert_eq!(sent.len(), 2, "one query a page: {sent:?}");
+        for (op, body) in &sent {
+            assert_eq!(op, "Query");
+            assert_eq!(body["Limit"], 50);
+            assert_eq!(body["ExpressionAttributeValues"][":ks"]["S"], "timeseries");
+            assert_eq!(body["ExpressionAttributeValues"][":pfx"]["S"], "ts:");
+        }
+        assert!(
+            sent[0].1.get("ExclusiveStartKey").is_none(),
+            "{:?}",
+            sent[0]
+        );
+        assert_eq!(
+            sent[1].1["ExclusiveStartKey"],
+            serde_json::json!({"pk": {"S": "timeseries"}, "sk": {"S": "ts:a:300"}})
+        );
+    }
+
     #[tokio::test]
     async fn an_oversized_item_is_refused_before_it_is_sent() {
         let (backend, capture) = capturing_backend(None);

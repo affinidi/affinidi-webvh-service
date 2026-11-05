@@ -164,6 +164,7 @@ Automatic, idempotent, and safe to roll back.
    |---|---|---|---|
    | fjall | pages of 1,000 keys, in key order | one series at a time | resumes from the cursor |
    | DynamoDB | a paged `Scan`, 1,000 items a request, in hash order | every series, until the scan ends | resumes from the cursor |
+   | DynamoDB, single table | a paged `Query` on the keyspace's partition, 1,000 items a request, in key order | one series at a time | resumes from the cursor |
    | Redis, Firestore, Cosmos DB | the whole prefix at once | every series | reads again after 5 minutes |
 
    Each series records the

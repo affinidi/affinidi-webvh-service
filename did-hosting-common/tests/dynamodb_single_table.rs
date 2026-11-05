@@ -484,6 +484,62 @@ async fn prefix_iter_returns_matching_keys() {
     delete_test_table(&client, &table).await;
 }
 
+/// Walking a prefix page by page reads every key once, in key order, and
+/// nothing outside the prefix or the keyspace.
+#[tokio::test]
+async fn prefix_pages_walk_a_prefix_in_key_order() {
+    let endpoint = require_endpoint!();
+    let client = local_client(&endpoint).await;
+    let table = create_test_table(&client).await;
+
+    let store = open_store(&endpoint, &table).await;
+    let ks = store.keyspace("timeseries").expect("keyspace");
+    let other = store.keyspace("stats").expect("keyspace");
+    for key in ["ts:b:600", "ts:a:300", "ts:c:900", "ts:a:600", "ts:b:300"] {
+        ks.insert_raw(key, key.as_bytes().to_vec())
+            .await
+            .expect("insert");
+    }
+    ks.insert_raw("tz:outside", b"x".to_vec())
+        .await
+        .expect("insert");
+    other
+        .insert_raw("ts:z:0", b"x".to_vec())
+        .await
+        .expect("insert");
+
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    let mut pages = 0;
+    loop {
+        let page = ks
+            .prefix_page_raw("ts:", cursor, 2)
+            .await
+            .expect("page")
+            .expect("the single-table backend pages");
+        assert!(page.ordered);
+        assert!(page.rows.len() <= 2, "{:?}", page.rows);
+        for (key, value) in page.rows {
+            assert_eq!(key, value);
+            seen.push(String::from_utf8(key).expect("utf-8"));
+        }
+        pages += 1;
+        cursor = page.next;
+        if cursor.is_none() {
+            break;
+        }
+        assert!(pages < 10, "the walk must end");
+    }
+
+    assert_eq!(
+        seen,
+        ["ts:a:300", "ts:a:600", "ts:b:300", "ts:b:600", "ts:c:900"]
+    );
+    assert!(pages >= 3, "five keys at two a page: {pages}");
+
+    delete_test_table(&client, &table).await;
+}
+
 #[tokio::test]
 async fn prefix_iter_returns_empty_for_no_match() {
     let endpoint = require_endpoint!();
