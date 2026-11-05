@@ -196,9 +196,9 @@ digest = "sha256:708ba6e7447f9d62556f59019bd4da90ae73f5fe1b2a5b339b7f5665ec53811
 
 [[task]]
 slug = "auth/step-up/approve-response"
-version = "0.6"
-type_uri = "https://trusttasks.org/spec/auth/step-up/approve-response/0.6"
-digest = "sha256:bc641e92ffcd694d3ddf40ca01687f99fce4aeb3c8f818e009bfe7d422099b39"
+version = "0.7"
+type_uri = "https://trusttasks.org/spec/auth/step-up/approve-response/0.7"
+digest = "sha256:943b7d993ef1599ded1e939169efaa9d8c212f7f4547f6d61f64dca9cc10eff2"
 
 [[task]]
 slug = "auth/step-up/start"

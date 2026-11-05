@@ -159,8 +159,9 @@ async fn make_harness() -> Harness {
         pending_challenges: Arc::new(
             did_hosting_control::pending_challenges::PendingChallengeTracker::new(),
         ),
-        ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::IpRateLimiter::new()),
-        redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::SourceRateLimiter::new()),
+        client_ips: Default::default(),
+        ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::challenge_limiter()),
+        redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::redeem_limiter()),
         large_document_budget: Arc::new(
             did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
         ),

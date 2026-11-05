@@ -80,33 +80,38 @@ pub async fn trust_tasks_endpoint(
             "no connection address for this request".into(),
         ));
     };
-    let ip = crate::rate_limit::resolve_client_ip(
-        addr.ip(),
-        &headers,
-        &state.config.server.trusted_proxies,
-    );
+    // A trusted proxy's unreadable `X-Forwarded-For` leaves the request with
+    // no one to charge. Refused as every other refusal here is — a
+    // `trust-task-error` document (`malformedRequest`, 400) — not as a REST
+    // error body.
+    let ip = match state.client_ips.client_ip(addr.ip(), &headers) {
+        Ok(ip) => ip,
+        Err(invalid) => {
+            let reject = RejectReason::MalformedRequest {
+                reason: invalid.to_string(),
+            };
+            return Ok(into_response(DispatchOutcome::Rejected(refusal(
+                &body, reject,
+            ))));
+        }
+    };
     let client_ip = Some(ip);
     if is_redeem_start(&body) {
-        let limited = state.redeem_rate_limiter.try_consume(
-            &format!("ip:{ip}"),
-            did_hosting_common::server::auth::session::now_epoch(),
-        );
+        let limited = state.redeem_rate_limiter.try_consume(format!("ip:{ip}"));
         if let Err(AppError::RateLimited {
             retry_after_secs, ..
         }) = limited
         {
-            tracing::warn!(%ip, "invite redemption rate limited");
             // Refused as the task would be — a routed `unavailable` document
             // with its retry time — not as a bare REST 429.
-            if let Ok(doc) = serde_json::from_slice::<TrustTask<Value>>(&body) {
-                let reject = RejectReason::Unavailable {
-                    retry_after: Some(
-                        chrono::Utc::now() + chrono::Duration::seconds(retry_after_secs as i64),
-                    ),
-                };
-                let routed = doc.reject_with(format!("urn:uuid:{}", Uuid::new_v4()), reject);
-                return Ok(into_response(DispatchOutcome::Rejected(routed)));
-            }
+            let reject = RejectReason::Unavailable {
+                retry_after: Some(
+                    chrono::Utc::now() + chrono::Duration::seconds(retry_after_secs as i64),
+                ),
+            };
+            return Ok(into_response(DispatchOutcome::Rejected(refusal(
+                &body, reject,
+            ))));
         }
     }
     dispatch_trust_task(auth, State(state), client_ip, &headers, body).await
@@ -192,7 +197,6 @@ pub async fn dispatch_trust_task(
             &state.acl_ks,
             &state.large_document_budget,
             &address,
-            did_hosting_common::server::auth::session::now_epoch(),
         )
         .await
         {
@@ -376,15 +380,28 @@ fn sealed_response(sealed: crate::control_tasks::SealedReply) -> Response {
     resp
 }
 
+/// A `trust-task-error` refusing `body` for `reject` before it is
+/// dispatched: routed to the document when the body parses as one, unrouted
+/// otherwise.
+fn refusal(body: &[u8], reject: RejectReason) -> trust_tasks_rs::ErrorResponse {
+    match serde_json::from_slice::<TrustTask<Value>>(body) {
+        Ok(doc) => doc.reject_with(format!("urn:uuid:{}", Uuid::new_v4()), reject),
+        Err(_) => unrouted_error(reject),
+    }
+}
+
 /// Build a `trust-task-error` document for a body-parse failure.
-/// We have no source `TrustTask` to draw `issuer`/`recipient` from,
-/// so the error response is unrouted — the framework permits this on
-/// malformed-body failures since the producer can correlate on the
-/// response `id`.
 fn body_parse_error(reason: &str) -> trust_tasks_rs::ErrorResponse {
-    let reject = RejectReason::MalformedRequest {
+    unrouted_error(RejectReason::MalformedRequest {
         reason: format!("body did not parse as a Trust Task document: {reason}"),
-    };
+    })
+}
+
+/// An unrouted `trust-task-error` document. We have no source `TrustTask` to
+/// draw `issuer`/`recipient` from, so the error response is unrouted — the
+/// framework permits this on malformed-body failures since the producer can
+/// correlate on the response `id`.
+fn unrouted_error(reject: RejectReason) -> trust_tasks_rs::ErrorResponse {
     let payload: ErrorPayload = reject.into();
     trust_tasks_rs::ErrorResponse {
         id: format!("urn:uuid:{}", Uuid::new_v4()),

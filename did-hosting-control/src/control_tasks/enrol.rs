@@ -548,9 +548,7 @@ pub(crate) async fn redeem_start(
     // messaging transport vouches for its sender.
     if cx.via != Some(ObservedTransport::Https) {
         let source = format!("vid:{}", cx.caller.as_deref().unwrap_or_default());
-        state
-            .redeem_rate_limiter
-            .try_consume(&source, now_epoch())?;
+        state.redeem_rate_limiter.try_consume(source)?;
     }
     require_webauthn(state)?;
     let invalid = || {

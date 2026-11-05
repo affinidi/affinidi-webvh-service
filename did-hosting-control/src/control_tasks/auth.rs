@@ -1,4 +1,4 @@
-//! Step-up (`auth/step-up/start/0.2`, `auth/step-up/approve-response/0.6`),
+//! Step-up (`auth/step-up/start/0.2`, `auth/step-up/approve-response/0.7`),
 //! and passkey login (`auth/passkey/login/{start,finish}/0.2`). Enrolment is
 //! `enrol`.
 //!
@@ -297,7 +297,7 @@ pub(crate) async fn step_up_start(
     )
 }
 
-/// `auth/step-up/approve-response/0.6`: the approver's signed decision. The
+/// `auth/step-up/approve-response/0.7`: the approver's signed decision. The
 /// gate has verified it as an attestation (`assertionMethod`); here it must
 /// answer the challenge bound to its session, be made by that session's
 /// subject, and — approved — it raises the session's assurance level. Tokens
@@ -319,9 +319,9 @@ pub(crate) async fn step_up_start(
 /// subject with none keeps `didSigned`.
 pub(crate) async fn approve_response(
     cx: &Cx<'_>,
-    p: approve_response::v0_6::Payload,
-) -> Result<approve_response::v0_6::Response, TaskError> {
-    use approve_response::v0_6::{Evidence, PayloadDecision, error_codes};
+    p: approve_response::v0_7::Payload,
+) -> Result<approve_response::v0_7::Response, TaskError> {
+    use approve_response::v0_7::{Evidence, PayloadDecision, error_codes};
 
     // `approverSigned` (0.6) is never in the `accepts` this service offers:
     // it keeps no step-up approvers. Spec step 1 refuses a gate the relying

@@ -36,7 +36,7 @@
 "auth/refresh" = "0.2"
 "auth/revoke-session" = "0.2"
 "auth/step-up/approve-request" = "0.5"
-"auth/step-up/approve-response" = "0.6"
+"auth/step-up/approve-response" = "0.7"
 "auth/step-up/start" = "0.2"
 "auth/whoami" = "0.1"
 "did-management/agent-name/check" = "0.1"
