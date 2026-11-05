@@ -242,6 +242,40 @@ impl KeyspaceOps for FjallKeyspace {
         })
     }
 
+    fn prefix_page_raw(
+        &self,
+        prefix: Vec<u8>,
+        after: Option<Vec<u8>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Option<Vec<RawKvPair>>, AppError>> {
+        let (db, ks) = (self.db.clone(), self.keyspace.clone());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || -> Result<Option<Vec<RawKvPair>>, AppError> {
+                use std::ops::Bound;
+                let start = match after {
+                    Some(a) if a.as_slice() >= prefix.as_slice() => Bound::Excluded(a),
+                    _ => Bound::Included(prefix.clone()),
+                };
+                let mut results = Vec::new();
+                for guard in db.snapshot().range(&ks, (start, Bound::Unbounded)) {
+                    if results.len() >= limit {
+                        break;
+                    }
+                    let (key, value) = guard
+                        .into_inner()
+                        .map_err(|e| AppError::Store(e.to_string()))?;
+                    if !key.starts_with(&prefix) {
+                        break;
+                    }
+                    results.push((key.to_vec(), value.to_vec()));
+                }
+                Ok(Some(results))
+            })
+            .await
+            .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
+        })
+    }
+
     fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
         Box::pin(async move {
             // Per-keyspace mutex serialises the get-then-remove so two
@@ -657,6 +691,34 @@ mod tests {
         ks.insert_raw("raw1", b"raw-value".to_vec()).await.unwrap();
         let val = ks.get_raw("raw1").await.unwrap();
         assert_eq!(val, Some(b"raw-value".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn prefix_page_raw_walks_a_prefix_in_key_order() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace("test").unwrap();
+        for k in ["a:0", "p:3", "p:1", "p:2", "q:0"] {
+            ks.insert_raw(k, k.as_bytes().to_vec()).await.unwrap();
+        }
+        let keys = |page: Vec<RawKvPair>| -> Vec<String> {
+            page.into_iter()
+                .map(|(k, _)| String::from_utf8(k).unwrap())
+                .collect()
+        };
+        let first = ks.prefix_page_raw("p:", None, 2).await.unwrap().unwrap();
+        assert_eq!(keys(first), ["p:1", "p:2"]);
+        let rest = ks
+            .prefix_page_raw("p:", Some(b"p:2".to_vec()), 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(keys(rest), ["p:3"], "stops at the end of the prefix");
+        let done = ks
+            .prefix_page_raw("p:", Some(b"p:3".to_vec()), 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(done.is_empty());
     }
 
     #[tokio::test]

@@ -241,6 +241,7 @@ export function timeseriesFromWire(t: TimeseriesResponse): TimeSeriesPoint[] {
     timestamp: requiredEpoch(p.startsAt),
     resolves: p.resolves,
     updates: p.updates,
+    seconds: t.bucketSeconds,
   }));
 }
 

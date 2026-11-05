@@ -299,7 +299,12 @@ describe("management calls (passkey session)", () => {
     const points = await api.getServerTimeseries("7d", "example.com");
     expect(tasks(sent)[0]!.doc.payload).toEqual({ range: "lastWeek", domain: "example.com" });
     expect(points).toEqual([
-      { timestamp: Date.parse("2026-01-01T00:00:00Z") / 1000, resolves: 3, updates: 1 },
+      {
+        timestamp: Date.parse("2026-01-01T00:00:00Z") / 1000,
+        resolves: 3,
+        updates: 1,
+        seconds: 3600,
+      },
     ]);
   });
 

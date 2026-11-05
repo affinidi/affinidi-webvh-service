@@ -221,6 +221,7 @@ pub async fn run_wizard(
         replay: Default::default(),
         geoip: Default::default(),
         stats_flush: Default::default(),
+        stats: Default::default(),
         features,
         identity: IdentityConfig::default(),
         enable,
@@ -1083,6 +1084,7 @@ async fn run_self_managed_setup(
         replay: Default::default(),
         geoip: Default::default(),
         stats_flush: Default::default(),
+        stats: Default::default(),
         features,
         identity: IdentityConfig {
             mode: IdentityMode::SelfManaged,
@@ -1457,6 +1459,7 @@ pub async fn run_setup_offline_complete(
         replay: Default::default(),
         geoip: Default::default(),
         stats_flush: Default::default(),
+        stats: Default::default(),
         features: state.features.clone(),
         identity: IdentityConfig::default(),
         hosting: did_hosting_common::server::config::HostingConfig::default(),

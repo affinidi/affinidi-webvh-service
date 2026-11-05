@@ -131,25 +131,18 @@ pub(crate) async fn query_timeseries(
     Ok(points)
 }
 
-/// Read-time per-domain timeseries aggregation.
-///
-/// Walks the `dids` keyspace, selects every record whose `domain`
-/// matches (with a fallback to the host segment of `did_id` for slots
-/// that haven't been backfilled yet), reads each mnemonic's per-DID
-/// buckets, and sums them at the same step granularity as
-/// `query_timeseries`. Cost is O(N_dids_in_domain × buckets_in_range);
-/// the dashboard chart is not the hot path.
-pub(crate) async fn query_timeseries_by_domain(
+/// The mnemonics of the DIDs hosted under `domain`: every record whose
+/// `domain` matches, with a fallback to the host segment of `did_id` for
+/// slots that haven't been backfilled yet.
+pub(crate) async fn domain_mnemonics(
     state: &AppState,
     domain: &str,
-    range: &str,
-) -> Result<Vec<TimeSeriesPoint>, AppError> {
+) -> Result<Vec<String>, AppError> {
     use did_hosting_common::server::domain::extract_did_host;
 
-    // 1. Enumerate matching mnemonics. The `dids` keyspace key shape is
-    //    `did:{mnemonic}` for the record blob plus `owner:…` / content
-    //    keys; filter on the `did:` prefix and skip anything that
-    //    deserialises as something other than a `DidRecord`.
+    // The `dids` keyspace key shape is `did:{mnemonic}` for the record
+    // blob plus `owner:…` / content keys; filter on the `did:` prefix and
+    // skip anything that deserialises as something other than a `DidRecord`.
     let raw = state.dids_ks.prefix_iter_raw("did:").await?;
     let mut mnemonics: Vec<String> = Vec::new();
     for (_key, value) in &raw {
@@ -170,11 +163,28 @@ pub(crate) async fn query_timeseries_by_domain(
             mnemonics.push(record.mnemonic);
         }
     }
+    Ok(mnemonics)
+}
 
-    // 2. Fan out per-mnemonic reads and merge the bucket maps. We could
-    //    in theory short-circuit when the domain has zero DIDs, but the
-    //    empty-result path below produces the same all-zeros series the
-    //    chart already renders cleanly, so don't bother special-casing.
+/// Read-time per-domain timeseries aggregation.
+///
+/// Walks the `dids` keyspace, selects every record whose `domain`
+/// matches (with a fallback to the host segment of `did_id` for slots
+/// that haven't been backfilled yet), reads each mnemonic's per-DID
+/// buckets, and sums them at the same step granularity as
+/// `query_timeseries`. Cost is O(N_dids_in_domain × buckets_in_range);
+/// the dashboard chart is not the hot path.
+pub(crate) async fn query_timeseries_by_domain(
+    state: &AppState,
+    domain: &str,
+    range: &str,
+) -> Result<Vec<TimeSeriesPoint>, AppError> {
+    let mnemonics = domain_mnemonics(state, domain).await?;
+
+    // Fan out per-mnemonic reads and merge the bucket maps. We could in
+    // theory short-circuit when the domain has zero DIDs, but the
+    // empty-result path below produces the same all-zeros series the chart
+    // already renders cleanly, so don't bother special-casing.
     use std::collections::HashMap;
 
     #[derive(serde::Deserialize, Default)]

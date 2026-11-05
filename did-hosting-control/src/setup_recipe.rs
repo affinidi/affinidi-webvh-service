@@ -241,6 +241,7 @@ pub async fn apply_recipe(
         replay: Default::default(),
         geoip: Default::default(),
         stats_flush: Default::default(),
+        stats: Default::default(),
         config_path: recipe.output.config_path.clone(),
     };
 

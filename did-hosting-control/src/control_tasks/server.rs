@@ -267,11 +267,7 @@ pub(crate) async fn stats_get(
             other => other.into(),
         })?;
     did_ops::ensure_slot_domain_matches(&record, p.domain.as_deref().map(|d| d.as_str()))?;
-    let stats: did_hosting_common::DidStats = state
-        .stats_ks
-        .get(format!("stats:{mnemonic}"))
-        .await?
-        .unwrap_or_default();
+    let stats = crate::stats_admin::live_did_stats(state, mnemonic).await?;
     let mut body = serde_json::Map::new();
     body.insert("mnemonic".into(), json!(mnemonic.as_str()));
     body.insert("totalResolves".into(), json!(stats.total_resolves));
@@ -303,7 +299,15 @@ pub(crate) async fn timeseries(
         PayloadRange::Last30Days => ("30d", "last30Days", 14400),
         _ => ("24h", "lastDay", 900),
     };
-    let points = match (p.mnemonic.as_deref(), p.domain.as_deref()) {
+    // Charts come from the tiered rows once the migration has completed,
+    // from the legacy `ts:` rows until then (`stats_query`).
+    let tiered = crate::stats_query::tiered_ready(&state.timeseries_ks).await?;
+    let chart_range = crate::stats_query::Range::from_name(range);
+    let legacy = |points| crate::stats_query::Chart {
+        points,
+        bucket_seconds,
+    };
+    let chart = match (p.mnemonic.as_deref(), p.domain.as_deref()) {
         (Some(mnemonic), domain) => {
             let (record, _) = did_ops::get_did_info(&auth, state, mnemonic)
                 .await
@@ -314,7 +318,19 @@ pub(crate) async fn timeseries(
                     other => other.into(),
                 })?;
             did_ops::ensure_slot_domain_matches(&record, domain.map(|d| d.as_str()))?;
-            super::queries::query_timeseries(&state.timeseries_ks, mnemonic, range).await?
+            if tiered {
+                crate::stats_query::did_chart(
+                    &state.stats_ks,
+                    &state.timeseries_ks,
+                    mnemonic,
+                    chart_range,
+                )
+                .await?
+            } else {
+                legacy(
+                    super::queries::query_timeseries(&state.timeseries_ks, mnemonic, range).await?,
+                )
+            }
         }
         (None, Some(domain)) => {
             let unknown = || {
@@ -343,18 +359,33 @@ pub(crate) async fn timeseries(
                     return Err(unknown());
                 }
             }
-            super::queries::query_timeseries_by_domain(state, &canonical, range).await?
+            if tiered {
+                let mnemonics = super::queries::domain_mnemonics(state, &canonical).await?;
+                crate::stats_query::domain_chart(&state.stats_ks, &mnemonics, chart_range).await?
+            } else {
+                legacy(super::queries::query_timeseries_by_domain(state, &canonical, range).await?)
+            }
         }
         (None, None) => {
             cx.admin().await?;
-            super::queries::query_timeseries(
-                &state.timeseries_ks,
-                did_hosting_common::server::stats_collector::ALL_SERIES,
-                range,
-            )
-            .await?
+            if tiered {
+                crate::stats_query::server_chart(&state.timeseries_ks, chart_range).await?
+            } else {
+                legacy(
+                    super::queries::query_timeseries(
+                        &state.timeseries_ks,
+                        did_hosting_common::server::stats_collector::ALL_SERIES,
+                        range,
+                    )
+                    .await?,
+                )
+            }
         }
     };
+    let crate::stats_query::Chart {
+        points,
+        bucket_seconds,
+    } = chart;
     let points: Vec<Value> = points
         .iter()
         .map(|pt| json!({ "startsAt": at(pt.timestamp), "resolves": pt.resolves, "updates": pt.updates }))
