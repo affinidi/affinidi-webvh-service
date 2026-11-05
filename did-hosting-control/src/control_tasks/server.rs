@@ -4,7 +4,7 @@
 use did_hosting_common::tasks::did_management::{
     identity::{list as identity_list, retire as identity_retire},
     server::{config, info, metrics},
-    stats::{get as stats_get, timeseries},
+    stats::{get as stats_get, set_resolution, timeseries},
 };
 use serde_json::{Value, json};
 use tracing::warn;
@@ -232,6 +232,68 @@ pub(crate) async fn replication_gauges(state: &AppState) -> Result<Vec<Value>, T
 /// `stats/get/0.1`: one slot's counters (owner or admin — a slot the caller
 /// may not read answers exactly as a missing one), or, with no `mnemonic`, the
 /// server-wide aggregate (admin).
+/// `stats/set-resolution/0.1`: set how much statistical detail is kept for a
+/// slot. An owner may choose less (`auto`, `coarse`, `off`); only an admin
+/// may set `fine` (`stats_admin::set_stats_resolution`). A slot that does not
+/// exist and one the caller does not own are the same `notFound`, as in
+/// `stats/get`; an owner asking for `fine` is `permissionDenied`.
+pub(crate) async fn stats_set_resolution(
+    cx: &Cx<'_>,
+    p: set_resolution::v0_1::Payload,
+) -> Result<set_resolution::v0_1::Response, TaskError> {
+    use did_hosting_common::server::stats_tiers::{StatsResolution, Tier, TierReason};
+
+    let auth = cx.auth().await?;
+    let state = cx.state;
+    let mnemonic = p.mnemonic.as_str();
+    let (record, _) = did_ops::get_did_info(&auth, state, mnemonic)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound(_) | AppError::Forbidden(_) => TaskError::Declared(
+                set_resolution::v0_1::error_codes::NOT_FOUND,
+                "no such slot".into(),
+            ),
+            other => other.into(),
+        })?;
+    did_ops::ensure_slot_domain_matches(&record, p.domain.as_deref().map(|d| d.as_str()))?;
+
+    // The schema's enum and ours share their wire spelling.
+    let wire = serde_json::to_value(p.resolution)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let resolution: StatsResolution = wire
+        .parse()
+        .map_err(|_| AppError::Validation(format!("unknown resolution `{wire}`")))?;
+
+    // Ownership is settled above, so a refusal here is an owner asking for
+    // `fine`: `permissionDenied`.
+    let previous =
+        crate::stats_admin::set_stats_resolution(&auth, state, mnemonic, resolution).await?;
+    let info = crate::stats_admin::stats_tier(&auth, state, mnemonic).await?;
+    let tier = match info.tier {
+        Tier::Fine => "fine",
+        Tier::Coarse => "coarse",
+        Tier::Off => "off",
+    };
+    let reason = match info.reason {
+        TierReason::Pinned => "override",
+        TierReason::Mode => "policy",
+        TierReason::Traffic => "traffic",
+    };
+    typed(
+        json!({
+            "mnemonic": mnemonic,
+            "resolution": resolution.as_str(),
+            "previousResolution": previous.as_str(),
+            "changed": previous != resolution,
+            "tier": tier,
+            "tierReason": reason,
+        }),
+        "stats/set-resolution response",
+    )
+}
+
 pub(crate) async fn stats_get(
     cx: &Cx<'_>,
     p: stats_get::v0_1::Payload,
