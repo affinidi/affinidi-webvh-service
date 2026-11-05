@@ -142,7 +142,7 @@ max_age_secs = 300                          # max-age; 0 sends no-cache (default
 
 # [server.resolve_rate_limit]               # Per-client limit on resolution (off by default)
 # max_per_window = 500                      # requests per address per window; then 429
-# window_secs = 10                          # fixed window (default 10, at most 3600)
+# window_secs = 10                          # refill window (default 10, at most 3600)
 
 [log]
 level = "info"       # trace, debug, info, warn, error
@@ -418,9 +418,10 @@ bounds ("Replay cache bounds").
 
 Resolution is public and unauthenticated, and each request reads the store.
 `[server.resolve_rate_limit]` caps how many resolution requests one client
-may make per fixed window; past it the client gets `429 Too Many Requests`
-with `Retry-After` until the window ends, and the service logs one warning
-per client per window. It is off by default. The Trust Task listener has its
+may make per window. A client may spend the whole allowance at once, and
+regains one request every `window_secs / max_per_window`; past it the client
+gets `429 Too Many Requests` with `Retry-After` until its next request, and
+the service logs one warning per client per window. It is off by default. The Trust Task listener has its
 own limiter and is not counted.
 
 A client is its address, and an IPv6 client its /64. The address is the TCP
@@ -438,15 +439,13 @@ When sizing `max_per_window`:
 
 - The budget is per process. With N replicas behind a load balancer, one
   client gets up to N times the limit.
-- The window is fixed, so a client can send up to twice the limit across a
-  window boundary.
 - In the daemon one budget covers the server's and watcher's resolution and
   the root fallback, which also serves the UI; one UI page load takes several
   dozen requests.
-- At most 10,000 clients are tracked. Clients whose window has ended are
-  dropped first; if more than 7,500 are still live, all counts are cleared,
-  so a flood from that many addresses (or IPv6 /64s) is not held back. A CDN or web application
-  firewall is the defence against that.
+- At most 250,000 clients are tracked, and idle ones are swept every minute.
+  When that many are live, a new client is refused until room frees up, so a
+  flood from that many addresses (or IPv6 /64s) also delays new clients. A
+  CDN or web application firewall is the defence against that.
 
 ## Building
 

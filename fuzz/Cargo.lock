@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-common"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "affinidi-did-common",
  "affinidi-did-resolver-cache-sdk",

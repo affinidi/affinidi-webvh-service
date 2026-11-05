@@ -15,9 +15,7 @@ use tracing::warn;
 
 use did_hosting_common::{ChallengeRequest, ChallengeResponse};
 
-use crate::auth::session::now_epoch;
 use crate::error::AppError;
-use crate::rate_limit::resolve_client_ip;
 use crate::server::AppState;
 
 /// Default maximum concurrent pending challenges per DID. Combined with the
@@ -40,7 +38,7 @@ const _: () = assert!(MAX_PENDING_CHALLENGES_PER_DID == 10);
 /// POST /api/auth/challenge — request a challenge nonce.
 ///
 /// Two layers of rate-limit defence:
-/// 1. Per-IP fixed-window counter (`IpRateLimiter`) — caps requests
+/// 1. Per-IP limit (`crate::rate_limit::challenge_limiter`) — caps requests
 ///    from any single IP regardless of which DID they're issuing
 ///    challenges for. Trusted-proxy XFF resolution per
 ///    `server.trusted_proxies` config.
@@ -64,13 +62,9 @@ pub async fn challenge(
     }
 
     // IP rate limit (defence in depth before any session-storage I/O).
-    let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.server.trusted_proxies);
     state
         .ip_rate_limiter
-        .try_consume(client_ip, now_epoch())
-        .inspect_err(|e| {
-            warn!(ip = %client_ip, error = %e, "challenge IP rate limited");
-        })?;
+        .admit(&state.client_ips, addr.ip(), &headers)?;
 
     let canonical = issue_challenge(&state, req.did).await?;
     // did-hosting's ChallengeResponse drops the canonical

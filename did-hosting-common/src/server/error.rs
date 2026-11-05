@@ -41,6 +41,11 @@ pub const LIMITER_REPLAY_CACHE: &str = "replay-cache";
 /// repeats.
 pub const STORE_THROTTLED_RETRY_AFTER_SECS: u64 = 2;
 
+/// The `message` of an [`AppError::InvalidForwardedFor`] body: the
+/// `affinidi-rate-limit` layer's own wording, so a handler's refusal and the
+/// layer's are byte-identical.
+pub const INVALID_FORWARDED_FOR_MESSAGE: &str = "Invalid X-Forwarded-For header; request rejected.";
+
 /// The instant `secs` from now: a Trust Task `retryAfter`.
 pub fn retry_at(secs: u64) -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now() + chrono::Duration::seconds(secs as i64)
@@ -121,6 +126,19 @@ pub enum AppError {
         message: String,
         /// Seconds after which a retry can succeed. Rendered as at least 1.
         retry_after_secs: u64,
+    },
+
+    /// A trusted proxy sent an `X-Forwarded-For` chain that cannot be
+    /// attributed to a client, so the request cannot be charged to anyone.
+    ///
+    /// Renders to **400** exactly as the `affinidi-rate-limit` layer refuses
+    /// it on DID resolution: `x-rate-limit-source: did-host` and the body
+    /// `{ "error": "invalid_forwarded_for", "limiter": "<limiter>",
+    /// "message": "..." }`, so the condition reads the same on every route.
+    #[error("invalid X-Forwarded-For chain from a trusted proxy ({limiter})")]
+    InvalidForwardedFor {
+        /// The limiter that could not attribute the request.
+        limiter: &'static str,
     },
 
     // ---- Trust-Tasks transport errors (REST `Trust-Task:` header) ----
@@ -506,6 +524,7 @@ impl IntoResponse for AppError {
             AppError::Validation(_) => StatusCode::BAD_REQUEST,
             AppError::QuotaExceeded(_) => StatusCode::FORBIDDEN,
             AppError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+            AppError::InvalidForwardedFor { .. } => StatusCode::BAD_REQUEST,
             AppError::TrustTaskMissing => StatusCode::BAD_REQUEST,
             AppError::TrustTaskMalformed(_) => StatusCode::BAD_REQUEST,
             AppError::TrustTaskMismatch { .. } => StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -549,6 +568,20 @@ impl IntoResponse for AppError {
             headers.insert(
                 axum::http::header::RETRY_AFTER,
                 HeaderValue::from(retry_after_secs),
+            );
+            return response;
+        }
+
+        if let AppError::InvalidForwardedFor { limiter } = &self {
+            let body = serde_json::json!({
+                "error": affinidi_rate_limit::INVALID_FORWARDED_FOR_ERROR,
+                "limiter": limiter,
+                "message": INVALID_FORWARDED_FOR_MESSAGE,
+            });
+            let mut response = (status, axum::Json(body)).into_response();
+            response.headers_mut().insert(
+                RATE_LIMIT_SOURCE_HEADER,
+                HeaderValue::from_static(RATE_LIMIT_SOURCE),
             );
             return response;
         }

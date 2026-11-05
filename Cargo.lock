@@ -670,13 +670,14 @@ dependencies = [
 
 [[package]]
 name = "affinidi-rate-limit"
-version = "0.1.2"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96a7eed66d177bae59e3b4174a47eb6e2c6ccfcb3865b280f1b5722da367a660"
+checksum = "bf917044c3ef68fe294b0e97611ee507a2ae07f92140bcd6a81068a1751ef27e"
 dependencies = [
  "axum",
  "governor",
  "http",
+ "ipnet",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -3047,7 +3048,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-common"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-common",
@@ -3056,6 +3057,7 @@ dependencies = [
  "affinidi-messaging-didcomm",
  "affinidi-messaging-didcomm-service",
  "affinidi-messaging-sdk",
+ "affinidi-rate-limit",
  "affinidi-secrets-resolver",
  "affinidi-tdk",
  "affinidi-tdk-common",
@@ -3115,7 +3117,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-control"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
@@ -3193,7 +3195,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-daemon"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
@@ -3233,7 +3235,7 @@ dependencies = [
 
 [[package]]
 name = "did-hosting-server"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
@@ -9784,7 +9786,7 @@ dependencies = [
 
 [[package]]
 name = "webvh-watcher"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",
@@ -9821,7 +9823,7 @@ dependencies = [
 
 [[package]]
 name = "webvh-witness"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-did-resolver-cache-sdk",

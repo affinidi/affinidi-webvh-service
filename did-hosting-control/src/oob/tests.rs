@@ -1667,10 +1667,29 @@ mod https {
                 .unwrap();
             resp.status().as_u16()
         };
+        // The whole allowance is admitted at once; past it the ceiling holds,
+        // letting through only what refilled while the test ran (one request
+        // every 60 s / the ceiling).
+        let started = std::time::Instant::now();
         for n in 0..GLOBAL_REQUEST_MAX_PER_MINUTE {
             assert_eq!(send(n).await, 200, "request {n}");
         }
-        assert_eq!(send(GLOBAL_REQUEST_MAX_PER_MINUTE).await, 429);
+        // Bounded, so a test that admits everything fails rather than hangs:
+        // a ceiling that holds refuses well within the allowance again.
+        let mut admitted_past_the_ceiling: u32 = 0;
+        let mut n = GLOBAL_REQUEST_MAX_PER_MINUTE;
+        while admitted_past_the_ceiling < GLOBAL_REQUEST_MAX_PER_MINUTE as u32
+            && send(n).await == 200
+        {
+            admitted_past_the_ceiling += 1;
+            n += 1;
+        }
+        let refill = std::time::Duration::from_secs(60) / GLOBAL_REQUEST_MAX_PER_MINUTE as u32;
+        let refilled = started.elapsed().as_nanos() / refill.as_nanos() + 1;
+        assert!(
+            u128::from(admitted_past_the_ceiling) <= refilled,
+            "{admitted_past_the_ceiling} admitted past the ceiling, {refilled} refilled"
+        );
     }
 
     #[tokio::test]

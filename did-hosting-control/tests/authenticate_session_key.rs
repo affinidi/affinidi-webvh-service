@@ -408,7 +408,7 @@ async fn the_session_key_cannot_approve_a_step_up() {
 
     let approve = || {
         doc(
-            "auth/step-up/approve-response/0.6",
+            "auth/step-up/approve-response/0.7",
             &alice.did,
             json!({
                 "subject": alice.did,
