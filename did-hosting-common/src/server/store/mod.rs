@@ -6,6 +6,8 @@ mod dynamodb;
 mod firestore;
 #[cfg(feature = "store-fjall")]
 mod fjall;
+#[cfg(feature = "store-fjall")]
+pub mod flusher;
 pub mod keyspaces;
 #[cfg(feature = "store-redis")]
 mod redis;
