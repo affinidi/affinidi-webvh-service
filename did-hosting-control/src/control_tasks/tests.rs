@@ -664,6 +664,69 @@ async fn info_reports_the_did_scid_alias_state_of_the_latest_document() {
     }
 }
 
+const REGISTER: &str = "https://trusttasks.org/spec/did-management/did/register/0.1";
+
+/// The `hyperledger-labs/did-webs-resolver` reference publication: a
+/// `keri.cesr` stream, registered over the Trust Task a VTA publishes with.
+const WEBS_KERI: &[u8] =
+    include_bytes!("../../../did-hosting-common/tests/fixtures/ENro7uf0.keri.cesr");
+const WEBS_AID: &str = "ENro7uf0ePmiK3jdTo2YCdXLqW7z7xoP6qhhBou6gBLe";
+
+fn webs_register(domain: &str) -> Value {
+    json!({
+        "path": WEBS_AID,
+        "method": "webs",
+        "didData": String::from_utf8(WEBS_KERI.to_vec()).expect("CESR is text"),
+        "force": false,
+        "domain": domain,
+    })
+}
+
+#[cfg(feature = "method-webs")]
+#[tokio::test]
+async fn register_hosts_a_did_webs_key_event_log() {
+    let (state, _dir) = state().await;
+    let owner = member(&state, 22, Role::Owner).await;
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        REGISTER,
+        webs_register("control.test"),
+    )
+    .await;
+    conforms(&reply);
+    let record = &ok(&reply, REGISTER)["record"];
+    assert_eq!(record["mnemonic"], WEBS_AID, "{reply}");
+    let stored: DidRecord = state
+        .dids_ks
+        .get(did_key(WEBS_AID))
+        .await
+        .unwrap()
+        .expect("record");
+    assert_eq!(stored.method, "webs");
+    assert_eq!(
+        stored.did_id.as_deref(),
+        Some(format!("did:webs:control.test:{WEBS_AID}").as_str())
+    );
+}
+
+#[cfg(not(feature = "method-webs"))]
+#[tokio::test]
+async fn register_refuses_did_webs_on_a_host_built_without_it() {
+    let (state, _dir) = state().await;
+    let owner = member(&state, 22, Role::Owner).await;
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        REGISTER,
+        webs_register("control.test"),
+    )
+    .await;
+    assert!(reply.to_string().contains("method-webs"), "{reply}");
+}
+
 #[tokio::test]
 async fn delete_answers_the_record_as_it_stood() {
     let (state, _dir) = state().await;
