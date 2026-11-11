@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Fixed — a watcher slot stays with the source that first synced it
+
+A watcher with more than one source let any of them write to a slot another
+source held, as long as the log was for the same DID: re-sending the held log
+with `disabled` flipped took the slot over, after which that source could
+delete it. A slot now belongs to the source that first synced it until that
+source deletes it. An update from another source is refused
+`webvh/sync/update:notAuthorized` (in a batch, that entry is refused with the
+same code), and a delete from another source leaves the slot in place and is
+answered `absent`, as before. Both are logged as warnings.
+
+Behaviour change: before, a second source could extend a DID held by another
+source; now only the holding source can. A slot stored by an earlier release
+belongs to the source its record names, which is the source that last wrote
+it; no migration is needed. A watcher with a single source is unaffected.
+
 ### Fixed — the daemon sends the standard response headers
 
 `did-hosting-daemon` now sets the same response headers as the standalone

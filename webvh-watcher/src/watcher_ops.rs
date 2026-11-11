@@ -13,6 +13,11 @@
 //! - strictly extend the log the watcher holds for the same DID, and the
 //!   high-water log it keeps for that DID, which a delete does not clear — so
 //!   not even a configured source can roll a DID back or rewrite its history.
+//!
+//! A slot belongs to the source that first wrote it ([`WatcherRecord::source_did`])
+//! until that source deletes it. No other source may update, disable or delete
+//! it, even with the same log. A record stored by an earlier release is bound
+//! to the source it names, which is the source that last wrote it.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +30,9 @@ use crate::store::{KeyspaceHandle, Store};
 pub struct WatcherRecord {
     pub mnemonic: String,
     pub did_id: String,
-    /// The source (control plane) whose signed sync last wrote this slot.
+    /// The source (control plane) that holds this slot: the one whose signed
+    /// sync first wrote it. It never changes while the slot is held; only
+    /// this source can update or delete the slot.
     pub source_did: String,
     pub version_count: u64,
     pub updated_at: u64,
@@ -90,8 +97,8 @@ pub enum SyncRefusal {
     HistoryRewrite(String),
     /// The DID is held as deactivated (`deactivated`).
     Deactivated(String),
-    /// The slot holds a different DID, written by a different source: one
-    /// source cannot take over, or delete, another's slot (`notAuthorized`).
+    /// The slot is held by a different source: one source cannot update,
+    /// disable, take over or delete another's slot (`notAuthorized`).
     NotOwner(String),
     /// The store's per-item size limit refuses the log (`taskFailed`). Not
     /// retryable: the same log will be refused every time.
@@ -183,15 +190,19 @@ pub async fn apply_sync(
         .get_raw(content_log_key(&entry.mnemonic))
         .await?
         .map(|b| String::from_utf8_lossy(&b).into_owned());
-    // A slot is its writer's: another source may extend the same DID there
-    // (the history checks below still hold it to that DID's log), but it may
-    // not re-point the slot at a different DID.
+    // A slot is its holder's: no other source may write to it, not even to
+    // re-send the same log, or to flip `disabled`.
     if let Some(prev) = held.as_ref()
         && prev.source_did != source_did
-        && webvh_scid(&prev.did_id).as_deref() != Some(scid.as_str())
     {
+        tracing::warn!(
+            mnemonic = %entry.mnemonic,
+            holder = %prev.source_did,
+            source = %source_did,
+            "sync refused: the slot is held by another source"
+        );
         return Err(SyncRefusal::NotOwner(format!(
-            "slot {} mirrors a DID another source syncs",
+            "slot {} is held by another source",
             entry.mnemonic
         )));
     }
@@ -260,7 +271,8 @@ pub async fn apply_sync(
 }
 
 /// Stop mirroring a slot for `source_did`. The high-water mark stays, so a
-/// later sync cannot roll the DID back. Returns whether anything was held for
+/// later sync cannot roll the DID back, but the slot is released: any
+/// configured source may write it next. Returns whether anything was held for
 /// that source: a slot another source wrote is left alone, and reported as
 /// not held, so a source learns nothing of other sources' slots.
 pub async fn delete_record(
@@ -270,8 +282,18 @@ pub async fn delete_record(
     source_did: &str,
 ) -> Result<bool, AppError> {
     let held: Option<WatcherRecord> = ks.get(did_key(mnemonic)).await?;
-    if held.is_none_or(|r| r.source_did != source_did) {
-        return Ok(false);
+    match held {
+        None => return Ok(false),
+        Some(r) if r.source_did != source_did => {
+            tracing::warn!(
+                mnemonic,
+                holder = %r.source_did,
+                source = %source_did,
+                "sync delete refused: the slot is held by another source"
+            );
+            return Ok(false);
+        }
+        Some(_) => {}
     }
     let mut batch = store.batch();
     batch.remove(ks, did_key(mnemonic));

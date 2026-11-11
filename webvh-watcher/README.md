@@ -89,6 +89,15 @@ Clients ──(GET /{mnemonic}/did.jsonl)──► webvh-watcher
 A document that does not verify gets no reply. A verified one from a DID that
 is not a source is refused `notAuthorized` (signed), and is not recorded.
 
+A slot belongs to the source that first synced it, until that source deletes
+it. An update from any other configured source, even one that re-sends the
+same log or only changes `disabled`, is refused `notAuthorized`; a delete from
+another source leaves the slot in place and is answered `absent`. Both are
+logged as warnings. A slot stored by an earlier release belongs to the source
+its record names (the source that last wrote it). Once the holding source
+deletes a slot, any configured source may sync it next, still held to the
+DID's high-water log.
+
 ## Configuration
 
 The watcher is configured via a TOML file. By default it looks

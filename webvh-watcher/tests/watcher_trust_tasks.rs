@@ -173,8 +173,12 @@ fn signed_by_the_watcher(reply: &Value, to: &str) {
 }
 
 fn answered(reply: &Value, type_uri: &str) -> Value {
+    answered_to(reply, type_uri, &source().0)
+}
+
+fn answered_to(reply: &Value, type_uri: &str, to: &str) -> Value {
     assert_eq!(reply["type"], format!("{type_uri}#response"), "{reply}");
-    signed_by_the_watcher(reply, &source().0);
+    signed_by_the_watcher(reply, to);
     let schema = did_hosting_common::tasks::payload_schema(&format!("{type_uri}#response"))
         .unwrap_or_else(|| panic!("no schema is known for {type_uri}#response"));
     if let Err(e) = trust_tasks_rs::validate::against_schema(schema, &reply["payload"]) {
@@ -635,4 +639,167 @@ async fn a_source_cannot_take_over_or_delete_another_sources_slot() {
     .expect("answered");
     assert_eq!(answered(&reply, MSG_SYNC_DELETE)["status"], "deleted");
     assert!(held(&state, "frank").await.is_none());
+}
+
+/// A watcher configured with two sources: the default one and a second.
+async fn two_source_watcher() -> (
+    AppState,
+    tempfile::TempDir,
+    (String, Secret),
+    (String, Secret),
+) {
+    let (mut state, dir) = watcher_state().await;
+    let (a, b) = (source(), signer(84));
+    let mut config = (*state.config).clone();
+    config.sync.source_dids.push(b.0.clone());
+    state.config = Arc::new(config);
+    (state, dir, a, b)
+}
+
+#[tokio::test]
+async fn a_source_cannot_resend_disable_or_delete_another_sources_did() {
+    let (state, _dir, a, b) = two_source_watcher().await;
+    let (did, log) = did_log("grace", 1).await;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(MSG_SYNC_UPDATE, &a, update_body("grace", &did, &log)).await,
+    )
+    .await
+    .expect("answered");
+    answered(&reply, MSG_SYNC_UPDATE);
+
+    // The same log, with `disabled` flipped, from the other source.
+    let mut disable = update_body("grace", &did, &log);
+    disable["disabled"] = json!(true);
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, disable.clone()).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(refused(&reply, &b.0), "webvh/sync/update:notAuthorized");
+
+    // The same log, unchanged, from the other source.
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, update_body("grace", &did, &log)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(refused(&reply, &b.0), "webvh/sync/update:notAuthorized");
+
+    // In a batch, the entry is refused with the same code.
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_BATCH, &b, json!({ "updates": [disable] })).await,
+    )
+    .await
+    .expect("answered");
+    let results = answered_to(&reply, MSG_SYNC_BATCH, &b.0)["results"].clone();
+    assert_eq!(results[0]["status"], "refused", "{results}");
+    assert_eq!(results[0]["code"], "webvh/sync/update:notAuthorized");
+
+    // Its delete leaves the slot alone.
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_DELETE, &b, json!({ "mnemonic": "grace" })).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        answered_to(&reply, MSG_SYNC_DELETE, &b.0)["status"],
+        "absent"
+    );
+
+    let record = held(&state, "grace").await.expect("still mirrored");
+    assert_eq!(record.source_did, a.0);
+    assert!(!record.disabled);
+
+    // The holding source can still disable it.
+    let mut disable = update_body("grace", &did, &log);
+    disable["disabled"] = json!(true);
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(MSG_SYNC_UPDATE, &a, disable).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_UPDATE)["status"], "applied");
+    let record = held(&state, "grace").await.unwrap();
+    assert!(record.disabled);
+    assert_eq!(record.source_did, a.0);
+}
+
+/// A slot stays bound to the source that holds it, including a record stored
+/// before this rule; once that source deletes it, the slot is free again.
+#[tokio::test]
+async fn a_stored_slot_stays_bound_to_its_source_until_that_source_deletes_it() {
+    let (state, _dir, a, b) = two_source_watcher().await;
+    let (did, log) = did_log("heidi", 1).await;
+    // Write the slot directly, as an earlier release stored it.
+    let record = watcher_ops::WatcherRecord {
+        mnemonic: "heidi".into(),
+        did_id: did.clone(),
+        source_did: a.0.clone(),
+        version_count: 1,
+        updated_at: 1,
+        disabled: false,
+    };
+    let mut batch = state.store.batch();
+    batch
+        .insert(&state.dids_ks, watcher_ops::did_key("heidi"), &record)
+        .unwrap();
+    batch.insert_raw(
+        &state.dids_ks,
+        watcher_ops::content_log_key("heidi"),
+        log.as_bytes().to_vec(),
+    );
+    batch.commit().await.unwrap();
+
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, update_body("heidi", &did, &log)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(refused(&reply, &b.0), "webvh/sync/update:notAuthorized");
+    assert_eq!(held(&state, "heidi").await.unwrap().source_did, a.0);
+
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(MSG_SYNC_DELETE, &a, json!({ "mnemonic": "heidi" })).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_DELETE)["status"], "deleted");
+
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, update_body("heidi", &did, &log)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        answered_to(&reply, MSG_SYNC_UPDATE, &b.0)["status"],
+        "applied"
+    );
+    assert_eq!(held(&state, "heidi").await.unwrap().source_did, b.0);
 }
