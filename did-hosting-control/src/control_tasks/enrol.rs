@@ -370,7 +370,7 @@ fn verify_uv(
 async fn claim_credential_id(
     state: &AppState,
     passkey: &Passkey,
-) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, TaskError> {
+) -> Result<Option<did_hosting_common::server::path_locks::PathGuard>, TaskError> {
     let id = cred_id_hex(passkey.cred_id());
     let guard = state
         .path_locks
@@ -565,6 +565,7 @@ pub(crate) async fn invite(
             issued_by: auth.did.clone(),
             ttl_secs: ttl,
         },
+        state.config.auth.claim_code_hash_wait(),
     )
     .await?;
     typed(
@@ -609,7 +610,14 @@ pub(crate) async fn redeem_start(
             "the invite is not redeemable with that token and claim code".into(),
         )
     };
-    let invite = match invite::redeem(&state.sessions_ks, &p.token, &p.claim_code).await? {
+    let invite = match invite::redeem(
+        &state.sessions_ks,
+        &p.token,
+        &p.claim_code,
+        state.config.auth.claim_code_hash_wait(),
+    )
+    .await?
+    {
         Redemption::Valid(invite) => *invite,
         Redemption::Invalid => return Err(invalid()),
         Redemption::TooManyAttempts => {

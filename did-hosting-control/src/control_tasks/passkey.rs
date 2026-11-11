@@ -49,7 +49,7 @@ pub(crate) async fn credentials_guard(
     state: &AppState,
     purpose: Purpose,
     subject: &str,
-) -> tokio::sync::OwnedMutexGuard<()> {
+) -> did_hosting_common::server::path_locks::PathGuard {
     state
         .path_locks
         .guard(&format!(

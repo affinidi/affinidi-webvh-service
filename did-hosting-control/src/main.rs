@@ -813,6 +813,7 @@ async fn run_invite(
         enrollment_ttl,
         &did,
         &role,
+        config.auth.claim_code_hash_wait(),
     )
     .await?;
 

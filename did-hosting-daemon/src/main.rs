@@ -1972,6 +1972,7 @@ async fn run_invite(
         enrollment_ttl,
         &did,
         &role,
+        control_config.auth.claim_code_hash_wait(),
     )
     .await?;
 

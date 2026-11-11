@@ -980,6 +980,13 @@ pub struct AuthConfig {
     pub admin_idle_timeout: u64,
     #[serde(default = "default_passkey_enrollment_ttl")]
     pub passkey_enrollment_ttl: u64,
+    /// How long a passkey invite's claim-code check may wait for a free
+    /// hashing slot, in milliseconds, before it is refused as `unavailable`
+    /// with a retry time. The checks share a small fixed number of slots
+    /// because each takes a large, fixed amount of memory; this bounds how
+    /// long a burst of redemption attempts can hold the others up.
+    #[serde(default = "default_claim_code_hash_wait_ms")]
+    pub claim_code_hash_wait_ms: u64,
     /// How long (in minutes) to keep empty DID records before auto-cleanup.
     #[serde(default = "default_cleanup_ttl_minutes")]
     pub cleanup_ttl_minutes: u64,
@@ -1045,6 +1052,10 @@ fn default_passkey_enrollment_ttl() -> u64 {
     86400
 }
 
+fn default_claim_code_hash_wait_ms() -> u64 {
+    5000
+}
+
 fn default_cleanup_ttl_minutes() -> u64 {
     60
 }
@@ -1070,6 +1081,11 @@ fn default_absolute_session_lifetime() -> u64 {
 }
 
 impl AuthConfig {
+    /// [`Self::claim_code_hash_wait_ms`] as a duration.
+    pub fn claim_code_hash_wait(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.claim_code_hash_wait_ms)
+    }
+
     /// Validate configuration values are within acceptable ranges.
     pub fn validate(&self) -> Result<(), AppError> {
         if self.challenge_ttl < 10 {
@@ -1138,6 +1154,7 @@ impl Default for AuthConfig {
             session_cleanup_interval: default_session_cleanup_interval(),
             admin_idle_timeout: default_admin_idle_timeout(),
             passkey_enrollment_ttl: default_passkey_enrollment_ttl(),
+            claim_code_hash_wait_ms: default_claim_code_hash_wait_ms(),
             cleanup_ttl_minutes: default_cleanup_ttl_minutes(),
             max_global_pending_challenges: default_max_global_pending_challenges(),
             max_pending_challenges_per_did: default_max_pending_challenges_per_did(),
@@ -1783,6 +1800,10 @@ pub fn apply_env_overrides(
         auth.passkey_enrollment_ttl
     );
     env_parse!(
+        &format!("{prefix}_AUTH_CLAIM_CODE_HASH_WAIT_MS"),
+        auth.claim_code_hash_wait_ms
+    );
+    env_parse!(
         &format!("{prefix}_CLEANUP_TTL_MINUTES"),
         auth.cleanup_ttl_minutes
     );
@@ -1924,6 +1945,24 @@ pub fn init_tracing(log: &LogConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The claim-code hashing wait is finite by default and the operator's
+    /// to set.
+    #[test]
+    fn claim_code_hash_wait_has_a_finite_default_and_is_configurable() {
+        let auth: AuthConfig = toml::from_str("").unwrap();
+        assert_eq!(auth.claim_code_hash_wait_ms, 5000);
+        assert_eq!(
+            auth.claim_code_hash_wait(),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(AuthConfig::default().claim_code_hash_wait_ms, 5000);
+        let auth: AuthConfig = toml::from_str("claim_code_hash_wait_ms = 250").unwrap();
+        assert_eq!(
+            auth.claim_code_hash_wait(),
+            std::time::Duration::from_millis(250)
+        );
+    }
 
     /// `did:webs` self-registration is off unless a domain opts in, and a
     /// domain's prefixes match whole leading segments only.

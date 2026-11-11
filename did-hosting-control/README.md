@@ -102,6 +102,9 @@ access_token_expiry = 900
 refresh_token_expiry = 86400
 challenge_ttl = 300
 passkey_enrollment_ttl = 86400
+# Longest a passkey invite's claim-code check waits for a free hashing slot
+# before it is answered `unavailable` with a retry time (milliseconds).
+claim_code_hash_wait_ms = 5000
 
 [secrets]
 keyring_service = "did-hosting-control"

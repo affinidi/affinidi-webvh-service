@@ -927,6 +927,62 @@ async fn https_redemption_is_rate_limited_per_client_ip() {
     assert!(last["payload"]["retryAfter"].is_string(), "{last}");
 }
 
+/// A redemption body over its size limit is refused for its size, before it
+/// is parsed, and does not count against the client's redemption limit.
+#[tokio::test]
+async fn https_oversized_redemption_is_refused_for_its_size_and_not_counted() {
+    use axum::response::IntoResponse;
+    use did_hosting_common::server::trust_tasks::size::{
+        DEFAULT_MAX_DOCUMENT_BYTES, DETAILS_MAX_BYTES,
+    };
+    use http_body_util::BodyExt;
+
+    let (state, _dir) = state().await;
+    let addr: std::net::SocketAddr = "203.0.113.8:4000".parse().unwrap();
+    let post = |doc: Value| {
+        let state = state.clone();
+        async move {
+            let response = crate::routes::trust_tasks::trust_tasks_endpoint(
+                None,
+                axum::extract::State(state),
+                Ok(axum::extract::ConnectInfo(addr)),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
+            )
+            .await
+            .into_response();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        }
+    };
+    let redeem_doc = |padding: usize| {
+        let mut doc = request(
+            &t(REDEEM_START),
+            "unused",
+            json!({
+                "token": "inv_not-a-real-token-at-all",
+                "claimCode": "0000-0000-0000",
+                "padding": "x".repeat(padding),
+            }),
+        );
+        doc.as_object_mut().unwrap().remove("issuer");
+        doc
+    };
+    for _ in 0..=crate::rate_limit::REDEEM_MAX_PER_WINDOW {
+        let reply = post(redeem_doc(DEFAULT_MAX_DOCUMENT_BYTES)).await;
+        assert_eq!(code(&reply), "malformedRequest", "{reply}");
+        assert_eq!(
+            reply["payload"]["details"][DETAILS_MAX_BYTES],
+            json!(DEFAULT_MAX_DOCUMENT_BYTES),
+            "{reply}"
+        );
+    }
+    // None of them was counted: an ordinary attempt is still served (and
+    // refused only for its unknown token).
+    let reply = post(redeem_doc(0)).await;
+    assert_ne!(code(&reply), "unavailable", "{reply}");
+}
+
 /// A step-up approve-response's `webauthn` evidence is gated on the
 /// subject's step-up-only store: offered only once one is enrolled, bound to
 /// the ceremony's own challenge, refused without user verification, and
