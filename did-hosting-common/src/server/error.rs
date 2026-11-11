@@ -406,7 +406,9 @@ const MAX_USER_MESSAGE_LEN: usize = 256;
 fn sanitize_user_message(s: &str) -> String {
     let mut out: String = s.chars().filter(|c| !c.is_ascii_control()).collect();
     if out.len() > MAX_USER_MESSAGE_LEN {
-        out.truncate(MAX_USER_MESSAGE_LEN);
+        // On a character boundary: `String::truncate` panics mid-character,
+        // and this text is caller-supplied.
+        out.truncate(out.floor_char_boundary(MAX_USER_MESSAGE_LEN));
         out.push('…');
     }
     out
@@ -639,6 +641,21 @@ mod response_tests {
         let msg = err.user_message();
         assert!(msg.chars().count() <= MAX_USER_MESSAGE_LEN + 1); // +1 for '…'
         assert!(msg.ends_with('…'));
+    }
+
+    #[test]
+    fn validation_caps_length_on_a_character_boundary() {
+        // A two-byte character straddling the cap.
+        let text = format!(
+            "{}é{}",
+            "x".repeat(MAX_USER_MESSAGE_LEN - 1),
+            "y".repeat(50)
+        );
+        let msg = AppError::Validation(text).user_message();
+        assert_eq!(msg, format!("{}…", "x".repeat(MAX_USER_MESSAGE_LEN - 1)));
+        let msg = AppError::Conflict("😀".repeat(200)).user_message();
+        assert!(msg.ends_with('…'));
+        assert!(msg.len() <= MAX_USER_MESSAGE_LEN + '…'.len_utf8());
     }
 
     #[test]
