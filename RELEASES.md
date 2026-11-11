@@ -86,7 +86,11 @@ description says why.
 
 The `branch rules` check (`scripts/check-branch-rules.py`) holds all of this: a
 PR into `release/**` is a bot backport, a prep PR or labelled `release-direct`;
-only the release tooling changes versions or `RELEASE`, on any branch.
+only the release tooling changes versions or `RELEASE`, on any branch. The
+tooling's branch names (`backport-…`, `release-prep/…`, `release-cut/…`) count
+only on branches in this repository: a PR from a fork whose branch carries one
+of those names fails the check and is asked to rename it. A hand-made backport
+branch is therefore pushed here, not to a fork.
 
 ## Procedures
 

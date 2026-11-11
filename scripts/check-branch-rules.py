@@ -15,7 +15,17 @@ Into `main`:
      crate's `version`: main carries the next release's version, set at the cut.
   4. No PR adds a `RELEASE` file: it marks a release branch.
 
-Environment: BASE_REF, HEAD_REF, LABELS (JSON list of label names).
+Either way:
+  5. A head branch whose name the rules above treat specially (`backport-…`,
+     `release-prep/…`, `release-cut/…`) must live in this repository. A fork
+     can name a branch anything, so only a branch pushed here carries the
+     meaning of its name.
+
+Environment: BASE_REF, HEAD_REF, LABELS (JSON list of label names), REPO
+(this repository, `owner/name`) and HEAD_REPO (the repository the head branch
+lives in). Without REPO (a local run), rule 5 is not checked; with REPO set,
+an empty HEAD_REPO (a head repository that has since been deleted) counts as
+another repository.
 """
 
 import json
@@ -44,6 +54,8 @@ def main():
     base = os.environ["BASE_REF"]
     head = os.environ["HEAD_REF"]
     labels = set(json.loads(os.environ.get("LABELS") or "[]"))
+    repo = os.environ.get("REPO") or ""
+    head_repo = os.environ.get("HEAD_REPO") or ""
     changed = git("diff", "--name-only", "HEAD^1", "HEAD").split()
 
     versions = []
@@ -55,6 +67,17 @@ def main():
     release_file = "RELEASE" in changed
 
     problems = []
+    tooling_name = re.match(r"(backport-\d+-to-release/|release-prep/|release-cut/)", head)
+    if tooling_name and repo and head_repo != repo:
+        where = head_repo or "a repository that no longer exists"
+        problems.append(
+            f"`{head}` is a release-tooling branch name, but this branch is in {where}, "
+            f"not {repo}. Those names are only honoured on branches in {repo}; rename the "
+            "branch."
+        )
+        # Judge the rest as an ordinary branch.
+        head = f"{head_repo or 'unknown'}:{head}"
+
     if base.startswith("release/"):
         name = base.removeprefix("release/")
         backport = re.fullmatch(rf"backport-\d+-to-release/{re.escape(name)}", head)
