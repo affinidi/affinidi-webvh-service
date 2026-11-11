@@ -126,8 +126,24 @@ pub fn is_unreachable(err: &VerificationError) -> bool {
     matches!(err, VerificationError::Other(m) if m.contains(UNREACHABLE))
 }
 
+/// A verification failure reporting that the signer's DID could not be
+/// resolved in time, which [`is_unreachable`] recognises (and callers report
+/// as retryable). For a caller that bounds how long it waits on a resolution.
+pub fn unreachable_error(detail: impl std::fmt::Display) -> VerificationError {
+    VerificationError::Other(format!("{UNREACHABLE}: {detail}"))
+}
+
 /// Minimum spacing between forced re-resolutions of one DID.
 pub const FORCED_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Most DIDs the forced-refresh limiter tracks at once. Past it, a DID it is
+/// not already tracking gets no forced refresh until older entries age out of
+/// [`FORCED_REFRESH_INTERVAL`] (the proof is then refused as it stands).
+pub const FORCED_REFRESH_CAPACITY: usize = 4096;
+
+/// Longest DID the forced-refresh limiter tracks; a longer one gets no forced
+/// refresh.
+pub const FORCED_REFRESH_MAX_DID_LEN: usize = 2048;
 
 /// One bearer session's signing delegate: the only key, and the only
 /// principal, a delegated proof may name.
@@ -145,6 +161,12 @@ trait StaleKeyRefresh: Send + Sync {
 }
 
 /// Allows one forced refresh per DID per [`FORCED_REFRESH_INTERVAL`].
+///
+/// Keyed on the DID's identity ([`crate::scid::identity`]), so the `src`
+/// variants of one `did:scid` share a single allowance. Holds at most
+/// [`FORCED_REFRESH_CAPACITY`] DIDs, each at most
+/// [`FORCED_REFRESH_MAX_DID_LEN`] bytes; when full it refuses rather than
+/// forgets, so a stream of distinct DIDs cannot reset another DID's spacing.
 #[derive(Default)]
 struct RefreshLimiter {
     last: Mutex<HashMap<String, Instant>>,
@@ -152,15 +174,22 @@ struct RefreshLimiter {
 
 impl RefreshLimiter {
     fn allow(&self, did: &str, now: Instant) -> bool {
+        if did.len() > FORCED_REFRESH_MAX_DID_LEN {
+            return false;
+        }
+        let key = crate::scid::identity(did);
         let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
         if last
-            .get(did)
+            .get(&key)
             .is_some_and(|t| now.duration_since(*t) < FORCED_REFRESH_INTERVAL)
         {
             return false;
         }
         last.retain(|_, t| now.duration_since(*t) < FORCED_REFRESH_INTERVAL);
-        last.insert(did.to_string(), now);
+        if last.len() >= FORCED_REFRESH_CAPACITY {
+            return false;
+        }
+        last.insert(key, now);
         true
     }
 }
@@ -180,7 +209,7 @@ impl StaleKeyRefresh for CacheRefresher {
             return false;
         }
         self.client.remove(did).await;
-        self.deactivation.forget(did);
+        self.deactivation.forget(&crate::scid::identity(did));
         true
     }
 }
@@ -449,6 +478,19 @@ impl TransportBoundVerifier {
         }
     }
 
+    /// This verifier without the forced re-resolution retry: a proof that
+    /// fails against the cached document is refused as it stands. For a
+    /// signer this service has no standing relationship with (no ACL entry),
+    /// where a retry would only double the outbound resolutions a stranger
+    /// can cause; a known peer that has just rotated is what the retry is
+    /// for.
+    pub fn without_forced_refresh(&self) -> Self {
+        Self {
+            refresher: None,
+            ..self.clone()
+        }
+    }
+
     /// Override the [`VerifyOptions`] (expected proof purpose, domain /
     /// challenge, …). Defaults match `VerifyOptions::default()`.
     pub fn with_options(mut self, options: VerifyOptions) -> Self {
@@ -554,9 +596,12 @@ impl TransportBoundVerifier {
         };
         // Only a failure that a different document could cure is worth a fresh
         // resolution: the key was not found, or the key found did not match.
-        // A deactivated signer is final — deactivation cannot be undone.
+        // A deactivated signer is final — deactivation cannot be undone. A
+        // DID that could not be resolved at all had no cached document to
+        // replace, and is already reported as retryable to the caller, so it
+        // is not resolved a second time here.
         let retryable = match &err {
-            DataIntegrityError::Resolver(m) => !m.contains(DEACTIVATED),
+            DataIntegrityError::Resolver(m) => !m.contains(DEACTIVATED) && !m.contains(UNREACHABLE),
             DataIntegrityError::InvalidSignature { .. } => true,
             _ => false,
         };
@@ -1085,6 +1130,74 @@ mod tests {
         assert!(!limiter.allow("did:example:a", t0 + Duration::from_secs(1)));
         assert!(limiter.allow("did:example:b", t0 + Duration::from_secs(1)));
         assert!(limiter.allow("did:example:a", t0 + FORCED_REFRESH_INTERVAL));
+    }
+
+    /// The `src` variants of one did:scid share one allowance.
+    #[test]
+    fn forced_refreshes_are_limited_per_scid_identity() {
+        let limiter = RefreshLimiter::default();
+        let t0 = Instant::now();
+        assert!(limiter.allow("did:scid:vh:1:abc?src=one.example", t0));
+        assert!(!limiter.allow("did:scid:vh:1:abc?src=two.example", t0));
+        assert!(!limiter.allow("did:scid:vh:1:abc", t0));
+    }
+
+    /// The limiter holds a bounded number of DIDs and refuses (rather than
+    /// forgets) past it, until entries age out; an oversized DID is refused.
+    #[test]
+    fn the_forced_refresh_limiter_is_bounded() {
+        let limiter = RefreshLimiter::default();
+        let t0 = Instant::now();
+        for i in 0..FORCED_REFRESH_CAPACITY {
+            assert!(limiter.allow(&format!("did:example:{i}"), t0));
+        }
+        assert!(!limiter.allow("did:example:one-more", t0));
+        assert!(limiter.allow("did:example:one-more", t0 + FORCED_REFRESH_INTERVAL));
+        let long = format!("did:example:{}", "a".repeat(FORCED_REFRESH_MAX_DID_LEN));
+        assert!(!limiter.allow(&long, t0 + FORCED_REFRESH_INTERVAL));
+    }
+
+    /// A signer whose DID could not be resolved at all is not resolved a
+    /// second time: the failure is reported as unreachable straight away.
+    #[tokio::test]
+    async fn an_unresolvable_signer_is_not_resolved_twice() {
+        struct Unreachable;
+        #[async_trait]
+        impl ProofPurposeResolver for Unreachable {
+            async fn resolve_vm_for_purpose(
+                &self,
+                vm: &str,
+                _purpose: ProofPurpose,
+            ) -> Result<ResolvedKey, DataIntegrityError> {
+                Err(DataIntegrityError::Resolver(format!(
+                    "{UNREACHABLE}: cannot resolve {vm}"
+                )))
+            }
+        }
+        let refresher = Arc::new(FlagRefresher {
+            refreshed: Default::default(),
+            calls: Default::default(),
+            allow: true,
+        });
+        let mut v = TransportBoundVerifier::with_resolver(Arc::new(Unreachable));
+        v.refresher = Some(refresher.clone());
+        let err = v.verify(&self_issued_doc().await).await.unwrap_err();
+        assert!(is_unreachable(&err), "{err:?}");
+        assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// `without_forced_refresh` refuses a proof that fails against the cached
+    /// document as it stands.
+    #[tokio::test]
+    async fn without_forced_refresh_does_not_re_resolve() {
+        let (v, refresher) = rotated_verifier(true);
+        assert!(
+            v.without_forced_refresh()
+                .verify(&self_issued_doc().await)
+                .await
+                .is_err()
+        );
+        assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// Operational proofs must be `authentication`-purpose.

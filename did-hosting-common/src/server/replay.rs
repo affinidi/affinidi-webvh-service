@@ -9,7 +9,9 @@
 //! This module remembers every accepted `(signer, id)` pair for as long as
 //! the freshness gate would still accept its document. Callers insert only
 //! after the signer has been authorised and verified, so an unauthenticated
-//! flood cannot occupy it.
+//! flood cannot occupy it. A service that also accepts proofs from signers it
+//! has no standing relationship with keeps a separate instance for those
+//! (the control plane's `unlisted_signers`), so they cannot fill this one.
 //!
 //! # Compact records, filed by `issuedAt`
 //!

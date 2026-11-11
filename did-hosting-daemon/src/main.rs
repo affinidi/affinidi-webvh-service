@@ -1758,6 +1758,7 @@ async fn build_control(
         stats_ks,
         timeseries_ks,
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
+        unlisted_signers: Default::default(),
         replay_cache: Arc::new(did_hosting_control::replay::ReplayCache::with_config(
             config.replay.clone(),
         )?),

@@ -28,6 +28,35 @@ and the pending-approval log check on a DID's page are marked this way, as are
 the agent-name and DID reloads they trigger, and both polls pause while the
 browser tab is hidden. A request without the header counts as
 activity, as before.
+### Fixed — signers outside the ACL get their own replay cache and bounded DID resolution
+
+The control plane recorded every signed Trust Task document in one shared
+replay cache, including those on the tasks that take a proof from a signer the
+ACL does not list (`server/info`, discovery, the `auth/*` family, passkey login
+and invite redemption). Such a signer (a fresh `did:key`, say) costs nothing to
+create, so that traffic could fill the cache, which then refused every signed
+request as `unavailable` until its records aged out. Verifying those proofs
+could also resolve any DID the document named, twice.
+
+- A signed document from a signer the ACL does not list is now recorded in a
+  separate cache (100,000 records, 10,000 per signer). The shared cache holds
+  only ACL members' and configured watchers' records. Both still refuse rather
+  than forget at their bounds, and replays are refused as before.
+- Verifying such a signer's proof runs the key-free checks (recipient,
+  freshness, issuer/sender) first. If the DID must be resolved over the network
+  (anything but a `did:key`), at most 16 resolutions run at once and 300 per
+  minute across all such signers, each within 10 s. Past those limits the
+  document is refused as `unavailable` with a `retryAfter`; a timeout is
+  reported as an unreachable signer (retryable). These signers no longer get
+  the forced re-resolution retry.
+- For every signer: a proof whose signer DID could not be resolved at all is no
+  longer resolved a second time (it was already reported retryable). The
+  forced-refresh limiter is keyed on the DID's identity, so a `did:scid`'s
+  `?src=` variants share one allowance, and tracks at most 4,096 DIDs.
+- Behaviour change (R3.6): a signed request from outside the ACL can now be
+  refused as `unavailable` when those limits are reached, even if the shared
+  cache has room. A `did:webs` self-registration's record goes into the
+  separate cache. ACL members are not affected.
 
 ### Added — a `did:webs` can register itself, proved by its own key event log
 

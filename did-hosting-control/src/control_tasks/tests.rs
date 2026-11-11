@@ -3513,3 +3513,116 @@ fn a_store_size_refusal_is_a_task_failure_naming_the_limit() {
     let message = payload["message"].as_str().unwrap_or_default();
     assert!(message.contains("409600"), "{payload}");
 }
+
+/// A signed document from a signer the ACL does not list is recorded in the
+/// unlisted-signer replay cache, never the shared one, and a resend of it is
+/// still refused as a replay — on every transport.
+#[tokio::test]
+async fn an_unlisted_signer_is_recorded_apart_from_the_shared_replay_cache() {
+    let (state, _dir) = state().await;
+    let uri = t("did-management/server/info/0.1");
+    let caller = stranger(70);
+    for via in VIAS {
+        let doc = signed(request(&uri, &caller.did, json!({})), &caller.key).await;
+        ok(&send(&state, via, &caller, doc.clone()).await, &uri);
+        assert_eq!(code(&send(&state, via, &caller, doc).await), "idConflict");
+    }
+    assert!(state.replay_cache.is_empty());
+    assert_eq!(state.unlisted_signers.replay.len(), VIAS.len());
+
+    // A listed signer's document goes to the shared cache, as before.
+    let admin = member(&state, 71, Role::Admin).await;
+    ok(&call(&state, Via::Tsp, &admin, &uri, json!({})).await, &uri);
+    assert_eq!(state.replay_cache.len(), 1);
+    assert_eq!(state.unlisted_signers.replay.len(), VIAS.len());
+}
+
+/// However full the unlisted-signer cache is, listed signers are unaffected:
+/// only unlisted signers are told to retry.
+#[tokio::test]
+async fn a_full_unlisted_signer_cache_does_not_refuse_listed_signers() {
+    let (state, _dir) = state().await;
+    let now = Some(chrono::Utc::now());
+    for i in 0..2 * crate::unlisted_signers::REPLAY_MAX_ENTRIES {
+        let _ = state.unlisted_signers.replay.check(
+            &format!("did:key:filler-{}", i / 50),
+            &format!("urn:uuid:{i}"),
+            now,
+        );
+    }
+    assert_eq!(
+        state.unlisted_signers.replay.len(),
+        crate::unlisted_signers::REPLAY_MAX_ENTRIES
+    );
+
+    let uri = t("did-management/server/info/0.1");
+    let caller = stranger(72);
+    let doc = signed(request(&uri, &caller.did, json!({})), &caller.key).await;
+    assert_eq!(
+        code(&send(&state, Via::Tsp, &caller, doc).await),
+        "unavailable"
+    );
+
+    let admin = member(&state, 73, Role::Admin).await;
+    ok(&call(&state, Via::Tsp, &admin, &uri, json!({})).await, &uri);
+    // An operational request, too.
+    ok(
+        &call(
+            &state,
+            Via::Tsp,
+            &admin,
+            &t("did-management/server/config/0.1"),
+            json!({}),
+        )
+        .await,
+        &t("did-management/server/config/0.1"),
+    );
+}
+
+/// A proof by an unlisted signer whose DID would have to be resolved over the
+/// network is refused as retryable, before any resolution, while every
+/// resolution slot is in use; one that fails the key-free checks never takes
+/// a slot at all. A `did:key` needs no slot.
+#[tokio::test]
+async fn unlisted_signer_resolutions_are_bounded() {
+    let (state, _dir) = state().await;
+    let uri = t("did-management/server/info/0.1");
+    let did = "did:web:unlisted.example";
+    let mut key =
+        affinidi_tdk::secrets_resolver::secrets::Secret::generate_ed25519(None, Some(&[74u8; 32]));
+    key.id = format!("{did}#key-1");
+    let caller = Caller {
+        did: did.to_string(),
+        key,
+        role: Role::Owner,
+    };
+
+    let held = state.unlisted_signers.occupy_all();
+    let doc = signed(request(&uri, did, json!({})), &caller.key).await;
+    assert_eq!(
+        code(&send(&state, Via::Tsp, &caller, doc).await),
+        "unavailable"
+    );
+    // Addressed elsewhere: refused on that, with no slot needed.
+    let mut wrong = request(&uri, did, json!({}));
+    wrong["recipient"] = json!("did:example:elsewhere");
+    let wrong = signed(wrong, &caller.key).await;
+    assert_eq!(
+        code(&send(&state, Via::Tsp, &caller, wrong).await),
+        "wrongRecipient"
+    );
+    // A did:key signer is decoded locally and still served.
+    let local = stranger(75);
+    let doc = signed(request(&uri, &local.did, json!({})), &local.key).await;
+    ok(&send(&state, Via::Tsp, &local, doc).await, &uri);
+    drop(held);
+
+    // With a slot free, the resolution is attempted (and, with no such DID,
+    // fails) rather than refused as busy.
+    let doc = signed(request(&uri, did, json!({})), &caller.key).await;
+    assert_ne!(
+        code(&send(&state, Via::Tsp, &caller, doc).await),
+        "unavailable"
+    );
+    assert!(state.replay_cache.is_empty());
+}

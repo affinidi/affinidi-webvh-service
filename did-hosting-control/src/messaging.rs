@@ -1581,6 +1581,20 @@ async fn route_trust_task_doc(
             ))));
         }
     }
+    // Whether the signer is one this service has a standing relationship
+    // with: past the pre-filter above, or — for a rule without one — listed
+    // in the ACL. The proof below binds the proven signer to `sender`, so by
+    // the time the replay cache is chosen this describes the proven signer.
+    // An unlisted signer's proof is verified under the bounds of
+    // `crate::unlisted_signers`, and its record goes into that module's own
+    // replay cache, never the shared one. A failed lookup counts as
+    // unlisted: the stricter of the two.
+    let listed_signer = needs_acl
+        || (signed
+            && matches!(
+                did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, sender).await,
+                Ok(Some(_))
+            ));
     // A self-registration's proof, verified against the key state its own
     // key event log establishes (never a resolved document): the identifier
     // it proves, and the `SelfCertifiedWebs` the register row runs as.
@@ -1624,7 +1638,28 @@ async fn route_trust_task_doc(
             },
             _ => match self_bound {
                 Some(bound) => bound,
-                None => verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await,
+                None if listed_signer => {
+                    verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await
+                }
+                None => match state
+                    .unlisted_signers
+                    .verify(&doc, sender, my_vid, verifier)
+                    .await
+                {
+                    Ok(principal) => Ok(principal),
+                    Err(Err(e)) => Err(e),
+                    Err(Ok(reason)) => {
+                        did_hosting_common::server::trust_tasks::size::settle_large_document_charge(
+                            &state.large_document_budget,
+                            large_doc_charge.as_ref(),
+                            None,
+                        );
+                        warn!(sender, %type_uri, "trust task deferred: unlisted signer over its verification bounds");
+                        return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
+                            doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
+                        ))));
+                    }
+                },
             },
         };
         // Settle any large-document charge against this verification's own
@@ -1654,9 +1689,17 @@ async fn route_trust_task_doc(
     // document id. A captured document re-submitted inside the freshness window
     // — on any transport, in any framing — is refused as an id conflict.
     // At its bounds the cache refuses (retryable) rather than forgetting.
+    // A signer the ACL does not list is recorded in a cache of its own, so
+    // such records can never fill the shared one every operational request
+    // depends on.
+    let replay_cache = if listed_signer {
+        &*state.replay_cache
+    } else {
+        &state.unlisted_signers.replay
+    };
     if signed
         && rule.uses_shared_replay_cache()
-        && let Err(e) = state.replay_cache.check(&principal, &doc.id, doc.issued_at)
+        && let Err(e) = replay_cache.check(&principal, &doc.id, doc.issued_at)
     {
         warn!(did = %principal, doc_id = %doc.id, %type_uri, ?e, "trust task refused: replay cache");
         let reason = e.reject_reason();
@@ -1758,7 +1801,7 @@ async fn route_trust_task_doc(
         && !wrote
         && matches!(&reply, Ok(r) if r.is_unavailable())
     {
-        state.replay_cache.release(signer, id, *issued_at);
+        replay_cache.release(signer, id, *issued_at);
     }
     reply
 }
@@ -1951,6 +1994,7 @@ mod tests {
             stats_ks: stats_ks.clone(),
             timeseries_ks: store.keyspace(KS_TIMESERIES).expect("timeseries ks"),
             signing_key_bytes: None,
+            unlisted_signers: Default::default(),
             replay_cache: Arc::new(crate::replay::ReplayCache::new()),
             path_locks: crate::path_locks::PathLocks::new(),
             acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),

@@ -292,8 +292,19 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
   an issuer-absent path; the passkey session delegate is per-request, HTTPS-only
   (`with_session_delegate`).
 - **A proof failing against a cached DID document is re-resolved once**
-  (rate-limited per DID) before refusal, so a rotation doesn't strand a peer;
-  the cache TTL is `DID_CACHE_TTL_SECS`.
+  (rate-limited per DID identity, bounded map) before refusal, so a rotation
+  doesn't strand a peer; the cache TTL is `DID_CACHE_TTL_SECS`. A DID that
+  could not be resolved at all is not re-resolved (it is reported retryable).
+- **Signers outside the ACL never touch the shared replay cache.** On the
+  rules without an ACL pre-filter (`Optional`, `SessionKey`, a `did:webs`
+  self-registration), a signer the ACL does not list is recorded in
+  `crate::unlisted_signers`' own, smaller replay cache, and (unless it is a
+  self-registration, verified against its own key event log) its proof is
+  verified there: key-free checks first, then — only for a DID that needs a
+  network resolution — a bounded number of resolution slots, a shared rate
+  and a timeout, with no forced re-resolution. Keys like `did:key` cost
+  nothing to mint; never let such a signer's records or resolutions reach
+  what ACL members depend on.
 - **Edges verify what they serve.** A synced webvh log must pass the chain
   check and strictly extend the held log and the per-DID high-water mark
   (`control_register::verify_history`); a deactivated DID takes no further
