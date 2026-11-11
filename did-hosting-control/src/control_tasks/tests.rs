@@ -1197,18 +1197,34 @@ async fn agent_name_list_answers_the_registry_parked_names_included() {
 async fn agent_name_check_reports_free_reserved_and_taken() {
     let (state, _dir) = state().await;
     let owner = member(&state, 32, Role::Owner).await;
+    // A name is held by a live slot whose record lists it.
+    let mut holder = seed_did(&state, "did:example:holder", "alpha-beta").await;
+    holder.agent_names.push(AgentNameEntry {
+        name: "taken".into(),
+        enabled: true,
+        created_at: 1,
+    });
     state
         .dids_ks
-        .insert_raw(
-            did_hosting_common::did_ops::agent_name_key("example.com", "taken"),
-            b"alpha-beta".to_vec(),
-        )
+        .insert(did_key("alpha-beta"), &holder)
         .await
         .unwrap();
+    for (name, holder) in [("taken", "alpha-beta"), ("leftover", "gone-slot")] {
+        state
+            .dids_ks
+            .insert_raw(
+                did_hosting_common::did_ops::agent_name_key("example.com", name),
+                holder.as_bytes().to_vec(),
+            )
+            .await
+            .unwrap();
+    }
     for (name, available, reserved) in [
         ("alice", true, false),
         ("admin", false, true),
         ("taken", false, false),
+        // An index entry left by a slot that no longer exists holds nothing.
+        ("leftover", true, false),
     ] {
         let reply = call(
             &state,

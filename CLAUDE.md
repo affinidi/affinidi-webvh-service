@@ -144,11 +144,14 @@ reconciled registry — not the edge — is the truth.
 **Reconciling is not trusting.** Deriving the registry from `alsoKnownAs` says
 what a document *claims*, never that the claim is allowed. So both reconcile
 sites apply the same preconditions the explicit `set` verb does — reserved names
-refused, a name held by another DID refused, all under `path_locks.guard` — and
-the invariant to preserve when touching any of this is:
+refused, a name held by another DID refused, all under `path_locks.guard` for
+the DID *and* a per-name lock (`did_ops::lock_agent_names`; the DID's lock
+first, then the names in sorted order) — and the invariant to preserve when
+touching any of this is:
 
 > **A name only ever changes owner through an explicit `remove` by its current
-> holder.**
+> holder** (or the deletion of the DID that holds it, which releases its names
+> in the same write).
 
 Layer-1 verification cannot enforce that for you, and it is worth understanding
 why: after a hijack the new holder's document genuinely claims the name and the
