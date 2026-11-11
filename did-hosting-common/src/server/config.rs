@@ -1254,7 +1254,7 @@ pub struct HostingConfig {
 
 /// One hosting domain's opt-in to `did:webs` self-registration
 /// ([`HostingConfig::webs_self_register`]).
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WebsSelfRegistration {
     /// The hosting domain, as it is configured in the domain registry
@@ -1266,6 +1266,34 @@ pub struct WebsSelfRegistration {
     /// domain, the bare `{AID}` included.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path_prefixes: Vec<String>,
+    /// The most identifiers that may hold a self-registered slot on this
+    /// domain at once (default [`DEFAULT_WEBS_SELF_REGISTER_MAX`]). Opting a
+    /// domain in opens it to anyone with a key event log, and each AID is
+    /// free to mint, so the rate limits bound how fast slots can be taken
+    /// and this bounds how many. Counted from the owner entries
+    /// self-registration grants; an administrator who deletes one frees its
+    /// place. Per-process like the rate limits: replicas behind one store
+    /// can overshoot it by at most one each.
+    #[serde(default = "default_webs_self_register_max")]
+    pub max_registrations: u32,
+}
+
+/// The default [`WebsSelfRegistration::max_registrations`]: enough for a
+/// deployment's own nodes, not a public registry.
+pub const DEFAULT_WEBS_SELF_REGISTER_MAX: u32 = 100;
+
+fn default_webs_self_register_max() -> u32 {
+    DEFAULT_WEBS_SELF_REGISTER_MAX
+}
+
+impl Default for WebsSelfRegistration {
+    fn default() -> Self {
+        Self {
+            domain: String::new(),
+            path_prefixes: Vec::new(),
+            max_registrations: DEFAULT_WEBS_SELF_REGISTER_MAX,
+        }
+    }
 }
 
 impl WebsSelfRegistration {
@@ -1921,6 +1949,12 @@ mod tests {
         assert!(!scoped.admits_path("nodesx/EAID"));
         assert!(!scoped.admits_path("nodes/"));
         assert!(!scoped.admits_path("x/EAID"));
+        // Capped by default, and the cap is the operator's to set.
+        assert_eq!(any.max_registrations, DEFAULT_WEBS_SELF_REGISTER_MAX);
+        let hosting: HostingConfig =
+            toml::from_str("[[webs_self_register]]\ndomain = \"a\"\nmax_registrations = 3")
+                .unwrap();
+        assert_eq!(hosting.webs_self_register[0].max_registrations, 3);
 
         // An unknown member is refused, not ignored.
         assert!(

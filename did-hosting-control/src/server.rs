@@ -159,6 +159,10 @@ pub struct AppState {
     /// [`crate::rate_limit::webs_self_register_limiter`].
     pub webs_self_register_limiter:
         Arc<did_hosting_common::server::rate_limit::KeyedRateLimiter<String>>,
+    /// The bucket every `did:webs` self-registration shares, whatever its
+    /// source. See [`crate::rate_limit::webs_self_register_global_limiter`].
+    pub webs_self_register_global_limiter:
+        Arc<did_hosting_common::server::rate_limit::KeyedRateLimiter<String>>,
     /// Per-address budget for large documents (over the framework's default
     /// 64 KiB) a claimed — not yet verified — known issuer is granted a
     /// raised size limit for. See
@@ -208,6 +212,8 @@ impl AppState {
         self.ip_rate_limiter.spawn_gc(shutdown.clone());
         self.redeem_rate_limiter.spawn_gc(shutdown.clone());
         self.webs_self_register_limiter.spawn_gc(shutdown.clone());
+        self.webs_self_register_global_limiter
+            .spawn_gc(shutdown.clone());
         self.large_document_budget.spawn_gc(shutdown);
         self.oob.spawn_rate_limit_gc(shutdown);
     }
@@ -428,6 +434,9 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         ip_rate_limiter: Arc::new(crate::rate_limit::challenge_limiter()),
         redeem_rate_limiter: Arc::new(crate::rate_limit::redeem_limiter()),
         webs_self_register_limiter: Arc::new(crate::rate_limit::webs_self_register_limiter()),
+        webs_self_register_global_limiter: Arc::new(
+            crate::rate_limit::webs_self_register_global_limiter(),
+        ),
         large_document_budget: Arc::new(
             did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
         ),

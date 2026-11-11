@@ -34,8 +34,11 @@
 //! 3. the `issuer` is exactly the identifier the slot builds
 //!    ([`Webs::slot_did`]) — the same function the write path builds it with;
 //! 4. a per-source rate limit
-//!    ([`crate::rate_limit::webs_self_register_limiter`]), before the work a
-//!    stranger can otherwise ask for;
+//!    ([`crate::rate_limit::webs_self_register_limiter`]) and one shared by
+//!    every source ([`crate::rate_limit::webs_self_register_global_limiter`]),
+//!    before the work a stranger can otherwise ask for. A source on TSP or
+//!    DIDComm is its sender, and a sender can be a fresh `did:key` each time,
+//!    so only the shared bucket bounds the whole;
 //! 5. the submitted `keri.cesr` verifies in full — the same
 //!    [`Webs::verified_document`] the write path and every resolver use —
 //!    and establishes that identifier's AID;
@@ -51,7 +54,9 @@
 //!
 //! What passes is a [`SelfCertifiedWebs`], constructible only by
 //! [`Candidate::verify`]. The register row then runs as that identifier, an
-//! `Owner` with no ACL entry: `register_did_atomic` verifies the log again,
+//! `Owner` with no ACL entry, one self-registration on the domain at a time
+//! ([`SelfCertifiedWebs::reserve`]): it refuses a domain already holding its
+//! `max_registrations`, then `register_did_atomic` verifies the log again,
 //! refuses a slot owned by anyone else, and commits. Only after the commit does
 //! the row give the identifier an ACL entry ([`SelfCertifiedWebs::
 //! grant_owner_entry`]), so that its later publications — key rotations — take
@@ -86,6 +91,10 @@ pub(crate) const SELF_REGISTER_TYPE_URI: &str = register::v0_1::Payload::TYPE_UR
 /// login, is what authenticated it.
 const AMR: &str = "keri";
 
+/// The label of the owner entry a self-registration grants, by which
+/// [`SelfCertifiedWebs::reserve`] counts a domain's self-registered slots.
+pub(crate) const SELF_REGISTERED_LABEL: &str = "self-registered did:webs";
+
 /// A `did:webs` outside the ACL that proved control of itself: its
 /// `did/register/0.1` verified against the key state its own submitted key
 /// event log establishes. Built only by [`Candidate::verify`].
@@ -96,6 +105,11 @@ pub(crate) struct SelfCertifiedWebs {
     /// `register_did_atomic`, so both build the same identifier.
     domain: String,
     path: String,
+    /// What the transport vouched for (`ip:…` or `vid:…`), for the audit
+    /// record.
+    source: String,
+    /// The domain's `max_registrations`.
+    max_registrations: u32,
 }
 
 impl SelfCertifiedWebs {
@@ -138,6 +152,54 @@ impl SelfCertifiedWebs {
         Ok(())
     }
 
+    /// Hold this domain's self-registration lock for the rest of the row, and
+    /// refuse when the domain already holds its `max_registrations`
+    /// self-registered identifiers. Held across the count, the commit and the
+    /// grant, so concurrent self-registrations on one domain cannot each see
+    /// room for one more (per process: see `max_registrations`).
+    pub(crate) async fn reserve(
+        &self,
+        state: &AppState,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, AppError> {
+        use did_hosting_common::server::acl::list_acl_entries;
+        use did_hosting_common::server::domain::normalize_domain_name;
+
+        let canonical = normalize_domain_name(&self.domain).unwrap_or_else(|_| self.domain.clone());
+        let guard = state
+            .acl_locks
+            .guard(&format!("webs-self-register:{canonical}"))
+            .await;
+        let held = list_acl_entries(&state.acl_ks)
+            .await?
+            .into_iter()
+            .filter(|e| e.label.as_deref() == Some(SELF_REGISTERED_LABEL) && e.did != self.did)
+            .filter(|e| match &e.domains {
+                DomainScope::Allowed { domains } => domains
+                    .iter()
+                    .any(|d| normalize_domain_name(d).ok().as_deref() == Some(canonical.as_str())),
+                _ => false,
+            })
+            .count();
+        if held >= self.max_registrations as usize {
+            tracing::warn!(
+                target: "audit",
+                event = "did.webs.self_register_refused",
+                did = %self.did,
+                domain = %self.domain,
+                source = %self.source,
+                held,
+                max = self.max_registrations,
+                "did:webs self-registration refused: the domain holds its maximum"
+            );
+            return Err(AppError::QuotaExceeded(format!(
+                "domain `{}` already holds its {} self-registered did:webs identifiers \
+                 (`max_registrations`); an administrator registers this one, or raises the limit",
+                self.domain, self.max_registrations
+            )));
+        }
+        Ok(guard)
+    }
+
     /// Give the newly registered identifier an `Owner` ACL entry, scoped to
     /// its domain and to the one slot it holds (`max_did_count = 1`), so that
     /// its later publications take the ordinary owner path. Left alone when
@@ -168,7 +230,7 @@ impl SelfCertifiedWebs {
                 &AclEntry {
                     did: self.did.clone(),
                     role: Role::Owner,
-                    label: Some("self-registered did:webs".into()),
+                    label: Some(SELF_REGISTERED_LABEL.into()),
                     created_at: did_hosting_common::server::auth::session::now_epoch(),
                     max_total_size: None,
                     max_did_count: Some(1),
@@ -188,6 +250,7 @@ impl SelfCertifiedWebs {
             did = %self.did,
             path = %record.mnemonic,
             domain = %record.domain,
+            source = %self.source,
             version = record.version_count,
             acl_granted = granted,
             "did:webs registered itself, authenticated by its own key event log"
@@ -204,6 +267,8 @@ pub(crate) struct Candidate {
     did: String,
     domain: String,
     path: String,
+    source: String,
+    max_registrations: u32,
     document: affinidi_did_common::Document,
 }
 
@@ -252,6 +317,8 @@ impl Candidate {
             did: self.did,
             domain: self.domain,
             path: self.path,
+            source: self.source,
+            max_registrations: self.max_registrations,
         })
     }
 }
@@ -384,15 +451,26 @@ pub(crate) async fn admit(
             .map_or_else(|| "ip:unknown".to_string(), |ip| format!("ip:{ip}")),
         None => format!("vid:{sender}"),
     };
-    if let Err(AppError::RateLimited {
-        retry_after_secs, ..
-    }) = state.webs_self_register_limiter.try_consume(source)
-    {
-        return Err(RejectReason::Unavailable {
-            retry_after: Some(
-                chrono::Utc::now() + chrono::Duration::seconds(retry_after_secs as i64),
-            ),
-        });
+    // Per source, then all sources together: a sender on TSP or DIDComm can
+    // be a new `did:key` every time, so only the shared bucket bounds what
+    // strangers together can make this verify.
+    for limited in [
+        state.webs_self_register_limiter.try_consume(source.clone()),
+        state
+            .webs_self_register_global_limiter
+            .try_consume(crate::rate_limit::WEBS_SELF_REGISTER_GLOBAL_KEY.to_string()),
+    ] {
+        if let Err(AppError::RateLimited {
+            retry_after_secs, ..
+        }) = limited
+        {
+            warn!(%issuer, %source, "did:webs self-registration refused: rate limited");
+            return Err(RejectReason::Unavailable {
+                retry_after: Some(
+                    chrono::Utc::now() + chrono::Duration::seconds(retry_after_secs as i64),
+                ),
+            });
+        }
     }
 
     let document = Webs::verified_document(&slot_did, &did_data).map_err(|e| {
@@ -408,6 +486,8 @@ pub(crate) async fn admit(
         did: slot_did,
         domain,
         path,
+        source,
+        max_registrations: policy.max_registrations,
         document,
     }))
 }
@@ -517,6 +597,7 @@ mod tests {
         config.hosting.webs_self_register = vec![WebsSelfRegistration {
             domain: DOMAIN.into(),
             path_prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
         }];
         state.config = Arc::new(config);
         (state, dir)
@@ -623,6 +704,51 @@ mod tests {
         );
     }
 
+    /// A domain holds at most its `max_registrations` self-registered
+    /// identifiers: AIDs are free to mint, so the rate limits alone would let
+    /// strangers fill it slowly.
+    #[cfg(feature = "method-webs")]
+    #[tokio::test]
+    async fn a_domain_at_its_maximum_refuses_another_self_registration() {
+        let (mut state, _dir) = enabled(&[]).await;
+        let mut config = (*state.config).clone();
+        config.hosting.webs_self_register[0].max_registrations = 1;
+        state.config = Arc::new(config);
+
+        let first = Webs::incept(20);
+        ok(
+            &register_as(&state, Via::Https, &first.caller(""), first.payload("")).await,
+            REGISTER,
+        );
+
+        let second = Webs::incept(21);
+        let caller = second.caller("");
+        let reply = register_as(&state, Via::Https, &caller, second.payload("")).await;
+        assert!(
+            !reply["type"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("#response"),
+            "{reply}"
+        );
+        assert!(stored(&state, &second.aid).await.is_none());
+        assert!(
+            get_acl_entry(&state.acl_ks, &caller.did)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // An administrator freeing the first's place makes room again.
+        did_hosting_common::server::acl::delete_acl_entry(&state.acl_ks, &first.did_at(""))
+            .await
+            .unwrap();
+        ok(
+            &register_as(&state, Via::Https, &caller, second.payload("")).await,
+            REGISTER,
+        );
+    }
+
     /// Without an operator's opt-in, a `did:webs` outside the ACL is refused
     /// exactly as any other caller outside it — on a build with or without
     /// `method-webs`.
@@ -644,7 +770,7 @@ mod tests {
         let mut config = (*state.config).clone();
         config.hosting.webs_self_register = vec![WebsSelfRegistration {
             domain: "elsewhere.test".into(),
-            path_prefixes: Vec::new(),
+            ..Default::default()
         }];
         state.config = Arc::new(config);
         let reply = register_as(&state, Via::Https, &caller, webs.payload("")).await;

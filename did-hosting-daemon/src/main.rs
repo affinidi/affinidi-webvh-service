@@ -1758,6 +1758,9 @@ async fn build_control(
         webs_self_register_limiter: Arc::new(
             did_hosting_control::rate_limit::webs_self_register_limiter(),
         ),
+        webs_self_register_global_limiter: Arc::new(
+            did_hosting_control::rate_limit::webs_self_register_global_limiter(),
+        ),
         cache_invalidate,
         // Wallet sign-in locations from the local GeoIP database, if any
         // (mirrors `did_hosting_control::server`).

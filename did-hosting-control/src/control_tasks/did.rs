@@ -131,11 +131,17 @@ pub(crate) async fn register(
         AppError::Validation(format!("[log] {method} didData is not valid UTF-8: {e}"))
     })?;
 
-    if let Some(webs) = cx.self_certified {
-        // The gate read this same document; a disagreement here would be a
-        // routing bug, and is refused before anything is written.
-        webs.matches(p.path.as_str(), p.domain.as_deref(), &method, p.force)?;
-    }
+    // One self-registration per domain at a time, from the count to the
+    // grant, so the domain's `max_registrations` holds under concurrency.
+    let _reserved = match cx.self_certified {
+        Some(webs) => {
+            // The gate read this same document; a disagreement here would be
+            // a routing bug, and is refused before anything is written.
+            webs.matches(p.path.as_str(), p.domain.as_deref(), &method, p.force)?;
+            Some(webs.reserve(state).await?)
+        }
+        None => None,
+    };
 
     let record = did_ops::register_did_atomic(
         &auth,

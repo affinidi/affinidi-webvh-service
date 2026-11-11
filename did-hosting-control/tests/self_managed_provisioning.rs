@@ -107,6 +107,9 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         webs_self_register_limiter: Arc::new(
             did_hosting_control::rate_limit::webs_self_register_limiter(),
         ),
+        webs_self_register_global_limiter: Arc::new(
+            did_hosting_control::rate_limit::webs_self_register_global_limiter(),
+        ),
         large_document_budget: Arc::new(
             did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
         ),
