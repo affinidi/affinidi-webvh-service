@@ -711,6 +711,112 @@ async fn register_hosts_a_did_webs_key_event_log() {
     );
 }
 
+/// A did:webs slot is managed through the same tasks as any other: read,
+/// its history, suspend, change owner, delete. Its path ends in a mixed-case AID.
+#[cfg(feature = "method-webs")]
+#[tokio::test]
+async fn a_did_webs_slot_is_read_suspended_transferred_and_deleted() {
+    let (state, _dir) = state().await;
+    let owner = member(&state, 23, Role::Owner).await;
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        REGISTER,
+        webs_register("control.test"),
+    )
+    .await;
+    ok(&reply, REGISTER);
+    let did = format!("did:webs:control.test:{WEBS_AID}");
+
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        INFO,
+        json!({ "mnemonic": WEBS_AID }),
+    )
+    .await;
+    conforms(&reply);
+    assert_eq!(ok(&reply, INFO)["record"]["mnemonic"], WEBS_AID, "{reply}");
+
+    let log = t("did-management/did/log/0.1");
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        &log,
+        json!({ "mnemonic": WEBS_AID, "raw": true }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &log);
+    assert_eq!(body["method"], "webs");
+    let entries = body["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{reply}");
+    assert_eq!(entries[0]["state"]["id"], did.as_str(), "{reply}");
+    assert_eq!(
+        body["logContent"].as_str().unwrap().as_bytes(),
+        WEBS_KERI,
+        "raw returns the stored stream verbatim"
+    );
+
+    let set_state = t("did-management/did/set-state/0.1");
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        &set_state,
+        json!({ "mnemonic": WEBS_AID, "state": "suspended" }),
+    )
+    .await;
+    conforms(&reply);
+    ok(&reply, &set_state);
+    let stored: DidRecord = state
+        .dids_ks
+        .get(did_key(WEBS_AID))
+        .await
+        .unwrap()
+        .expect("record");
+    assert!(stored.disabled);
+
+    let admin = member(&state, 24, Role::Admin).await;
+    let heir = member(&state, 25, Role::Owner).await;
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        CHANGE_OWNER,
+        json!({ "mnemonic": WEBS_AID, "newOwner": heir.did }),
+    )
+    .await;
+    conforms(&reply);
+    assert_eq!(
+        ok(&reply, CHANGE_OWNER)["record"]["owner"],
+        heir.did.as_str(),
+        "{reply}"
+    );
+
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &heir,
+        DELETE,
+        json!({ "mnemonic": WEBS_AID }),
+    )
+    .await;
+    conforms(&reply);
+    ok(&reply, DELETE);
+    assert!(
+        state
+            .dids_ks
+            .get::<DidRecord>(did_key(WEBS_AID))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 #[cfg(not(feature = "method-webs"))]
 #[tokio::test]
 async fn register_refuses_did_webs_on_a_host_built_without_it() {

@@ -715,28 +715,11 @@ pub(crate) async fn log(
         Err(AppError::NotFound(_)) => return Err(not_found()),
         Err(e) => return Err(e.into()),
     };
-    let entries: Vec<serde_json::Value> = did_hosting_common::did_ops::parse_log_entries(&content)
-        .into_iter()
-        .map(|e| {
-            let mut entry = serde_json::Map::new();
-            if let Some(id) = e.version_id {
-                entry.insert("versionId".into(), json!(id));
-            }
-            if let Some(time) = e.version_time {
-                entry.insert("versionTime".into(), json!(time));
-            }
-            entry.insert(
-                "state".into(),
-                e.state
-                    .filter(|s| s.is_object())
-                    .unwrap_or_else(|| json!({})),
-            );
-            if let Some(parameters) = e.parameters.filter(|p| p.is_object()) {
-                entry.insert("parameters".into(), parameters);
-            }
-            serde_json::Value::Object(entry)
-        })
-        .collect();
+    let entries: Vec<serde_json::Value> = if record.method == "webs" {
+        webs_log_entries(&record, &content)
+    } else {
+        log_entries(&content)
+    };
     let method = if record.method.is_empty() {
         "webvh".to_string()
     } else {
@@ -761,4 +744,61 @@ pub(crate) async fn log(
         }
     }
     typed(serde_json::Value::Object(body), "log response")
+}
+
+/// A did:webvh log's entries, one per line.
+fn log_entries(content: &str) -> Vec<serde_json::Value> {
+    did_hosting_common::did_ops::parse_log_entries(content)
+        .into_iter()
+        .map(|e| {
+            let mut entry = serde_json::Map::new();
+            if let Some(id) = e.version_id {
+                entry.insert("versionId".into(), json!(id));
+            }
+            if let Some(time) = e.version_time {
+                entry.insert("versionTime".into(), json!(time));
+            }
+            entry.insert(
+                "state".into(),
+                e.state
+                    .filter(|s| s.is_object())
+                    .unwrap_or_else(|| json!({})),
+            );
+            if let Some(parameters) = e.parameters.filter(|p| p.is_object()) {
+                entry.insert("parameters".into(), parameters);
+            }
+            serde_json::Value::Object(entry)
+        })
+        .collect()
+}
+
+/// A did:webs slot's entries: the document its key event log implies now.
+/// The stream is re-verified, as on every resolution; a stream that does not
+/// verify (a corrupt store) yields no entries rather than an unverified
+/// document. Earlier establishment events are not listed.
+#[cfg(feature = "method-webs")]
+fn webs_log_entries(
+    record: &did_hosting_common::did_ops::DidRecord,
+    content: &str,
+) -> Vec<serde_json::Value> {
+    use did_hosting_common::method::webs::Webs;
+
+    record
+        .did_id
+        .as_deref()
+        .and_then(|did| Webs::derive_document(did, content.as_bytes()).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter(serde_json::Value::is_object)
+        .map(|document| vec![json!({ "state": document })])
+        .unwrap_or_default()
+}
+
+/// Without `method-webs` the stream cannot be verified, so nothing is derived
+/// from it; `raw` still returns it verbatim.
+#[cfg(not(feature = "method-webs"))]
+fn webs_log_entries(
+    _record: &did_hosting_common::did_ops::DidRecord,
+    _content: &str,
+) -> Vec<serde_json::Value> {
+    Vec::new()
 }
