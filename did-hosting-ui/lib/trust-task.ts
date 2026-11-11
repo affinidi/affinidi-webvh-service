@@ -403,6 +403,9 @@ export interface TrustTaskOptions {
   /** Send no bearer token. A document signed by a key the session does not
    *  have yet (`fresh-session-key`) must not carry the old session's. */
   anonymous?: boolean;
+  /** Sent by a timer rather than by the operator, so it must not count as
+   *  session activity (see `BACKGROUND_REQUEST_HEADER` in `http.ts`). */
+  background?: boolean;
 }
 
 /** Attach the proof `signer` calls for, setting `issuer` to match. */
@@ -471,7 +474,7 @@ async function sign(
  */
 async function post<Resp>(
   doc: TrustTaskDocument<unknown>,
-  opts: { anonymous?: boolean } = {},
+  opts: { anonymous?: boolean; background?: boolean } = {},
 ): Promise<TrustTaskDocument<Resp>> {
   let reply: TrustTaskDocument<Resp | TrustTaskErrorPayload>;
   try {
@@ -482,6 +485,7 @@ async function post<Resp>(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(doc),
         anonymous: opts.anonymous,
+        background: opts.background,
       },
     );
   } catch (e) {
@@ -523,7 +527,10 @@ async function sendOnce<Req, Resp>(
     payload,
   };
   const doc = await sign(unsigned, opts.signer ?? "session");
-  const reply = await post<Resp>(doc, { anonymous: opts.anonymous });
+  const reply = await post<Resp>(doc, {
+    anonymous: opts.anonymous,
+    background: opts.background,
+  });
   checkReply(doc, reply, serviceDid);
   return reply.payload;
 }

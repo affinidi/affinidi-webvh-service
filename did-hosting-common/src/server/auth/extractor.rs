@@ -13,6 +13,16 @@ use crate::server::auth::session::{SessionState, get_session, now_epoch, touch_l
 use crate::server::error::AppError;
 use crate::server::store::KeyspaceHandle;
 
+/// Request header a client sets on a request it sends on its own schedule (a
+/// dashboard refresh, a status poll) rather than because someone acted.
+///
+/// Such a request is authenticated and served as usual, but it does not count
+/// as activity: [`AuthClaims`] skips [`touch_last_seen`] for it, so a console
+/// left open on a polling page still reaches `auth.admin_idle_timeout`. Any
+/// value counts; only the header's presence is read. A client that omits it is
+/// treated as active, as before.
+pub const BACKGROUND_REQUEST_HEADER: &str = "x-background-request";
+
 /// Trait that application states must implement to support auth extractors.
 ///
 /// Both did-hosting-server and webvh-witness implement this for their respective
@@ -176,9 +186,16 @@ impl<S: AuthState> FromRequestParts<S> for AuthClaims {
         // extractor, so a client's refresh timer cannot keep its own session
         // alive: only requests that do actual work count as activity.
         //
+        // A request the client marks as background (see
+        // `BACKGROUND_REQUEST_HEADER`) is not activity: a page that refreshes
+        // itself on a timer would otherwise hold an unattended session open.
+        //
         // Best-effort. A failed touch must not fail an otherwise valid
         // request — it costs an early sign-out, never access.
-        if let Err(e) = touch_last_seen(state.sessions_ks(), &session, now).await {
+        let background = parts.headers.contains_key(BACKGROUND_REQUEST_HEADER);
+        if background {
+            debug!(session_id = %claims.session_id, "background request; activity not recorded");
+        } else if let Err(e) = touch_last_seen(state.sessions_ks(), &session, now).await {
             warn!(
                 session_id = %claims.session_id,
                 error = %e,
@@ -455,6 +472,48 @@ mod tests {
             .unwrap();
         assert_eq!(auth.did, "did:example:caller");
         assert_eq!(auth.role, Role::Owner);
+    }
+
+    async fn last_seen_of(state: &TestState, session_id: &str) -> u64 {
+        crate::server::auth::session::get_session(&state.ks, session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_seen
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_request_records_activity() {
+        let (state, _dir) = make_state().await;
+        let session_id = seed_session(&state, Role::Admin, "tok-1").await;
+        let token = issue(&state, &session_id, "admin", "tok-1");
+        let mut parts = parts_with_bearer(&token);
+        AuthClaims::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap();
+        assert!(last_seen_of(&state, &session_id).await > 0);
+    }
+
+    #[tokio::test]
+    async fn a_background_request_is_served_but_records_no_activity() {
+        let (state, _dir) = make_state().await;
+        let session_id = seed_session(&state, Role::Admin, "tok-1").await;
+        let token = issue(&state, &session_id, "admin", "tok-1");
+        let req = Request::builder()
+            .header("authorization", format!("Bearer {token}"))
+            .header(BACKGROUND_REQUEST_HEADER, "1")
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let auth = AuthClaims::from_request_parts(&mut parts, &state)
+            .await
+            .expect("a background request still authenticates");
+        assert_eq!(auth.role, Role::Admin);
+        assert_eq!(
+            last_seen_of(&state, &session_id).await,
+            0,
+            "a background request must not move the idle clock"
+        );
     }
 
     #[tokio::test]

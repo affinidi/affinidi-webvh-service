@@ -4,7 +4,7 @@ pub mod jwt;
 pub mod session;
 
 pub use backend::DidHostingSessionStore;
-pub use extractor::{AdminAuth, AuthClaims, ServiceAuth};
+pub use extractor::{AdminAuth, AuthClaims, BACKGROUND_REQUEST_HEADER, ServiceAuth};
 
 /// Constant-time byte comparison to prevent timing side-channel attacks.
 ///
