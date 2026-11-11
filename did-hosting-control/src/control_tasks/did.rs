@@ -11,6 +11,7 @@ use serde_json::json;
 use tracing::info;
 use trust_tasks_rs::StandardCode;
 
+use did_hosting_common::server::error::ValidationKind;
 use did_hosting_common::server::trust_tasks::ext::WEBVH_EXT_KEY;
 
 use super::{Cx, TaskError, at, spec_record, typed};
@@ -703,10 +704,15 @@ pub(crate) async fn log(
             "no such slot with published content".into(),
         )
     };
+    // A path no slot can have is answered as a missing slot too. Whether an
+    // AID-shaped path is valid depends on whether a did:webs slot is
+    // recorded there, so answering it differently would tell a caller that
+    // may not read the slot that one exists.
     let (record, _) = did_ops::get_did_info(&auth, state, &p.mnemonic)
         .await
         .map_err(|e| match e {
             AppError::NotFound(_) | AppError::Forbidden(_) => not_found(),
+            e if e.validation_kind() == ValidationKind::InvalidPath => not_found(),
             other => other.into(),
         })?;
     did_ops::ensure_slot_domain_matches(&record, p.domain.as_deref().map(|d| d.as_str()))?;

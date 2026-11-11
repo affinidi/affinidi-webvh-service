@@ -712,7 +712,7 @@ async fn register_hosts_a_did_webs_key_event_log() {
 }
 
 /// A did:webs slot is managed through the same tasks as any other: read,
-/// its history, suspend, change owner, delete. Its path ends in a mixed-case AID.
+/// its agent names and history, suspend, change owner, delete. Its path ends in a mixed-case AID.
 #[cfg(feature = "method-webs")]
 #[tokio::test]
 async fn a_did_webs_slot_is_read_suspended_transferred_and_deleted() {
@@ -740,7 +740,35 @@ async fn a_did_webs_slot_is_read_suspended_transferred_and_deleted() {
     conforms(&reply);
     assert_eq!(ok(&reply, INFO)["record"]["mnemonic"], WEBS_AID, "{reply}");
 
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        NAME_LIST,
+        json!({ "mnemonic": WEBS_AID }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, NAME_LIST);
+    assert_eq!(body["domain"], "control.test", "{reply}");
+    assert_eq!(body["agentNames"], json!([]), "{reply}");
+
     let log = t("did-management/did/log/0.1");
+
+    // A caller that may not read the slot gets the same answer whether or not
+    // a did:webs slot is recorded at an AID-shaped path.
+    let stranger = member(&state, 26, Role::Owner).await;
+    for path in [WEBS_AID, "EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"] {
+        let reply = call(
+            &state,
+            Via::Tsp,
+            &stranger,
+            &log,
+            json!({ "mnemonic": path }),
+        )
+        .await;
+        assert_eq!(code(&reply), "did-management/did/log:notFound", "{reply}");
+    }
     let reply = call(
         &state,
         Via::Tsp,

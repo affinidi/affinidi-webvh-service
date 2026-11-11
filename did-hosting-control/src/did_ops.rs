@@ -2461,16 +2461,19 @@ pub async fn rollback_did_to(
     let _path_guard = state.path_locks.guard(mnemonic).await;
     let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
-    // Rollback truncates a did:webvh log by line. A did:webs key event
-    // stream is not line-delimited, and its controller moves it on by
-    // publishing a longer one; the host never shortens it (a published
-    // update may not rewind it either, see `Webs::verify_continuation`).
-    if record.method == "webs" {
-        return Err(AppError::Validation(
-            "a did:webs slot cannot be rolled back: its key event log is only ever \
-             extended by its controller"
-                .into(),
-        ));
+    // Rollback truncates a did:webvh log by line, so it applies to did:webvh
+    // alone (an empty method is a slot from before methods were recorded,
+    // which is did:webvh). Any other method's content is not one entry per
+    // line: a did:web did.json may be pretty-printed, and cutting it by line
+    // leaves invalid JSON; a did:webs key event stream is only ever extended
+    // by its controller (a publish may not rewind it either, see
+    // `Webs::verify_continuation`).
+    if !record.method.is_empty() && record.method != "webvh" {
+        return Err(AppError::Validation(format!(
+            "a did:{} slot cannot be rolled back: rollback removes did:webvh log \
+             entries, and this method's content is not a did:webvh log",
+            record.method
+        )));
     }
 
     // Re-check DomainScope at time-of-use (SEC-4045 W7).
@@ -4477,6 +4480,61 @@ mod tests_atomic {
         register_did_atomic(&owner_auth(owner), state, path, &log, false, None)
             .await
             .expect("register");
+    }
+
+    /// Rollback removes did:webvh log entries by line. A did:web slot's
+    /// did.json may be pretty-printed over several lines; cutting it would
+    /// leave invalid JSON, so the slot is refused and left as it was.
+    #[tokio::test]
+    async fn a_did_web_slot_is_not_rolled_back() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:web-owner";
+        let did_json = serde_json::to_string_pretty(&serde_json::json!({
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "id": "did:web:control.test:plain",
+        }))
+        .unwrap();
+        assert!(did_json.lines().count() > 2, "a multi-line document");
+        // Stored as a did:web publication stores it: the document's bytes
+        // unchanged under the slot's content key, and the record tagged
+        // `web`.
+        register_owned(&state, owner, "plain").await;
+        let mut record = get_record(&state, "plain").await;
+        record.method = "web".into();
+        record.did_id = Some("did:web:control.test:plain".into());
+        record.version_count = 1;
+        record.content_size = did_json.len() as u64;
+        state
+            .dids_ks
+            .insert(did_key("plain"), &record)
+            .await
+            .unwrap();
+        state
+            .dids_ks
+            .insert_raw(content_log_key("plain"), did_json.as_bytes().to_vec())
+            .await
+            .unwrap();
+        let before = get_record(&state, "plain").await;
+
+        for target in [None, Some(1)] {
+            let err = rollback_did_to(&owner_auth(owner), &state, "plain", target)
+                .await
+                .expect_err("rollback refused");
+            assert!(
+                matches!(&err, AppError::Validation(m) if m.contains("did:web slot")),
+                "got {err:?}"
+            );
+        }
+        let stored = state
+            .dids_ks
+            .get_raw(content_log_key("plain"))
+            .await
+            .unwrap()
+            .expect("stored document");
+        assert_eq!(stored, did_json.as_bytes(), "the document is unchanged");
+        let after = get_record(&state, "plain").await;
+        assert_eq!(after.did_id, before.did_id);
+        assert_eq!(after.version_count, before.version_count);
     }
 
     /// Test shims over `update_agent_name` keeping the historical verb
