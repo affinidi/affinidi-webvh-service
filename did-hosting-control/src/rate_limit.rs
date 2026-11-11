@@ -69,6 +69,56 @@ pub fn redeem_limiter() -> KeyedRateLimiter<String> {
     KeyedRateLimiter::new(REDEEM_LIMITER_NAME, REDEEM_MAX_PER_WINDOW, WINDOW_SECS)
 }
 
+/// Self-registration attempts one source may make per [`WINDOW_SECS`].
+///
+/// A `did:webs` outside the ACL that registers itself makes the service
+/// verify the key event log it submits — every event's SAID, signature and
+/// pre-rotation commitment — before anything proves who sent it, which is
+/// work a stranger can ask for. A node registers its identifier once, and
+/// again only to retry; this bounds what a single source can make the
+/// service verify.
+pub const WEBS_SELF_REGISTER_MAX_PER_WINDOW: u64 = 10;
+
+/// The `limiter` a refused self-registration names.
+pub const WEBS_SELF_REGISTER_LIMITER_NAME: &str = "webs-self-register-per-source";
+
+/// The per-source limiter for `did:webs` self-registration
+/// (`crate::webs_self_register`). A source is what the transport vouches
+/// for, as for [`redeem_limiter`]: the client IP on HTTPS (`ip:…`), the
+/// authenticated sender on TSP and DIDComm (`vid:…`). Per-process, for the
+/// reason [`redeem_limiter`] gives.
+pub fn webs_self_register_limiter() -> KeyedRateLimiter<String> {
+    KeyedRateLimiter::new(
+        WEBS_SELF_REGISTER_LIMITER_NAME,
+        WEBS_SELF_REGISTER_MAX_PER_WINDOW,
+        WINDOW_SECS,
+    )
+}
+
+/// Self-registration attempts every source together may make per
+/// [`WINDOW_SECS`]. The per-source limit cannot bound the whole on TSP and
+/// DIDComm, where a source is its sender and a sender can mint a new
+/// `did:key` for each attempt; this bucket does, at a rate no deployment's
+/// own first boots come near.
+pub const WEBS_SELF_REGISTER_GLOBAL_MAX_PER_WINDOW: u64 = 30;
+
+/// The `limiter` a self-registration refused by the shared bucket names.
+pub const WEBS_SELF_REGISTER_GLOBAL_LIMITER_NAME: &str = "webs-self-register-global";
+
+/// The one key of [`webs_self_register_global_limiter`].
+pub const WEBS_SELF_REGISTER_GLOBAL_KEY: &str = "all";
+
+/// The limiter every `did:webs` self-registration shares, whatever its
+/// source, keyed on [`WEBS_SELF_REGISTER_GLOBAL_KEY`]. Per-process, for the
+/// reason [`redeem_limiter`] gives.
+pub fn webs_self_register_global_limiter() -> KeyedRateLimiter<String> {
+    KeyedRateLimiter::new(
+        WEBS_SELF_REGISTER_GLOBAL_LIMITER_NAME,
+        WEBS_SELF_REGISTER_GLOBAL_MAX_PER_WINDOW,
+        WINDOW_SECS,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +146,25 @@ mod tests {
             })
         ));
         limiter.try_consume(ip("203.0.113.2")).unwrap();
+    }
+
+    /// Self-registration shares one bucket across every source, so senders
+    /// minted fresh for each attempt are bounded together.
+    #[test]
+    fn self_registration_shares_one_bucket_across_sources() {
+        let limiter = webs_self_register_global_limiter();
+        for _ in 0..WEBS_SELF_REGISTER_GLOBAL_MAX_PER_WINDOW {
+            limiter
+                .try_consume(WEBS_SELF_REGISTER_GLOBAL_KEY.into())
+                .unwrap();
+        }
+        assert!(matches!(
+            limiter.try_consume(WEBS_SELF_REGISTER_GLOBAL_KEY.into()),
+            Err(AppError::RateLimited {
+                limiter: WEBS_SELF_REGISTER_GLOBAL_LIMITER_NAME,
+                ..
+            })
+        ));
     }
 
     /// Redemption is limited per source, whichever transport vouched for it.

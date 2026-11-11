@@ -2555,6 +2555,10 @@ mod tests_atomic {
             client_ips: Default::default(),
             ip_rate_limiter: Arc::new(crate::rate_limit::challenge_limiter()),
             redeem_rate_limiter: Arc::new(crate::rate_limit::redeem_limiter()),
+            webs_self_register_limiter: Arc::new(crate::rate_limit::webs_self_register_limiter()),
+            webs_self_register_global_limiter: Arc::new(
+                crate::rate_limit::webs_self_register_global_limiter(),
+            ),
             large_document_budget: Arc::new(
                 did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
             ),

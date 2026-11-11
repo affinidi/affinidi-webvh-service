@@ -1505,8 +1505,31 @@ async fn route_trust_task_doc(
             return Ok(RoutedReply::Sealed(refused));
         }
     }
+    // ── did:webs self-registration (`crate::webs_self_register`). A
+    //    `did/register/0.1` from a `did:webs` the ACL does not list, on a
+    //    domain whose operator enabled it, is authenticated by the key event
+    //    log it submits instead of by an ACL entry: checked here — before the
+    //    ACL pre-filter it is exempt from, and before any proof work — and its
+    //    proof is then verified against that log's key state below. Anything
+    //    else (`None`) goes through this gate unchanged.
+    #[cfg(feature = "method-webs")]
+    let webs_candidate =
+        match crate::webs_self_register::admit(state, sender, https, &type_uri, &doc).await {
+            Ok(candidate) => candidate,
+            Err(reason) => {
+                return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
+                    doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
+                ))));
+            }
+        };
+    #[cfg(feature = "method-webs")]
+    let self_registering = webs_candidate.is_some();
+    #[cfg(not(feature = "method-webs"))]
+    let self_registering = false;
+
     let signed = rule != ProofRule::Optional || doc.proof.is_some();
-    let needs_acl = matches!(rule, ProofRule::Authentication | ProofRule::AssertionMethod);
+    let needs_acl =
+        matches!(rule, ProofRule::Authentication | ProofRule::AssertionMethod) && !self_registering;
     // A session ceremony is signed by a `did:key` the caller holds: as the
     // issuer itself, or — for a session that already exists — as that
     // session's delegate key.
@@ -1558,6 +1581,26 @@ async fn route_trust_task_doc(
             ))));
         }
     }
+    // A self-registration's proof, verified against the key state its own
+    // key event log establishes (never a resolved document): the identifier
+    // it proves, and the `SelfCertifiedWebs` the register row runs as.
+    #[cfg(feature = "method-webs")]
+    let (self_certified, self_bound) = match webs_candidate {
+        Some(candidate) => match candidate.verify(&doc, sender, my_vid).await {
+            Ok(webs) => {
+                let did = webs.did().to_string();
+                (Some(webs), Some(Ok(did)))
+            }
+            Err(e) => (None, Some(Err(e))),
+        },
+        None => (None, None),
+    };
+    #[cfg(not(feature = "method-webs"))]
+    let (self_certified, self_bound): (
+        Option<crate::webs_self_register::SelfCertifiedWebs>,
+        Option<Result<String, did_hosting_common::server::trust_tasks::BoundError>>,
+    ) = (None, None);
+
     let principal = if signed {
         let bound = match rule {
             ProofRule::AssertionMethod => {
@@ -1579,7 +1622,10 @@ async fn route_trust_task_doc(
                     )));
                 }
             },
-            _ => verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await,
+            _ => match self_bound {
+                Some(bound) => bound,
+                None => verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await,
+            },
         };
         // Settle any large-document charge against this verification's own
         // outcome — before the early return below, so a claimed issuer that
@@ -1673,6 +1719,7 @@ async fn route_trust_task_doc(
         let doc = match crate::control_tasks::route(
             state,
             bearer,
+            self_certified.as_ref(),
             https,
             transport,
             trust_tasks_rs::ProofPolicy::<TransportBoundVerifier>::AcceptUnverified,
@@ -1911,6 +1958,10 @@ mod tests {
             client_ips: Default::default(),
             ip_rate_limiter: Arc::new(crate::rate_limit::challenge_limiter()),
             redeem_rate_limiter: Arc::new(crate::rate_limit::redeem_limiter()),
+            webs_self_register_limiter: Arc::new(crate::rate_limit::webs_self_register_limiter()),
+            webs_self_register_global_limiter: Arc::new(
+                crate::rate_limit::webs_self_register_global_limiter(),
+            ),
             large_document_budget: Arc::new(
                 did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
             ),

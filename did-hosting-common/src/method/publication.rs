@@ -247,8 +247,7 @@ fn verify_webs(
     // domain registry both hold), so encoding here is the conversion
     // from "hosting domain" to "DID label". Idempotent, so a caller
     // that already passed the encoded form is unaffected.
-    let did_domain = domain.replace(':', "%3A");
-    let did_id = format!("did:webs:{did_domain}:{}", mnemonic.replace('/', ":"));
+    let did_id = Webs::slot_did(domain, mnemonic);
 
     // Refuse an update that rewinds or forks the hosted log, before
     // deriving anything from the new one.

@@ -93,18 +93,15 @@ pub(crate) async fn register(
     cx: &Cx<'_>,
     p: register::v0_1::Payload,
 ) -> Result<register::v0_1::Response, TaskError> {
-    let auth = cx.auth().await?;
+    // A `did:webs` outside the ACL that the gate verified against its own
+    // key event log (`crate::webs_self_register`) registers as itself, an
+    // owner with no ACL entry yet; everyone else is authorised on the ACL.
+    let auth = match cx.self_certified {
+        Some(webs) => webs.claims(),
+        None => cx.auth().await?,
+    };
     let state = cx.state;
-    // The typed payload is the schema's; `DidRegisterRequest::resolve` is the
-    // one place the method is derived from and cross-checked against the data.
-    let req: did_hosting_common::DidRegisterRequest = serde_json::from_value(json!({
-        "path": p.path.as_str(),
-        "method": serde_json::to_value(&p.method)?,
-        "didData": serde_json::to_value(&p.did_data)?,
-        "force": p.force,
-    }))
-    .map_err(|e| AppError::Validation(format!("invalid register payload: {e}")))?;
-    let (method, payload) = req.resolve().map_err(AppError::Validation)?;
+    let (method, payload) = register_method_and_data(&p)?;
     // webvh, and did:webs where this host is built to verify it: a `keri.cesr`
     // stream, from which the identifier is built with the slot and domain
     // (`register_did_atomic`). Every other method is refused by name, so a
@@ -134,6 +131,18 @@ pub(crate) async fn register(
         AppError::Validation(format!("[log] {method} didData is not valid UTF-8: {e}"))
     })?;
 
+    // One self-registration per domain at a time, from the count to the
+    // grant, so the domain's `max_registrations` holds under concurrency.
+    let _reserved = match cx.self_certified {
+        Some(webs) => {
+            // The gate read this same document; a disagreement here would be
+            // a routing bug, and is refused before anything is written.
+            webs.matches(p.path.as_str(), p.domain.as_deref(), &method, p.force)?;
+            Some(webs.reserve(state).await?)
+        }
+        None => None,
+    };
+
     let record = did_ops::register_did_atomic(
         &auth,
         state,
@@ -143,12 +152,38 @@ pub(crate) async fn register(
         p.domain.as_deref(),
     )
     .await?;
+    if let Some(webs) = cx.self_certified {
+        // After the slot, never before it: a grant for a registration that
+        // then failed would leave a stranger standing here with no slot to
+        // show for it. A crash between the two leaves an owned slot and no
+        // entry, and a retry (the same DID, the same slot) takes this path
+        // again and grants it then.
+        webs.grant_owner_entry(state, &record).await?;
+    }
     server_push::notify_servers_did(state, record.mnemonic.clone());
 
     typed(
         json!({ "record": spec_record::<register::v0_1::DidRecord>(state, &record)? }),
         "register response",
     )
+}
+
+/// The method a `did/register/0.1` payload declares and the bytes it
+/// publishes. The typed payload is the schema's; `DidRegisterRequest::resolve`
+/// is the one place the method is derived from and cross-checked against the
+/// data — for the row, and for the self-registration gate, which must read the
+/// payload exactly as the row will.
+pub(crate) fn register_method_and_data(
+    p: &register::v0_1::Payload,
+) -> Result<(String, Vec<u8>), AppError> {
+    let req: did_hosting_common::DidRegisterRequest = serde_json::from_value(json!({
+        "path": p.path.as_str(),
+        "method": serde_json::to_value(&p.method)?,
+        "didData": serde_json::to_value(&p.did_data)?,
+        "force": p.force,
+    }))
+    .map_err(|e| AppError::Validation(format!("invalid register payload: {e}")))?;
+    req.resolve().map_err(AppError::Validation)
 }
 
 /// `did/info/0.1`.

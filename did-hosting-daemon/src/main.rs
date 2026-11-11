@@ -1755,6 +1755,12 @@ async fn build_control(
         client_ips: client_ips.clone(),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::challenge_limiter()),
         redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::redeem_limiter()),
+        webs_self_register_limiter: Arc::new(
+            did_hosting_control::rate_limit::webs_self_register_limiter(),
+        ),
+        webs_self_register_global_limiter: Arc::new(
+            did_hosting_control::rate_limit::webs_self_register_global_limiter(),
+        ),
         cache_invalidate,
         // Wallet sign-in locations from the local GeoIP database, if any
         // (mirrors `did_hosting_control::server`).

@@ -409,6 +409,12 @@ Also worth knowing before you go looking for them:
 - **`resolve_webs` must stay ahead of `resolve_web`** in the fallback
   dispatcher; both serve `/did.json`, and only webs can tell whether the
   slot behind it is a webs record.
+- **A `did:webs` outside the ACL may register itself** — only
+  `did/register/0.1`, only on a domain in `[[hosting.webs_self_register]]`,
+  and only with a proof under a key the *submitted* `keri.cesr` establishes
+  (`webs_self_register.rs`). Never verify that proof against a resolved
+  document (the DID does not exist yet), never extend it to another task or
+  method, and grant the ACL entry only after the slot commits.
 - **The service never creates a `did:webs` DID.** `affinidi-did-webs` is
   taken without its `create` feature — the controller holds the KERI
   keys and publishes the stream here, exactly as a VTA publishes a

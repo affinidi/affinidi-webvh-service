@@ -117,6 +117,7 @@ macro_rules! control_tasks {
         pub(crate) async fn route<V>(
             state: &AppState,
             bearer: Option<&AuthClaims>,
+            self_certified: Option<&crate::webs_self_register::SelfCertifiedWebs>,
             https: Option<&crate::messaging::HttpsFacts<'_>>,
             transport: &(impl TransportHandler + Sync),
             policy: ProofPolicy<'_, V>,
@@ -132,6 +133,7 @@ macro_rules! control_tasks {
                         serve::<$($seg)::+::Payload, _>(
                             state,
                             bearer,
+                            self_certified,
                             transport,
                             policy,
                             doc,
@@ -327,9 +329,12 @@ pub(crate) static SERVED_TRUST_TASK_URIS: std::sync::LazyLock<Vec<&'static str>>
 
 /// Narrow `doc` into `P`, run the framework pipeline, and hand the typed
 /// payload to `handler`.
+// One argument per thing a row may be handed; a struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 async fn serve<P, V>(
     state: &AppState,
     bearer: Option<&AuthClaims>,
+    self_certified: Option<&crate::webs_self_register::SelfCertifiedWebs>,
     transport: &(impl TransportHandler + Sync),
     policy: ProofPolicy<'_, V>,
     doc: TrustTask<Value>,
@@ -371,6 +376,12 @@ where
                 // The identity: a did:scid issuer without its `src` locator.
                 caller: parties.issuer.as_deref().map(did_hosting_common::scid::identity),
                 bearer,
+                // Only the type the gate verified it for: a self-certified
+                // did:webs has no standing on any other row.
+                self_certified: self_certified.filter(|_| {
+                    <P as trust_tasks_rs::Payload>::TYPE_URI
+                        == crate::webs_self_register::SELF_REGISTER_TYPE_URI
+                }),
                 proof_vm: doc.proof.as_ref().map(|p| p.verification_method.clone()),
                 proof_created: doc.proof.as_ref().map(|p| p.created),
                 via: did_hosting_common::server::didcomm_profile::ObservedTransport::from_binding_uri(
@@ -396,6 +407,11 @@ pub(crate) struct Cx<'a> {
     /// The bearer session an HTTPS request presented, if any. Its assurance
     /// level applies only when its subject is the proven caller.
     bearer: Option<&'a AuthClaims>,
+    /// A `did:webs` outside the ACL that the gate verified against the key
+    /// event log its own `did/register/0.1` submits
+    /// ([`crate::webs_self_register`]). Set on that row alone; `None` on every
+    /// other request, which is authorised on the ACL through [`Cx::auth`].
+    pub self_certified: Option<&'a crate::webs_self_register::SelfCertifiedWebs>,
     /// The request proof's `verificationMethod`, when it carried a proof.
     pub proof_vm: Option<String>,
     /// The request proof's `created`, when it carried a proof.
