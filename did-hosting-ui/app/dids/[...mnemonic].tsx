@@ -15,6 +15,7 @@ import { useAuth } from "../../components/AuthProvider";
 import { AgentNameChips } from "../../components/AgentNameChips";
 import { useAgentNames } from "../../lib/use-agent-names";
 import { hasLogMovedPast } from "../../lib/pinned-edit";
+import { startPolling } from "../../lib/poll";
 import { extractDidHost } from "../../lib/domain";
 import { scidAliasesOf } from "../../lib/did-scid";
 import {
@@ -637,10 +638,12 @@ export default function DidDetail() {
   useEffect(() => {
     if (!consent || !mnemonic || !isAuthenticated) return;
     let cancelled = false;
+    // Every check is a background read: it runs on a timer while the page
+    // waits, and must not keep an unattended session alive.
     const check = async () => {
       let entries: LogEntryInfo[];
       try {
-        entries = await api.getDidLog(mnemonic);
+        entries = await api.getDidLog(mnemonic, { background: true });
       } catch {
         // Transient — the next tick retries. Never surfaced: a failed poll is
         // indistinguishable to the user from still waiting.
@@ -666,10 +669,10 @@ export default function DidDetail() {
       );
     };
     void check();
-    const id = setInterval(() => void check(), 5000);
+    const stop = startPolling(() => void check(), 5000);
     return () => {
       cancelled = true;
-      clearInterval(id);
+      stop();
     };
   }, [consent, mnemonic, isAuthenticated, api, loadData]);
 

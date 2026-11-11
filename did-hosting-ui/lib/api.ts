@@ -556,12 +556,26 @@ const T = {
 /** Largest page `did/list` answers. */
 const DID_LIST_PAGE = 1000;
 
+/** Options for a read a page may also send on a timer. `background` marks a
+ *  call the operator did not make, so it does not keep the session alive. */
+export interface ReadOptions {
+  background?: boolean;
+}
+
 /** The control plane's `did/log` for `mnemonic`. */
-function didLog(mnemonic: string, raw: boolean): Promise<DidLog.Response> {
-  return trustTask<DidLog.Payload, DidLog.Response>(T.didLog, {
-    mnemonic,
-    ...(raw ? { raw: true } : {}),
-  });
+function didLog(
+  mnemonic: string,
+  raw: boolean,
+  opts: ReadOptions = {},
+): Promise<DidLog.Response> {
+  return trustTask<DidLog.Payload, DidLog.Response>(
+    T.didLog,
+    {
+      mnemonic,
+      ...(raw ? { raw: true } : {}),
+    },
+    opts,
+  );
 }
 
 /**
@@ -699,8 +713,8 @@ export const api = {
     };
   },
 
-  getDidLog: async (mnemonic: string): Promise<LogEntryInfo[]> =>
-    logEntriesFromWire(await didLog(mnemonic, false)),
+  getDidLog: async (mnemonic: string, opts: ReadOptions = {}): Promise<LogEntryInfo[]> =>
+    logEntriesFromWire(await didLog(mnemonic, false, opts)),
 
   /** The stored `did.jsonl`, verbatim. */
   getRawLog: async (mnemonic: string): Promise<string> =>
@@ -809,8 +823,10 @@ export const api = {
       await trustTask<StatsGet.Payload, StatsGet.Response>(T.statsGet, { mnemonic }),
     ),
 
-  getServerStats: async (): Promise<ServerStats> =>
-    statsFromWire(await trustTask<StatsGet.Payload, StatsGet.Response>(T.statsGet, {})),
+  getServerStats: async (opts: ReadOptions = {}): Promise<ServerStats> =>
+    statsFromWire(
+      await trustTask<StatsGet.Payload, StatsGet.Response>(T.statsGet, {}, opts),
+    ),
 
   getServerTimeseries: async (
     range: TimeRange = "24h",
@@ -836,17 +852,17 @@ export const api = {
 
   // ---- The deployment ----
 
-  getConfig: async (): Promise<ControlPlaneConfig> =>
+  getConfig: async (opts: ReadOptions = {}): Promise<ControlPlaneConfig> =>
     configFromWire(
-      await trustTask<ServerConfig.Payload, ServerConfig.Response>(T.serverConfig, {}),
+      await trustTask<ServerConfig.Payload, ServerConfig.Response>(T.serverConfig, {}, opts),
     ),
 
   /** Control plane + fleet + totals, for the dashboard. Admin. */
-  getServicesOverview: async (): Promise<ServiceOverview> => {
+  getServicesOverview: async (opts: ReadOptions = {}): Promise<ServiceOverview> => {
     const [config, services, stats] = await Promise.all([
-      api.getConfig(),
-      api.listRegistry(),
-      api.getServerStats(),
+      api.getConfig(opts),
+      api.listRegistry(opts),
+      api.getServerStats(opts),
     ]);
     const count = (s: ServiceInstance["status"]) =>
       services.filter((i) => i.status === s).length;
@@ -873,9 +889,9 @@ export const api = {
     };
   },
 
-  listRegistry: async (): Promise<ServiceInstance[]> =>
+  listRegistry: async (opts: ReadOptions = {}): Promise<ServiceInstance[]> =>
     (
-      await trustTask<RegistryList.Payload, RegistryList.Response>(T.registryList, {})
+      await trustTask<RegistryList.Payload, RegistryList.Response>(T.registryList, {}, opts)
     ).instances.map(serviceInstanceFromWire),
 
   /** Assign a hosting domain to a server instance; the control plane queues

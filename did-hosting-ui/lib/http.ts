@@ -25,9 +25,20 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Header on a request the console sends on its own schedule — a dashboard
+ * refresh, a status poll — rather than because the operator did something.
+ * The control plane serves it as usual but does not count it as activity, so
+ * a page left open still signs out after `auth.admin_idle_timeout`.
+ */
+export const BACKGROUND_REQUEST_HEADER = "X-Background-Request";
+
 export interface RequestOptions extends RequestInit {
   /** Send no bearer token, whatever the session holds — for a public read. */
   anonymous?: boolean;
+  /** Sent by a timer, not by the operator: marked with
+   *  {@link BACKGROUND_REQUEST_HEADER} so it does not keep the session alive. */
+  background?: boolean;
 }
 
 export async function request<T>(
@@ -40,7 +51,7 @@ export async function request<T>(
   // The token cache lives in memory, restored from IndexedDB lazily — a
   // fresh page load has not populated it yet. No-op after the first call.
   await restoreSession();
-  const { anonymous = false, ...init } = options;
+  const { anonymous = false, background = false, ...init } = options;
   if (!anonymous && path !== "/api/auth/refresh") {
     await renewIfNeeded();
   }
@@ -51,6 +62,9 @@ export async function request<T>(
 
   if (token) {
     headers["Authorization"] = `Bearer ${token}`;
+  }
+  if (background) {
+    headers[BACKGROUND_REQUEST_HEADER] = "1";
   }
 
   const res = await fetch(path, { ...init, headers });

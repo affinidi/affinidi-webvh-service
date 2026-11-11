@@ -18,6 +18,7 @@ import { AgentNameChips } from "./AgentNameChips";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 import type { ServiceOverview, ServiceInfo } from "../lib/api";
 import { useAgentNames } from "../lib/use-agent-names";
+import { startPolling } from "../lib/poll";
 
 const STATUS_COLORS: Record<string, string> = {
   active: colors.teal,
@@ -248,9 +249,11 @@ export function ServiceOverviewPanel({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const refresh = useCallback(() => {
+  // `background`: a timer tick rather than the operator, so it must not keep
+  // the session alive (see `lib/poll.ts`).
+  const refresh = useCallback((background = false) => {
     api
-      .getServicesOverview()
+      .getServicesOverview({ background })
       .then((d) => {
         setData(d);
         setError(null);
@@ -261,8 +264,7 @@ export function ServiceOverviewPanel({
 
   useEffect(() => {
     refresh();
-    const interval = setInterval(refresh, 5000);
-    return () => clearInterval(interval);
+    return startPolling(({ background }) => refresh(background), 5000);
   }, [refresh]);
 
   // Above the early returns, so the hook order stays fixed. The panel polls
@@ -281,7 +283,7 @@ export function ServiceOverviewPanel({
     return (
       <View style={styles.errorBox}>
         <Text style={styles.errorText}>{error}</Text>
-        <Pressable style={styles.retryButton} onPress={refresh}>
+        <Pressable style={styles.retryButton} onPress={() => refresh()}>
           <Text style={styles.retryText}>Retry</Text>
         </Pressable>
       </View>
