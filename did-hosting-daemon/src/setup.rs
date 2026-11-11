@@ -675,7 +675,10 @@ async fn connect_setup_client(
     setup_key: &EphemeralSetupKey,
 ) -> Result<VtaClient, Box<dyn std::error::Error>> {
     if let Some(rest_url) = resolved.rest_url.as_deref() {
-        let http = reqwest::Client::new();
+        // The REST URL comes from the VTA's DID document: finite timeouts,
+        // and no redirect carries the signed challenge response elsewhere.
+        let http = did_hosting_common::outbound_client()
+            .map_err(|e| format!("could not build an HTTP client: {e}"))?;
         let auth = vta_sdk::auth_light::challenge_response_light(
             &http,
             rest_url,

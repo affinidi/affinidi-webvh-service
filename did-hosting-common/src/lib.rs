@@ -6,6 +6,9 @@ pub mod didcomm_types;
 mod error;
 #[cfg(feature = "server-core")]
 mod http;
+/// The shared outbound HTTP client: finite timeouts, redirects refused.
+#[cfg(feature = "server-core")]
+pub use http::outbound_client;
 pub mod method;
 pub mod scid;
 mod types;

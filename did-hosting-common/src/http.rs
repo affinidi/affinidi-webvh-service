@@ -27,15 +27,24 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// If the client cannot be built (the TLS backend or the platform certificate
 /// verifier failed to initialise), the error is returned. There is no
 /// fallback client: one without these settings would drop both guarantees.
-pub(crate) fn outbound_client() -> reqwest::Result<reqwest::Client> {
+pub fn outbound_client() -> reqwest::Result<reqwest::Client> {
     build_outbound(reqwest::Client::builder())
 }
 
 /// Apply the outbound policy to `builder` and build it.
 fn build_outbound(builder: reqwest::ClientBuilder) -> reqwest::Result<reqwest::Client> {
+    build_outbound_with(builder, REQUEST_TIMEOUT, CONNECT_TIMEOUT)
+}
+
+/// [`build_outbound`] with the timeouts given.
+fn build_outbound_with(
+    builder: reqwest::ClientBuilder,
+    request_timeout: Duration,
+    connect_timeout: Duration,
+) -> reqwest::Result<reqwest::Client> {
     builder
-        .timeout(REQUEST_TIMEOUT)
-        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(request_timeout)
+        .connect_timeout(connect_timeout)
         .redirect(reqwest::redirect::Policy::none())
         .build()
 }
@@ -57,6 +66,35 @@ mod tests {
     fn the_timeouts_are_finite() {
         assert!(CONNECT_TIMEOUT <= REQUEST_TIMEOUT);
         assert!(REQUEST_TIMEOUT <= Duration::from_secs(60));
+    }
+
+    /// The total timeout is applied: a peer that accepts the connection and
+    /// never answers fails the request.
+    #[tokio::test]
+    async fn a_peer_that_never_answers_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let client = build_outbound_with(
+            reqwest::Client::builder(),
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+        )
+        .expect("the client builds");
+        let started = std::time::Instant::now();
+        let err = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("no reply");
+        assert!(err.is_timeout(), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        server.abort();
     }
 
     /// A 3xx is returned to the caller, not followed.
