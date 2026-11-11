@@ -299,7 +299,7 @@ pub async fn post_trust_task_https_verified(
     doc: &trust_tasks_rs::TrustTask<Value>,
     verifier: &TransportBoundVerifier,
 ) -> Result<trust_tasks_rs::TrustTask<Value>, SendError> {
-    let resp = crate::http::outbound_client()
+    let resp = crate::http::outbound_client()?
         .post(url)
         .json(doc)
         .send()

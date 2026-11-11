@@ -23,14 +23,69 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// endpoint cannot 3xx-bounce the request — and any `Authorization` header on
 /// it — to a host the caller did not choose. The runtime server/control clients
 /// already build this way; the shared clients now match.
-pub(crate) fn outbound_client() -> reqwest::Client {
-    reqwest::Client::builder()
+///
+/// If the client cannot be built (the TLS backend or the platform certificate
+/// verifier failed to initialise), the error is returned. There is no
+/// fallback client: one without these settings would drop both guarantees.
+pub(crate) fn outbound_client() -> reqwest::Result<reqwest::Client> {
+    build_outbound(reqwest::Client::builder())
+}
+
+/// Apply the outbound policy to `builder` and build it.
+fn build_outbound(builder: reqwest::ClientBuilder) -> reqwest::Result<reqwest::Client> {
+    builder
         .timeout(REQUEST_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        // A builder failure means the TLS backend could not initialise — a
-        // fatal environment condition, not a runtime input. Fall back to a
-        // default client so these infallible constructors keep their signature.
-        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A builder that cannot be built is reported, not replaced by a client
+    /// without the timeouts and redirect policy.
+    #[test]
+    fn a_client_that_cannot_be_built_is_an_error() {
+        let failing = reqwest::Client::builder().tls_backend_preconfigured(());
+        assert!(build_outbound(failing).is_err());
+    }
+
+    #[test]
+    fn the_timeouts_are_finite() {
+        assert!(CONNECT_TIMEOUT <= REQUEST_TIMEOUT);
+        assert!(REQUEST_TIMEOUT <= Duration::from_secs(60));
+    }
+
+    /// A 3xx is returned to the caller, not followed.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let reply = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{addr}/elsewhere\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        let resp = outbound_client()
+            .expect("the client builds")
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect("a reply");
+        assert_eq!(resp.status(), reqwest::StatusCode::FOUND);
+        assert_eq!(
+            resp.headers()["location"],
+            format!("http://{addr}/elsewhere").as_str()
+        );
+        server.abort();
+    }
 }
