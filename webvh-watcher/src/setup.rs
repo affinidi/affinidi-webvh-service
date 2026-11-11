@@ -352,6 +352,7 @@ pub async fn apply_recipe(
         replay: Default::default(),
         sync: SyncConfig {
             source_dids: recipe.watcher.source_dids.clone(),
+            sources: Vec::new(),
         },
         config_path: recipe.output.config_path.clone(),
     };

@@ -19,7 +19,7 @@ pub async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn Erro
             health::pass(&format!("Listen address: {listen}"));
             health::check_value("server_did", &c.server_did);
             health::check_value("mediator_did", &c.mediator_did);
-            health::info_msg(&format!("Sync sources: {}", c.sync.source_dids.len()));
+            health::info_msg(&format!("Sync sources: {}", c.sync.source_count()));
             Some(c)
         }
         Err(e) => {

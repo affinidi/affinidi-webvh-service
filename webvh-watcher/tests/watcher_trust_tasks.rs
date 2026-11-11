@@ -71,6 +71,7 @@ async fn watcher_state() -> (AppState, tempfile::TempDir) {
         store: store_config,
         sync: SyncConfig {
             source_dids: vec![source().0],
+            sources: Vec::new(),
         },
         ..AppConfig::default()
     };
@@ -802,4 +803,210 @@ async fn a_stored_slot_stays_bound_to_its_source_until_that_source_deletes_it() 
         "applied"
     );
     assert_eq!(held(&state, "heidi").await.unwrap().source_did, b.0);
+}
+
+/// The one-entry log [`did_log`] builds for `mnemonic`, and a two-entry log
+/// that extends it with an ordinary update (not a deactivation).
+async fn did_log_and_extension(mnemonic: &str) -> (String, String, String) {
+    let secret = Secret::generate_ed25519(None, Some(&[7u8; 32]));
+    let pk_mb = secret.get_public_keymultibase().unwrap();
+    let mut signing = secret.clone();
+    signing.id = format!("did:key:{pk_mb}#{pk_mb}");
+    let doc = build_did_document(
+        "origin.example.com",
+        mnemonic,
+        &pk_mb,
+        &DidDocumentOptions::default(),
+    );
+    let params = didwebvh_rs::parameters::Parameters {
+        update_keys: Some(Arc::new(vec![pk_mb.clone().into()])),
+        ..Default::default()
+    };
+    let mut state = didwebvh_rs::DIDWebVHState::default();
+    state
+        .create_log_entry(Some(genesis_time()), &doc, &params, &signing)
+        .await
+        .expect("create webvh log entry");
+    let render = |state: &didwebvh_rs::DIDWebVHState| {
+        state
+            .log_entries()
+            .iter()
+            .map(|e| serde_json::to_string(&e.log_entry).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let v1 = render(&state);
+    let mut doc = serde_json::to_value(&state.log_entries()[0].log_entry).unwrap()["state"].clone();
+    doc["alsoKnownAs"] = json!(["https://example.org/v2"]);
+    state
+        .create_log_entry(None, &doc, &params, &signing)
+        .await
+        .expect("second webvh log entry");
+    let v2 = render(&state);
+    let did = did_hosting_common::did_ops::extract_did_id(&v1).unwrap();
+    (did, v1, v2)
+}
+
+#[tokio::test]
+async fn a_source_cannot_extend_another_sources_did() {
+    let (state, _dir, a, b) = two_source_watcher().await;
+    let (did, v1, v2) = did_log_and_extension("ivan").await;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(MSG_SYNC_UPDATE, &a, update_body("ivan", &did, &v1)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_UPDATE)["status"], "applied");
+
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, update_body("ivan", &did, &v2)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(refused(&reply, &b.0), "webvh/sync/update:notAuthorized");
+    let record = held(&state, "ivan").await.unwrap();
+    assert_eq!(
+        (record.source_did.as_str(), record.version_count),
+        (a.0.as_str(), 1)
+    );
+
+    // The holder's own extension applies.
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(MSG_SYNC_UPDATE, &a, update_body("ivan", &did, &v2)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_UPDATE)["status"], "applied");
+    assert_eq!(held(&state, "ivan").await.unwrap().version_count, 2);
+}
+
+/// A slot whose holder is removed from the configuration is released: another
+/// configured source may sync it (still held to the high-water log) or
+/// delete it.
+#[tokio::test]
+async fn a_slot_is_released_when_its_holder_is_no_longer_a_source() {
+    let (mut state, _dir, a, b) = two_source_watcher().await;
+    let (did, v1, v2) = did_log_and_extension("judy").await;
+    let (did_k, log_k) = did_log_on("origin.example.com", "karl").await;
+    for (m, d, l) in [("judy", &did, &v2), ("karl", &did_k, &log_k)] {
+        let reply = deliver(
+            &state,
+            Via::Https,
+            &a.0,
+            signed(MSG_SYNC_UPDATE, &a, update_body(m, d, l)).await,
+        )
+        .await
+        .expect("answered");
+        answered(&reply, MSG_SYNC_UPDATE);
+    }
+
+    // The operator removes A.
+    let mut config = (*state.config).clone();
+    config.sync.source_dids.retain(|s| *s != a.0);
+    state.config = Arc::new(config);
+
+    // B may not roll the released DID back...
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, update_body("judy", &did, &v1)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(refused(&reply, &b.0), "webvh/sync/update:historyRewrite");
+
+    // ...but may take it over at the high-water log.
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, update_body("judy", &did, &v2)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        answered_to(&reply, MSG_SYNC_UPDATE, &b.0)["status"],
+        "applied"
+    );
+    assert_eq!(held(&state, "judy").await.unwrap().source_did, b.0);
+
+    // And may delete a released slot.
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_DELETE, &b, json!({ "mnemonic": "karl" })).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        answered_to(&reply, MSG_SYNC_DELETE, &b.0)["status"],
+        "deleted"
+    );
+    assert!(held(&state, "karl").await.is_none());
+}
+
+/// A source configured with `domains` may sync only DIDs on those hosts; a
+/// source without them is unaffected.
+#[tokio::test]
+async fn a_source_with_domains_syncs_only_dids_on_them() {
+    let (mut state, _dir, a, b) = two_source_watcher().await;
+    let mut config = (*state.config).clone();
+    config.sync.source_dids.retain(|s| *s != b.0);
+    config
+        .sync
+        .sources
+        .push(webvh_watcher::config::SourceConfig {
+            did: b.0.clone(),
+            domains: vec!["Other.Example.com".into()],
+        });
+    state.config = Arc::new(config);
+
+    let (did_o, log_o) = did_log_on("origin.example.com", "liam").await;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, update_body("liam", &did_o, &log_o)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(refused(&reply, &b.0), "webvh/sync/update:notAuthorized");
+    assert!(held(&state, "liam").await.is_none());
+
+    let (did_x, log_x) = did_log_on("other.example.com", "liam").await;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, update_body("liam", &did_x, &log_x)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        answered_to(&reply, MSG_SYNC_UPDATE, &b.0)["status"],
+        "applied"
+    );
+
+    // A has no domains configured: any host.
+    let (did_m, log_m) = did_log_on("origin.example.com", "mia").await;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(MSG_SYNC_UPDATE, &a, update_body("mia", &did_m, &log_m)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_UPDATE)["status"], "applied");
 }

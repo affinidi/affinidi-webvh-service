@@ -18,9 +18,21 @@
 //! until that source deletes it. No other source may update, disable or delete
 //! it, even with the same log. A record stored by an earlier release is bound
 //! to the source it names, which is the source that last wrote it.
+//!
+//! The first sync wins: a configured source that syncs a DID's public log
+//! before the DID's own control plane does holds the slot. Two settings bound
+//! that. A source configured with `domains` (`[[sync.sources]]`) may sync only
+//! DIDs on those hosts. And a slot whose holder is no longer a configured
+//! source is released: the next configured source to sync or delete it may,
+//! still held to the DID's high-water log.
+//!
+//! The per-process `sync_lock` serialises the check and the write. The store
+//! offers no conditional write, so two watcher processes on one shared store
+//! could both pass the check; run one watcher process per store.
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::SyncConfig;
 use crate::error::AppError;
 use crate::store::{KeyspaceHandle, Store};
 
@@ -132,11 +144,35 @@ fn webvh_scid(did_id: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether `held` belongs to a source other than `source_did`. A slot whose
+/// holder is no longer configured is not held: it is logged and released.
+fn held_by_another(
+    sync: &SyncConfig,
+    held: &WatcherRecord,
+    source_did: &str,
+    mnemonic: &str,
+) -> bool {
+    if held.source_did == source_did {
+        return false;
+    }
+    if !sync.is_source(&held.source_did) {
+        tracing::warn!(
+            mnemonic,
+            old_holder = %held.source_did,
+            source = %source_did,
+            "slot released: its holder is no longer a configured source"
+        );
+        return false;
+    }
+    true
+}
+
 /// Verify `entry` against everything the watcher has mirrored, and apply it
 /// as one atomic change. `source_did` is the proven source.
 pub async fn apply_sync(
     store: &Store,
     ks: &KeyspaceHandle,
+    sync: &SyncConfig,
     source_did: &str,
     entry: &SyncEntry,
 ) -> Result<SyncApplied, SyncRefusal> {
@@ -179,6 +215,17 @@ pub async fn apply_sync(
         .map_err(|e| SyncRefusal::InvalidLog(e.to_string()))?;
     validate_did_id_matches_request(&entry.did_id, &entry.mnemonic, &format!("https://{host}"))
         .map_err(SyncRefusal::InvalidLog)?;
+    if !sync.allows_host(source_did, &host) {
+        tracing::warn!(
+            mnemonic = %entry.mnemonic,
+            %host,
+            source = %source_did,
+            "sync refused: the DID's host is not among the source's domains"
+        );
+        return Err(SyncRefusal::NotOwner(format!(
+            "this source may not sync DIDs on {host}"
+        )));
+    }
 
     // Chain: every entry's proof, and the witness proofs when witnessed.
     verify_did_log_and_witness_proofs(&entry.log_content, entry.witness_content.as_deref())
@@ -193,7 +240,7 @@ pub async fn apply_sync(
     // A slot is its holder's: no other source may write to it, not even to
     // re-send the same log, or to flip `disabled`.
     if let Some(prev) = held.as_ref()
-        && prev.source_did != source_did
+        && held_by_another(sync, prev, source_did, &entry.mnemonic)
     {
         tracing::warn!(
             mnemonic = %entry.mnemonic,
@@ -223,12 +270,14 @@ pub async fn apply_sync(
         })?;
     }
 
-    // Nothing to write when the watcher already mirrors exactly this state.
+    // Nothing to write when the watcher already mirrors exactly this state
+    // for this source. A released slot is rewritten to record its new holder.
     let held_witness = ks
         .get_raw(content_witness_key(&entry.mnemonic))
         .await?
         .map(|w| String::from_utf8_lossy(&w).into_owned());
     if let Some(prev) = held.as_ref()
+        && prev.source_did == source_did
         && prev.did_id == entry.did_id
         && prev.disabled == entry.disabled
         && held_log.as_deref() == Some(entry.log_content.as_str())
@@ -272,19 +321,20 @@ pub async fn apply_sync(
 
 /// Stop mirroring a slot for `source_did`. The high-water mark stays, so a
 /// later sync cannot roll the DID back, but the slot is released: any
-/// configured source may write it next. Returns whether anything was held for
-/// that source: a slot another source wrote is left alone, and reported as
-/// not held, so a source learns nothing of other sources' slots.
+/// configured source may write it next. Returns whether the slot was removed.
+/// A slot another configured source holds is left alone and reported as not
+/// held; one whose holder is no longer configured is removed.
 pub async fn delete_record(
     store: &Store,
     ks: &KeyspaceHandle,
+    sync: &SyncConfig,
     mnemonic: &str,
     source_did: &str,
 ) -> Result<bool, AppError> {
     let held: Option<WatcherRecord> = ks.get(did_key(mnemonic)).await?;
     match held {
         None => return Ok(false),
-        Some(r) if r.source_did != source_did => {
+        Some(r) if held_by_another(sync, &r, source_did, mnemonic) => {
             tracing::warn!(
                 mnemonic,
                 holder = %r.source_did,

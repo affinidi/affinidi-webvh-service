@@ -69,6 +69,7 @@ async fn pair() -> Pair {
         store: store_config,
         sync: webvh_watcher::config::SyncConfig {
             source_dids: vec![control_did.clone()],
+            sources: Vec::new(),
         },
         ..Default::default()
     };

@@ -46,6 +46,17 @@ whom it mirrors:
 source_dids = ["did:webvh:control.example.com"]
 ```
 
+A source can also be listed with the hosts it may sync DIDs for. A DID on
+any other host is refused `notAuthorized`. Hosts are compared with the DID's
+host (`host:port` when the DID names a port), ignoring case. A source with no
+`domains` may sync any host, as one in `source_dids` does:
+
+```toml
+[[sync.sources]]
+did = "did:webvh:…:control-b.example.com"
+domains = ["b.example.com"]
+```
+
 ### 3. Configure the control plane
 
 On each control plane the watcher mirrors, map the watcher's URL to its DID:
@@ -89,14 +100,36 @@ Clients ──(GET /{mnemonic}/did.jsonl)──► webvh-watcher
 A document that does not verify gets no reply. A verified one from a DID that
 is not a source is refused `notAuthorized` (signed), and is not recorded.
 
+### Which source holds a slot
+
 A slot belongs to the source that first synced it, until that source deletes
-it. An update from any other configured source, even one that re-sends the
-same log or only changes `disabled`, is refused `notAuthorized`; a delete from
-another source leaves the slot in place and is answered `absent`. Both are
-logged as warnings. A slot stored by an earlier release belongs to the source
-its record names (the source that last wrote it). Once the holding source
-deletes a slot, any configured source may sync it next, still held to the
-DID's high-water log.
+it. An update from any other configured source, whether it extends the log,
+re-sends it or only changes `disabled`, is refused `notAuthorized`. A delete
+from another source leaves the slot in place and is answered `absent`. Both
+are logged as warnings. Once the holding source deletes a slot, any
+configured source may sync it next, still held to the DID's high-water log.
+
+**The first sync wins.** A DID's log is public, so any configured source can
+sync it before the DID's own control plane does, and then hold its slot. A
+watcher with one source is not affected. With more than one source:
+
+- Give each source the hosts it publishes for, so it cannot sync DIDs on any
+  other (see `[[sync.sources]]` below).
+- Check which source holds each DID: the `sourceDid` field of the slot's
+  `did:{mnemonic}` record in the watcher's store, and the `holder` in each
+  refusal's warning. After upgrading from a release without this rule, check
+  slots that more than one source syncs. A slot stored by an earlier release belongs to the
+  source its record names, which is the source that last wrote it.
+- To move a slot to another source, remove the holder from `source_dids` and
+  `[[sync.sources]]` and restart. A slot whose holder is no longer configured
+  is released: the next configured source to sync it holds it (still held to
+  the high-water log), and the release is logged with the old holder.
+
+**One watcher process per store.** The check that a source holds a slot and
+the write that follows are serialised within one process. The store has no
+conditional write, so two watcher processes sharing one store (Redis,
+DynamoDB, Firestore, Cosmos DB) could both pass the check. Run one watcher
+process per store.
 
 ## Configuration
 
