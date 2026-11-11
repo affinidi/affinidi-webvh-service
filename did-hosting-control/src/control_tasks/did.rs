@@ -105,14 +105,33 @@ pub(crate) async fn register(
     }))
     .map_err(|e| AppError::Validation(format!("invalid register payload: {e}")))?;
     let (method, payload) = req.resolve().map_err(AppError::Validation)?;
-    if method != "webvh" {
-        return Err(AppError::Validation(format!(
-            "this host registers webvh only over this task; received method = '{method}'"
-        ))
-        .into());
+    // webvh, and did:webs where this host is built to verify it: a `keri.cesr`
+    // stream, from which the identifier is built with the slot and domain
+    // (`register_did_atomic`). Every other method is refused by name, so a
+    // caller can tell "this host does not host it" from a bad log.
+    match method.as_str() {
+        "webvh" => {}
+        #[cfg(feature = "method-webs")]
+        "webs" => {}
+        #[cfg(not(feature = "method-webs"))]
+        "webs" => {
+            return Err(AppError::Validation(
+                "this host does not host did:webs: it was built without the `method-webs` \
+                 feature"
+                    .into(),
+            )
+            .into());
+        }
+        other => {
+            return Err(AppError::Validation(format!(
+                "this host registers webvh and did:webs over this task; received method = \
+                 '{other}'"
+            ))
+            .into());
+        }
     }
     let did_log = std::str::from_utf8(&payload).map_err(|e| {
-        AppError::Validation(format!("[log] webvh didData is not valid UTF-8: {e}"))
+        AppError::Validation(format!("[log] {method} didData is not valid UTF-8: {e}"))
     })?;
 
     let record = did_ops::register_did_atomic(
