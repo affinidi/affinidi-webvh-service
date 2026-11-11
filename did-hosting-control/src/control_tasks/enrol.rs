@@ -128,7 +128,17 @@ fn descriptors(v: Option<&Value>) -> Option<Value> {
 /// Creation options in the shape the shared WebAuthn schema allows. The
 /// library adds hints the schema (and the platform API) does not need; they
 /// are dropped rather than sent off-schema.
-fn creation_options(ccr: &CreationChallengeResponse) -> Result<Value, TaskError> {
+///
+/// A login credential is asked to be discoverable (`residentKey:
+/// preferred`): a passkey login that names no subject lists no credentials
+/// (`auth::login_start`), so the authenticator has to find it by itself. An
+/// authenticator that cannot store one still enrols, and signs in by naming
+/// its subject. A step-up credential is always asked for by id, and keeps the
+/// library's default.
+fn creation_options(
+    ccr: &CreationChallengeResponse,
+    discoverable: bool,
+) -> Result<Value, TaskError> {
     let value = serde_json::to_value(ccr)?;
     let pk = value.get("publicKey").cloned().unwrap_or(value);
     let mut out = pick(
@@ -155,18 +165,19 @@ fn creation_options(ccr: &CreationChallengeResponse) -> Result<Value, TaskError>
         );
     }
     if let Some(sel) = pk.get("authenticatorSelection") {
-        obj.insert(
-            "authenticatorSelection".into(),
-            pick(
-                sel,
-                &[
-                    "authenticatorAttachment",
-                    "requireResidentKey",
-                    "residentKey",
-                    "userVerification",
-                ],
-            ),
+        let mut sel = pick(
+            sel,
+            &[
+                "authenticatorAttachment",
+                "requireResidentKey",
+                "residentKey",
+                "userVerification",
+            ],
         );
+        if discoverable {
+            sel["residentKey"] = json!("preferred");
+        }
+        obj.insert("authenticatorSelection".into(), sel);
     }
     if let Some(ex) = descriptors(pk.get("excludeCredentials")) {
         obj.insert("excludeCredentials".into(), ex);
@@ -251,7 +262,7 @@ async fn open(
     };
     pk::store_ceremony(&state.sessions_ks, &ceremony).await?;
     Ok(Opened {
-        options: creation_options(&ccr)?,
+        options: creation_options(&ccr, purpose == Purpose::Session)?,
         uv_options,
         ceremony,
     })
@@ -346,6 +357,35 @@ fn verify_uv(
     Ok(())
 }
 
+/// Claim `passkey`'s credential id for this enrolment, or `None` when it is
+/// already bound — to any subject, in either credential store.
+///
+/// A credential id names one credential; binding one that is already bound
+/// would repoint its `pk_cred:` index at the new subject, so its holder could
+/// no longer sign in with it (WebAuthn §7.1 step 22: refuse a credential id
+/// already registered to any user). The returned guard serialises enrolments
+/// of the same id across subjects (the credentials guard is per subject); hold
+/// it through [`persist`]. Taken after the subject's credentials guard, and
+/// nothing takes them the other way round.
+async fn claim_credential_id(
+    state: &AppState,
+    passkey: &Passkey,
+) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, TaskError> {
+    let id = cred_id_hex(passkey.cred_id());
+    let guard = state
+        .path_locks
+        .guard(&format!("::passkey-credential-id:{id}"))
+        .await;
+    for purpose in [Purpose::Session, Purpose::StepUp] {
+        let store = credential_store(state, purpose)?;
+        if pk::get_passkey_user_by_cred(&store, &id).await?.is_some() {
+            warn!(credential_id = %id, "enrolment refused: the credential id is already bound");
+            return Ok(None);
+        }
+    }
+    Ok(Some(guard))
+}
+
 /// Write the credential — and, for a redemption that grants a role, the ACL
 /// entry it authorises — in one batch.
 async fn persist(
@@ -415,6 +455,18 @@ pub(crate) async fn invite(
             error_codes::ROLE_NOT_PERMITTED,
             "only an administrator may issue enrolment invites".into(),
         ));
+    }
+    // An invite enrols a passkey, and a login passkey signs in at `aal2`: an
+    // administrator's session must already hold that much to issue one (for
+    // anyone — itself, another administrator, or an owner), or a session at
+    // `aal1` could reach `aal2` through an invite to itself.
+    if !has_step_up_authority(cx, &auth) {
+        return Err(AppError::StepUpRequired(
+            "issuing an enrolment invite needs a stepped-up (aal2) session, or a request \
+             signed with your own DID key"
+                .into(),
+        )
+        .into());
     }
     let state = cx.state;
     require_webauthn(state)?;
@@ -700,6 +752,12 @@ pub(crate) async fn redeem_finish(
         }
         Refusal::Attestation(m) => TaskError::Declared(error_codes::ATTESTATION_INVALID, m),
     })?;
+    let Some(_credential_guard) = claim_credential_id(state, &passkey).await? else {
+        return Err(TaskError::Declared(
+            error_codes::ATTESTATION_INVALID,
+            "this credential is already registered".into(),
+        ));
+    };
 
     // Consume the invite. Exactly one finish wins this; the loser binds
     // nothing.
@@ -803,6 +861,44 @@ pub(crate) async fn redeem_finish(
 // auth/passkey/enroll/{start,finish}/0.2
 // ---------------------------------------------------------------------------
 
+/// Whether this request carries `aal2`-strength authority: a session already
+/// stepped up to `aal2`, or a request the caller's own DID key signs (the
+/// factor a `didSigned` step-up rests on). A session's delegated key — what a
+/// browser session signs with — is neither.
+fn has_step_up_authority(cx: &Cx<'_>, auth: &crate::auth::AuthClaims) -> bool {
+    let own_key = cx.proof_vm.as_deref().is_some_and(|vm| {
+        did_hosting_common::scid::same_reference(
+            did_hosting_common::server::trust_tasks::verifier::controller_did(vm),
+            &auth.did,
+        )
+    });
+    auth.acr == "aal2" || own_key
+}
+
+/// Refuse unless this request may add its subject's *first* login passkey.
+///
+/// A passkey login is minted at `aal2`, so the first login passkey a subject
+/// enrols is a new way to reach `aal2`, and must be added with at least that
+/// much ([`has_step_up_authority`]), so a session alone cannot turn itself
+/// into an `aal2` one this way. A subject that has neither enrols its first
+/// login passkey through an administrator's invite
+/// (`auth/passkey/enroll/invite`). Adding a further passkey is gated by the
+/// user verification over an existing one instead.
+fn require_first_passkey_authority(
+    cx: &Cx<'_>,
+    auth: &crate::auth::AuthClaims,
+) -> Result<(), TaskError> {
+    if has_step_up_authority(cx, auth) {
+        return Ok(());
+    }
+    Err(AppError::StepUpRequired(
+        "a first login passkey is enrolled from a stepped-up (aal2) session, by a request \
+         signed with your own DID key, or through an administrator's invite"
+            .into(),
+    )
+    .into())
+}
+
 /// `auth/passkey/enroll/start/0.2`: the proven caller adds a login passkey to
 /// their own VID. When they already hold one, the response carries
 /// `uvOptions` and the finish must answer them.
@@ -829,6 +925,9 @@ pub(crate) async fn start(
             error_codes::MAX_CREDENTIALS_REACHED,
             format!("at most {MAX_SESSION_CREDENTIALS} passkeys per subject"),
         ));
+    }
+    if held == 0 {
+        require_first_passkey_authority(cx, &auth)?;
     }
     let session_id = cx
         .bearer_session()
@@ -895,6 +994,11 @@ pub(crate) async fn finish(
     let _guard =
         super::passkey::credentials_guard(state, Purpose::Session, &ceremony.subject).await;
     let existing = pk::get_passkey_user_by_did(&state.sessions_ks, &ceremony.subject).await?;
+    // Checked again here, against what the subject holds now: the start's
+    // check saw the store before this guard was taken.
+    if existing.as_ref().is_none_or(|u| u.credentials.is_empty()) {
+        require_first_passkey_authority(cx, &auth)?;
+    }
     if existing
         .as_ref()
         .is_some_and(|u| u.credentials.len() >= MAX_SESSION_CREDENTIALS)
@@ -920,6 +1024,12 @@ pub(crate) async fn finish(
         Refusal::UserVerification(m) => TaskError::Standard(StandardCode::PermissionDenied, m),
         Refusal::Attestation(m) => TaskError::Declared(error_codes::ATTESTATION_INVALID, m),
     })?;
+    let Some(_credential_guard) = claim_credential_id(state, &passkey).await? else {
+        return Err(TaskError::Declared(
+            error_codes::ATTESTATION_INVALID,
+            "this credential is already registered".into(),
+        ));
+    };
     let label = p
         .device_label
         .as_deref()

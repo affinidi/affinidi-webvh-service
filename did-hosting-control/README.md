@@ -368,9 +368,9 @@ DIDComm), with WebAuthn's ceremony data inside their payloads:
 | `auth/passkey/enroll/invite/0.3` | administrator | Issue an invite: a URL token and a separate claim code, stored only as hashes |
 | `auth/passkey/enroll/redeem/start/0.1` | optional | Present token + claim code; get creation options (and `uvOptions` over existing passkeys of the purpose) |
 | `auth/passkey/enroll/redeem/finish/0.1` | optional | Bind the passkey to the invite's subject and consume the invite |
-| `auth/passkey/enroll/start/0.2`, `finish/0.2` | the subject | Add a login passkey to your own VID (re-verified with an existing one) |
+| `auth/passkey/enroll/start/0.2`, `finish/0.2` | the subject | Add a login passkey to your own VID (re-verified with an existing one; a first one needs an `aal2` session or your own DID key's signature, else an invite) |
 | `auth/passkey/enroll/invite/{list,update,revoke}/0.1` | administrator | Manage invites by `inviteId` |
-| `auth/passkey/login/start/0.2`, `finish/0.2` | optional / session key | Sign in, or step a session up |
+| `auth/passkey/login/start/0.2`, `finish/0.2` | optional / session key | Sign in, or step a session up. The start lists no credentials (the authenticator offers its discoverable ones) unless the request carries the named subject's own session; 30 starts per source a minute |
 
 A `stepUp` invite enrols a step-up-only passkey, kept in its own keyspace
 (`passkey_step_up`) that the login ceremony never reads.

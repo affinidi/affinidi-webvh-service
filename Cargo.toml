@@ -130,8 +130,11 @@ axum-extra = { version = "0.12", features = ["typed-header"] }
 base64 = "0.23"
 
 # WebAuthn / Passkey
+# `conditional-ui` adds the discoverable-credential ceremony a passkey login
+# uses: the browser picks the credential, so the login start lists none.
 webauthn-rs = { version = "0.5", features = [
   "danger-allow-state-serialisation",
+  "conditional-ui",
 ] }
 webauthn-rs-proto = "0.5"
 # Passkey enrolment invites: the claim code is short enough to type, so it is

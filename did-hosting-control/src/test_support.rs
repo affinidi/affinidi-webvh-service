@@ -199,6 +199,7 @@ impl TestServer {
             pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
             client_ips: Default::default(),
             ip_rate_limiter: Arc::new(crate::rate_limit::challenge_limiter()),
+            login_start_rate_limiter: Arc::new(crate::rate_limit::login_start_limiter()),
             redeem_rate_limiter: Arc::new(crate::rate_limit::redeem_limiter()),
             webs_self_register_limiter: Arc::new(crate::rate_limit::webs_self_register_limiter()),
             webs_self_register_global_limiter: Arc::new(

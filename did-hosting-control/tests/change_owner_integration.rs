@@ -39,7 +39,7 @@ use did_hosting_common::server::store::{
 use did_hosting_control::auth::AuthClaims;
 use did_hosting_control::config::{AppConfig, RegistryConfig};
 use did_hosting_control::did_ops::{
-    change_did_owner, create_did, delete_did, get_did_info, list_dids,
+    OwnerChangeError, change_did_owner, create_did, delete_did, get_did_info, list_dids,
 };
 use did_hosting_control::server::AppState;
 
@@ -112,6 +112,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         ),
         client_ips: Default::default(),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::challenge_limiter()),
+        login_start_rate_limiter: Arc::new(did_hosting_control::rate_limit::login_start_limiter()),
         redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::redeem_limiter()),
         webs_self_register_limiter: Arc::new(
             did_hosting_control::rate_limit::webs_self_register_limiter(),
@@ -200,10 +201,20 @@ async fn owner_can_transfer_did_and_listing_index_swaps() {
         .expect("new owner list");
     assert!(new_owner_list.is_empty());
 
-    // 2. Owner transfers the DID.
-    let updated = change_did_owner(&owner_auth, &state, &create.mnemonic, &new_owner)
+    // 2. Owner offers the DID; nothing moves until the new owner accepts.
+    let offered = change_did_owner(&owner_auth, &state, &create.mnemonic, &new_owner, None)
         .await
-        .expect("change_did_owner");
+        .expect("change_did_owner (offer)");
+    assert_eq!(offered.record.owner, owner);
+    assert_eq!(
+        offered.offer.as_ref().map(|o| o.to.as_str()),
+        Some(new_owner.as_str())
+    );
+    let accepted = change_did_owner(&new_owner_auth, &state, &create.mnemonic, &new_owner, None)
+        .await
+        .expect("change_did_owner (accept)");
+    assert!(accepted.offer.is_none());
+    let updated = accepted.record;
     assert_eq!(updated.owner, new_owner);
     assert_ne!(updated.updated_at, 0);
 
@@ -283,10 +294,14 @@ async fn admin_can_transfer_did_owned_by_someone_else() {
         .expect("create");
 
     let admin_auth = auth_for(&admin, Role::Admin);
-    let updated = change_did_owner(&admin_auth, &state, "tenant/admin-flow", &target)
+    let updated = change_did_owner(&admin_auth, &state, "tenant/admin-flow", &target, None)
         .await
         .expect("admin transfers to target");
-    assert_eq!(updated.owner, target);
+    assert!(
+        updated.offer.is_none(),
+        "an administrator moves the slot at once"
+    );
+    assert_eq!(updated.record.owner, target);
 
     let target_auth = auth_for(&target, Role::Owner);
     let target_list = list_dids(&target_auth, &state, None, None, None)
@@ -325,22 +340,23 @@ async fn stranger_cannot_change_owner_of_someone_elses_did() {
     // Even with an Owner claim, the stranger can't touch a record they
     // don't own.
     let stranger_auth = auth_for(&stranger, Role::Owner);
-    let err = change_did_owner(&stranger_auth, &state, "tenant/protected", &target)
+    let err = change_did_owner(&stranger_auth, &state, "tenant/protected", &target, None)
         .await
         .expect_err("stranger must be forbidden");
     assert!(matches!(
         err,
-        did_hosting_control::error::AppError::Forbidden(_)
+        OwnerChangeError::Failed(did_hosting_control::error::AppError::Forbidden(_))
     ));
 
     mediator.shutdown();
     mediator.join().await.expect("mediator shutdown");
 }
 
-/// `change_did_owner` must reject transfers to a DID that's not in the
-/// ACL — otherwise we'd hand the slot to someone who can never log in to
-/// claim it. Pin this with a real DID format so future stricter checks
-/// (DID-method allow-listing, etc.) can't mask the ACL gate.
+/// A slot never lands with a DID that is not in the ACL — it could never log
+/// in to manage it. An owner's offer to one says nothing about the ACL (it is
+/// recorded like any other) and can never be accepted; an administrator's
+/// direct transfer is refused. Pinned with a real DID format so future
+/// stricter checks (DID-method allow-listing, etc.) can't mask the ACL gate.
 #[tokio::test]
 async fn cannot_transfer_to_did_not_in_acl() {
     let (mediator, users) = TestMediator::with_users(["Owner", "Outsider"])
@@ -358,12 +374,33 @@ async fn cannot_transfer_to_did_not_in_acl() {
         .await
         .expect("create");
 
-    let err = change_did_owner(&owner_auth, &state, "tenant/check-acl", &outsider)
+    let offered = change_did_owner(&owner_auth, &state, "tenant/check-acl", &outsider, None)
         .await
-        .expect_err("transfer to non-ACL'd DID must fail");
+        .expect("an offer is recorded whoever it names");
+    assert_eq!(offered.record.owner, owner);
+    let outsider_auth = auth_for(&outsider, Role::Owner);
+    let err = change_did_owner(&outsider_auth, &state, "tenant/check-acl", &outsider, None)
+        .await
+        .expect_err("a DID outside the ACL cannot take the slot");
     assert!(
-        matches!(err, did_hosting_control::error::AppError::Validation(ref m) if m.contains("not in the ACL")),
-        "expected Validation about ACL membership, got {err:?}",
+        matches!(err, OwnerChangeError::TargetNotAuthorized(_)),
+        "got {err:?}"
+    );
+
+    let admin = "did:example:admin-check-acl";
+    acl(&state, admin, Role::Admin).await;
+    let err = change_did_owner(
+        &auth_for(admin, Role::Admin),
+        &state,
+        "tenant/check-acl",
+        &outsider,
+        None,
+    )
+    .await
+    .expect_err("an administrator cannot hand the slot to a DID outside the ACL");
+    assert!(
+        matches!(err, OwnerChangeError::TargetNotAuthorized(ref m) if m.contains("no ACL entry")),
+        "got {err:?}"
     );
 
     mediator.shutdown();
@@ -387,10 +424,11 @@ async fn transfer_to_self_is_idempotent() {
         .await
         .expect("create");
 
-    let result = change_did_owner(&owner_auth, &state, "tenant/self", &owner)
+    let result = change_did_owner(&owner_auth, &state, "tenant/self", &owner, None)
         .await
         .expect("self-transfer ok");
-    assert_eq!(result.owner, owner);
+    assert_eq!(result.record.owner, owner);
+    assert!(result.offer.is_none());
 
     // Owner index unchanged: exactly one row under `owner:{owner}:`.
     let idx = state
@@ -541,11 +579,20 @@ async fn delete_after_transfer_clears_new_owners_index() {
     create_did(&owner_auth, &state, Some("tenant/del-after"), false, None)
         .await
         .expect("create");
-    change_did_owner(&owner_auth, &state, "tenant/del-after", &new_owner)
+    change_did_owner(&owner_auth, &state, "tenant/del-after", &new_owner, None)
         .await
-        .expect("transfer");
-
+        .expect("offer");
     let new_owner_auth = auth_for(&new_owner, Role::Owner);
+    change_did_owner(
+        &new_owner_auth,
+        &state,
+        "tenant/del-after",
+        &new_owner,
+        None,
+    )
+    .await
+    .expect("accept");
+
     delete_did(&new_owner_auth, &state, "tenant/del-after", None)
         .await
         .expect("new owner deletes");

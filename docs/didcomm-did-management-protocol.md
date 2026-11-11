@@ -47,7 +47,7 @@ The protocol covers:
 
 | Message Type | Direction | Description |
 |---|---|---|
-| `https://affinidi.com/webvh/1.0/did/change-owner` | Client -> Server | Transfer ownership of an existing DID to another DID. Requester must be the current owner or an admin; the new owner must already be in the ACL. |
+| `https://affinidi.com/webvh/1.0/did/change-owner` | Client -> Server | Transfer ownership of an existing DID to another DID. An admin moves it at once; an owner offers it, and it moves when the new owner accepts. The new owner's ACL entry, domain scope and quota must allow the DID. |
 | `https://affinidi.com/webvh/1.0/did/change-owner-confirm` | Server -> Client | Confirm successful ownership transfer |
 
 ### Witness Management
@@ -935,16 +935,17 @@ admin-driven re-assignment.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `mnemonic` | string | Yes | The DID slot being transferred. |
-| `new_owner` | string | Yes | The DID receiving ownership. Must be in the ACL. Validated via `validate_did_format` (trim, `did:` prefix, no control chars, ≤ 2048 bytes). |
+| `new_owner` | string | Yes | The DID receiving ownership. Validated via `validate_did_format` (trim, `did:` prefix, no control chars, ≤ 2048 bytes). |
 
 **Server Processing:**
 
-1. Authorize the sender against the existing record's owner (must be the current owner, or have `Admin` role).
+1. Authorize the sender: the current owner, an `Admin`, or the DID an outstanding offer names, accepting it by naming itself as `new_owner`.
 2. Validate `new_owner`'s format.
-3. If `new_owner == current_owner`: no-op, return success.
-4. Verify `new_owner` is in the ACL — otherwise reject with `e.p.did.validation-error` (transferring to an identity that can never authenticate would lose the slot).
-5. Atomic batch write: update `DidRecord.owner` and `updated_at`; remove `owner:{prev}:{mnemonic}` index entry; insert `owner:{new}:{mnemonic}` index entry.
-6. Respond with `did/change-owner-confirm` or `did/problem-report`.
+3. If `new_owner == current_owner`: no-op (withdrawing any outstanding offer), return success.
+4. An owner who is not an admin only records an offer (`did_xfer:{mnemonic}`, 72 hours); nothing moves and nothing about `new_owner` is looked up. The offer lapses if the slot changes owner or is registered again.
+5. Before the slot moves (an admin's request, or an acceptance), `new_owner` must hold an ACL entry whose role owns DIDs (`Owner` or `Admin`), with a domain scope covering the slot and room in its count and size quotas; otherwise the request is refused as `targetNotAuthorized`.
+6. Atomic batch write: update `DidRecord.owner` and `updated_at`; remove `owner:{prev}:{mnemonic}` index entry; insert `owner:{new}:{mnemonic}` index entry; remove the offer.
+7. Respond with `did/change-owner-confirm` or `did/problem-report`.
 
 Authorization order is deliberate: caller-authorization runs *before* `new_owner` format validation so a cross-owner attacker submitting a malformed `new_owner` gets `e.p.did.unauthorized` (correct error class), not `e.p.did.validation-error`.
 

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   View,
   Text,
+  TextInput,
   StyleSheet,
   Pressable,
 } from "react-native";
@@ -39,6 +40,9 @@ export default function Login() {
   const router = useRouter();
   const [passkeyLoading, setPasskeyLoading] = useState(false);
   const [passkeyError, setPasskeyError] = useState<string | null>(null);
+  // Optional: name your DID so a security key that the browser does not
+  // offer by itself (one enrolled as non-discoverable) is asked for by id.
+  const [passkeySubject, setPasskeySubject] = useState("");
   const [walletLoading, setWalletLoading] = useState(false);
   const [walletError, setWalletError] = useState<string | null>(null);
   const walletAvailable = isWalletAvailable();
@@ -141,7 +145,9 @@ export default function Login() {
     setPasskeyLoading(true);
     setPasskeyError(null);
     try {
-      const { authId, options } = await api.passkeyLoginStart();
+      const { authId, options } = await api.passkeyLoginStart(
+        passkeySubject.trim() || undefined,
+      );
       const credential = await getPasskeyCredential({ publicKey: options });
       const result = await api.passkeyLoginFinish(authId, credential);
       setAuthMethod("passkey");
@@ -343,6 +349,16 @@ export default function Login() {
           </View>
         )}
 
+        <TextInput
+          style={styles.subjectInput}
+          placeholder="Your DID (optional; for a security key that is not offered)"
+          placeholderTextColor={colors.textTertiary}
+          value={passkeySubject}
+          onChangeText={setPasskeySubject}
+          autoCapitalize="none"
+          autoCorrect={false}
+          accessibilityLabel="Your DID, to sign in with a security key the browser does not offer"
+        />
         <Pressable
           style={[styles.button, passkeyLoading && styles.disabled]}
           onPress={handlePasskeyLogin}
@@ -690,6 +706,17 @@ const styles = StyleSheet.create({
   },
   disabled: {
     opacity: 0.5,
+  },
+  subjectInput: {
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radii.md,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    marginBottom: spacing.sm,
+    fontSize: 13,
+    fontFamily: fonts.regular,
+    color: colors.textPrimary,
   },
   dangerButton: {
     backgroundColor: "transparent",

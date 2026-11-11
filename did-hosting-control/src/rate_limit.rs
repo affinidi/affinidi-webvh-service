@@ -1,5 +1,6 @@
 //! The control plane's own rate limits: per client address on
-//! `POST /api/auth/challenge`, and per source on invite redemption.
+//! `POST /api/auth/challenge`, and per source on opening a passkey login and
+//! on invite redemption.
 //!
 //! `POST /api/auth/challenge` is the only unauthenticated request-shape
 //! exposed by the control plane (everything else requires Bearer
@@ -67,6 +68,28 @@ pub const REDEEM_LIMITER_NAME: &str = "passkey-redeem-per-source";
 /// doesn't need to make.
 pub fn redeem_limiter() -> KeyedRateLimiter<String> {
     KeyedRateLimiter::new(REDEEM_LIMITER_NAME, REDEEM_MAX_PER_WINDOW, WINDOW_SECS)
+}
+
+/// Passkey login ceremonies one source may open per [`WINDOW_SECS`]. Opening
+/// one is unauthenticated and stores a row until it is finished or swept, so
+/// this bounds how many a single source can leave behind; a person signing in
+/// opens one per attempt.
+pub const LOGIN_START_MAX_PER_WINDOW: u64 = 30;
+
+/// The `limiter` a refused login start names.
+pub const LOGIN_START_LIMITER_NAME: &str = "passkey-login-start-per-source";
+
+/// The per-source limiter for `auth/passkey/login/start` (the task declares
+/// `rateLimited` for "the issuer's login-start budget"). A source is what the
+/// transport vouches for, as for [`redeem_limiter`]: the client IP on HTTPS
+/// (`ip:…`), the authenticated sender on TSP and DIDComm (`vid:…`).
+/// Per-process, for the reason [`redeem_limiter`] gives.
+pub fn login_start_limiter() -> KeyedRateLimiter<String> {
+    KeyedRateLimiter::new(
+        LOGIN_START_LIMITER_NAME,
+        LOGIN_START_MAX_PER_WINDOW,
+        WINDOW_SECS,
+    )
 }
 
 /// Self-registration attempts one source may make per [`WINDOW_SECS`].
