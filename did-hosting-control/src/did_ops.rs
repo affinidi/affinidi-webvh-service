@@ -11,6 +11,7 @@ use did_hosting_common::did_ops::{
 };
 use did_hosting_common::method::publication::Publication;
 use did_hosting_common::server::acl::validate_did_format;
+use did_hosting_common::server::agent_name_index;
 use did_hosting_common::server::error::AgentNameError;
 use did_hosting_common::server::identity::mnemonic_from_did;
 use did_hosting_common::server::mnemonic::{
@@ -777,6 +778,16 @@ pub async fn register_did_atomic(
     Ok(new_record)
 }
 
+/// Refuse a path no slot can have before taking its lock, so a malformed
+/// path does not add an entry to the lock map. Accepts either grammar —
+/// [`prepare_republish`] applies the one the stored record calls for once the
+/// lock is held — and reports the shared grammar's error when both fail.
+fn validate_slot_path_shape(mnemonic: &str) -> Result<(), AppError> {
+    validate_mnemonic(mnemonic).or_else(|e| {
+        did_hosting_common::server::mnemonic::validate_webs_mnemonic(mnemonic).map_err(|_| e)
+    })
+}
+
 /// Shared front-half of a new-version publish: authorize the caller, verify
 /// the submitted log's cryptographic proofs, run the host/domain safety
 /// checks, and advance the loaded record's version/size/did_id/services/domain
@@ -1136,23 +1147,13 @@ pub(crate) type AgentNameLocks = Vec<tokio::sync::OwnedMutexGuard<()>>;
 /// is always taken first, and the name locks after it in sorted order. Nothing
 /// takes a slot lock while holding a name lock.
 ///
-/// The keys live in the same `PathLocks` map as slot paths, behind a `::`
-/// prefix no mnemonic can carry.
+/// The keys live in the same `PathLocks` map as slot paths
+/// ([`agent_name_index::lock_key`]).
 pub(crate) async fn lock_agent_names(
     state: &AppState,
     index_keys: impl IntoIterator<Item = String>,
 ) -> AgentNameLocks {
-    let mut keys: Vec<String> = index_keys
-        .into_iter()
-        .map(|key| format!("::agent-name:{key}"))
-        .collect();
-    keys.sort();
-    keys.dedup();
-    let mut guards = Vec::with_capacity(keys.len());
-    for key in &keys {
-        guards.push(state.path_locks.guard(key).await);
-    }
-    guards
+    agent_name_index::lock_names(&state.path_locks, index_keys).await
 }
 
 /// Whether the index entry for `name` on `domain` belongs to a slot other
@@ -1182,54 +1183,6 @@ async fn agent_name_held_by_other(
     Ok(record.is_some_and(|r| r.agent_names.iter().any(|e| e.name == name)))
 }
 
-/// The agent-name index keys that point at `record`'s slot.
-///
-/// A name is scoped to the record's domain, or to its DID's host on a legacy
-/// record that carries none; both are checked so a record tagged later still
-/// finds entries written under either. Only entries whose value is this
-/// mnemonic are returned, so releasing them never touches another slot's
-/// entry. The caller holds the names' locks (see [`agent_name_index_keys`]).
-async fn owned_agent_name_keys(
-    state: &AppState,
-    record: &DidRecord,
-) -> Result<Vec<String>, AppError> {
-    let mut owned = Vec::new();
-    for key in agent_name_index_keys(record) {
-        if state
-            .dids_ks
-            .get_raw(key.clone())
-            .await?
-            .is_some_and(|bytes| bytes == record.mnemonic.as_bytes())
-        {
-            owned.push(key);
-        }
-    }
-    Ok(owned)
-}
-
-/// Every index key `record`'s agent names could be filed under.
-fn agent_name_index_keys(record: &DidRecord) -> Vec<String> {
-    let mut domains = Vec::new();
-    if !record.domain.is_empty() {
-        domains.push(record.domain.clone());
-    }
-    if let Some(host) = record
-        .did_id
-        .as_deref()
-        .and_then(|d| did_hosting_common::server::domain::extract_did_host(d).ok())
-        && !domains.contains(&host)
-    {
-        domains.push(host);
-    }
-    let mut keys = Vec::new();
-    for domain in &domains {
-        for entry in &record.agent_names {
-            keys.push(agent_name_key(domain, &entry.name));
-        }
-    }
-    keys
-}
-
 pub async fn publish_did(
     auth: &AuthClaims,
     state: &AppState,
@@ -1242,7 +1195,8 @@ pub async fn publish_did(
     // the same lock — without it a publish and a `set` on the same DID
     // interleave between check and commit. Two slots claiming the same free
     // name are serialised by the per-name locks `reconcile_agent_names` takes.
-    let _guard = state.path_locks.guard(mnemonic).await;
+    validate_slot_path_shape(mnemonic)?;
+    let slot_guard = state.path_locks.guard(mnemonic).await;
 
     let (mut record, domain, publication) =
         prepare_republish(auth, state, mnemonic, did_log, request_domain).await?;
@@ -1252,7 +1206,7 @@ pub async fn publish_did(
     // Keep the authoritative registry in step with what the document claims —
     // applying the same preconditions `set` does, so this path cannot be used
     // to capture a reserved name or take one from another DID.
-    let (claimed, released, _name_locks) = reconcile_agent_names(
+    let (claimed, released, name_locks) = reconcile_agent_names(
         state,
         &mut record,
         mnemonic,
@@ -1280,6 +1234,11 @@ pub async fn publish_did(
         batch.remove(&state.dids_ks, agent_name_key(&domain, name));
     }
     batch.commit().await?;
+    // Released before the identity check below, which can reach the network
+    // when this is the service's own DID; nothing after this point reads or
+    // writes the slot or its names.
+    drop(name_locks);
+    drop(slot_guard);
     invalidate_cached_content(state, mnemonic);
 
     // Mirror did-hosting-server's `record_update` call so total_updates /
@@ -1445,7 +1404,8 @@ async fn apply_agent_name_op(
     // Serialise the read-modify-write on this slot: the collision check, the
     // registry mutation, and the index write must not interleave with another
     // op on the same DID.
-    let _guard = state.path_locks.guard(mnemonic).await;
+    validate_slot_path_shape(mnemonic)?;
+    let slot_guard = state.path_locks.guard(mnemonic).await;
 
     // Authorize + verify the submitted document + advance the record. This
     // yields not_owner / invalid_did_data / unknown_domain exactly as a plain
@@ -1466,7 +1426,7 @@ async fn apply_agent_name_op(
     let index_key = agent_name_key(&domain, &name);
     // The slot lock above does not cover the index entry, which every slot on
     // the domain shares: hold the name's own lock from the check to the commit.
-    let _name_locks = lock_agent_names(state, [index_key.clone()]).await;
+    let name_locks = lock_agent_names(state, [index_key.clone()]).await;
 
     // Verb-specific precondition + registry mutation, yielding the index
     // side-effect to fold into the commit batch below.
@@ -1535,6 +1495,9 @@ async fn apply_agent_name_op(
         IndexWrite::Keep => {}
     }
     batch.commit().await?;
+    // As in `publish_did`: not held across the identity check below.
+    drop(name_locks);
+    drop(slot_guard);
     invalidate_cached_content(state, mnemonic);
 
     state.stats_collector.record_update(mnemonic);
@@ -2000,23 +1963,39 @@ pub async fn delete_did(
 
     ensure_slot_domain_matches(&record, request_domain)?;
 
-    // Release the slot's agent names with it, in the same batch. Otherwise the
-    // index keeps pointing at a slot that no longer exists: the names read as
-    // taken to everyone else, and whoever next registers this path finds them
-    // already pointing at it. Only entries that point here are removed.
-    let _name_locks = lock_agent_names(state, agent_name_index_keys(&record)).await;
-    let released_names = owned_agent_name_keys(state, &record).await?;
+    // The slot's agent names are released with it. Otherwise the index keeps
+    // pointing at a slot that no longer exists, and the names read as taken
+    // to everyone else. Only entries that point here are removed.
+    let _name_locks = lock_agent_names(state, agent_name_index::index_keys(&record)).await;
+    let released_names = agent_name_index::owned_keys(&state.dids_ks, &record).await?;
 
     let mut batch = state.store.batch();
     batch.remove(&state.dids_ks, did_key(mnemonic));
     batch.remove(&state.dids_ks, content_log_key(mnemonic));
     batch.remove(&state.dids_ks, content_witness_key(mnemonic));
     batch.remove(&state.dids_ks, owner_key(&record.owner, mnemonic));
-    for key in released_names {
-        batch.remove(&state.dids_ks, key);
-    }
     batch.commit().await?;
     invalidate_cached_content(state, mnemonic);
+
+    // The names go in a write of their own, after the record: a slot can hold
+    // more names than one transactional write takes on some backends
+    // (DynamoDB's is 100 items), and that must not make the slot undeletable.
+    // A name whose removal fails or is cut short by a crash is harmless — an
+    // index entry pointing at a slot that no longer exists does not hold the
+    // name (`agent_name_held_by_other`) — so this logs rather than fails.
+    if !released_names.is_empty() {
+        let mut names_batch = state.store.batch();
+        for key in released_names {
+            names_batch.remove(&state.dids_ks, key);
+        }
+        if let Err(e) = names_batch.commit_in_parts().await {
+            warn!(
+                mnemonic = %mnemonic,
+                error = %e,
+                "DID deleted; some of its agent-name index entries were not removed"
+            );
+        }
+    }
     state.stats_collector.decrement_total_dids();
     crate::stats_admin::delete_did_stats(state, mnemonic).await;
 

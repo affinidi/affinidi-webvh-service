@@ -45,9 +45,15 @@ impl RedisBackend {
 fn redacted_url(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(mut parsed) => {
-            let had_credentials = !parsed.username().is_empty()
-                || parsed.password().is_some()
-                || parsed.query().is_some();
+            let query_credentials = parsed.query_pairs().any(|(key, _)| {
+                matches!(
+                    key.to_ascii_lowercase().as_str(),
+                    "pass" | "password" | "user" | "username"
+                )
+            });
+            let had_credentials =
+                !parsed.username().is_empty() || parsed.password().is_some() || query_credentials;
+            let had_query = parsed.query().is_some();
             // Both setters fail only for a URL that cannot carry credentials,
             // which then has none to remove.
             let _ = parsed.set_username("");
@@ -57,6 +63,8 @@ fn redacted_url(url: &str) -> String {
             let mut shown = parsed.to_string();
             if had_credentials {
                 shown.push_str(" (credentials redacted)");
+            } else if had_query {
+                shown.push_str(" (query omitted)");
             }
             shown
         }
@@ -297,6 +305,10 @@ mod tests {
             (
                 "redis+unix:///run/redis.sock?db=1&pass=hunter2",
                 "redis+unix:///run/redis.sock (credentials redacted)",
+            ),
+            (
+                "redis://127.0.0.1:6379/?protocol=resp3",
+                "redis://127.0.0.1:6379/ (query omitted)",
             ),
         ] {
             let shown = redacted_url(input);

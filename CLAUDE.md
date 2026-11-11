@@ -150,8 +150,8 @@ first, then the names in sorted order) — and the invariant to preserve when
 touching any of this is:
 
 > **A name only ever changes owner through an explicit `remove` by its current
-> holder** (or the deletion of the DID that holds it, which releases its names
-> in the same write).
+> holder** (or the deletion of the DID that holds it, which releases its
+> names).
 
 Layer-1 verification cannot enforce that for you, and it is worth understanding
 why: after a hijack the new holder's document genuinely claims the name and the

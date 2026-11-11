@@ -51,13 +51,21 @@ is refused as taken.
 
 - `agent-name/remove` retires the name's index entry only while it points at
   the DID removing it; it no longer deletes another DID's entry.
-- `did/delete` releases the deleted DID's agent names (active and parked) in
-  the same write as the delete, again only entries that point at that DID.
-  Previously they stayed indexed against a DID that no longer existed.
+- `did/delete` releases the deleted DID's agent names (active and parked),
+  again only entries that point at that DID. Previously they stayed indexed
+  against a DID that no longer existed. The names are removed in a second
+  write right after the record, so a DID with many names stays deletable on
+  stores that cap one transactional write (DynamoDB: 100 items).
+- A domain purge likewise removes only the index entries that still point at
+  each purged DID, after the record; in the daemon it now takes the control
+  plane's DID and name locks while it deletes.
+- The DID and name locks are released as soon as a publish or agent-name
+  change commits, before the check for a rotation of the service's own DID.
 - **Behaviour change:** an index entry that points at a DID which no longer
   exists, or whose record no longer lists the name, no longer holds the name.
-  Names left behind by earlier deletes become claimable again, and
-  `agent-name/check` reports them available.
+  `agent-name/check` reports such a name available and it can be claimed.
+- **Upgrading:** agent names left indexed by DIDs deleted before this release
+  become claimable again by any DID on their domain.
 
 ### Fixed — error text with multi-byte characters is truncated safely
 
