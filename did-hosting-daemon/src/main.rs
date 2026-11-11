@@ -1127,6 +1127,15 @@ async fn run_daemon(config_path: Option<PathBuf>) {
                         .latency_unit(tower_http::LatencyUnit::Millis),
                 ),
         )
+        // The same response headers every standalone service sets (CSP,
+        // `nosniff`, framing, HSTS, `no-store` unless the handler chose its
+        // own `Cache-Control`), over everything the daemon serves: the
+        // console and its assets, the Trust Task listener, the embedded
+        // witness and watcher, and DID resolution, whose handlers set
+        // `Cache-Control: public, …` themselves and keep it.
+        .layer(axum::middleware::from_fn(
+            did_hosting_common::server::security_headers,
+        ))
         // Allow browser-based resolvers to fetch public DID documents
         // cross-origin. Read-only, unauthenticated, wildcard origin.
         .layer(did_hosting_common::server::public_resolution_cors())

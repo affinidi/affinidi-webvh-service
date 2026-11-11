@@ -645,3 +645,84 @@ async fn resolution_is_rate_limited_per_address() {
 
     daemon.teardown().await;
 }
+
+/// Every surface the daemon serves carries the same response headers the
+/// standalone services set: the console, the Trust Task listener, the embedded
+/// witness and watcher, and DID resolution. Resolution keeps the cacheable
+/// `Cache-Control` its handlers choose; everything else defaults to
+/// `no-store`.
+#[tokio::test]
+async fn every_daemon_surface_carries_the_response_headers() {
+    let daemon = Daemon::spawn_with(&[], &[], true).await;
+    let http = reqwest::Client::new();
+
+    fn assert_common(path: &str, headers: &reqwest::header::HeaderMap) {
+        let csp = headers
+            .get("content-security-policy")
+            .unwrap_or_else(|| panic!("{path}: no Content-Security-Policy"))
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'self'"), "{path}: CSP {csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{path}: CSP {csp}");
+        assert_eq!(headers["x-content-type-options"], "nosniff", "{path}");
+        assert_eq!(headers["x-frame-options"], "DENY", "{path}");
+        assert_eq!(headers["referrer-policy"], "no-referrer", "{path}");
+        assert!(
+            headers.contains_key("strict-transport-security"),
+            "{path}: no HSTS"
+        );
+    }
+
+    // The console (or its 404 when the bundle was not built) and a client-side
+    // route the SPA fallback answers.
+    for path in ["/", "/dids"] {
+        let resp = http
+            .get(format!("{}{path}", daemon.base_url))
+            .send()
+            .await
+            .expect("GET the console");
+        assert_common(path, resp.headers());
+        assert_eq!(resp.headers()["cache-control"], "no-store", "{path}");
+    }
+
+    // The Trust Task listener, answering a document it cannot parse.
+    let resp = http
+        .post(format!("{}/api/trust-tasks", daemon.base_url))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("POST trust-tasks");
+    assert_common("/api/trust-tasks", resp.headers());
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+
+    // The embedded witness's and watcher's listeners.
+    for path in ["/witness/api/trust-tasks", "/watcher/ghost/did.jsonl"] {
+        let resp = if path.starts_with("/witness") {
+            http.post(format!("{}{path}", daemon.base_url))
+                .header("content-type", "application/json")
+                .body("{}")
+                .send()
+                .await
+        } else {
+            http.get(format!("{}{path}", daemon.base_url)).send().await
+        }
+        .expect("request the daemon");
+        assert_common(path, resp.headers());
+    }
+
+    // Resolution: the headers are there, and its own caching is kept.
+    let resp = http
+        .get(format!("{}/.well-known/did.jsonl", daemon.base_url))
+        .send()
+        .await
+        .expect("GET the root DID");
+    assert!(resp.status().is_success());
+    assert_common("/.well-known/did.jsonl", resp.headers());
+    let cache = resp.headers()["cache-control"].to_str().unwrap();
+    assert_ne!(cache, "no-store", "resolution keeps its own Cache-Control");
+    // And browser resolvers can still read it cross-origin.
+    assert_eq!(resp.headers()["access-control-allow-origin"], "*");
+
+    daemon.teardown().await;
+}
