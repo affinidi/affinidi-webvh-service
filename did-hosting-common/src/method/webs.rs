@@ -254,6 +254,41 @@ impl Webs {
         })
     }
 
+    /// The `did:webs` identifier a slot builds: `did:webs:{domain}:{path}:{AID}`.
+    ///
+    /// `mnemonic` is the slot's path, already ending in the AID, with `/`
+    /// between segments; `domain` is the hosting domain as the registry
+    /// holds it (decoded). The host's port separator is percent-encoded
+    /// (`%3A`), because a DID's labels are colon-separated: a literal
+    /// `localhost:8534` would parse back as host `localhost` with `8534` as
+    /// a path segment — a different DID, on a host that is not this one.
+    /// Idempotent for a domain already in the encoded form.
+    ///
+    /// The one place the identifier is built from a slot, so the write
+    /// path and the self-registration gate cannot disagree about it.
+    pub fn slot_did(domain: &str, mnemonic: &str) -> String {
+        let did_domain = domain.replace(':', "%3A");
+        format!("did:webs:{did_domain}:{}", mnemonic.replace('/', ":"))
+    }
+
+    /// [`Self::verify_artifacts`], returning the derived document itself
+    /// rather than its bytes: for a caller that verifies a proof against
+    /// the key state the stream establishes (self-registration, where the
+    /// DID is not resolvable yet because it is the very thing being
+    /// published).
+    ///
+    /// # Errors
+    /// As [`Self::verify_artifacts`].
+    pub fn verified_document(
+        did: &str,
+        keri_cesr: &[u8],
+    ) -> Result<affinidi_did_common::Document, MethodError> {
+        let parsed =
+            DidWebs::parse(did).map_err(|e| MethodError::Malformed(format!("{did}: {e}")))?;
+        resolve_from_artifacts(&parsed, keri_cesr, None)
+            .map_err(|e| MethodError::Validation(format!("{did}: {e}")))
+    }
+
     /// Derive the `did.json` bytes for a stored stream.
     ///
     /// Read-path counterpart to [`Self::verify_artifacts`]. Re-verifies

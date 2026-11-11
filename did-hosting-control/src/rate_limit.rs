@@ -69,6 +69,32 @@ pub fn redeem_limiter() -> KeyedRateLimiter<String> {
     KeyedRateLimiter::new(REDEEM_LIMITER_NAME, REDEEM_MAX_PER_WINDOW, WINDOW_SECS)
 }
 
+/// Self-registration attempts one source may make per [`WINDOW_SECS`].
+///
+/// A `did:webs` outside the ACL that registers itself makes the service
+/// verify the key event log it submits — every event's SAID, signature and
+/// pre-rotation commitment — before anything proves who sent it, which is
+/// work a stranger can ask for. A node registers its identifier once, and
+/// again only to retry; this bounds what a single source can make the
+/// service verify.
+pub const WEBS_SELF_REGISTER_MAX_PER_WINDOW: u64 = 10;
+
+/// The `limiter` a refused self-registration names.
+pub const WEBS_SELF_REGISTER_LIMITER_NAME: &str = "webs-self-register-per-source";
+
+/// The per-source limiter for `did:webs` self-registration
+/// (`crate::webs_self_register`). A source is what the transport vouches
+/// for, as for [`redeem_limiter`]: the client IP on HTTPS (`ip:…`), the
+/// authenticated sender on TSP and DIDComm (`vid:…`). Per-process, for the
+/// reason [`redeem_limiter`] gives.
+pub fn webs_self_register_limiter() -> KeyedRateLimiter<String> {
+    KeyedRateLimiter::new(
+        WEBS_SELF_REGISTER_LIMITER_NAME,
+        WEBS_SELF_REGISTER_MAX_PER_WINDOW,
+        WINDOW_SECS,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

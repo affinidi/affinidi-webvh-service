@@ -104,6 +104,9 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         client_ips: Default::default(),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::challenge_limiter()),
         redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::redeem_limiter()),
+        webs_self_register_limiter: Arc::new(
+            did_hosting_control::rate_limit::webs_self_register_limiter(),
+        ),
         large_document_budget: Arc::new(
             did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
         ),

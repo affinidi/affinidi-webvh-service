@@ -37,7 +37,11 @@ metrics = ["did-hosting-common/metrics"]
 # webvh and web need no feature here: their write paths predate the
 # method abstraction and are always compiled. webs is opt-in for the
 # same reason as everywhere else — it pulls the KERI stack.
-method-webs = ["did-hosting-common/method-webs"]
+#
+# It also lets a `did:webs` outside the ACL register itself on a domain whose
+# operator enables it (`[[hosting.webs_self_register]]`), authenticated by its
+# own key event log — see `src/webs_self_register.rs`.
+method-webs = ["did-hosting-common/method-webs", "dep:affinidi-did-common"]
 ui = ["dep:rust-embed", "dep:mime_guess"]
 keyring = ["did-hosting-common/keyring"]
 aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "did-hosting-common/aws-secrets"]
@@ -116,6 +120,9 @@ trust-tasks-https = { workspace = true }
 trust-tasks-didcomm = { workspace = true }
 trust-tasks-proof = { workspace = true }
 chrono = { workspace = true }
+# `method-webs` only: the document a self-registering did:webs's key event log
+# implies, which its registration's proof is checked against.
+affinidi-did-common = { workspace = true, optional = true }
 # Direct dep for signing the request leg of outbound approval Trust Tasks
 # (task-consent/request, auth/step-up/approve-request) with the control DID's
 # operational (`authentication`) key — see src/signing.rs and issue #147.
@@ -184,6 +191,10 @@ tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true
+# The self-registration tests incept real did:webs identifiers, and sign as
+# their keys. Tests only: the service itself never holds KERI keys, and this
+# brings the KERI store (LMDB) into the test graph alone.
+affinidi-keri = "0.4"
 # `validate` is also on in `[dependencies]` above now (the invite/update
 # handler uses it at runtime); kept explicit here too so the table's tests
 # can check any reply against the schema its type names
