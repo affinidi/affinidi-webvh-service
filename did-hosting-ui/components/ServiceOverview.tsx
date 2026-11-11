@@ -269,7 +269,12 @@ export function ServiceOverviewPanel({
 
   // Above the early returns, so the hook order stays fixed. The panel polls
   // every 5s; the lookup only re-fires when the set of DIDs actually changes.
-  const agentNames = useAgentNames((data?.services ?? []).map((s) => s.did));
+  // Background: after the first load, a change in the DID set can only come
+  // from a poll tick.
+  const agentNames = useAgentNames(
+    (data?.services ?? []).map((s) => s.did),
+    { background: true },
+  );
 
   if (loading && !data) {
     return (

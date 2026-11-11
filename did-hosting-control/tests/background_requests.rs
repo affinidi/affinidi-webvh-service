@@ -8,7 +8,7 @@
 //! call takes.
 
 use axum::body::Body;
-use axum::http::Request;
+use axum::http::{Request, StatusCode};
 use did_hosting_common::server::acl::Role;
 use did_hosting_common::server::auth::BACKGROUND_REQUEST_HEADER;
 use did_hosting_common::server::auth::session::{get_session, now_epoch, store_session};
@@ -75,11 +75,16 @@ async fn a_background_request_leaves_the_idle_clock_alone() {
     let (token, session_id, backdated) = idle_admin_session(&ts).await;
 
     for _ in 0..3 {
-        let _ = ts
+        let resp = ts
             .router()
             .oneshot(trust_task_post(&token, true))
             .await
             .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a background request still authenticates"
+        );
     }
 
     assert_eq!(last_seen(&ts, &session_id).await, backdated);
@@ -90,11 +95,12 @@ async fn an_ordinary_request_moves_the_idle_clock() {
     let ts = TestServer::start().await;
     let (token, session_id, backdated) = idle_admin_session(&ts).await;
 
-    let _ = ts
+    let resp = ts
         .router()
         .oneshot(trust_task_post(&token, false))
         .await
         .unwrap();
+    assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
 
     assert!(last_seen(&ts, &session_id).await > backdated);
 }

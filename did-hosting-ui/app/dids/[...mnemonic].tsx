@@ -165,18 +165,20 @@ export default function DidDetail() {
   // Guards the one-time path prefill below so it never clobbers later edits.
   const namePrefilled = useRef(false);
 
-  const loadData = useCallback(() => {
+  // `background`: the reload follows a timer-driven check rather than the
+  // operator, so it must not keep the session alive (see `lib/poll.ts`).
+  const loadData = useCallback((opts: { background?: boolean } = {}) => {
     if (!mnemonic || !isAuthenticated) return;
     api
-      .getStats(mnemonic)
+      .getStats(mnemonic, opts)
       .then(setStats)
       .catch((e) => setStatsError(e.message));
     api
-      .getDid(mnemonic)
+      .getDid(mnemonic, opts)
       .then(setDidDetail)
       .catch(() => {});
     api
-      .getDidLog(mnemonic)
+      .getDidLog(mnemonic, opts)
       .then((entries) => {
         setLogEntries(entries);
         setSelectedVersion(entries.length - 1);
@@ -657,7 +659,7 @@ export default function DidDetail() {
       resubmitRef.current = null;
       pinnedVersionRef.current = null;
       setConsent(null);
-      loadData();
+      loadData({ background: true });
       // Deliberately not "your change was applied": the log advancing proves
       // only that it moved, not who moved it. Another admin, or the owner's own
       // agent, could have published in the same window, and claiming credit for

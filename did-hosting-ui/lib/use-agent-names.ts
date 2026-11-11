@@ -29,12 +29,17 @@ import { api } from "./api";
  * @param dids DIDs to resolve. Nullish entries and duplicates are fine — they
  *   are dropped before the request, so callers can pass optional fields
  *   straight through without pre-filtering.
+ * @param opts.background The lookup follows a timer-driven refresh (a polling
+ *   page), so it is sent as a background request and does not count as
+ *   session activity. See `lib/poll.ts`.
  * @returns DID -> served names (bare local parts). Absent keys mean no names;
  *   read with `names[did] ?? []`.
  */
 export function useAgentNames(
   dids: (string | null | undefined)[],
+  opts: { background?: boolean } = {},
 ): Record<string, string[]> {
+  const background = opts.background ?? false;
   const [names, setNames] = useState<Record<string, string[]>>({});
 
   // Sort so a caller re-ordering its list doesn't refetch, and join into a
@@ -59,7 +64,7 @@ export function useAgentNames(
     let cancelled = false;
     void (async () => {
       try {
-        const res = await api.resolveAgentNames(key.split(" "));
+        const res = await api.resolveAgentNames(key.split(" "), { background });
         if (!cancelled) setNames(res.names ?? {});
       } catch {
         // Best-effort — see the module doc. Render the DIDs alone.
@@ -69,7 +74,7 @@ export function useAgentNames(
     return () => {
       cancelled = true;
     };
-  }, [key]);
+  }, [key, background]);
 
   return names;
 }

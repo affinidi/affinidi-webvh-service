@@ -71,6 +71,20 @@ describe("background requests", () => {
 
     expect(tasks(sent).map((s) => s.background)).toEqual([true, false]);
   });
+
+  it("marks the reads a poll triggers: agent names, DID detail and stats", async () => {
+    const sent = refuseAll();
+    await api.resolveAgentNames(["did:example:a"], { background: true }).catch(() => undefined);
+    await api.getStats("abc", { background: true }).catch(() => undefined);
+    await api.getDid("abc", { background: true }).catch(() => undefined);
+    await vi.waitFor(() => expect(tasks(sent)).toHaveLength(4));
+    for (const s of tasks(sent)) expect(s.background, s.doc.type).toBe(true);
+
+    const before = tasks(sent).length;
+    await api.resolveAgentNames(["did:example:a"]).catch(() => undefined);
+    await api.getStats("abc").catch(() => undefined);
+    expect(tasks(sent).slice(before).map((s) => s.background)).toEqual([false, false]);
+  });
 });
 
 /** A poll environment the test drives by hand. */

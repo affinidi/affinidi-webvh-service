@@ -698,10 +698,10 @@ export const api = {
 
   /** A slot with its log summarised: `did/info` for the record, `did/log` for
    *  the summary (webvh parameters are read from the log itself). */
-  getDid: async (mnemonic: string): Promise<DidDetailResponse> => {
+  getDid: async (mnemonic: string, opts: ReadOptions = {}): Promise<DidDetailResponse> => {
     const [info, log] = await Promise.all([
-      trustTask<DidInfo.Payload, DidInfo.Response>(T.didInfo, { mnemonic }),
-      didLog(mnemonic, false).catch((e) => {
+      trustTask<DidInfo.Payload, DidInfo.Response>(T.didInfo, { mnemonic }, opts),
+      didLog(mnemonic, false, opts).catch((e) => {
         // A slot with no published content has no log; that is not a failure.
         if (isRejection(e, "notFound")) return null;
         throw e;
@@ -766,11 +766,15 @@ export const api = {
 
   /** DID -> its served agent names, batched. Only DIDs the caller may read
    *  and this service serves come back; read a miss and an empty list alike. */
-  resolveAgentNames: async (dids: string[]): Promise<AgentNameResolveResponse> => {
+  resolveAgentNames: async (
+    dids: string[],
+    opts: ReadOptions = {},
+  ): Promise<AgentNameResolveResponse> => {
     if (dids.length === 0) return { names: {} };
     const r = await trustTask<AgentNameResolve.Payload, AgentNameResolve.Response>(
       T.agentNameResolve,
       { dids: dids as [string, ...string[]] },
+      opts,
     );
     const names: Record<string, string[]> = {};
     for (const e of r.entries) names[e.did] = e.names;
@@ -818,9 +822,9 @@ export const api = {
 
   // ---- Stats ----
 
-  getStats: async (mnemonic: string): Promise<DidStats> =>
+  getStats: async (mnemonic: string, opts: ReadOptions = {}): Promise<DidStats> =>
     statsFromWire(
-      await trustTask<StatsGet.Payload, StatsGet.Response>(T.statsGet, { mnemonic }),
+      await trustTask<StatsGet.Payload, StatsGet.Response>(T.statsGet, { mnemonic }, opts),
     ),
 
   getServerStats: async (opts: ReadOptions = {}): Promise<ServerStats> =>
