@@ -333,6 +333,24 @@ impl ReplayCache {
         self.check(signer, id, issued_at).map_err(AppError::from)
     }
 
+    /// Whether `(signer, id)` is recorded for a document issued at
+    /// `issued_at`, without recording anything. For a service that keeps
+    /// more than one cache, to refuse a document already accepted through
+    /// another one.
+    pub fn contains(&self, signer: &str, id: &str, issued_at: Option<DateTime<Utc>>) -> bool {
+        let Some(issued_at) = issued_at.and_then(|t| u64::try_from(t.timestamp()).ok()) else {
+            return false;
+        };
+        let record = (u128::from(self.keys.0.hash_one((signer, id))) << 64)
+            | u128::from(self.keys.1.hash_one((signer, id)));
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .buckets
+            .get(&(issued_at / BUCKET_SECS))
+            .is_some_and(|b| b.records.contains(&record))
+    }
+
     /// Number of records currently held.
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).total
@@ -345,6 +363,20 @@ impl ReplayCache {
 
 #[cfg(test)]
 mod tests {
+
+    /// `contains` reports a record without recording one.
+    #[test]
+    fn contains_reads_without_recording() {
+        let cache = ReplayCache::new();
+        let now = Some(Utc::now());
+        assert!(!cache.contains("did:example:a", "urn:1", now));
+        assert!(cache.is_empty());
+        cache.check("did:example:a", "urn:1", now).unwrap();
+        assert!(cache.contains("did:example:a", "urn:1", now));
+        assert!(!cache.contains("did:example:b", "urn:1", now));
+        assert!(!cache.contains("did:example:a", "urn:1", None));
+    }
+
     use super::*;
 
     const NOW: u64 = 1_700_000_000;

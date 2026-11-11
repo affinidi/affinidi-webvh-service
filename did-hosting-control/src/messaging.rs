@@ -1641,6 +1641,12 @@ async fn route_trust_task_doc(
                 None if listed_signer => {
                     verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await
                 }
+                // The delegate of a proxied login whose principal, an ACL
+                // member, signed the evidence naming it: verified as the
+                // member's own requests are.
+                None if crate::trust_tasks_auth::vouched_delegate(state, &doc).await => {
+                    verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await
+                }
                 None => match state
                     .unlisted_signers
                     .verify(&doc, sender, my_vid, verifier)
@@ -1689,26 +1695,51 @@ async fn route_trust_task_doc(
     // document id. A captured document re-submitted inside the freshness window
     // — on any transport, in any framing — is refused as an id conflict.
     // At its bounds the cache refuses (retryable) rather than forgetting.
-    // A signer the ACL does not list is recorded in a cache of its own, so
-    // such records can never fill the shared one every operational request
-    // depends on.
-    let replay_cache = if listed_signer {
-        &*state.replay_cache
+    // Which cache, if any, is `replay_partition`'s choice: ACL members' go to
+    // the shared one, and nothing a signer the ACL does not list sends can
+    // fill it (see `crate::unlisted_signers`). A record already in another
+    // cache — the signer's ACL entry changed inside the window — is a replay
+    // too.
+    let replay_cache = if signed {
+        state.unlisted_signers.cache(
+            replay_partition(&type_uri, rule, listed_signer, self_registering),
+            &state.replay_cache,
+        )
     } else {
-        &state.unlisted_signers.replay
+        None
     };
-    if signed
-        && rule.uses_shared_replay_cache()
-        && let Err(e) = replay_cache.check(&principal, &doc.id, doc.issued_at)
-    {
-        warn!(did = %principal, doc_id = %doc.id, %type_uri, ?e, "trust task refused: replay cache");
-        let reason = e.reject_reason();
-        return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
-            doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
-        ))));
+    if let Some(cache) = replay_cache {
+        let replayed = state
+            .unlisted_signers
+            .all(&state.replay_cache)
+            .into_iter()
+            .filter(|other| !std::ptr::eq(*other, cache))
+            .any(|other| other.contains(&principal, &doc.id, doc.issued_at));
+        let refusal = if replayed {
+            Some(crate::replay::ReplayError::Duplicate.reject_reason())
+        } else if std::ptr::eq(cache, &state.unlisted_signers.sign_in)
+            && let Err(reason) = state.unlisted_signers.charge_sign_in(match https {
+                Some(h) => {
+                    h.ip.map_or_else(|| "ip:unknown".to_string(), |ip| format!("ip:{ip}"))
+                }
+                None => format!("vid:{sender}"),
+            })
+        {
+            Some(reason)
+        } else {
+            cache
+                .check(&principal, &doc.id, doc.issued_at)
+                .err()
+                .map(|e| e.reject_reason())
+        };
+        if let Some(reason) = refusal {
+            warn!(did = %principal, doc_id = %doc.id, %type_uri, ?reason, "trust task refused: replay cache");
+            return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
+                doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
+            ))));
+        }
     }
-    let recorded = (signed && rule.uses_shared_replay_cache())
-        .then(|| (principal.clone(), doc.id.clone(), doc.issued_at));
+    let recorded = replay_cache.map(|_| (principal.clone(), doc.id.clone(), doc.issued_at));
 
     let (reply, wrote) = did_hosting_common::server::store::track_writes(Box::pin(async {
         // Proofs are verified on every path — there is no configuration under
@@ -1798,6 +1829,7 @@ async fn route_trust_task_doc(
     // One that attempted a write may have applied part of it, so its record
     // stays and a retry must be a new document.
     if let Some((signer, id, issued_at)) = &recorded
+        && let Some(replay_cache) = replay_cache
         && !wrote
         && matches!(&reply, Ok(r) if r.is_unavailable())
     {
@@ -1845,6 +1877,36 @@ pub(crate) fn proof_rule(type_uri: &str) -> ProofRule {
         return ProofRule::Optional;
     }
     ProofRule::Authentication
+}
+
+/// Where a signed `type_uri` document's `(signer, id)` record goes (see
+/// [`crate::unlisted_signers`]): nowhere for an open read — `server/info`,
+/// capability discovery, an `auth/oob/*` version this service does not serve
+/// — or a bound-key row, which keeps its own; the shared cache for a signer
+/// the ACL lists (or the gate admitted as a configured watcher); otherwise,
+/// for a signer the ACL does not list, the sign-in cache, or the cache for
+/// everything else (a `did:webs` self-registration).
+pub(crate) fn replay_partition(
+    type_uri: &str,
+    rule: ProofRule,
+    listed_signer: bool,
+    self_registering: bool,
+) -> crate::unlisted_signers::ReplayPartition {
+    use crate::unlisted_signers::ReplayPartition;
+    use trust_tasks_rs::Payload;
+    let open_read = type_uri
+        == did_hosting_common::tasks::did_management::server::info::v0_1::Payload::TYPE_URI
+        || type_uri == trust_tasks_rs::specs::trust_task_discovery::v0_3::Payload::TYPE_URI
+        || (rule == ProofRule::Optional && type_uri.starts_with(OOB_FAMILY_PREFIX));
+    if !rule.uses_shared_replay_cache() || open_read {
+        ReplayPartition::None
+    } else if listed_signer {
+        ReplayPartition::Shared
+    } else if self_registering {
+        ReplayPartition::Other
+    } else {
+        ReplayPartition::SignIn
+    }
 }
 
 /// The `auth/oob/*` family's Type URIs (see [`proof_rule`]).

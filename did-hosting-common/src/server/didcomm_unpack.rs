@@ -339,6 +339,17 @@ fn ed25519_pubkey_from_did_key(did: &str) -> Result<[u8; 32], AppError> {
         .map_err(|_| AppError::Authentication("id_token `iss` Ed25519 key is not 32 bytes".into()))
 }
 
+/// The `iss` a compact SIOPv2 `id_token` claims, read without verifying
+/// anything — so a caller can refuse a token naming a DID it would never
+/// accept before [`verify_siop_id_token`] resolves that DID. `None` when the
+/// token is not a compact JWS with a JSON payload carrying `iss`.
+pub fn siop_id_token_claimed_issuer(id_token: &str) -> Option<String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let payload_b64 = id_token.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    serde_json::from_slice::<SiopClaims>(&bytes).ok()?.iss
+}
+
 /// Verify a SIOPv2 self-issued `id_token` (compact EdDSA JWS).
 ///
 /// Performs the cryptographic security checks; envelope/session/TTL
