@@ -214,6 +214,29 @@ async fn owner_quota_guard(state: &AppState, owner: &str) -> tokio::sync::OwnedM
         .await
 }
 
+/// Take the caller's quota lock and check its total-size quota for replacing
+/// `mnemonic`'s stored content with `new_size` bytes. Hold the returned guard
+/// through the commit of that content, and release it with the slot's guard:
+/// a publish is checked against usage that no other write of the same owner
+/// can change before it lands. Taken after the slot lock and before any
+/// agent-name lock.
+async fn hold_size_quota(
+    state: &AppState,
+    auth: &AuthClaims,
+    mnemonic: &str,
+    new_size: u64,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, AppError> {
+    let guard = owner_quota_guard(state, &auth.did).await;
+    let old_size = state
+        .dids_ks
+        .get::<DidRecord>(did_key(mnemonic))
+        .await?
+        .map(|r| r.content_size)
+        .unwrap_or(0);
+    check_total_size_limit(auth, state, old_size, new_size).await?;
+    Ok(guard)
+}
+
 /// Enforce the caller's per-account `max_did_count` before adding a new slot.
 /// Admin-exempt. `None` ACL max (or no ACL entry) means no cap.
 async fn check_did_count_limit(auth: &AuthClaims, state: &AppState) -> Result<(), AppError> {
@@ -879,7 +902,8 @@ async fn prepare_republish(
     // this slot's current content, so the owner's usage moves by
     // `new_size - record.content_size`. `record.content_size` is still the OLD
     // size here (it is overwritten below). Admin-exempt; no-op with no ACL cap.
-    let _quota_guard = owner_quota_guard(state, &auth.did).await;
+    // An early refusal only: the caller re-checks under the owner's quota lock
+    // and holds it through its commit ([`hold_size_quota`]).
     check_total_size_limit(auth, state, record.content_size, new_size).await?;
 
     // T20b: same safety check as register_did_atomic — the embedded
@@ -1129,6 +1153,7 @@ pub async fn publish_did(
         prepare_republish(auth, state, mnemonic, did_log, request_domain).await?;
     let new_size = record.content_size;
     let now = record.updated_at;
+    let quota_guard = hold_size_quota(state, auth, mnemonic, new_size).await?;
 
     // Keep the authoritative registry in step with what the document claims —
     // applying the same preconditions `set` does, so this path cannot be used
@@ -1162,6 +1187,7 @@ pub async fn publish_did(
     }
     batch.commit().await?;
     invalidate_cached_content(state, mnemonic);
+    drop(quota_guard);
 
     // Mirror did-hosting-server's `record_update` call so total_updates /
     // last_updated_at advance when the control plane is the authoritative
@@ -1340,6 +1366,7 @@ async fn apply_agent_name_op(
     // comparison is byte-identical to what a resolver will later do.
     let names = publication.agent_names(&domain);
     let claimed = names.iter().any(|n| n == &name);
+    let quota_guard = hold_size_quota(state, auth, mnemonic, record.content_size).await?;
     if claimed != op.requires_claim() {
         return Err(AgentNameError::AlsoKnownAsMismatch.into());
     }
@@ -1404,6 +1431,7 @@ async fn apply_agent_name_op(
     }
     batch.commit().await?;
     invalidate_cached_content(state, mnemonic);
+    drop(quota_guard);
 
     state.stats_collector.record_update(mnemonic);
 

@@ -25,6 +25,7 @@ use did_hosting_common::server::auth::session::{
     store_session,
 };
 use did_hosting_common::server::didcomm_profile::ObservedTransport;
+use did_hosting_common::server::passkey::invite::Purpose;
 use did_hosting_common::server::passkey::store::{self as passkey_store, cred_id_hex};
 use did_hosting_common::server::store::KS_PASSKEY_STEP_UP;
 
@@ -558,6 +559,10 @@ enum LoginCeremony {
     /// credential it answers with is looked up at finish. Holds only the
     /// challenge, whatever the number of passkeys enrolled here.
     Discoverable(webauthn_rs::prelude::DiscoverableAuthentication),
+    /// Over decoy credential ids, for a named subject with no login passkey:
+    /// no assertion can answer it, and finish fails it exactly as a failed
+    /// assertion over a real subject's credentials.
+    Decoy,
     /// Over the named subject's own credentials.
     Listed(webauthn_rs::prelude::PasskeyAuthentication),
 }
@@ -784,7 +789,7 @@ pub(crate) async fn login_start(
                     // Shaped as the listed ceremony's options: its members,
                     // with the decoys in place of real descriptors and none of
                     // the discoverable ceremony's own extensions.
-                    let (options, auth_state) = discoverable()?;
+                    let (options, _) = discoverable()?;
                     let value = serde_json::to_value(&options)?;
                     let mut public_key = value.get("publicKey").cloned().unwrap_or(value);
                     if let Some(obj) = public_key.as_object_mut() {
@@ -794,10 +799,7 @@ pub(crate) async fn login_start(
                             decoy_credentials(&decoy_key(state).await?, did)?,
                         );
                     }
-                    (
-                        pick_request_options(&public_key),
-                        LoginCeremony::Discoverable(auth_state),
-                    )
+                    (pick_request_options(&public_key), LoginCeremony::Decoy)
                 }
             }
         }
@@ -884,6 +886,21 @@ pub(crate) async fn login_finish(
                 format!("unreadable assertion: {e}"),
             )
         })?;
+    // A login that named its subject fails in one way, whatever went wrong —
+    // a credential not enrolled, not in the list, another subject's, a decoy
+    // list, an assertion that does not verify — so its outcome says nothing
+    // about whether the subject is enrolled. An unnamed one may say which.
+    let named_subject = meta.subject.is_some();
+    let failed = |unnamed_code, unnamed_message: &str| {
+        if named_subject {
+            TaskError::Declared(
+                error_codes::ASSERTION_INVALID,
+                "the assertion did not verify".into(),
+            )
+        } else {
+            TaskError::Declared(unnamed_code, unnamed_message.into())
+        }
+    };
     // The credential the assertion names, looked up before verification: a
     // discoverable ceremony verifies against exactly that credential's user.
     // The listed ceremony's own credential check still applies to it.
@@ -891,11 +908,9 @@ pub(crate) async fn login_finish(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    let mut user = passkey_store::get_passkey_user_by_cred(&state.sessions_ks, &named)
+    let user = passkey_store::get_passkey_user_by_cred(&state.sessions_ks, &named)
         .await?
-        .ok_or_else(|| {
-            TaskError::Declared(error_codes::CREDENTIAL_UNKNOWN, "unknown credential".into())
-        })?;
+        .ok_or_else(|| failed(error_codes::CREDENTIAL_UNKNOWN, "unknown credential"))?;
     let result = match ceremony {
         LoginCeremony::Listed(auth_state) => {
             webauthn.finish_passkey_authentication(&credential, &auth_state)
@@ -903,12 +918,13 @@ pub(crate) async fn login_finish(
         LoginCeremony::Discoverable(auth_state) => {
             finish_discoverable(webauthn, &credential, auth_state, &user)
         }
+        LoginCeremony::Decoy => Err(webauthn_rs::prelude::WebauthnError::CredentialNotFound),
     }
     .map_err(|e| {
         warn!(error = %e, "passkey assertion failed");
-        TaskError::Declared(
+        failed(
             error_codes::ASSERTION_INVALID,
-            "the assertion did not verify".into(),
+            "the assertion did not verify",
         )
     })?;
     let cred_id: String = AsRef::<[u8]>::as_ref(result.cred_id())
@@ -916,21 +932,37 @@ pub(crate) async fn login_finish(
         .map(|b| format!("{b:02x}"))
         .collect();
     if cred_id != named {
-        return Err(TaskError::Declared(
+        return Err(failed(
             error_codes::ASSERTION_INVALID,
-            "the assertion did not verify".into(),
+            "the assertion did not verify",
         ));
     }
     if meta.subject.as_deref().is_some_and(|s| s != user.did) {
-        return Err(TaskError::Declared(
+        return Err(failed(
             error_codes::ASSERTION_INVALID,
-            "the credential belongs to another subject".into(),
+            "the assertion did not verify",
         ));
     }
-    for c in &mut user.credentials {
-        c.update_credential(&result);
-    }
-    passkey_store::store_passkey_user(&state.sessions_ks, &user).await?;
+    // The counter update is a read-modify-write of the subject's credentials:
+    // under the guard enrolment and revocation hold, on a fresh read, so it
+    // neither restores a credential revoked meanwhile nor drops one enrolled
+    // meanwhile. A credential revoked since the lookup no longer signs in.
+    let user = {
+        let _guard = super::passkey::credentials_guard(state, Purpose::Session, &user.did).await;
+        let mut current = passkey_store::get_passkey_user_by_did(&state.sessions_ks, &user.did)
+            .await?
+            .filter(|u| {
+                u.credentials
+                    .iter()
+                    .any(|c| cred_id_hex(c.cred_id()) == named)
+            })
+            .ok_or_else(|| failed(error_codes::CREDENTIAL_UNKNOWN, "unknown credential"))?;
+        for c in &mut current.credentials {
+            c.update_credential(&result);
+        }
+        passkey_store::store_passkey_user(&state.sessions_ks, &current).await?;
+        current
+    };
     let role = check_acl(&state.acl_ks, &user.did).await?;
 
     if meta.step_up {

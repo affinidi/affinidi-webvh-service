@@ -2323,3 +2323,141 @@ async fn a_login_start_without_a_sender_is_refused_on_messaging_transports() {
         "{reply}"
     );
 }
+
+/// A login that named its subject fails the same way whether the subject is
+/// enrolled or was answered with decoys, whatever passkey answers: so two
+/// requests cannot tell an enrolled subject from an unknown one.
+#[tokio::test]
+async fn a_named_login_fails_the_same_for_enrolled_and_unknown_subjects() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 180, Role::Admin).await;
+    let invitee = stranger(181);
+    let dana = stranger(182);
+    let erin = stranger(183);
+    let mut dana_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Tsp, &invitee, &issued, &mut dana_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let mut erin_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &erin.did, "session").await;
+    ok(
+        &redeem(&state, Via::Tsp, &invitee, &issued, &mut erin_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let mut unenrolled = SoftPasskey::new();
+
+    for via in VIAS {
+        let browser = stranger(184);
+        let mut outcomes = Vec::new();
+        for subject in [dana.did.as_str(), "did:example:nobody"] {
+            for key in [&mut unenrolled, &mut erin_key] {
+                let start = ok(
+                    &login_start(&state, via, &browser, json!({ "subject": subject })).await,
+                    &t(LOGIN_START),
+                );
+                let reply = call(
+                    &state,
+                    via,
+                    &browser,
+                    &t(LOGIN_FINISH),
+                    json!({ "authId": start["authId"], "credential": key.assert(&start["options"]) }),
+                )
+                .await;
+                outcomes.push((
+                    code(&reply),
+                    reply["payload"]["message"].clone(),
+                    reply["payload"]["retryable"].clone(),
+                ));
+            }
+        }
+        assert_eq!(outcomes[0].0, "auth/passkey/login/finish:assertionInvalid");
+        assert!(
+            outcomes.iter().all(|o| o == &outcomes[0]),
+            "{via:?}: {outcomes:?}"
+        );
+        // The real subject still signs in with its own passkey.
+        let start = ok(
+            &login_start(&state, via, &browser, json!({ "subject": dana.did })).await,
+            &t(LOGIN_START),
+        );
+        let reply = call(
+            &state,
+            via,
+            &browser,
+            &t(LOGIN_FINISH),
+            json!({ "authId": start["authId"], "credential": dana_key.assert(&start["options"]) }),
+        )
+        .await;
+        ok(&reply, &t(LOGIN_FINISH));
+    }
+}
+
+/// A login racing a revocation never writes the revoked credential back: the
+/// counter update waits for the subject's credentials guard and re-reads.
+#[tokio::test]
+async fn a_login_does_not_restore_a_revoked_credential() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 185, Role::Admin).await;
+    let invitee = stranger(186);
+    let dana = stranger(187);
+    let mut first = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Tsp, &invitee, &issued, &mut first, None).await,
+        &t(REDEEM_FINISH),
+    );
+    // Hold the subject's credentials guard, as a revocation does, start a
+    // login, remove the credential, then release the guard.
+    let browser = stranger(188);
+    let start = ok(
+        &login_start(&state, Via::Tsp, &browser, json!({})).await,
+        &t(LOGIN_START),
+    );
+    let guard = super::passkey::credentials_guard(
+        &state,
+        did_hosting_common::server::passkey::invite::Purpose::Session,
+        &dana.did,
+    )
+    .await;
+    let finish = {
+        let state = state.clone();
+        let assertion = first.assert(&start["options"]);
+        let auth_id = start["authId"].clone();
+        tokio::spawn(async move {
+            let browser = stranger(188);
+            call(
+                &state,
+                Via::Tsp,
+                &browser,
+                &t(LOGIN_FINISH),
+                json!({ "authId": auth_id, "credential": assertion }),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let mut user = pk::get_passkey_user_by_did(&state.sessions_ks, &dana.did)
+        .await
+        .unwrap()
+        .unwrap();
+    user.credentials.clear();
+    pk::store_passkey_user(&state.sessions_ks, &user)
+        .await
+        .unwrap();
+    drop(guard);
+    let reply = finish.await.unwrap();
+    assert!(
+        code(&reply).starts_with("auth/passkey/login/finish:"),
+        "{reply}"
+    );
+    let user = pk::get_passkey_user_by_did(&state.sessions_ks, &dana.did)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        user.credentials.is_empty(),
+        "the revoked credential came back"
+    );
+}

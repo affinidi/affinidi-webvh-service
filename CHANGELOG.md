@@ -48,9 +48,15 @@ it also said which DIDs had a passkey.
   answering `subjectNotRecognized` / `noCredentials`: one or two ids derived
   from a service key (made on first use, kept as `pk_login_decoy_key`) and
   the subject, the same on every start for that subject and shaped as the
-  console's own enrolments are. Nothing answers them, so finish fails as for
-  an enrolled subject whose authenticator is absent. The subject is enforced
-  at finish.
+  console's own enrolments are. Nothing answers them.
+- A login that named its subject fails in exactly one way at finish
+  (`assertionInvalid`, "the assertion did not verify"), whether the
+  credential is unknown, not listed, another subject's, or a decoy list's,
+  or the assertion does not verify, so its outcome does not say whether the
+  subject is enrolled. An unnamed login still says `credentialUnknown`.
+- The counter update after a successful login is made under the subject's
+  credentials guard on a fresh read, so a login racing a revocation or an
+  enrolment neither restores the revoked credential nor drops the new one.
 - Only a request carrying the named subject's own bearer session is told
   `subjectNotRecognized` or `noCredentials`.
 - Each source may open 30 login ceremonies a minute: the client address on
@@ -80,6 +86,14 @@ it also said which DIDs had a passkey.
     when the start names its subject — in the console, by entering the DID
     beside "Login with Passkey".
   - A discoverable-flow assertion with no user handle is refused.
+  - A named login's failures are all `assertionInvalid` (a named login with
+    an unknown credential used to be `credentialUnknown`).
+  - Residual signal: decoys are always one or two ids of 16, 20 or 32 bytes.
+    A named subject whose real list has three or more credentials, ids of
+    other lengths, or `transports` (recorded when a browser reports them at
+    enrolment) is distinguishable from an unknown one. Real lists cannot be
+    trimmed without breaking those credentials' sign-in, so this is left as
+    is; a subject's count and id lengths are what they disclose.
   - The 31st login start a minute from one source is refused, and a
     DIDComm/TSP start with no sender is refused.
   - Checked consumers: the console's `passkeyLoginStart` (updated here to
@@ -147,9 +161,11 @@ DID had an entry.
   `targetNotAuthorized`, naming the check that failed (only an administrator,
   or the recipient about itself, can reach it).
 - The recipient's quota check and the move are one critical section per
-  owner, and so are the quota checks and commits of `did/register`, create
-  and publish, so two writes for the same owner cannot both take its last
-  slot.
+  owner, and so are the quota checks and commits of `did/register`, create,
+  publish and the agent-name verbs (the publish paths re-check the size quota
+  under the owner's lock and hold it through their commit), so two writes for
+  the same owner cannot both take its last slot or byte. Lock order: slot,
+  then owner, then agent names.
 - `did_ops::change_did_owner` takes the request's `domain` and returns
   `OwnerChange { record, offer }`, or `OwnerChangeError`.
 - The console's ownership card offers a DID (owners) or transfers it
