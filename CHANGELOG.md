@@ -16,11 +16,14 @@ builds. The new slot is owned by the identifier, which is then given an
 take the ordinary owner path.
 
 - **`[[hosting.webs_self_register]]`**: `domain`, and optional
-  `path_prefixes`. Off by default; ignored without `method-webs`.
+  `path_prefixes` and `max_registrations` (default 100, the most
+  self-registered identifiers the domain holds at once). Off by default;
+  ignored without `method-webs`.
 - Webs only: a self-registration of any other method, with `force`, at a slot
   someone else owns, outside the prefixes, or signed by any key but the log's
-  is refused. Rate-limited per source (10 a minute) before the log is
-  verified, and audited (`did.webs.self_registered`).
+  is refused. Rate-limited per source (10 a minute) and across all sources (30
+  a minute) before the log is verified, and audited with its source
+  (`did.webs.self_registered`).
 
 See `docs/did-webs-hosting.md` ("Self-registration").
 

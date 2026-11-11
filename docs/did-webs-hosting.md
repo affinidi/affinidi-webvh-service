@@ -221,7 +221,15 @@ So a host built with `method-webs` accepts a `did/register/0.1` from a
 [[hosting.webs_self_register]]
 domain = "did.example.com"
 path_prefixes = ["nodes"]   # optional; empty = any path on the domain
+max_registrations = 100     # optional; the default
 ```
+
+Opting a domain in opens it to anyone with a key event log, and an AID costs
+nothing to mint. `max_registrations` bounds how many self-registered
+identifiers the domain holds at once (counted from the owner entries
+self-registration grants; deleting one frees its place). A domain at its limit
+refuses with `quotaExceeded`. Like the rate limits it is per process, so N
+replicas can exceed it by at most N−1.
 
 Off by default: with no entry, an unknown `did:webs` is refused exactly as any
 caller outside the ACL is (`permissionDenied`). A host built without
@@ -239,8 +247,10 @@ entry replaced by the key event log (`did-hosting-control/src/webs_self_register
    `did:webs:{domain}:{path}:{AID}` (`Webs::slot_did`, which the write path
    builds it with too);
 4. a per-source rate limit (`webs-self-register-per-source`, 10 a minute: the
-   client IP on HTTPS, the sender on TSP and DIDComm), before any key event
-   log is verified;
+   client IP on HTTPS, the sender on TSP and DIDComm), and one bucket shared
+   by every source (`webs-self-register-global`, 30 a minute), since a sender
+   can be a fresh `did:key` each time; both before any key event log is
+   verified;
 5. the submitted `keri.cesr` verifies in full and establishes that AID;
 6. the proof is sender-bound as every privileged proof is — issuer, transport
    sender, recipient, freshness, `proofPurpose: authentication` — and verifies
@@ -249,8 +259,9 @@ entry replaced by the key event log (`did-hosting-control/src/webs_self_register
    that log this service is about to publish. Any of the log's current signing
    keys may sign, as when the published identifier is resolved later.
 
-The registration is then the ordinary `register_did_atomic`, as that
-identifier: it verifies the log again, refuses a slot owned by anyone else
+The registration then holds the domain's self-registration lock, refuses a
+domain at its `max_registrations`, and is the ordinary `register_did_atomic`,
+as that identifier: it verifies the log again, refuses a slot owned by anyone else
 (only an administrator takes one over), and commits. **After** the commit the
 identifier is given an `Owner` ACL entry, scoped to its domain and to one slot
 (`max_did_count = 1`), so its later publications — key rotations — take the
@@ -258,7 +269,8 @@ ordinary owner path, authenticated by resolving the published identifier from
 this host. A crash between the two leaves an owned slot and no entry; a retry
 is again a self-registration of a slot the identifier already owns, and grants
 it then. Each self-registration is logged on the `audit` target
-(`did.webs.self_registered`).
+(`did.webs.self_registered`, with the `source` the transport vouched for);
+a refusal at the limit as `did.webs.self_register_refused`.
 
 The document is subject to the default 64 KiB Trust Task size limit (the raised
 `did/register` limit is for issuers the ACL lists).
