@@ -27,7 +27,7 @@ take the ordinary owner path.
 
 See `docs/did-webs-hosting.md` ("Self-registration").
 
-### Changed — a passkey login start lists no credentials and leaves no rows behind
+### Changed — a passkey login start discloses no subject and leaves no rows behind
 
 `auth/passkey/login/start/0.2` is answered to anyone, unsigned. With no
 `subject` it read every login passkey enrolled here, returned all their
@@ -36,61 +36,92 @@ new `authId`. Those rows were never removed unless the login finished, and
 the start answered `subjectNotRecognized` and `noCredentials` differently, so
 it also said which DIDs had a passkey.
 
-- The start now opens a discoverable-credential ceremony: no
-  `allowCredentials`, and the browser offers the passkeys it holds for this
-  service. Finish looks the credential up by id, checks the returned user
-  handle against it, and verifies against that one subject's credentials. The
-  ceremony row holds only its challenge, whatever the number of passkeys.
-- The answer is the same whatever the request names (no subject, a subject
-  with a passkey, an unknown one, a step-up). Only a request carrying the
-  named subject's own bearer session gets that subject's `allowCredentials`
-  and the `subjectNotRecognized` / `noCredentials` answers. A named subject
-  is still enforced at finish.
-- Each source may open 30 login ceremonies a minute (the client address on
-  HTTPS; the sender on DIDComm and TSP, refused there as `rateLimited`).
+- **No subject named:** the start opens a discoverable-credential ceremony
+  with no `allowCredentials`; the browser offers the passkeys it holds for
+  this service. Finish looks the credential up by id, requires the returned
+  user handle to be that credential's user (an assertion without one is
+  `assertionInvalid`), and verifies against that one subject's credentials.
+  The ceremony row holds only its challenge, whatever the number of passkeys.
+- **A subject named:** the start lists that subject's credentials, as
+  before, so a passkey enrolled as non-discoverable keeps signing in. For a
+  subject with no login passkey it lists decoy credential ids instead of
+  answering `subjectNotRecognized` / `noCredentials`: one or two ids derived
+  from a service key (made on first use, kept as `pk_login_decoy_key`) and
+  the subject, the same on every start for that subject and shaped as the
+  console's own enrolments are. Nothing answers them, so finish fails as for
+  an enrolled subject whose authenticator is absent. The subject is enforced
+  at finish.
+- Only a request carrying the named subject's own bearer session is told
+  `subjectNotRecognized` or `noCredentials`.
+- Each source may open 30 login ceremonies a minute: the client address on
+  HTTPS (refused as `unavailable` with `retryAfter`), the authenticated
+  sender on DIDComm and TSP (refused as `rateLimited`). A DIDComm or TSP
+  start with no authenticated sender is refused (`permissionDenied`). A
+  messaging sender can mint a fresh `did:key` per request, so there the limit
+  is per identity rather than per party; what each start leaves is one small,
+  swept row.
 - The session sweep now removes expired login ceremonies (`pk_task_meta:`
   and any `pk_auth:` state row an older build wrote), passkey revocation
   ceremonies (`pk_revoke:`), step-up challenges (`stepup-task:`) and DID
   ownership offers (`did_xfer:`). A login ceremony opened by the previous
   build can still be finished.
-- New login passkeys are created with `residentKey: required`, so an
-  authenticator can find them without a credential list. Step-up passkeys
-  are unchanged.
+- New login passkeys are requested with `residentKey: preferred`, so an
+  authenticator that can store a discoverable credential does. Step-up
+  passkeys are unchanged.
+- The console's passkey sign-in takes an optional DID; naming it lists that
+  DID's credentials, for a security key the browser does not offer by itself.
 - `webauthn-rs` gains its `conditional-ui` feature (no new dependency).
 - Behaviour changes (R3.6):
   - An anonymous login start never answers `noCredentials` or
-    `subjectNotRecognized`; it opens a ceremony, and finish fails if no
-    enrolled passkey answers.
-  - A login passkey that is not discoverable (some hardware security keys
-    enrolled before this change, which were registered with
-    `residentKey: discouraged`) can no longer sign in from the console. Its
-    holder enrols a new passkey (through an invite, or from a stepped-up
-    session). Platform and synced passkeys are discoverable and unaffected.
-  - The 31st login start a minute from one source is refused.
-  - Checked consumers: the console's `passkeyLoginStart` sends `{ purpose:
-    "login" }` and handles options with no `allowCredentials`. No client in
-    verifiable-trust-infrastructure calls this service's passkey login (its
-    own `vta-service` and `vtc-service` have their own).
+    `subjectNotRecognized`. Unnamed, it opens a ceremony with no list;
+    naming an unknown subject, it lists decoys.
+  - A passkey enrolled as non-discoverable (some hardware security keys,
+    registered under the earlier `residentKey: discouraged`) signs in only
+    when the start names its subject — in the console, by entering the DID
+    beside "Login with Passkey".
+  - A discoverable-flow assertion with no user handle is refused.
+  - The 31st login start a minute from one source is refused, and a
+    DIDComm/TSP start with no sender is refused.
+  - Checked consumers: the console's `passkeyLoginStart` (updated here to
+    pass an optional subject) handles options with or without
+    `allowCredentials`. No client in verifiable-trust-infrastructure calls
+    this service's passkey login (its own `vta-service` and `vtc-service`
+    have their own).
 
-### Changed — a first login passkey needs a stepped-up session or the subject's own key
+### Changed — enrolling a passkey that grants `aal2` needs a stepped-up session or the caller's own key
 
 A passkey login is minted at `aal2`. `auth/passkey/enroll/{start,finish}/0.2`
 let any authenticated subject add a login passkey, and asked for user
 verification only when one was already held, so a session at `aal1` (signed
 by its browser session key) could enrol a first passkey and sign in again at
-`aal2`.
+`aal2`. An administrator's session at `aal1` could do the same through an
+invite (`auth/passkey/enroll/invite/0.3`) naming itself. And enrolment
+accepted a credential id already bound to another subject, repointing that
+credential's index so its holder could no longer sign in with it.
 
-- Enrolling a subject's first login passkey now needs a session already at
+- Enrolling a subject's first login passkey needs a session already at
   `aal2`, or a request signed by the subject's own DID key (the factor a
-  `didSigned` step-up rests on). Otherwise it is refused with
-  `permissionDenied` (message `step_up_required`). The check runs at start and
-  again at finish, against the credentials held then.
+  `didSigned` step-up rests on). The check runs at start and again at finish,
+  against the credentials held then.
+- Issuing any enrolment invite needs the same of the administrator: an `aal2`
+  session or its own DID key's signature, whoever the invite names.
+- Both refusals are `permissionDenied` with message `step_up_required`. The
+  console treats that, like a declared `stepUpRequired`, as a request to step
+  up and retry, for invites and for domain purges.
+- Every enrolment finish (redeem, self-enrolment, either purpose) refuses a
+  credential id already bound to any subject in either credential store
+  (`attestationInvalid`), as WebAuthn §7.1 requires; enrolments of the same id
+  are serialised.
 - Adding a further passkey is unchanged (user verification over an existing
-  one), and an administrator's invite still enrols a first one.
-- Behaviour change (R3.6): a session at `aal1` signed by its session key can
-  no longer start or finish a first login passkey enrolment. The console
-  does not offer self-enrolment (it enrols through invites); no client in
-  verifiable-trust-infrastructure calls this service's `enroll/start`.
+  one).
+- Behaviour changes (R3.6):
+  - A session at `aal1` signed by its session key can no longer start or
+    finish a first login passkey enrolment, or issue an invite. A passkey
+    session is `aal2` already; a wallet session steps up first.
+  - Re-enrolling a credential already bound anywhere is refused.
+  - Checked consumers: the console enrols through invites (it steps up when
+    asked); no client in verifiable-trust-infrastructure calls this service's
+    `enroll/*` tasks.
 
 ### Changed — `did/change-owner` moves a slot only when its recipient accepts
 
@@ -103,8 +134,9 @@ DID had an entry.
 - An owner's request now only offers it. The record is returned unchanged,
   with `ext["vnd.affinidi.webvh"].ownerTransfer = { status: "offered",
   newOwner, expiresAt }`. The offer lasts 72 hours. A new offer replaces the
-  last; naming the current owner withdraws it. Nothing about the recipient is
-  looked up when an offer is made, so an offer answers the same for any DID.
+  last; naming the current owner withdraws it; deleting the slot removes it.
+  Nothing about the recipient is looked up when an offer is made, so an offer
+  answers the same for any DID.
 - The recipient accepts by sending the same request naming itself as
   `newOwner`. It needs the live offer from the slot's current owner, made
   since the slot was registered; anyone else still gets `notOwner`.
@@ -112,8 +144,12 @@ DID had an entry.
   recipient must have an ACL entry with a role that owns DIDs (`owner` or
   `admin`), a domain scope that covers the slot, and room for it in its DID
   count and total size quotas. Otherwise the request is refused as
-  `targetNotAuthorized`. An administrator is told which check failed; the
-  recipient gets one message.
+  `targetNotAuthorized`, naming the check that failed (only an administrator,
+  or the recipient about itself, can reach it).
+- The recipient's quota check and the move are one critical section per
+  owner, and so are the quota checks and commits of `did/register`, create
+  and publish, so two writes for the same owner cannot both take its last
+  slot.
 - `did_ops::change_did_owner` takes the request's `domain` and returns
   `OwnerChange { record, offer }`, or `OwnerChangeError`.
 - The console's ownership card offers a DID (owners) or transfers it

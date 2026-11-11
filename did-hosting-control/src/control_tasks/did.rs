@@ -579,18 +579,10 @@ pub(crate) async fn change_owner(
     {
         Ok(change) => change,
         Err(did_ops::OwnerChangeError::TargetNotAuthorized(why)) => {
-            // An administrator moving the slot is told why; anyone else gets
-            // one answer for every reason (the acceptor is the recipient,
-            // and knows its own standing).
-            let message = if auth.role == crate::acl::Role::Admin {
-                why
-            } else {
-                "you cannot take this DID: your domain scope or quota does not allow it".into()
-            };
-            return Err(TaskError::Declared(
-                error_codes::TARGET_NOT_AUTHORIZED,
-                message,
-            ));
+            // Only an administrator's transfer or the recipient's own
+            // acceptance is checked against the recipient, so the reason goes
+            // to one of them: an owner's offer looks nothing up.
+            return Err(TaskError::Declared(error_codes::TARGET_NOT_AUTHORIZED, why));
         }
         Err(did_ops::OwnerChangeError::Failed(e)) => return Err(e.into()),
     };

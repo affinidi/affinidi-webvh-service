@@ -558,8 +558,7 @@ enum LoginCeremony {
     /// credential it answers with is looked up at finish. Holds only the
     /// challenge, whatever the number of passkeys enrolled here.
     Discoverable(webauthn_rs::prelude::DiscoverableAuthentication),
-    /// Over one subject's own credentials, for a caller holding that
-    /// subject's session.
+    /// Over the named subject's own credentials.
     Listed(webauthn_rs::prelude::PasskeyAuthentication),
 }
 
@@ -599,6 +598,10 @@ fn request_options(
 ) -> Result<Value, TaskError> {
     let value = serde_json::to_value(options)?;
     let public_key = value.get("publicKey").cloned().unwrap_or(value);
+    Ok(pick_request_options(&public_key))
+}
+
+fn pick_request_options(public_key: &Value) -> Value {
     let mut out = serde_json::Map::new();
     for k in [
         "challenge",
@@ -612,24 +615,95 @@ fn request_options(
             out.insert(k.into(), v.clone());
         }
     }
-    Ok(Value::Object(out))
+    Value::Object(out)
+}
+
+/// Where the key the decoy credential ids are derived with is kept. Never
+/// swept, so a subject's decoys stay the same across restarts.
+const DECOY_KEY: &str = "pk_login_decoy_key";
+
+/// The service's key for decoy credential ids, made on first use.
+async fn decoy_key(state: &AppState) -> Result<Vec<u8>, TaskError> {
+    if let Some(key) = state.sessions_ks.get_raw(DECOY_KEY).await? {
+        return Ok(key);
+    }
+    // Made once: concurrent first uses must agree on one key.
+    let _guard = state.path_locks.guard("::passkey-login-decoy-key").await;
+    if let Some(key) = state.sessions_ks.get_raw(DECOY_KEY).await? {
+        return Ok(key);
+    }
+    let key = rand::random::<[u8; 32]>().to_vec();
+    state.sessions_ks.insert_raw(DECOY_KEY, key.clone()).await?;
+    Ok(key)
+}
+
+/// HMAC-SHA-256 (RFC 2104) of `message` under `key`.
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+    let mut block = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let pad = |byte: u8| block.map(|b| b ^ byte);
+    let inner = Sha256::new()
+        .chain_update(pad(0x36))
+        .chain_update(message)
+        .finalize();
+    let outer = Sha256::new()
+        .chain_update(pad(0x5c))
+        .chain_update(inner)
+        .finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&outer);
+    out
+}
+
+/// The credential descriptors a login start lists for `subject` when no
+/// login passkey is enrolled for it: derived from `key` and the subject, so
+/// they are the same on every start for that subject, and shaped as the
+/// console's own enrolments are (one or two `public-key` ids of a common
+/// length, no transports). Nothing answers them, so finish fails as for a
+/// real subject whose authenticator is absent.
+fn decoy_credentials(key: &[u8], subject: &str) -> Result<Value, TaskError> {
+    const LENGTHS: [usize; 3] = [16, 20, 32];
+    let seed = hmac_sha256(key, format!("login-decoy:{subject}").as_bytes());
+    let count = if seed[0].is_multiple_of(4) { 2 } else { 1 };
+    let mut descriptors = Vec::with_capacity(count);
+    for i in 0..count {
+        let len = LENGTHS[seed[1 + i] as usize % LENGTHS.len()];
+        let id = hmac_sha256(key, format!("login-decoy-id:{i}:{subject}").as_bytes());
+        let id = webauthn_rs::prelude::Base64UrlSafeData::from(id[..len.min(32)].to_vec());
+        descriptors.push(json!({ "type": "public-key", "id": serde_json::to_value(id)? }));
+    }
+    Ok(Value::Array(descriptors))
 }
 
 /// `auth/passkey/login/start/0.2`: open a login (or, `purpose: stepUp`, a
 /// step-up) ceremony. Accepted unsigned — the assertion at finish is the gate.
 ///
-/// Opening a ceremony tells the caller nothing about who is enrolled here. A
-/// caller that does not hold the named subject's own session gets a
-/// discoverable-credential ceremony (no `allowCredentials`) whether or not
-/// the subject exists or has a passkey, and whether or not it named one: the
-/// authenticator offers the credentials it holds for this relying party, and
-/// finish checks the one it answers with (and that it is the named subject's,
-/// when one was named). Only the subject's own session sees its credential
-/// list, and the `subjectNotRecognized` / `noCredentials` answers about it.
+/// Opening a ceremony tells an unauthenticated caller nothing about who is
+/// enrolled here:
+///
+/// - **No subject named:** a discoverable-credential ceremony, with no
+///   `allowCredentials`. The authenticator offers the credentials it holds for
+///   this relying party, and finish checks the one it answers with.
+/// - **A subject named:** that subject's credentials as `allowCredentials`,
+///   so a credential enrolled as non-discoverable still signs in. For a
+///   subject with no login passkey the list is decoys derived from a service
+///   key and the subject ([`decoy_credentials`]): stable for the subject and
+///   shaped like a real list, so the answer does not say whether the subject
+///   is enrolled. The subject is enforced at finish.
+/// - Only a request carrying the named subject's own session is told
+///   `subjectNotRecognized` / `noCredentials`.
 ///
 /// Each source may open [`crate::rate_limit::LOGIN_START_MAX_PER_WINDOW`] a
-/// minute (the client address on HTTPS, counted by the route; the sender on
-/// DIDComm and TSP, here), and an unfinished ceremony is swept once it
+/// minute: the client address on HTTPS, counted by the route; the
+/// authenticated sender on DIDComm and TSP, here. A messaging sender can mint
+/// a fresh `did:key` per request, so that bound is per identity, not per
+/// party; what each start leaves behind is one small row, swept once it
 /// expires.
 pub(crate) async fn login_start(
     cx: &Cx<'_>,
@@ -639,8 +713,22 @@ pub(crate) async fn login_start(
 
     let state = cx.state;
     if cx.via != Some(ObservedTransport::Https) {
-        let source = format!("vid:{}", cx.caller.as_deref().unwrap_or_default());
-        if let Err(e) = state.login_start_rate_limiter.try_consume(source) {
+        // On DIDComm and TSP the sender is the source; a start the transport
+        // vouches for no sender of has nothing to be counted against.
+        let sender = cx
+            .caller
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                TaskError::Standard(
+                    trust_tasks_rs::StandardCode::PermissionDenied,
+                    "a passkey login over DIDComm or TSP needs an authenticated sender".into(),
+                )
+            })?;
+        if let Err(e) = state
+            .login_start_rate_limiter
+            .try_consume(format!("vid:{sender}"))
+        {
             return Err(match e {
                 AppError::RateLimited { .. } => TaskError::Declared(
                     error_codes::RATE_LIMITED,
@@ -653,34 +741,66 @@ pub(crate) async fn login_start(
     let webauthn = require_webauthn(state)?;
     let step_up = matches!(p.purpose, Some(PayloadPurpose::StepUp));
     let subject = p.subject.as_ref().map(|s| s.to_string());
-    let own_session = subject
-        .as_deref()
-        .is_some_and(|s| cx.bearer_session().is_some_and(|b| b.did == s));
-    let (options, ceremony) = if own_session {
-        let did = subject.as_deref().unwrap_or_default();
-        let user = passkey_store::get_passkey_user_by_did(&state.sessions_ks, did)
-            .await?
-            .ok_or_else(|| {
-                TaskError::Declared(
-                    error_codes::SUBJECT_NOT_RECOGNIZED,
-                    "unknown subject".into(),
-                )
-            })?;
-        if user.credentials.is_empty() {
-            return Err(TaskError::Declared(
-                error_codes::NO_CREDENTIALS,
-                "the subject has no passkey".into(),
-            ));
-        }
-        let (options, auth_state) = webauthn
-            .start_passkey_authentication(&user.credentials)
-            .map_err(|e| AppError::Internal(format!("webauthn start failed: {e}")))?;
-        (options, LoginCeremony::Listed(auth_state))
-    } else {
-        let (options, auth_state) = webauthn
+    let discoverable = || {
+        webauthn
             .start_discoverable_authentication()
-            .map_err(|e| AppError::Internal(format!("webauthn start failed: {e}")))?;
-        (options, LoginCeremony::Discoverable(auth_state))
+            .map_err(|e| TaskError::from(AppError::Internal(format!("webauthn start failed: {e}"))))
+    };
+    let (options, ceremony) = match subject.as_deref() {
+        None => {
+            let (options, auth_state) = discoverable()?;
+            (
+                request_options(&options)?,
+                LoginCeremony::Discoverable(auth_state),
+            )
+        }
+        Some(did) => {
+            let own_session = cx.bearer_session().is_some_and(|b| b.did == did);
+            let user = passkey_store::get_passkey_user_by_did(&state.sessions_ks, did).await?;
+            match user {
+                Some(user) if !user.credentials.is_empty() => {
+                    let (options, auth_state) = webauthn
+                        .start_passkey_authentication(&user.credentials)
+                        .map_err(|e| AppError::Internal(format!("webauthn start failed: {e}")))?;
+                    (
+                        request_options(&options)?,
+                        LoginCeremony::Listed(auth_state),
+                    )
+                }
+                known if own_session => {
+                    return Err(if known.is_some() {
+                        TaskError::Declared(
+                            error_codes::NO_CREDENTIALS,
+                            "the subject has no passkey".into(),
+                        )
+                    } else {
+                        TaskError::Declared(
+                            error_codes::SUBJECT_NOT_RECOGNIZED,
+                            "unknown subject".into(),
+                        )
+                    });
+                }
+                _ => {
+                    // Shaped as the listed ceremony's options: its members,
+                    // with the decoys in place of real descriptors and none of
+                    // the discoverable ceremony's own extensions.
+                    let (options, auth_state) = discoverable()?;
+                    let value = serde_json::to_value(&options)?;
+                    let mut public_key = value.get("publicKey").cloned().unwrap_or(value);
+                    if let Some(obj) = public_key.as_object_mut() {
+                        obj.remove("extensions");
+                        obj.insert(
+                            "allowCredentials".into(),
+                            decoy_credentials(&decoy_key(state).await?, did)?,
+                        );
+                    }
+                    (
+                        pick_request_options(&public_key),
+                        LoginCeremony::Discoverable(auth_state),
+                    )
+                }
+            }
+        }
     };
     let auth_id = uuid::Uuid::new_v4().to_string();
     state
@@ -696,23 +816,24 @@ pub(crate) async fn login_start(
         )
         .await?;
     typed(
-        json!({ "authId": auth_id, "options": request_options(&options)? }),
+        json!({ "authId": auth_id, "options": options }),
         "login start response",
     )
 }
 
 /// Verify `credential` against a discoverable ceremony: the credential it
 /// names must be a login passkey enrolled here, and the user handle the
-/// authenticator returned (when it returned one) that passkey's user.
+/// authenticator returned must be that passkey's user. A discoverable
+/// credential always returns one, so an assertion without a readable user
+/// handle is refused.
 fn finish_discoverable(
     webauthn: &webauthn_rs::Webauthn,
     credential: &webauthn_rs::prelude::PublicKeyCredential,
     auth_state: webauthn_rs::prelude::DiscoverableAuthentication,
     user: &passkey_store::PasskeyUser,
 ) -> Result<webauthn_rs::prelude::AuthenticationResult, webauthn_rs::prelude::WebauthnError> {
-    if let Ok((user_uuid, _)) = webauthn.identify_discoverable_authentication(credential)
-        && user_uuid != user.user_uuid
-    {
+    let (user_uuid, _) = webauthn.identify_discoverable_authentication(credential)?;
+    if user_uuid != user.user_uuid {
         return Err(webauthn_rs::prelude::WebauthnError::InvalidUserUniqueId);
     }
     let keys: Vec<webauthn_rs::prelude::DiscoverableKey> =

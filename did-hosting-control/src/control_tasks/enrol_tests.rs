@@ -1740,10 +1740,11 @@ async fn login_start(state: &AppState, via: Via, from: &Caller, payload: Value) 
     unsigned(state, via, from, LOGIN_START, payload).await
 }
 
-/// Whatever an unauthenticated caller names — nothing, an enrolled subject,
-/// an unknown one, a step-up — the start is the same discoverable ceremony:
-/// no credential ids, and no answer that tells subjects apart. The login it
-/// opens still works, and still holds a named subject to its own passkey.
+/// An unauthenticated start that names no subject lists no credentials. One
+/// that names a subject lists that subject's credentials, so a passkey
+/// enrolled as non-discoverable still signs in, and for a subject with no
+/// passkey lists stable decoys of the same shape, so the answer does not say
+/// who is enrolled. A named subject is held to its own passkey at finish.
 #[tokio::test]
 async fn a_login_start_discloses_no_credentials_or_subjects() {
     let (state, _dir) = state().await;
@@ -1766,23 +1767,56 @@ async fn a_login_start_discloses_no_credentials_or_subjects() {
 
     for (i, via) in VIAS.into_iter().enumerate() {
         let browser = stranger(124 + i as u8);
-        for payload in [
-            json!({}),
-            json!({ "subject": dana.did }),
-            json!({ "subject": "did:example:nobody" }),
-            json!({ "purpose": "stepUp", "subject": dana.did }),
-            json!({ "purpose": "stepUp", "subject": "did:example:nobody" }),
-        ] {
-            let reply = login_start(&state, via, &browser, payload.clone()).await;
-            conforms(&reply);
-            let start = ok(&reply, &t(LOGIN_START));
-            let options = start["options"].to_string();
-            assert!(
-                start["options"].get("allowCredentials").is_none()
-                    && !options.contains(&dana_key.id())
-                    && !options.contains(&erin_key.id()),
-                "{via:?} {payload}: {start}"
+        // Nothing named: no list.
+        let start = ok(
+            &login_start(&state, via, &browser, json!({})).await,
+            &t(LOGIN_START),
+        );
+        assert!(
+            start["options"].get("allowCredentials").is_none(),
+            "{start}"
+        );
+
+        let listed = |payload: Value| {
+            let state = &state;
+            let browser = &browser;
+            async move {
+                let reply = login_start(state, via, browser, payload).await;
+                conforms(&reply);
+                ok(&reply, &t(LOGIN_START))["options"].clone()
+            }
+        };
+        let keys = |options: &Value| {
+            let mut keys: Vec<String> = options.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        for purpose in ["login", "stepUp"] {
+            // dana: exactly her credential.
+            let real = listed(json!({ "purpose": purpose, "subject": dana.did })).await;
+            assert_eq!(
+                real["allowCredentials"],
+                json!([{ "type": "public-key", "id": dana_key.id() }]),
+                "{real}"
             );
+            // Nobody: decoys, the same on every start, shaped like a real list.
+            let decoy =
+                listed(json!({ "purpose": purpose, "subject": "did:example:nobody" })).await;
+            let again =
+                listed(json!({ "purpose": purpose, "subject": "did:example:nobody" })).await;
+            assert_eq!(decoy["allowCredentials"], again["allowCredentials"]);
+            assert_ne!(decoy["challenge"], again["challenge"]);
+            assert_eq!(keys(&decoy), keys(&real), "{decoy} / {real}");
+            let ids = decoy["allowCredentials"].as_array().unwrap();
+            assert!((1..=2).contains(&ids.len()), "{decoy}");
+            for d in ids {
+                assert_eq!(keys(d), vec!["id".to_string(), "type".to_string()], "{d}");
+                assert_ne!(d["id"], json!(dana_key.id()));
+                assert_ne!(d["id"], json!(erin_key.id()));
+            }
+            // Another unknown subject gets other decoys.
+            let other = listed(json!({ "purpose": purpose, "subject": "did:example:other" })).await;
+            assert_ne!(other["allowCredentials"], decoy["allowCredentials"]);
         }
 
         // An unnamed login signs in whoever's passkey answers.
@@ -1812,8 +1846,9 @@ async fn a_login_start_discloses_no_credentials_or_subjects() {
     }
 }
 
-/// A discoverable assertion whose user handle is not the credential's user
-/// is refused, though the signature is the credential's own.
+/// A discoverable assertion whose user handle is missing, or is not the
+/// credential's user, is refused, though the signature is the credential's
+/// own.
 #[tokio::test]
 async fn a_login_refuses_a_user_handle_that_is_not_the_credentials() {
     let (state, _dir) = state().await;
@@ -1827,17 +1862,19 @@ async fn a_login_refuses_a_user_handle_that_is_not_the_credentials() {
         &t(REDEEM_FINISH),
     );
     assert!(dana_key.user_handle.is_some());
-    dana_key.user_handle = Some("AAAAAAAAAAAAAAAAAAAAAA".into());
-    let reply = login(&state, Via::Https, &mut dana_key, 143).await;
-    assert_eq!(
-        code(&reply),
-        "auth/passkey/login/finish:assertionInvalid",
-        "{reply}"
-    );
+    for handle in [Some("AAAAAAAAAAAAAAAAAAAAAA".to_string()), None] {
+        dana_key.user_handle = handle;
+        let reply = login(&state, Via::Https, &mut dana_key, 143).await;
+        assert_eq!(
+            code(&reply),
+            "auth/passkey/login/finish:assertionInvalid",
+            "{reply}"
+        );
+    }
 }
 
-/// The subject's own session sees its credential list for a step-up, and the
-/// answers about it; nobody else does.
+/// Only the subject's own session is told that it has no passkey, or that it
+/// is unknown.
 #[tokio::test]
 async fn the_subjects_own_session_gets_its_credential_list() {
     let (state, _dir) = state().await;
@@ -1875,10 +1912,19 @@ async fn the_subjects_own_session_gets_its_credential_list() {
             .contains(&dana_key.id()),
         "{body}"
     );
-    // Another subject's session is just another stranger here.
+    // Another subject's session sees what anyone naming her sees.
     let reply = super::harness::https(&state, Some(claims(&admin.did)), start(&dana.did)).await;
     let body = ok(&reply, &t(LOGIN_START));
-    assert!(body["options"].get("allowCredentials").is_none(), "{body}");
+    assert!(
+        body["options"]["allowCredentials"]
+            .to_string()
+            .contains(&dana_key.id()),
+        "{body}"
+    );
+    // Without its own session, an unknown subject is answered with decoys,
+    // not an error.
+    let reply = super::harness::https(&state, Some(claims(&dana.did)), start(&admin.did)).await;
+    ok(&reply, &t(LOGIN_START));
     // A session's own subject with no passkey is told so.
     let reply = super::harness::https(&state, Some(claims(&admin.did)), start(&admin.did)).await;
     assert_eq!(
@@ -2140,9 +2186,10 @@ async fn a_first_login_passkey_needs_a_stepped_up_session_or_the_subjects_key() 
             &call(&state, via, &gina, &t(START), json!({})).await,
             &t(START),
         );
-        // A login credential is created discoverable: login lists none.
+        // A login credential is asked to be discoverable: an unnamed login
+        // lists none.
         assert_eq!(
-            start["options"]["authenticatorSelection"]["residentKey"], "required",
+            start["options"]["authenticatorSelection"]["residentKey"], "preferred",
             "{start}"
         );
     }
@@ -2153,4 +2200,126 @@ async fn a_first_login_passkey_needs_a_stepped_up_session_or_the_subjects_key() 
     let reply = as_session(&state, &frank, &session_key, aal1, &t(START), json!({})).await;
     let start = ok(&reply, &t(START));
     assert!(start["uvOptions"].is_object(), "{start}");
+}
+
+/// An invite enrols a passkey, so an administrator's session issues one only
+/// at `aal2` (or by its own DID key's signature) — whoever it names.
+#[tokio::test]
+async fn issuing_an_invite_needs_a_stepped_up_session_or_the_callers_key() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 170, Role::Admin).await;
+    let payloads = [
+        json!({ "subject": admin.did, "purpose": "session" }),
+        json!({ "subject": "did:example:someone", "purpose": "session" }),
+        json!({ "subject": admin.did, "purpose": "stepUp" }),
+    ];
+    let (session_key, aal1) = browser_session(&admin, 171, "aal1");
+    for payload in &payloads {
+        let reply = as_session(
+            &state,
+            &admin,
+            &session_key,
+            aal1.clone(),
+            &t(INVITE),
+            payload.clone(),
+        )
+        .await;
+        assert_eq!(code(&reply), "permissionDenied", "{payload}: {reply}");
+        assert_eq!(reply["payload"]["message"], "step_up_required", "{reply}");
+    }
+    let (session_key, aal2) = browser_session(&admin, 172, "aal2");
+    let reply = as_session(
+        &state,
+        &admin,
+        &session_key,
+        aal2,
+        &t(INVITE),
+        payloads[1].clone(),
+    )
+    .await;
+    ok(&reply, &t(INVITE));
+    // Signed by the administrator's own key: allowed.
+    issue(&state, &admin, "did:example:another", "session").await;
+}
+
+/// A credential id already bound — to anyone, for either purpose — is
+/// refused at enrolment, and its holder keeps it.
+#[tokio::test]
+async fn a_credential_id_already_bound_is_refused_at_enrolment() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 173, Role::Admin).await;
+    let invitee = stranger(174);
+    let dana = stranger(175);
+    let mut shared = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Tsp, &invitee, &issued, &mut shared, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let dana_handle = shared.user_handle.clone();
+
+    // By invite, for another subject, with the same credential.
+    let issued = issue(&state, &admin, "did:example:mallory", "session").await;
+    let reply = redeem(&state, Via::Tsp, &invitee, &issued, &mut shared, None).await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/redeem/finish:attestationInvalid",
+        "{reply}"
+    );
+    // As a step-up credential for someone else.
+    let carol = member(&state, 176, Role::Owner).await;
+    let issued = issue(&state, &admin, &carol.did, "stepUp").await;
+    let reply = redeem(&state, Via::Tsp, &invitee, &issued, &mut shared, None).await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/redeem/finish:attestationInvalid",
+        "{reply}"
+    );
+    // By self-enrolment.
+    let frank = member(&state, 177, Role::Owner).await;
+    let start = ok(
+        &call(&state, Via::Tsp, &frank, &t(START), json!({})).await,
+        &t(START),
+    );
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &frank,
+        &t(FINISH),
+        json!({ "enrollmentId": start["enrollmentId"], "credential": shared.attest(&start["options"]) }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/finish:attestationInvalid",
+        "{reply}"
+    );
+
+    // Dana still signs in with it.
+    shared.user_handle = dana_handle;
+    let reply = login(&state, Via::Tsp, &mut shared, 178).await;
+    let body = ok(&reply, &t(LOGIN_FINISH));
+    assert_eq!(body["session"]["subject"], dana.did.as_str(), "{body}");
+}
+
+/// A messaging-transport login start with no authenticated sender has no
+/// source to be counted against, and is refused.
+#[tokio::test]
+async fn a_login_start_without_a_sender_is_refused_on_messaging_transports() {
+    let (state, _dir) = state().await;
+    let mut doc = request(&t(LOGIN_START), "unused", json!({}));
+    doc.as_object_mut().unwrap().remove("issuer");
+    let out = crate::tsp::run_tsp_trust_task(&state, "", &serde_json::to_vec(&doc).unwrap())
+        .await
+        .expect("TSP handler ok")
+        .expect("TSP reply");
+    let reply: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(code(&reply), "permissionDenied", "{reply}");
+    assert!(
+        reply["payload"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("authenticated sender"),
+        "{reply}"
+    );
 }

@@ -202,6 +202,18 @@ async fn owner_usage(state: &AppState, owner: &str) -> Result<(u64, u64), AppErr
     Ok((count, total_size))
 }
 
+/// The per-owner lock held from a quota check through the commit it
+/// authorises. Quota usage is summed over all of an owner's slots, so the slot
+/// lock alone lets two writes to different slots (a register and an accepted
+/// transfer, say) each see room for one more and both commit. Always taken
+/// after the slot's path lock, never before it.
+async fn owner_quota_guard(state: &AppState, owner: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    state
+        .path_locks
+        .guard(&format!("::owner-quota:{owner}"))
+        .await
+}
+
 /// Enforce the caller's per-account `max_did_count` before adding a new slot.
 /// Admin-exempt. `None` ACL max (or no ACL entry) means no cap.
 async fn check_did_count_limit(auth: &AuthClaims, state: &AppState) -> Result<(), AppError> {
@@ -406,6 +418,7 @@ pub async fn create_did(
     let adds_slot = replaced
         .as_ref()
         .is_none_or(|existing| existing.owner != auth.did);
+    let _quota_guard = owner_quota_guard(state, &auth.did).await;
     if adds_slot {
         check_did_count_limit(auth, state).await?;
     }
@@ -636,6 +649,7 @@ pub async fn register_did_atomic(
     // `max_did_count`; the published log counts against `max_total_size`
     // (old size 0 for a fresh slot, else the slot's current content_size).
     // Both helpers are admin-exempt and no-op when the ACL sets no cap.
+    let _quota_guard = owner_quota_guard(state, &auth.did).await;
     if existing.is_none() {
         check_did_count_limit(auth, state).await?;
     }
@@ -865,6 +879,7 @@ async fn prepare_republish(
     // this slot's current content, so the owner's usage moves by
     // `new_size - record.content_size`. `record.content_size` is still the OLD
     // size here (it is overwritten below). Admin-exempt; no-op with no ACL cap.
+    let _quota_guard = owner_quota_guard(state, &auth.did).await;
     check_total_size_limit(auth, state, record.content_size, new_size).await?;
 
     // T20b: same safety check as register_did_atomic — the embedded
@@ -1856,6 +1871,7 @@ pub async fn delete_did(
     let mut batch = state.store.batch();
     batch.remove(&state.dids_ks, did_key(mnemonic));
     batch.remove(&state.dids_ks, content_log_key(mnemonic));
+    batch.remove(&state.sessions_ks, transfer_offer_key(mnemonic));
     batch.remove(&state.dids_ks, content_witness_key(mnemonic));
     batch.remove(&state.dids_ks, owner_key(&record.owner, mnemonic));
     batch.commit().await?;
@@ -1904,7 +1920,8 @@ pub struct OwnerChange {
 pub enum OwnerChangeError {
     /// The recipient may not hold this slot: no ACL entry, a role that holds
     /// no DIDs, a domain scope that excludes it, or no room in its quota.
-    /// Only an administrator's direct transfer is told which.
+    /// The message names the check that failed; only an administrator or
+    /// the recipient itself (accepting an offer made to it) ever sees it.
     TargetNotAuthorized(String),
     /// Anything else, as the other DID operations report it.
     Failed(AppError),
@@ -1943,16 +1960,25 @@ async fn check_recipient_may_hold(
 
     let refused = |why: String| OwnerChangeError::TargetNotAuthorized(why);
     let Some(entry) = get_acl_entry(&state.acl_ks, recipient).await? else {
-        return Err(refused(format!("'{recipient}' has no ACL entry")));
+        return Err(refused(format!(
+            "'{recipient}' has no ACL entry, so it cannot own a DID here"
+        )));
     };
     if matches!(entry.role, Role::Service | Role::MetricsReader) {
         return Err(refused(format!(
-            "'{recipient}' holds the {} role, which owns no DIDs",
+            "'{recipient}' holds the {} role, which cannot own DIDs",
             entry.role
         )));
     }
     let scope = |e: AppError| match e {
-        AppError::Forbidden(m) => refused(m),
+        AppError::Forbidden(_) => refused(format!(
+            "'{recipient}' is not scoped to the domain this DID is hosted on{}",
+            if record.domain.is_empty() {
+                String::new()
+            } else {
+                format!(" ('{}')", record.domain)
+            }
+        )),
         other => OwnerChangeError::Failed(other),
     };
     if !record.domain.is_empty() {
@@ -2063,6 +2089,7 @@ pub async fn change_did_owner(
         ensure_slot_domain_matches(&record, request_domain)?;
         // The acceptor's own standing — its domain scope at time of use, and
         // its quota — which it is told about as any of its writes would be.
+        let _quota_guard = owner_quota_guard(state, &auth.did).await;
         check_recipient_may_hold(state, &record, &auth.did).await?;
         let recipient = auth.did.clone();
         let prev_owner =
@@ -2131,6 +2158,7 @@ pub async fn change_did_owner(
         });
     }
 
+    let _quota_guard = owner_quota_guard(state, &new_owner).await;
     check_recipient_may_hold(state, &record, &new_owner).await?;
     let prev_owner =
         commit_owner_change(state, mnemonic, &mut record, &new_owner, &offer_key).await?;

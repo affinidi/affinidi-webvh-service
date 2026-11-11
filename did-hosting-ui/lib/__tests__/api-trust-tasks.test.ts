@@ -738,6 +738,55 @@ describe("step-up (wallet session)", () => {
     expect(tasks(sent)[1]!.bearer).toBe(`Bearer ${elevated}`);
   });
 
+  it("steps up when an invite is refused as step_up_required, then issues it", async () => {
+    stubStorage({
+      webvh_token: TOKEN,
+      webvh_refresh_token: "refresh-1",
+      webvh_auth_method: "wallet",
+    });
+    await generateSessionKeypair();
+    const elevated = tokenFor(SUBJECT, { session_id: "sess-1", acr: "aal2" });
+    const stepUpVta = stubWallet(
+      vi.fn().mockResolvedValue({
+        accessToken: elevated,
+        refreshToken: "refresh-2",
+        sessionId: "sess-1",
+        holderDid: SUBJECT,
+      }),
+    );
+    let invites = 0;
+    const sent = installControlPlane((req) =>
+      ++invites === 1
+        ? {
+            ...rejection("permissionDenied"),
+            payload: { code: "permissionDenied", message: "step_up_required", retryable: false },
+          }
+        : seal(req, {
+            invite: { token: "t", url: "https://control.example/enroll?token=t" },
+            subject: "did:example:new",
+            purpose: "session",
+            expiresAt: "2026-01-01T00:00:00Z",
+            claimCode: "ABCD-EFGH-IJKL",
+          }),
+    );
+
+    const issued = await api.createInvite("did:example:new", "owner");
+
+    expect(stepUpVta).toHaveBeenCalledTimes(1);
+    expect(issued.claimCode).toBe("ABCD-EFGH-IJKL");
+    expect(tasks(sent)).toHaveLength(2);
+    expect(tasks(sent)[1]!.bearer).toBe(`Bearer ${elevated}`);
+  });
+
+  it("does not step up for any other permissionDenied", async () => {
+    stubStorage({ webvh_token: TOKEN, webvh_refresh_token: "r", webvh_auth_method: "wallet" });
+    await generateSessionKeypair();
+    const stepUpVta = stubWallet();
+    installControlPlane(() => rejection("permissionDenied"));
+    await expect(api.createInvite("did:example:new", "owner")).rejects.toThrow();
+    expect(stepUpVta).not.toHaveBeenCalled();
+  });
+
   it("says so when the session cannot step up", async () => {
     stubStorage({ webvh_token: TOKEN, webvh_refresh_token: "r", webvh_auth_method: "wallet" });
     await generateSessionKeypair();
@@ -881,6 +930,17 @@ describe("passkey login", () => {
     expect(doc.proof).toBeUndefined();
     expect(doc.issuer).toBeUndefined();
     expect(bearer).toBeUndefined();
+  });
+
+  it("names a subject when one is given, so its credentials are listed", async () => {
+    const sent = installControlPlane((req) =>
+      seal(req, { authId: "auth-2", options: { challenge: "Y2hhbGxlbmdl" } }),
+    );
+    await api.passkeyLoginStart("did:example:dana");
+    expect(tasks(sent)[0]!.doc.payload).toEqual({
+      purpose: "login",
+      subject: "did:example:dana",
+    });
   });
 
   it("finishes signed by a fresh session did:key as its own issuer, with no bearer", async () => {

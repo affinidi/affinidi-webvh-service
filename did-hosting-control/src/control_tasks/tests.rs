@@ -1052,8 +1052,8 @@ async fn an_offer_discloses_nothing_and_can_be_withdrawn() {
 
 /// The recipient takes a slot only if it could have registered it: its quota
 /// and domain scope are applied when it accepts, and when an administrator
-/// moves the slot directly. The administrator is told why; the recipient is
-/// not told anything about the slot's owner.
+/// moves the slot directly. Each is told which check failed; the recipient
+/// is told nothing about the slot's owner.
 #[tokio::test]
 async fn the_recipients_quota_and_domain_scope_apply_to_a_transfer() {
     use did_hosting_common::server::domain::DomainScope;
@@ -1082,7 +1082,7 @@ async fn the_recipients_quota_and_domain_scope_apply_to_a_transfer() {
         .await
         .unwrap();
 
-    for recipient in [&full, &elsewhere] {
+    for (recipient, why) in [(&full, "count limit"), (&elsewhere, "not scoped")] {
         // Offered by the owner, refused when the recipient accepts.
         ok(
             &call(
@@ -1104,20 +1104,19 @@ async fn the_recipients_quota_and_domain_scope_apply_to_a_transfer() {
         )
         .await;
         assert_eq!(code(&reply), TARGET_NOT_AUTHORIZED, "{reply}");
+        // The recipient is told its own reason, and nothing about the owner.
+        let message = reply["payload"]["message"].as_str().unwrap_or_default();
         assert!(
-            !reply["payload"]["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains(&owner.did),
-            "{reply}"
+            message.contains(why) && !message.contains(&owner.did),
+            "{why}: {reply}"
         );
     }
     // An administrator's direct transfer is held to the same limits, and says
     // which one.
     for (recipient, why) in [
         (&full.did, "count limit"),
-        (&elsewhere.did, "control.test"),
-        (&service.did, "owns no DIDs"),
+        (&elsewhere.did, "'control.test'"),
+        (&service.did, "cannot own DIDs"),
         (&"did:example:not-in-acl".to_string(), "no ACL entry"),
     ] {
         let reply = call(
@@ -1146,8 +1145,71 @@ async fn the_recipients_quota_and_domain_scope_apply_to_a_transfer() {
     assert_eq!(record.owner, owner.did, "nothing moved");
 }
 
-/// An offer is for the slot as it stood: once the slot is deleted and the
-/// path registered again, an earlier offer for it cannot be accepted.
+/// Deleting a slot withdraws its offer, even when the path is registered
+/// again at once (within the same second as the offer).
+#[tokio::test]
+async fn deleting_a_slot_withdraws_its_offer() {
+    let (state, _dir) = state().await;
+    let owner = member(&state, 36, Role::Owner).await;
+    let heir = member(&state, 37, Role::Owner).await;
+    let mut record = seed_did(&state, &owner.did, "iota-kappa").await;
+    let now = did_hosting_common::server::auth::session::now_epoch();
+    record.created_at = now;
+    state
+        .dids_ks
+        .insert(did_key("iota-kappa"), &record)
+        .await
+        .unwrap();
+    ok(
+        &call(
+            &state,
+            Via::Tsp,
+            &owner,
+            CHANGE_OWNER,
+            json!({ "mnemonic": "iota-kappa", "newOwner": heir.did }),
+        )
+        .await,
+        CHANGE_OWNER,
+    );
+    ok(
+        &call(
+            &state,
+            Via::Tsp,
+            &owner,
+            "https://trusttasks.org/spec/did-management/did/delete/0.1",
+            json!({ "mnemonic": "iota-kappa" }),
+        )
+        .await,
+        "https://trusttasks.org/spec/did-management/did/delete/0.1",
+    );
+    assert!(
+        state
+            .sessions_ks
+            .get_raw("did_xfer:iota-kappa")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut record = seed_did(&state, &owner.did, "iota-kappa").await;
+    record.created_at = now;
+    state
+        .dids_ks
+        .insert(did_key("iota-kappa"), &record)
+        .await
+        .unwrap();
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &heir,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "iota-kappa", "newOwner": heir.did }),
+    )
+    .await;
+    assert_eq!(code(&reply), NOT_OWNER, "{reply}");
+}
+
+/// An offer is for the slot as it stood: once the path is registered again,
+/// an earlier offer for it cannot be accepted.
 #[tokio::test]
 async fn an_offer_does_not_survive_its_slot() {
     let (state, _dir) = state().await;

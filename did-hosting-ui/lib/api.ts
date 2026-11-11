@@ -118,6 +118,18 @@ export interface HealthResponse {
 /** DID hosting method tag carried on every DidRecord. */
 export type DidMethod = "webvh" | "web" | "webs" | "webplus" | string;
 
+/**
+ * Whether `e` asks for a stepped-up session: the declared `stepUpRequired`
+ * where a task declares it, else `permissionDenied` whose message is the
+ * control plane's `step_up_required` class.
+ */
+export function needsStepUp(e: unknown): boolean {
+  return (
+    isRejection(e, "stepUpRequired") ||
+    (isRejection(e, "permissionDenied") && e.payload.message === "step_up_required")
+  );
+}
+
 /** What `changeOwner` did: `offer` is set when the DID did not move yet and
  *  waits for its recipient to accept. */
 export interface OwnerChangeResult {
@@ -1204,7 +1216,7 @@ export const api = {
     try {
       await purge();
     } catch (e) {
-      if (!isRejection(e, "stepUpRequired")) throw e;
+      if (!needsStepUp(e)) throw e;
       await api.stepUp();
       await purge();
     }
@@ -1284,11 +1296,16 @@ export const api = {
 
   // ---- Passkey login (Trust Tasks) ----
 
-  /** Open a login ceremony. Sent anonymously: opening one authorises nothing. */
-  passkeyLoginStart: async (): Promise<LoginStartResponse> => {
+  /**
+   * Open a login ceremony. Sent anonymously: opening one authorises nothing.
+   * With no `subject` the browser offers the passkeys it can find by itself;
+   * naming one also lists that subject's credentials, for a security key
+   * enrolled as non-discoverable.
+   */
+  passkeyLoginStart: async (subject?: string): Promise<LoginStartResponse> => {
     const r = await trustTask<LoginStart.Payload, LoginStart.Response>(
       T.loginStart,
-      { purpose: "login" },
+      { purpose: "login", ...(subject ? { subject } : {}) },
       { signer: "none", anonymous: true },
     );
     return { authId: r.authId, options: r.options };
@@ -1327,10 +1344,20 @@ export const api = {
     role: Role,
     purpose: InvitePurpose = "session",
   ): Promise<CreateInviteResponse> => {
-    const r = await trustTask<Invite.Payload, Invite.Response>(T.invite, {
-      subject: did,
-      ...(purpose === "session" ? { role } : { purpose }),
-    });
+    // Issuing an invite needs a stepped-up session, like a purge.
+    const send = () =>
+      trustTask<Invite.Payload, Invite.Response>(T.invite, {
+        subject: did,
+        ...(purpose === "session" ? { role } : { purpose }),
+      });
+    let r: Invite.Response;
+    try {
+      r = await send();
+    } catch (e) {
+      if (!needsStepUp(e)) throw e;
+      await api.stepUp();
+      r = await send();
+    }
     return {
       inviteUrl: r.invite.url,
       claimCode: r.claimCode,
