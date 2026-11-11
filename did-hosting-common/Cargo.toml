@@ -42,7 +42,7 @@ server-core = [
     "dep:trust-tasks-proof", "dep:affinidi-data-integrity",
     "dep:affinidi-messaging-didcomm-service", "dep:affinidi-messaging-didcomm",
     "dep:affinidi-tsp", "dep:affinidi-messaging-sdk",
-    "dep:trust-tasks-build", "dep:affinidi-rate-limit",
+    "dep:trust-tasks-build", "dep:affinidi-rate-limit", "dep:affinidi-net-guard",
 ]
 store-fjall = ["server-core", "dep:fjall"]
 store-redis = ["server-core", "dep:redis"]
@@ -73,9 +73,10 @@ passkey = [
     "server-core", "dep:webauthn-rs", "dep:webauthn-rs-proto", "dep:argon2", "dep:subtle",
     "dep:sha2",
 ]
-# Test-only seams (e.g. seeding a verifier's deactivation verdicts). Enabled
-# only from dev-dependencies; never compiled into a release.
-test-support = ["server-core"]
+# Test-only seams (e.g. seeding a verifier's deactivation verdicts, or letting
+# a test reach a peer's Trust Task endpoint on loopback). Enabled only from
+# dev-dependencies; never compiled into a release.
+test-support = ["server-core", "affinidi-net-guard/dev-loopback"]
 
 [dependencies]
 affinidi-tdk = { workspace = true }
@@ -104,6 +105,10 @@ ipnetwork = "0.21"
 # Every per-address and per-source limit, and the trusted-proxy client
 # address rule, shared with the mediator and the DID resolver cache.
 affinidi-rate-limit = { version = "0.1.4", optional = true }
+# Egress policy for a peer-advertised `TrustTaskHTTPS` endpoint: the URL comes
+# from the peer's DID document, so it is vetted (public addresses only, https
+# only, no redirects) and the name is resolved through the guarded resolver.
+affinidi-net-guard = { version = "0.1.1", optional = true }
 vta-sdk = { workspace = true }
 
 # Cross-repo dep on the VTI Verifiable Trust Infrastructure

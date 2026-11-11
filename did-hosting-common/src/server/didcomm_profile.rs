@@ -211,12 +211,14 @@ pub async fn resolve_service_types(
 /// and prefer `DIDComm` over `TrustTaskHTTPS` — the concrete realisation
 /// of "TSP > DIDComm > HTTPS".
 ///
-/// A `TrustTaskHTTPS` endpoint is used only when
-/// [`crate::did::is_https_or_loopback`] accepts it — the same gate
-/// `add_trust_task_https_service` asks callers to apply before
-/// advertising it. A document that names a plain non-loopback `http://`
-/// endpoint (misconfiguration, or a downgrade attempt) is treated as
-/// silent on this transport rather than routed to insecurely.
+/// A `TrustTaskHTTPS` endpoint is used only when it passes the peer endpoint
+/// egress policy (`crate::http::vet_peer_endpoint`): `https`, and a host that
+/// is a public name or a globally routable address — not loopback, a private
+/// or link-local range, or a special-use name such as `localhost`. The
+/// endpoint comes from the peer's own document, so this node must not send
+/// wherever it says. A document naming any other endpoint is treated as
+/// silent on this transport. What the name resolves to is checked again
+/// when the send connects.
 pub async fn resolve_transport(
     peer_did: &str,
     did_resolver: Option<&DIDCacheClient>,
@@ -265,16 +267,19 @@ pub async fn resolve_transport(
         return Some((PeerTransport::Didcomm, didcomm));
     }
     if let Some(https) = find_uri("TrustTaskHTTPS") {
-        if crate::did::is_https_or_loopback(&https) {
-            info!(peer = peer_did, endpoint = %https, "peer advertises TrustTaskHTTPS — using HTTPS");
-            return Some((PeerTransport::Https, https));
+        match crate::http::vet_peer_endpoint(&https) {
+            Ok(_) => {
+                info!(peer = peer_did, endpoint = %https, "peer advertises TrustTaskHTTPS — using HTTPS");
+                return Some((PeerTransport::Https, https));
+            }
+            Err(e) => warn!(
+                peer = peer_did,
+                endpoint = %https,
+                reason = %e,
+                "peer advertises TrustTaskHTTPS at an endpoint outside the outbound policy \
+                 (https to a public host) — not routing trust tasks there"
+            ),
         }
-        warn!(
-            peer = peer_did,
-            endpoint = %https,
-            "peer advertises TrustTaskHTTPS at a non-https, non-loopback endpoint — refusing to \
-             route trust tasks there"
-        );
     }
     None
 }
@@ -630,6 +635,60 @@ mod tests {
             https,
             Some((PeerTransport::Https, "https://peer.example/api".into()))
         );
+    }
+
+    /// A `did:peer` whose only service is `TrustTaskHTTPS` at `endpoint`.
+    fn https_only_peer(endpoint: &str) -> String {
+        use affinidi_tdk::dids::{DID, KeyType, PeerKeyRole, PeerService, PeerServiceEndpoint};
+        let (did, _) = DID::generate_did_peer_with_services(
+            vec![(PeerKeyRole::Verification, KeyType::Ed25519)],
+            Some(vec![PeerService {
+                type_: "TrustTaskHTTPS".into(),
+                endpoint: PeerServiceEndpoint::Uri(endpoint.to_string()),
+                id: Some("#trust-tasks".into()),
+            }]),
+        )
+        .expect("generate did:peer");
+        did
+    }
+
+    /// The `TrustTaskHTTPS` endpoint comes from the peer's own document, so
+    /// one on loopback, a private or link-local range, or a special-use name
+    /// is treated as not advertised (and falls through to the configured
+    /// mediator, or to no route); a public `https` one is used.
+    #[tokio::test]
+    async fn a_peer_advertised_https_endpoint_must_be_public() {
+        let resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .expect("resolver");
+
+        let public = https_only_peer("https://edge.example.com/api");
+        assert_eq!(
+            resolve_transport(&public, Some(&resolver)).await,
+            Some((PeerTransport::Https, "https://edge.example.com/api".into()))
+        );
+
+        for endpoint in [
+            "http://127.0.0.1:8534/api",
+            "https://127.0.0.1:8534/api",
+            "https://10.0.0.5/api",
+            "https://192.168.0.2/api",
+            "https://169.254.169.254/latest",
+            "https://localhost/api",
+            "http://edge.example.com/api",
+        ] {
+            let peer = https_only_peer(endpoint);
+            assert_eq!(
+                resolve_transport(&peer, Some(&resolver)).await,
+                None,
+                "{endpoint} must not be routed to"
+            );
+            assert_eq!(
+                resolve_send_binding(&peer, &cfg(None, false), Some(&resolver)).await,
+                None,
+                "{endpoint}: no route without a configured mediator"
+            );
+        }
     }
 
     #[test]

@@ -23,7 +23,8 @@ use trust_tasks_rs::Payload;
 
 use crate::did::{build_did_document, create_log_entry, encode_host};
 use crate::error::{Result, WebVHError};
-use crate::server::trust_tasks::send::{build_signed_request, post_trust_task_https};
+use crate::server::trust_tasks::TransportBoundVerifier;
+use crate::server::trust_tasks::send::{build_signed_request, post_trust_task_https_verified};
 use crate::types::*;
 
 /// The requester a [`WebVHClient`] signs as, and the service it addresses.
@@ -31,7 +32,9 @@ struct Requester {
     did: String,
     signer: Secret,
     service_did: String,
-    did_resolver: DIDCacheClient,
+    /// Verifies every reply. Built once, at [`WebVHClient::sign_as`], so it
+    /// keeps its DID-status verdicts and forced-refresh limit across calls.
+    verifier: TransportBoundVerifier,
 }
 
 /// A client for one DID Hosting control plane.
@@ -92,7 +95,7 @@ impl WebVHClient {
             did: did.to_string(),
             signer: signer.clone(),
             service_did: service_did.to_string(),
-            did_resolver,
+            verifier: TransportBoundVerifier::with_did_cache(did_resolver),
         });
         Ok(())
     }
@@ -342,12 +345,12 @@ impl WebVHClient {
         )
         .await
         .map_err(|e| WebVHError::Transport(e.to_string()))?;
-        let reply = post_trust_task_https(
+        let reply = post_trust_task_https_verified(
             &requester.did,
             &requester.service_did,
             &format!("{}/api/trust-tasks", self.server_url),
             &doc,
-            Some(&requester.did_resolver),
+            &requester.verifier,
         )
         .await
         .map_err(|e| WebVHError::Transport(e.to_string()))?;

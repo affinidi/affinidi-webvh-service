@@ -378,20 +378,38 @@ to each other must keep the document as the source of truth.
 
 - **Send precedence: document → config → fail.** Outbound trust-task delivery
   picks its binding via `resolve_send_binding` (`server::didcomm_profile`): the
-  peer's advertised `TSPTransport` (preferred) or `DIDCommMessaging` wins; if
-  the document advertises neither, the node's own configured mediator is the
-  fallback (the compatibility bridge for DIDs minted before transports were
-  published); if neither yields a binding, the send **fails** as unroutable.
-  Do **not** reintroduce a blind-DIDComm default, and do **not** add a REST tier
-  — `POST /api/trust-tasks` is the HTTPS binding, the same dispatch TSP and
-  DIDComm reach, never a separate API; and HTTP-only nodes are served by the
-  pull/watcher model, not a trust-task push.
+  peer's advertised `TSPTransport` (preferred), then `DIDCommMessaging`, then
+  `TrustTaskHTTPS` wins; if the document advertises none of them, the node's
+  own configured mediator is the fallback (the compatibility bridge for DIDs
+  minted before transports were published; TSP/DIDComm only — a
+  document-silent peer is never guessed to speak HTTPS); if nothing yields a
+  binding, the send **fails** as unroutable. Do **not** reintroduce a
+  blind-DIDComm default. The `TrustTaskHTTPS` tier is the same Trust Task
+  `POST`ed to the peer's `{endpoint}/trust-tasks` — the HTTPS binding of the
+  same dispatch TSP and DIDComm reach, never a separate REST API — with the
+  reply verified synchronously (`trust_tasks::send`).
+
+- **A peer-advertised URL is the peer's to name, not to aim.** The
+  `TrustTaskHTTPS` endpoint comes from the peer's own DID document, so it goes
+  through the peer endpoint egress policy (`http::vet_peer_endpoint` /
+  `http::peer_endpoint_client`, on `affinidi-net-guard`): `https` to a public
+  host only — loopback, private, link-local and special-use names are treated
+  as not advertised, and the resolved addresses are checked again at connect
+  time; no redirects, finite timeouts, a 1 MiB reply cap. URLs an operator
+  configured (a control plane, witness or hosting URL) use
+  `http::outbound_client` instead. Tests whose peers listen on `127.0.0.1`
+  opt in with `send::allow_loopback_peer_endpoints_for_tests()`
+  (`test-support` only). Both clients, and each service's
+  `TransportBoundVerifier`, are built once and shared: pass the service's
+  `trust_tasks_verifier` to a send (`send::Peers`), never a verifier built per
+  call.
 
 - **Nothing gates on `WebVHHosting`.** `resolve_send_binding` reads only the
-  messaging services; registration and health use the DIDComm identity; the
-  registry's `advertised_services` is display-only; DID resolution is
-  identifier-derived. Keep it that way — don't make behaviour depend on the
-  hosting service being present.
+  transport services (`TSPTransport`, `DIDCommMessaging`, `TrustTaskHTTPS`);
+  registration and health use the DIDComm identity; the registry's
+  `advertised_services` is display-only; DID resolution is identifier-derived.
+  Keep it that way — don't make behaviour depend on the hosting service being
+  present.
 
 ## `did:webs` is hosted, and it breaks two of the shared rules on purpose
 

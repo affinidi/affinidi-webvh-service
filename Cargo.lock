@@ -3099,6 +3099,7 @@ dependencies = [
  "affinidi-messaging-didcomm",
  "affinidi-messaging-didcomm-service",
  "affinidi-messaging-sdk",
+ "affinidi-net-guard",
  "affinidi-rate-limit",
  "affinidi-secrets-resolver",
  "affinidi-tdk",
