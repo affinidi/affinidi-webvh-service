@@ -402,7 +402,9 @@ to each other must keep the document as the source of truth.
   (`test-support` only). Both clients, and each service's
   `TransportBoundVerifier`, are built once and shared: pass the service's
   `trust_tasks_verifier` to a send (`send::Peers`), never a verifier built per
-  call.
+  call. Reply checks use `TransportBoundVerifier::for_replies`, a separate
+  forced-refresh allowance over the same DID cache, so unsolicited inbound
+  documents cannot spend it.
 
 - **Nothing gates on `WebVHHosting`.** `resolve_send_binding` reads only the
   transport services (`TSPTransport`, `DIDCommMessaging`, `TrustTaskHTTPS`);

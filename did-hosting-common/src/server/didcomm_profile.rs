@@ -10,7 +10,7 @@ use std::time::Duration;
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 use affinidi_tdk_common::profiles::TDKProfile;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::error::AppError;
 use super::identity::ServiceIdentity;
@@ -272,16 +272,42 @@ pub async fn resolve_transport(
                 info!(peer = peer_did, endpoint = %https, "peer advertises TrustTaskHTTPS — using HTTPS");
                 return Some((PeerTransport::Https, https));
             }
-            Err(e) => warn!(
+            // Every send to this peer re-reads its document, so warn once per
+            // peer and keep the repeats at debug.
+            Err(e) if first_refusal(peer_did) => warn!(
                 peer = peer_did,
                 endpoint = %https,
                 reason = %e,
                 "peer advertises TrustTaskHTTPS at an endpoint outside the outbound policy \
                  (https to a public host) — not routing trust tasks there"
             ),
+            Err(e) => debug!(
+                peer = peer_did,
+                endpoint = %https,
+                reason = %e,
+                "peer's TrustTaskHTTPS endpoint is still outside the outbound policy"
+            ),
         }
     }
     None
+}
+
+/// Most peers [`first_refusal`] remembers. Past it, every refusal is logged at
+/// debug: the log cannot be flooded by a stream of distinct peers either.
+const REFUSAL_WARNINGS_CAPACITY: usize = 1024;
+
+/// Whether this is the first time `peer_did`'s advertised HTTPS endpoint has
+/// been refused in this process (and so worth a warning).
+fn first_refusal(peer_did: &str) -> bool {
+    static WARNED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    let mut warned = WARNED.lock().unwrap_or_else(|p| p.into_inner());
+    let warned = warned.get_or_insert_with(Default::default);
+    if warned.contains(peer_did) || warned.len() >= REFUSAL_WARNINGS_CAPACITY {
+        return false;
+    }
+    warned.insert(peer_did.to_string());
+    true
 }
 
 /// The node's locally-configured messaging fallback, applied when a peer's
@@ -689,6 +715,13 @@ mod tests {
                 "{endpoint}: no route without a configured mediator"
             );
         }
+    }
+
+    #[test]
+    fn a_refused_endpoint_warns_once_per_peer() {
+        assert!(first_refusal("did:example:refusal-once"));
+        assert!(!first_refusal("did:example:refusal-once"));
+        assert!(first_refusal("did:example:refusal-other"));
     }
 
     #[test]

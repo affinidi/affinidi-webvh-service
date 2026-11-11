@@ -1034,6 +1034,15 @@ async fn run_self_managed_setup(
     let trust_task_base = format!("{public_url}/api");
     if did_hosting_common::did::is_https_or_loopback(&trust_task_base) {
         did_hosting_common::did::add_trust_task_https_service(&mut doc, &trust_task_base);
+        if let Some(reason) =
+            did_hosting_common::server::trust_tasks::send::peer_endpoint_refusal(&trust_task_base)
+        {
+            eprintln!(
+                "  Note: other hosting nodes will not send Trust Tasks to {trust_task_base} \
+                 ({reason}); they send only to https on a public host. Use a public https \
+                 URL, or a mediator (TSP/DIDComm), for node-to-node traffic."
+            );
+        }
         // The console's login page, for wallet sign-in with a trigger link
         // (contract C4): the embedded control plane serves the UI at the
         // origin root. `https` only — a loopback-http dev daemon still gets

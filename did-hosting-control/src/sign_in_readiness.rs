@@ -376,11 +376,52 @@ pub async fn check(resolver: &DIDCacheClient, server_did: &str, public_url: &str
     resolver.remove(server_did).await;
     match resolver.resolve(server_did).await {
         Ok(resolved) => match serde_json::to_value(&resolved.doc) {
-            Ok(doc) => check_document(&doc, public_url),
+            Ok(doc) => {
+                if let Some(text) = peer_routing_note(&doc) {
+                    warn_once_per_endpoint(&text);
+                }
+                check_document(&doc, public_url)
+            }
             Err(e) => Readiness::Unknown(format!("could not read the DID document: {e}")),
         },
         Err(e) => Readiness::Unknown(format!("could not resolve {server_did}: {e}")),
     }
+}
+
+/// A note when the server DID's advertised `TrustTaskHTTPS` endpoint is one
+/// other hosting nodes will not send to (loopback, a private address, plain
+/// `http`): they hold a peer's advertised endpoint to `https` on a public
+/// host. Separate from wallet sign-in readiness, which this does not affect.
+pub fn peer_routing_note(doc: &Value) -> Option<String> {
+    let endpoint = doc
+        .get("service")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|s| types_of(s).contains(&SignInService::TrustTaskHttps.type_name()))?
+        .get("serviceEndpoint")?;
+    let uri = match endpoint {
+        Value::String(u) => u.as_str(),
+        Value::Object(m) => m.get("uri").and_then(Value::as_str)?,
+        _ => return None,
+    };
+    let reason = did_hosting_common::server::trust_tasks::send::peer_endpoint_refusal(uri)?;
+    Some(format!(
+        "the server DID advertises TrustTaskHTTPS at {uri}, which other hosting nodes will not \
+         send Trust Tasks to ({reason}); they send only to https on a public host. Publish a \
+         public https endpoint, or a TSP/DIDComm service, for node-to-node traffic."
+    ))
+}
+
+/// Log `text` at warn the first time, and again only when it changes.
+fn warn_once_per_endpoint(text: &str) {
+    static LAST: RwLock<Option<String>> = RwLock::new(None);
+    if LAST.read().is_ok_and(|l| l.as_deref() == Some(text)) {
+        return;
+    }
+    if let Ok(mut last) = LAST.write() {
+        *last = Some(text.to_string());
+    }
+    warn!("{text}");
 }
 
 /// The latest result, for the server DID it was computed for.
@@ -554,6 +595,28 @@ mod tests {
             s["type"] = json!([t]);
         }
         assert_eq!(check_document(&doc_with(services), URL), READY);
+    }
+
+    #[test]
+    fn a_trust_task_endpoint_peers_refuse_is_noted() {
+        let doc = |uri: &str| {
+            json!({ "id": DID, "service": [{
+                "id": format!("{DID}#trust-tasks"), "type": "TrustTaskHTTPS",
+                "serviceEndpoint": uri }] })
+        };
+        assert_eq!(
+            peer_routing_note(&doc("https://webvh.example.com/api")),
+            None
+        );
+        for uri in [
+            "http://localhost:8534/api",
+            "https://10.0.0.5/api",
+            "https://127.0.0.1/api",
+        ] {
+            let note = peer_routing_note(&doc(uri)).expect(uri);
+            assert!(note.contains(uri), "{note}");
+        }
+        assert_eq!(peer_routing_note(&json!({ "id": DID })), None);
     }
 
     #[test]

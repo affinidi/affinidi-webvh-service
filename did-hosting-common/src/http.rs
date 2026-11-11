@@ -119,6 +119,18 @@ fn loopback_peers() -> bool {
     }
 }
 
+/// Why a peer would refuse `url` as this node's advertised Trust Task
+/// endpoint, under the policy release builds apply (no test opt-in), or
+/// `None` when it would be accepted. For setup and self-checks: a node
+/// advertising an endpoint other nodes will not send to is unreachable over
+/// HTTPS.
+pub(crate) fn peer_endpoint_refusal(url: &str) -> Option<String> {
+    peer_endpoint_policy(false)
+        .vet(url)
+        .err()
+        .map(|e| e.to_string())
+}
+
 /// Check a URL taken from a peer's DID document against the peer endpoint
 /// policy (scheme, userinfo, literal address class, special-use names). The
 /// resolved addresses are checked when [`peer_endpoint_client`] connects.

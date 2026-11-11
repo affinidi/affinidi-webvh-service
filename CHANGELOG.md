@@ -437,6 +437,14 @@ log line or an outbox error.
   service.
 - URLs an operator configures (`WebVHClient`'s server URL, `WitnessClient`'s
   witness URL) are unaffected.
+- Setup (interactive and recipe) and the control plane's sign-in self-check
+  now note when this node's own advertised `TrustTaskHTTPS` endpoint is one
+  other nodes will not send to.
+- There is no setting yet to admit private address ranges; a deployment whose
+  nodes reach each other only over a private network uses TSP/DIDComm through
+  a mediator.
+- A peer whose endpoint is refused is warned about once per process; repeats
+  are logged at debug.
 
 ### Changed — outbound HTTPS Trust Tasks share one client and one verifier
 
@@ -444,7 +452,9 @@ An HTTPS send built a new HTTP client, and a new reply verifier, for every
 request. Each service now verifies HTTPS replies with the verifier it checks
 inbound documents with, so DID-status verdicts are reused and forced
 re-resolutions of a peer's DID are rate-limited across calls (at most one per
-DID per 30 s) on these paths too. `WitnessClient` and `WebVHClient` build
+DID per 30 s) on these paths too. Replies get a forced-refresh allowance of
+their own (`TransportBoundVerifier::for_replies`), so inbound documents cannot
+use up the re-resolution a just-rotated peer's reply needs. `WitnessClient` and `WebVHClient` build
 their verifier once per client. HTTP clients are built once per process, so
 connections are reused.
 

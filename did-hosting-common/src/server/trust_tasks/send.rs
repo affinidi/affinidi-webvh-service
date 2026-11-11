@@ -85,8 +85,15 @@ pub type SendError = Box<dyn std::error::Error + Send + Sync>;
 /// Pass the service's own long-lived verifier (the one it checks inbound
 /// documents with, built once at startup by [`super::build_verifier`]): it
 /// remembers DID-status verdicts and rate-limits forced re-resolutions, so a
-/// reply is held to the same per-DID limit as an inbound document. A verifier
-/// built per send would remember nothing and limit nothing.
+/// reply is held to the same DID-status verdicts as an inbound document (with
+/// a forced-refresh allowance of its own, see
+/// [`TransportBoundVerifier::for_replies`]). A verifier built per send would
+/// remember nothing and limit nothing.
+///
+/// `Peers::default()` has no resolver and **no verifier**: TSP and DIDComm
+/// sends work (the peer's document is resolved through a default cache built
+/// for the call), but an HTTPS send fails, because its reply cannot be
+/// checked.
 #[derive(Clone, Copy, Default)]
 pub struct Peers<'a> {
     /// Resolves the peer's DID document. `None` falls back to a default
@@ -95,6 +102,14 @@ pub struct Peers<'a> {
     /// Verifies a reply that arrives as the HTTP response. `None` means an
     /// HTTPS send fails: an unverified reply is not evidence of delivery.
     pub verifier: Option<&'a TransportBoundVerifier>,
+}
+
+/// Why other nodes would refuse `endpoint` as this node's advertised
+/// `TrustTaskHTTPS` endpoint (they send only to `https` on a public host), or
+/// `None` if they would accept it. For setup and self-checks to warn an
+/// operator whose own endpoint is loopback, private or plain `http`.
+pub fn peer_endpoint_refusal(endpoint: &str) -> Option<String> {
+    crate::http::peer_endpoint_refusal(endpoint)
 }
 
 /// Let this process send to a peer whose advertised Trust Task endpoint is on
@@ -309,8 +324,15 @@ async fn send_over_https(
     verifier: Option<&TransportBoundVerifier>,
 ) -> Result<(), SendError> {
     let url = format!("{}/trust-tasks", endpoint.trim_end_matches('/'));
-    let vetted = crate::http::vet_peer_endpoint(&url)
-        .map_err(|e| format!("trust task to {to}: endpoint {url} not allowed: {e}"))?;
+    // The URL is the peer's text: sanitised and bounded before it reaches an
+    // outbox error or a log line.
+    let vetted = crate::http::vet_peer_endpoint(&url).map_err(|e| {
+        format!(
+            "trust task to {to}: endpoint {} not allowed: {}",
+            crate::error::redact_server_message(&url),
+            crate::error::redact_server_message(&e.to_string())
+        )
+    })?;
     let verifier = verifier.ok_or_else(|| {
         format!("trust task HTTPS reply from {to}: no DID resolver configured to verify it")
     })?;
@@ -428,7 +450,10 @@ async fn check_https_reply(
     // peer that answers 2xx with an *unsigned* framework error (the one shape
     // left unsigned) fails here; surface its code so the refusal is legible
     // rather than reported as a signature failure.
-    if let Err(e) = verify_sender_bound(&reply, Some(to), None, from, verifier).await {
+    // `for_replies`: a reply to our own send has its own forced-refresh
+    // allowance, which documents arriving unasked cannot spend.
+    let verifier = verifier.for_replies();
+    if let Err(e) = verify_sender_bound(&reply, Some(to), None, from, &verifier).await {
         if let Some((code, message)) = unsigned_error_summary(body) {
             return Err(refused(to, url, &code, &message).into());
         }
