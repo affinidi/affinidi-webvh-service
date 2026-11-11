@@ -128,7 +128,15 @@ fn descriptors(v: Option<&Value>) -> Option<Value> {
 /// Creation options in the shape the shared WebAuthn schema allows. The
 /// library adds hints the schema (and the platform API) does not need; they
 /// are dropped rather than sent off-schema.
-fn creation_options(ccr: &CreationChallengeResponse) -> Result<Value, TaskError> {
+///
+/// A login credential must be discoverable (`residentKey: required`): a
+/// passkey login lists no credentials (`auth::login_start`), so the
+/// authenticator has to find it by itself. A step-up credential is always
+/// asked for by id, and keeps the library's default.
+fn creation_options(
+    ccr: &CreationChallengeResponse,
+    discoverable: bool,
+) -> Result<Value, TaskError> {
     let value = serde_json::to_value(ccr)?;
     let pk = value.get("publicKey").cloned().unwrap_or(value);
     let mut out = pick(
@@ -155,18 +163,20 @@ fn creation_options(ccr: &CreationChallengeResponse) -> Result<Value, TaskError>
         );
     }
     if let Some(sel) = pk.get("authenticatorSelection") {
-        obj.insert(
-            "authenticatorSelection".into(),
-            pick(
-                sel,
-                &[
-                    "authenticatorAttachment",
-                    "requireResidentKey",
-                    "residentKey",
-                    "userVerification",
-                ],
-            ),
+        let mut sel = pick(
+            sel,
+            &[
+                "authenticatorAttachment",
+                "requireResidentKey",
+                "residentKey",
+                "userVerification",
+            ],
         );
+        if discoverable {
+            sel["residentKey"] = json!("required");
+            sel["requireResidentKey"] = json!(true);
+        }
+        obj.insert("authenticatorSelection".into(), sel);
     }
     if let Some(ex) = descriptors(pk.get("excludeCredentials")) {
         obj.insert("excludeCredentials".into(), ex);
@@ -251,7 +261,7 @@ async fn open(
     };
     pk::store_ceremony(&state.sessions_ks, &ceremony).await?;
     Ok(Opened {
-        options: creation_options(&ccr)?,
+        options: creation_options(&ccr, purpose == Purpose::Session)?,
         uv_options,
         ceremony,
     })
@@ -803,6 +813,38 @@ pub(crate) async fn redeem_finish(
 // auth/passkey/enroll/{start,finish}/0.2
 // ---------------------------------------------------------------------------
 
+/// Whether this request may add its subject's *first* login passkey.
+///
+/// A passkey login is minted at `aal2`, so the first login passkey a subject
+/// enrols is a new way to reach `aal2`, and must be added with at least that
+/// much: by a session already stepped up to `aal2`, or by a request the
+/// subject's own DID key signs (the factor a `didSigned` step-up rests on). A
+/// session's delegated key — what a browser session signs with — is neither,
+/// so a session alone cannot turn itself into an `aal2` one this way. A
+/// subject that has neither enrols its first login passkey through an
+/// administrator's invite (`auth/passkey/enroll/invite`). Adding a further
+/// passkey is gated by the user verification over an existing one instead.
+fn require_first_passkey_authority(
+    cx: &Cx<'_>,
+    auth: &crate::auth::AuthClaims,
+) -> Result<(), TaskError> {
+    let own_key = cx.proof_vm.as_deref().is_some_and(|vm| {
+        did_hosting_common::scid::same_reference(
+            did_hosting_common::server::trust_tasks::verifier::controller_did(vm),
+            &auth.did,
+        )
+    });
+    if auth.acr == "aal2" || own_key {
+        return Ok(());
+    }
+    Err(AppError::StepUpRequired(
+        "a first login passkey is enrolled from a stepped-up (aal2) session, by a request \
+         signed with your own DID key, or through an administrator's invite"
+            .into(),
+    )
+    .into())
+}
+
 /// `auth/passkey/enroll/start/0.2`: the proven caller adds a login passkey to
 /// their own VID. When they already hold one, the response carries
 /// `uvOptions` and the finish must answer them.
@@ -829,6 +871,9 @@ pub(crate) async fn start(
             error_codes::MAX_CREDENTIALS_REACHED,
             format!("at most {MAX_SESSION_CREDENTIALS} passkeys per subject"),
         ));
+    }
+    if held == 0 {
+        require_first_passkey_authority(cx, &auth)?;
     }
     let session_id = cx
         .bearer_session()
@@ -895,6 +940,11 @@ pub(crate) async fn finish(
     let _guard =
         super::passkey::credentials_guard(state, Purpose::Session, &ceremony.subject).await;
     let existing = pk::get_passkey_user_by_did(&state.sessions_ks, &ceremony.subject).await?;
+    // Checked again here, against what the subject holds now: the start's
+    // check saw the store before this guard was taken.
+    if existing.as_ref().is_none_or(|u| u.credentials.is_empty()) {
+        require_first_passkey_authority(cx, &auth)?;
+    }
     if existing
         .as_ref()
         .is_some_and(|u| u.credentials.len() >= MAX_SESSION_CREDENTIALS)

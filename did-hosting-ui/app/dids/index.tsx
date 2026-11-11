@@ -78,6 +78,10 @@ export default function DidList() {
   const [creating, setCreating] = useState(false);
 
   const [creatingRoot, setCreatingRoot] = useState(false);
+  // Accepting a DID another owner offered to this identity.
+  const [showAccept, setShowAccept] = useState(false);
+  const [acceptPath, setAcceptPath] = useState("");
+  const [accepting, setAccepting] = useState(false);
   const [copiedDid, setCopiedDid] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState<DidSort>({ key: "mnemonic", dir: "asc" });
@@ -158,6 +162,24 @@ export default function DidList() {
       showAlert("Error", msg);
     } finally {
       setCreating(false);
+    }
+  };
+
+  const handleAccept = async () => {
+    const path = acceptPath.trim();
+    if (!path || !myDid) return;
+    setAccepting(true);
+    try {
+      await api.acceptDidTransfer(path, myDid);
+      setAcceptPath("");
+      setShowAccept(false);
+      refresh();
+      showAlert("Success", `"${path}" is now yours`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to accept the DID";
+      showAlert("Error", msg);
+    } finally {
+      setAccepting(false);
     }
   };
 
@@ -319,6 +341,14 @@ export default function DidList() {
               </Text>
             </Pressable>
           )}
+          {!showAccept && myDid && (
+            <Pressable
+              style={styles.buttonSecondary}
+              onPress={() => setShowAccept(true)}
+            >
+              <Text style={styles.buttonSecondaryText}>Accept a DID</Text>
+            </Pressable>
+          )}
           {!showForm && (
             <Pressable
               style={styles.buttonPrimary}
@@ -329,6 +359,49 @@ export default function DidList() {
           )}
         </View>
       </View>
+
+      {showAccept && (
+        <View style={styles.formCard}>
+          <TextInput
+            style={styles.input}
+            placeholder="path of the DID offered to you"
+            placeholderTextColor={colors.textTertiary}
+            value={acceptPath}
+            onChangeText={setAcceptPath}
+            autoCapitalize="none"
+            autoCorrect={false}
+            accessibilityLabel="Path of the DID offered to you"
+          />
+          <Text style={styles.validationHint}>
+            Another owner offered you a DID. Enter its path to take ownership;
+            the offer lapses after 72 hours.
+          </Text>
+          <View style={styles.formActions}>
+            <Pressable
+              style={[
+                styles.buttonPrimary,
+                (!acceptPath.trim() || accepting) && styles.disabled,
+              ]}
+              onPress={handleAccept}
+              disabled={!acceptPath.trim() || accepting}
+            >
+              <Text style={styles.buttonPrimaryText}>
+                {accepting ? "Accepting..." : "Accept"}
+              </Text>
+            </Pressable>
+            <Pressable
+              style={styles.buttonSecondary}
+              onPress={() => {
+                setShowAccept(false);
+                setAcceptPath("");
+              }}
+              disabled={accepting}
+            >
+              <Text style={styles.buttonSecondaryText}>Cancel</Text>
+            </Pressable>
+          </View>
+        </View>
+      )}
 
       {showForm && (
         <View style={styles.formCard}>

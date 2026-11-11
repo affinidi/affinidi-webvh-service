@@ -866,38 +866,70 @@ async fn check_name_keeps_well_known_for_admins() {
     assert_eq!(code(&reply), "permissionDenied", "{reply}");
 }
 
+/// The slot's owner set in the ownership indexes: `(owner rows, heir rows)`.
+async fn owner_rows(state: &AppState, owner: &str, heir: &str) -> (usize, usize) {
+    let rows = |did: String| async move {
+        state
+            .dids_ks
+            .prefix_iter_raw(format!("owner:{did}:"))
+            .await
+            .unwrap()
+            .len()
+    };
+    (rows(owner.to_string()).await, rows(heir.to_string()).await)
+}
+
+/// An ACL member of `role` whose entry carries `max_did_count` and `domains`.
+async fn limited_member(
+    state: &AppState,
+    seed: u8,
+    role: Role,
+    max_did_count: Option<u64>,
+    domains: did_hosting_common::server::domain::DomainScope,
+) -> Caller {
+    let caller = member(state, seed, role.clone()).await;
+    did_hosting_common::server::acl::store_acl_entry(
+        &state.acl_ks,
+        &did_hosting_common::server::acl::AclEntry {
+            did: caller.did.clone(),
+            role,
+            label: None,
+            created_at: 1_700_000_000,
+            max_total_size: None,
+            max_did_count,
+            domains,
+        },
+    )
+    .await
+    .unwrap();
+    caller
+}
+
+const TARGET_NOT_AUTHORIZED: &str = "did-management/did/change-owner:targetNotAuthorized";
+const NOT_OWNER: &str = "did-management/did/change-owner:notOwner";
+
+/// An owner's change-owner only offers the slot; it moves when the recipient
+/// sends the same request naming itself. Nobody else can take it, and the
+/// offer is spent by the acceptance.
 #[tokio::test]
-async fn change_owner_moves_the_slot_to_an_acl_member_only() {
+async fn change_owner_moves_the_slot_only_when_the_recipient_accepts() {
     let (state, _dir) = state().await;
     let owner = member(&state, 24, Role::Owner).await;
     let heir = member(&state, 25, Role::Owner).await;
-    let attacker = member(&state, 26, Role::Owner).await;
+    let other = member(&state, 26, Role::Owner).await;
     seed_did(&state, &owner.did, "alpha-beta").await;
 
     let reply = call(
         &state,
         Via::Tsp,
-        &attacker,
+        &other,
         CHANGE_OWNER,
         json!({ "mnemonic": "alpha-beta", "newOwner": heir.did }),
     )
     .await;
-    assert_eq!(
-        code(&reply),
-        "did-management/did/change-owner:notOwner",
-        "{reply}"
-    );
+    assert_eq!(code(&reply), NOT_OWNER, "{reply}");
 
-    let reply = call(
-        &state,
-        Via::Tsp,
-        &owner,
-        CHANGE_OWNER,
-        json!({ "mnemonic": "alpha-beta", "newOwner": "did:example:not-in-acl" }),
-    )
-    .await;
-    assert!(!code(&reply).is_empty(), "{reply}");
-
+    // The offer: the record is unchanged, and the reply says it is pending.
     let reply = call(
         &state,
         Via::Tsp,
@@ -907,27 +939,249 @@ async fn change_owner_moves_the_slot_to_an_acl_member_only() {
     )
     .await;
     conforms(&reply);
-    assert_eq!(
-        ok(&reply, CHANGE_OWNER)["record"]["owner"],
-        heir.did.as_str()
+    let body = ok(&reply, CHANGE_OWNER);
+    assert_eq!(body["record"]["owner"], owner.did.as_str());
+    let transfer = &body["ext"]["vnd.affinidi.webvh"]["ownerTransfer"];
+    assert_eq!(transfer["status"], "offered", "{body}");
+    assert_eq!(transfer["newOwner"], heir.did.as_str());
+    assert!(transfer["expiresAt"].is_string());
+    assert_eq!(owner_rows(&state, &owner.did, &heir.did).await, (1, 0));
+
+    // Another member cannot take an offer made to someone else.
+    let reply = call(
+        &state,
+        Via::Didcomm,
+        &other,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "alpha-beta", "newOwner": other.did }),
+    )
+    .await;
+    assert_eq!(code(&reply), NOT_OWNER, "{reply}");
+    // Nor can the recipient name anyone but itself.
+    let reply = call(
+        &state,
+        Via::Didcomm,
+        &heir,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "alpha-beta", "newOwner": other.did }),
+    )
+    .await;
+    assert_eq!(code(&reply), NOT_OWNER, "{reply}");
+
+    // The recipient accepts.
+    let reply = call(
+        &state,
+        Via::Https,
+        &heir,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "alpha-beta", "newOwner": heir.did }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, CHANGE_OWNER);
+    assert_eq!(body["record"]["owner"], heir.did.as_str());
+    assert!(body.get("ext").is_none(), "{body}");
+    assert_eq!(owner_rows(&state, &owner.did, &heir.did).await, (0, 1));
+
+    // The offer is spent: the old owner cannot take the slot back with it.
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "alpha-beta", "newOwner": owner.did }),
+    )
+    .await;
+    assert_eq!(code(&reply), NOT_OWNER, "{reply}");
+}
+
+/// An offer says nothing about its recipient: one to a DID outside the ACL
+/// is recorded like any other (and can never be accepted). Naming the owner
+/// withdraws an outstanding offer.
+#[tokio::test]
+async fn an_offer_discloses_nothing_and_can_be_withdrawn() {
+    let (state, _dir) = state().await;
+    let owner = member(&state, 27, Role::Owner).await;
+    let heir = member(&state, 28, Role::Owner).await;
+    seed_did(&state, &owner.did, "gamma-delta").await;
+
+    let outside = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "gamma-delta", "newOwner": "did:example:not-in-acl" }),
+    )
+    .await;
+    let inside = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "gamma-delta", "newOwner": heir.did }),
+    )
+    .await;
+    for reply in [&outside, &inside] {
+        let body = ok(reply, CHANGE_OWNER);
+        assert_eq!(
+            body["ext"]["vnd.affinidi.webvh"]["ownerTransfer"]["status"],
+            "offered"
+        );
+    }
+
+    // Withdrawn by naming the owner; the recipient then has nothing to accept.
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "gamma-delta", "newOwner": owner.did }),
+    )
+    .await;
+    assert!(ok(&reply, CHANGE_OWNER).get("ext").is_none(), "{reply}");
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &heir,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "gamma-delta", "newOwner": heir.did }),
+    )
+    .await;
+    assert_eq!(code(&reply), NOT_OWNER, "{reply}");
+}
+
+/// The recipient takes a slot only if it could have registered it: its quota
+/// and domain scope are applied when it accepts, and when an administrator
+/// moves the slot directly. The administrator is told why; the recipient is
+/// not told anything about the slot's owner.
+#[tokio::test]
+async fn the_recipients_quota_and_domain_scope_apply_to_a_transfer() {
+    use did_hosting_common::server::domain::DomainScope;
+
+    let (state, _dir) = state().await;
+    let admin = member(&state, 29, Role::Admin).await;
+    let owner = member(&state, 30, Role::Owner).await;
+    let full = limited_member(&state, 31, Role::Owner, Some(1), DomainScope::All).await;
+    seed_did(&state, &full.did, "full-own").await;
+    let elsewhere = limited_member(
+        &state,
+        32,
+        Role::Owner,
+        None,
+        DomainScope::Allowed {
+            domains: vec!["other.example".into()],
+        },
+    )
+    .await;
+    let service = member(&state, 33, Role::Service).await;
+    let mut record = seed_did(&state, &owner.did, "epsilon-zeta").await;
+    record.domain = "control.test".into();
+    state
+        .dids_ks
+        .insert(did_key("epsilon-zeta"), &record)
+        .await
+        .unwrap();
+
+    for recipient in [&full, &elsewhere] {
+        // Offered by the owner, refused when the recipient accepts.
+        ok(
+            &call(
+                &state,
+                Via::Tsp,
+                &owner,
+                CHANGE_OWNER,
+                json!({ "mnemonic": "epsilon-zeta", "newOwner": recipient.did }),
+            )
+            .await,
+            CHANGE_OWNER,
+        );
+        let reply = call(
+            &state,
+            Via::Tsp,
+            recipient,
+            CHANGE_OWNER,
+            json!({ "mnemonic": "epsilon-zeta", "newOwner": recipient.did }),
+        )
+        .await;
+        assert_eq!(code(&reply), TARGET_NOT_AUTHORIZED, "{reply}");
+        assert!(
+            !reply["payload"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&owner.did),
+            "{reply}"
+        );
+    }
+    // An administrator's direct transfer is held to the same limits, and says
+    // which one.
+    for (recipient, why) in [
+        (&full.did, "count limit"),
+        (&elsewhere.did, "control.test"),
+        (&service.did, "owns no DIDs"),
+        (&"did:example:not-in-acl".to_string(), "no ACL entry"),
+    ] {
+        let reply = call(
+            &state,
+            Via::Tsp,
+            &admin,
+            CHANGE_OWNER,
+            json!({ "mnemonic": "epsilon-zeta", "newOwner": recipient }),
+        )
+        .await;
+        assert_eq!(code(&reply), TARGET_NOT_AUTHORIZED, "{reply}");
+        assert!(
+            reply["payload"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(why),
+            "{why}: {reply}"
+        );
+    }
+    let record: DidRecord = state
+        .dids_ks
+        .get(did_key("epsilon-zeta"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.owner, owner.did, "nothing moved");
+}
+
+/// An offer is for the slot as it stood: once the slot is deleted and the
+/// path registered again, an earlier offer for it cannot be accepted.
+#[tokio::test]
+async fn an_offer_does_not_survive_its_slot() {
+    let (state, _dir) = state().await;
+    let owner = member(&state, 34, Role::Owner).await;
+    let heir = member(&state, 35, Role::Owner).await;
+    seed_did(&state, &owner.did, "eta-theta").await;
+    ok(
+        &call(
+            &state,
+            Via::Tsp,
+            &owner,
+            CHANGE_OWNER,
+            json!({ "mnemonic": "eta-theta", "newOwner": heir.did }),
+        )
+        .await,
+        CHANGE_OWNER,
     );
-    assert!(
-        state
-            .dids_ks
-            .prefix_iter_raw(format!("owner:{}:", owner.did))
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(
-        state
-            .dids_ks
-            .prefix_iter_raw(format!("owner:{}:", heir.did))
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
+    // The same owner registers the path afresh, later than the offer.
+    let mut record = seed_did(&state, &owner.did, "eta-theta").await;
+    record.created_at = did_hosting_common::server::auth::session::now_epoch() + 10;
+    state
+        .dids_ks
+        .insert(did_key("eta-theta"), &record)
+        .await
+        .unwrap();
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &heir,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "eta-theta", "newOwner": heir.did }),
+    )
+    .await;
+    assert_eq!(code(&reply), NOT_OWNER, "{reply}");
 }
 
 /// Seed a slot with a real, signed, single-entry did:webvh log configuring
@@ -1559,7 +1813,9 @@ async fn server_info_answers_an_anonymous_request_signed_by_the_service() {
     assert!(reply["proof"].is_object());
 }
 
-/// Passkey login opens unsigned; with no passkeys registered it says so.
+/// Passkey login opens unsigned, and the ceremony it opens is the same
+/// whether or not any passkey is registered: no credential list, no
+/// `noCredentials`.
 #[tokio::test]
 async fn passkey_login_start_is_open_to_an_unsigned_request() {
     let (state, _dir) = state().await;
@@ -1567,11 +1823,11 @@ async fn passkey_login_start_is_open_to_an_unsigned_request() {
     let mut doc = request(&uri, "unused", json!({}));
     doc.as_object_mut().unwrap().remove("issuer");
     let reply = https(&state, None, doc).await;
-    assert_eq!(
-        code(&reply),
-        "auth/passkey/login/start:noCredentials",
-        "{reply}"
-    );
+    conforms(&reply);
+    let body = ok(&reply, &uri);
+    assert!(body["authId"].is_string(), "{body}");
+    assert!(body["options"]["challenge"].is_string(), "{body}");
+    assert!(body["options"].get("allowCredentials").is_none(), "{body}");
 }
 
 /// Invites are addressed by inviteId, and no read sends a token back.

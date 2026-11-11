@@ -25,6 +25,9 @@ pub(crate) struct SoftPasskey {
     counter: u32,
     /// Whether it reports user verification (a real one always would here).
     pub user_verified: bool,
+    /// The user handle it was created for (the creation options' `user.id`),
+    /// returned with every assertion as a discoverable credential's is.
+    pub user_handle: Option<String>,
 }
 
 impl SoftPasskey {
@@ -35,6 +38,7 @@ impl SoftPasskey {
             cred_id: rand::random::<[u8; 16]>().to_vec(),
             counter: 0,
             user_verified: true,
+            user_handle: None,
         }
     }
 
@@ -88,6 +92,7 @@ impl SoftPasskey {
     pub fn attest(&mut self, options: &Value) -> Value {
         let challenge = options["challenge"].as_str().expect("a challenge");
         let rp_id = options["rp"]["id"].as_str().expect("an rp id");
+        self.user_handle = options["user"]["id"].as_str().map(str::to_string);
         let client_data = Self::client_data("webauthn.create", challenge);
         self.counter += 1;
         let mut auth_data = Sha256::digest(rp_id.as_bytes()).to_vec();
@@ -130,7 +135,7 @@ impl SoftPasskey {
             .unwrap()
             .to_der()
             .unwrap();
-        json!({
+        let mut assertion = json!({
             "id": self.id(),
             "rawId": self.id(),
             "type": "public-key",
@@ -140,7 +145,11 @@ impl SoftPasskey {
                 "signature": B64.encode(sig),
             },
             "clientExtensionResults": {},
-        })
+        });
+        if let Some(handle) = &self.user_handle {
+            assertion["response"]["userHandle"] = json!(handle);
+        }
+        assertion
     }
 }
 

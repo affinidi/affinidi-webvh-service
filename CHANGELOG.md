@@ -27,6 +27,112 @@ take the ordinary owner path.
 
 See `docs/did-webs-hosting.md` ("Self-registration").
 
+### Changed — a passkey login start lists no credentials and leaves no rows behind
+
+`auth/passkey/login/start/0.2` is answered to anyone, unsigned. With no
+`subject` it read every login passkey enrolled here, returned all their
+credential ids as `allowCredentials`, and stored a snapshot of them under the
+new `authId`. Those rows were never removed unless the login finished, and
+the start answered `subjectNotRecognized` and `noCredentials` differently, so
+it also said which DIDs had a passkey.
+
+- The start now opens a discoverable-credential ceremony: no
+  `allowCredentials`, and the browser offers the passkeys it holds for this
+  service. Finish looks the credential up by id, checks the returned user
+  handle against it, and verifies against that one subject's credentials. The
+  ceremony row holds only its challenge, whatever the number of passkeys.
+- The answer is the same whatever the request names (no subject, a subject
+  with a passkey, an unknown one, a step-up). Only a request carrying the
+  named subject's own bearer session gets that subject's `allowCredentials`
+  and the `subjectNotRecognized` / `noCredentials` answers. A named subject
+  is still enforced at finish.
+- Each source may open 30 login ceremonies a minute (the client address on
+  HTTPS; the sender on DIDComm and TSP, refused there as `rateLimited`).
+- The session sweep now removes expired login ceremonies (`pk_task_meta:`
+  and any `pk_auth:` state row an older build wrote), passkey revocation
+  ceremonies (`pk_revoke:`), step-up challenges (`stepup-task:`) and DID
+  ownership offers (`did_xfer:`). A login ceremony opened by the previous
+  build can still be finished.
+- New login passkeys are created with `residentKey: required`, so an
+  authenticator can find them without a credential list. Step-up passkeys
+  are unchanged.
+- `webauthn-rs` gains its `conditional-ui` feature (no new dependency).
+- Behaviour changes (R3.6):
+  - An anonymous login start never answers `noCredentials` or
+    `subjectNotRecognized`; it opens a ceremony, and finish fails if no
+    enrolled passkey answers.
+  - A login passkey that is not discoverable (some hardware security keys
+    enrolled before this change, which were registered with
+    `residentKey: discouraged`) can no longer sign in from the console. Its
+    holder enrols a new passkey (through an invite, or from a stepped-up
+    session). Platform and synced passkeys are discoverable and unaffected.
+  - The 31st login start a minute from one source is refused.
+  - Checked consumers: the console's `passkeyLoginStart` sends `{ purpose:
+    "login" }` and handles options with no `allowCredentials`. No client in
+    verifiable-trust-infrastructure calls this service's passkey login (its
+    own `vta-service` and `vtc-service` have their own).
+
+### Changed — a first login passkey needs a stepped-up session or the subject's own key
+
+A passkey login is minted at `aal2`. `auth/passkey/enroll/{start,finish}/0.2`
+let any authenticated subject add a login passkey, and asked for user
+verification only when one was already held, so a session at `aal1` (signed
+by its browser session key) could enrol a first passkey and sign in again at
+`aal2`.
+
+- Enrolling a subject's first login passkey now needs a session already at
+  `aal2`, or a request signed by the subject's own DID key (the factor a
+  `didSigned` step-up rests on). Otherwise it is refused with
+  `permissionDenied` (message `step_up_required`). The check runs at start and
+  again at finish, against the credentials held then.
+- Adding a further passkey is unchanged (user verification over an existing
+  one), and an administrator's invite still enrols a first one.
+- Behaviour change (R3.6): a session at `aal1` signed by its session key can
+  no longer start or finish a first login passkey enrolment. The console
+  does not offer self-enrolment (it enrols through invites); no client in
+  verifiable-trust-infrastructure calls this service's `enroll/start`.
+
+### Changed — `did/change-owner` moves a slot only when its recipient accepts
+
+`did/change-owner/0.1` moved a slot to any DID with an ACL entry, at the
+owner's word alone. The recipient never agreed, its quota and domain scope
+were not applied, and the "not in the ACL" error told the owner whether a
+DID had an entry.
+
+- An administrator's request moves the slot at once, as before.
+- An owner's request now only offers it. The record is returned unchanged,
+  with `ext["vnd.affinidi.webvh"].ownerTransfer = { status: "offered",
+  newOwner, expiresAt }`. The offer lasts 72 hours. A new offer replaces the
+  last; naming the current owner withdraws it. Nothing about the recipient is
+  looked up when an offer is made, so an offer answers the same for any DID.
+- The recipient accepts by sending the same request naming itself as
+  `newOwner`. It needs the live offer from the slot's current owner, made
+  since the slot was registered; anyone else still gets `notOwner`.
+- Before a slot moves (an administrator's transfer or an acceptance), the
+  recipient must have an ACL entry with a role that owns DIDs (`owner` or
+  `admin`), a domain scope that covers the slot, and room for it in its DID
+  count and total size quotas. Otherwise the request is refused as
+  `targetNotAuthorized`. An administrator is told which check failed; the
+  recipient gets one message.
+- `did_ops::change_did_owner` takes the request's `domain` and returns
+  `OwnerChange { record, offer }`, or `OwnerChangeError`.
+- The console's ownership card offers a DID (owners) or transfers it
+  (administrators), and the DID list has "Accept a DID".
+- Behaviour changes (R3.6):
+  - A non-administrator's `did/change-owner` no longer moves the slot. A
+    caller that read `record.owner` from the reply to confirm a move now sees
+    the old owner and an `ownerTransfer` offer.
+  - A transfer to a DID outside the ACL is no longer refused at once when an
+    owner sends it. It is recorded as an offer that can never be accepted.
+    An administrator's transfer to one is refused as `targetNotAuthorized`
+    (it was `malformedRequest`).
+  - A transfer to a `service` or `metrics-reader` entry, or to a recipient
+    over its quota or outside its domain scope, is refused, administrators
+    included.
+  - Checked consumers: the console (updated here). verifiable-trust-
+    infrastructure defines the Type URI constant in `vta-sdk` but sends no
+    `did/change-owner`.
+
 ### Fixed — `did:webs` registers over `did/register/0.1`
 
 The `did/register/0.1` Trust Task refused every method but webvh ("this host

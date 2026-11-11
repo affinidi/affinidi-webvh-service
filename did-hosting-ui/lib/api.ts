@@ -118,6 +118,13 @@ export interface HealthResponse {
 /** DID hosting method tag carried on every DidRecord. */
 export type DidMethod = "webvh" | "web" | "webs" | "webplus" | string;
 
+/** What `changeOwner` did: `offer` is set when the DID did not move yet and
+ *  waits for its recipient to accept. */
+export interface OwnerChangeResult {
+  record: DidRecord;
+  offer?: { newOwner: string; expiresAt: string };
+}
+
 export interface DidRecord {
   mnemonic: string;
   owner: string;
@@ -721,15 +728,31 @@ export const api = {
     return { mnemonic: resp.record.mnemonic, didUrl: resp.record.didUrl ?? null };
   },
 
-  changeOwner: async (mnemonic: string, newOwner: string): Promise<DidRecord> =>
-    didRecordFromWire(
-      (
-        await trustTask<DidChangeOwner.Payload, DidChangeOwner.Response>(T.didChangeOwner, {
-          mnemonic,
-          newOwner,
-        })
-      ).record,
-    ),
+  /**
+   * Move a DID to `newOwner`. An administrator's request moves it at once.
+   * An owner's request only offers it: `offer` is set, the record is
+   * unchanged, and the DID moves when the recipient accepts
+   * (`acceptDidTransfer`). Naming the current owner withdraws an offer.
+   */
+  changeOwner: async (mnemonic: string, newOwner: string): Promise<OwnerChangeResult> => {
+    const resp = await trustTask<DidChangeOwner.Payload, DidChangeOwner.Response>(
+      T.didChangeOwner,
+      { mnemonic, newOwner },
+    );
+    const transfer = (resp.ext as Record<string, any> | undefined)?.[WEBVH_EXT]?.ownerTransfer;
+    return {
+      record: didRecordFromWire(resp.record),
+      offer:
+        transfer?.status === "offered" && typeof transfer.newOwner === "string"
+          ? { newOwner: transfer.newOwner, expiresAt: String(transfer.expiresAt ?? "") }
+          : undefined,
+    };
+  },
+
+  /** Accept a DID its owner offered to `me` (the signed-in DID): the same
+   *  `did/change-owner`, sent by the recipient naming itself. */
+  acceptDidTransfer: async (mnemonic: string, me: string): Promise<DidRecord> =>
+    (await api.changeOwner(mnemonic, me)).record,
 
   /** Is `path` free? A read-only probe. */
   checkName: async (path: string, domain?: string): Promise<CheckNameResponse> => {

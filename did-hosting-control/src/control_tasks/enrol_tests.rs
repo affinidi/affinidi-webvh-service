@@ -1729,3 +1729,428 @@ async fn enrolling_a_step_up_passkey_revokes_a_prior_non_passkey_elevation() {
     assert_eq!(body["status"], "elevated", "{body}");
     assert_eq!(body["session"]["acr"], "aal2", "{body}");
 }
+
+// ---------------------------------------------------------------------------
+// Passkey login start: what an unauthenticated caller learns, and what it
+// leaves behind
+// ---------------------------------------------------------------------------
+
+/// An unsigned login start from `from` over `via` with `payload`.
+async fn login_start(state: &AppState, via: Via, from: &Caller, payload: Value) -> Value {
+    unsigned(state, via, from, LOGIN_START, payload).await
+}
+
+/// Whatever an unauthenticated caller names — nothing, an enrolled subject,
+/// an unknown one, a step-up — the start is the same discoverable ceremony:
+/// no credential ids, and no answer that tells subjects apart. The login it
+/// opens still works, and still holds a named subject to its own passkey.
+#[tokio::test]
+async fn a_login_start_discloses_no_credentials_or_subjects() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 120, Role::Admin).await;
+    let invitee = stranger(121);
+    let dana = stranger(122);
+    let erin = stranger(123);
+    let mut dana_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Tsp, &invitee, &issued, &mut dana_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let mut erin_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &erin.did, "session").await;
+    ok(
+        &redeem(&state, Via::Tsp, &invitee, &issued, &mut erin_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+
+    for (i, via) in VIAS.into_iter().enumerate() {
+        let browser = stranger(124 + i as u8);
+        for payload in [
+            json!({}),
+            json!({ "subject": dana.did }),
+            json!({ "subject": "did:example:nobody" }),
+            json!({ "purpose": "stepUp", "subject": dana.did }),
+            json!({ "purpose": "stepUp", "subject": "did:example:nobody" }),
+        ] {
+            let reply = login_start(&state, via, &browser, payload.clone()).await;
+            conforms(&reply);
+            let start = ok(&reply, &t(LOGIN_START));
+            let options = start["options"].to_string();
+            assert!(
+                start["options"].get("allowCredentials").is_none()
+                    && !options.contains(&dana_key.id())
+                    && !options.contains(&erin_key.id()),
+                "{via:?} {payload}: {start}"
+            );
+        }
+
+        // An unnamed login signs in whoever's passkey answers.
+        let reply = login(&state, via, &mut dana_key, 130 + i as u8).await;
+        let body = ok(&reply, &t(LOGIN_FINISH));
+        assert_eq!(body["session"]["subject"], dana.did.as_str(), "{body}");
+
+        // A login named for dana refuses erin's passkey.
+        let browser = stranger(135 + i as u8);
+        let start = ok(
+            &login_start(&state, via, &browser, json!({ "subject": dana.did })).await,
+            &t(LOGIN_START),
+        );
+        let reply = call(
+            &state,
+            via,
+            &browser,
+            &t(LOGIN_FINISH),
+            json!({ "authId": start["authId"], "credential": erin_key.assert(&start["options"]) }),
+        )
+        .await;
+        assert_eq!(
+            code(&reply),
+            "auth/passkey/login/finish:assertionInvalid",
+            "{via:?} {reply}"
+        );
+    }
+}
+
+/// A discoverable assertion whose user handle is not the credential's user
+/// is refused, though the signature is the credential's own.
+#[tokio::test]
+async fn a_login_refuses_a_user_handle_that_is_not_the_credentials() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 140, Role::Admin).await;
+    let invitee = stranger(141);
+    let dana = stranger(142);
+    let mut dana_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut dana_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    assert!(dana_key.user_handle.is_some());
+    dana_key.user_handle = Some("AAAAAAAAAAAAAAAAAAAAAA".into());
+    let reply = login(&state, Via::Https, &mut dana_key, 143).await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/login/finish:assertionInvalid",
+        "{reply}"
+    );
+}
+
+/// The subject's own session sees its credential list for a step-up, and the
+/// answers about it; nobody else does.
+#[tokio::test]
+async fn the_subjects_own_session_gets_its_credential_list() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 144, Role::Admin).await;
+    let invitee = stranger(145);
+    let dana = stranger(146);
+    let mut dana_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut dana_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let claims = |did: &str| crate::auth::AuthClaims {
+        did: did.to_string(),
+        role: Role::Owner,
+        session_id: "sess-own".into(),
+        session_pubkey_b58btc: None,
+        amr: vec!["did".into()],
+        acr: "aal1".into(),
+    };
+    let start = |subject: &str| {
+        let mut doc = request(
+            &t(LOGIN_START),
+            "unused",
+            json!({ "purpose": "stepUp", "subject": subject }),
+        );
+        doc.as_object_mut().unwrap().remove("issuer");
+        doc
+    };
+    let reply = super::harness::https(&state, Some(claims(&dana.did)), start(&dana.did)).await;
+    let body = ok(&reply, &t(LOGIN_START));
+    assert!(
+        body["options"]["allowCredentials"]
+            .to_string()
+            .contains(&dana_key.id()),
+        "{body}"
+    );
+    // Another subject's session is just another stranger here.
+    let reply = super::harness::https(&state, Some(claims(&admin.did)), start(&dana.did)).await;
+    let body = ok(&reply, &t(LOGIN_START));
+    assert!(body["options"].get("allowCredentials").is_none(), "{body}");
+    // A session's own subject with no passkey is told so.
+    let reply = super::harness::https(&state, Some(claims(&admin.did)), start(&admin.did)).await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/login/start:subjectNotRecognized",
+        "{reply}"
+    );
+}
+
+/// A login start stores one small row however many passkeys are enrolled,
+/// and an unfinished one is swept once it expires — as are the other
+/// ceremonies that carry an expiry, and the per-ceremony state rows an older
+/// build left beside them.
+#[tokio::test]
+async fn unfinished_ceremonies_are_swept_when_they_expire() {
+    let (state, _dir) = state().await;
+    let ks = &state.sessions_ks;
+    let browser = stranger(150);
+    let start = ok(
+        &login_start(&state, Via::Tsp, &browser, json!({})).await,
+        &t(LOGIN_START),
+    );
+    let auth_id = start["authId"].as_str().unwrap().to_string();
+    let rows = ks.prefix_iter_raw("pk_task_meta:").await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(ks.prefix_iter_raw("pk_auth:").await.unwrap().is_empty());
+
+    let now = did_hosting_common::server::auth::session::now_epoch();
+    let expiring = |expires_at: u64| json!({ "expires_at": expires_at, "subject": "x" });
+    // The login ceremony, aged past its expiry.
+    let mut row: Value = ks
+        .get(format!("pk_task_meta:{auth_id}"))
+        .await
+        .unwrap()
+        .unwrap();
+    row["expires_at"] = json!(now - 1);
+    ks.insert(format!("pk_task_meta:{auth_id}"), &row)
+        .await
+        .unwrap();
+    ks.insert(format!("pk_auth:{auth_id}"), &json!({}))
+        .await
+        .unwrap();
+    // An orphaned state row, and expired and live rows of the other kinds.
+    ks.insert("pk_auth:orphan", &json!({})).await.unwrap();
+    for prefix in ["pk_revoke:", "stepup-task:", "did_xfer:"] {
+        ks.insert(format!("{prefix}old"), &expiring(now - 1))
+            .await
+            .unwrap();
+        ks.insert(format!("{prefix}live"), &expiring(now + 600))
+            .await
+            .unwrap();
+    }
+    let live = ok(
+        &login_start(&state, Via::Tsp, &browser, json!({})).await,
+        &t(LOGIN_START),
+    );
+
+    did_hosting_common::server::auth::session::cleanup_expired_sessions(ks, 300)
+        .await
+        .unwrap();
+
+    let keys: Vec<String> = ks
+        .iter_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| String::from_utf8_lossy(&k).into_owned())
+        .collect();
+    assert!(
+        !keys.contains(&format!("pk_task_meta:{auth_id}")),
+        "{keys:?}"
+    );
+    assert!(!keys.iter().any(|k| k.starts_with("pk_auth:")), "{keys:?}");
+    assert!(
+        keys.contains(&format!(
+            "pk_task_meta:{}",
+            live["authId"].as_str().unwrap()
+        )),
+        "{keys:?}"
+    );
+    for prefix in ["pk_revoke:", "stepup-task:", "did_xfer:"] {
+        assert!(!keys.contains(&format!("{prefix}old")), "{keys:?}");
+        assert!(keys.contains(&format!("{prefix}live")), "{keys:?}");
+    }
+}
+
+/// One messaging-transport source may open only so many logins a minute; the
+/// refusal is the task's own `rateLimited`.
+#[tokio::test]
+async fn login_start_is_rate_limited_per_source() {
+    let (state, _dir) = state().await;
+    let browser = stranger(151);
+    for _ in 0..crate::rate_limit::LOGIN_START_MAX_PER_WINDOW {
+        ok(
+            &login_start(&state, Via::Tsp, &browser, json!({})).await,
+            &t(LOGIN_START),
+        );
+    }
+    let reply = login_start(&state, Via::Tsp, &browser, json!({})).await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/login/start:rateLimited",
+        "{reply}"
+    );
+    // Another source is unaffected.
+    ok(
+        &login_start(&state, Via::Tsp, &stranger(152), json!({})).await,
+        &t(LOGIN_START),
+    );
+}
+
+/// Over HTTPS the source is the client IP, counted before dispatch.
+#[tokio::test]
+async fn https_login_start_is_rate_limited_per_client_ip() {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+
+    let (state, _dir) = state().await;
+    let addr: std::net::SocketAddr = "203.0.113.8:4000".parse().unwrap();
+    let mut last = Value::Null;
+    for _ in 0..=crate::rate_limit::LOGIN_START_MAX_PER_WINDOW {
+        let mut doc = request(&t(LOGIN_START), "unused", json!({}));
+        doc.as_object_mut().unwrap().remove("issuer");
+        let response = crate::routes::trust_tasks::trust_tasks_endpoint(
+            None,
+            axum::extract::State(state.clone()),
+            Ok(axum::extract::ConnectInfo(addr)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
+        )
+        .await
+        .into_response();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        last = serde_json::from_slice(&bytes).unwrap();
+    }
+    assert_eq!(code(&last), "unavailable", "{last}");
+    assert!(last["payload"]["retryAfter"].is_string(), "{last}");
+}
+
+// ---------------------------------------------------------------------------
+// A first login passkey, self-enrolled
+// ---------------------------------------------------------------------------
+
+/// A browser session's delegated key, and the session claims it signs under.
+fn browser_session(subject: &Caller, seed: u8, acr: &str) -> (Caller, crate::auth::AuthClaims) {
+    let key = stranger(seed);
+    let pk = key.did.strip_prefix("did:key:").unwrap().to_string();
+    let claims = crate::auth::AuthClaims {
+        did: subject.did.clone(),
+        role: subject.role.clone(),
+        session_id: format!("sess-{seed}"),
+        session_pubkey_b58btc: Some(pk),
+        amr: vec!["did".into()],
+        acr: acr.into(),
+    };
+    (key, claims)
+}
+
+/// `type_uri` with `payload`, issued as `subject` and signed by `signer`,
+/// over HTTPS under `claims`.
+async fn as_session(
+    state: &AppState,
+    subject: &Caller,
+    signer: &Caller,
+    claims: crate::auth::AuthClaims,
+    type_uri: &str,
+    payload: Value,
+) -> Value {
+    use affinidi_data_integrity::crypto_suites::CryptoSuite;
+    use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
+    // Signed by the session's key on the subject's behalf, as the console
+    // signs: the issuer is the subject, the key is not the subject's (so the
+    // issuer-binding signing helpers refuse it).
+    let mut doc = request(type_uri, &subject.did, payload);
+    let proof = DataIntegrityProof::sign(
+        &doc,
+        &signer.key,
+        SignOptions::new()
+            .with_proof_purpose("authentication")
+            .with_cryptosuite(CryptoSuite::EddsaJcs2022),
+    )
+    .await
+    .expect("sign");
+    doc["proof"] = serde_json::to_value(&proof).unwrap();
+    Box::pin(super::harness::https(state, Some(claims), doc)).await
+}
+
+/// A login passkey signs in at `aal2`, so a subject's first one is added only
+/// with that much: from a stepped-up session, or by the subject's own DID
+/// key. A plain browser session's key cannot add it, at start or at finish.
+#[tokio::test]
+async fn a_first_login_passkey_needs_a_stepped_up_session_or_the_subjects_key() {
+    let (state, _dir) = state().await;
+    let frank = member(&state, 160, Role::Owner).await;
+
+    // An aal1 browser session: refused at start.
+    let (session_key, aal1) = browser_session(&frank, 161, "aal1");
+    let reply = as_session(
+        &state,
+        &frank,
+        &session_key,
+        aal1.clone(),
+        &t(START),
+        json!({}),
+    )
+    .await;
+    assert_eq!(code(&reply), "permissionDenied", "{reply}");
+    assert!(
+        reply["payload"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("step_up_required"),
+        "{reply}"
+    );
+
+    // Stepped up: allowed, and the finish binds it.
+    let (session_key, aal2) = browser_session(&frank, 162, "aal2");
+    let reply = as_session(
+        &state,
+        &frank,
+        &session_key,
+        aal2.clone(),
+        &t(START),
+        json!({}),
+    )
+    .await;
+    let start = ok(&reply, &t(START));
+    // ...but a finish under an aal1 session is refused, even for that start.
+    let mut first = SoftPasskey::new();
+    let finish = json!({
+        "enrollmentId": start["enrollmentId"],
+        "credential": first.attest(&start["options"]),
+    });
+    let mut demoted = aal2.clone();
+    demoted.acr = "aal1".into();
+    let reply = as_session(&state, &frank, &session_key, demoted, &t(FINISH), finish).await;
+    assert_eq!(code(&reply), "permissionDenied", "{reply}");
+    let reply = as_session(
+        &state,
+        &frank,
+        &session_key,
+        aal2.clone(),
+        &t(START),
+        json!({}),
+    )
+    .await;
+    let start = ok(&reply, &t(START));
+    let finish = json!({
+        "enrollmentId": start["enrollmentId"],
+        "credential": first.attest(&start["options"]),
+    });
+    let reply = as_session(&state, &frank, &session_key, aal2, &t(FINISH), finish).await;
+    ok(&reply, &t(FINISH));
+
+    // Signed by the subject's own key (no session): allowed.
+    let gina = member(&state, 163, Role::Owner).await;
+    for via in VIAS {
+        let start = ok(
+            &call(&state, via, &gina, &t(START), json!({})).await,
+            &t(START),
+        );
+        // A login credential is created discoverable: login lists none.
+        assert_eq!(
+            start["options"]["authenticatorSelection"]["residentKey"], "required",
+            "{start}"
+        );
+    }
+
+    // Once a login passkey is held, an aal1 session may start adding another
+    // (its finish answers user verification over the first instead).
+    let (session_key, aal1) = browser_session(&frank, 164, "aal1");
+    let reply = as_session(&state, &frank, &session_key, aal1, &t(START), json!({})).await;
+    let start = ok(&reply, &t(START));
+    assert!(start["uvOptions"].is_object(), "{start}");
+}

@@ -404,17 +404,27 @@ export default function DidDetail() {
     if (!newOwner) return;
     showConfirm(
       "Change Owner",
-      `Transfer ownership of "${mnemonic}" to ${newOwner}? The new owner must already exist in the ACL.`,
+      role === "admin"
+        ? `Transfer ownership of "${mnemonic}" to ${newOwner}? The new owner must be in the ACL, and its domain scope and quota must allow this DID.`
+        : `Offer "${mnemonic}" to ${newOwner}? It moves when they accept it from their DID list.`,
       async () => {
         setChangingOwner(true);
         try {
-          const result = await api.changeOwner(mnemonic, newOwner);
+          const { record, offer } = await api.changeOwner(mnemonic, newOwner);
           setDidDetail((prev) =>
-            prev ? { ...prev, owner: result.owner, updatedAt: result.updatedAt } : prev,
+            prev ? { ...prev, owner: record.owner, updatedAt: record.updatedAt } : prev,
           );
           setNewOwnerInput("");
           setShowChangeOwner(false);
-          showAlert("Success", "DID owner changed");
+          if (offer) {
+            const until = offer.expiresAt ? new Date(offer.expiresAt).toLocaleString() : "";
+            showAlert(
+              "Offer sent",
+              `${offer.newOwner} can accept "${mnemonic}" from their DID list${until ? ` until ${until}` : ""}. You stay the owner until then.`,
+            );
+          } else {
+            showAlert("Success", "DID owner changed");
+          }
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : "Change owner failed";
           showAlert("Error", msg);
@@ -1710,8 +1720,9 @@ export default function DidDetail() {
                 </Pressable>
               </View>
               <Text style={styles.hint}>
-                Transfer this DID to a different identity. The new owner must
-                already be in the ACL.
+                {role === "admin"
+                  ? "Transfer this DID to a different identity. The new owner must be in the ACL, with a domain scope and quota that allow this DID."
+                  : "Offer this DID to a different identity. It moves only when they accept it, within 72 hours."}
               </Text>
               {showChangeOwner && (
                 <>
@@ -1733,7 +1744,11 @@ export default function DidDetail() {
                     disabled={!newOwnerInput.trim() || changingOwner}
                   >
                     <Text style={styles.buttonText}>
-                      {changingOwner ? "Transferring..." : "Transfer Ownership"}
+                      {changingOwner
+                        ? "Sending..."
+                        : role === "admin"
+                          ? "Transfer Ownership"
+                          : "Offer Ownership"}
                     </Text>
                   </Pressable>
                 </>

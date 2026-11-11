@@ -149,6 +149,11 @@ pub struct AppState {
     /// global counters above. See `crate::rate_limit` for the
     /// trusted-proxy / X-Forwarded-For policy.
     pub ip_rate_limiter: Arc<did_hosting_common::server::rate_limit::IpRateLimiter>,
+    /// Per-source limiter for opening a passkey login
+    /// (`auth/passkey/login/start`). See
+    /// [`crate::rate_limit::login_start_limiter`].
+    pub login_start_rate_limiter:
+        Arc<did_hosting_common::server::rate_limit::KeyedRateLimiter<String>>,
     /// Per-source limiter for passkey invite redemption
     /// (`auth/passkey/enroll/redeem/start`). See
     /// [`crate::rate_limit::redeem_limiter`].
@@ -199,7 +204,8 @@ pub struct AppState {
 
 impl AppState {
     /// Sweep idle clients out of every rate limiter this state serves (the
-    /// challenge, redemption, large-document and wallet sign-in limits) until
+    /// challenge, passkey login, redemption, large-document and wallet sign-in
+    /// limits) until
     /// `shutdown` fires.
     ///
     /// Call it on a runtime that lives as long as the process serves
@@ -210,6 +216,7 @@ impl AppState {
     /// shared maps, so which runtime runs it does not matter otherwise.
     pub fn spawn_rate_limit_gc(&self, shutdown: &CancellationToken) {
         self.ip_rate_limiter.spawn_gc(shutdown.clone());
+        self.login_start_rate_limiter.spawn_gc(shutdown.clone());
         self.redeem_rate_limiter.spawn_gc(shutdown.clone());
         self.webs_self_register_limiter.spawn_gc(shutdown.clone());
         self.webs_self_register_global_limiter
@@ -432,6 +439,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         pending_challenges: Arc::new(pending_challenges),
         client_ips,
         ip_rate_limiter: Arc::new(crate::rate_limit::challenge_limiter()),
+        login_start_rate_limiter: Arc::new(crate::rate_limit::login_start_limiter()),
         redeem_rate_limiter: Arc::new(crate::rate_limit::redeem_limiter()),
         webs_self_register_limiter: Arc::new(crate::rate_limit::webs_self_register_limiter()),
         webs_self_register_global_limiter: Arc::new(

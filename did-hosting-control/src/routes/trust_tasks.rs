@@ -96,8 +96,16 @@ pub async fn trust_tasks_endpoint(
         }
     };
     let client_ip = Some(ip);
-    if is_redeem_start(&body) {
-        let limited = state.redeem_rate_limiter.try_consume(format!("ip:{ip}"));
+    // The unauthenticated ceremonies are limited per client address here, the
+    // one place that knows it; on DIDComm and TSP their handlers limit per
+    // sender.
+    let limiter = match ceremony_kind(&body) {
+        Some(Ceremony::RedeemStart) => Some(&state.redeem_rate_limiter),
+        Some(Ceremony::LoginStart) => Some(&state.login_start_rate_limiter),
+        None => None,
+    };
+    if let Some(limiter) = limiter {
+        let limited = limiter.try_consume(format!("ip:{ip}"));
         if let Err(AppError::RateLimited {
             retry_after_secs, ..
         }) = limited
@@ -117,18 +125,32 @@ pub async fn trust_tasks_endpoint(
     dispatch_trust_task(auth, State(state), client_ip, &headers, body).await
 }
 
-/// Whether `body` is an `auth/passkey/enroll/redeem/start` document.
+/// An unauthenticated ceremony the route limits per client address.
+enum Ceremony {
+    /// `auth/passkey/enroll/redeem/start`.
+    RedeemStart,
+    /// `auth/passkey/login/start`.
+    LoginStart,
+}
+
+/// Which limited ceremony `body` opens, if any.
 ///
 /// Read exactly as [`dispatch_trust_task`] and the task table read it — the
 /// whole body as a `TrustTask`, its parsed `type` compared as the router
-/// compares it — so no body the router serves as a redemption (duplicate
-/// members, escapes, any other quirk of a lighter parse) slips past the limit.
-fn is_redeem_start(body: &[u8]) -> bool {
+/// compares it — so no body the router serves as one (duplicate members,
+/// escapes, any other quirk of a lighter parse) slips past the limit.
+fn ceremony_kind(body: &[u8]) -> Option<Ceremony> {
+    use did_hosting_common::tasks::auth::passkey::{enroll::redeem, login};
     use trust_tasks_rs::Payload;
-    serde_json::from_slice::<TrustTask<Value>>(body).is_ok_and(|doc| {
-        doc.type_uri.to_string()
-            == did_hosting_common::tasks::auth::passkey::enroll::redeem::start::v0_1::Payload::TYPE_URI
-    })
+    let doc = serde_json::from_slice::<TrustTask<Value>>(body).ok()?;
+    let type_uri = doc.type_uri.to_string();
+    if type_uri == redeem::start::v0_1::Payload::TYPE_URI {
+        Some(Ceremony::RedeemStart)
+    } else if type_uri == login::start::v0_2::Payload::TYPE_URI {
+        Some(Ceremony::LoginStart)
+    } else {
+        None
+    }
 }
 
 /// `POST /api/trust-tasks` handler — the HTTPS binding of the same dispatch

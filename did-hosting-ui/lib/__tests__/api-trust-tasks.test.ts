@@ -270,6 +270,46 @@ describe("management calls (passkey session)", () => {
     await expect(api.getDid("m")).resolves.toMatchObject({ mnemonic: "m", log: null });
   });
 
+  it("reports an owner's change-owner as an offer, and accepts one by naming the caller", async () => {
+    const record = (owner: string) => ({
+      mnemonic: "m",
+      owner,
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      versionCount: 1,
+    });
+    const HEIR = "did:webvh:QmHeir:example.com:heir";
+    const sent = installControlPlane((req) =>
+      req.payload.newOwner === HEIR
+        ? seal(req, {
+            record: record(SUBJECT),
+            ext: {
+              "vnd.affinidi.webvh": {
+                ownerTransfer: {
+                  status: "offered",
+                  newOwner: HEIR,
+                  expiresAt: "2026-01-04T00:00:00Z",
+                },
+              },
+            },
+          })
+        : seal(req, { record: record(SUBJECT) }),
+    );
+
+    const offered = await api.changeOwner("m", HEIR);
+    expect(offered.record.owner).toBe(SUBJECT);
+    expect(offered.offer).toEqual({ newOwner: HEIR, expiresAt: "2026-01-04T00:00:00Z" });
+
+    const accepted = await api.acceptDidTransfer("m", SUBJECT);
+    expect(accepted.owner).toBe(SUBJECT);
+    const [, accept] = tasks(sent);
+    expect(accept!.doc).toMatchObject({
+      type: `${DM}did/change-owner/0.1`,
+      issuer: SUBJECT,
+      payload: { mnemonic: "m", newOwner: SUBJECT },
+    });
+  });
+
   it("rolls back exactly the last entry", async () => {
     const sent = installControlPlane((req) =>
       seal(req, {

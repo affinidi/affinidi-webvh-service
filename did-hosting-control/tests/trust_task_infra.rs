@@ -100,6 +100,7 @@ async fn make_harness() -> Harness {
         ),
         client_ips: Default::default(),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::challenge_limiter()),
+        login_start_rate_limiter: Arc::new(did_hosting_control::rate_limit::login_start_limiter()),
         redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::redeem_limiter()),
         webs_self_register_limiter: Arc::new(
             did_hosting_control::rate_limit::webs_self_register_limiter(),

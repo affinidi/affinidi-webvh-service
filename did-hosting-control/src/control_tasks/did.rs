@@ -13,7 +13,7 @@ use trust_tasks_rs::StandardCode;
 
 use did_hosting_common::server::trust_tasks::ext::WEBVH_EXT_KEY;
 
-use super::{Cx, TaskError, spec_record, typed};
+use super::{Cx, TaskError, at, spec_record, typed};
 use crate::did_ops;
 use crate::error::AppError;
 use crate::server::AppState;
@@ -564,15 +564,53 @@ pub(crate) async fn change_owner(
     cx: &Cx<'_>,
     p: change_owner::v0_1::Payload,
 ) -> Result<change_owner::v0_1::Response, TaskError> {
+    use change_owner::v0_1::error_codes;
+
     let auth = cx.auth().await?;
     let state = cx.state;
-    let (current, _) = did_ops::get_did_info(&auth, state, &p.mnemonic).await?;
-    did_ops::ensure_slot_domain_matches(&current, p.domain.as_deref())?;
-    let record = did_ops::change_did_owner(&auth, state, &p.mnemonic, &p.new_owner).await?;
-    typed(
-        json!({ "record": spec_record::<change_owner::v0_1::DidRecord>(state, &record)? }),
-        "change-owner response",
+    let change = match did_ops::change_did_owner(
+        &auth,
+        state,
+        &p.mnemonic,
+        &p.new_owner,
+        p.domain.as_deref(),
     )
+    .await
+    {
+        Ok(change) => change,
+        Err(did_ops::OwnerChangeError::TargetNotAuthorized(why)) => {
+            // An administrator moving the slot is told why; anyone else gets
+            // one answer for every reason (the acceptor is the recipient,
+            // and knows its own standing).
+            let message = if auth.role == crate::acl::Role::Admin {
+                why
+            } else {
+                "you cannot take this DID: your domain scope or quota does not allow it".into()
+            };
+            return Err(TaskError::Declared(
+                error_codes::TARGET_NOT_AUTHORIZED,
+                message,
+            ));
+        }
+        Err(did_ops::OwnerChangeError::Failed(e)) => return Err(e.into()),
+    };
+    let mut body = json!({
+        "record": spec_record::<change_owner::v0_1::DidRecord>(state, &change.record)?,
+    });
+    if let Some(offer) = change.offer {
+        // The slot has not moved: its owner offered it, and it moves when the
+        // recipient sends this same request naming itself.
+        body["ext"] = json!({
+            WEBVH_EXT_KEY: {
+                "ownerTransfer": {
+                    "status": "offered",
+                    "newOwner": offer.to,
+                    "expiresAt": at(offer.expires_at),
+                }
+            }
+        });
+    }
+    typed(body, "change-owner response")
 }
 
 /// `webvh/witness/publish/0.1`.
