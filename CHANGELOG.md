@@ -39,6 +39,40 @@ that verifies the log and builds the identifier from the slot. A host built
 without it refuses `webs` by name, naming the feature. This is how a VTA
 publishes the `did:webs` DIDs it creates.
 
+### Fixed — agent names are reserved per name, and released when their DID is deleted
+
+The check that an agent name is free and the write that binds it were held
+under the claiming DID's own lock only, so two DIDs claiming the same free name
+at once (`agent-name/update`, a plain publish, or `did/register`) could both
+succeed, leaving both records listing the name and the index pointing at
+whichever wrote last. Each name now has its own lock, taken after the DID's lock
+and held from the check to the commit, so exactly one claim wins and the other
+is refused as taken.
+
+- `agent-name/remove` retires the name's index entry only while it points at
+  the DID removing it; it no longer deletes another DID's entry.
+- `did/delete` releases the deleted DID's agent names (active and parked) in
+  the same write as the delete, again only entries that point at that DID.
+  Previously they stayed indexed against a DID that no longer existed.
+- **Behaviour change:** an index entry that points at a DID which no longer
+  exists, or whose record no longer lists the name, no longer holds the name.
+  Names left behind by earlier deletes become claimable again, and
+  `agent-name/check` reports them available.
+
+### Fixed — error text with multi-byte characters is truncated safely
+
+The control plane's outbox cut a failed delivery's error text at a fixed byte
+offset; text with a multi-byte character across that offset (an edge's own
+error message, or one of this service's messages containing `—`) stopped the
+outbox worker. User-facing error messages capped in `did-hosting-common` had the
+same problem. Both now cut on a character boundary.
+
+### Fixed — the Redis store URL is logged without credentials
+
+Opening the Redis store logged `redis_url` as configured, including any
+username, password or query parameters. The log line now shows the scheme,
+host, port and database only.
+
 ### Changed — tiered, bounded statistics; charts read by key
 
 Every DID now keeps a coarse series (hourly for 7 days, daily for 30) inside
