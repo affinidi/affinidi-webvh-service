@@ -11,6 +11,7 @@ use did_hosting_common::did_ops::{
 };
 use did_hosting_common::method::publication::Publication;
 use did_hosting_common::server::acl::validate_did_format;
+use did_hosting_common::server::agent_name_index;
 use did_hosting_common::server::error::AgentNameError;
 use did_hosting_common::server::identity::mnemonic_from_did;
 use did_hosting_common::server::mnemonic::{
@@ -701,13 +702,14 @@ pub async fn register_did_atomic(
     // via the explicit agent-name ops. Parked entries are preserved.
     //
     // Reserved and already-held names are refused here exactly as on the
-    // publish path; the `_path_guard` above is the critical section the
-    // collision check needs. A fresh slot is the *easiest* place to attempt a
+    // publish path; the `_path_guard` above plus the per-name locks
+    // `reconcile_agent_names` returns are the critical section the collision
+    // check needs. A fresh slot is the *easiest* place to attempt a
     // name capture — nothing else about registering constrains what the
     // submitted document may claim.
     let reg_domain =
         did_hosting_common::server::domain::extract_did_host(&did_id).unwrap_or_default();
-    let (claimed, released) = reconcile_agent_names(
+    let (claimed, released, _name_locks) = reconcile_agent_names(
         state,
         &mut new_record,
         path,
@@ -774,6 +776,16 @@ pub async fn register_did_atomic(
     // eventually consistent store that read can miss the write, and the caller
     // would be told a stored DID failed.
     Ok(new_record)
+}
+
+/// Refuse a path no slot can have before taking its lock, so a malformed
+/// path does not add an entry to the lock map. Accepts either grammar —
+/// [`prepare_republish`] applies the one the stored record calls for once the
+/// lock is held — and reports the shared grammar's error when both fail.
+fn validate_slot_path_shape(mnemonic: &str) -> Result<(), AppError> {
+    validate_mnemonic(mnemonic).or_else(|e| {
+        did_hosting_common::server::mnemonic::validate_webs_mnemonic(mnemonic).map_err(|_| e)
+    })
 }
 
 /// Shared front-half of a new-version publish: authorize the caller, verify
@@ -988,9 +1000,12 @@ async fn prepare_republish(
 /// failing the publish over an `alsoKnownAs` entry that was never an agent name
 /// in our sense would break unrelated documents.
 ///
-/// Callers must hold `state.path_locks.guard(mnemonic)`: the collision check
-/// below and the index write it authorises have to be one critical section, or
-/// two concurrent publishes each see a free name and both claim it.
+/// Callers must hold `state.path_locks.guard(mnemonic)`, and must keep the
+/// returned [`AgentNameLocks`] alive until their batch commits. The slot lock
+/// alone does not serialise two *different* slots claiming the same name, so
+/// this function also takes the per-name lock of every name it checks or
+/// retires (see [`lock_agent_names`]); the collision check and the index write
+/// it authorises are one critical section only while those are held.
 ///
 /// `claims` is the set of names the published document asserts on `domain`,
 /// already extracted by the publishing method — `Publication::agent_names`.
@@ -1007,8 +1022,8 @@ async fn reconcile_agent_names(
     claims: &[String],
     domain: &str,
     now: u64,
-) -> Result<(Vec<String>, Vec<String>), AppError> {
-    let mut claimed = Vec::new();
+) -> Result<(Vec<String>, Vec<String>, AgentNameLocks), AppError> {
+    let mut candidates = Vec::new();
     for name in claims.iter().cloned() {
         match validate_agent_name_binding(&name, mnemonic) {
             Ok(()) => {}
@@ -1033,14 +1048,34 @@ async fn reconcile_agent_names(
                 continue;
             }
         }
+        candidates.push(name);
+    }
 
+    // Every name this call may write or retire: the valid claims, plus the
+    // names the record currently serves (candidates for release).
+    let locks = lock_agent_names(
+        state,
+        candidates
+            .iter()
+            .map(String::as_str)
+            .chain(
+                record
+                    .agent_names
+                    .iter()
+                    .filter(|e| e.enabled)
+                    .map(|e| e.name.as_str()),
+            )
+            .map(|name| agent_name_key(domain, name)),
+    )
+    .await;
+
+    let mut claimed = Vec::new();
+    for name in candidates {
         // Held by another DID on this domain? Refuse the whole publish. The
         // caller controls their own document, so the remedy is theirs: drop
         // the claim and republish. Nobody else can put a document into this
         // state, so this cannot be used to wedge someone's key rotation.
-        if let Some(bytes) = state.dids_ks.get_raw(agent_name_key(domain, &name)).await?
-            && bytes != mnemonic.as_bytes()
-        {
+        if agent_name_held_by_other(state, domain, &name, mnemonic).await? {
             warn!(
                 mnemonic = %mnemonic,
                 name = %name,
@@ -1093,7 +1128,59 @@ async fn reconcile_agent_names(
     }
     record.agent_names = next;
 
-    Ok((claimed, released))
+    Ok((claimed, released, locks))
+}
+
+/// Per-name locks held across an agent-name check and the commit it
+/// authorises. Dropping it releases them.
+pub(crate) type AgentNameLocks = Vec<tokio::sync::OwnedMutexGuard<()>>;
+
+/// Take the per-name write lock for each agent-name index key in `index_keys`.
+///
+/// The index key `name:{domain}:{name}` is shared by every slot on the
+/// domain, so a lock on the claiming slot does not stop a second slot from
+/// passing the same "is it free?" check at the same moment. Every code path
+/// that reads the index to decide a write — claiming, retiring, deleting —
+/// takes these locks first.
+///
+/// Ordering, to stay deadlock-free: the slot lock (`path_locks.guard(mnemonic)`)
+/// is always taken first, and the name locks after it in sorted order. Nothing
+/// takes a slot lock while holding a name lock.
+///
+/// The keys live in the same `PathLocks` map as slot paths
+/// ([`agent_name_index::lock_key`]).
+pub(crate) async fn lock_agent_names(
+    state: &AppState,
+    index_keys: impl IntoIterator<Item = String>,
+) -> AgentNameLocks {
+    agent_name_index::lock_names(&state.path_locks, index_keys).await
+}
+
+/// Whether the index entry for `name` on `domain` belongs to a slot other
+/// than `mnemonic`. The caller holds the name's lock.
+///
+/// An entry that points at a slot which no longer exists, or whose record no
+/// longer lists the name, is a leftover — the record and its index entry are
+/// always written in one batch, so a live holder lists the name. Such an entry
+/// does not hold the name.
+async fn agent_name_held_by_other(
+    state: &AppState,
+    domain: &str,
+    name: &str,
+    mnemonic: &str,
+) -> Result<bool, AppError> {
+    let Some(holder) = state.dids_ks.get_raw(agent_name_key(domain, name)).await? else {
+        return Ok(false);
+    };
+    if holder == mnemonic.as_bytes() {
+        return Ok(false);
+    }
+    let Ok(holder) = String::from_utf8(holder) else {
+        // Unreadable: keep treating the name as taken.
+        return Ok(true);
+    };
+    let record: Option<DidRecord> = state.dids_ks.get(did_key(&holder)).await?;
+    Ok(record.is_some_and(|r| r.agent_names.iter().any(|e| e.name == name)))
 }
 
 pub async fn publish_did(
@@ -1105,10 +1192,11 @@ pub async fn publish_did(
 ) -> Result<(), AppError> {
     // Serialise the read-modify-write on this slot. `reconcile_agent_names`
     // checks the name index and then writes it, and the agent-name verbs take
-    // the same lock — without it a publish and a `set` on the same DID, or two
-    // publishes claiming the same free name, interleave between check and
-    // commit.
-    let _guard = state.path_locks.guard(mnemonic).await;
+    // the same lock — without it a publish and a `set` on the same DID
+    // interleave between check and commit. Two slots claiming the same free
+    // name are serialised by the per-name locks `reconcile_agent_names` takes.
+    validate_slot_path_shape(mnemonic)?;
+    let slot_guard = state.path_locks.guard(mnemonic).await;
 
     let (mut record, domain, publication) =
         prepare_republish(auth, state, mnemonic, did_log, request_domain).await?;
@@ -1118,7 +1206,7 @@ pub async fn publish_did(
     // Keep the authoritative registry in step with what the document claims —
     // applying the same preconditions `set` does, so this path cannot be used
     // to capture a reserved name or take one from another DID.
-    let (claimed, released) = reconcile_agent_names(
+    let (claimed, released, name_locks) = reconcile_agent_names(
         state,
         &mut record,
         mnemonic,
@@ -1146,6 +1234,11 @@ pub async fn publish_did(
         batch.remove(&state.dids_ks, agent_name_key(&domain, name));
     }
     batch.commit().await?;
+    // Released before the identity check below, which can reach the network
+    // when this is the service's own DID; nothing after this point reads or
+    // writes the slot or its names.
+    drop(name_locks);
+    drop(slot_guard);
     invalidate_cached_content(state, mnemonic);
 
     // Mirror did-hosting-server's `record_update` call so total_updates /
@@ -1311,7 +1404,8 @@ async fn apply_agent_name_op(
     // Serialise the read-modify-write on this slot: the collision check, the
     // registry mutation, and the index write must not interleave with another
     // op on the same DID.
-    let _guard = state.path_locks.guard(mnemonic).await;
+    validate_slot_path_shape(mnemonic)?;
+    let slot_guard = state.path_locks.guard(mnemonic).await;
 
     // Authorize + verify the submitted document + advance the record. This
     // yields not_owner / invalid_did_data / unknown_domain exactly as a plain
@@ -1330,6 +1424,9 @@ async fn apply_agent_name_op(
     }
 
     let index_key = agent_name_key(&domain, &name);
+    // The slot lock above does not cover the index entry, which every slot on
+    // the domain shares: hold the name's own lock from the check to the commit.
+    let name_locks = lock_agent_names(state, [index_key.clone()]).await;
 
     // Verb-specific precondition + registry mutation, yielding the index
     // side-effect to fold into the commit batch below.
@@ -1338,9 +1435,7 @@ async fn apply_agent_name_op(
             // A name already bound to a *different* DID on this domain is
             // taken; the same DID re-activating is an idempotent refresh, and
             // a parked entry is resumed (upsert flips `enabled` back on).
-            if let Some(bytes) = state.dids_ks.get_raw(index_key.clone()).await?
-                && bytes != mnemonic.as_bytes()
-            {
+            if agent_name_held_by_other(state, &domain, &name, mnemonic).await? {
                 return Err(AgentNameError::Taken.into());
             }
             upsert_agent_name(&mut record.agent_names, &name, now_epoch());
@@ -1367,7 +1462,19 @@ async fn apply_agent_name_op(
             if record.agent_names.len() == before {
                 return Err(AgentNameError::NotFound.into());
             }
-            IndexWrite::Remove
+            // Retire the index entry only while it points at this slot. A
+            // registry entry this slot kept from an earlier double claim must
+            // not delete the current holder's index.
+            let ours = state
+                .dids_ks
+                .get_raw(index_key.clone())
+                .await?
+                .is_some_and(|bytes| bytes == mnemonic.as_bytes());
+            if ours {
+                IndexWrite::Remove
+            } else {
+                IndexWrite::Keep
+            }
         }
     };
 
@@ -1388,6 +1495,9 @@ async fn apply_agent_name_op(
         IndexWrite::Keep => {}
     }
     batch.commit().await?;
+    // As in `publish_did`: not held across the identity check below.
+    drop(name_locks);
+    drop(slot_guard);
     invalidate_cached_content(state, mnemonic);
 
     state.stats_collector.record_update(mnemonic);
@@ -1853,6 +1963,12 @@ pub async fn delete_did(
 
     ensure_slot_domain_matches(&record, request_domain)?;
 
+    // The slot's agent names are released with it. Otherwise the index keeps
+    // pointing at a slot that no longer exists, and the names read as taken
+    // to everyone else. Only entries that point here are removed.
+    let _name_locks = lock_agent_names(state, agent_name_index::index_keys(&record)).await;
+    let released_names = agent_name_index::owned_keys(&state.dids_ks, &record).await?;
+
     let mut batch = state.store.batch();
     batch.remove(&state.dids_ks, did_key(mnemonic));
     batch.remove(&state.dids_ks, content_log_key(mnemonic));
@@ -1860,6 +1976,26 @@ pub async fn delete_did(
     batch.remove(&state.dids_ks, owner_key(&record.owner, mnemonic));
     batch.commit().await?;
     invalidate_cached_content(state, mnemonic);
+
+    // The names go in a write of their own, after the record: a slot can hold
+    // more names than one transactional write takes on some backends
+    // (DynamoDB's is 100 items), and that must not make the slot undeletable.
+    // A name whose removal fails or is cut short by a crash is harmless — an
+    // index entry pointing at a slot that no longer exists does not hold the
+    // name (`agent_name_held_by_other`) — so this logs rather than fails.
+    if !released_names.is_empty() {
+        let mut names_batch = state.store.batch();
+        for key in released_names {
+            names_batch.remove(&state.dids_ks, key);
+        }
+        if let Err(e) = names_batch.commit_in_parts().await {
+            warn!(
+                mnemonic = %mnemonic,
+                error = %e,
+                "DID deleted; some of its agent-name index entries were not removed"
+            );
+        }
+    }
     state.stats_collector.decrement_total_dids();
     crate::stats_admin::delete_did_stats(state, mnemonic).await;
 
@@ -2138,11 +2274,9 @@ pub async fn check_agent_name(
             Err(e) => return Err(e),
         }
     };
-    let taken = state
-        .dids_ks
-        .get_raw(agent_name_key(domain, &bare))
-        .await?
-        .is_some();
+    // Same rule a claim applies: a leftover index entry does not hold a name.
+    // No slot has an empty mnemonic, so every live holder counts as "other".
+    let taken = agent_name_held_by_other(state, domain, &bare, "").await?;
     Ok(AgentNameAvailability {
         available: !reserved && !taken,
         reserved,
@@ -5042,6 +5176,220 @@ mod tests_atomic {
                 .as_deref(),
             Some("slot-a"),
             "A's index entry must survive B's release"
+        );
+    }
+
+    /// Give `path`'s record a stale enabled entry for `name` — the state an
+    /// earlier double claim could leave behind — without touching the index.
+    async fn plant_stale_name(state: &AppState, path: &str, name: &str) {
+        let mut record = get_record(state, path).await;
+        record.agent_names.push(AgentNameEntry {
+            name: name.to_string(),
+            enabled: true,
+            created_at: 0,
+        });
+        state.dids_ks.insert(did_key(path), &record).await.unwrap();
+    }
+
+    /// Two slots claiming the same free name at the same moment: exactly one
+    /// gets it, and the index and both records agree on which. Covers both
+    /// the `agent-name/update` path and a plain publish.
+    #[tokio::test]
+    async fn concurrent_claims_of_one_name_bind_it_once() {
+        let (state, _dir) = test_state().await;
+        let owner_a = "did:example:a";
+        let owner_b = "did:example:b";
+        register_owned(&state, owner_a, "slot-a").await;
+        register_owned(&state, owner_b, "slot-b").await;
+
+        for round in 0..8 {
+            let name = format!("name-{round}");
+            let log_a = build_test_did_log_with_names("control.test", "slot-a", &[&name]).await;
+            let log_b = build_test_did_log_with_names("control.test", "slot-b", &[&name]).await;
+            let auth_a = owner_auth(owner_a);
+            let auth_b = owner_auth(owner_b);
+            let (result_a, result_b): (Result<(), AppError>, Result<(), AppError>) =
+                if round % 2 == 0 {
+                    let (a, b) = tokio::join!(
+                        set_agent_name(&auth_a, &state, "slot-a", &name, &log_a, None),
+                        set_agent_name(&auth_b, &state, "slot-b", &name, &log_b, None),
+                    );
+                    (a.map(drop), b.map(drop))
+                } else {
+                    tokio::join!(
+                        publish_did(&auth_a, &state, "slot-a", &log_a, None),
+                        publish_did(&auth_b, &state, "slot-b", &log_b, None),
+                    )
+                };
+            let winner = match (&result_a, &result_b) {
+                (Ok(_), Err(AppError::AgentName(AgentNameError::Taken))) => "slot-a",
+                (Err(AppError::AgentName(AgentNameError::Taken)), Ok(_)) => "slot-b",
+                other => panic!("round {round}: expected exactly one claim to win: {other:?}"),
+            };
+            let loser = if winner == "slot-a" {
+                "slot-b"
+            } else {
+                "slot-a"
+            };
+            assert_eq!(
+                index_target(&state, "control.test", &name).await.as_deref(),
+                Some(winner)
+            );
+            assert!(
+                !get_record(&state, loser)
+                    .await
+                    .agent_names
+                    .iter()
+                    .any(|e| e.name == name),
+                "round {round}: the refused slot must not list the name"
+            );
+        }
+    }
+
+    /// `remove` on a slot whose registry lists a name the index gives to
+    /// another slot drops its own entry and leaves the other slot's index.
+    #[tokio::test]
+    async fn remove_does_not_retire_another_slots_index() {
+        let (state, _dir) = test_state().await;
+        let owner_a = "did:example:a";
+        let owner_b = "did:example:b";
+        register_owned(&state, owner_a, "slot-a").await;
+        register_owned(&state, owner_b, "slot-b").await;
+
+        let bind = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
+        set_agent_name(&owner_auth(owner_a), &state, "slot-a", "alice", &bind, None)
+            .await
+            .unwrap();
+        plant_stale_name(&state, "slot-b", "alice").await;
+
+        let dropped = build_test_did_log_with_names("control.test", "slot-b", &[]).await;
+        let record = remove_agent_name(
+            &owner_auth(owner_b),
+            &state,
+            "slot-b",
+            "alice",
+            &dropped,
+            None,
+        )
+        .await
+        .expect("B removes its own entry");
+        assert!(!record.agent_names.iter().any(|e| e.name == "alice"));
+        assert_eq!(
+            index_target(&state, "control.test", "alice")
+                .await
+                .as_deref(),
+            Some("slot-a"),
+            "A's index entry must survive B's remove"
+        );
+    }
+
+    /// Deleting a DID releases the agent names it held, in the same write, so
+    /// another slot can claim them.
+    #[tokio::test]
+    async fn delete_releases_the_slots_agent_names() {
+        let (state, _dir) = test_state().await;
+        let owner_a = "did:example:a";
+        let owner_b = "did:example:b";
+        register_owned(&state, owner_a, "slot-a").await;
+        register_owned(&state, owner_b, "slot-b").await;
+
+        let bind = build_test_did_log_with_names("control.test", "slot-a", &["alice", "bob"]).await;
+        publish_did(&owner_auth(owner_a), &state, "slot-a", &bind, None)
+            .await
+            .unwrap();
+        let park = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
+        disable_agent_name(&owner_auth(owner_a), &state, "slot-a", "bob", &park, None)
+            .await
+            .expect("park bob");
+
+        delete_did(&owner_auth(owner_a), &state, "slot-a", None)
+            .await
+            .expect("delete");
+        for name in ["alice", "bob"] {
+            assert_eq!(
+                index_target(&state, "control.test", name).await,
+                None,
+                "{name}: active and parked names are both released"
+            );
+        }
+
+        let claim = build_test_did_log_with_names("control.test", "slot-b", &["alice"]).await;
+        set_agent_name(
+            &owner_auth(owner_b),
+            &state,
+            "slot-b",
+            "alice",
+            &claim,
+            None,
+        )
+        .await
+        .expect("a released name is free");
+        assert_eq!(
+            index_target(&state, "control.test", "alice")
+                .await
+                .as_deref(),
+            Some("slot-b")
+        );
+    }
+
+    /// Deleting a slot whose registry lists a name the index gives to another
+    /// slot leaves that index entry alone.
+    #[tokio::test]
+    async fn delete_does_not_retire_another_slots_index() {
+        let (state, _dir) = test_state().await;
+        let owner_a = "did:example:a";
+        let owner_b = "did:example:b";
+        register_owned(&state, owner_a, "slot-a").await;
+        register_owned(&state, owner_b, "slot-b").await;
+
+        let bind = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
+        set_agent_name(&owner_auth(owner_a), &state, "slot-a", "alice", &bind, None)
+            .await
+            .unwrap();
+        plant_stale_name(&state, "slot-b", "alice").await;
+
+        delete_did(&owner_auth(owner_b), &state, "slot-b", None)
+            .await
+            .expect("delete");
+        assert_eq!(
+            index_target(&state, "control.test", "alice")
+                .await
+                .as_deref(),
+            Some("slot-a")
+        );
+    }
+
+    /// An index entry pointing at a slot that no longer exists (left by a
+    /// delete before names were released with it) does not hold the name.
+    #[tokio::test]
+    async fn a_leftover_index_entry_does_not_hold_a_name() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        register_owned(&state, owner, "slot-a").await;
+        state
+            .dids_ks
+            .insert_raw(
+                agent_name_key("control.test", "alice"),
+                b"gone-slot".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            check_agent_name(&state, "control.test", "alice")
+                .await
+                .unwrap()
+                .available
+        );
+        let claim = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
+        publish_did(&owner_auth(owner), &state, "slot-a", &claim, None)
+            .await
+            .expect("a leftover entry does not block the claim");
+        assert_eq!(
+            index_target(&state, "control.test", "alice")
+                .await
+                .as_deref(),
+            Some("slot-a")
         );
     }
 

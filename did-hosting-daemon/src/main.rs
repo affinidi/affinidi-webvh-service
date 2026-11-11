@@ -1472,7 +1472,11 @@ async fn run_daemon_storage_task(
                 }
             }
             _ = purge_timer.tick() => {
-                let sweep = did_hosting_server::purge_sweep::run_sweep_once(&params.store).await;
+                // Under the control plane's path locks, as the DID cleanup is.
+                let sweep = did_hosting_server::purge_sweep::run_sweep_once_locked(
+                    &params.store,
+                    params.control_state.as_ref().map(|s| &s.path_locks),
+                ).await;
                 if sweep.entries > 0 {
                     info!(count = sweep.entries, "purge sweep tick completed");
                 }
