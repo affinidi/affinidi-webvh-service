@@ -178,12 +178,41 @@ fn siop_id_token(id: &Key, aud: &str, nonce: &str, now: u64) -> String {
 /// A `mandateCredential` document: `principal` entitles `delegate`, signed by
 /// `signer` (the principal itself, for a genuine mandate — or an impostor,
 /// for the forged-evidence cases).
+/// Valid for the longest a mandate may be (30 days), so the session it backs
+/// has the default lifetime.
 async fn mandate_credential(principal: &str, delegate: &str, signer: &Key) -> Value {
-    let mandate = doc(
+    mandate_credential_valid_for(principal, delegate, signer, Some(30 * 24 * 60 * 60)).await
+}
+
+/// A `mandateCredential` whose `expiresAt` is `valid_for` seconds after its
+/// `issuedAt` (negative: already past), or which has none.
+async fn mandate_credential_valid_for(
+    principal: &str,
+    delegate: &str,
+    signer: &Key,
+    valid_for: Option<i64>,
+) -> Value {
+    let mut mandate = doc(
         "local/did-hosting-auth-mandate/0.1",
         principal,
         json!({ "delegate": delegate }),
     );
+    if let Some(secs) = valid_for {
+        let issued_at = chrono::DateTime::parse_from_rfc3339(mandate["issuedAt"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let (issued_at, expires_at) = if secs < 0 {
+            // Issued in the past and already over.
+            (
+                issued_at + chrono::Duration::seconds(2 * secs),
+                issued_at + chrono::Duration::seconds(secs),
+            )
+        } else {
+            (issued_at, issued_at + chrono::Duration::seconds(secs))
+        };
+        mandate["issuedAt"] = json!(issued_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        mandate["expiresAt"] = json!(expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    }
     sign(mandate, signer, "assertionMethod").await
 }
 
@@ -247,6 +276,124 @@ async fn mandate_credential_proxied_login_succeeds() {
     assert_eq!(body["payload"]["session"]["actor"], delegate.did);
     assert!(
         body["payload"]["session"]["absoluteExpiresAt"].is_string(),
+        "{body}"
+    );
+}
+
+/// A session a mandate backs ends no later than the mandate does.
+#[tokio::test]
+async fn a_mandate_session_ends_with_its_mandate() {
+    let h = harness().await;
+    let (principal, delegate) = (key(30), key(31));
+    h.add_acl(&principal.did, Role::Owner).await;
+
+    let (challenge, session_id) = challenge(&h, &principal).await;
+    let mandate =
+        mandate_credential_valid_for(&principal.did, &delegate.did, &principal, Some(3600)).await;
+    let mandate_expires_at =
+        chrono::DateTime::parse_from_rfc3339(mandate["expiresAt"].as_str().expect("expiresAt"))
+            .unwrap();
+    let d = proxied_authenticate(
+        &delegate,
+        &principal.did,
+        &challenge,
+        &session_id,
+        delegation_evidence("mandateCredential", mandate),
+        None,
+    )
+    .await;
+
+    let (status, body) = post(&h, &d).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let absolute = chrono::DateTime::parse_from_rfc3339(
+        body["payload"]["session"]["absoluteExpiresAt"]
+            .as_str()
+            .expect("absoluteExpiresAt"),
+    )
+    .unwrap();
+    assert!(
+        absolute <= mandate_expires_at,
+        "the session outlives its mandate: {absolute} > {mandate_expires_at}"
+    );
+    let refresh_expires_in = body["payload"]["tokens"]["refreshExpiresIn"]
+        .as_u64()
+        .expect("refreshExpiresIn");
+    assert!(
+        refresh_expires_in <= 3600,
+        "the refresh token outlives the mandate: {refresh_expires_in}s"
+    );
+}
+
+/// A mandate must name its own end, within the longest validity this service
+/// accepts, and not be over.
+#[tokio::test]
+async fn a_mandate_without_a_bounded_expiry_is_refused() {
+    let h = harness().await;
+    let (principal, delegate) = (key(32), key(33));
+    h.add_acl(&principal.did, Role::Owner).await;
+
+    for (case, valid_for) in [
+        ("no expiresAt", None),
+        ("longer than the limit", Some(31 * 24 * 60 * 60)),
+        ("expired", Some(-60)),
+    ] {
+        let (challenge, session_id) = challenge(&h, &principal).await;
+        let mandate =
+            mandate_credential_valid_for(&principal.did, &delegate.did, &principal, valid_for)
+                .await;
+        let d = proxied_authenticate(
+            &delegate,
+            &principal.did,
+            &challenge,
+            &session_id,
+            delegation_evidence("mandateCredential", mandate),
+            None,
+        )
+        .await;
+
+        let (status, body) = post(&h, &d).await;
+        assert_ne!(status, StatusCode::OK, "{case}: {body}");
+        assert_eq!(
+            code(&body),
+            "auth/authenticate:delegationNotRecognized",
+            "{case}: {body}"
+        );
+    }
+}
+
+/// A mandate signed for `authentication` is not a decision and is refused.
+#[tokio::test]
+async fn a_mandate_signed_for_authentication_is_refused() {
+    let h = harness().await;
+    let (principal, delegate) = (key(34), key(35));
+    h.add_acl(&principal.did, Role::Owner).await;
+
+    let (challenge, session_id) = challenge(&h, &principal).await;
+    let mut mandate = doc(
+        "local/did-hosting-auth-mandate/0.1",
+        &principal.did,
+        json!({ "delegate": delegate.did }),
+    );
+    mandate["expiresAt"] = json!(
+        (chrono::Utc::now() + chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    );
+    let mandate = sign(mandate, &principal, "authentication").await;
+    let d = proxied_authenticate(
+        &delegate,
+        &principal.did,
+        &challenge,
+        &session_id,
+        delegation_evidence("mandateCredential", mandate),
+        None,
+    )
+    .await;
+
+    let (status, body) = post(&h, &d).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        code(&body),
+        "auth/authenticate:delegationNotRecognized",
         "{body}"
     );
 }
