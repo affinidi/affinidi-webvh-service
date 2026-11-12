@@ -731,9 +731,7 @@ pub fn controller_did(verification_method: &str) -> &str {
 /// one DID cannot each claim an allowance of their own. A string that is not
 /// a DID URL is returned up to the same delimiters.
 pub fn canonical_did(did_url: &str) -> &str {
-    let end = did_url
-        .find(|c| matches!(c, '/' | '?' | '#'))
-        .unwrap_or(did_url.len());
+    let end = did_url.find(['/', '?', '#']).unwrap_or(did_url.len());
     &did_url[..end]
 }
 
