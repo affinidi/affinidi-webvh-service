@@ -285,6 +285,7 @@ fn default_server() -> ServerConfig {
         host: "0.0.0.0".to_string(),
         port: 8532,
         trusted_proxies: Vec::new(),
+        client_ipv6_prefix: did_hosting_common::server::config::default_client_ipv6_prefix(),
         trusted_proxy_cidrs: Vec::new(),
         resolve_cache: Default::default(),
         resolve_rate_limit: Default::default(),

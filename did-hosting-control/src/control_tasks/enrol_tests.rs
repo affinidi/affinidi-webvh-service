@@ -927,6 +927,40 @@ async fn https_redemption_is_rate_limited_per_client_ip() {
     assert!(last["payload"]["retryAfter"].is_string(), "{last}");
 }
 
+/// An IPv6 client is counted by its /64: stepping to a new address inside the
+/// block for each attempt does not earn a fresh allowance.
+#[tokio::test]
+async fn https_redemption_counts_an_ipv6_client_by_its_network() {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+
+    let (state, _dir) = state().await;
+    let mut last = Value::Null;
+    for i in 0..=crate::rate_limit::REDEEM_MAX_PER_WINDOW {
+        let addr: std::net::SocketAddr =
+            format!("[2001:db8:7:7::{:x}]:4000", i + 1).parse().unwrap();
+        let mut doc = request(
+            &t(REDEEM_START),
+            "unused",
+            json!({ "token": "inv_not-a-real-token-at-all", "claimCode": "0000-0000-0000" }),
+        );
+        doc.as_object_mut().unwrap().remove("issuer");
+        let response = crate::routes::trust_tasks::trust_tasks_endpoint(
+            None,
+            axum::extract::State(state.clone()),
+            Ok(axum::extract::ConnectInfo(addr)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
+        )
+        .await
+        .into_response();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        last = serde_json::from_slice(&bytes).unwrap();
+    }
+    assert_eq!(code(&last), "unavailable", "{last}");
+    assert!(last["payload"]["retryAfter"].is_string(), "{last}");
+}
+
 /// A redemption body over its size limit is refused for its size, before it
 /// is parsed, and does not count against the client's redemption limit.
 #[tokio::test]

@@ -136,6 +136,7 @@ impl World {
     async fn send_from(&self, doc: Value, ip: &str) -> (u16, Value) {
         let conn = Connection {
             ip: Some(ip.into()),
+            address_key: Some(ip.into()),
             location: None,
             browser: Some("Firefox".into()),
             os: Some("macOS".into()),
@@ -328,6 +329,7 @@ async fn step_2_shows_the_requests_location() {
         .await;
     let conn = Connection {
         ip: Some("203.0.113.7".into()),
+        address_key: Some("203.0.113.7".into()),
         location: Some("Vienna, AT".into()),
         browser: Some("Firefox".into()),
         os: Some("macOS".into()),

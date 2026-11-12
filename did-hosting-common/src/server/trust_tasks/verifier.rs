@@ -162,8 +162,10 @@ trait StaleKeyRefresh: Send + Sync {
 
 /// Allows one forced refresh per DID per [`FORCED_REFRESH_INTERVAL`].
 ///
-/// Keyed on the DID's identity ([`crate::scid::identity`]), so the `src`
-/// variants of one `did:scid` share a single allowance. Holds at most
+/// Keyed on the canonical DID ([`canonical_did`]: no path, query or
+/// fragment), so every variant of one DID that a `verificationMethod` can name
+/// — a `did:scid`'s `?src=`, with or without further parameters, a version
+/// query, a fragment — shares a single allowance. Holds at most
 /// [`FORCED_REFRESH_CAPACITY`] DIDs, each at most
 /// [`FORCED_REFRESH_MAX_DID_LEN`] bytes; when full it refuses rather than
 /// forgets, so a stream of distinct DIDs cannot reset another DID's spacing.
@@ -177,7 +179,7 @@ impl RefreshLimiter {
         if did.len() > FORCED_REFRESH_MAX_DID_LEN {
             return false;
         }
-        let key = crate::scid::identity(did);
+        let key = canonical_did(did).to_owned();
         let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
         if last
             .get(&key)
@@ -209,7 +211,7 @@ impl StaleKeyRefresh for CacheRefresher {
             return false;
         }
         self.client.remove(did).await;
-        self.deactivation.forget(&crate::scid::identity(did));
+        self.deactivation.forget(canonical_did(did));
         true
     }
 }
@@ -721,6 +723,20 @@ pub fn controller_did(verification_method: &str) -> &str {
         .unwrap_or(verification_method)
 }
 
+/// The DID a DID URL names, with any path, query and fragment removed:
+/// `did:scid:vh:1:Qm?src=a.example&x=1#key-1` is `did:scid:vh:1:Qm`, and
+/// `did:webvh:Qm:host.example?versionId=2` is `did:webvh:Qm:host.example`.
+///
+/// What limits keyed on a signer's DID count it as, so the many spellings of
+/// one DID cannot each claim an allowance of their own. A string that is not
+/// a DID URL is returned up to the same delimiters.
+pub fn canonical_did(did_url: &str) -> &str {
+    let end = did_url
+        .find(|c| matches!(c, '/' | '?' | '#'))
+        .unwrap_or(did_url.len());
+    &did_url[..end]
+}
+
 #[async_trait]
 impl ProofVerifier for TransportBoundVerifier {
     async fn verify<P>(&self, doc: &TrustTask<P>) -> Result<(), VerificationError>
@@ -1195,6 +1211,49 @@ mod tests {
         assert!(limiter.allow("did:scid:vh:1:abc?src=one.example", t0));
         assert!(!limiter.allow("did:scid:vh:1:abc?src=two.example", t0));
         assert!(!limiter.allow("did:scid:vh:1:abc", t0));
+    }
+
+    /// Every spelling of one DID shares one allowance: a `src` with further
+    /// parameters (which the `src` helpers leave alone), any other query, a
+    /// path or a fragment.
+    #[test]
+    fn forced_refreshes_are_limited_per_canonical_did() {
+        let limiter = RefreshLimiter::default();
+        let t0 = Instant::now();
+        assert!(limiter.allow("did:scid:vh:1:abc?src=one.example", t0));
+        for variant in [
+            "did:scid:vh:1:abc?src=two.example&n=1",
+            "did:scid:vh:1:abc?src=three.example&src=four.example",
+            "did:scid:vh:1:abc?versionId=2",
+            "did:scid:vh:1:abc/some/path",
+            "did:scid:vh:1:abc#key-1",
+        ] {
+            assert!(!limiter.allow(variant, t0), "{variant}");
+        }
+        assert!(limiter.allow("did:webvh:Qm:host.example?versionId=1", t0));
+        assert!(!limiter.allow("did:webvh:Qm:host.example?versionId=2", t0));
+        assert!(limiter.allow("did:scid:vh:1:other?src=one.example", t0));
+    }
+
+    #[test]
+    fn canonical_did_drops_path_query_and_fragment() {
+        assert_eq!(
+            canonical_did("did:scid:vh:1:Qm?src=a.example&x=1#key-1"),
+            "did:scid:vh:1:Qm"
+        );
+        assert_eq!(
+            canonical_did("did:webvh:Qm:host.example?versionId=2"),
+            "did:webvh:Qm:host.example"
+        );
+        assert_eq!(canonical_did("did:key:z6Mk#z6Mk"), "did:key:z6Mk");
+        assert_eq!(
+            canonical_did("did:web:host.example/x"),
+            "did:web:host.example"
+        );
+        assert_eq!(
+            canonical_did("did:web:host.example"),
+            "did:web:host.example"
+        );
     }
 
     /// The limiter holds a bounded number of DIDs and refuses (rather than

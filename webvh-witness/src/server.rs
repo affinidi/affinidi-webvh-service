@@ -95,7 +95,7 @@ impl AppState {
         let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
         let replay_cache = Arc::new(ReplayCache::with_config(config.replay.clone())?);
         let client_ips =
-            did_hosting_common::server::rate_limit::ClientIps::new(&config.server.trusted_proxies)?;
+            did_hosting_common::server::rate_limit::ClientIps::from_server_config(&config.server)?;
         Ok(Self {
             acl_ks: store.keyspace(KS_ACL)?,
             witnesses_ks: store.keyspace(KS_WITNESSES)?,

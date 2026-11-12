@@ -632,7 +632,11 @@ impl OobService {
         }
         self.fresh(env, &doc)?;
 
-        let ip = conn.ip.clone().unwrap_or_else(|| "unknown".into());
+        let ip = conn
+            .address_key
+            .clone()
+            .or_else(|| conn.ip.clone())
+            .unwrap_or_else(|| "unknown".into());
         let _guard = self
             .store
             .open_poll(&rec.request_id, &ip, self.config.max_polls_per_ip)
@@ -1016,6 +1020,9 @@ const OPERATIONAL: &str = "authentication";
 pub struct Connection {
     /// Egress IP. Used only to compute `sameNetwork`; never returned.
     pub ip: Option<String>,
+    /// What per-address caps count this connection as: its address, or an
+    /// IPv6 client's network (`ClientIps::key_of`). Never returned.
+    pub address_key: Option<String>,
     /// City and country from a local GeoIP lookup, or `None`.
     pub location: Option<String>,
     pub browser: Option<String>,

@@ -112,7 +112,7 @@ impl AppState {
             did_hosting_common::server::replay::ReplayCache::with_config(config.replay.clone())?,
         );
         let client_ips =
-            did_hosting_common::server::rate_limit::ClientIps::new(&config.server.trusted_proxies)?;
+            did_hosting_common::server::rate_limit::ClientIps::from_server_config(&config.server)?;
         Ok(Self {
             dids_ks: store.keyspace(KS_DIDS)?,
             store,
