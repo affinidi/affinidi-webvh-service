@@ -100,7 +100,9 @@ use trust_tasks_rs::{
 };
 
 use did_hosting_common::epoch_to_rfc3339;
-use did_hosting_common::server::auth::session::{get_session, get_session_by_refresh, now_epoch};
+use did_hosting_common::server::auth::session::{
+    SessionFate, get_session, get_session_by_refresh, now_epoch,
+};
 use did_hosting_common::server::trust_tasks::{DispatchOutcome, run_pipeline};
 use vti_common::auth::backend::{AuthenticateInput, RefreshInput};
 use vti_common::auth::handlers::{handle_authenticate, handle_refresh};
@@ -609,6 +611,28 @@ pub(crate) async fn delete_auth_proxy_meta(
         .await
 }
 
+/// Apply `fate` to every live session of `subject` (any reference to its
+/// identity), and drop the auth-proxy meta row of each session it ends.
+///
+/// The one place the control plane ends or demotes sessions because what they
+/// rest on was withdrawn: an ACL entry removed, or a passkey revoked.
+pub(crate) async fn settle_subject_sessions(
+    state: &AppState,
+    subject: &str,
+    fate: impl Fn(&did_hosting_common::server::auth::session::Session) -> SessionFate,
+) -> Result<did_hosting_common::server::auth::session::SettledSessions, crate::error::AppError> {
+    let settled = did_hosting_common::server::auth::session::settle_subject_sessions(
+        &state.sessions_ks,
+        subject,
+        fate,
+    )
+    .await?;
+    for session_id in &settled.ended {
+        delete_auth_proxy_meta(state, session_id).await?;
+    }
+    Ok(settled)
+}
+
 #[allow(clippy::result_large_err)]
 async fn authenticate_v3_arm(
     state: &AppState,
@@ -850,6 +874,7 @@ async fn refresh_v2_arm(
     let backend = crate::auth::DidHostingControlAuthBackend::from_state(state)
         .map_err(|e| denied(&doc, "refresh/backend", e))?;
 
+    let presented_refresh_token = refresh_token.clone();
     let resp = handle_refresh(
         &backend,
         RefreshInput {
@@ -866,6 +891,52 @@ async fn refresh_v2_arm(
     // migration here.
     let new_session_id = resp.session.id.clone();
     let mut value = serde_json::to_value(&resp).map_err(|e| denied(&doc, "refresh/response", e))?;
+
+    // A session ended or demoted while this refresh was in flight (its
+    // passkey revoked, its ACL entry removed) stays so: the rotation was
+    // written from the row as it stood before.
+    // The rotation this refresh wrote: a row that has moved on since is not
+    // this refresh's to settle.
+    let rotated_refresh_token = value["tokens"]["refreshToken"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let rotated_token_id = state
+        .jwt_keys
+        .as_deref()
+        .and_then(|keys| {
+            value["tokens"]["accessToken"]
+                .as_str()
+                .and_then(|t| keys.decode(t).ok())
+        })
+        .map(|claims| claims.jti)
+        .unwrap_or_default();
+    match did_hosting_common::server::auth::session::settle_after_refresh(
+        &state.sessions_ks,
+        &presented_refresh_token,
+        &new_session_id,
+        &rotated_refresh_token,
+        &rotated_token_id,
+    )
+    .await
+    .map_err(|e| denied(&doc, "refresh/settled", e))?
+    {
+        Some(SessionFate::End) => {
+            delete_auth_proxy_meta(state, &new_session_id)
+                .await
+                .map_err(|e| denied(&doc, "refresh/settled", e))?;
+            return Err(denied(
+                &doc,
+                "refresh",
+                "the session was ended while the refresh was in flight",
+            ));
+        }
+        Some(SessionFate::Demote) => {
+            value["session"]["acr"] = Value::String("aal1".into());
+            value["session"]["amr"] = serde_json::json!(["did"]);
+        }
+        _ => {}
+    }
     if let Some(meta) = get_auth_proxy_meta(state, &new_session_id)
         .await
         .map_err(|e| denied(&doc, "refresh/meta", e))?

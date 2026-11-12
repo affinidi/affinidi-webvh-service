@@ -1,4 +1,5 @@
 pub mod acl;
+pub mod acl_removal;
 pub mod agent_name_index;
 pub mod assignment;
 pub mod assignment_seed;

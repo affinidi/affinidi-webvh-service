@@ -125,12 +125,36 @@ pub async fn run_remove_acl(
     let entry = existing.unwrap();
     delete_acl_entry(&acl_ks, &did).await?;
     store.persist().await?;
+    // What the entry authorised goes with it, as on `acl/revoke`: the
+    // subject's sessions and the enrolment invites issued for it or by it.
+    // The removal stands either way; a failure here is reported, and the
+    // sessions it missed end at their own expiry. This does not take the
+    // control plane's in-process removal lock: on a store a running control
+    // plane shares (DynamoDB, Redis, ...), prefer `acl/revoke`.
+    let sessions_ks = store.keyspace(crate::server::store::KS_SESSIONS)?;
+    let (ended, withdrawn) =
+        match super::acl_removal::withdraw_removed_member(&sessions_ks, &did).await {
+            Ok((settled, withdrawn)) => {
+                store.persist().await?;
+                (settled.ended.len(), withdrawn)
+            }
+            Err(e) => {
+                eprintln!();
+                eprintln!(
+                    "  Warning: the entry was removed, but its sessions and invites could not \
+                     all be withdrawn: {e}"
+                );
+                (0, 0)
+            }
+        };
 
     eprintln!();
     eprintln!("  ACL entry removed!");
     eprintln!();
     eprintln!("  DID:  {}", entry.did);
     eprintln!("  Role: {}", entry.role);
+    eprintln!("  Sessions ended:    {ended}");
+    eprintln!("  Invites withdrawn: {withdrawn}");
     eprintln!();
 
     Ok(())

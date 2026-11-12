@@ -386,6 +386,11 @@ async fn claim_credential_id(
     Ok(Some(guard))
 }
 
+/// The lock `acl/revoke` holds, on the control plane, from before it removes
+/// an ACL entry until it has withdrawn the subject's invites; an invite
+/// redemption holds it too. Taken before the ACL write lock.
+pub(crate) const ACL_REMOVAL_LOCK_KEY: &str = "::trust-tasks::acl-removal";
+
 /// Write the credential — and, for a redemption that grants a role, the ACL
 /// entry it authorises — in one batch.
 async fn persist(
@@ -767,31 +772,53 @@ pub(crate) async fn redeem_finish(
         ));
     };
 
+    // Held from here through `persist`'s commit:
+    // - the ACL removal lock, which `acl/revoke` holds from before it removes
+    //   an entry until it has withdrawn that subject's invites, so a removal
+    //   and this redemption never interleave (taken first: a removal holds it
+    //   while the handler takes the ACL write lock);
+    // - the ACL write lock, which `acl/grant`, `acl/change-role` and
+    //   `acl/revoke` hold for their read-then-write, because what follows
+    //   reads the ACL (the issuer's standing, whether the subject has an
+    //   entry) and may write it. Unlocked, an admin's grant (or role change)
+    //   landing in between was silently overwritten by the invite's role.
+    // Both are taken after `credentials_guard`; the ACL handlers never take a
+    // credentials guard, so the order cannot deadlock.
+    let _removal_guard = state.acl_locks.guard(ACL_REMOVAL_LOCK_KEY).await;
+    let _acl_guard = state
+        .acl_locks
+        .guard(did_hosting_common::server::trust_tasks::ACL_WRITE_LOCK_KEY)
+        .await;
+
     // Consume the invite. Exactly one finish wins this; the loser binds
-    // nothing.
+    // nothing. An invite withdrawn by a removal is gone by now.
     if invite::take(&state.sessions_ks, &token_hash)
         .await?
         .is_none()
     {
         return Err(not_found());
     }
-    // An invite that confers a role decides whether to create the subject's
-    // ACL entry from a read of the ACL, so — like `acl/grant`,
-    // `acl/change-role` and `acl/revoke` — it holds the ACL write lock from
-    // that read through `persist`'s commit. Unlocked, an admin's grant (or
-    // role change) landing in between was silently overwritten by the
-    // invite's role. Taken after `credentials_guard`; the ACL handlers never
-    // take a credentials guard, so the order cannot deadlock.
-    let _acl_guard = if ceremony.purpose == Purpose::Session && role.is_some() {
-        Some(
-            state
-                .acl_locks
-                .guard(did_hosting_common::server::trust_tasks::ACL_WRITE_LOCK_KEY)
-                .await,
-        )
-    } else {
-        None
+    // An invite carries its issuer's authority, so it is honoured only while
+    // the issuer still holds it: an administrator removed or demoted since
+    // issuing it no longer enrols anyone. Checked after the take, so the
+    // invite is spent either way.
+    let issuer_standing = match acl::check_acl(&state.acl_ks, &issued_by).await {
+        Ok(role) => role == Role::Admin,
+        Err(e) if acl::is_acl_refusal(&e) => false,
+        Err(e) => return Err(e.into()),
     };
+    if !issuer_standing {
+        warn!(
+            invite_id = %invite_id,
+            issued_by = %issued_by,
+            subject = %ceremony.subject,
+            "invite redemption refused: its issuer no longer holds administrator standing"
+        );
+        return Err(TaskError::Standard(
+            trust_tasks_rs::StandardCode::PermissionDenied,
+            "the administrator who issued this invite no longer holds that standing".into(),
+        ));
+    }
     let acl_entry = match (ceremony.purpose, role) {
         (Purpose::Session, Some(role)) => {
             match acl::get_acl_entry(&state.acl_ks, &ceremony.subject).await? {
