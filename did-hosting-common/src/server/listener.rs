@@ -10,6 +10,13 @@
 //! - **Connection cap.** At most [`ListenerLimits::max_connections`] are
 //!   served at once. Past that, `accept` waits for one to close; the kernel's
 //!   backlog holds the rest.
+//! - **Per-address cap.** At most
+//!   [`ListenerLimits::max_connections_per_address`] of them come from one
+//!   source: one IPv4 address, or one IPv6 /64 (the block a single host is
+//!   usually given). A connection past that is closed as soon as it is
+//!   accepted, so one source cannot take every slot of the connection cap.
+//!   Trusted proxies ([`BoundedListener::with_trusted_proxies`]) are exempt:
+//!   every client behind one shares its address.
 //! - **Header read.** Once a request's first byte arrives, its header block
 //!   must be complete within [`ListenerLimits::header_read_timeout`]. The
 //!   deadline is fixed when the request starts: a client that keeps sending
@@ -17,6 +24,12 @@
 //! - **Idle.** A kept-alive connection with no request in progress is closed
 //!   after [`ListenerLimits::idle_timeout`], and so is one whose response
 //!   the peer stops reading for that long.
+//! - **HTTP/2.** A connection that opens with the HTTP/2 preface is held to
+//!   the header deadline, renewed only when the service writes to it (a
+//!   SETTINGS or PING acknowledgement, a response). Bytes from the peer alone
+//!   never extend it, and it never gets the longer idle timeout. (axum is
+//!   built without its `http2` feature here, so hyper refuses the preface at
+//!   once; this only keeps the bound if that feature is ever turned on.)
 //!
 //! A request body is read by the handler, after any admission check, with
 //! [`read_body`]: bounded in size and in time
@@ -25,18 +38,21 @@
 //! These are a backstop for a service reachable directly. A deployment is
 //! still expected to put a reverse proxy in front, with its own limits.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::serve::{Listener, ListenerExt, TapIo};
+use ipnetwork::IpNetwork;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -55,6 +71,9 @@ pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Connections served at once.
 pub const MAX_CONNECTIONS: usize = 256;
 
+/// Connections served at once from one IPv4 address or one IPv6 /64.
+pub const MAX_CONNECTIONS_PER_ADDRESS: usize = 32;
+
 /// The limits a [`BoundedListener`] applies.
 #[derive(Debug, Clone, Copy)]
 pub struct ListenerLimits {
@@ -62,6 +81,7 @@ pub struct ListenerLimits {
     pub idle_timeout: Duration,
     pub body_read_timeout: Duration,
     pub max_connections: usize,
+    pub max_connections_per_address: usize,
 }
 
 impl Default for ListenerLimits {
@@ -71,6 +91,7 @@ impl Default for ListenerLimits {
             idle_timeout: IDLE_TIMEOUT,
             body_read_timeout: BODY_READ_TIMEOUT,
             max_connections: MAX_CONNECTIONS,
+            max_connections_per_address: MAX_CONNECTIONS_PER_ADDRESS,
         }
     }
 }
@@ -80,6 +101,9 @@ pub struct BoundedListener {
     inner: TcpListener,
     limits: ListenerLimits,
     slots: Arc<Semaphore>,
+    per_address: Arc<PerAddress>,
+    /// Sources exempt from the per-address cap.
+    trusted_proxies: Vec<IpNetwork>,
 }
 
 impl BoundedListener {
@@ -88,6 +112,32 @@ impl BoundedListener {
             inner,
             limits,
             slots: Arc::new(Semaphore::new(limits.max_connections.max(1))),
+            per_address: Arc::new(PerAddress {
+                limit: limits.max_connections_per_address.max(1),
+                open: Mutex::new(HashMap::new()),
+            }),
+            trusted_proxies: Vec::new(),
+        }
+    }
+
+    /// Exempt `trusted_proxies` (the service's `server.trusted_proxies`)
+    /// from the per-address cap: every client behind a proxy reaches this
+    /// listener from the proxy's address. They still count towards the
+    /// connection cap.
+    pub fn with_trusted_proxies(mut self, trusted_proxies: &[IpNetwork]) -> Self {
+        self.trusted_proxies = trusted_proxies.to_vec();
+        self
+    }
+
+    /// Admit a connection from `ip` under the per-address cap.
+    fn admit(&self, ip: IpAddr) -> Admission {
+        let ip = unmapped(ip);
+        if self.trusted_proxies.iter().any(|net| net.contains(ip)) {
+            return Admission::Exempt;
+        }
+        match self.per_address.take(AddressKey::of(ip)) {
+            Some(slot) => Admission::Counted(slot),
+            None => Admission::Refused,
         }
     }
 
@@ -100,9 +150,96 @@ impl BoundedListener {
     }
 }
 
-/// Serve `listener` under the default [`ListenerLimits`].
-pub fn bounded(listener: TcpListener) -> TapIo<BoundedListener, fn(&mut BoundedIo)> {
-    BoundedListener::new(listener, ListenerLimits::default()).into_serve()
+/// Serve `listener` under the default [`ListenerLimits`], exempting
+/// `trusted_proxies` from the per-address cap.
+pub fn bounded(
+    listener: TcpListener,
+    trusted_proxies: &[IpNetwork],
+) -> TapIo<BoundedListener, fn(&mut BoundedIo)> {
+    BoundedListener::new(listener, ListenerLimits::default())
+        .with_trusted_proxies(trusted_proxies)
+        .into_serve()
+}
+
+/// An IPv4-mapped IPv6 address as the IPv4 address it carries.
+fn unmapped(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    }
+}
+
+/// The source a connection is counted against: an IPv4 address, or the /64
+/// an IPv6 address is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AddressKey {
+    V4(Ipv4Addr),
+    V6(u64),
+}
+
+impl AddressKey {
+    fn of(ip: IpAddr) -> Self {
+        match unmapped(ip) {
+            IpAddr::V4(v4) => Self::V4(v4),
+            IpAddr::V6(v6) => Self::V6((u128::from(v6) >> 64) as u64),
+        }
+    }
+}
+
+/// Open connections per source. An entry exists only while a connection
+/// from that source is open, so the map holds at most `max_connections`
+/// entries.
+#[derive(Debug)]
+struct PerAddress {
+    limit: usize,
+    open: Mutex<HashMap<AddressKey, usize>>,
+}
+
+impl PerAddress {
+    fn take(self: &Arc<Self>, key: AddressKey) -> Option<AddressSlot> {
+        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = open.entry(key).or_insert(0);
+        if *count >= self.limit {
+            return None;
+        }
+        *count += 1;
+        Some(AddressSlot {
+            table: Arc::clone(self),
+            key,
+        })
+    }
+}
+
+/// One connection's place in its source's count, released on drop.
+#[derive(Debug)]
+struct AddressSlot {
+    table: Arc<PerAddress>,
+    key: AddressKey,
+}
+
+impl Drop for AddressSlot {
+    fn drop(&mut self) {
+        let mut open = self
+            .table
+            .open
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Entry::Occupied(mut count) = open.entry(self.key) {
+            *count.get_mut() -= 1;
+            if *count.get() == 0 {
+                count.remove();
+            }
+        }
+    }
+}
+
+/// The per-address decision for an accepted connection.
+enum Admission {
+    /// From a trusted proxy: not counted.
+    Exempt,
+    Counted(AddressSlot),
+    /// Its source already has the most connections it may.
+    Refused,
 }
 
 impl Listener for BoundedListener {
@@ -111,17 +248,31 @@ impl Listener for BoundedListener {
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         // Wait for a free slot before taking the next connection off the
-        // backlog. The semaphore is never closed, so this cannot fail.
-        let permit = self
-            .slots
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("the connection semaphore is never closed");
+        // backlog. Nothing closes the semaphore; if something ever did, no
+        // slot could be issued again, so stop accepting (graceful shutdown
+        // still ends the serve loop) rather than panic.
+        let Ok(permit) = self.slots.clone().acquire_owned().await else {
+            tracing::error!("the connection limit was closed; accepting no more connections");
+            return std::future::pending().await;
+        };
         loop {
             match self.inner.accept().await {
                 Ok((stream, addr)) => {
-                    return (BoundedIo::new(stream, self.limits, permit), addr);
+                    let address = match self.admit(addr.ip()) {
+                        Admission::Exempt => None,
+                        Admission::Counted(slot) => Some(slot),
+                        Admission::Refused => {
+                            // Close it at once and keep the slot for the
+                            // next connection.
+                            tracing::debug!(
+                                peer = %addr.ip(),
+                                "connection refused: its address has the most connections it may"
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                    };
+                    return (BoundedIo::new(stream, self.limits, permit, address), addr);
                 }
                 Err(e) => handle_accept_error(e).await,
             }
@@ -158,8 +309,10 @@ enum Phase {
     Header,
     /// The header block is complete. The handler bounds the body.
     Request,
-    /// The connection speaks HTTP/2, whose frames carry no header block
-    /// this can see; only the idle deadline applies, on every read.
+    /// The connection opened with the HTTP/2 preface, whose frames carry
+    /// no header block this can see. It is held to the header deadline,
+    /// renewed only when the service writes; the peer's bytes alone never
+    /// extend it.
     Http2,
 }
 
@@ -210,14 +363,21 @@ pub struct BoundedIo {
     header_end: HeaderEnd,
     /// Bytes of the connection seen so far, up to the HTTP/2 preface's length.
     sniffed: Vec<u8>,
-    /// The task waiting on a pending read, woken when a write moves the read
-    /// deadline so that it arms the new one.
-    reader: Option<std::task::Waker>,
+    /// The task that last polled a read, woken whenever the read deadline
+    /// moves so that its next `poll_read` arms the new one. Kept, not taken,
+    /// so a move made between two reads still reaches it.
+    reader: Option<Waker>,
     _slot: OwnedSemaphorePermit,
+    _address: Option<AddressSlot>,
 }
 
 impl BoundedIo {
-    fn new(inner: TcpStream, limits: ListenerLimits, slot: OwnedSemaphorePermit) -> Self {
+    fn new(
+        inner: TcpStream,
+        limits: ListenerLimits,
+        slot: OwnedSemaphorePermit,
+        address: Option<AddressSlot>,
+    ) -> Self {
         let now = Instant::now();
         Self {
             inner,
@@ -234,6 +394,7 @@ impl BoundedIo {
             sniffed: Vec::with_capacity(H2_PREFACE.len()),
             reader: None,
             _slot: slot,
+            _address: address,
         }
     }
 
@@ -242,11 +403,14 @@ impl BoundedIo {
         self.set_read_deadline(Instant::now() + self.limits.idle_timeout);
     }
 
-    /// Move the read deadline, waking a pending read so it is armed.
+    /// Move the read deadline and wake the reading task, so that its next
+    /// `poll_read` (which re-arms the timer whenever the deadline differs)
+    /// is held to the new one. A wake with no read pending is spurious and
+    /// harmless.
     fn set_read_deadline(&mut self, deadline: Instant) {
         self.read_deadline = Some(deadline);
-        if let Some(reader) = self.reader.take() {
-            reader.wake();
+        if let Some(reader) = &self.reader {
+            reader.wake_by_ref();
         }
     }
 
@@ -269,14 +433,14 @@ impl BoundedIo {
                 self.sniffed = H2_PREFACE.to_vec();
                 self.sniffed[0] = 0;
             } else if self.sniffed.len() == H2_PREFACE.len() {
+                // The preface opens the connection, so the header deadline
+                // set when it was accepted still applies. It is not moved.
                 self.phase = Phase::Http2;
             }
         }
         match self.phase {
-            Phase::Http2 => {
-                self.read_deadline = Some(Instant::now() + self.limits.idle_timeout);
-            }
-            Phase::Request => {}
+            // Reads never extend an HTTP/2 connection's deadline.
+            Phase::Http2 | Phase::Request => {}
             Phase::Idle => {
                 self.start_request();
                 self.scan(bytes);
@@ -302,8 +466,12 @@ impl BoundedIo {
         }
         match self.phase {
             Phase::Request | Phase::Idle => self.enter_idle(),
+            // Beyond its own opening SETTINGS, the service writes on an
+            // HTTP/2 connection only in answer to frames it accepted, so a
+            // write renews the deadline: by the header timeout, the same as
+            // every connection's first request, never the idle timeout.
             Phase::Http2 => {
-                self.set_read_deadline(Instant::now() + self.limits.idle_timeout);
+                self.set_read_deadline(Instant::now() + self.limits.header_read_timeout);
             }
             Phase::Header => {}
         }
@@ -329,6 +497,13 @@ impl AsyncRead for BoundedIo {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        // Record the reading task on every poll, whatever the outcome, so a
+        // deadline moved by a write wakes it even if no read is pending at
+        // that moment.
+        match &this.reader {
+            Some(reader) if reader.will_wake(cx.waker()) => {}
+            _ => this.reader = Some(cx.waker().clone()),
+        }
         let before = buf.filled().len();
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Ready(Ok(())) => {
@@ -338,12 +513,12 @@ impl AsyncRead for BoundedIo {
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => {
-                this.reader = Some(cx.waker().clone());
                 if let Some(deadline) = this.read_deadline
                     && poll_deadline(&mut this.read_timer, deadline, cx)
                 {
                     let what = match this.phase {
                         Phase::Header => "reading the request headers",
+                        Phase::Http2 => "the HTTP/2 connection",
                         _ => "the idle connection",
                     };
                     return Poll::Ready(Err(timed_out(what)));
@@ -501,6 +676,7 @@ mod tests {
             idle_timeout: Duration::from_millis(300),
             body_read_timeout: Duration::from_millis(300),
             max_connections: 2,
+            max_connections_per_address: 2,
         }
     }
 
@@ -630,6 +806,250 @@ mod tests {
             .expect("served once the slot is free")
             .unwrap();
         assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+    }
+
+    async fn serve_listener(listener: BoundedListener) -> SocketAddr {
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/", get(|| async { "ok" }));
+        tokio::spawn(async move {
+            axum::serve(
+                listener.into_serve(),
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        addr
+    }
+
+    fn per_address_limits() -> ListenerLimits {
+        ListenerLimits {
+            header_read_timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(30),
+            max_connections: 8,
+            max_connections_per_address: 2,
+            ..short()
+        }
+    }
+
+    /// One address cannot hold more than its share of the connection cap:
+    /// past it, a connection is closed at once, and the slots it would
+    /// have taken stay free.
+    #[tokio::test]
+    async fn connections_past_the_per_address_cap_are_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = serve_listener(BoundedListener::new(listener, per_address_limits())).await;
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        assert!(get_ok(&mut first).await.starts_with("HTTP/1.1 200"));
+        assert!(get_ok(&mut second).await.starts_with("HTTP/1.1 200"));
+
+        let mut third = TcpStream::connect(addr).await.unwrap();
+        assert!(
+            closed_within(&mut third, Duration::from_secs(3)).await,
+            "a third connection from the address is closed"
+        );
+
+        // Closing one frees its place for the address.
+        drop(first);
+        let mut fourth = None;
+        for _ in 0..50 {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            if s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await
+                .is_ok()
+            {
+                let mut buf = [0u8; 256];
+                if let Ok(Ok(n)) =
+                    tokio::time::timeout(Duration::from_millis(500), s.read(&mut buf)).await
+                    && n > 0
+                {
+                    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+                    fourth = Some(s);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(fourth.is_some(), "served once the address has a place free");
+    }
+
+    /// A trusted proxy carries many clients' connections, so it is held to
+    /// the connection cap only.
+    #[tokio::test]
+    async fn a_trusted_proxy_is_not_held_to_the_per_address_cap() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bounded = BoundedListener::new(listener, per_address_limits())
+            .with_trusted_proxies(&["127.0.0.0/8".parse().unwrap()]);
+        let addr = serve_listener(bounded).await;
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            assert!(get_ok(&mut s).await.starts_with("HTTP/1.1 200"));
+            held.push(s);
+        }
+    }
+
+    #[test]
+    fn ipv6_addresses_are_counted_by_their_64() {
+        let key = |s: &str| AddressKey::of(s.parse().unwrap());
+        assert_eq!(key("2001:db8:1:2::1"), key("2001:db8:1:2:ffff::9"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        // An IPv4-mapped address counts as the IPv4 address it carries.
+        assert_eq!(key("::ffff:192.0.2.7"), key("192.0.2.7"));
+        assert_ne!(key("192.0.2.7"), key("192.0.2.8"));
+
+        let table = Arc::new(PerAddress {
+            limit: 2,
+            open: Mutex::new(HashMap::new()),
+        });
+        let a = table.take(key("2001:db8::1")).unwrap();
+        let _b = table.take(key("2001:db8::2")).unwrap();
+        assert!(table.take(key("2001:db8::3")).is_none(), "the /64 is full");
+        assert!(table.take(key("2001:db8:0:1::1")).is_some(), "another /64");
+        drop(a);
+        assert!(table.take(key("2001:db8::3")).is_some(), "a place freed");
+    }
+
+    /// A connected `BoundedIo` and the peer's end.
+    async fn pair(limits: ListenerLimits) -> (BoundedIo, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        (BoundedIo::new(server, limits, permit, None), client)
+    }
+
+    #[derive(Default)]
+    struct CountWakes(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for CountWakes {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A deadline moved by a write while no read is pending (the last read
+    /// completed) still wakes the reading task, so its next poll arms it.
+    #[tokio::test]
+    async fn a_deadline_moved_between_reads_wakes_the_reader() {
+        let (mut io, mut client) = pair(short()).await;
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        // Let the request arrive, so the first poll completes the read and
+        // no read is left pending.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let wakes = Arc::new(CountWakes::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
+        let mut storage = [0u8; 256];
+        loop {
+            let mut buf = ReadBuf::new(&mut storage);
+            match Pin::new(&mut io).poll_read(&mut cx, &mut buf) {
+                Poll::Ready(Ok(())) if !buf.filled().is_empty() => break,
+                Poll::Ready(r) => panic!("read ended: {r:?}"),
+                Poll::Pending => tokio::time::sleep(Duration::from_millis(5)).await,
+            }
+        }
+        assert_eq!(io.phase, Phase::Request);
+
+        // The response goes out: the connection is idle, and its read
+        // deadline moves while no read is pending.
+        let before = wakes.0.load(std::sync::atomic::Ordering::SeqCst);
+        io.wrote(10);
+        assert_eq!(io.phase, Phase::Idle);
+        assert!(
+            wakes.0.load(std::sync::atomic::Ordering::SeqCst) > before,
+            "the reading task is woken"
+        );
+
+        // Its next poll is held to the new deadline.
+        let deadline = io.read_deadline.unwrap();
+        let mut buf = ReadBuf::new(&mut storage);
+        assert!(Pin::new(&mut io).poll_read(&mut cx, &mut buf).is_pending());
+        assert_eq!(io.read_timer.deadline(), deadline);
+    }
+
+    /// The HTTP/2 preface does not earn the idle timeout, and the peer's
+    /// bytes never extend the deadline; only a write by the service renews
+    /// it, by the header timeout.
+    #[tokio::test]
+    async fn the_http2_preface_does_not_extend_the_deadline() {
+        let limits = ListenerLimits {
+            header_read_timeout: Duration::from_millis(300),
+            idle_timeout: Duration::from_secs(60),
+            ..short()
+        };
+        let (mut io, _client) = pair(limits).await;
+        let accepted = io.read_deadline.unwrap();
+        io.observe(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        assert_eq!(io.phase, Phase::Http2);
+        assert_eq!(
+            io.read_deadline,
+            Some(accepted),
+            "the preface moves nothing"
+        );
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        io.observe(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        io.observe(b"x");
+        assert_eq!(io.read_deadline, Some(accepted), "nor do later bytes");
+
+        io.wrote(9);
+        let renewed = io.read_deadline.unwrap();
+        assert!(renewed > accepted);
+        assert!(renewed <= Instant::now() + limits.header_read_timeout);
+    }
+
+    /// A trickle after the preface is closed at the header deadline, not
+    /// kept for the idle timeout.
+    #[tokio::test]
+    async fn a_trickle_after_the_http2_preface_is_closed() {
+        let limits = ListenerLimits {
+            header_read_timeout: Duration::from_millis(300),
+            idle_timeout: Duration::from_secs(30),
+            ..short()
+        };
+        let addr = serve(limits).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let started = Instant::now();
+        let _ = stream.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await;
+        let mut closed = false;
+        while started.elapsed() < Duration::from_secs(5) {
+            if stream.write_all(b"\0").await.is_err() {
+                closed = true;
+                break;
+            }
+            let mut buf = [0u8; 64];
+            match tokio::time::timeout(Duration::from_millis(100), stream.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => {
+                    closed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(closed, "closed well before the idle timeout");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A closed connection limit stops `accept` without a panic.
+    #[tokio::test]
+    async fn a_closed_connection_limit_stops_accepting_without_a_panic() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut bounded = BoundedListener::new(listener, short());
+        bounded.slots.close();
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let accepted = tokio::time::timeout(Duration::from_millis(300), bounded.accept()).await;
+        assert!(accepted.is_err(), "no connection is accepted");
     }
 
     #[test]

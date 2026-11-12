@@ -173,7 +173,9 @@ The resolution limit lives in `[server.resolve_rate_limit]` (`max_per_window`,
 ### Connection limits and a reverse proxy
 
 The HTTP listener applies its own limits: at most 256 connections are
-served at once (more wait for a free slot); a request's headers must arrive
+served at once (more wait for a free slot), at most 32 of them from one
+IPv4 address or IPv6 /64 (more are closed at once; addresses in
+`server.trusted_proxies` are exempt); a request's headers must arrive
 within 20 seconds of its first byte; a connection waiting for its next
 request, or not reading its response, is closed after 60 seconds; and a
 `POST /api/trust-tasks` body is read only after the sender's address passes

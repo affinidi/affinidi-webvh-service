@@ -188,7 +188,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(
-                did_hosting_common::server::listener::bounded(listener),
+                did_hosting_common::server::listener::bounded(listener, &[]),
                 app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .await

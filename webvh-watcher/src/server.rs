@@ -307,6 +307,7 @@ fn run_rest_thread(
         state
             .trust_tasks_rate_limiter
             .spawn_gc(rate_limit_gc.clone());
+        let trusted_proxies = state.config.server.trusted_proxies.clone();
         let app = routes::router_with_resolve_limit(resolve_limit)
             .with_state(state)
             .layer(
@@ -324,9 +325,9 @@ fn run_rest_thread(
             .route("/api/health", get(routes::health::health));
         let _ = ready_tx.send(());
         let mut rx = shutdown_rx.clone();
-        // Header, idle and connection limits: see `listener`.
+        // Header, idle, connection and per-address limits: see `listener`.
         axum::serve(
-            did_hosting_common::server::listener::bounded(listener),
+            did_hosting_common::server::listener::bounded(listener, &trusted_proxies),
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .with_graceful_shutdown(async move {
