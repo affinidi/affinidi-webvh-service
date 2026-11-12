@@ -367,7 +367,7 @@ fn stored_secrets_debug_redacts_the_seed() {
     let env = StoredSecrets {
         secrets: Some(sample()),
         bootstrap_seed: Some(StoredSecrets::encode_seed(&[9u8; 32])),
-        witness_keys: BTreeMap::from([("z6MkWitnessId".into(), "z3uWitnessPrivate".into())]),
+        other: Default::default(),
     };
     let dbg = format!("{env:?}");
     assert!(!dbg.contains("z6Mksigning_test"), "{dbg}");
@@ -375,79 +375,6 @@ fn stored_secrets_debug_redacts_the_seed() {
         !dbg.contains(&StoredSecrets::encode_seed(&[9u8; 32])),
         "{dbg}"
     );
-    assert!(!dbg.contains("z3uWitnessPrivate"), "{dbg}");
-    assert!(dbg.contains("z6MkWitnessId"), "{dbg}");
-}
-
-/// Witness keys share the envelope with the service's own keys: writing one
-/// part keeps the others, and a payload from before witness keys reads as
-/// holding none.
-#[tokio::test]
-async fn witness_keys_share_the_envelope_with_the_service_keys() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = create_secret_store(&plaintext_config(), &dir.path().join("w.toml")).unwrap();
-    assert!(store.get_witness_keys().await.unwrap().is_empty());
-
-    store.set(&sample()).await.unwrap();
-    store
-        .put_witness_keys(&BTreeMap::from([
-            ("z6MkA".to_string(), "z3uA".to_string()),
-            ("z6MkB".to_string(), "z3uB".to_string()),
-        ]))
-        .await
-        .unwrap();
-    store.set_bootstrap_seed(&[3u8; 32]).await.unwrap();
-    // A rotation rewrites the service keys; the witness keys stay.
-    store.set(&sample()).await.unwrap();
-    assert_eq!(store.get_witness_keys().await.unwrap().len(), 2);
-
-    store.remove_witness_key("z6MkA").await.unwrap();
-    store.remove_witness_key("z6MkMissing").await.unwrap();
-    let keys = store.get_witness_keys().await.unwrap();
-    assert_eq!(
-        keys,
-        BTreeMap::from([("z6MkB".to_string(), "z3uB".to_string())])
-    );
-    assert_eq!(
-        store.get().await.unwrap().unwrap().signing_key,
-        sample().signing_key
-    );
-    assert_eq!(store.get_bootstrap_seed().await.unwrap(), Some([3u8; 32]));
-
-    // An envelope written before witness keys existed has none, and its
-    // serialised form gains no member until one is added.
-    let env = StoredSecrets::from_bytes(br#"{"bootstrap_seed":"AAAA"}"#).unwrap();
-    assert!(env.witness_keys.is_empty());
-    let bytes = StoredSecrets::default().to_bytes().unwrap();
-    assert_eq!(bytes, b"{}");
-}
-
-/// Concurrent writers in one process each keep the other's change.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_envelope_writes_are_not_lost() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("c.toml");
-    let mut tasks = Vec::new();
-    for i in 0..16 {
-        let path = path.clone();
-        tasks.push(tokio::spawn(async move {
-            let store = create_secret_store(&plaintext_config(), &path).unwrap();
-            if i % 4 == 0 {
-                store.set(&sample()).await.unwrap();
-            } else {
-                store
-                    .put_witness_keys(&BTreeMap::from([(format!("z6Mk{i}"), format!("z3u{i}"))]))
-                    .await
-                    .unwrap();
-            }
-        }));
-    }
-    for t in tasks {
-        t.await.unwrap();
-    }
-    let store = create_secret_store(&plaintext_config(), &path).unwrap();
-    assert_eq!(store.get_witness_keys().await.unwrap().len(), 12);
-    assert!(store.get().await.unwrap().is_some());
 }
 
 // ---- keyring (CI's keyring-required job) ----
@@ -502,4 +429,41 @@ fn the_plaintext_warning_is_logged_once_per_file() {
     assert!(first_plaintext_open(&a));
     assert!(!first_plaintext_open(&a));
     assert!(first_plaintext_open(&b));
+}
+
+/// A member written by a newer release survives this release's writes of the
+/// envelope (a rotation, an expiry sweep, the bootstrap seed).
+#[tokio::test]
+async fn members_this_release_does_not_know_survive_its_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("n.toml");
+    // The plaintext backend stores the envelope hex-encoded.
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    std::fs::write(
+        plaintext_path(&config),
+        hex(br#"{"bootstrap_seed":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","from_a_newer_release":{"k":"secret-value"}}"#),
+    )
+    .unwrap();
+    let store = create_secret_store(&plaintext_config(), &config).unwrap();
+    store.set(&sample()).await.unwrap();
+    store.clear_bootstrap_seed().await.unwrap();
+    store.set_bootstrap_seed(&[1u8; 32]).await.unwrap();
+
+    let stored = std::fs::read_to_string(plaintext_path(&config)).unwrap();
+    let stored = stored.trim();
+    let raw = String::from_utf8(
+        (0..stored.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&stored[i..i + 2], 16).unwrap())
+            .collect(),
+    )
+    .unwrap();
+    let env: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(env["from_a_newer_release"]["k"], "secret-value", "{raw}");
+    assert!(env["secrets"].is_object(), "{raw}");
+
+    let parsed = StoredSecrets::from_bytes(raw.as_bytes()).unwrap();
+    let dbg = format!("{parsed:?}");
+    assert!(dbg.contains("from_a_newer_release"), "{dbg}");
+    assert!(!dbg.contains("secret-value"), "{dbg}");
 }

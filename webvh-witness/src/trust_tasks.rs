@@ -424,14 +424,9 @@ async fn key_delete_task(state: &AppState, doc: &TrustTask<Value>) -> Result<Val
         return Err(ErrorPayload::from(key_delete::error_codes::NOT_FOUND)
             .with_message(format!("no witness identity {witness_id}")));
     }
-    witness_ops::delete_witness(
-        &state.store,
-        &state.witnesses_ks,
-        &state.witness_keys,
-        witness_id,
-    )
-    .await
-    .map_err(store_failure)?;
+    witness_ops::delete_witness(&state.store, &state.witnesses_ks, witness_id)
+        .await
+        .map_err(store_failure)?;
     info!(audit = true, witness_id, "witness identity deleted");
     reply::<key_delete::Response>(json!({
         "witnessId": witness_id,

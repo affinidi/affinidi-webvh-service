@@ -5,9 +5,9 @@
 //! Vault, HashiCorp Vault, Kubernetes `Secret`, and a test-only plaintext file.
 //! This module adds only what is specific to a webvh service:
 //!
-//! - [`ServerSecrets`], the keys a service holds, the offline-bootstrap
-//!   seed, and a witness's signing keys, serialised together as one
-//!   [`StoredSecrets`] JSON envelope that is the backend's payload. One entry means one IAM/RBAC grant, and a rotation
+//! - [`ServerSecrets`], the keys a service holds, and the offline-bootstrap
+//!   seed, serialised together as one [`StoredSecrets`] JSON envelope that is
+//!   the backend's payload. One entry means one IAM/RBAC grant, and a rotation
 //!   that retires a key and installs its replacement is a single write.
 //! - [`to_vti_config`], which maps the `[secrets]` config onto
 //!   [`vti_secrets::SecretsConfig`] with an explicit backend.
@@ -17,12 +17,16 @@
 //!   Plaintext is never chosen implicitly: it needs `backend = "plaintext"`
 //!   *and* `confirm_plaintext = true`, and is for tests only.
 
+mod witness_kek;
 #[cfg(feature = "setup-wizard")]
 pub mod wizard;
 
+pub use witness_kek::{
+    WITNESS_KEK_TIMEOUT, WitnessKekStore, create_witness_kek_store, witness_kek_location,
+};
+
 pub use vti_secrets::SecretBackend;
 
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -148,12 +152,11 @@ pub struct StoredSecrets {
     pub secrets: Option<ServerSecrets>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrap_seed: Option<String>,
-    /// A witness's signing keys: witness id (the multibase public key) →
-    /// multibase-encoded Ed25519 private key. The witness's data store holds
-    /// only each identity's public metadata. Empty — and absent from the
-    /// payload — on every service that is not a witness.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub witness_keys: BTreeMap<String, String>,
+    /// Members this release does not know, kept as they were so that writing
+    /// the envelope (a rotation, an expiry sweep) never drops what a newer
+    /// release stored in it.
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 // `bootstrap_seed` is base64 of a 32-byte HPKE seed used to open sealed VTA
@@ -166,10 +169,8 @@ impl std::fmt::Debug for StoredSecrets {
                 "bootstrap_seed",
                 &self.bootstrap_seed.as_ref().map(|_| "<redacted>"),
             )
-            .field(
-                "witness_keys",
-                &self.witness_keys.keys().collect::<Vec<_>>(),
-            )
+            // Unknown members may be secret too: names only.
+            .field("other", &self.other.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -232,32 +233,7 @@ pub trait SecretStore: Send + Sync {
     /// Called by phase 2 once the sealed response has been opened
     /// successfully.  No-op if no seed is stored.
     fn clear_bootstrap_seed(&self) -> BoxFuture<'_, Result<(), AppError>>;
-
-    /// Every witness signing key held: witness id → multibase-encoded private
-    /// key. Empty on a service that is not a witness.
-    fn get_witness_keys(&self) -> BoxFuture<'_, Result<BTreeMap<String, String>, AppError>>;
-
-    /// Add (or replace) the given witness signing keys, keeping every other
-    /// key held. One write, however many keys.
-    fn put_witness_keys(
-        &self,
-        keys: &BTreeMap<String, String>,
-    ) -> BoxFuture<'_, Result<(), AppError>>;
-
-    /// Remove one witness signing key. No-op if it is not held.
-    fn remove_witness_key(&self, witness_id: &str) -> BoxFuture<'_, Result<(), AppError>>;
 }
-
-/// Serialises this process's read-modify-write cycles on the envelope.
-///
-/// The backends have no compare-and-swap, and a store is built wherever one is
-/// needed, so two writers in one process (the identity sweep rotating the
-/// service's keys while the witness adds a signing key, say) would each load
-/// the envelope, change their own part, and the second save would drop the
-/// first one's change. Holding this across load and save makes each write see
-/// the one before it. It does not reach other processes: a CLI command run
-/// against a shared backend while the service writes can still race it.
-static ENVELOPE_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A [`SecretStore`] over any `vti-secrets` backend: the [`StoredSecrets`]
 /// envelope is the backend's payload.
@@ -286,7 +262,6 @@ impl SecretStore for EnvelopeStore {
     fn set(&self, secrets: &ServerSecrets) -> BoxFuture<'_, Result<(), AppError>> {
         let secrets = secrets.clone();
         Box::pin(async move {
-            let _write = ENVELOPE_WRITE.lock().await;
             let mut env = self.load().await?;
             env.secrets = Some(secrets);
             self.save(&env).await
@@ -307,7 +282,6 @@ impl SecretStore for EnvelopeStore {
     fn set_bootstrap_seed(&self, seed: &[u8; 32]) -> BoxFuture<'_, Result<(), AppError>> {
         let encoded = StoredSecrets::encode_seed(seed);
         Box::pin(async move {
-            let _write = ENVELOPE_WRITE.lock().await;
             let mut env = self.load().await?;
             env.bootstrap_seed = Some(encoded);
             self.save(&env).await
@@ -316,38 +290,8 @@ impl SecretStore for EnvelopeStore {
 
     fn clear_bootstrap_seed(&self) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async move {
-            let _write = ENVELOPE_WRITE.lock().await;
             let mut env = self.load().await?;
             if env.bootstrap_seed.take().is_none() {
-                return Ok(());
-            }
-            self.save(&env).await
-        })
-    }
-
-    fn get_witness_keys(&self) -> BoxFuture<'_, Result<BTreeMap<String, String>, AppError>> {
-        Box::pin(async move { Ok(self.load().await?.witness_keys) })
-    }
-
-    fn put_witness_keys(
-        &self,
-        keys: &BTreeMap<String, String>,
-    ) -> BoxFuture<'_, Result<(), AppError>> {
-        let keys = keys.clone();
-        Box::pin(async move {
-            let _write = ENVELOPE_WRITE.lock().await;
-            let mut env = self.load().await?;
-            env.witness_keys.extend(keys);
-            self.save(&env).await
-        })
-    }
-
-    fn remove_witness_key(&self, witness_id: &str) -> BoxFuture<'_, Result<(), AppError>> {
-        let witness_id = witness_id.to_string();
-        Box::pin(async move {
-            let _write = ENVELOPE_WRITE.lock().await;
-            let mut env = self.load().await?;
-            if env.witness_keys.remove(&witness_id).is_none() {
                 return Ok(());
             }
             self.save(&env).await
@@ -366,7 +310,7 @@ pub(crate) fn from_vti(e: vti_common::error::AppError) -> AppError {
 
 /// The keyring entry (`user`) that holds the envelope, under
 /// `secrets.keyring_service`.
-const KEYRING_USER: &str = "server_secrets";
+pub(crate) const KEYRING_USER: &str = "server_secrets";
 
 /// Which backend `secrets` selects.
 ///
@@ -580,6 +524,11 @@ pub(crate) fn ensure_keyring() -> Result<(), AppError> {
 /// after it (`config.toml` → `config.secrets.plaintext`), so services sharing a
 /// directory do not share keys.
 pub fn plaintext_path(config_path: &Path) -> PathBuf {
+    plaintext_path_named(config_path, "secrets")
+}
+
+/// `config.toml` → `config.<what>.plaintext`, beside the config.
+pub(crate) fn plaintext_path_named(config_path: &Path, what: &str) -> PathBuf {
     let dir = config_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -588,13 +537,13 @@ pub fn plaintext_path(config_path: &Path) -> PathBuf {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("config");
-    dir.join(format!("{stem}.secrets.plaintext"))
+    dir.join(format!("{stem}.{what}.plaintext"))
 }
 
 /// Whether this is the process's first plaintext store on `path`. The store is
 /// rebuilt wherever it is needed (the identity sweep does so every minute), so
 /// its warning is logged once per file rather than on every build.
-fn first_plaintext_open(path: &Path) -> bool {
+pub(crate) fn first_plaintext_open(path: &Path) -> bool {
     static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
         std::sync::OnceLock::new();
     WARNED
@@ -641,18 +590,27 @@ pub fn create_secret_store(
     Ok(Box::new(EnvelopeStore { inner }))
 }
 
-#[cfg(feature = "keyring")]
 fn keyring_store(vti: &vti_secrets::SecretsConfig) -> Result<Box<dyn SeedStore>, AppError> {
+    keyring_store_for(vti, KEYRING_USER)
+}
+
+#[cfg(feature = "keyring")]
+pub(crate) fn keyring_store_for(
+    vti: &vti_secrets::SecretsConfig,
+    user: &str,
+) -> Result<Box<dyn SeedStore>, AppError> {
     ensure_keyring()?;
     Ok(Box::new(vti_secrets::seed_store::KeyringSeedStore::new(
         vti.keyring_service.clone(),
-        KEYRING_USER,
+        user,
     )))
 }
 
 #[cfg(not(feature = "keyring"))]
-fn keyring_store(_vti: &vti_secrets::SecretsConfig) -> Result<Box<dyn SeedStore>, AppError> {
-    let _ = KEYRING_USER;
+pub(crate) fn keyring_store_for(
+    _vti: &vti_secrets::SecretsConfig,
+    _user: &str,
+) -> Result<Box<dyn SeedStore>, AppError> {
     Err(no_secure_store(
         "no backend is configured, and the default (the OS keyring) is not compiled \
          into this binary",

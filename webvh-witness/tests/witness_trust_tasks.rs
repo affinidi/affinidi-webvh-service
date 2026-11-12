@@ -134,19 +134,9 @@ async fn witness_state() -> (AppState, tempfile::TempDir) {
     (state, dir)
 }
 
-/// Witness keys over a plaintext secret store in `dir` (CI has no keyring).
-fn test_witness_keys(dir: &tempfile::TempDir) -> Arc<WitnessKeys> {
-    let secrets = SecretsConfig {
-        backend: Some(webvh_witness::secret_store::SecretBackend::Plaintext),
-        confirm_plaintext: true,
-        ..SecretsConfig::default()
-    };
-    let store = did_hosting_common::server::secret_store::create_secret_store(
-        &secrets,
-        &dir.path().join("witness.toml"),
-    )
-    .expect("plaintext secret store");
-    Arc::new(WitnessKeys::new(store))
+/// A witness key-encryption key for one test witness.
+fn test_witness_keys(_dir: &tempfile::TempDir) -> Arc<WitnessKeys> {
+    Arc::new(WitnessKeys::generate().expect("key-encryption key"))
 }
 
 /// How a test document is signed.

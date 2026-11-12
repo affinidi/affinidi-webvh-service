@@ -401,19 +401,10 @@ impl Topology {
             witness_store,
             witness_config,
             Some(witness_identity),
-            Arc::new(webvh_witness::witness_keys::WitnessKeys::new(
-                did_hosting_common::server::secret_store::create_secret_store(
-                    &SecretsConfig {
-                        backend: Some(
-                            did_hosting_common::server::secret_store::SecretBackend::Plaintext,
-                        ),
-                        confirm_plaintext: true,
-                        ..SecretsConfig::default()
-                    },
-                    &witness_dir.path().join("witness.toml"),
-                )
-                .expect("witness secret store"),
-            )),
+            Arc::new(
+                webvh_witness::witness_keys::WitnessKeys::generate()
+                    .expect("witness key-encryption key"),
+            ),
         )
         .expect("witness state");
         witness.trust_tasks_verifier = Some(Arc::new(TransportBoundVerifier::with_did_cache(

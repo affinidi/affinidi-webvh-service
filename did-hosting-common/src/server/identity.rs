@@ -1706,26 +1706,6 @@ mod tests {
         ) -> super::super::secret_store::BoxFuture<'_, Result<(), AppError>> {
             Box::pin(async move { Ok(()) })
         }
-        fn get_witness_keys(
-            &self,
-        ) -> super::super::secret_store::BoxFuture<
-            '_,
-            Result<std::collections::BTreeMap<String, String>, AppError>,
-        > {
-            Box::pin(async move { Ok(Default::default()) })
-        }
-        fn put_witness_keys(
-            &self,
-            _keys: &std::collections::BTreeMap<String, String>,
-        ) -> super::super::secret_store::BoxFuture<'_, Result<(), AppError>> {
-            Box::pin(async move { Ok(()) })
-        }
-        fn remove_witness_key(
-            &self,
-            _witness_id: &str,
-        ) -> super::super::secret_store::BoxFuture<'_, Result<(), AppError>> {
-            Box::pin(async move { Ok(()) })
-        }
     }
 
     /// A generation plus a freshly generated key pair for it.

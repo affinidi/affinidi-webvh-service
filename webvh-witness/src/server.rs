@@ -75,11 +75,12 @@ pub struct AppState {
 
 impl AppState {
     /// A witness state over `store`, with the Trust Task machinery built from
-    /// `identity`'s resolver, signing with the keys `witness_keys` holds
-    /// ([`LocalSigner`]; replace `signer` for another backend).
+    /// `identity`'s resolver, signing with the identities' sealed keys opened
+    /// by `witness_keys` ([`LocalSigner`]; replace `signer` for another
+    /// backend).
     ///
-    /// Run [`crate::witness_keys::prepare`] on the store first, so no
-    /// identity's key is still in its data-store record.
+    /// Get `witness_keys` from [`crate::witness_keys::prepare`], so no
+    /// identity's key is still in clear in its record.
     pub fn new(
         store: Store,
         config: AppConfig,
@@ -120,12 +121,17 @@ impl AppState {
 }
 
 pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
-    // Witness signing keys live in the secret store. Move any a record from an
-    // earlier release still holds before anything is served.
-    let witness_keys = Arc::new(WitnessKeys::new(crate::secret_store::create_secret_store(
-        &config,
-    )?));
-    crate::witness_keys::prepare(&store, &store.keyspace(KS_WITNESSES)?, &witness_keys).await?;
+    // Witness signing keys are sealed to a key-encryption key held in the
+    // secret store. Load it (creating it on a first start), and seal any key a
+    // record from an earlier release holds in clear, before serving anything.
+    let witness_keys = Arc::new(
+        crate::witness_keys::prepare(
+            &store,
+            &store.keyspace(KS_WITNESSES)?,
+            &crate::secret_store::create_witness_kek_store(&config.secrets, &config.config_path)?,
+        )
+        .await?,
+    );
 
     // Load the service's own identity (requires server_did). Resolves the DID
     // document for the *real* verification-method key IDs and seeds the secrets

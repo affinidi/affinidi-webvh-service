@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use affinidi_data_integrity::DataIntegrityProof;
 use affinidi_tdk::secrets_resolver::secrets::Secret;
 use serde::{Deserialize, Serialize};
@@ -9,9 +7,8 @@ use crate::signing::WitnessSigner;
 use crate::store::{KeyspaceHandle, Store};
 use crate::witness_keys::WitnessKeys;
 
-/// A witness identity managed by this service: its public metadata. The
-/// identity's private key is held in the secret store, never in this record
-/// (see [`crate::witness_keys`]).
+/// A witness identity managed by this service. Its private key is held only
+/// sealed to the witness key-encryption key (see [`crate::witness_keys`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WitnessRecord {
     /// Multibase-encoded public key (z6Mk...) — used as the primary identifier.
@@ -20,6 +17,11 @@ pub struct WitnessRecord {
     pub did: String,
     /// Optional VTA key reference for remote signing.
     pub vta_key_id: Option<String>,
+    /// The Ed25519 private key, HPKE-sealed to the witness key-encryption key
+    /// (multibase). Empty on a record from before keys were sealed, until the
+    /// witness's startup migration seals it.
+    #[serde(default)]
+    pub sealed_private_key: String,
     /// Multibase-encoded Ed25519 public key.
     pub public_key_multibase: String,
     /// Optional human-readable label.
@@ -30,13 +32,8 @@ pub struct WitnessRecord {
     pub proofs_signed: u64,
 }
 
-/// Create a new witness identity: its private key goes to the secret store
-/// (`keys`), then its record to the data store.
-///
-/// Key first: a failure or crash between the two leaves at most a key with no
-/// record, which signs nothing (signing starts from the record). The other
-/// order could leave a listed identity that cannot sign. If the record write
-/// fails, the key is removed again.
+/// Create a new witness identity and store it: one record, its private key
+/// sealed to the witness key-encryption key held by `keys`.
 pub async fn create_witness(
     witnesses_ks: &KeyspaceHandle,
     keys: &WitnessKeys,
@@ -48,9 +45,12 @@ pub async fn create_witness(
         .get_public_keymultibase()
         .map_err(|e| AppError::Internal(format!("failed to get public key multibase: {e}")))?;
 
-    let private_key_multibase = secret
-        .get_private_keymultibase()
-        .map_err(|e| AppError::Internal(format!("failed to get private key multibase: {e}")))?;
+    let sealed_private_key = keys.seal(
+        &public_key_multibase,
+        &secret
+            .get_private_keymultibase()
+            .map_err(|e| AppError::Internal(format!("failed to encode the private key: {e}")))?,
+    )?;
 
     let did = format!("did:key:{public_key_multibase}");
 
@@ -60,27 +60,14 @@ pub async fn create_witness(
         witness_id: public_key_multibase.clone(),
         did,
         vta_key_id: None,
+        sealed_private_key,
         public_key_multibase,
         label,
         created_at: now,
         proofs_signed: 0,
     };
 
-    keys.put(BTreeMap::from([(
-        record.witness_id.clone(),
-        private_key_multibase,
-    )]))
-    .await?;
-    if let Err(e) = store_witness(witnesses_ks, &record).await {
-        if let Err(cleanup) = keys.remove(&record.witness_id).await {
-            tracing::warn!(
-                witness_id = %record.witness_id,
-                error = %cleanup,
-                "witness record not stored, and its key could not be removed from the secret store"
-            );
-        }
-        return Err(e);
-    }
+    store_witness(witnesses_ks, &record).await?;
 
     Ok(record)
 }
@@ -115,25 +102,12 @@ pub async fn list_witnesses(witnesses_ks: &KeyspaceHandle) -> Result<Vec<Witness
     Ok(records)
 }
 
-/// Delete a witness record by its ID, with every witnessed mark it holds, and
-/// then its private key from the secret store.
+/// Delete a witness record by its ID, with every witnessed mark it holds.
 ///
-/// The record and its marks are one atomic write, so a crash mid-delete
-/// cannot leave orphaned marks behind a deleted identity. The key goes after
-/// them: an identity with no record signs nothing, so a key left behind by a
-/// failure there is inert. That failure is still returned, so the caller
-/// knows the key is still held.
+/// One atomic write: the record (and the sealed key in it) and its marks go
+/// together, so a crash mid-delete cannot leave orphaned marks behind a
+/// deleted identity.
 pub async fn delete_witness(
-    store: &Store,
-    witnesses_ks: &KeyspaceHandle,
-    keys: &WitnessKeys,
-    witness_id: &str,
-) -> Result<(), AppError> {
-    delete_witness_record(store, witnesses_ks, witness_id).await?;
-    keys.remove(witness_id).await
-}
-
-async fn delete_witness_record(
     store: &Store,
     witnesses_ks: &KeyspaceHandle,
     witness_id: &str,
@@ -290,7 +264,7 @@ mod tests {
 
         let (store, _dir) = temp_store().await;
         let ks = store.keyspace(crate::store::KS_WITNESSES).unwrap();
-        let (keys, _keys_dir) = crate::signing::tests::temp_keys();
+        let keys = std::sync::Arc::new(WitnessKeys::generate().unwrap());
         let record = create_witness(&ks, &keys, None).await.unwrap();
         let witness_id = record.witness_id.clone();
 
@@ -354,7 +328,7 @@ mod tests {
     async fn delete_witness_removes_its_marks() {
         let (store, _dir) = temp_store().await;
         let ks = store.keyspace(crate::store::KS_WITNESSES).unwrap();
-        let (keys, _keys_dir) = crate::signing::tests::temp_keys();
+        let keys = WitnessKeys::generate().unwrap();
         let record = create_witness(&ks, &keys, None).await.unwrap();
         let other = create_witness(&ks, &keys, None).await.unwrap();
         let mark = WitnessedMark {
@@ -370,12 +344,9 @@ mod tests {
             .await
             .unwrap();
 
-        delete_witness(&store, &ks, &keys, &record.witness_id)
+        delete_witness(&store, &ks, &record.witness_id)
             .await
             .unwrap();
-        // The key went with the record; the other identity's stays.
-        assert_eq!(keys.private_key(&record.witness_id).await.unwrap(), None);
-        assert!(keys.private_key(&other.witness_id).await.unwrap().is_some());
 
         assert!(
             get_witness(&ks, &record.witness_id)
@@ -403,21 +374,19 @@ mod tests {
         );
     }
 
-    /// A new identity's private key is in the secret store, and nothing in
-    /// its data-store record is key material.
+    /// A new identity's private key is in its record only sealed, and opens
+    /// to the identity's own key.
     #[tokio::test]
-    async fn a_created_identity_keeps_its_private_key_out_of_the_data_store() {
+    async fn a_created_identity_keeps_its_private_key_sealed() {
         let (store, _dir) = temp_store().await;
         let ks = store.keyspace(crate::store::KS_WITNESSES).unwrap();
-        let (keys, _keys_dir) = crate::signing::tests::temp_keys();
+        let keys = WitnessKeys::generate().unwrap();
         let record = create_witness(&ks, &keys, Some("w".into())).await.unwrap();
 
-        let private = keys
-            .private_key(&record.witness_id)
-            .await
-            .unwrap()
-            .expect("key held in the secret store");
-        crate::witness_keys::signing_secret(&record.did, &record.witness_id, &private).unwrap();
+        let secret = keys
+            .open(&record.did, &record.witness_id, &record.sealed_private_key)
+            .unwrap();
+        let private = secret.get_private_keymultibase().unwrap();
 
         let raw = ks
             .get_raw(format!("witness:{}", record.witness_id))

@@ -6,7 +6,7 @@ use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
 use serde_json::json;
 
 use crate::error::AppError;
-use crate::witness_keys::{WitnessKeys, signing_secret};
+use crate::witness_keys::WitnessKeys;
 use crate::witness_ops::WitnessRecord;
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -20,8 +20,9 @@ pub trait WitnessSigner: Send + Sync {
     ) -> BoxFuture<'a, Result<DataIntegrityProof, AppError>>;
 }
 
-/// Signs witness proofs locally, with the identity's Ed25519 private key read
-/// from the secret store ([`WitnessKeys`]).
+/// Signs witness proofs locally: opens the identity's sealed key from its
+/// record with the witness key-encryption key ([`WitnessKeys`]), in memory.
+/// No secret-store read happens here.
 pub struct LocalSigner {
     keys: Arc<WitnessKeys>,
 }
@@ -39,20 +40,20 @@ impl WitnessSigner for LocalSigner {
         version_id: &'a str,
     ) -> BoxFuture<'a, Result<DataIntegrityProof, AppError>> {
         Box::pin(async move {
-            let private_key = self
-                .keys
-                .private_key(&witness.witness_id)
-                .await?
-                .ok_or_else(|| {
-                    AppError::Internal(format!(
-                        "the secret store holds no signing key for witness {}",
-                        witness.witness_id
-                    ))
-                })?;
-            // The KID must be the full verification method DID URL:
-            //   did:key:z6Mk...#z6Mk...
-            // and the key must be the one the identity's id names.
-            let secret = signing_secret(&witness.did, &witness.witness_id, &private_key)?;
+            if witness.sealed_private_key.is_empty() {
+                return Err(AppError::Internal(format!(
+                    "witness {} has no sealed signing key",
+                    witness.witness_id
+                )));
+            }
+            // The KID is the full verification method DID URL
+            // (did:key:z6Mk...#z6Mk...), and the key must be the one the
+            // identity's id names.
+            let secret = self.keys.open(
+                &witness.did,
+                &witness.witness_id,
+                &witness.sealed_private_key,
+            )?;
 
             // Sign the canonical {"versionId": "..."} document via the
             // 0.6 API (async, Signer-based, SignOptions for cryptosuite/
@@ -71,43 +72,24 @@ impl WitnessSigner for LocalSigner {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use affinidi_tdk::secrets_resolver::secrets::Secret;
-    use std::collections::BTreeMap;
 
-    /// Witness keys over a plaintext secret store in a temp dir (CI has no
-    /// keyring).
-    pub(crate) fn temp_keys() -> (Arc<WitnessKeys>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let secrets = crate::config::SecretsConfig {
-            backend: Some(crate::secret_store::SecretBackend::Plaintext),
-            confirm_plaintext: true,
-            ..Default::default()
-        };
-        let store = did_hosting_common::server::secret_store::create_secret_store(
-            &secrets,
-            &dir.path().join("w.toml"),
-        )
-        .unwrap();
-        (Arc::new(WitnessKeys::new(store)), dir)
-    }
-
-    /// A witness whose key is held in `keys`, as `create_witness` leaves it.
-    async fn make_witness(keys: &WitnessKeys) -> WitnessRecord {
+    fn make_witness(keys: &WitnessKeys) -> WitnessRecord {
         let secret = Secret::generate_ed25519(None, None);
-        let private_key_multibase = secret.get_private_keymultibase().unwrap();
         let public_key_multibase = secret.get_public_keymultibase().unwrap();
-        keys.put(BTreeMap::from([(
-            public_key_multibase.clone(),
-            private_key_multibase,
-        )]))
-        .await
-        .unwrap();
+        let sealed_private_key = keys
+            .seal(
+                &public_key_multibase,
+                &secret.get_private_keymultibase().unwrap(),
+            )
+            .unwrap();
         WitnessRecord {
             witness_id: public_key_multibase.clone(),
             did: format!("did:key:{public_key_multibase}"),
             vta_key_id: None,
+            sealed_private_key,
             public_key_multibase,
             label: Some("test-witness".into()),
             created_at: 0,
@@ -115,11 +97,15 @@ pub(crate) mod tests {
         }
     }
 
+    fn signer() -> (LocalSigner, Arc<WitnessKeys>) {
+        let keys = Arc::new(WitnessKeys::generate().unwrap());
+        (LocalSigner::new(keys.clone()), keys)
+    }
+
     #[tokio::test]
     async fn local_signer_produces_signed_proof() {
-        let (keys, _dir) = temp_keys();
-        let signer = LocalSigner::new(keys.clone());
-        let witness = make_witness(&keys).await;
+        let (signer, keys) = signer();
+        let witness = make_witness(&keys);
         let proof = signer
             .sign_proof(&witness, "1-test-version")
             .await
@@ -138,9 +124,8 @@ pub(crate) mod tests {
         // Different version_ids must yield different signatures — same secret,
         // different message. Catches a regression where the canonical input is
         // accidentally constant.
-        let (keys, _dir) = temp_keys();
-        let signer = LocalSigner::new(keys.clone());
-        let witness = make_witness(&keys).await;
+        let (signer, keys) = signer();
+        let witness = make_witness(&keys);
         let proof_a = signer.sign_proof(&witness, "1-aaa").await.unwrap();
         let proof_b = signer.sign_proof(&witness, "2-bbb").await.unwrap();
         let json_a = serde_json::to_value(&proof_a).unwrap();
@@ -149,44 +134,22 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn local_signer_refuses_a_witness_with_no_held_key() {
-        let (keys, _dir) = temp_keys();
-        let signer = LocalSigner::new(keys.clone());
-        let witness = make_witness(&keys).await;
-        keys.remove(&witness.witness_id).await.unwrap();
-        let err = signer
-            .sign_proof(&witness, "1-version")
-            .await
-            .expect_err("no key, no proof");
-        assert!(matches!(err, AppError::Internal(_)));
-    }
-
-    #[tokio::test]
-    async fn local_signer_refuses_a_key_that_is_not_the_identitys() {
-        let (keys, _dir) = temp_keys();
-        let signer = LocalSigner::new(keys.clone());
-        let witness = make_witness(&keys).await;
-        let other = Secret::generate_ed25519(None, None)
-            .get_private_keymultibase()
-            .unwrap();
-        keys.put(BTreeMap::from([(witness.witness_id.clone(), other)]))
-            .await
-            .unwrap();
-        let err = signer
-            .sign_proof(&witness, "1-version")
-            .await
-            .expect_err("a key for another identity must not sign");
-        assert!(
-            err.to_string().contains("belongs to another identity"),
-            "{err}"
-        );
-
-        keys.put(BTreeMap::from([(
-            witness.witness_id.clone(),
-            "z6MkBOGUS".into(),
-        )]))
-        .await
-        .unwrap();
+    async fn local_signer_refuses_a_witness_it_cannot_open() {
+        let (signer, keys) = signer();
+        let mut witness = make_witness(&keys);
+        witness.sealed_private_key = String::new();
+        assert!(matches!(
+            signer.sign_proof(&witness, "1-version").await,
+            Err(AppError::Internal(_))
+        ));
+        // Sealed to another key-encryption key.
+        let witness = make_witness(&WitnessKeys::generate().unwrap());
+        assert!(matches!(
+            signer.sign_proof(&witness, "1-version").await,
+            Err(AppError::Internal(_))
+        ));
+        let mut witness = make_witness(&keys);
+        witness.sealed_private_key = "z6MkBOGUS".into();
         assert!(matches!(
             signer.sign_proof(&witness, "1-version").await,
             Err(AppError::Internal(_))

@@ -35,7 +35,9 @@
 #![cfg(all(feature = "vault-secrets", feature = "k8s-secrets"))]
 
 use did_hosting_common::server::config::SecretsConfig;
-use did_hosting_common::server::secret_store::{ServerSecrets, create_secret_store};
+use did_hosting_common::server::secret_store::{
+    ServerSecrets, create_secret_store, create_witness_kek_store,
+};
 
 fn sample_secrets() -> ServerSecrets {
     ServerSecrets {
@@ -109,6 +111,40 @@ async fn assert_round_trip(store: &dyn did_hosting_common::server::secret_store:
     );
 }
 
+/// The witness key-encryption key round-trips in its own entry, and the
+/// service envelope at `cfg` is not changed by it, nor it by the envelope.
+async fn assert_witness_kek_round_trip(cfg: &SecretsConfig) {
+    let path = std::path::Path::new("config.toml");
+    let kek_store = create_witness_kek_store(cfg, path).expect("build witness kek store");
+    assert!(kek_store.get().await.expect("get empty").is_none());
+    let kek = affinidi_secrets_resolver::secrets::Secret::generate_x25519(None, None).unwrap();
+    kek_store.set(&kek).await.expect("set kek");
+
+    let envelope = create_secret_store(cfg, path).expect("build store");
+    let before = envelope
+        .get()
+        .await
+        .expect("get secrets")
+        .map(|s| s.signing_key);
+    envelope
+        .set(&sample_secrets())
+        .await
+        .expect("rewrite envelope");
+    assert_eq!(
+        before.as_deref(),
+        Some(sample_secrets().signing_key.as_str()),
+        "writing the key-encryption key must not touch the envelope"
+    );
+
+    let read = kek_store
+        .get()
+        .await
+        .expect("get kek")
+        .expect("kek present");
+    assert_eq!(read.get_public_bytes(), kek.get_public_bytes());
+    eprintln!("witness key-encryption key: OK in {}", kek_store.location());
+}
+
 #[tokio::test]
 async fn vault_round_trip() {
     let (Ok(addr), Ok(token)) = (
@@ -136,6 +172,7 @@ async fn vault_round_trip() {
     let store =
         create_secret_store(&cfg, std::path::Path::new("config.toml")).expect("build vault store");
     assert_round_trip(store.as_ref()).await;
+    assert_witness_kek_round_trip(&cfg).await;
     eprintln!("vault_round_trip: OK against path {path}");
 }
 
@@ -158,5 +195,8 @@ async fn k8s_round_trip() {
     let store =
         create_secret_store(&cfg, std::path::Path::new("config.toml")).expect("build k8s store");
     assert_round_trip(store.as_ref()).await;
-    eprintln!("k8s_round_trip: OK against Secret {name} (remember to delete it)");
+    assert_witness_kek_round_trip(&cfg).await;
+    eprintln!(
+        "k8s_round_trip: OK against Secrets {name} and {name}-witness-kek (remember to delete them)"
+    );
 }
