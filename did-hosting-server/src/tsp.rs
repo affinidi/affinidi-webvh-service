@@ -61,7 +61,12 @@ pub async fn run_tsp_trust_task(
         }
     };
     debug!(sender = %sender_vid, type_uri = %doc.type_uri, "inbound TSP: trust task");
-    match crate::messaging::dispatch_inbound_document(state, Some(sender_vid), doc).await {
+    // A deferred document is left unanswered too: the control plane re-sends
+    // what it is not answered.
+    match crate::messaging::dispatch_inbound_document(state, Some(sender_vid), doc)
+        .await
+        .into_reply()
+    {
         Some(reply) => Ok(Some(tsp_binding::frame(
             serde_json::to_vec(&reply).map_err(|e| DIDCommServiceError::Internal(e.to_string()))?,
             carriage,

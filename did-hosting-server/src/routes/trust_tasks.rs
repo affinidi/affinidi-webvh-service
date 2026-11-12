@@ -25,13 +25,14 @@ use std::net::SocketAddr;
 
 use axum::Json;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 use tracing::error;
-use trust_tasks_rs::{RejectReason, TrustTask};
+use trust_tasks_rs::TrustTask;
 
+use crate::messaging::Inbound;
 use crate::server::AppState;
 
 /// Logs, but does not itself refuse, a request reaching this route with no
@@ -51,9 +52,13 @@ pub async fn log_missing_connect_info(req: Request, next: Next) -> Response {
 /// Hand the posted document to the edge's one inbound dispatch and answer with
 /// its signed reply.
 ///
-/// A document that does not verify gets no signed answer — a signed refusal
-/// would settle a directive the control plane never sent — so it is answered
-/// `403` with an unsigned, detail-free error document, which settles nothing.
+/// A document that fails `verify_control_plane` gets no answer, signed or
+/// unsigned: a signed refusal would settle a directive the control plane never
+/// sent, and an error document is an answer too. It is refused with a bare
+/// `403` and an empty body, as is a document that takes no reply. One that
+/// could not be checked just now (its signer's DID could not be resolved, the
+/// replay cache is full) is answered `503` with `Retry-After` and an empty
+/// body, so the sender keeps it and sends it again.
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/api/trust-tasks",
@@ -62,8 +67,9 @@ pub async fn log_missing_connect_info(req: Request, next: Next) -> Response {
     responses(
         (status = 200, description = "The edge's signed reply document", content_type = "application/json"),
         (status = 400, description = "The body is not a Trust Task document", content_type = "application/json"),
-        (status = 403, description = "The document was not accepted; an unsigned refusal", content_type = "application/json"),
+        (status = 403, description = "The document was not accepted, or takes no reply; empty body"),
         (status = 429, description = "This address's request rate exceeds the limit", content_type = "application/json"),
+        (status = 503, description = "The document could not be checked just now; send it again after `Retry-After`. Empty body"),
     ),
 ))]
 pub async fn receive(
@@ -95,14 +101,13 @@ pub async fn receive(
                 .into_response();
         }
     };
-    let refusal = doc.reject_with(
-        format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-        RejectReason::PermissionDenied {
-            reason: "the document was not accepted".into(),
-        },
-    );
     match crate::messaging::dispatch_inbound_document(&state, None, doc).await {
-        Some(reply) => (StatusCode::OK, Json(reply)).into_response(),
-        None => (StatusCode::FORBIDDEN, Json(refusal)).into_response(),
+        Inbound::Reply(reply) => (StatusCode::OK, Json(reply)).into_response(),
+        Inbound::NoReply => StatusCode::FORBIDDEN.into_response(),
+        Inbound::Deferred(deferred) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, deferred.retry_after_secs.max(1))],
+        )
+            .into_response(),
     }
 }

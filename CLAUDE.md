@@ -285,7 +285,9 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
 - **An edge never answers a document that failed `verify_control_plane`** —
   no signed refusal (it would settle an op the control plane never sent), no
   unsigned one. Transient failures (unresolvable signer DID, storage/I-O) are
-  reported retryable so the control plane keeps the op queued.
+  reported retryable so the control plane keeps the op queued. On HTTPS that
+  is a bare `403` (unverified) or `503` with `Retry-After` (transient), never
+  a document; on DIDComm and TSP, no reply.
 - **Outbound privileged documents are signed** (`build_signed_request`, signed
   at send time so retries stay fresh). A new control↔edge op needs both halves.
 - **`TransportBoundVerifier` requires an in-band `issuer`.** Don't reintroduce

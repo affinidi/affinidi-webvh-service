@@ -195,30 +195,52 @@ async fn deliver(state: &AppState, via: Via, sender: &str, doc: Value) -> Option
                 })
         }
         Via::Https => {
-            use axum::response::IntoResponse;
-            use http_body_util::BodyExt;
-            let response = did_hosting_server::routes::trust_tasks::receive(
-                axum::extract::State(state.clone()),
-                axum::extract::ConnectInfo(fresh_https_addr()),
-                axum::http::HeaderMap::new(),
-                axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
-            )
-            .await
-            .into_response();
-            let status = response.status();
-            let bytes = response.into_body().collect().await.unwrap().to_bytes();
-            let body: Value = serde_json::from_slice(&bytes).expect("HTTPS reply is JSON");
-            // An unverified document is answered with an unsigned refusal,
-            // which settles nothing — the equivalent of no reply.
+            let (status, _, bytes) = post_https(state, &doc).await;
+            // A document that is not answered gets a bare `403`: no
+            // document at all, signed or unsigned.
             if status == axum::http::StatusCode::FORBIDDEN {
-                assert!(body.get("proof").is_none(), "{body}");
+                assert!(
+                    bytes.is_empty(),
+                    "an unanswered document gets no body: {}",
+                    String::from_utf8_lossy(&bytes)
+                );
                 None
             } else {
-                assert_eq!(status, axum::http::StatusCode::OK, "{body}");
-                Some(body)
+                assert_eq!(
+                    status,
+                    axum::http::StatusCode::OK,
+                    "{}",
+                    String::from_utf8_lossy(&bytes)
+                );
+                Some(serde_json::from_slice(&bytes).expect("HTTPS reply is JSON"))
             }
         }
     }
+}
+
+/// `POST` `doc` to the edge's HTTPS binding; its status, headers and body.
+async fn post_https(
+    state: &AppState,
+    doc: &Value,
+) -> (
+    axum::http::StatusCode,
+    axum::http::HeaderMap,
+    axum::body::Bytes,
+) {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+    let response = did_hosting_server::routes::trust_tasks::receive(
+        axum::extract::State(state.clone()),
+        axum::extract::ConnectInfo(fresh_https_addr()),
+        axum::http::HeaderMap::new(),
+        axum::body::Bytes::from(serde_json::to_vec(doc).unwrap()),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, headers, bytes)
 }
 
 /// The reply is the task's `#response`, signed by the edge and addressed to
@@ -906,6 +928,155 @@ async fn misaddressed_stale_and_replayed_directives_are_not_answered() {
         assert!(
             deliver(&state, via, &cp.0, fresh).await.is_none(),
             "{via:?}: a replay is not answered"
+        );
+    }
+}
+
+/// A directive that could not be checked just now — the control plane's DID
+/// could not be resolved — gets no answer on DIDComm or TSP, and `503` with
+/// `Retry-After` and no body on HTTPS, so the control plane keeps it queued.
+/// Nothing is applied, and the same directive is answered once it can be
+/// checked.
+#[tokio::test]
+async fn a_directive_that_cannot_be_checked_yet_is_deferred_on_every_transport() {
+    struct Unreachable;
+    #[async_trait::async_trait]
+    impl trust_tasks_proof::affinidi::ProofPurposeResolver for Unreachable {
+        async fn resolve_vm_for_purpose(
+            &self,
+            vm: &str,
+            _purpose: trust_tasks_proof::affinidi::ProofPurpose,
+        ) -> Result<affinidi_data_integrity::ResolvedKey, affinidi_data_integrity::DataIntegrityError>
+        {
+            // The wording the verifier reports an unresolvable signer with.
+            Err(affinidi_data_integrity::DataIntegrityError::Resolver(
+                format!("signer DID unreachable: cannot resolve {vm}"),
+            ))
+        }
+    }
+
+    for via in VIAS {
+        let (mut state, _dir) = edge_state().await;
+        let resolvable = state.trust_tasks_verifier.take();
+        state.trust_tasks_verifier = Some(Arc::new(TransportBoundVerifier::with_resolver(
+            Arc::new(Unreachable),
+        )));
+        let cp = control();
+        let directive = signed(
+            MSG_REPLICA_DOMAIN_ASSIGN,
+            &cp,
+            json!({ "domain": "later.example" }),
+        )
+        .await;
+        let ping = signed(MSG_HEALTH_PING, &cp, json!({})).await;
+        for doc in [&directive, &ping] {
+            match via {
+                Via::Https => {
+                    let (status, headers, body) = post_https(&state, doc).await;
+                    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+                    let retry_after: u64 = headers
+                        .get(axum::http::header::RETRY_AFTER)
+                        .expect("Retry-After is set")
+                        .to_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    assert!(retry_after >= 1, "{retry_after}");
+                    assert!(
+                        body.is_empty(),
+                        "a deferred document gets no body: {}",
+                        String::from_utf8_lossy(&body)
+                    );
+                }
+                _ => assert!(
+                    deliver(&state, via, &cp.0, doc.clone()).await.is_none(),
+                    "{via:?}: a deferred document is not answered"
+                ),
+            }
+        }
+        assert!(
+            did_hosting_common::server::assignment::get(&state.store, "later.example")
+                .await
+                .unwrap()
+                .is_none(),
+            "{via:?}: nothing was applied"
+        );
+
+        // Once the signer resolves, the same directive is applied and answered:
+        // the deferral did not record it as seen.
+        state.trust_tasks_verifier = resolvable;
+        let reply = deliver(&state, via, &cp.0, directive.clone())
+            .await
+            .unwrap_or_else(|| panic!("{via:?}: answered once it can be checked"));
+        answered(&reply, MSG_REPLICA_DOMAIN_ASSIGN);
+    }
+}
+
+/// A full replay cache defers a verified directive: `503` on HTTPS, with the
+/// replay cache's own `Retry-After`, and no reply on DIDComm or TSP. Nothing
+/// is applied.
+#[tokio::test]
+async fn a_full_replay_cache_defers_a_directive_on_every_transport() {
+    use did_hosting_common::server::config::ReplayConfig;
+    use did_hosting_common::server::replay::{
+        FULL_RETRY_AFTER_SECS, FULL_RETRY_JITTER_SECS, ReplayCache,
+    };
+    for via in VIAS {
+        let (mut state, _dir) = edge_state().await;
+        state.replay_cache = Arc::new(
+            ReplayCache::with_config(ReplayConfig {
+                max_entries: 1,
+                max_entries_per_signer: 1,
+            })
+            .unwrap(),
+        );
+        let cp = control();
+        let first = signed(
+            MSG_REPLICA_DOMAIN_ASSIGN,
+            &cp,
+            json!({ "domain": "one.example" }),
+        )
+        .await;
+        let reply = deliver(&state, via, &cp.0, first)
+            .await
+            .unwrap_or_else(|| panic!("{via:?}: the first directive is answered"));
+        answered(&reply, MSG_REPLICA_DOMAIN_ASSIGN);
+
+        let second = signed(
+            MSG_REPLICA_DOMAIN_ASSIGN,
+            &cp,
+            json!({ "domain": "two.example" }),
+        )
+        .await;
+        match via {
+            Via::Https => {
+                let (status, headers, body) = post_https(&state, &second).await;
+                assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+                let retry_after: u64 = headers
+                    .get(axum::http::header::RETRY_AFTER)
+                    .expect("Retry-After is set")
+                    .to_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(
+                    (FULL_RETRY_AFTER_SECS..=FULL_RETRY_AFTER_SECS + FULL_RETRY_JITTER_SECS)
+                        .contains(&retry_after),
+                    "the replay cache's own wait: {retry_after}"
+                );
+                assert!(body.is_empty(), "no document");
+            }
+            _ => assert!(
+                deliver(&state, via, &cp.0, second).await.is_none(),
+                "{via:?}: a deferred directive is not answered"
+            ),
+        }
+        assert!(
+            did_hosting_common::server::assignment::get(&state.store, "two.example")
+                .await
+                .unwrap()
+                .is_none(),
+            "{via:?}: nothing was applied"
         );
     }
 }
