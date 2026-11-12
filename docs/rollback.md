@@ -124,6 +124,21 @@ backup (the v0.7 backup format dumps `pending_purges` +
 `assignments` keyspaces — those carry the trail of what was
 where).
 
+A restore into a store that is still in use never rolls a DID's
+history back: each restored `did:webvh` (or `did:webs`) log must
+extend the log and high-water marks the store already holds for
+that DID, even one since purged. If a DID changed after the backup
+was taken, the restore is refused and nothing is written, not even
+`config.toml`. On an edge, re-sync from the control plane instead,
+which sends each DID's current log. Restoring into an empty store
+(scenario 1) works for any consistent backup. A backup whose own log
+is behind its own high-water mark is refused even there, and the
+refusal says so. The data goes into the store the backup's config
+names (`store.data_dir`, after environment overrides such as
+`DID_HOSTING_STORE_DATA_DIR`), so check it matches the running
+service before restoring. If a restore is interrupted, run it
+again: it is safe to repeat.
+
 ### "An admin Purge Now hit the wrong domain"
 
 The `domain/purge/1.0` Trust Task bypasses the grace and

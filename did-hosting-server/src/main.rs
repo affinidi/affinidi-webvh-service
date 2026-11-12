@@ -168,13 +168,26 @@ enum Command {
         #[arg(short, long, default_value = "webvh-backup.json")]
         output: String,
     },
-    /// Restore server data from a backup file
+    /// Restore server data from a backup file.
+    ///
+    /// The backup is checked before anything is written, config.toml
+    /// included. Each did:webvh (or did:webs) log must verify, match its
+    /// record, and extend both the backup's own high-water mark and what the
+    /// store already holds for that DID; otherwise nothing is restored.
+    /// Restore into an empty store to start from the backup's state. The
+    /// data goes into the store the backup's config names (after the
+    /// usual environment overrides). If a restore is interrupted, run it
+    /// again: it is safe to repeat.
     Restore {
         /// Input backup file path
         #[arg(short, long)]
         input: String,
     },
-    /// Load a DID at an arbitrary path (e.g., "services/control")
+    /// Load a DID at an arbitrary path (e.g., "services/control").
+    ///
+    /// The log must verify (and its witness proofs, if it is witnessed) and
+    /// must extend every history this store has served for that DID,
+    /// including one since removed with `remove-did`.
     LoadDid {
         /// Path to store the DID at (e.g., "services/control")
         #[arg(long)]

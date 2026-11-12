@@ -301,14 +301,27 @@ struct SlotHighWater {
     method: String,
 }
 
+/// The key prefix of a DID identity's high-water log.
+pub(crate) const HIGH_WATER_IDENTITY_PREFIX: &str = "hw:id:";
+
+/// The key prefix of a slot's high-water record.
+pub(crate) const HIGH_WATER_SLOT_PREFIX: &str = "hw:slot:";
+
 /// The high-water log key for a DID identity (SCID / webs identifier).
 fn high_water_identity_key(identity: &str) -> String {
-    format!("hw:id:{identity}")
+    format!("{HIGH_WATER_IDENTITY_PREFIX}{identity}")
 }
 
 /// The high-water record key for a slot.
 fn high_water_slot_key(mnemonic: &str) -> String {
-    format!("hw:slot:{mnemonic}")
+    format!("{HIGH_WATER_SLOT_PREFIX}{mnemonic}")
+}
+
+/// The methods whose logs carry a history an edge holds them to: every
+/// replacement must extend what was served before.
+/// A `did:webs` log is checked only by a build with `method-webs`.
+pub(crate) fn has_history(method: &str) -> bool {
+    method == "webvh" || (method == "webs" && cfg!(feature = "method-webs"))
 }
 
 /// Verify a sync update before it replaces anything:
@@ -403,7 +416,6 @@ pub(crate) async fn verify_history(
     method: &str,
 ) -> Result<String, crate::error::AppError> {
     use crate::error::AppError;
-    use did_hosting_common::did_ops::verify_log_extends;
 
     let held = dids_ks
         .get_raw(content_log_key(mnemonic))
@@ -446,26 +458,75 @@ pub(crate) async fn verify_history(
             });
     let same_did_held = held.filter(|_| held_identity.as_deref() == Some(identity.as_str()));
     for previous in [same_did_held, high_water].into_iter().flatten() {
-        match method {
-            "webvh" => {
-                verify_log_extends(Some(&previous), log_content).map_err(AppError::Validation)?
-            }
-            #[cfg(feature = "method-webs")]
-            _ => did_hosting_common::method::webs::Webs::verify_continuation(
-                did_id,
-                previous.as_bytes(),
-                log_content.as_bytes(),
-            )
-            .map_err(|e| AppError::Validation(e.to_string()))?,
-            #[cfg(not(feature = "method-webs"))]
-            _ => {
-                return Err(AppError::Validation(format!(
-                    "this server cannot verify {method} logs"
-                )));
-            }
-        }
+        verify_extends(method, did_id, &previous, log_content)?;
     }
     Ok(identity)
+}
+
+/// Whether `next` strictly extends `previous`, two logs of the same DID: the
+/// history check [`verify_history`] applies to each history it holds.
+pub(crate) fn verify_extends(
+    method: &str,
+    did_id: &str,
+    previous: &str,
+    next: &str,
+) -> Result<(), crate::error::AppError> {
+    use crate::error::AppError;
+    match method {
+        "webvh" => did_hosting_common::did_ops::verify_log_extends(Some(previous), next)
+            .map_err(AppError::Validation),
+        #[cfg(feature = "method-webs")]
+        "webs" => did_hosting_common::method::webs::Webs::verify_continuation(
+            did_id,
+            previous.as_bytes(),
+            next.as_bytes(),
+        )
+        .map_err(|e| AppError::Validation(e.to_string())),
+        _ => {
+            let _ = did_id;
+            Err(AppError::Validation(format!(
+                "this server cannot verify {method} logs"
+            )))
+        }
+    }
+}
+
+/// For a restore: what to do with a high-water log `incoming` for `identity`
+/// that a backup carries. `true` when it may be written (nothing is held for
+/// that identity, or it extends what is held); `false` when what is held
+/// already extends it, so the held mark is kept. Two marks that diverge are
+/// refused: a restore never moves a mark back or onto another history.
+pub(crate) async fn high_water_to_restore(
+    dids_ks: &KeyspaceHandle,
+    identity: &str,
+    incoming: &str,
+) -> Result<bool, crate::error::AppError> {
+    let Some(held) = dids_ks
+        .get_raw(high_water_identity_key(identity))
+        .await?
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    else {
+        return Ok(true);
+    };
+    // A webs identity is its identifier; a webvh identity is the bare SCID.
+    let method = if identity.starts_with("did:webs:") {
+        "webs"
+    } else {
+        "webvh"
+    };
+    if !has_history(method) {
+        // This build cannot compare the two: keep the held one.
+        return Ok(false);
+    }
+    if verify_extends(method, identity, &held, incoming).is_ok() {
+        return Ok(true);
+    }
+    verify_extends(method, identity, incoming, &held).map_err(|_| {
+        crate::error::AppError::Validation(format!(
+            "the backup's history for {identity} diverges from the one this store has served"
+        ))
+    })?;
+    Ok(false)
 }
 
 /// Record, in `batch`, the high-water marks for a log that passed
