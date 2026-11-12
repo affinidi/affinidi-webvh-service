@@ -335,15 +335,22 @@ pub async fn replace_own_did(
     mnemonic: &str,
     jsonl: &str,
 ) -> Result<BootstrapResult, AppError> {
+    // Verify the new DID before touching the old one: a log that would be
+    // refused must leave the stored DID where it is.
+    let checked = check_import(dids_ks, mnemonic, jsonl, None).await?;
+    let mut batch = store.batch();
     if let Some(existing) = dids_ks.get::<DidRecord>(did_key(mnemonic)).await? {
-        let mut batch = store.batch();
-        batch.remove(dids_ks, did_key(mnemonic));
-        batch.remove(dids_ks, content_log_key(mnemonic));
+        // The record and log are overwritten below; what the new DID does not
+        // replace is removed here.
         batch.remove(dids_ks, content_witness_key(mnemonic));
-        batch.remove(dids_ks, owner_key(&existing.owner, mnemonic));
-        batch.commit().await?;
+        if existing.owner != "system" {
+            batch.remove(dids_ks, owner_key(&existing.owner, mnemonic));
+        }
     }
-    import_did_at_path(store, dids_ks, mnemonic, jsonl, None).await
+    stage_import(&mut batch, dids_ks, mnemonic, jsonl, None, &checked)?;
+    batch.commit().await?;
+    info!(did = %checked.did_id, path = %mnemonic, "own DID replaced");
+    Ok(checked.into_result(mnemonic, jsonl))
 }
 
 /// The operator-facing refusal for [`OwnDidImport::HeldByAnother`], shared
@@ -390,7 +397,51 @@ pub async fn import_did_at_path(
         )));
     }
 
-    // Validate the JSONL content
+    let checked = check_import(dids_ks, mnemonic, jsonl, witness_content).await?;
+    let mut batch = store.batch();
+    stage_import(
+        &mut batch,
+        dids_ks,
+        mnemonic,
+        jsonl,
+        witness_content,
+        &checked,
+    )?;
+    batch.commit().await?;
+
+    info!(did = %checked.did_id, scid = %checked.scid, path = %mnemonic, "DID imported from files");
+    Ok(checked.into_result(mnemonic, jsonl))
+}
+
+/// A `did:webvh` log [`check_import`] accepted for a slot.
+struct CheckedImport {
+    did_id: String,
+    scid: String,
+    /// The DID's identity, for [`stage_high_water`].
+    identity: String,
+}
+
+impl CheckedImport {
+    fn into_result(self, mnemonic: &str, jsonl: &str) -> BootstrapResult {
+        BootstrapResult {
+            scid: self.scid,
+            did_id: self.did_id,
+            jsonl: jsonl.to_string(),
+            mnemonic: mnemonic.to_string(),
+        }
+    }
+}
+
+/// Everything [`import_did_at_path`] checks before it writes, bar the
+/// "nothing at this path" guard: the log's structure, chain and witness
+/// proofs, and that it extends every history this store has served for the
+/// DID and slot ([`verify_history`]). Writes nothing.
+async fn check_import(
+    dids_ks: &KeyspaceHandle,
+    mnemonic: &str,
+    jsonl: &str,
+    witness_content: Option<&str>,
+) -> Result<CheckedImport, AppError> {
     validate_did_jsonl(jsonl)?;
 
     let did_id = extract_did_id(jsonl)
@@ -414,18 +465,33 @@ pub async fn import_did_at_path(
     // DID, the witness proofs.
     verify_did_log_and_witness_proofs(jsonl, witness_content).map_err(AppError::Validation)?;
     let identity = verify_history(dids_ks, mnemonic, &did_id, jsonl, "webvh").await?;
+    Ok(CheckedImport {
+        did_id,
+        scid,
+        identity,
+    })
+}
 
-    let mnemonic_str = mnemonic.to_string();
+/// Stage, in `batch`, the writes of a [`check_import`]ed log: the record
+/// (owner `"system"`), the log, the owner index, any witness proofs, and the
+/// high-water marks.
+fn stage_import(
+    batch: &mut crate::store::WriteBatch,
+    dids_ks: &KeyspaceHandle,
+    mnemonic: &str,
+    jsonl: &str,
+    witness_content: Option<&str>,
+    checked: &CheckedImport,
+) -> Result<(), AppError> {
     let now = now_epoch();
     let version_count = jsonl.lines().filter(|l| !l.trim().is_empty()).count() as u64;
-
     let record = DidRecord {
         owner: "system".to_string(),
-        mnemonic: mnemonic_str.clone(),
+        mnemonic: mnemonic.to_string(),
         created_at: now,
         updated_at: now,
         version_count,
-        did_id: Some(did_id.clone()),
+        did_id: Some(checked.did_id.clone()),
         content_size: jsonl.len() as u64,
         disabled: false,
         disabled_by_admin: false,
@@ -434,51 +500,40 @@ pub async fn import_did_at_path(
         method: "webvh".to_string(),
         // The host the identifier names, as a synced record is tagged, so a
         // purge of that domain selects it.
-        domain: extract_did_host(&did_id).unwrap_or_default(),
+        domain: extract_did_host(&checked.did_id).unwrap_or_default(),
 
         services: extract_service_types(jsonl),
 
         agent_names: Vec::new(),
     };
 
-    let mut batch = store.batch();
-    batch.insert(dids_ks, did_key(&mnemonic_str), &record)?;
+    batch.insert(dids_ks, did_key(mnemonic), &record)?;
     batch.insert_raw(
         dids_ks,
-        content_log_key(&mnemonic_str),
+        content_log_key(mnemonic),
         jsonl.as_bytes().to_vec(),
     );
     batch.insert_raw(
         dids_ks,
-        owner_key("system", &mnemonic_str),
-        mnemonic_str.as_bytes().to_vec(),
+        owner_key("system", mnemonic),
+        mnemonic.as_bytes().to_vec(),
     );
     if let Some(witness) = witness_content {
         batch.insert_raw(
             dids_ks,
-            content_witness_key(&mnemonic_str),
+            content_witness_key(mnemonic),
             witness.as_bytes().to_vec(),
         );
     }
     stage_high_water(
-        &mut batch,
+        batch,
         dids_ks,
-        &identity,
-        &mnemonic_str,
-        &did_id,
+        &checked.identity,
+        mnemonic,
+        &checked.did_id,
         "webvh",
         jsonl,
-    )?;
-    batch.commit().await?;
-
-    info!(did = %did_id, scid = %scid, path = %mnemonic_str, "DID imported from files");
-
-    Ok(BootstrapResult {
-        scid,
-        did_id,
-        jsonl: jsonl.to_string(),
-        mnemonic: mnemonic_str,
-    })
+    )
 }
 
 #[cfg(test)]
@@ -615,6 +670,33 @@ mod own_did_import_tests {
             }
             other => panic!("expected AlreadyPresent, got {other:?}"),
         }
+    }
+
+    /// A new DID that would be refused leaves the stored one in place.
+    #[tokio::test]
+    async fn replace_own_did_keeps_the_old_did_when_the_new_one_is_refused() {
+        let (_dir, store, ks) = store().await;
+        let old = minted_for("http://old-host.example").await;
+        import_own_did(&store, &ks, ".well-known", &old)
+            .await
+            .unwrap();
+        let mut entry: serde_json::Value =
+            serde_json::from_str(minted_for("http://new-host.example").await.trim()).unwrap();
+        entry["state"]["alsoKnownAs"] = serde_json::json!(["did:example:edited"]);
+
+        assert!(
+            replace_own_did(&store, &ks, ".well-known", &entry.to_string())
+                .await
+                .is_err()
+        );
+        let kept: DidRecord = ks.get(did_key(".well-known")).await.unwrap().unwrap();
+        assert_eq!(kept.did_id, extract_did_id(&old), "the old DID is kept");
+        assert!(
+            ks.get_raw(content_log_key(".well-known"))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// A free path is also a valid target — reprovisioning after an

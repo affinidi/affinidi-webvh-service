@@ -490,10 +490,22 @@ did-hosting-server backup --output /path/to/backup.json
 did-hosting-server restore --input /path/to/backup.json
 ```
 
-A restore never rolls a DID's history back. Each restored log must extend
-what the store already holds for that DID, including the high-water mark it
-keeps after a delete. Otherwise the restore is refused and nothing is
-written. A restore into an empty data directory always succeeds.
+A restore checks the whole backup before it writes anything, `config.toml`
+included. Each restored log must verify, match its record, and extend both the
+backup's own high-water mark and what the store already holds for that DID,
+including the mark it keeps after a delete. Otherwise the restore is refused
+and nothing is written.
+
+- To start from a backup's state, restore into an empty data directory. That
+  works for any consistent backup. A backup whose own log is behind its own
+  high-water mark (a store an earlier version's `load-did` wrote an older log
+  into) is refused even then, with a message that says so.
+- The data goes into the store the backup's config names, after the same
+  environment overrides the service applies (`DID_HOSTING_STORE_DATA_DIR`
+  among them). If the running service uses a different data directory, set
+  that variable, or move the data afterwards.
+- If a restore is interrupted, run it again. Re-running is safe.
+
 `load-did` follows the same rule, and also verifies the log's chain and
 witness proofs.
 

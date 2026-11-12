@@ -384,10 +384,14 @@ enum Command {
     },
     /// Restore server data from a backup file.
     ///
-    /// A restore never rolls a DID's history back: each restored did:webvh
-    /// (or did:webs) log must extend the log and high-water marks this store
-    /// already holds for that DID, or nothing is restored. Restore into an
-    /// empty store to start from the backup's state.
+    /// The backup is checked before anything is written, config.toml
+    /// included. Each did:webvh (or did:webs) log must verify, match its
+    /// record, and extend both the backup's own high-water mark and what the
+    /// store already holds for that DID; otherwise nothing is restored.
+    /// Restore into an empty store to start from the backup's state. The
+    /// data goes into the store the backup's config names (after the
+    /// usual environment overrides). If a restore is interrupted, run it
+    /// again: it is safe to repeat.
     Restore {
         /// Input backup file path
         #[arg(short, long)]
