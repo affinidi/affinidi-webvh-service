@@ -12,14 +12,20 @@ authenticated. It:
      workspace crate to `<name>.0`, its internal pins to `<name>`, and writes
      `RELEASE` = `<name>.0-rc.0`. `release-tag.yml` then tags `v<name>.0-rc.0`;
   3. opens a PR to main (`release-cut/<name>`) that moves every crate to the
-     next minor (`0.10.0` after `0.9`) and starts a fresh `## Unreleased`
-     section in CHANGELOG.md, the old one becoming `<name>.0`'s;
+     next minor (`0.10.0` after `0.9`) and writes the release's CHANGELOG.md
+     section, `## <name>.0 (release/<name>)`, from the `changelog.d/`
+     fragments the source commit has (changelog_fragments.assemble()),
+     deleting them. `## Unreleased` stays, holding only the pointer line;
   4. creates the `backport release/<name>` label backport.yml reads.
 
-The CHANGELOG split is only automatic when main's `## Unreleased` section is
-the one the source commit has (nothing changelogged landed after nightly). If
-it differs, main's CHANGELOG is left alone and the script says so: move the
-entries that shipped in the release under its heading by hand, in the PR.
+Fragments added on main after the source commit stay in `changelog.d/`: they
+belong to the next release. The release branch keeps its fragments until its
+GA prep assembles them into `## <name>.0 (date)`.
+
+The split is only automatic when every shipped fragment is unchanged on main
+and main's `## Unreleased` holds what the source commit's did. If not, main's
+CHANGELOG is left alone and the script says so: move the entries that shipped
+in the release under its heading by hand, in the PR.
 """
 
 import argparse
@@ -27,6 +33,7 @@ import pathlib
 import sys
 import tempfile
 
+from changelog_fragments import FRAGMENT_DIR, README, assemble, strip_pointer
 from release_lib import RELEASE_NAME, git, run, set_version, unreleased_split
 
 
@@ -34,6 +41,22 @@ def worktree(rev, tmp, name):
     path = pathlib.Path(tmp) / name
     git("worktree", "add", "--detach", str(path), rev)
     return path
+
+
+def shipped_fragments(source, mn):
+    """(names, problems): the source commit's fragments, as main still has them."""
+    listing = git("ls-tree", "--name-only", f"{source}:{FRAGMENT_DIR}", check=False).stdout.split()
+    names, problems = set(), []
+    for name in listing:
+        if name == README or not name.endswith(".md"):
+            continue
+        on_main = mn / FRAGMENT_DIR / name
+        if not on_main.exists():
+            continue  # removed on main since: nothing to move
+        if on_main.read_text() != git("show", f"{source}:{FRAGMENT_DIR}/{name}").stdout:
+            problems.append(f"{FRAGMENT_DIR}/{name} changed on main since the cut's source")
+        names.add(name)
+    return names, problems
 
 
 def main():
@@ -75,12 +98,14 @@ def main():
             source_log = git("show", f"{source}:CHANGELOG.md").stdout
             main_log = (mn / "CHANGELOG.md").read_text()
             src, cur = unreleased_split(source_log), unreleased_split(main_log)
-            split = bool(src and cur and src[1] == cur[1])
+            shipped, drift = shipped_fragments(source, mn)
+            for d in drift:
+                print(f"WARNING: {d}", file=sys.stderr)
+            split = bool(
+                src and cur and strip_pointer(src[1]).strip() == strip_pointer(cur[1]).strip() and not drift
+            )
             if split:
-                before, body, after = cur
-                (mn / "CHANGELOG.md").write_text(
-                    f"{before}## Unreleased\n\n## {version} ({branch})\n{body}{after}"
-                )
+                assemble(f"{version} ({branch})", mn, keep_unreleased=True, only=shipped)
             git("add", "-A", cwd=mn)
             git(
                 "commit", "-s", "-m",

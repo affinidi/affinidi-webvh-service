@@ -20,6 +20,12 @@ Either way:
      `release-prep/…`, `release-cut/…`) must live in this repository. A fork
      can name a branch anything, so only a branch pushed here carries the
      meaning of its name.
+  6. Only the release tooling's branches (those same names, in this
+     repository) change CHANGELOG.md. Everyone else adds a `changelog.d/`
+     fragment (changelog.d/README.md), so open PRs never conflict over
+     `## Unreleased`. The one change anyone may make is moving entries out:
+     a CHANGELOG.md that differs from the base only in `## Unreleased`, which
+     is left holding nothing but the pointer line.
 
 Environment: BASE_REF, HEAD_REF, LABELS (JSON list of label names), REPO
 (this repository, `owner/name`) and HEAD_REPO (the repository the head branch
@@ -35,19 +41,36 @@ import subprocess
 import sys
 import tomllib
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from changelog_fragments import unreleased_is_pointer_only  # noqa: E402
+from release_lib import unreleased_split  # noqa: E402
+
 
 def git(*args):
     return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout
 
 
-def package_version(rev, path):
+def show(rev, path):
     out = subprocess.run(["git", "show", f"{rev}:{path}"], capture_output=True, text=True)
-    if out.returncode:
+    return out.stdout if out.returncode == 0 else None
+
+
+def package_version(rev, path):
+    text = show(rev, path)
+    if text is None:
         return None
     try:
-        return tomllib.loads(out.stdout).get("package", {}).get("version")
+        return tomllib.loads(text).get("package", {}).get("version")
     except tomllib.TOMLDecodeError:
         return None
+
+
+def only_empties_unreleased():
+    """Whether the PR's CHANGELOG.md change only moves `## Unreleased` entries out."""
+    before, after = show("HEAD^1", "CHANGELOG.md"), show("HEAD", "CHANGELOG.md")
+    b = unreleased_split(before) if before is not None else None
+    a = unreleased_split(after) if after is not None else None
+    return bool(a and b and unreleased_is_pointer_only(a[1]) and (a[0], a[2]) == (b[0], b[2]))
 
 
 def main():
@@ -103,6 +126,16 @@ def main():
             )
         if release_file:
             problems.append("RELEASE marks a release branch; it never belongs on main. Remove it.")
+
+    # `head` is already demoted to `<fork>:<name>` above when a fork borrows a
+    # tooling name, so this match means a release-tooling branch in this repo.
+    tooling = re.match(r"(backport-\d+-to-release/|release-prep/|release-cut/)", head)
+    if "CHANGELOG.md" in changed and not tooling and not only_empties_unreleased():
+        problems.append(
+            "Only the release tooling edits CHANGELOG.md. Revert it, and record the change as a "
+            "new file changelog.d/<short-kebab-name>.md holding the `### <Kind> — <title>` entry "
+            "(changelog.d/README.md); it is assembled into CHANGELOG.md at release."
+        )
 
     if problems:
         print(f"Branch rules ({head} -> {base}), RELEASES.md:\n", file=sys.stderr)

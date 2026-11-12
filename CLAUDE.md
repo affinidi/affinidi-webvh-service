@@ -506,6 +506,15 @@ Also worth knowing before you go looking for them:
   generate-lockfile --manifest-path fuzz/Cargo.toml`, or the fuzz job turns red
   the next morning with no fuzzing having run.
 
+- **Never edit `CHANGELOG.md` in a PR.** Record a user-facing change as a new
+  file `changelog.d/<short-kebab-name>.md` holding one or more
+  `### <Kind> — <title>` entries (Breaking, Changed, Fixed, Added, …; see
+  `changelog.d/README.md`). Main's `## Unreleased` holds only a pointer line;
+  the release tooling assembles the fragments (`scripts/changelog_fragments.py`)
+  at the cut and at GA. The `branch rules` check fails any other PR that
+  changes `CHANGELOG.md`, and `release guards` checks the fragments' format
+  (`python3 scripts/changelog_fragments.py --check`).
+
 - **Publishing needs `cargo publish --allow-dirty`.** The control plane embeds
   the management UI from `did-hosting-control/ui-dist/` — a gitignored build
   artifact (`npm run build:web` exports there) that an explicit `include` list
