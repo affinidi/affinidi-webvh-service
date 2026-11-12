@@ -67,7 +67,7 @@ mod tests {
             store,
             config,
             None,
-            std::sync::Arc::new(crate::signing::LocalSigner),
+            std::sync::Arc::new(crate::witness_keys::WitnessKeys::generate().unwrap()),
         )
         .unwrap();
         (state, dir)
