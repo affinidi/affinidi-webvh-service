@@ -2,6 +2,325 @@
 
 ## Unreleased
 
+### Fixed — the daemon sends the standard response headers
+
+`did-hosting-daemon` now sets the same response headers as the standalone
+control plane, server, witness and watcher: `Content-Security-Policy`
+(`default-src 'self'`, …), `X-Content-Type-Options: nosniff`,
+`X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
+`Strict-Transport-Security`, and `Cache-Control: no-store` on any response whose
+handler sets no `Cache-Control` of its own. They cover the management console and
+its assets, `POST /api/trust-tasks`, the embedded witness and watcher, and DID
+resolution, which keeps its configured `[server.resolve_cache]` value.
+`/health` is unchanged. Before this the daemon sent only the console's own HTML
+headers, so Trust Task replies and error responses could be cached. Operators
+whose reverse proxy already adds these headers will now see them twice and may
+want to drop one copy.
+
+### Fixed — dashboard polling no longer keeps an idle console signed in
+
+The console's dashboard refreshed itself every five seconds, and each refresh
+counted as activity, so a console left open on the dashboard never reached
+`auth.admin_idle_timeout`. Requests the console sends on a timer now carry
+`X-Background-Request: 1`. The control plane authenticates and answers them
+as before, but does not record them as session activity. The dashboard refresh
+and the pending-approval log check on a DID's page are marked this way, as are
+the agent-name and DID reloads they trigger, and both polls pause while the
+browser tab is hidden. A request without the header counts as
+activity, as before.
+### Fixed — signers outside the ACL get their own replay cache and bounded DID resolution
+
+The control plane recorded every signed Trust Task document in one shared
+replay cache, including those on the tasks that take a proof from a signer the
+ACL does not list (`server/info`, discovery, the `auth/*` family, passkey login
+and invite redemption). Such a signer (a fresh `did:key`, say) costs nothing to
+create, so that traffic could fill the cache, which then refused every signed
+request as `unavailable` until its records aged out. Verifying those proofs,
+and a proxied login's delegation evidence, could also resolve any DID the
+document named, twice.
+
+- Replay records are now partitioned. Open reads (`server/info`, capability
+  discovery, an `auth/oob/*` version this service does not serve) are not
+  recorded at all. The shared cache holds only ACL members' and configured
+  watchers' records. Sign-in rows from any other signer go to a separate cache
+  (100,000 records, 1,000 per signer), and each source (client address on
+  HTTPS, sender on DIDComm and TSP) may add at most 120 records a minute. A
+  `did:webs` self-registration goes to a third, small cache. A document
+  recorded in any of them is refused as a replay in all of them.
+- Verifying a proof from a signer the ACL does not list runs the key-free
+  checks (recipient, freshness, issuer/sender) first. If the DID must be
+  resolved over the network (anything but a `did:key`), at most 16 resolutions
+  run at once and 300 per minute across all such signers, each within 10 s,
+  with no forced re-resolution retry. Past those limits the document is refused
+  as `unavailable` with a `retryAfter`; a timeout is reported as an unreachable
+  signer (retryable). The delegate of a proxied login whose principal is an ACL
+  member, and whose delegation evidence that principal signed verifies, is
+  verified as a member is.
+- A proxied `auth/authenticate/0.3` is refused (`permissionDenied`) when its
+  principal has no ACL entry, before its delegation evidence is checked. A
+  `siopIdToken` must claim the principal as `iss` before it is resolved. Both
+  evidence checks are bounded at 10 s.
+- For every signer: a proof whose signer DID could not be resolved at all is no
+  longer resolved a second time. The forced-refresh limiter is keyed on the
+  DID's identity, so a `did:scid`'s `?src=` variants share one allowance, and
+  tracks at most 4,096 DIDs.
+- Behaviour changes (R3.6):
+  - Signers outside the ACL, members' own sign-in keys included (a passkey
+    login's browser key, a session key on `auth/refresh`, a proxied login's
+    delegate, invite redemption), share the sign-in cache and per-source
+    quota. When they are spent, those requests get `unavailable` (retryable)
+    even though the shared cache has room. Members' own signed operational
+    requests are not affected.
+  - A non-`did:key` delegate whose mandate does not verify, and any other
+    non-`did:key` signer outside the ACL, competes for the shared resolution
+    slots and rate.
+  - A signed open read can be resent; it is answered again rather than refused
+    as `idConflict`.
+  - A proxied login for a principal outside the ACL is now refused before its
+    evidence is checked (it was refused later, at the ACL check, before).
+  - A signer DID whose resolution fails, including a `did:webvh` whose log
+    cannot be read to establish deactivation, used to get a forced fresh
+    resolution within the same request. It now gets a retryable `unavailable`,
+    and the retry resolves it afresh.
+  - The new bounds are constants, not configuration.
+
+### Added — a `did:webs` can register itself, proved by its own key event log
+
+A `did:webs` does not exist until a host publishes it, so a node whose own
+identity is a `did:webs` had no DID to authenticate to this host with before
+its first publication. With `method-webs`, a `did/register/0.1` from a
+`did:webs` outside the ACL is now accepted on a domain whose operator enables
+it, when the request is signed by a current signing key of the identifier as
+the submitted `keri.cesr` establishes it (not by resolving it: it does not
+exist yet), and `issuer` is the `did:webs:{domain}:{path}:{AID}` the slot
+builds. The new slot is owned by the identifier, which is then given an
+`Owner` ACL entry scoped to that domain and one slot, so later publications
+take the ordinary owner path.
+
+- **`[[hosting.webs_self_register]]`**: `domain`, and optional
+  `path_prefixes` and `max_registrations` (default 100, the most
+  self-registered identifiers the domain holds at once). Off by default;
+  ignored without `method-webs`.
+- Webs only: a self-registration of any other method, with `force`, at a slot
+  someone else owns, outside the prefixes, or signed by any key but the log's
+  is refused. Rate-limited per source (10 a minute) and across all sources (30
+  a minute) before the log is verified, and audited with its source
+  (`did.webs.self_registered`).
+
+See `docs/did-webs-hosting.md` ("Self-registration").
+
+### Changed — a passkey login start discloses no subject and leaves no rows behind
+
+`auth/passkey/login/start/0.2` is answered to anyone, unsigned. With no
+`subject` it read every login passkey enrolled here, returned all their
+credential ids as `allowCredentials`, and stored a snapshot of them under the
+new `authId`. Those rows were never removed unless the login finished, and
+the start answered `subjectNotRecognized` and `noCredentials` differently, so
+it also said which DIDs had a passkey.
+
+- **No subject named:** the start opens a discoverable-credential ceremony
+  with no `allowCredentials`; the browser offers the passkeys it holds for
+  this service. Finish looks the credential up by id, requires the returned
+  user handle to be that credential's user (an assertion without one is
+  `assertionInvalid`), and verifies against that one subject's credentials.
+  The ceremony row holds only its challenge, whatever the number of passkeys.
+- **A subject named:** the start lists that subject's credentials, as
+  before, so a passkey enrolled as non-discoverable keeps signing in. For a
+  subject with no login passkey it lists decoy credential ids instead of
+  answering `subjectNotRecognized` / `noCredentials`: one or two ids derived
+  from a service key (made on first use, kept as `pk_login_decoy_key`) and
+  the subject, the same on every start for that subject and shaped as the
+  console's own enrolments are. Nothing answers them.
+- A login that named its subject fails in exactly one way at finish
+  (`assertionInvalid`, "the assertion did not verify"), whether the
+  credential is unknown, not listed, another subject's, or a decoy list's,
+  or the assertion does not verify, so its outcome does not say whether the
+  subject is enrolled. An unnamed login still says `credentialUnknown`.
+- The counter update after a successful login is made under the subject's
+  credentials guard on a fresh read, so a login racing a revocation or an
+  enrolment neither restores the revoked credential nor drops the new one.
+- Only a request carrying the named subject's own bearer session is told
+  `subjectNotRecognized` or `noCredentials`.
+- Each source may open 30 login ceremonies a minute: the client address on
+  HTTPS (refused as `unavailable` with `retryAfter`), the authenticated
+  sender on DIDComm and TSP (refused as `rateLimited`). A DIDComm or TSP
+  start with no authenticated sender is refused (`permissionDenied`). A
+  messaging sender can mint a fresh `did:key` per request, so there the limit
+  is per identity rather than per party; what each start leaves is one small,
+  swept row.
+- The session sweep now removes expired login ceremonies (`pk_task_meta:`
+  and any `pk_auth:` state row an older build wrote), passkey revocation
+  ceremonies (`pk_revoke:`), step-up challenges (`stepup-task:`) and DID
+  ownership offers (`did_xfer:`). A login ceremony opened by the previous
+  build can still be finished.
+- New login passkeys are requested with `residentKey: preferred`, so an
+  authenticator that can store a discoverable credential does. Step-up
+  passkeys are unchanged.
+- The console's passkey sign-in takes an optional DID; naming it lists that
+  DID's credentials, for a security key the browser does not offer by itself.
+- `webauthn-rs` gains its `conditional-ui` feature (no new dependency).
+- Behaviour changes (R3.6):
+  - An anonymous login start never answers `noCredentials` or
+    `subjectNotRecognized`. Unnamed, it opens a ceremony with no list;
+    naming an unknown subject, it lists decoys.
+  - A passkey enrolled as non-discoverable (some hardware security keys,
+    registered under the earlier `residentKey: discouraged`) signs in only
+    when the start names its subject — in the console, by entering the DID
+    beside "Login with Passkey".
+  - A discoverable-flow assertion with no user handle is refused.
+  - A named login's failures are all `assertionInvalid` (a named login with
+    an unknown credential used to be `credentialUnknown`).
+  - Residual signal: decoys are always one or two ids of 16, 20 or 32 bytes.
+    A named subject whose real list has three or more credentials, ids of
+    other lengths, or `transports` (recorded when a browser reports them at
+    enrolment) is distinguishable from an unknown one. Real lists cannot be
+    trimmed without breaking those credentials' sign-in, so this is left as
+    is; a subject's count and id lengths are what they disclose.
+  - The 31st login start a minute from one source is refused, and a
+    DIDComm/TSP start with no sender is refused.
+  - Checked consumers: the console's `passkeyLoginStart` (updated here to
+    pass an optional subject) handles options with or without
+    `allowCredentials`. No client in verifiable-trust-infrastructure calls
+    this service's passkey login (its own `vta-service` and `vtc-service`
+    have their own).
+
+### Changed — enrolling a passkey that grants `aal2` needs a stepped-up session or the caller's own key
+
+A passkey login is minted at `aal2`. `auth/passkey/enroll/{start,finish}/0.2`
+let any authenticated subject add a login passkey, and asked for user
+verification only when one was already held, so a session at `aal1` (signed
+by its browser session key) could enrol a first passkey and sign in again at
+`aal2`. An administrator's session at `aal1` could do the same through an
+invite (`auth/passkey/enroll/invite/0.3`) naming itself. And enrolment
+accepted a credential id already bound to another subject, repointing that
+credential's index so its holder could no longer sign in with it.
+
+- Enrolling a subject's first login passkey needs a session already at
+  `aal2`, or a request signed by the subject's own DID key (the factor a
+  `didSigned` step-up rests on). The check runs at start and again at finish,
+  against the credentials held then.
+- Issuing any enrolment invite needs the same of the administrator: an `aal2`
+  session or its own DID key's signature, whoever the invite names.
+- Both refusals are `permissionDenied` with message `step_up_required`. The
+  console treats that, like a declared `stepUpRequired`, as a request to step
+  up and retry, for invites and for domain purges.
+- Every enrolment finish (redeem, self-enrolment, either purpose) refuses a
+  credential id already bound to any subject in either credential store
+  (`attestationInvalid`), as WebAuthn §7.1 requires; enrolments of the same id
+  are serialised.
+- Adding a further passkey is unchanged (user verification over an existing
+  one).
+- Behaviour changes (R3.6):
+  - A session at `aal1` signed by its session key can no longer start or
+    finish a first login passkey enrolment, or issue an invite. A passkey
+    session is `aal2` already; a wallet session steps up first.
+  - Re-enrolling a credential already bound anywhere is refused.
+  - Checked consumers: the console enrols through invites (it steps up when
+    asked); no client in verifiable-trust-infrastructure calls this service's
+    `enroll/*` tasks.
+
+### Changed — `did/change-owner` moves a slot only when its recipient accepts
+
+`did/change-owner/0.1` moved a slot to any DID with an ACL entry, at the
+owner's word alone. The recipient never agreed, its quota and domain scope
+were not applied, and the "not in the ACL" error told the owner whether a
+DID had an entry.
+
+- An administrator's request moves the slot at once, as before.
+- An owner's request now only offers it. The record is returned unchanged,
+  with `ext["vnd.affinidi.webvh"].ownerTransfer = { status: "offered",
+  newOwner, expiresAt }`. The offer lasts 72 hours. A new offer replaces the
+  last; naming the current owner withdraws it; deleting the slot removes it.
+  Nothing about the recipient is looked up when an offer is made, so an offer
+  answers the same for any DID.
+- The recipient accepts by sending the same request naming itself as
+  `newOwner`. It needs the live offer from the slot's current owner, made
+  since the slot was registered; anyone else still gets `notOwner`.
+- Before a slot moves (an administrator's transfer or an acceptance), the
+  recipient must have an ACL entry with a role that owns DIDs (`owner` or
+  `admin`), a domain scope that covers the slot, and room for it in its DID
+  count and total size quotas. Otherwise the request is refused as
+  `targetNotAuthorized`, naming the check that failed (only an administrator,
+  or the recipient about itself, can reach it).
+- The recipient's quota check and the move are one critical section per
+  owner, and so are the quota checks and commits of `did/register`, create,
+  publish and the agent-name verbs (the publish paths re-check the size quota
+  under the owner's lock and hold it through their commit), so two writes for
+  the same owner cannot both take its last slot or byte. Lock order: slot,
+  then owner, then agent names.
+- `did_ops::change_did_owner` takes the request's `domain` and returns
+  `OwnerChange { record, offer }`, or `OwnerChangeError`.
+- The console's ownership card offers a DID (owners) or transfers it
+  (administrators), and the DID list has "Accept a DID".
+- Behaviour changes (R3.6):
+  - A non-administrator's `did/change-owner` no longer moves the slot. A
+    caller that read `record.owner` from the reply to confirm a move now sees
+    the old owner and an `ownerTransfer` offer.
+  - A transfer to a DID outside the ACL is no longer refused at once when an
+    owner sends it. It is recorded as an offer that can never be accepted.
+    An administrator's transfer to one is refused as `targetNotAuthorized`
+    (it was `malformedRequest`).
+  - A transfer to a `service` or `metrics-reader` entry, or to a recipient
+    over its quota or outside its domain scope, is refused, administrators
+    included.
+  - Checked consumers: the console (updated here). verifiable-trust-
+    infrastructure defines the Type URI constant in `vta-sdk` but sends no
+    `did/change-owner`.
+
+### Fixed — `did:webs` registers over `did/register/0.1`
+
+The `did/register/0.1` Trust Task refused every method but webvh ("this host
+registers webvh only over this task"), and the REST `POST /api/dids/register`
+that took `method: "webs"` has since been removed, so a host built with
+`method-webs` had no way left to accept a `did:webs` publication. The task now
+takes `method: "webs"` with the `keri.cesr` stream as `didData` and a `domain`,
+on a host built with `method-webs`, through the same `register_did_atomic`
+that verifies the log and builds the identifier from the slot. A host built
+without it refuses `webs` by name, naming the feature. This is how a VTA
+publishes the `did:webs` DIDs it creates.
+
+### Fixed — agent names are reserved per name, and released when their DID is deleted
+
+The check that an agent name is free and the write that binds it were held
+under the claiming DID's own lock only, so two DIDs claiming the same free name
+at once (`agent-name/update`, a plain publish, or `did/register`) could both
+succeed, leaving both records listing the name and the index pointing at
+whichever wrote last. Each name now has its own lock, taken after the DID's lock
+and held from the check to the commit, so exactly one claim wins and the other
+is refused as taken.
+
+- `agent-name/remove` retires the name's index entry only while it points at
+  the DID removing it; it no longer deletes another DID's entry.
+- `did/delete` releases the deleted DID's agent names (active and parked),
+  again only entries that point at that DID. Previously they stayed indexed
+  against a DID that no longer existed. The names are removed in a second
+  write right after the record, so a DID with many names stays deletable on
+  stores that cap one transactional write (DynamoDB: 100 items).
+- A domain purge likewise removes only the index entries that still point at
+  each purged DID, after the record; in the daemon it now takes the control
+  plane's DID and name locks while it deletes.
+- The DID and name locks are released as soon as a publish or agent-name
+  change commits, before the check for a rotation of the service's own DID.
+- **Behaviour change:** an index entry that points at a DID which no longer
+  exists, or whose record no longer lists the name, no longer holds the name.
+  `agent-name/check` reports such a name available and it can be claimed.
+- **Upgrading:** agent names left indexed by DIDs deleted before this release
+  become claimable again by any DID on their domain.
+
+### Fixed — error text with multi-byte characters is truncated safely
+
+The control plane's outbox cut a failed delivery's error text at a fixed byte
+offset; text with a multi-byte character across that offset (an edge's own
+error message, or one of this service's messages containing `—`) stopped the
+outbox worker. User-facing error messages capped in `did-hosting-common` had the
+same problem. Both now cut on a character boundary.
+
+### Fixed — the Redis store URL is logged without credentials
+
+Opening the Redis store logged `redis_url` as configured, including any
+username, password or query parameters. The log line now shows the scheme,
+host, port and database only.
+
 ### Changed — tiered, bounded statistics; charts read by key
 
 Every DID now keeps a coarse series (hourly for 7 days, daily for 30) inside

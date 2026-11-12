@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use did_hosting_common::server::domain::{self, DISABLE_PURGE_REASON};
-use did_hosting_common::server::domain_purge::purge_domain_dids;
+use did_hosting_common::server::domain_purge::purge_domain_dids_locked;
 use did_hosting_common::server::pending_purge::{self, PurgeCheck};
 use did_hosting_common::server::stats_collector::StatsCollector;
 use did_hosting_common::server::store::Store;
@@ -59,6 +59,16 @@ pub struct SweepReport {
 /// loop and by tests that want to observe one tick's effect without
 /// waiting for the timer.
 pub async fn run_sweep_once(store: &Store) -> SweepReport {
+    run_sweep_once_locked(store, None).await
+}
+
+/// [`run_sweep_once`] for a store the control plane also writes (the
+/// daemon): each purged slot and its agent names are deleted under
+/// `locks`, the control plane's path locks.
+pub async fn run_sweep_once_locked(
+    store: &Store,
+    locks: Option<&did_hosting_common::server::path_locks::PathLocks>,
+) -> SweepReport {
     let pending = match pending_purge::list(store).await {
         Ok(p) => p,
         Err(e) => {
@@ -80,7 +90,7 @@ pub async fn run_sweep_once(store: &Store) -> SweepReport {
         if !still_due(store, &entry).await {
             continue;
         }
-        match purge_domain_dids(store, &entry.domain, &entry.reason).await {
+        match purge_domain_dids_locked(store, &entry.domain, &entry.reason, locks).await {
             Ok(report) => {
                 info!(
                     domain = %entry.domain,

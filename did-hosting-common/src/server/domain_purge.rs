@@ -29,7 +29,8 @@
 //! - `owner:<did>:<mnemonic>` — the owner index entry.
 //! - `watcher_sync:<mnemonic>` — the watcher-sync cursor (if any).
 //! - `name:<host>:<name>` — the agent-name index for each name the record
-//!   holds.
+//!   holds, where it still points at this record (in a second write, after
+//!   the record).
 //!
 //! All deletes for one DID are batched into a single atomic write
 //! per the existing `Store` API. Cross-DID atomicity is not
@@ -38,7 +39,9 @@
 
 use tracing::{info, warn};
 
+use super::agent_name_index;
 use super::error::AppError;
+use super::path_locks::PathLocks;
 use super::store::{KS_DIDS, Store};
 use crate::did_ops::{
     DidRecord, content_log_key, content_witness_key, did_key, owner_key, watcher_sync_key,
@@ -71,10 +74,26 @@ pub struct PurgeReport {
 /// `reason` is recorded in the audit log but is not persisted with
 /// the deletion (the records are gone, after all); it's surfaced via
 /// the structured log only.
+///
+/// For a store a control plane also writes to, use
+/// [`purge_domain_dids_locked`] with its path locks.
 pub async fn purge_domain_dids(
     store: &Store,
     target_domain: &str,
     reason: &str,
+) -> Result<PurgeReport, AppError> {
+    purge_domain_dids_locked(store, target_domain, reason, None).await
+}
+
+/// [`purge_domain_dids`], taking each slot's lock and its agent names' locks
+/// from `locks` (the control plane's `path_locks`) while it deletes them, so
+/// a purge cannot interleave with a publish or a name claim on the same
+/// slot or name. `None` where no such writer shares the store (an edge).
+pub async fn purge_domain_dids_locked(
+    store: &Store,
+    target_domain: &str,
+    reason: &str,
+    locks: Option<&PathLocks>,
 ) -> Result<PurgeReport, AppError> {
     let ks = store.keyspace(KS_DIDS)?;
     let raw = ks.prefix_iter_raw(b"did:".to_vec()).await?;
@@ -108,6 +127,42 @@ pub async fn purge_domain_dids(
             continue;
         }
 
+        // Under the slot's lock the scan is only a snapshot: re-read and
+        // decide again.
+        let _slot_guard = match locks {
+            Some(locks) => Some(locks.guard(&record.mnemonic).await),
+            None => None,
+        };
+        let record = if locks.is_some() {
+            match ks.get::<DidRecord>(did_key(&record.mnemonic)).await {
+                Ok(Some(current)) if current.domain == target_domain => current,
+                Ok(_) => continue,
+                Err(e) => {
+                    warn!(mnemonic = %record.mnemonic, error = %e, "domain purge: re-read failed; skipping");
+                    failed += 1;
+                    continue;
+                }
+            }
+        } else {
+            record
+        };
+        let _name_guards = match locks {
+            Some(locks) => {
+                agent_name_index::lock_names(locks, agent_name_index::index_keys(&record)).await
+            }
+            None => Vec::new(),
+        };
+        // The agent-name index entries that still point at this slot; an
+        // entry another slot has since claimed is left alone.
+        let names = match agent_name_index::owned_keys(&ks, &record).await {
+            Ok(names) => names,
+            Err(e) => {
+                warn!(mnemonic = %record.mnemonic, error = %e, "domain purge: reading the name index failed; skipping");
+                failed += 1;
+                continue;
+            }
+        };
+
         // Batch every key for this DID into a single atomic write.
         // Other DIDs remain unaffected by failure on this one.
         let mut batch = store.batch();
@@ -116,17 +171,25 @@ pub async fn purge_domain_dids(
         batch.remove(&ks, content_witness_key(&record.mnemonic));
         batch.remove(&ks, owner_key(&record.owner, &record.mnemonic));
         batch.remove(&ks, watcher_sync_key(&record.mnemonic));
-        // The agent-name index derived from the record goes with it, keyed on
-        // the host its DID identifier names — the same key the sync path wrote.
-        let host = record
-            .did_id
-            .as_deref()
-            .and_then(|d| super::domain::safety::extract_did_host(d).ok())
-            .unwrap_or_default();
-        for name in &record.agent_names {
-            batch.remove(&ks, crate::did_ops::agent_name_key(&host, &name.name));
+        let committed = batch.commit().await;
+        // The names go after the record, in a write of their own: a slot can
+        // hold more names than one transactional write takes on some
+        // backends. One left behind is harmless — an entry pointing at a slot
+        // that no longer exists does not hold the name.
+        if committed.is_ok() && !names.is_empty() {
+            let mut names_batch = store.batch();
+            for key in names {
+                names_batch.remove(&ks, key);
+            }
+            if let Err(e) = names_batch.commit_in_parts().await {
+                warn!(
+                    mnemonic = %record.mnemonic,
+                    error = %e,
+                    "DID purged; some of its agent-name index entries were not removed"
+                );
+            }
         }
-        match batch.commit().await {
+        match committed {
             Ok(()) => {
                 deleted += 1;
                 info!(
@@ -262,5 +325,51 @@ mod tests {
         let report = purge_domain_dids(&store, "a.example", "x").await.unwrap();
         assert_eq!(report.deleted, 1, "modern record deleted");
         assert_eq!(report.skipped_no_domain, 1, "legacy record skipped");
+    }
+
+    /// The purge removes the index entries that point at the purged slot and
+    /// leaves one that another slot holds, with and without locks.
+    #[tokio::test]
+    async fn purge_removes_only_the_slots_own_name_index_entries() {
+        use crate::did_ops::{AgentNameEntry, agent_name_key};
+
+        for locks in [None, Some(PathLocks::new())] {
+            let store = fjall_store().await;
+            let mut purged = record("alice", "a.example");
+            for name in ["own", "shared"] {
+                purged.agent_names.push(AgentNameEntry {
+                    name: name.into(),
+                    enabled: true,
+                    created_at: 1,
+                });
+            }
+            seed_record(&store, &purged).await;
+            let ks = store.keyspace(KS_DIDS).unwrap();
+            ks.insert_raw(agent_name_key("a.example", "own"), b"alice".to_vec())
+                .await
+                .unwrap();
+            ks.insert_raw(agent_name_key("a.example", "shared"), b"other".to_vec())
+                .await
+                .unwrap();
+
+            let report = purge_domain_dids_locked(&store, "a.example", "x", locks.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(report.deleted, 1);
+            assert_eq!(
+                ks.get_raw(agent_name_key("a.example", "own"))
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                ks.get_raw(agent_name_key("a.example", "shared"))
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"other"[..]),
+                "another slot's entry survives"
+            );
+        }
     }
 }

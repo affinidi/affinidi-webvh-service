@@ -144,11 +144,14 @@ reconciled registry — not the edge — is the truth.
 **Reconciling is not trusting.** Deriving the registry from `alsoKnownAs` says
 what a document *claims*, never that the claim is allowed. So both reconcile
 sites apply the same preconditions the explicit `set` verb does — reserved names
-refused, a name held by another DID refused, all under `path_locks.guard` — and
-the invariant to preserve when touching any of this is:
+refused, a name held by another DID refused, all under `path_locks.guard` for
+the DID *and* a per-name lock (`did_ops::lock_agent_names`; the DID's lock
+first, then the names in sorted order) — and the invariant to preserve when
+touching any of this is:
 
 > **A name only ever changes owner through an explicit `remove` by its current
-> holder.**
+> holder** (or the deletion of the DID that holds it, which releases its
+> names).
 
 Layer-1 verification cannot enforce that for you, and it is worth understanding
 why: after a hijack the new holder's document genuinely claims the name and the
@@ -289,8 +292,26 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
   an issuer-absent path; the passkey session delegate is per-request, HTTPS-only
   (`with_session_delegate`).
 - **A proof failing against a cached DID document is re-resolved once**
-  (rate-limited per DID) before refusal, so a rotation doesn't strand a peer;
-  the cache TTL is `DID_CACHE_TTL_SECS`.
+  (rate-limited per DID identity, bounded map) before refusal, so a rotation
+  doesn't strand a peer; the cache TTL is `DID_CACHE_TTL_SECS`. A DID that
+  could not be resolved at all is not re-resolved (it is reported retryable).
+- **Signers outside the ACL never touch the shared replay cache.**
+  `messaging::replay_partition` picks where a signed document is recorded:
+  open reads (`server/info`, discovery, an unserved `auth/oob/*` version)
+  nowhere; ACL members (and admitted watchers) in the shared cache; any
+  other signer of a sign-in row (`auth/*`, passkey login, invite redemption)
+  in `crate::unlisted_signers`' sign-in cache, with a per-source quota; a
+  `did:webs` self-registration in a third, small cache. A record in any
+  cache is a replay for all of them. Such a signer's proof (unless it is a
+  self-registration, verified against its own key event log, or the
+  delegate of a member whose signed evidence names it —
+  `trust_tasks_auth::vouched_delegate`) is verified under bounds: key-free
+  checks first, then — only for a DID that needs a network resolution — a
+  bounded number of resolution slots, a shared rate and a timeout, with no
+  forced re-resolution. A proxied login's principal must be in the ACL
+  before its delegation evidence is checked, and that check resolves only
+  the principal. Keys like `did:key` cost nothing to mint; never let such a
+  signer's records or resolutions reach what ACL members depend on.
 - **Edges verify what they serve.** A synced webvh log must pass the chain
   check and strictly extend the held log and the per-DID high-water mark
   (`control_register::verify_history`); a deactivated DID takes no further
@@ -409,6 +430,12 @@ Also worth knowing before you go looking for them:
 - **`resolve_webs` must stay ahead of `resolve_web`** in the fallback
   dispatcher; both serve `/did.json`, and only webs can tell whether the
   slot behind it is a webs record.
+- **A `did:webs` outside the ACL may register itself** — only
+  `did/register/0.1`, only on a domain in `[[hosting.webs_self_register]]`,
+  and only with a proof under a key the *submitted* `keri.cesr` establishes
+  (`webs_self_register.rs`). Never verify that proof against a resolved
+  document (the DID does not exist yet), never extend it to another task or
+  method, and grant the ACL entry only after the slot commits.
 - **The service never creates a `did:webs` DID.** `affinidi-did-webs` is
   taken without its `create` feature — the controller holds the KERI
   keys and publishes the stream here, exactly as a VTA publishes a

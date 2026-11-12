@@ -380,6 +380,11 @@ struct SiopIdTokenCredential {
 ///
 /// Returns the refusal reason (operator-log detail only; the wire refusal is
 /// the same opaque `delegationNotRecognized` for every cause) on failure.
+///
+/// Callers check first that `principal` has an ACL entry
+/// ([`principal_is_listed`]): both kinds resolve the principal's DID, and
+/// that must never be a DID a stranger chose. Each check is bounded by
+/// [`crate::unlisted_signers::RESOLUTION_TIMEOUT`].
 async fn verify_delegation_evidence(
     state: &AppState,
     principal: &str,
@@ -428,9 +433,9 @@ async fn verify_delegation_evidence(
                 .trust_tasks_verifier
                 .as_ref()
                 .ok_or_else(|| "no proof verifier configured".to_string())?;
-            verifier
-                .verify(&mandate)
+            tokio::time::timeout(state.unlisted_signers.timeout(), verifier.verify(&mandate))
                 .await
+                .map_err(|_| "credential proof verification timed out".to_string())?
                 .map_err(|e| format!("credential proof failed verification: {e}"))?;
             Ok(())
         }
@@ -441,15 +446,29 @@ async fn verify_delegation_evidence(
             let cred: SiopIdTokenCredential =
                 serde_json::from_value(Value::Object(evidence.credential.clone()))
                     .map_err(|e| format!("credential is not a siopIdToken payload: {e}"))?;
+            // Refused before anything is resolved unless the token at least
+            // claims to be the principal's: the only DID it may make this
+            // service resolve is one the caller has already checked.
+            if !did_hosting_common::server::didcomm_unpack::siop_id_token_claimed_issuer(
+                &cred.id_token,
+            )
+            .is_some_and(|iss| did_hosting_common::scid::same_reference(&iss, principal))
+            {
+                return Err("id_token does not claim to be issued by the principal".into());
+            }
             let did_resolver = state
                 .did_resolver
                 .as_ref()
                 .ok_or_else(|| "no DID resolver configured".to_string())?;
-            let verified = did_hosting_common::server::didcomm_unpack::verify_siop_id_token(
-                &cred.id_token,
-                did_resolver,
+            let verified = tokio::time::timeout(
+                state.unlisted_signers.timeout(),
+                did_hosting_common::server::didcomm_unpack::verify_siop_id_token(
+                    &cred.id_token,
+                    did_resolver,
+                ),
             )
             .await
+            .map_err(|_| "id_token verification timed out".to_string())?
             .map_err(|e| format!("id_token failed verification: {e}"))?;
             if !did_hosting_common::scid::same_reference(&verified.issuer, principal) {
                 return Err("id_token iss/sub does not name the principal".into());
@@ -480,6 +499,52 @@ async fn verify_delegation_evidence(
         }
         other => Err(format!("unrecognized delegationEvidence.kind {other:?}")),
     }
+}
+
+/// Whether `principal` has an ACL entry. A failed lookup counts as `false`:
+/// the caller refuses, and the login can be retried.
+async fn principal_is_listed(state: &AppState, principal: &str) -> bool {
+    matches!(
+        did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, principal).await,
+        Ok(Some(_))
+    )
+}
+
+/// Whether `doc` is a proxied `auth/authenticate/0.3` whose principal has an
+/// ACL entry and whose delegation evidence — signed by that principal,
+/// naming `doc`'s issuer as its delegate — verifies. The gate then verifies
+/// the delegate's own proof as it would a member's, rather than under the
+/// bounds for signers the ACL does not list (`crate::unlisted_signers`): the
+/// member has vouched for it. Everything here resolves only the member's
+/// DID. The arm checks the evidence again; this decides nothing else.
+pub(crate) async fn vouched_delegate(state: &AppState, doc: &TrustTask<Value>) -> bool {
+    use trust_tasks_rs::Payload as _;
+    if doc.type_uri.to_string() != authenticate::Payload::TYPE_URI {
+        return false;
+    }
+    let Some(delegate) = doc.issuer.as_deref() else {
+        return false;
+    };
+    let Ok(payload) = serde_json::from_value::<authenticate::Payload>(doc.payload.clone()) else {
+        return false;
+    };
+    let (Some(principal), Some(evidence)) = (
+        payload.principal.as_ref().map(|p| p.to_string()),
+        payload.delegation_evidence.as_ref(),
+    ) else {
+        return false;
+    };
+    principal != delegate
+        && principal_is_listed(state, &principal).await
+        && verify_delegation_evidence(
+            state,
+            &principal,
+            delegate,
+            payload.challenge.as_str(),
+            evidence,
+        )
+        .await
+        .is_ok()
 }
 
 /// Side state this module keeps *outside* the `vti_common::auth::session`
@@ -593,6 +658,17 @@ async fn authenticate_v3_arm(
                     .with_message("a proxied authenticate must carry delegationEvidence"),
             ));
         };
+        // Only a member may be logged in as, so a principal outside the ACL
+        // is refused before its evidence is checked — which would resolve
+        // whatever DID the request named, before the challenge is even
+        // looked at.
+        if !principal_is_listed(state, &acting_party).await {
+            return Err(denied(
+                &doc,
+                "authenticate",
+                format!("proxied principal {acting_party} has no ACL entry"),
+            ));
+        }
         if let Err(reason) = verify_delegation_evidence(
             state,
             &acting_party,

@@ -110,6 +110,8 @@ export interface Sent {
   doc: Doc;
   /** The `Authorization` header, when one was sent. */
   bearer: string | undefined;
+  /** Whether the request was marked as a background (timer-driven) one. */
+  background: boolean;
 }
 
 /** What the fake answers a request with: a reply document, or `undefined` for
@@ -129,7 +131,11 @@ export function installControlPlane(handler: Handler, serverInfo?: Handler): Sen
       if (path !== "/api/trust-tasks") throw new Error(`unexpected fetch: ${path}`);
       const doc = JSON.parse(String(init?.body ?? "{}")) as Doc;
       const headers = (init?.headers ?? {}) as Record<string, string>;
-      sent.push({ doc, bearer: headers["Authorization"] });
+      sent.push({
+        doc,
+        bearer: headers["Authorization"],
+        background: headers["X-Background-Request"] === "1",
+      });
       if (doc.type === SERVER_INFO) {
         const reply =
           serverInfo?.(doc) ??

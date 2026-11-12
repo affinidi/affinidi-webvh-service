@@ -118,6 +118,25 @@ export interface HealthResponse {
 /** DID hosting method tag carried on every DidRecord. */
 export type DidMethod = "webvh" | "web" | "webs" | "webplus" | string;
 
+/**
+ * Whether `e` asks for a stepped-up session: the declared `stepUpRequired`
+ * where a task declares it, else `permissionDenied` whose message is the
+ * control plane's `step_up_required` class.
+ */
+export function needsStepUp(e: unknown): boolean {
+  return (
+    isRejection(e, "stepUpRequired") ||
+    (isRejection(e, "permissionDenied") && e.payload.message === "step_up_required")
+  );
+}
+
+/** What `changeOwner` did: `offer` is set when the DID did not move yet and
+ *  waits for its recipient to accept. */
+export interface OwnerChangeResult {
+  record: DidRecord;
+  offer?: { newOwner: string; expiresAt: string };
+}
+
 export interface DidRecord {
   mnemonic: string;
   owner: string;
@@ -556,12 +575,26 @@ const T = {
 /** Largest page `did/list` answers. */
 const DID_LIST_PAGE = 1000;
 
+/** Options for a read a page may also send on a timer. `background` marks a
+ *  call the operator did not make, so it does not keep the session alive. */
+export interface ReadOptions {
+  background?: boolean;
+}
+
 /** The control plane's `did/log` for `mnemonic`. */
-function didLog(mnemonic: string, raw: boolean): Promise<DidLog.Response> {
-  return trustTask<DidLog.Payload, DidLog.Response>(T.didLog, {
-    mnemonic,
-    ...(raw ? { raw: true } : {}),
-  });
+function didLog(
+  mnemonic: string,
+  raw: boolean,
+  opts: ReadOptions = {},
+): Promise<DidLog.Response> {
+  return trustTask<DidLog.Payload, DidLog.Response>(
+    T.didLog,
+    {
+      mnemonic,
+      ...(raw ? { raw: true } : {}),
+    },
+    opts,
+  );
 }
 
 /**
@@ -684,10 +717,10 @@ export const api = {
 
   /** A slot with its log summarised: `did/info` for the record, `did/log` for
    *  the summary (webvh parameters are read from the log itself). */
-  getDid: async (mnemonic: string): Promise<DidDetailResponse> => {
+  getDid: async (mnemonic: string, opts: ReadOptions = {}): Promise<DidDetailResponse> => {
     const [info, log] = await Promise.all([
-      trustTask<DidInfo.Payload, DidInfo.Response>(T.didInfo, { mnemonic }),
-      didLog(mnemonic, false).catch((e) => {
+      trustTask<DidInfo.Payload, DidInfo.Response>(T.didInfo, { mnemonic }, opts),
+      didLog(mnemonic, false, opts).catch((e) => {
         // A slot with no published content has no log; that is not a failure.
         if (isRejection(e, "notFound")) return null;
         throw e;
@@ -699,8 +732,8 @@ export const api = {
     };
   },
 
-  getDidLog: async (mnemonic: string): Promise<LogEntryInfo[]> =>
-    logEntriesFromWire(await didLog(mnemonic, false)),
+  getDidLog: async (mnemonic: string, opts: ReadOptions = {}): Promise<LogEntryInfo[]> =>
+    logEntriesFromWire(await didLog(mnemonic, false, opts)),
 
   /** The stored `did.jsonl`, verbatim. */
   getRawLog: async (mnemonic: string): Promise<string> =>
@@ -721,15 +754,31 @@ export const api = {
     return { mnemonic: resp.record.mnemonic, didUrl: resp.record.didUrl ?? null };
   },
 
-  changeOwner: async (mnemonic: string, newOwner: string): Promise<DidRecord> =>
-    didRecordFromWire(
-      (
-        await trustTask<DidChangeOwner.Payload, DidChangeOwner.Response>(T.didChangeOwner, {
-          mnemonic,
-          newOwner,
-        })
-      ).record,
-    ),
+  /**
+   * Move a DID to `newOwner`. An administrator's request moves it at once.
+   * An owner's request only offers it: `offer` is set, the record is
+   * unchanged, and the DID moves when the recipient accepts
+   * (`acceptDidTransfer`). Naming the current owner withdraws an offer.
+   */
+  changeOwner: async (mnemonic: string, newOwner: string): Promise<OwnerChangeResult> => {
+    const resp = await trustTask<DidChangeOwner.Payload, DidChangeOwner.Response>(
+      T.didChangeOwner,
+      { mnemonic, newOwner },
+    );
+    const transfer = (resp.ext as Record<string, any> | undefined)?.[WEBVH_EXT]?.ownerTransfer;
+    return {
+      record: didRecordFromWire(resp.record),
+      offer:
+        transfer?.status === "offered" && typeof transfer.newOwner === "string"
+          ? { newOwner: transfer.newOwner, expiresAt: String(transfer.expiresAt ?? "") }
+          : undefined,
+    };
+  },
+
+  /** Accept a DID its owner offered to `me` (the signed-in DID): the same
+   *  `did/change-owner`, sent by the recipient naming itself. */
+  acceptDidTransfer: async (mnemonic: string, me: string): Promise<DidRecord> =>
+    (await api.changeOwner(mnemonic, me)).record,
 
   /** Is `path` free? A read-only probe. */
   checkName: async (path: string, domain?: string): Promise<CheckNameResponse> => {
@@ -752,11 +801,15 @@ export const api = {
 
   /** DID -> its served agent names, batched. Only DIDs the caller may read
    *  and this service serves come back; read a miss and an empty list alike. */
-  resolveAgentNames: async (dids: string[]): Promise<AgentNameResolveResponse> => {
+  resolveAgentNames: async (
+    dids: string[],
+    opts: ReadOptions = {},
+  ): Promise<AgentNameResolveResponse> => {
     if (dids.length === 0) return { names: {} };
     const r = await trustTask<AgentNameResolve.Payload, AgentNameResolve.Response>(
       T.agentNameResolve,
       { dids: dids as [string, ...string[]] },
+      opts,
     );
     const names: Record<string, string[]> = {};
     for (const e of r.entries) names[e.did] = e.names;
@@ -804,13 +857,15 @@ export const api = {
 
   // ---- Stats ----
 
-  getStats: async (mnemonic: string): Promise<DidStats> =>
+  getStats: async (mnemonic: string, opts: ReadOptions = {}): Promise<DidStats> =>
     statsFromWire(
-      await trustTask<StatsGet.Payload, StatsGet.Response>(T.statsGet, { mnemonic }),
+      await trustTask<StatsGet.Payload, StatsGet.Response>(T.statsGet, { mnemonic }, opts),
     ),
 
-  getServerStats: async (): Promise<ServerStats> =>
-    statsFromWire(await trustTask<StatsGet.Payload, StatsGet.Response>(T.statsGet, {})),
+  getServerStats: async (opts: ReadOptions = {}): Promise<ServerStats> =>
+    statsFromWire(
+      await trustTask<StatsGet.Payload, StatsGet.Response>(T.statsGet, {}, opts),
+    ),
 
   getServerTimeseries: async (
     range: TimeRange = "24h",
@@ -836,17 +891,17 @@ export const api = {
 
   // ---- The deployment ----
 
-  getConfig: async (): Promise<ControlPlaneConfig> =>
+  getConfig: async (opts: ReadOptions = {}): Promise<ControlPlaneConfig> =>
     configFromWire(
-      await trustTask<ServerConfig.Payload, ServerConfig.Response>(T.serverConfig, {}),
+      await trustTask<ServerConfig.Payload, ServerConfig.Response>(T.serverConfig, {}, opts),
     ),
 
   /** Control plane + fleet + totals, for the dashboard. Admin. */
-  getServicesOverview: async (): Promise<ServiceOverview> => {
+  getServicesOverview: async (opts: ReadOptions = {}): Promise<ServiceOverview> => {
     const [config, services, stats] = await Promise.all([
-      api.getConfig(),
-      api.listRegistry(),
-      api.getServerStats(),
+      api.getConfig(opts),
+      api.listRegistry(opts),
+      api.getServerStats(opts),
     ]);
     const count = (s: ServiceInstance["status"]) =>
       services.filter((i) => i.status === s).length;
@@ -873,9 +928,9 @@ export const api = {
     };
   },
 
-  listRegistry: async (): Promise<ServiceInstance[]> =>
+  listRegistry: async (opts: ReadOptions = {}): Promise<ServiceInstance[]> =>
     (
-      await trustTask<RegistryList.Payload, RegistryList.Response>(T.registryList, {})
+      await trustTask<RegistryList.Payload, RegistryList.Response>(T.registryList, {}, opts)
     ).instances.map(serviceInstanceFromWire),
 
   /** Assign a hosting domain to a server instance; the control plane queues
@@ -1181,7 +1236,7 @@ export const api = {
     try {
       await purge();
     } catch (e) {
-      if (!isRejection(e, "stepUpRequired")) throw e;
+      if (!needsStepUp(e)) throw e;
       await api.stepUp();
       await purge();
     }
@@ -1261,11 +1316,16 @@ export const api = {
 
   // ---- Passkey login (Trust Tasks) ----
 
-  /** Open a login ceremony. Sent anonymously: opening one authorises nothing. */
-  passkeyLoginStart: async (): Promise<LoginStartResponse> => {
+  /**
+   * Open a login ceremony. Sent anonymously: opening one authorises nothing.
+   * With no `subject` the browser offers the passkeys it can find by itself;
+   * naming one also lists that subject's credentials, for a security key
+   * enrolled as non-discoverable.
+   */
+  passkeyLoginStart: async (subject?: string): Promise<LoginStartResponse> => {
     const r = await trustTask<LoginStart.Payload, LoginStart.Response>(
       T.loginStart,
-      { purpose: "login" },
+      { purpose: "login", ...(subject ? { subject } : {}) },
       { signer: "none", anonymous: true },
     );
     return { authId: r.authId, options: r.options };
@@ -1304,10 +1364,20 @@ export const api = {
     role: Role,
     purpose: InvitePurpose = "session",
   ): Promise<CreateInviteResponse> => {
-    const r = await trustTask<Invite.Payload, Invite.Response>(T.invite, {
-      subject: did,
-      ...(purpose === "session" ? { role } : { purpose }),
-    });
+    // Issuing an invite needs a stepped-up session, like a purge.
+    const send = () =>
+      trustTask<Invite.Payload, Invite.Response>(T.invite, {
+        subject: did,
+        ...(purpose === "session" ? { role } : { purpose }),
+      });
+    let r: Invite.Response;
+    try {
+      r = await send();
+    } catch (e) {
+      if (!needsStepUp(e)) throw e;
+      await api.stepUp();
+      r = await send();
+    }
     return {
       inviteUrl: r.invite.url,
       claimCode: r.claimCode,

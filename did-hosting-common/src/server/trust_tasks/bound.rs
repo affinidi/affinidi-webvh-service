@@ -213,10 +213,37 @@ async fn verify_bound<P>(
 where
     P: Serialize + Send + Sync,
 {
+    precheck_sender_bound(doc, expected_issuer, transport_sender, my_vid, now)?;
+    match relationship {
+        Relationship::Authentication => verifier.verify_operational(doc).await?,
+        Relationship::AssertionMethod => verifier.verify_approval(doc).await?,
+    }
+    // The identity, not the reference: a did:scid issuer may carry the `src`
+    // its recipient needed to resolve it, which is not part of who it is.
+    Ok(crate::scid::identity(issuer_of(doc)?))
+}
+
+fn issuer_of<P>(doc: &TrustTask<P>) -> Result<&str, BoundError> {
+    doc.issuer.as_deref().ok_or(BoundError::MissingIssuer)
+}
+
+/// The checks of [`verify_sender_bound`] that need no key: steps 1–5 of the
+/// rule (proof present, issuer, transport sender, recipient, freshness and
+/// expiry), with nothing resolved. A caller that must spend a scarce
+/// resource on the proof itself — a DID resolution for a signer it has no
+/// standing relationship with — runs this first, so a document that would be
+/// refused anyway costs nothing. [`verify_sender_bound`] runs it again.
+pub fn precheck_sender_bound<P>(
+    doc: &TrustTask<P>,
+    expected_issuer: Option<&str>,
+    transport_sender: Option<&str>,
+    my_vid: &str,
+    now: DateTime<Utc>,
+) -> Result<(), BoundError> {
     if doc.proof.is_none() {
         return Err(BoundError::MissingProof);
     }
-    let issuer = doc.issuer.as_deref().ok_or(BoundError::MissingIssuer)?;
+    let issuer = issuer_of(doc)?;
     if let Some(expected) = expected_issuer
         && !same_reference(issuer, expected)
     {
@@ -254,13 +281,7 @@ where
     {
         return Err(BoundError::Expired(expires_at));
     }
-    match relationship {
-        Relationship::Authentication => verifier.verify_operational(doc).await?,
-        Relationship::AssertionMethod => verifier.verify_approval(doc).await?,
-    }
-    // The identity, not the reference: a did:scid issuer may carry the `src`
-    // its recipient needed to resolve it, which is not part of who it is.
-    Ok(crate::scid::identity(issuer))
+    Ok(())
 }
 
 /// Why a document failed [`verify_bound_key`].

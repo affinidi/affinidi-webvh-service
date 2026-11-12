@@ -50,5 +50,7 @@ pub mod test_support;
 pub mod trust_tasks_auth;
 pub mod trust_tasks_infra;
 pub mod tsp;
+pub mod unlisted_signers;
 #[cfg(test)]
 mod watcher_e2e;
+pub(crate) mod webs_self_register;

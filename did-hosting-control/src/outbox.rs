@@ -160,7 +160,9 @@ fn truncated(err: &str) -> String {
     if err.len() <= MAX {
         err.to_string()
     } else {
-        format!("{}…", &err[..MAX])
+        // Cut on a character boundary: the text can carry a peer's own error
+        // message, and slicing a multi-byte character in half panics.
+        format!("{}…", &err[..err.floor_char_boundary(MAX)])
     }
 }
 
@@ -732,6 +734,20 @@ mod tests {
         assert!(t.ends_with('…'));
         // 200 char prefix + … (1 char in str sense; multi-byte)
         assert_eq!(t.chars().count(), 201);
+    }
+
+    #[test]
+    fn truncated_cuts_on_a_character_boundary() {
+        // A two-byte character straddling byte 200.
+        let long = format!("{}é{}", "x".repeat(199), "y".repeat(100));
+        let t = truncated(&long);
+        assert_eq!(t, format!("{}…", "x".repeat(199)));
+        // Three- and four-byte characters throughout.
+        for ch in ["—", "😀"] {
+            let t = truncated(&ch.repeat(300));
+            assert!(t.ends_with('…'));
+            assert!(t.len() <= 200 + '…'.len_utf8());
+        }
     }
 
     /// A row dropped while the worker is delivering it stays dropped: the

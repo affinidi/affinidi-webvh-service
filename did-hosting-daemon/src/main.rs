@@ -1127,6 +1127,15 @@ async fn run_daemon(config_path: Option<PathBuf>) {
                         .latency_unit(tower_http::LatencyUnit::Millis),
                 ),
         )
+        // The same response headers every standalone service sets (CSP,
+        // `nosniff`, framing, HSTS, `no-store` unless the handler chose its
+        // own `Cache-Control`), over everything the daemon serves: the
+        // console and its assets, the Trust Task listener, the embedded
+        // witness and watcher, and DID resolution, whose handlers set
+        // `Cache-Control: public, …` themselves and keep it.
+        .layer(axum::middleware::from_fn(
+            did_hosting_common::server::security_headers,
+        ))
         // Allow browser-based resolvers to fetch public DID documents
         // cross-origin. Read-only, unauthenticated, wildcard origin.
         .layer(did_hosting_common::server::public_resolution_cors())
@@ -1472,7 +1481,11 @@ async fn run_daemon_storage_task(
                 }
             }
             _ = purge_timer.tick() => {
-                let sweep = did_hosting_server::purge_sweep::run_sweep_once(&params.store).await;
+                // Under the control plane's path locks, as the DID cleanup is.
+                let sweep = did_hosting_server::purge_sweep::run_sweep_once_locked(
+                    &params.store,
+                    params.control_state.as_ref().map(|s| &s.path_locks),
+                ).await;
                 if sweep.entries > 0 {
                     info!(count = sweep.entries, "purge sweep tick completed");
                 }
@@ -1745,6 +1758,7 @@ async fn build_control(
         stats_ks,
         timeseries_ks,
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
+        unlisted_signers: Default::default(),
         replay_cache: Arc::new(did_hosting_control::replay::ReplayCache::with_config(
             config.replay.clone(),
         )?),
@@ -1754,7 +1768,14 @@ async fn build_control(
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
         client_ips: client_ips.clone(),
         ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::challenge_limiter()),
+        login_start_rate_limiter: Arc::new(did_hosting_control::rate_limit::login_start_limiter()),
         redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::redeem_limiter()),
+        webs_self_register_limiter: Arc::new(
+            did_hosting_control::rate_limit::webs_self_register_limiter(),
+        ),
+        webs_self_register_global_limiter: Arc::new(
+            did_hosting_control::rate_limit::webs_self_register_global_limiter(),
+        ),
         cache_invalidate,
         // Wallet sign-in locations from the local GeoIP database, if any
         // (mirrors `did_hosting_control::server`).

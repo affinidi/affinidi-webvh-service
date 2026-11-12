@@ -680,11 +680,12 @@ pub struct FjallTuning {
         deserialize_with = "deserialize_block_cache"
     )]
     pub block_cache: Option<u64>,
-    /// Maximum size of all active memtables across every keyspace this
-    /// process opens, in bytes
-    /// (`fjall::Database::builder(..).max_write_buffer_size(Some(..))`).
-    /// fjall's own default is unbounded. Env override:
-    /// `STORAGE_FJALL_WRITE_BUFFER`.
+    /// Maximum unflushed bytes held in memory across every keyspace this
+    /// process opens. fjall 3.1 stores but does not enforce its own
+    /// `max_write_buffer_size`, so the fjall store's background flusher
+    /// (`store::flusher`) enforces this value; unset, it uses
+    /// `store::flusher::DEFAULT_WRITE_BUFFER_LIMIT` (8 MiB).
+    /// Env override: `STORAGE_FJALL_WRITE_BUFFER`.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -694,7 +695,9 @@ pub struct FjallTuning {
     /// Maximum size of all journals — the write-ahead log fjall replays
     /// on startup — in bytes
     /// (`fjall::Database::builder(..).max_journaling_size(..)`). fjall's
-    /// own default is 512 MiB. Env override: `STORAGE_FJALL_MAX_JOURNAL`.
+    /// own default is 512 MiB. fjall only checks it while flushing, which
+    /// the store's background flusher now makes happen regularly. Env
+    /// override: `STORAGE_FJALL_MAX_JOURNAL`.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -1228,6 +1231,84 @@ pub struct HostingConfig {
     /// what it published. Default: `true`. Env: `<PREFIX>_HOSTING_SCID_ALSO_KNOWN_AS`.
     #[serde(default = "default_true")]
     pub scid_also_known_as: bool,
+
+    /// Hosting domains on which a `did:webs` may register itself, with no
+    /// ACL entry: a `did/register/0.1` whose `issuer` is the `did:webs`
+    /// the slot builds and whose proof verifies under the key state its own
+    /// submitted `keri.cesr` establishes. The key event log is the proof of
+    /// control; nothing else is asked for. Empty (default): no domain
+    /// accepts it, and an unknown `did:webs` is refused as any caller
+    /// outside the ACL is.
+    ///
+    /// Read only by a control plane built with `method-webs`; ignored
+    /// otherwise. See `docs/did-webs-hosting.md` ("Self-registration").
+    ///
+    /// ```toml
+    /// [[hosting.webs_self_register]]
+    /// domain = "did.example.com"
+    /// path_prefixes = ["nodes"]   # optional; empty = any path
+    /// ```
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub webs_self_register: Vec<WebsSelfRegistration>,
+}
+
+/// One hosting domain's opt-in to `did:webs` self-registration
+/// ([`HostingConfig::webs_self_register`]).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WebsSelfRegistration {
+    /// The hosting domain, as it is configured in the domain registry
+    /// (compared after normalisation).
+    pub domain: String,
+    /// Leading path segments a self-registered slot must sit under, each
+    /// `a/b` matched on whole segments (`nodes` admits `nodes/{AID}` and
+    /// `nodes/eu/{AID}`, not `nodesx/{AID}`). Empty: any path on the
+    /// domain, the bare `{AID}` included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_prefixes: Vec<String>,
+    /// The most identifiers that may hold a self-registered slot on this
+    /// domain at once (default [`DEFAULT_WEBS_SELF_REGISTER_MAX`]). Opting a
+    /// domain in opens it to anyone with a key event log, and each AID is
+    /// free to mint, so the rate limits bound how fast slots can be taken
+    /// and this bounds how many. Counted from the owner entries
+    /// self-registration grants; an administrator who deletes one frees its
+    /// place. Per-process like the rate limits: replicas behind one store
+    /// can overshoot it by at most one each.
+    #[serde(default = "default_webs_self_register_max")]
+    pub max_registrations: u32,
+}
+
+/// The default [`WebsSelfRegistration::max_registrations`]: enough for a
+/// deployment's own nodes, not a public registry.
+pub const DEFAULT_WEBS_SELF_REGISTER_MAX: u32 = 100;
+
+fn default_webs_self_register_max() -> u32 {
+    DEFAULT_WEBS_SELF_REGISTER_MAX
+}
+
+impl Default for WebsSelfRegistration {
+    fn default() -> Self {
+        Self {
+            domain: String::new(),
+            path_prefixes: Vec::new(),
+            max_registrations: DEFAULT_WEBS_SELF_REGISTER_MAX,
+        }
+    }
+}
+
+impl WebsSelfRegistration {
+    /// Whether a slot at `path` (`/`-separated, ending in the AID) is
+    /// under one of this domain's prefixes.
+    pub fn admits_path(&self, path: &str) -> bool {
+        self.path_prefixes.is_empty()
+            || self.path_prefixes.iter().any(|prefix| {
+                let prefix = prefix.trim_matches('/');
+                !prefix.is_empty()
+                    && path
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with('/') && rest.len() > 1)
+            })
+    }
 }
 
 fn default_unassigned_purge_grace() -> String {
@@ -1245,6 +1326,7 @@ impl Default for HostingConfig {
             unassigned_purge_grace: default_unassigned_purge_grace(),
             disable_purge_grace: default_disable_purge_grace(),
             scid_also_known_as: true,
+            webs_self_register: Vec::new(),
         }
     }
 }
@@ -1842,6 +1924,46 @@ pub fn init_tracing(log: &LogConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `did:webs` self-registration is off unless a domain opts in, and a
+    /// domain's prefixes match whole leading segments only.
+    #[test]
+    fn webs_self_register_is_off_by_default_and_matches_whole_segments() {
+        let hosting: HostingConfig = toml::from_str("").unwrap();
+        assert!(hosting.webs_self_register.is_empty());
+
+        let hosting: HostingConfig = toml::from_str(
+            "[[webs_self_register]]\ndomain = \"did.example.com\"\n\
+             [[webs_self_register]]\ndomain = \"b.example\"\npath_prefixes = [\"nodes\", \"x/y\"]",
+        )
+        .unwrap();
+        let [any, scoped] = hosting.webs_self_register.as_slice() else {
+            panic!("two domains");
+        };
+        assert!(any.admits_path("EAID"));
+        assert!(any.admits_path("a/EAID"));
+        assert!(scoped.admits_path("nodes/EAID"));
+        assert!(scoped.admits_path("nodes/eu/EAID"));
+        assert!(scoped.admits_path("x/y/EAID"));
+        assert!(!scoped.admits_path("EAID"));
+        assert!(!scoped.admits_path("nodesx/EAID"));
+        assert!(!scoped.admits_path("nodes/"));
+        assert!(!scoped.admits_path("x/EAID"));
+        // Capped by default, and the cap is the operator's to set.
+        assert_eq!(any.max_registrations, DEFAULT_WEBS_SELF_REGISTER_MAX);
+        let hosting: HostingConfig =
+            toml::from_str("[[webs_self_register]]\ndomain = \"a\"\nmax_registrations = 3")
+                .unwrap();
+        assert_eq!(hosting.webs_self_register[0].max_registrations, 3);
+
+        // An unknown member is refused, not ignored.
+        assert!(
+            toml::from_str::<HostingConfig>(
+                "[[webs_self_register]]\ndomain = \"a\"\nprefixes = [\"n\"]"
+            )
+            .is_err()
+        );
+    }
 
     /// An absent `[replay]` table keeps today's bounds; a set one replaces
     /// them, and an inconsistent one is refused.

@@ -1505,8 +1505,31 @@ async fn route_trust_task_doc(
             return Ok(RoutedReply::Sealed(refused));
         }
     }
+    // ── did:webs self-registration (`crate::webs_self_register`). A
+    //    `did/register/0.1` from a `did:webs` the ACL does not list, on a
+    //    domain whose operator enabled it, is authenticated by the key event
+    //    log it submits instead of by an ACL entry: checked here — before the
+    //    ACL pre-filter it is exempt from, and before any proof work — and its
+    //    proof is then verified against that log's key state below. Anything
+    //    else (`None`) goes through this gate unchanged.
+    #[cfg(feature = "method-webs")]
+    let webs_candidate =
+        match crate::webs_self_register::admit(state, sender, https, &type_uri, &doc).await {
+            Ok(candidate) => candidate,
+            Err(reason) => {
+                return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
+                    doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
+                ))));
+            }
+        };
+    #[cfg(feature = "method-webs")]
+    let self_registering = webs_candidate.is_some();
+    #[cfg(not(feature = "method-webs"))]
+    let self_registering = false;
+
     let signed = rule != ProofRule::Optional || doc.proof.is_some();
-    let needs_acl = matches!(rule, ProofRule::Authentication | ProofRule::AssertionMethod);
+    let needs_acl =
+        matches!(rule, ProofRule::Authentication | ProofRule::AssertionMethod) && !self_registering;
     // A session ceremony is signed by a `did:key` the caller holds: as the
     // issuer itself, or — for a session that already exists — as that
     // session's delegate key.
@@ -1558,6 +1581,40 @@ async fn route_trust_task_doc(
             ))));
         }
     }
+    // Whether the signer is one this service has a standing relationship
+    // with: past the pre-filter above, or — for a rule without one — listed
+    // in the ACL. The proof below binds the proven signer to `sender`, so by
+    // the time the replay cache is chosen this describes the proven signer.
+    // An unlisted signer's proof is verified under the bounds of
+    // `crate::unlisted_signers`, and its record goes into that module's own
+    // replay cache, never the shared one. A failed lookup counts as
+    // unlisted: the stricter of the two.
+    let listed_signer = needs_acl
+        || (signed
+            && matches!(
+                did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, sender).await,
+                Ok(Some(_))
+            ));
+    // A self-registration's proof, verified against the key state its own
+    // key event log establishes (never a resolved document): the identifier
+    // it proves, and the `SelfCertifiedWebs` the register row runs as.
+    #[cfg(feature = "method-webs")]
+    let (self_certified, self_bound) = match webs_candidate {
+        Some(candidate) => match candidate.verify(&doc, sender, my_vid).await {
+            Ok(webs) => {
+                let did = webs.did().to_string();
+                (Some(webs), Some(Ok(did)))
+            }
+            Err(e) => (None, Some(Err(e))),
+        },
+        None => (None, None),
+    };
+    #[cfg(not(feature = "method-webs"))]
+    let (self_certified, self_bound): (
+        Option<crate::webs_self_register::SelfCertifiedWebs>,
+        Option<Result<String, did_hosting_common::server::trust_tasks::BoundError>>,
+    ) = (None, None);
+
     let principal = if signed {
         let bound = match rule {
             ProofRule::AssertionMethod => {
@@ -1579,7 +1636,37 @@ async fn route_trust_task_doc(
                     )));
                 }
             },
-            _ => verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await,
+            _ => match self_bound {
+                Some(bound) => bound,
+                None if listed_signer => {
+                    verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await
+                }
+                // The delegate of a proxied login whose principal, an ACL
+                // member, signed the evidence naming it: verified as the
+                // member's own requests are.
+                None if crate::trust_tasks_auth::vouched_delegate(state, &doc).await => {
+                    verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await
+                }
+                None => match state
+                    .unlisted_signers
+                    .verify(&doc, sender, my_vid, verifier)
+                    .await
+                {
+                    Ok(principal) => Ok(principal),
+                    Err(Err(e)) => Err(e),
+                    Err(Ok(reason)) => {
+                        did_hosting_common::server::trust_tasks::size::settle_large_document_charge(
+                            &state.large_document_budget,
+                            large_doc_charge.as_ref(),
+                            None,
+                        );
+                        warn!(sender, %type_uri, "trust task deferred: unlisted signer over its verification bounds");
+                        return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
+                            doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
+                        ))));
+                    }
+                },
+            },
         };
         // Settle any large-document charge against this verification's own
         // outcome — before the early return below, so a claimed issuer that
@@ -1608,18 +1695,51 @@ async fn route_trust_task_doc(
     // document id. A captured document re-submitted inside the freshness window
     // — on any transport, in any framing — is refused as an id conflict.
     // At its bounds the cache refuses (retryable) rather than forgetting.
-    if signed
-        && rule.uses_shared_replay_cache()
-        && let Err(e) = state.replay_cache.check(&principal, &doc.id, doc.issued_at)
-    {
-        warn!(did = %principal, doc_id = %doc.id, %type_uri, ?e, "trust task refused: replay cache");
-        let reason = e.reject_reason();
-        return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
-            doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
-        ))));
+    // Which cache, if any, is `replay_partition`'s choice: ACL members' go to
+    // the shared one, and nothing a signer the ACL does not list sends can
+    // fill it (see `crate::unlisted_signers`). A record already in another
+    // cache — the signer's ACL entry changed inside the window — is a replay
+    // too.
+    let replay_cache = if signed {
+        state.unlisted_signers.cache(
+            replay_partition(&type_uri, rule, listed_signer, self_registering),
+            &state.replay_cache,
+        )
+    } else {
+        None
+    };
+    if let Some(cache) = replay_cache {
+        let replayed = state
+            .unlisted_signers
+            .all(&state.replay_cache)
+            .into_iter()
+            .filter(|other| !std::ptr::eq(*other, cache))
+            .any(|other| other.contains(&principal, &doc.id, doc.issued_at));
+        let refusal = if replayed {
+            Some(crate::replay::ReplayError::Duplicate.reject_reason())
+        } else if std::ptr::eq(cache, &state.unlisted_signers.sign_in)
+            && let Err(reason) = state.unlisted_signers.charge_sign_in(match https {
+                Some(h) => {
+                    h.ip.map_or_else(|| "ip:unknown".to_string(), |ip| format!("ip:{ip}"))
+                }
+                None => format!("vid:{sender}"),
+            })
+        {
+            Some(reason)
+        } else {
+            cache
+                .check(&principal, &doc.id, doc.issued_at)
+                .err()
+                .map(|e| e.reject_reason())
+        };
+        if let Some(reason) = refusal {
+            warn!(did = %principal, doc_id = %doc.id, %type_uri, ?reason, "trust task refused: replay cache");
+            return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
+                doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
+            ))));
+        }
     }
-    let recorded = (signed && rule.uses_shared_replay_cache())
-        .then(|| (principal.clone(), doc.id.clone(), doc.issued_at));
+    let recorded = replay_cache.map(|_| (principal.clone(), doc.id.clone(), doc.issued_at));
 
     let (reply, wrote) = did_hosting_common::server::store::track_writes(Box::pin(async {
         // Proofs are verified on every path — there is no configuration under
@@ -1673,6 +1793,7 @@ async fn route_trust_task_doc(
         let doc = match crate::control_tasks::route(
             state,
             bearer,
+            self_certified.as_ref(),
             https,
             transport,
             trust_tasks_rs::ProofPolicy::<TransportBoundVerifier>::AcceptUnverified,
@@ -1708,10 +1829,11 @@ async fn route_trust_task_doc(
     // One that attempted a write may have applied part of it, so its record
     // stays and a retry must be a new document.
     if let Some((signer, id, issued_at)) = &recorded
+        && let Some(replay_cache) = replay_cache
         && !wrote
         && matches!(&reply, Ok(r) if r.is_unavailable())
     {
-        state.replay_cache.release(signer, id, *issued_at);
+        replay_cache.release(signer, id, *issued_at);
     }
     reply
 }
@@ -1755,6 +1877,36 @@ pub(crate) fn proof_rule(type_uri: &str) -> ProofRule {
         return ProofRule::Optional;
     }
     ProofRule::Authentication
+}
+
+/// Where a signed `type_uri` document's `(signer, id)` record goes (see
+/// [`crate::unlisted_signers`]): nowhere for an open read — `server/info`,
+/// capability discovery, an `auth/oob/*` version this service does not serve
+/// — or a bound-key row, which keeps its own; the shared cache for a signer
+/// the ACL lists (or the gate admitted as a configured watcher); otherwise,
+/// for a signer the ACL does not list, the sign-in cache, or the cache for
+/// everything else (a `did:webs` self-registration).
+pub(crate) fn replay_partition(
+    type_uri: &str,
+    rule: ProofRule,
+    listed_signer: bool,
+    self_registering: bool,
+) -> crate::unlisted_signers::ReplayPartition {
+    use crate::unlisted_signers::ReplayPartition;
+    use trust_tasks_rs::Payload;
+    let open_read = type_uri
+        == did_hosting_common::tasks::did_management::server::info::v0_1::Payload::TYPE_URI
+        || type_uri == trust_tasks_rs::specs::trust_task_discovery::v0_3::Payload::TYPE_URI
+        || (rule == ProofRule::Optional && type_uri.starts_with(OOB_FAMILY_PREFIX));
+    if !rule.uses_shared_replay_cache() || open_read {
+        ReplayPartition::None
+    } else if listed_signer {
+        ReplayPartition::Shared
+    } else if self_registering {
+        ReplayPartition::Other
+    } else {
+        ReplayPartition::SignIn
+    }
 }
 
 /// The `auth/oob/*` family's Type URIs (see [`proof_rule`]).
@@ -1904,13 +2056,19 @@ mod tests {
             stats_ks: stats_ks.clone(),
             timeseries_ks: store.keyspace(KS_TIMESERIES).expect("timeseries ks"),
             signing_key_bytes: None,
+            unlisted_signers: Default::default(),
             replay_cache: Arc::new(crate::replay::ReplayCache::new()),
             path_locks: crate::path_locks::PathLocks::new(),
             acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
             pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
             client_ips: Default::default(),
             ip_rate_limiter: Arc::new(crate::rate_limit::challenge_limiter()),
+            login_start_rate_limiter: Arc::new(crate::rate_limit::login_start_limiter()),
             redeem_rate_limiter: Arc::new(crate::rate_limit::redeem_limiter()),
+            webs_self_register_limiter: Arc::new(crate::rate_limit::webs_self_register_limiter()),
+            webs_self_register_global_limiter: Arc::new(
+                crate::rate_limit::webs_self_register_global_limiter(),
+            ),
             large_document_budget: Arc::new(
                 did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
             ),

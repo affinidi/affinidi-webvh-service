@@ -349,6 +349,13 @@ pub async fn demote_non_passkey_step_up_sessions(
     Ok(demoted)
 }
 
+/// The control plane's passkey login ceremony rows, `pk_task_meta:{authId}`.
+const LOGIN_CEREMONY_PREFIX: &str = "pk_task_meta:";
+
+/// Where a login ceremony's WebAuthn state was kept before it moved into its
+/// `pk_task_meta:` row, `pk_auth:{authId}`.
+const LEGACY_LOGIN_STATE_PREFIX: &str = "pk_auth:";
+
 /// Remove expired sessions from the store.
 ///
 /// - `ChallengeSent` sessions expire after `challenge_ttl` seconds from `created_at`.
@@ -416,6 +423,54 @@ pub async fn cleanup_expired_sessions(
                 }
                 removed += 1;
             }
+        }
+    }
+
+    // Expired control-plane ceremonies: passkey login (`pk_task_meta:`, and
+    // the `pk_auth:` row an older build kept its state in), passkey
+    // revocation (`pk_revoke:`), step-up (`stepup-task:`) and DID ownership
+    // transfer offers (`did_xfer:`). Each carries `expires_at`; a finish
+    // refuses one past it, so the row is dead weight from then on. A login is
+    // opened unauthenticated, so without this every abandoned one stayed.
+    for prefix in [
+        LOGIN_CEREMONY_PREFIX,
+        "pk_revoke:",
+        "stepup-task:",
+        "did_xfer:",
+    ] {
+        for (key, value) in sessions.prefix_iter_raw(prefix).await? {
+            if let Ok(e) = serde_json::from_slice::<Expiry>(&value)
+                && now > e.expires_at
+            {
+                sessions.remove(key.clone()).await?;
+                if let Some(id) = key
+                    .strip_prefix(LOGIN_CEREMONY_PREFIX.as_bytes())
+                    .and_then(|id| std::str::from_utf8(id).ok())
+                {
+                    sessions
+                        .remove(format!("{LEGACY_LOGIN_STATE_PREFIX}{id}"))
+                        .await?;
+                }
+                removed += 1;
+            }
+        }
+    }
+    // A `pk_auth:` row is only ever read together with its `pk_task_meta:`
+    // row; once that is gone (finished, swept, or never written) it is
+    // unreachable.
+    for (key, _) in sessions.prefix_iter_raw(LEGACY_LOGIN_STATE_PREFIX).await? {
+        let Some(id) = key
+            .strip_prefix(LEGACY_LOGIN_STATE_PREFIX.as_bytes())
+            .and_then(|id| std::str::from_utf8(id).ok())
+        else {
+            continue;
+        };
+        if !sessions
+            .contains_key(format!("{LOGIN_CEREMONY_PREFIX}{id}"))
+            .await?
+        {
+            sessions.remove(key.clone()).await?;
+            removed += 1;
         }
     }
 

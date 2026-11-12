@@ -15,6 +15,7 @@ import { useAuth } from "../../components/AuthProvider";
 import { AgentNameChips } from "../../components/AgentNameChips";
 import { useAgentNames } from "../../lib/use-agent-names";
 import { hasLogMovedPast } from "../../lib/pinned-edit";
+import { startPolling } from "../../lib/poll";
 import { extractDidHost } from "../../lib/domain";
 import { scidAliasesOf } from "../../lib/did-scid";
 import {
@@ -164,18 +165,20 @@ export default function DidDetail() {
   // Guards the one-time path prefill below so it never clobbers later edits.
   const namePrefilled = useRef(false);
 
-  const loadData = useCallback(() => {
+  // `background`: the reload follows a timer-driven check rather than the
+  // operator, so it must not keep the session alive (see `lib/poll.ts`).
+  const loadData = useCallback((opts: { background?: boolean } = {}) => {
     if (!mnemonic || !isAuthenticated) return;
     api
-      .getStats(mnemonic)
+      .getStats(mnemonic, opts)
       .then(setStats)
       .catch((e) => setStatsError(e.message));
     api
-      .getDid(mnemonic)
+      .getDid(mnemonic, opts)
       .then(setDidDetail)
       .catch(() => {});
     api
-      .getDidLog(mnemonic)
+      .getDidLog(mnemonic, opts)
       .then((entries) => {
         setLogEntries(entries);
         setSelectedVersion(entries.length - 1);
@@ -404,17 +407,27 @@ export default function DidDetail() {
     if (!newOwner) return;
     showConfirm(
       "Change Owner",
-      `Transfer ownership of "${mnemonic}" to ${newOwner}? The new owner must already exist in the ACL.`,
+      role === "admin"
+        ? `Transfer ownership of "${mnemonic}" to ${newOwner}? The new owner must be in the ACL, and its domain scope and quota must allow this DID.`
+        : `Offer "${mnemonic}" to ${newOwner}? It moves when they accept it from their DID list.`,
       async () => {
         setChangingOwner(true);
         try {
-          const result = await api.changeOwner(mnemonic, newOwner);
+          const { record, offer } = await api.changeOwner(mnemonic, newOwner);
           setDidDetail((prev) =>
-            prev ? { ...prev, owner: result.owner, updatedAt: result.updatedAt } : prev,
+            prev ? { ...prev, owner: record.owner, updatedAt: record.updatedAt } : prev,
           );
           setNewOwnerInput("");
           setShowChangeOwner(false);
-          showAlert("Success", "DID owner changed");
+          if (offer) {
+            const until = offer.expiresAt ? new Date(offer.expiresAt).toLocaleString() : "";
+            showAlert(
+              "Offer sent",
+              `${offer.newOwner} can accept "${mnemonic}" from their DID list${until ? ` until ${until}` : ""}. You stay the owner until then.`,
+            );
+          } else {
+            showAlert("Success", "DID owner changed");
+          }
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : "Change owner failed";
           showAlert("Error", msg);
@@ -637,10 +650,12 @@ export default function DidDetail() {
   useEffect(() => {
     if (!consent || !mnemonic || !isAuthenticated) return;
     let cancelled = false;
+    // Every check is a background read: it runs on a timer while the page
+    // waits, and must not keep an unattended session alive.
     const check = async () => {
       let entries: LogEntryInfo[];
       try {
-        entries = await api.getDidLog(mnemonic);
+        entries = await api.getDidLog(mnemonic, { background: true });
       } catch {
         // Transient — the next tick retries. Never surfaced: a failed poll is
         // indistinguishable to the user from still waiting.
@@ -654,7 +669,7 @@ export default function DidDetail() {
       resubmitRef.current = null;
       pinnedVersionRef.current = null;
       setConsent(null);
-      loadData();
+      loadData({ background: true });
       // Deliberately not "your change was applied": the log advancing proves
       // only that it moved, not who moved it. Another admin, or the owner's own
       // agent, could have published in the same window, and claiming credit for
@@ -666,10 +681,10 @@ export default function DidDetail() {
       );
     };
     void check();
-    const id = setInterval(() => void check(), 5000);
+    const stop = startPolling(() => void check(), 5000);
     return () => {
       cancelled = true;
-      clearInterval(id);
+      stop();
     };
   }, [consent, mnemonic, isAuthenticated, api, loadData]);
 
@@ -1710,8 +1725,9 @@ export default function DidDetail() {
                 </Pressable>
               </View>
               <Text style={styles.hint}>
-                Transfer this DID to a different identity. The new owner must
-                already be in the ACL.
+                {role === "admin"
+                  ? "Transfer this DID to a different identity. The new owner must be in the ACL, with a domain scope and quota that allow this DID."
+                  : "Offer this DID to a different identity. It moves only when they accept it, within 72 hours."}
               </Text>
               {showChangeOwner && (
                 <>
@@ -1733,7 +1749,11 @@ export default function DidDetail() {
                     disabled={!newOwnerInput.trim() || changingOwner}
                   >
                     <Text style={styles.buttonText}>
-                      {changingOwner ? "Transferring..." : "Transfer Ownership"}
+                      {changingOwner
+                        ? "Sending..."
+                        : role === "admin"
+                          ? "Transfer Ownership"
+                          : "Offer Ownership"}
                     </Text>
                   </Pressable>
                 </>

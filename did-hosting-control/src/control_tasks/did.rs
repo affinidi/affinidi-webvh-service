@@ -13,7 +13,7 @@ use trust_tasks_rs::StandardCode;
 
 use did_hosting_common::server::trust_tasks::ext::WEBVH_EXT_KEY;
 
-use super::{Cx, TaskError, spec_record, typed};
+use super::{Cx, TaskError, at, spec_record, typed};
 use crate::did_ops;
 use crate::error::AppError;
 use crate::server::AppState;
@@ -93,27 +93,55 @@ pub(crate) async fn register(
     cx: &Cx<'_>,
     p: register::v0_1::Payload,
 ) -> Result<register::v0_1::Response, TaskError> {
-    let auth = cx.auth().await?;
+    // A `did:webs` outside the ACL that the gate verified against its own
+    // key event log (`crate::webs_self_register`) registers as itself, an
+    // owner with no ACL entry yet; everyone else is authorised on the ACL.
+    let auth = match cx.self_certified {
+        Some(webs) => webs.claims(),
+        None => cx.auth().await?,
+    };
     let state = cx.state;
-    // The typed payload is the schema's; `DidRegisterRequest::resolve` is the
-    // one place the method is derived from and cross-checked against the data.
-    let req: did_hosting_common::DidRegisterRequest = serde_json::from_value(json!({
-        "path": p.path.as_str(),
-        "method": serde_json::to_value(&p.method)?,
-        "didData": serde_json::to_value(&p.did_data)?,
-        "force": p.force,
-    }))
-    .map_err(|e| AppError::Validation(format!("invalid register payload: {e}")))?;
-    let (method, payload) = req.resolve().map_err(AppError::Validation)?;
-    if method != "webvh" {
-        return Err(AppError::Validation(format!(
-            "this host registers webvh only over this task; received method = '{method}'"
-        ))
-        .into());
+    let (method, payload) = register_method_and_data(&p)?;
+    // webvh, and did:webs where this host is built to verify it: a `keri.cesr`
+    // stream, from which the identifier is built with the slot and domain
+    // (`register_did_atomic`). Every other method is refused by name, so a
+    // caller can tell "this host does not host it" from a bad log.
+    match method.as_str() {
+        "webvh" => {}
+        #[cfg(feature = "method-webs")]
+        "webs" => {}
+        #[cfg(not(feature = "method-webs"))]
+        "webs" => {
+            return Err(AppError::Validation(
+                "this host does not host did:webs: it was built without the `method-webs` \
+                 feature"
+                    .into(),
+            )
+            .into());
+        }
+        other => {
+            return Err(AppError::Validation(format!(
+                "this host registers webvh and did:webs over this task; received method = \
+                 '{other}'"
+            ))
+            .into());
+        }
     }
     let did_log = std::str::from_utf8(&payload).map_err(|e| {
-        AppError::Validation(format!("[log] webvh didData is not valid UTF-8: {e}"))
+        AppError::Validation(format!("[log] {method} didData is not valid UTF-8: {e}"))
     })?;
+
+    // One self-registration per domain at a time, from the count to the
+    // grant, so the domain's `max_registrations` holds under concurrency.
+    let _reserved = match cx.self_certified {
+        Some(webs) => {
+            // The gate read this same document; a disagreement here would be
+            // a routing bug, and is refused before anything is written.
+            webs.matches(p.path.as_str(), p.domain.as_deref(), &method, p.force)?;
+            Some(webs.reserve(state).await?)
+        }
+        None => None,
+    };
 
     let record = did_ops::register_did_atomic(
         &auth,
@@ -124,12 +152,38 @@ pub(crate) async fn register(
         p.domain.as_deref(),
     )
     .await?;
+    if let Some(webs) = cx.self_certified {
+        // After the slot, never before it: a grant for a registration that
+        // then failed would leave a stranger standing here with no slot to
+        // show for it. A crash between the two leaves an owned slot and no
+        // entry, and a retry (the same DID, the same slot) takes this path
+        // again and grants it then.
+        webs.grant_owner_entry(state, &record).await?;
+    }
     server_push::notify_servers_did(state, record.mnemonic.clone());
 
     typed(
         json!({ "record": spec_record::<register::v0_1::DidRecord>(state, &record)? }),
         "register response",
     )
+}
+
+/// The method a `did/register/0.1` payload declares and the bytes it
+/// publishes. The typed payload is the schema's; `DidRegisterRequest::resolve`
+/// is the one place the method is derived from and cross-checked against the
+/// data — for the row, and for the self-registration gate, which must read the
+/// payload exactly as the row will.
+pub(crate) fn register_method_and_data(
+    p: &register::v0_1::Payload,
+) -> Result<(String, Vec<u8>), AppError> {
+    let req: did_hosting_common::DidRegisterRequest = serde_json::from_value(json!({
+        "path": p.path.as_str(),
+        "method": serde_json::to_value(&p.method)?,
+        "didData": serde_json::to_value(&p.did_data)?,
+        "force": p.force,
+    }))
+    .map_err(|e| AppError::Validation(format!("invalid register payload: {e}")))?;
+    req.resolve().map_err(AppError::Validation)
 }
 
 /// `did/info/0.1`.
@@ -510,15 +564,45 @@ pub(crate) async fn change_owner(
     cx: &Cx<'_>,
     p: change_owner::v0_1::Payload,
 ) -> Result<change_owner::v0_1::Response, TaskError> {
+    use change_owner::v0_1::error_codes;
+
     let auth = cx.auth().await?;
     let state = cx.state;
-    let (current, _) = did_ops::get_did_info(&auth, state, &p.mnemonic).await?;
-    did_ops::ensure_slot_domain_matches(&current, p.domain.as_deref())?;
-    let record = did_ops::change_did_owner(&auth, state, &p.mnemonic, &p.new_owner).await?;
-    typed(
-        json!({ "record": spec_record::<change_owner::v0_1::DidRecord>(state, &record)? }),
-        "change-owner response",
+    let change = match did_ops::change_did_owner(
+        &auth,
+        state,
+        &p.mnemonic,
+        &p.new_owner,
+        p.domain.as_deref(),
     )
+    .await
+    {
+        Ok(change) => change,
+        Err(did_ops::OwnerChangeError::TargetNotAuthorized(why)) => {
+            // Only an administrator's transfer or the recipient's own
+            // acceptance is checked against the recipient, so the reason goes
+            // to one of them: an owner's offer looks nothing up.
+            return Err(TaskError::Declared(error_codes::TARGET_NOT_AUTHORIZED, why));
+        }
+        Err(did_ops::OwnerChangeError::Failed(e)) => return Err(e.into()),
+    };
+    let mut body = json!({
+        "record": spec_record::<change_owner::v0_1::DidRecord>(state, &change.record)?,
+    });
+    if let Some(offer) = change.offer {
+        // The slot has not moved: its owner offered it, and it moves when the
+        // recipient sends this same request naming itself.
+        body["ext"] = json!({
+            WEBVH_EXT_KEY: {
+                "ownerTransfer": {
+                    "status": "offered",
+                    "newOwner": offer.to,
+                    "expiresAt": at(offer.expires_at),
+                }
+            }
+        });
+    }
+    typed(body, "change-owner response")
 }
 
 /// `webvh/witness/publish/0.1`.

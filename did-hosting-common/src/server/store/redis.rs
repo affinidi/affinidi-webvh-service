@@ -19,7 +19,7 @@ impl RedisBackend {
             .as_deref()
             .unwrap_or("redis://127.0.0.1:6379");
 
-        info!(url, "opening redis store");
+        info!(url = %redacted_url(url), "opening redis store");
 
         let client =
             redis::Client::open(url).map_err(|e| AppError::Store(format!("redis connect: {e}")))?;
@@ -35,6 +35,41 @@ impl RedisBackend {
             .map_err(|e| AppError::Store(format!("redis ping: {e}")))?;
 
         Ok(Box::new(Self { conn }))
+    }
+}
+
+/// `url` with any username, password and query removed, for logging.
+/// `StoreConfig`'s `Debug` redacts `redis_url` for the same reason: a
+/// connection URL can carry credentials (`redis://:password@host`,
+/// `rediss://user:pass@host`, or `redis+unix:///path?pass=...`).
+fn redacted_url(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut parsed) => {
+            let query_credentials = parsed.query_pairs().any(|(key, _)| {
+                matches!(
+                    key.to_ascii_lowercase().as_str(),
+                    "pass" | "password" | "user" | "username"
+                )
+            });
+            let had_credentials =
+                !parsed.username().is_empty() || parsed.password().is_some() || query_credentials;
+            let had_query = parsed.query().is_some();
+            // Both setters fail only for a URL that cannot carry credentials,
+            // which then has none to remove.
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            let mut shown = parsed.to_string();
+            if had_credentials {
+                shown.push_str(" (credentials redacted)");
+            } else if had_query {
+                shown.push_str(" (query omitted)");
+            }
+            shown
+        }
+        // Unparseable: whatever it holds is not safe to echo.
+        Err(_) => "<unparseable redis url>".to_string(),
     }
 }
 
@@ -247,5 +282,40 @@ impl BatchOps for RedisBatch {
 
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redacted_url;
+
+    #[test]
+    fn redacted_url_drops_credentials() {
+        for (input, expected) in [
+            ("redis://127.0.0.1:6379", "redis://127.0.0.1:6379"),
+            ("redis://127.0.0.1:6379/2", "redis://127.0.0.1:6379/2"),
+            (
+                "redis://:hunter2@cache.internal:6379/0",
+                "redis://cache.internal:6379/0 (credentials redacted)",
+            ),
+            (
+                "rediss://app:hunter2@cache.internal",
+                "rediss://cache.internal (credentials redacted)",
+            ),
+            (
+                "redis+unix:///run/redis.sock?db=1&pass=hunter2",
+                "redis+unix:///run/redis.sock (credentials redacted)",
+            ),
+            (
+                "redis://127.0.0.1:6379/?protocol=resp3",
+                "redis://127.0.0.1:6379/ (query omitted)",
+            ),
+        ] {
+            let shown = redacted_url(input);
+            assert_eq!(shown, expected);
+            assert!(!shown.contains("hunter2"));
+            assert!(!shown.contains("app@"));
+        }
+        assert_eq!(redacted_url("not a url"), "<unparseable redis url>");
     }
 }

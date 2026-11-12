@@ -664,6 +664,69 @@ async fn info_reports_the_did_scid_alias_state_of_the_latest_document() {
     }
 }
 
+const REGISTER: &str = "https://trusttasks.org/spec/did-management/did/register/0.1";
+
+/// The `hyperledger-labs/did-webs-resolver` reference publication: a
+/// `keri.cesr` stream, registered over the Trust Task a VTA publishes with.
+const WEBS_KERI: &[u8] =
+    include_bytes!("../../../did-hosting-common/tests/fixtures/ENro7uf0.keri.cesr");
+const WEBS_AID: &str = "ENro7uf0ePmiK3jdTo2YCdXLqW7z7xoP6qhhBou6gBLe";
+
+fn webs_register(domain: &str) -> Value {
+    json!({
+        "path": WEBS_AID,
+        "method": "webs",
+        "didData": String::from_utf8(WEBS_KERI.to_vec()).expect("CESR is text"),
+        "force": false,
+        "domain": domain,
+    })
+}
+
+#[cfg(feature = "method-webs")]
+#[tokio::test]
+async fn register_hosts_a_did_webs_key_event_log() {
+    let (state, _dir) = state().await;
+    let owner = member(&state, 22, Role::Owner).await;
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        REGISTER,
+        webs_register("control.test"),
+    )
+    .await;
+    conforms(&reply);
+    let record = &ok(&reply, REGISTER)["record"];
+    assert_eq!(record["mnemonic"], WEBS_AID, "{reply}");
+    let stored: DidRecord = state
+        .dids_ks
+        .get(did_key(WEBS_AID))
+        .await
+        .unwrap()
+        .expect("record");
+    assert_eq!(stored.method, "webs");
+    assert_eq!(
+        stored.did_id.as_deref(),
+        Some(format!("did:webs:control.test:{WEBS_AID}").as_str())
+    );
+}
+
+#[cfg(not(feature = "method-webs"))]
+#[tokio::test]
+async fn register_refuses_did_webs_on_a_host_built_without_it() {
+    let (state, _dir) = state().await;
+    let owner = member(&state, 22, Role::Owner).await;
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        REGISTER,
+        webs_register("control.test"),
+    )
+    .await;
+    assert!(reply.to_string().contains("method-webs"), "{reply}");
+}
+
 #[tokio::test]
 async fn delete_answers_the_record_as_it_stood() {
     let (state, _dir) = state().await;
@@ -803,38 +866,70 @@ async fn check_name_keeps_well_known_for_admins() {
     assert_eq!(code(&reply), "permissionDenied", "{reply}");
 }
 
+/// The slot's owner set in the ownership indexes: `(owner rows, heir rows)`.
+async fn owner_rows(state: &AppState, owner: &str, heir: &str) -> (usize, usize) {
+    let rows = |did: String| async move {
+        state
+            .dids_ks
+            .prefix_iter_raw(format!("owner:{did}:"))
+            .await
+            .unwrap()
+            .len()
+    };
+    (rows(owner.to_string()).await, rows(heir.to_string()).await)
+}
+
+/// An ACL member of `role` whose entry carries `max_did_count` and `domains`.
+async fn limited_member(
+    state: &AppState,
+    seed: u8,
+    role: Role,
+    max_did_count: Option<u64>,
+    domains: did_hosting_common::server::domain::DomainScope,
+) -> Caller {
+    let caller = member(state, seed, role.clone()).await;
+    did_hosting_common::server::acl::store_acl_entry(
+        &state.acl_ks,
+        &did_hosting_common::server::acl::AclEntry {
+            did: caller.did.clone(),
+            role,
+            label: None,
+            created_at: 1_700_000_000,
+            max_total_size: None,
+            max_did_count,
+            domains,
+        },
+    )
+    .await
+    .unwrap();
+    caller
+}
+
+const TARGET_NOT_AUTHORIZED: &str = "did-management/did/change-owner:targetNotAuthorized";
+const NOT_OWNER: &str = "did-management/did/change-owner:notOwner";
+
+/// An owner's change-owner only offers the slot; it moves when the recipient
+/// sends the same request naming itself. Nobody else can take it, and the
+/// offer is spent by the acceptance.
 #[tokio::test]
-async fn change_owner_moves_the_slot_to_an_acl_member_only() {
+async fn change_owner_moves_the_slot_only_when_the_recipient_accepts() {
     let (state, _dir) = state().await;
     let owner = member(&state, 24, Role::Owner).await;
     let heir = member(&state, 25, Role::Owner).await;
-    let attacker = member(&state, 26, Role::Owner).await;
+    let other = member(&state, 26, Role::Owner).await;
     seed_did(&state, &owner.did, "alpha-beta").await;
 
     let reply = call(
         &state,
         Via::Tsp,
-        &attacker,
+        &other,
         CHANGE_OWNER,
         json!({ "mnemonic": "alpha-beta", "newOwner": heir.did }),
     )
     .await;
-    assert_eq!(
-        code(&reply),
-        "did-management/did/change-owner:notOwner",
-        "{reply}"
-    );
+    assert_eq!(code(&reply), NOT_OWNER, "{reply}");
 
-    let reply = call(
-        &state,
-        Via::Tsp,
-        &owner,
-        CHANGE_OWNER,
-        json!({ "mnemonic": "alpha-beta", "newOwner": "did:example:not-in-acl" }),
-    )
-    .await;
-    assert!(!code(&reply).is_empty(), "{reply}");
-
+    // The offer: the record is unchanged, and the reply says it is pending.
     let reply = call(
         &state,
         Via::Tsp,
@@ -844,27 +939,311 @@ async fn change_owner_moves_the_slot_to_an_acl_member_only() {
     )
     .await;
     conforms(&reply);
-    assert_eq!(
-        ok(&reply, CHANGE_OWNER)["record"]["owner"],
-        heir.did.as_str()
+    let body = ok(&reply, CHANGE_OWNER);
+    assert_eq!(body["record"]["owner"], owner.did.as_str());
+    let transfer = &body["ext"]["vnd.affinidi.webvh"]["ownerTransfer"];
+    assert_eq!(transfer["status"], "offered", "{body}");
+    assert_eq!(transfer["newOwner"], heir.did.as_str());
+    assert!(transfer["expiresAt"].is_string());
+    assert_eq!(owner_rows(&state, &owner.did, &heir.did).await, (1, 0));
+
+    // Another member cannot take an offer made to someone else.
+    let reply = call(
+        &state,
+        Via::Didcomm,
+        &other,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "alpha-beta", "newOwner": other.did }),
+    )
+    .await;
+    assert_eq!(code(&reply), NOT_OWNER, "{reply}");
+    // Nor can the recipient name anyone but itself.
+    let reply = call(
+        &state,
+        Via::Didcomm,
+        &heir,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "alpha-beta", "newOwner": other.did }),
+    )
+    .await;
+    assert_eq!(code(&reply), NOT_OWNER, "{reply}");
+
+    // The recipient accepts.
+    let reply = call(
+        &state,
+        Via::Https,
+        &heir,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "alpha-beta", "newOwner": heir.did }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, CHANGE_OWNER);
+    assert_eq!(body["record"]["owner"], heir.did.as_str());
+    assert!(body.get("ext").is_none(), "{body}");
+    assert_eq!(owner_rows(&state, &owner.did, &heir.did).await, (0, 1));
+
+    // The offer is spent: the old owner cannot take the slot back with it.
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "alpha-beta", "newOwner": owner.did }),
+    )
+    .await;
+    assert_eq!(code(&reply), NOT_OWNER, "{reply}");
+}
+
+/// An offer says nothing about its recipient: one to a DID outside the ACL
+/// is recorded like any other (and can never be accepted). Naming the owner
+/// withdraws an outstanding offer.
+#[tokio::test]
+async fn an_offer_discloses_nothing_and_can_be_withdrawn() {
+    let (state, _dir) = state().await;
+    let owner = member(&state, 27, Role::Owner).await;
+    let heir = member(&state, 28, Role::Owner).await;
+    seed_did(&state, &owner.did, "gamma-delta").await;
+
+    let outside = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "gamma-delta", "newOwner": "did:example:not-in-acl" }),
+    )
+    .await;
+    let inside = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "gamma-delta", "newOwner": heir.did }),
+    )
+    .await;
+    for reply in [&outside, &inside] {
+        let body = ok(reply, CHANGE_OWNER);
+        assert_eq!(
+            body["ext"]["vnd.affinidi.webvh"]["ownerTransfer"]["status"],
+            "offered"
+        );
+    }
+
+    // Withdrawn by naming the owner; the recipient then has nothing to accept.
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "gamma-delta", "newOwner": owner.did }),
+    )
+    .await;
+    assert!(ok(&reply, CHANGE_OWNER).get("ext").is_none(), "{reply}");
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &heir,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "gamma-delta", "newOwner": heir.did }),
+    )
+    .await;
+    assert_eq!(code(&reply), NOT_OWNER, "{reply}");
+}
+
+/// The recipient takes a slot only if it could have registered it: its quota
+/// and domain scope are applied when it accepts, and when an administrator
+/// moves the slot directly. Each is told which check failed; the recipient
+/// is told nothing about the slot's owner.
+#[tokio::test]
+async fn the_recipients_quota_and_domain_scope_apply_to_a_transfer() {
+    use did_hosting_common::server::domain::DomainScope;
+
+    let (state, _dir) = state().await;
+    let admin = member(&state, 29, Role::Admin).await;
+    let owner = member(&state, 30, Role::Owner).await;
+    let full = limited_member(&state, 31, Role::Owner, Some(1), DomainScope::All).await;
+    seed_did(&state, &full.did, "full-own").await;
+    let elsewhere = limited_member(
+        &state,
+        32,
+        Role::Owner,
+        None,
+        DomainScope::Allowed {
+            domains: vec!["other.example".into()],
+        },
+    )
+    .await;
+    let service = member(&state, 33, Role::Service).await;
+    let mut record = seed_did(&state, &owner.did, "epsilon-zeta").await;
+    record.domain = "control.test".into();
+    state
+        .dids_ks
+        .insert(did_key("epsilon-zeta"), &record)
+        .await
+        .unwrap();
+
+    for (recipient, why) in [(&full, "count limit"), (&elsewhere, "not scoped")] {
+        // Offered by the owner, refused when the recipient accepts.
+        ok(
+            &call(
+                &state,
+                Via::Tsp,
+                &owner,
+                CHANGE_OWNER,
+                json!({ "mnemonic": "epsilon-zeta", "newOwner": recipient.did }),
+            )
+            .await,
+            CHANGE_OWNER,
+        );
+        let reply = call(
+            &state,
+            Via::Tsp,
+            recipient,
+            CHANGE_OWNER,
+            json!({ "mnemonic": "epsilon-zeta", "newOwner": recipient.did }),
+        )
+        .await;
+        assert_eq!(code(&reply), TARGET_NOT_AUTHORIZED, "{reply}");
+        // The recipient is told its own reason, and nothing about the owner.
+        let message = reply["payload"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(why) && !message.contains(&owner.did),
+            "{why}: {reply}"
+        );
+    }
+    // An administrator's direct transfer is held to the same limits, and says
+    // which one.
+    for (recipient, why) in [
+        (&full.did, "count limit"),
+        (&elsewhere.did, "'control.test'"),
+        (&service.did, "cannot own DIDs"),
+        (&"did:example:not-in-acl".to_string(), "no ACL entry"),
+    ] {
+        let reply = call(
+            &state,
+            Via::Tsp,
+            &admin,
+            CHANGE_OWNER,
+            json!({ "mnemonic": "epsilon-zeta", "newOwner": recipient }),
+        )
+        .await;
+        assert_eq!(code(&reply), TARGET_NOT_AUTHORIZED, "{reply}");
+        assert!(
+            reply["payload"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(why),
+            "{why}: {reply}"
+        );
+    }
+    let record: DidRecord = state
+        .dids_ks
+        .get(did_key("epsilon-zeta"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.owner, owner.did, "nothing moved");
+}
+
+/// Deleting a slot withdraws its offer, even when the path is registered
+/// again at once (within the same second as the offer).
+#[tokio::test]
+async fn deleting_a_slot_withdraws_its_offer() {
+    let (state, _dir) = state().await;
+    let owner = member(&state, 36, Role::Owner).await;
+    let heir = member(&state, 37, Role::Owner).await;
+    let mut record = seed_did(&state, &owner.did, "iota-kappa").await;
+    let now = did_hosting_common::server::auth::session::now_epoch();
+    record.created_at = now;
+    state
+        .dids_ks
+        .insert(did_key("iota-kappa"), &record)
+        .await
+        .unwrap();
+    ok(
+        &call(
+            &state,
+            Via::Tsp,
+            &owner,
+            CHANGE_OWNER,
+            json!({ "mnemonic": "iota-kappa", "newOwner": heir.did }),
+        )
+        .await,
+        CHANGE_OWNER,
+    );
+    ok(
+        &call(
+            &state,
+            Via::Tsp,
+            &owner,
+            "https://trusttasks.org/spec/did-management/did/delete/0.1",
+            json!({ "mnemonic": "iota-kappa" }),
+        )
+        .await,
+        "https://trusttasks.org/spec/did-management/did/delete/0.1",
     );
     assert!(
         state
-            .dids_ks
-            .prefix_iter_raw(format!("owner:{}:", owner.did))
+            .sessions_ks
+            .get_raw("did_xfer:iota-kappa")
             .await
             .unwrap()
-            .is_empty()
+            .is_none()
     );
-    assert_eq!(
-        state
-            .dids_ks
-            .prefix_iter_raw(format!("owner:{}:", heir.did))
-            .await
-            .unwrap()
-            .len(),
-        1
+    let mut record = seed_did(&state, &owner.did, "iota-kappa").await;
+    record.created_at = now;
+    state
+        .dids_ks
+        .insert(did_key("iota-kappa"), &record)
+        .await
+        .unwrap();
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &heir,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "iota-kappa", "newOwner": heir.did }),
+    )
+    .await;
+    assert_eq!(code(&reply), NOT_OWNER, "{reply}");
+}
+
+/// An offer is for the slot as it stood: once the path is registered again,
+/// an earlier offer for it cannot be accepted.
+#[tokio::test]
+async fn an_offer_does_not_survive_its_slot() {
+    let (state, _dir) = state().await;
+    let owner = member(&state, 34, Role::Owner).await;
+    let heir = member(&state, 35, Role::Owner).await;
+    seed_did(&state, &owner.did, "eta-theta").await;
+    ok(
+        &call(
+            &state,
+            Via::Tsp,
+            &owner,
+            CHANGE_OWNER,
+            json!({ "mnemonic": "eta-theta", "newOwner": heir.did }),
+        )
+        .await,
+        CHANGE_OWNER,
     );
+    // The same owner registers the path afresh, later than the offer.
+    let mut record = seed_did(&state, &owner.did, "eta-theta").await;
+    record.created_at = did_hosting_common::server::auth::session::now_epoch() + 10;
+    state
+        .dids_ks
+        .insert(did_key("eta-theta"), &record)
+        .await
+        .unwrap();
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &heir,
+        CHANGE_OWNER,
+        json!({ "mnemonic": "eta-theta", "newOwner": heir.did }),
+    )
+    .await;
+    assert_eq!(code(&reply), NOT_OWNER, "{reply}");
 }
 
 /// Seed a slot with a real, signed, single-entry did:webvh log configuring
@@ -1134,18 +1513,34 @@ async fn agent_name_list_answers_the_registry_parked_names_included() {
 async fn agent_name_check_reports_free_reserved_and_taken() {
     let (state, _dir) = state().await;
     let owner = member(&state, 32, Role::Owner).await;
+    // A name is held by a live slot whose record lists it.
+    let mut holder = seed_did(&state, "did:example:holder", "alpha-beta").await;
+    holder.agent_names.push(AgentNameEntry {
+        name: "taken".into(),
+        enabled: true,
+        created_at: 1,
+    });
     state
         .dids_ks
-        .insert_raw(
-            did_hosting_common::did_ops::agent_name_key("example.com", "taken"),
-            b"alpha-beta".to_vec(),
-        )
+        .insert(did_key("alpha-beta"), &holder)
         .await
         .unwrap();
+    for (name, holder) in [("taken", "alpha-beta"), ("leftover", "gone-slot")] {
+        state
+            .dids_ks
+            .insert_raw(
+                did_hosting_common::did_ops::agent_name_key("example.com", name),
+                holder.as_bytes().to_vec(),
+            )
+            .await
+            .unwrap();
+    }
     for (name, available, reserved) in [
         ("alice", true, false),
         ("admin", false, true),
         ("taken", false, false),
+        // An index entry left by a slot that no longer exists holds nothing.
+        ("leftover", true, false),
     ] {
         let reply = call(
             &state,
@@ -1496,7 +1891,9 @@ async fn server_info_answers_an_anonymous_request_signed_by_the_service() {
     assert!(reply["proof"].is_object());
 }
 
-/// Passkey login opens unsigned; with no passkeys registered it says so.
+/// Passkey login opens unsigned, and the ceremony it opens is the same
+/// whether or not any passkey is registered: no credential list, no
+/// `noCredentials`.
 #[tokio::test]
 async fn passkey_login_start_is_open_to_an_unsigned_request() {
     let (state, _dir) = state().await;
@@ -1504,11 +1901,11 @@ async fn passkey_login_start_is_open_to_an_unsigned_request() {
     let mut doc = request(&uri, "unused", json!({}));
     doc.as_object_mut().unwrap().remove("issuer");
     let reply = https(&state, None, doc).await;
-    assert_eq!(
-        code(&reply),
-        "auth/passkey/login/start:noCredentials",
-        "{reply}"
-    );
+    conforms(&reply);
+    let body = ok(&reply, &uri);
+    assert!(body["authId"].is_string(), "{body}");
+    assert!(body["options"]["challenge"].is_string(), "{body}");
+    assert!(body["options"].get("allowCredentials").is_none(), "{body}");
 }
 
 /// Invites are addressed by inviteId, and no read sends a token back.
@@ -3115,4 +3512,361 @@ fn a_store_size_refusal_is_a_task_failure_naming_the_limit() {
     assert_eq!(payload["code"], "taskFailed", "{payload}");
     let message = payload["message"].as_str().unwrap_or_default();
     assert!(message.contains("409600"), "{payload}");
+}
+
+// ---------------------------------------------------------------------------
+// Signers the ACL does not list (`crate::unlisted_signers`)
+// ---------------------------------------------------------------------------
+
+mod unlisted {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use affinidi_data_integrity::{DataIntegrityError, DidKeyResolver, ResolvedKey};
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+    use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
+    use trust_tasks_proof::affinidi::{ProofPurpose, ProofPurposeResolver};
+
+    use crate::unlisted_signers::{SIGN_IN_PER_SOURCE, UnlistedSigners};
+
+    const SERVER_INFO: &str = "did-management/server/info/0.1";
+    const CHALLENGE: &str = "auth/challenge/0.1";
+
+    /// Decodes a `did:key` locally; counts every other DID it is asked to
+    /// resolve, and then fails as unreachable — or never answers.
+    struct CountingResolver {
+        calls: Arc<AtomicUsize>,
+        hang: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ProofPurposeResolver for CountingResolver {
+        async fn resolve_vm_for_purpose(
+            &self,
+            vm: &str,
+            purpose: ProofPurpose,
+        ) -> Result<ResolvedKey, DataIntegrityError> {
+            if vm.starts_with("did:key:") {
+                return DidKeyResolver.resolve_vm_for_purpose(vm, purpose).await;
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.hang {
+                std::future::pending::<()>().await;
+            }
+            Err(DataIntegrityError::Resolver(format!(
+                "signer DID unreachable: cannot resolve {vm}"
+            )))
+        }
+    }
+
+    /// `state` with a counting resolver behind its verifier and `limits` on
+    /// unlisted signers; the count of network resolutions.
+    fn counting(state: &mut AppState, hang: bool, limits: UnlistedSigners) -> Arc<AtomicUsize> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        state.trust_tasks_verifier = Some(Arc::new(TransportBoundVerifier::with_resolver(
+            Arc::new(CountingResolver {
+                calls: calls.clone(),
+                hang,
+            }),
+        )));
+        state.unlisted_signers = Arc::new(limits);
+        calls
+    }
+
+    fn default_limits() -> UnlistedSigners {
+        UnlistedSigners::default()
+    }
+
+    /// A caller whose DID has to be resolved over the network.
+    fn web_caller(name: &str, seed: u8) -> Caller {
+        let did = format!("did:web:{name}.example");
+        let mut key = Secret::generate_ed25519(None, Some(&[seed; 32]));
+        key.id = format!("{did}#key-1");
+        Caller {
+            did,
+            key,
+            role: Role::Owner,
+        }
+    }
+
+    async fn send_signed(state: &AppState, via: Via, caller: &Caller, slug: &str) -> Value {
+        let doc = signed(request(&t(slug), &caller.did, json!({})), &caller.key).await;
+        send(state, via, caller, doc).await
+    }
+
+    /// An open read changes nothing, so it is recorded nowhere, whoever signs
+    /// it, and a resend is simply answered again.
+    #[tokio::test]
+    async fn open_reads_are_not_recorded() {
+        let (state, _dir) = state().await;
+        let uri = t(SERVER_INFO);
+        let stranger = stranger(70);
+        let admin = member(&state, 71, Role::Admin).await;
+        for via in VIAS {
+            for caller in [&stranger, &admin] {
+                let doc = signed(request(&uri, &caller.did, json!({})), &caller.key).await;
+                ok(&send(&state, via, caller, doc.clone()).await, &uri);
+                ok(&send(&state, via, caller, doc).await, &uri);
+            }
+        }
+        assert!(state.replay_cache.is_empty());
+        assert!(state.unlisted_signers.sign_in.is_empty());
+        assert!(state.unlisted_signers.other.is_empty());
+    }
+
+    /// A sign-in row signed by a stranger is recorded in the sign-in cache,
+    /// never the shared one, and its resend is refused; a member's goes to
+    /// the shared cache as before.
+    #[tokio::test]
+    async fn a_strangers_sign_in_is_recorded_apart_from_members() {
+        let (state, _dir) = state().await;
+        let stranger = stranger(72);
+        let doc = signed(
+            request(&t(CHALLENGE), &stranger.did, json!({})),
+            &stranger.key,
+        )
+        .await;
+        let first = send(&state, Via::Tsp, &stranger, doc.clone()).await;
+        assert_ne!(first["payload"]["code"], "unavailable", "{first}");
+        assert_eq!(
+            code(&send(&state, Via::Tsp, &stranger, doc).await),
+            "idConflict"
+        );
+        assert!(state.replay_cache.is_empty());
+        assert_eq!(state.unlisted_signers.sign_in.len(), 1);
+
+        let admin = member(&state, 73, Role::Admin).await;
+        send_signed(&state, Via::Tsp, &admin, CHALLENGE).await;
+        assert_eq!(state.replay_cache.len(), 1);
+        assert_eq!(state.unlisted_signers.sign_in.len(), 1);
+    }
+
+    /// However full the sign-in cache is, members are unaffected: only
+    /// strangers are told to retry.
+    #[tokio::test]
+    async fn a_full_sign_in_cache_does_not_refuse_members() {
+        let (state, _dir) = state().await;
+        let now = Some(chrono::Utc::now());
+        let max = crate::unlisted_signers::SIGN_IN_MAX_ENTRIES;
+        for i in 0..2 * max {
+            let _ = state.unlisted_signers.sign_in.check(
+                &format!("did:key:filler-{}", i / 50),
+                &format!("urn:uuid:{i}"),
+                now,
+            );
+        }
+        assert_eq!(state.unlisted_signers.sign_in.len(), max);
+
+        let stranger = stranger(74);
+        assert_eq!(
+            code(&send_signed(&state, Via::Tsp, &stranger, CHALLENGE).await),
+            "unavailable"
+        );
+        let admin = member(&state, 75, Role::Admin).await;
+        let reply = send_signed(&state, Via::Tsp, &admin, CHALLENGE).await;
+        assert_ne!(reply["payload"]["code"], "unavailable", "{reply}");
+        ok(
+            &send_signed(&state, Via::Tsp, &admin, "did-management/server/config/0.1").await,
+            &t("did-management/server/config/0.1"),
+        );
+    }
+
+    /// A document recorded in one cache is a replay whichever cache it would
+    /// go to now (the signer's ACL entry changed inside the window).
+    #[tokio::test]
+    async fn a_record_in_another_cache_is_a_replay() {
+        let (state, _dir) = state().await;
+        let admin = member(&state, 76, Role::Admin).await;
+        let doc = signed(request(&t(CHALLENGE), &admin.did, json!({})), &admin.key).await;
+        let id = doc["id"].as_str().unwrap();
+        state
+            .unlisted_signers
+            .sign_in
+            .check(&admin.did, id, Some(chrono::Utc::now()))
+            .unwrap();
+        assert_eq!(
+            code(&send(&state, Via::Tsp, &admin, doc).await),
+            "idConflict"
+        );
+        assert!(state.replay_cache.is_empty());
+    }
+
+    /// One source may add only so many sign-in records per window.
+    #[tokio::test]
+    async fn sign_in_records_are_limited_per_source() {
+        let (state, _dir) = state().await;
+        for i in 0..SIGN_IN_PER_SOURCE {
+            let caller = stranger((i % 200) as u8);
+            let reply = send_signed(&state, Via::Https, &caller, CHALLENGE).await;
+            assert_ne!(reply["payload"]["code"], "unavailable", "{i}: {reply}");
+        }
+        let reply = send_signed(&state, Via::Https, &stranger(201), CHALLENGE).await;
+        assert_eq!(code(&reply), "unavailable", "{reply}");
+        assert!(reply["payload"]["retryAfter"].is_string(), "{reply}");
+        // Another source is unaffected.
+        let other = stranger(202);
+        let reply = send_signed(&state, Via::Tsp, &other, CHALLENGE).await;
+        assert_ne!(reply["payload"]["code"], "unavailable", "{reply}");
+    }
+
+    /// A stranger's proof that needs a network resolution waits for a free
+    /// slot (refused before any resolution while none is); one that fails
+    /// the key-free checks never resolves; a `did:key` needs no slot.
+    #[tokio::test]
+    async fn unlisted_resolutions_need_a_free_slot() {
+        let (mut state, _dir) = state().await;
+        let calls = counting(&mut state, false, default_limits());
+        let web = web_caller("unlisted", 77);
+
+        let held = state.unlisted_signers.occupy_all();
+        assert_eq!(
+            code(&send_signed(&state, Via::Tsp, &web, SERVER_INFO).await),
+            "unavailable"
+        );
+        let mut wrong = request(&t(SERVER_INFO), &web.did, json!({}));
+        wrong["recipient"] = json!("did:example:elsewhere");
+        let wrong = signed(wrong, &web.key).await;
+        assert_eq!(
+            code(&send(&state, Via::Tsp, &web, wrong).await),
+            "wrongRecipient"
+        );
+        let local = stranger(78);
+        ok(
+            &send_signed(&state, Via::Tsp, &local, SERVER_INFO).await,
+            &t(SERVER_INFO),
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        drop(held);
+
+        // With a slot free the resolution is made, once (no forced retry),
+        // and its failure is reported as retryable.
+        assert_eq!(
+            code(&send_signed(&state, Via::Tsp, &web, SERVER_INFO).await),
+            "unavailable"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Strangers share a rate of resolutions; past it, a document is refused
+    /// with a retry time and nothing is resolved.
+    #[tokio::test]
+    async fn unlisted_resolutions_share_a_rate() {
+        let (mut state, _dir) = state().await;
+        let calls = counting(
+            &mut state,
+            false,
+            UnlistedSigners::with_limits(16, 3, Duration::from_secs(10)),
+        );
+        let web = web_caller("rated", 79);
+        for _ in 0..3 {
+            send_signed(&state, Via::Tsp, &web, SERVER_INFO).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let reply = send_signed(&state, Via::Tsp, &web, SERVER_INFO).await;
+        assert_eq!(code(&reply), "unavailable", "{reply}");
+        assert!(reply["payload"]["retryAfter"].is_string(), "{reply}");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// A resolution that never answers is abandoned at the timeout and
+    /// reported as retryable.
+    #[tokio::test]
+    async fn unlisted_resolutions_time_out() {
+        let (mut state, _dir) = state().await;
+        let calls = counting(
+            &mut state,
+            true,
+            UnlistedSigners::with_limits(16, 300, Duration::from_millis(50)),
+        );
+        let web = web_caller("silent", 80);
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_signed(&state, Via::Tsp, &web, SERVER_INFO),
+        )
+        .await
+        .expect("the request completes at the verification timeout");
+        assert_eq!(code(&reply), "unavailable", "{reply}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A proxied `auth/authenticate/0.3` from `delegate` for `principal`,
+    /// carrying a mandate `mandate_signer` signed naming `named_delegate`.
+    async fn proxied(
+        delegate: &Caller,
+        principal: &str,
+        mandate_signer: &Secret,
+        named_delegate: &str,
+    ) -> Value {
+        let mandate = signed_as_assertion(
+            request(
+                "https://trusttasks.org/spec/local/did-hosting-auth-mandate/0.1",
+                principal,
+                json!({ "delegate": named_delegate }),
+            ),
+            mandate_signer,
+        )
+        .await;
+        signed(
+            request(
+                &t("auth/authenticate/0.3"),
+                &delegate.did,
+                json!({
+                    "challenge": "not-a-live-challenge",
+                    "sessionId": uuid::Uuid::new_v4().to_string(),
+                    "principal": principal,
+                    "delegationEvidence": { "kind": "mandateCredential", "credential": mandate },
+                }),
+            ),
+            &delegate.key,
+        )
+        .await
+    }
+
+    /// A proxied login naming a principal outside the ACL is refused before
+    /// its evidence is checked: nothing it names is resolved.
+    #[tokio::test]
+    async fn a_proxied_login_for_a_stranger_resolves_nothing() {
+        let (mut state, _dir) = state().await;
+        let calls = counting(&mut state, false, default_limits());
+        let delegate = stranger(81);
+        let principal = web_caller("principal", 82);
+        let doc = proxied(&delegate, &principal.did, &principal.key, &delegate.did).await;
+        let reply = send(&state, Via::Tsp, &delegate, doc).await;
+        assert_eq!(code(&reply), "permissionDenied", "{reply}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// The delegate of a member who signed a mandate naming it is verified
+    /// as members are, not under the strangers' resolution slots; a delegate
+    /// the mandate does not name is not.
+    #[tokio::test]
+    async fn a_members_delegate_is_not_held_to_the_strangers_slots() {
+        let (mut state, _dir) = state().await;
+        let calls = counting(&mut state, false, default_limits());
+        let principal = member(&state, 83, Role::Owner).await;
+        let delegate = web_caller("delegate", 84);
+        let _held = state.unlisted_signers.occupy_all();
+
+        let unnamed = proxied(
+            &delegate,
+            &principal.did,
+            &principal.key,
+            "did:web:other.example",
+        )
+        .await;
+        assert_eq!(
+            code(&send(&state, Via::Tsp, &delegate, unnamed).await),
+            "unavailable"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let vouched = proxied(&delegate, &principal.did, &principal.key, &delegate.did).await;
+        send(&state, Via::Tsp, &delegate, vouched).await;
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "the delegate was resolved"
+        );
+    }
 }

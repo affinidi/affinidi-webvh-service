@@ -119,6 +119,10 @@ pub struct AppState {
     /// Both transports gate through it before dispatch to reject
     /// captured-and-resubmitted envelopes within the freshness window.
     pub replay_cache: Arc<crate::replay::ReplayCache>,
+    /// What signed documents from signers the ACL does not list may
+    /// consume: their own replay cache and bounded DID resolution. See
+    /// [`crate::unlisted_signers`].
+    pub unlisted_signers: Arc<crate::unlisted_signers::UnlistedSigners>,
     /// Per-mnemonic write lock. `register_did_atomic` (and any other
     /// read-then-write operation on the same path) holds the lock for
     /// the duration of its read + build + commit window so two
@@ -149,10 +153,25 @@ pub struct AppState {
     /// global counters above. See `crate::rate_limit` for the
     /// trusted-proxy / X-Forwarded-For policy.
     pub ip_rate_limiter: Arc<did_hosting_common::server::rate_limit::IpRateLimiter>,
+    /// Per-source limiter for opening a passkey login
+    /// (`auth/passkey/login/start`). See
+    /// [`crate::rate_limit::login_start_limiter`].
+    pub login_start_rate_limiter:
+        Arc<did_hosting_common::server::rate_limit::KeyedRateLimiter<String>>,
     /// Per-source limiter for passkey invite redemption
     /// (`auth/passkey/enroll/redeem/start`). See
     /// [`crate::rate_limit::redeem_limiter`].
     pub redeem_rate_limiter: Arc<did_hosting_common::server::rate_limit::KeyedRateLimiter<String>>,
+    /// Per-source limiter for `did:webs` self-registration (a
+    /// `did/register/0.1` from a `did:webs` outside the ACL, verified against
+    /// its own key event log). See
+    /// [`crate::rate_limit::webs_self_register_limiter`].
+    pub webs_self_register_limiter:
+        Arc<did_hosting_common::server::rate_limit::KeyedRateLimiter<String>>,
+    /// The bucket every `did:webs` self-registration shares, whatever its
+    /// source. See [`crate::rate_limit::webs_self_register_global_limiter`].
+    pub webs_self_register_global_limiter:
+        Arc<did_hosting_common::server::rate_limit::KeyedRateLimiter<String>>,
     /// Per-address budget for large documents (over the framework's default
     /// 64 KiB) a claimed — not yet verified — known issuer is granted a
     /// raised size limit for. See
@@ -189,7 +208,8 @@ pub struct AppState {
 
 impl AppState {
     /// Sweep idle clients out of every rate limiter this state serves (the
-    /// challenge, redemption, large-document and wallet sign-in limits) until
+    /// challenge, passkey login, redemption, large-document and wallet sign-in
+    /// limits) until
     /// `shutdown` fires.
     ///
     /// Call it on a runtime that lives as long as the process serves
@@ -200,7 +220,11 @@ impl AppState {
     /// shared maps, so which runtime runs it does not matter otherwise.
     pub fn spawn_rate_limit_gc(&self, shutdown: &CancellationToken) {
         self.ip_rate_limiter.spawn_gc(shutdown.clone());
+        self.login_start_rate_limiter.spawn_gc(shutdown.clone());
         self.redeem_rate_limiter.spawn_gc(shutdown.clone());
+        self.webs_self_register_limiter.spawn_gc(shutdown.clone());
+        self.webs_self_register_global_limiter
+            .spawn_gc(shutdown.clone());
         self.large_document_budget.spawn_gc(shutdown);
         self.oob.spawn_rate_limit_gc(shutdown);
     }
@@ -413,13 +437,19 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         stats_ks: stats_ks.clone(),
         timeseries_ks: timeseries_ks.clone(),
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
+        unlisted_signers: Default::default(),
         replay_cache: Arc::new(crate::replay::ReplayCache::with_config(replay_config)?),
         path_locks: crate::path_locks::PathLocks::new(),
         acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
         pending_challenges: Arc::new(pending_challenges),
         client_ips,
         ip_rate_limiter: Arc::new(crate::rate_limit::challenge_limiter()),
+        login_start_rate_limiter: Arc::new(crate::rate_limit::login_start_limiter()),
         redeem_rate_limiter: Arc::new(crate::rate_limit::redeem_limiter()),
+        webs_self_register_limiter: Arc::new(crate::rate_limit::webs_self_register_limiter()),
+        webs_self_register_global_limiter: Arc::new(
+            crate::rate_limit::webs_self_register_global_limiter(),
+        ),
         large_document_budget: Arc::new(
             did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
         ),
