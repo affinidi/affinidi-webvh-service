@@ -331,6 +331,12 @@ async fn generate_self_managed_keys(recipe: &SetupRecipe) -> Result<VtaSetupOutc
         let trust_task_base = format!("{origin}/api");
         if crate::did::is_https_or_loopback(&trust_task_base) {
             crate::did::add_trust_task_https_service(&mut doc, &trust_task_base);
+            if let Some(reason) = crate::http::peer_endpoint_refusal(&trust_task_base) {
+                eprintln!(
+                    "  [setup-recipe] note: other hosting nodes will not send Trust Tasks to \
+                     {trust_task_base} ({reason}); they send only to https on a public host"
+                );
+            }
             // The daemon serves the console, and so its login page, at the
             // same origin: wallet sign-in with a trigger link (C4) — `https`
             // only, as the control plane serves the family only there.

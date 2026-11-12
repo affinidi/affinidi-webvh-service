@@ -585,6 +585,9 @@ async fn distributed_mode_replicates_over_https() {
     // carries no encryption, and its document advertises `TrustTaskHTTPS`
     // (not `DIDCommMessaging`), so no key-agreement key is exercised.
     let (base_url, listener) = reserve_https_port().await;
+    // The edge listens on loopback, which a peer-advertised Trust Task
+    // endpoint may not name outside tests.
+    did_hosting_common::server::trust_tasks::send::allow_loopback_peer_endpoints_for_tests();
     let (edge_did, edge_signing) = mint_https_peer(&base_url);
     let edge_identity = ServiceIdentity::from_signing_secret(&edge_did, edge_signing)
         .await
@@ -797,6 +800,9 @@ async fn daemon_mode_replicates_over_https() {
     );
 
     let (base_url, listener) = reserve_https_port().await;
+    // The edge listens on loopback, which a peer-advertised Trust Task
+    // endpoint may not name outside tests.
+    did_hosting_common::server::trust_tasks::send::allow_loopback_peer_endpoints_for_tests();
     let (edge_did, edge_signing) = mint_https_peer(&base_url);
     let edge_identity = ServiceIdentity::from_signing_secret(&edge_did, edge_signing)
         .await

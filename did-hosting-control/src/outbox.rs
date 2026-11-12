@@ -49,13 +49,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_service::DIDCommService;
 use affinidi_tdk::secrets_resolver::secrets::Secret;
 use did_hosting_common::server::didcomm_profile::{PeerTransport, TransportFallback};
 use did_hosting_common::server::error::AppError;
 use did_hosting_common::server::store::{KS_OUTBOUND_QUEUE, KeyspaceHandle, Store};
-use did_hosting_common::server::trust_tasks::send::{build_signed_request, send_trust_task};
+use did_hosting_common::server::trust_tasks::send::{Peers, build_signed_request, send_trust_task};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Notify, watch};
@@ -410,7 +409,7 @@ async fn deliver(
     entry: &OutboxEntry,
     signer: &Secret,
     fallback: &TransportFallback,
-    did_resolver: Option<&DIDCacheClient>,
+    peers: Peers<'_>,
 ) -> Result<(String, PeerTransport), Box<dyn std::error::Error + Send + Sync>> {
     let doc = signed_document(control_did, entry, signer).await?;
     let transport = send_trust_task(
@@ -420,7 +419,7 @@ async fn deliver(
         &entry.target_did,
         &doc,
         fallback,
-        did_resolver,
+        peers,
     )
     .await?;
     Ok((doc.id.clone(), transport))
@@ -525,7 +524,10 @@ pub async fn run_tick(state: &AppState) -> TickReport {
                 &entry,
                 &signer,
                 &fallback,
-                state.did_resolver.as_ref(),
+                Peers::new(
+                    state.did_resolver.as_ref(),
+                    state.trust_tasks_verifier.as_deref(),
+                ),
             )
             .await
             {

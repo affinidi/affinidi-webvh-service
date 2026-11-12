@@ -34,7 +34,9 @@ pub async fn sync_to_control_messaging(
 ) {
     use did_hosting_common::didcomm_types::MSG_STATS_SYNC;
     use did_hosting_common::server::didcomm_profile::TransportFallback;
-    use did_hosting_common::server::trust_tasks::send::{build_signed_request, send_trust_task};
+    use did_hosting_common::server::trust_tasks::send::{
+        Peers, build_signed_request, send_trust_task,
+    };
     use serde_json::json;
 
     // Resolve the signer before draining, so a node that cannot sign keeps
@@ -98,7 +100,10 @@ pub async fn sync_to_control_messaging(
                 control_did,
                 &doc,
                 &fallback,
-                state.did_resolver.as_ref(),
+                Peers::new(
+                    state.did_resolver.as_ref(),
+                    state.trust_tasks_verifier.as_deref(),
+                ),
             )
             .await
             .map(|_| ()),

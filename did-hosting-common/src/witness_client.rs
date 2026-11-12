@@ -31,7 +31,9 @@ pub struct WitnessClient {
     requester_did: String,
     signer: Secret,
     did_resolver: DIDCacheClient,
-    host_policy: HostPolicy,
+    /// Verifies every reply. Built once per client, not per call, so it keeps
+    /// its DID-status verdicts and forced-refresh limit across calls.
+    verifier: TransportBoundVerifier,
 }
 
 impl WitnessClient {
@@ -51,8 +53,8 @@ impl WitnessClient {
             witness_did: witness_did.to_string(),
             requester_did: requester_did.to_string(),
             signer,
+            verifier: TransportBoundVerifier::with_did_cache(did_resolver.clone()),
             did_resolver,
-            host_policy: HostPolicy::PublicOnly,
         }
     }
 
@@ -62,7 +64,10 @@ impl WitnessClient {
     /// same hosts the resolver can — a witness on `localhost` needs
     /// `AllowPrivate` here as well as on the resolver.
     pub fn with_host_policy(mut self, host_policy: HostPolicy) -> Self {
-        self.host_policy = host_policy;
+        self.verifier = TransportBoundVerifier::with_did_cache_and_host_policy(
+            self.did_resolver.clone(),
+            host_policy,
+        );
         self
     }
 
@@ -131,16 +136,12 @@ impl WitnessClient {
         )
         .await
         .map_err(|e| WebVHError::Transport(e.to_string()))?;
-        let verifier = TransportBoundVerifier::with_did_cache_and_host_policy(
-            self.did_resolver.clone(),
-            self.host_policy,
-        );
         let reply = post_trust_task_https_verified(
             &self.requester_did,
             &self.witness_did,
             &self.url,
             &doc,
-            &verifier,
+            &self.verifier,
         )
         .await
         .map_err(|e| WebVHError::Transport(e.to_string()))?;

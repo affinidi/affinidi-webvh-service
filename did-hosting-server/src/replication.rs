@@ -171,7 +171,7 @@ async fn exchange_over_messaging(
     doc: trust_tasks_rs::TrustTask<Value>,
 ) -> Result<trust_tasks_rs::TrustTask<Value>, String> {
     use did_hosting_common::server::didcomm_profile::TransportFallback;
-    use did_hosting_common::server::trust_tasks::send::send_trust_task;
+    use did_hosting_common::server::trust_tasks::send::{Peers, send_trust_task};
 
     let svc = state
         .didcomm_service
@@ -199,7 +199,10 @@ async fn exchange_over_messaging(
         control_did,
         &doc,
         &fallback,
-        state.did_resolver.as_ref(),
+        Peers::new(
+            state.did_resolver.as_ref(),
+            state.trust_tasks_verifier.as_deref(),
+        ),
     )
     .await;
     let outcome = match sent {

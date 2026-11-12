@@ -25,7 +25,7 @@ use did_hosting_common::server::domain::safety::extract_did_host;
 use did_hosting_common::server::domain::{DomainStatus, list_domains};
 use did_hosting_common::server::mnemonic::validate_agent_name_binding;
 use did_hosting_common::server::trust_tasks::send::{
-    Retry, build_signed_request, send_trust_task_with_retry,
+    Peers, Retry, build_signed_request, send_trust_task_with_retry,
 };
 use did_hosting_common::tasks::did_management::server::register;
 use serde_json::json;
@@ -232,7 +232,10 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
             &control_did,
             &doc,
             &fallback,
-            state.did_resolver.as_ref(),
+            Peers::new(
+                state.did_resolver.as_ref(),
+                state.trust_tasks_verifier.as_deref(),
+            ),
             Retry {
                 attempts: 10,
                 delay: std::time::Duration::from_secs(5),

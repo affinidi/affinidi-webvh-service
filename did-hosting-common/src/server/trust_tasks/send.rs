@@ -23,6 +23,17 @@
 //! unit: the same Type URI, the same payload, the same handler — only the
 //! binding differs, chosen by what the recipient says it speaks.
 //!
+//! ## The HTTPS endpoint is the peer's to choose, within limits
+//!
+//! The `TrustTaskHTTPS` URL comes from the peer's own DID document, so this
+//! node does not send wherever it says. It must be `https` to a public host:
+//! not loopback, a private or link-local range, or a special-use name such as
+//! `localhost` — checked on the URL when the binding is chosen, and on every
+//! address the name resolves to when the send connects
+//! ([`crate::http::peer_endpoint_client`]). Redirects are not followed, the
+//! request has finite timeouts, and the reply is capped at 1 MiB. An
+//! endpoint outside that policy is treated as not advertised.
+//!
 //! ## Transport precedence: document, then config, then fail
 //!
 //! The binding is chosen by
@@ -67,6 +78,62 @@ use crate::server::trust_tasks::{TransportBoundVerifier, build_verifier, verify_
 /// eventually be rewritten on top of this without changing its signature.
 pub type SendError = Box<dyn std::error::Error + Send + Sync>;
 
+/// What a send needs from the sending service besides the document: the DID
+/// cache it resolves the peer's document with (to choose the binding), and the
+/// verifier it checks an HTTPS reply with.
+///
+/// Pass the service's own long-lived verifier (the one it checks inbound
+/// documents with, built once at startup by [`super::build_verifier`]): it
+/// remembers DID-status verdicts and rate-limits forced re-resolutions, so a
+/// reply is held to the same DID-status verdicts as an inbound document (with
+/// a forced-refresh allowance of its own, see
+/// [`TransportBoundVerifier::for_replies`]). A verifier built per send would
+/// remember nothing and limit nothing.
+///
+/// `Peers::default()` has no resolver and **no verifier**: TSP and DIDComm
+/// sends work (the peer's document is resolved through a default cache built
+/// for the call), but an HTTPS send fails, because its reply cannot be
+/// checked.
+#[derive(Clone, Copy, Default)]
+pub struct Peers<'a> {
+    /// Resolves the peer's DID document. `None` falls back to a default
+    /// cache built for the call.
+    pub did_resolver: Option<&'a DIDCacheClient>,
+    /// Verifies a reply that arrives as the HTTP response. `None` means an
+    /// HTTPS send fails: an unverified reply is not evidence of delivery.
+    pub verifier: Option<&'a TransportBoundVerifier>,
+}
+
+/// Why other nodes would refuse `endpoint` as this node's advertised
+/// `TrustTaskHTTPS` endpoint (they send only to `https` on a public host), or
+/// `None` if they would accept it. For setup and self-checks to warn an
+/// operator whose own endpoint is loopback, private or plain `http`.
+pub fn peer_endpoint_refusal(endpoint: &str) -> Option<String> {
+    crate::http::peer_endpoint_refusal(endpoint)
+}
+
+/// Let this process send to a peer whose advertised Trust Task endpoint is on
+/// loopback (plain `http` included), for tests whose peers listen on
+/// `127.0.0.1`. Process-wide and one-way; private ranges stay refused. Built
+/// only with the `test-support` feature, never into a release.
+#[cfg(feature = "test-support")]
+pub fn allow_loopback_peer_endpoints_for_tests() {
+    crate::http::allow_loopback_peer_endpoints();
+}
+
+impl<'a> Peers<'a> {
+    /// A send context over `did_resolver` and `verifier`.
+    pub fn new(
+        did_resolver: Option<&'a DIDCacheClient>,
+        verifier: Option<&'a TransportBoundVerifier>,
+    ) -> Self {
+        Self {
+            did_resolver,
+            verifier,
+        }
+    }
+}
+
 /// Send a trust-task document to `to`, choosing the binding from `to`'s DID
 /// document.
 ///
@@ -84,9 +151,9 @@ pub async fn send_trust_task(
     to: &str,
     doc: &trust_tasks_rs::TrustTask<Value>,
     fallback: &TransportFallback,
-    did_resolver: Option<&DIDCacheClient>,
+    peers: Peers<'_>,
 ) -> Result<PeerTransport, SendError> {
-    match resolve_send_binding(to, fallback, did_resolver).await {
+    match resolve_send_binding(to, fallback, peers.did_resolver).await {
         Some((PeerTransport::Tsp, _)) => {
             // Wrapped in the `binding/tsp/0.1` envelope. This sealed the bare
             // document, which no conformant consumer can read — the same half
@@ -131,7 +198,7 @@ pub async fn send_trust_task(
             Ok(PeerTransport::Didcomm)
         }
         Some((PeerTransport::Https, endpoint)) => {
-            send_over_https(from, to, &endpoint, doc, did_resolver).await?;
+            send_over_https(from, to, &endpoint, doc, peers.verifier).await?;
             debug!(to, endpoint, type_uri = %doc.type_uri, "trust task sent over HTTPS");
             Ok(PeerTransport::Https)
         }
@@ -164,13 +231,13 @@ pub async fn send_trust_task_with_retry(
     to: &str,
     doc: &trust_tasks_rs::TrustTask<Value>,
     fallback: &TransportFallback,
-    did_resolver: Option<&DIDCacheClient>,
+    peers: Peers<'_>,
     retry: Retry,
 ) -> Result<PeerTransport, SendError> {
     let attempts = retry.attempts.max(1);
     let mut last: Option<SendError> = None;
     for attempt in 1..=attempts {
-        match send_trust_task(didcomm, listener_id, from, to, doc, fallback, did_resolver).await {
+        match send_trust_task(didcomm, listener_id, from, to, doc, fallback, peers).await {
             Ok(t) => return Ok(t),
             Err(e) => {
                 debug!(
@@ -228,7 +295,7 @@ async fn send_over_didcomm(
 
 /// Refuse an HTTPS trust-task reply body larger than this. A reply is one
 /// small signed JSON document; a peer sending more is misbehaving, not slow.
-const HTTPS_MAX_REPLY_BYTES: u64 = 1024 * 1024;
+const HTTPS_MAX_REPLY_BYTES: u64 = crate::http::PEER_MAX_BODY as u64;
 
 /// `POST doc` to the peer's advertised `TrustTaskHTTPS` endpoint and verify
 /// the reply.
@@ -238,11 +305,11 @@ const HTTPS_MAX_REPLY_BYTES: u64 = 1024 * 1024;
 /// `{endpoint}/trust-tasks`, matching [`trust_tasks_https::HttpsClient`] and
 /// the inbound route this crate serves at `POST {base}/trust-tasks`.
 ///
-/// Uses [`crate::http::outbound_client`] for the shared connect/request
-/// timeouts and redirect refusal (a redirect to another origin would carry
-/// the signed document to a host the peer's document never named). The reply
-/// body is read with a hard cap ([`HTTPS_MAX_REPLY_BYTES`]) so a misbehaving
-/// peer cannot make the caller buffer an unbounded response.
+/// The endpoint came from the peer's document, so the request goes through
+/// [`crate::http::peer_endpoint_client`]: the URL is vetted against the peer
+/// endpoint policy (https, public host) and so is every address its name
+/// resolves to; redirects are refused, timeouts are finite, and the reply is
+/// read with a hard cap.
 ///
 /// A 2xx HTTP status is not itself success: the reply must additionally be
 /// signed by `to` (the peer this send addressed), addressed back to `from`,
@@ -254,10 +321,26 @@ async fn send_over_https(
     to: &str,
     endpoint: &str,
     doc: &trust_tasks_rs::TrustTask<Value>,
-    did_resolver: Option<&DIDCacheClient>,
+    verifier: Option<&TransportBoundVerifier>,
 ) -> Result<(), SendError> {
     let url = format!("{}/trust-tasks", endpoint.trim_end_matches('/'));
-    post_trust_task_https(from, to, &url, doc, did_resolver)
+    // The URL is the peer's text: sanitised and bounded before it reaches an
+    // outbox error or a log line.
+    let vetted = crate::http::vet_peer_endpoint(&url).map_err(|e| {
+        format!(
+            "trust task to {to}: endpoint {} not allowed: {}",
+            crate::error::redact_server_message(&url),
+            crate::error::redact_server_message(&e.to_string())
+        )
+    })?;
+    let verifier = verifier.ok_or_else(|| {
+        format!("trust task HTTPS reply from {to}: no DID resolver configured to verify it")
+    })?;
+    let client = crate::http::peer_endpoint_client()?;
+    let resp = client.post(&vetted)?.json(doc).send().await?;
+    let status = resp.status();
+    let body = client.read_body_capped(resp).await?;
+    check_https_reply(from, to, &url, doc, status, &body, verifier)
         .await
         .map(|_| ())
 }
@@ -272,10 +355,15 @@ async fn send_over_https(
 /// caller's business. A peer that refuses to answer a document it could not
 /// verify answers with a non-2xx status, reported as an error here.
 ///
-/// Uses [`crate::http::outbound_client`] for the shared connect/request
-/// timeouts and redirect refusal (a redirect to another origin would carry the
-/// signed document to a host the peer never named). The reply body is read
-/// with a hard cap ([`HTTPS_MAX_REPLY_BYTES`]).
+/// Builds a verifier for this one call, so it remembers no DID-status verdict
+/// and applies no forced-refresh limit across calls: for one-off callers (a
+/// CLI command, a test). A long-lived caller holds a verifier and uses
+/// [`post_trust_task_https_verified`].
+///
+/// `url` is one the caller chose (configuration, not a peer's document), so
+/// it is sent with [`crate::http::outbound_client`]'s timeouts and redirect
+/// refusal but no host policy. The reply body is read with a hard cap
+/// ([`HTTPS_MAX_REPLY_BYTES`]).
 pub async fn post_trust_task_https(
     from: &str,
     to: &str,
@@ -289,9 +377,9 @@ pub async fn post_trust_task_https(
     post_trust_task_https_verified(from, to, url, doc, &verifier).await
 }
 
-/// [`post_trust_task_https`], verifying the reply with `verifier` — for a
-/// caller whose DID cache is not the default one [`build_verifier`] assumes
-/// (one built with a non-default host policy, say).
+/// [`post_trust_task_https`], verifying the reply with `verifier` — the
+/// caller's long-lived verifier, or one over a DID cache that is not the
+/// default one [`build_verifier`] assumes (a non-default host policy, say).
 pub async fn post_trust_task_https_verified(
     from: &str,
     to: &str,
@@ -306,7 +394,21 @@ pub async fn post_trust_task_https_verified(
         .await?;
     let status = resp.status();
     let body = read_capped_body(resp, HTTPS_MAX_REPLY_BYTES).await?;
+    check_https_reply(from, to, url, doc, status, &body, verifier).await
+}
 
+/// The checks every HTTPS reply is held to, whichever client carried it: a
+/// 2xx status, a Trust Task threaded to `doc`, signed by `to` and addressed
+/// to `from`.
+async fn check_https_reply(
+    from: &str,
+    to: &str,
+    url: &str,
+    doc: &trust_tasks_rs::TrustTask<Value>,
+    status: reqwest::StatusCode,
+    body: &[u8],
+    verifier: &TransportBoundVerifier,
+) -> Result<trust_tasks_rs::TrustTask<Value>, SendError> {
     if !status.is_success() {
         // A task-level refusal (`permissionDenied` for an ungranted/revoked
         // key, say) comes back as an *unsigned* framework `trust-task-error`
@@ -314,17 +416,19 @@ pub async fn post_trust_task_https_verified(
         // unsigned. Surface its code so the operator sees the ACL refusal
         // rather than a bare transport error; we read the code for diagnostics
         // only and trust nothing else in the document.
-        if let Some((code, message)) = unsigned_error_summary(&body) {
+        if let Some((code, message)) = unsigned_error_summary(body) {
             return Err(refused(to, url, &code, &message).into());
         }
+        // Whatever else the peer answered is sanitised and bounded before it
+        // reaches a log line or an outbox error.
         return Err(format!(
             "trust task HTTPS send to {to} ({url}) failed: HTTP {status}: {}",
-            String::from_utf8_lossy(&body)
+            crate::error::redact_server_message(&String::from_utf8_lossy(body))
         )
         .into());
     }
 
-    let reply: trust_tasks_rs::TrustTask<Value> = serde_json::from_slice(&body).map_err(|e| {
+    let reply: trust_tasks_rs::TrustTask<Value> = serde_json::from_slice(body).map_err(|e| {
         format!("trust task HTTPS reply from {to} ({url}) did not parse as a Trust Task: {e}")
     })?;
 
@@ -346,8 +450,11 @@ pub async fn post_trust_task_https_verified(
     // peer that answers 2xx with an *unsigned* framework error (the one shape
     // left unsigned) fails here; surface its code so the refusal is legible
     // rather than reported as a signature failure.
-    if let Err(e) = verify_sender_bound(&reply, Some(to), None, from, verifier).await {
-        if let Some((code, message)) = unsigned_error_summary(&body) {
+    // `for_replies`: a reply to our own send has its own forced-refresh
+    // allowance, which documents arriving unasked cannot spend.
+    let verifier = verifier.for_replies();
+    if let Err(e) = verify_sender_bound(&reply, Some(to), None, from, &verifier).await {
+        if let Some((code, message)) = unsigned_error_summary(body) {
             return Err(refused(to, url, &code, &message).into());
         }
         return Err(e.into());
@@ -555,6 +662,66 @@ mod tests {
         );
         assert!(!msg.chars().any(char::is_control), "{msg:?}");
         assert!(msg.ends_with("permission Denied: a [2Jb c"), "{msg:?}");
+    }
+
+    /// A peer-advertised endpoint on loopback, a private or link-local range,
+    /// or a special-use name is refused before any connection is attempted,
+    /// and so is plain `http`.
+    #[tokio::test]
+    async fn https_send_refuses_endpoints_outside_the_peer_policy() {
+        let doc = build_request(
+            MSG_HEALTH_PING,
+            "did:example:control",
+            "did:example:server",
+            serde_json::json!({}),
+        )
+        .expect("build");
+        for endpoint in [
+            "http://127.0.0.1:9/api",
+            "https://127.0.0.1:9/api",
+            "https://10.0.0.5/api",
+            "https://169.254.169.254/latest",
+            "https://[fd00::1]/api",
+            "https://localhost/api",
+            "https://edge.internal/api",
+            "http://edge.example.com/api",
+        ] {
+            let err = send_over_https(
+                "did:example:control",
+                "did:example:server",
+                endpoint,
+                &doc,
+                None,
+            )
+            .await
+            .expect_err(endpoint)
+            .to_string();
+            assert!(err.contains("not allowed"), "{endpoint}: {err}");
+        }
+    }
+
+    /// A public endpoint passes the policy; without a verifier the send then
+    /// fails rather than accept a reply it cannot check.
+    #[tokio::test]
+    async fn https_send_needs_a_verifier_for_the_reply() {
+        let doc = build_request(
+            MSG_HEALTH_PING,
+            "did:example:control",
+            "did:example:server",
+            serde_json::json!({}),
+        )
+        .expect("build");
+        let err = send_over_https(
+            "did:example:control",
+            "did:example:server",
+            "https://edge.example.com/api",
+            &doc,
+            None,
+        )
+        .await
+        .expect_err("no verifier")
+        .to_string();
+        assert!(err.contains("no DID resolver configured"), "{err}");
     }
 
     /// The non-canonical `TASK_SERVER_HEALTH_*` route-decorator URIs must NOT

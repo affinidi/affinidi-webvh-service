@@ -113,6 +113,10 @@ impl Topology {
         let mut http_tasks = Vec::new();
         let mut dirs = Vec::new();
 
+        // The edge and watcher listen on loopback, which a peer-advertised
+        // Trust Task endpoint may not name outside tests.
+        did_hosting_common::server::trust_tasks::send::allow_loopback_peer_endpoints_for_tests();
+
         // Mint the edge's and watcher's identities up front — both are
         // HTTPS-only `did:peer`s content-addressed over their service
         // endpoint, so the port has to be known before minting, and the

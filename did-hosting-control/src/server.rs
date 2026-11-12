@@ -601,6 +601,9 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let health_control_did = state.config.server_did.clone();
     let health_interval_secs = state.config.registry.health_check_interval.max(10);
     let health_resolver = state.did_resolver.clone();
+    // The same verifier inbound documents are checked with, so a pong
+    // answered over HTTPS is held to the same per-DID limits.
+    let health_verifier = state.trust_tasks_verifier.clone();
     let health_identity = state.identity.clone();
     // Control's own configured mediator, used as the send fallback when a
     // target server's document advertises no transport.
@@ -621,7 +624,10 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
                         health_control_did.as_deref(),
                         health_interval_secs,
                         &health_fallback,
-                        health_resolver.as_ref(),
+                        did_hosting_common::server::trust_tasks::send::Peers::new(
+                            health_resolver.as_ref(),
+                            health_verifier.as_deref(),
+                        ),
                         health_identity.as_deref(),
                     ).await {
                         warn!("health check error: {e}");
@@ -1126,7 +1132,7 @@ async fn send_health_ping_trust_task(
     server_did: &str,
     inst: &registry::ServiceInstance,
     fallback: &did_hosting_common::server::didcomm_profile::TransportFallback,
-    did_resolver: Option<&DIDCacheClient>,
+    peers: did_hosting_common::server::trust_tasks::send::Peers<'_>,
     signer: &affinidi_tdk::secrets_resolver::secrets::Secret,
 ) {
     use did_hosting_common::server::trust_tasks::send::{build_signed_request, send_trust_task};
@@ -1155,7 +1161,7 @@ async fn send_health_ping_trust_task(
         server_did,
         &doc,
         fallback,
-        did_resolver,
+        peers,
     )
     .await
     {
@@ -1198,7 +1204,7 @@ pub async fn run_health_checks(
     control_did: Option<&str>,
     health_interval_secs: u64,
     fallback: &did_hosting_common::server::didcomm_profile::TransportFallback,
-    did_resolver: Option<&DIDCacheClient>,
+    peers: did_hosting_common::server::trust_tasks::send::Peers<'_>,
     identity: Option<&did_hosting_common::server::identity::ServiceIdentity>,
 ) -> Result<(), AppError> {
     let instances = registry::list_instances(registry_ks).await?;
@@ -1235,7 +1241,7 @@ pub async fn run_health_checks(
                 server_did,
                 inst,
                 fallback,
-                did_resolver,
+                peers,
                 signer,
             )
             .await;
@@ -1265,9 +1271,13 @@ pub async fn run_health_checks(
         if inst.did().is_none() {
             continue;
         }
-        if let Err(e) =
-            registry::refresh_advertised_services(registry_ks, &inst.instance_id, did_resolver, now)
-                .await
+        if let Err(e) = registry::refresh_advertised_services(
+            registry_ks,
+            &inst.instance_id,
+            peers.did_resolver,
+            now,
+        )
+        .await
         {
             debug!(
                 instance_id = %inst.instance_id,

@@ -388,6 +388,10 @@ pub struct TransportBoundVerifier {
     /// seam [`Self::record_deactivation_verdict`].
     #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     deactivation: Option<Arc<DeactivationCache>>,
+    /// The forced-refresh allowance [`Self::for_replies`] uses: the same DID
+    /// cache, with a limiter of its own, so documents arriving unasked cannot
+    /// spend the allowance a reply to this service's own send relies on.
+    reply_refresher: Option<Arc<dyn StaleKeyRefresh>>,
 }
 
 /// Build the proof verifier a service checks inbound Trust Task documents with,
@@ -425,6 +429,7 @@ impl TransportBoundVerifier {
             options: VerifyOptions::default(),
             delegate: None,
             deactivation: None,
+            reply_refresher: None,
         }
     }
 
@@ -455,6 +460,11 @@ impl TransportBoundVerifier {
                 deactivation: Some(deactivation.clone()),
             }),
             refresher: Some(Arc::new(CacheRefresher {
+                client: client.clone(),
+                limiter: RefreshLimiter::default(),
+                deactivation: deactivation.clone(),
+            })),
+            reply_refresher: Some(Arc::new(CacheRefresher {
                 client,
                 limiter: RefreshLimiter::default(),
                 deactivation: deactivation.clone(),
@@ -514,6 +524,21 @@ impl TransportBoundVerifier {
             verification_method: verification_method.into(),
         });
         self
+    }
+
+    /// This verifier, for a reply to a document this service sent: the same
+    /// DID cache and DID-status verdicts, but a forced-refresh allowance of
+    /// its own. Inbound documents anyone can send (a bad proof claiming some
+    /// peer's DID, say) spend the inbound allowance; they cannot use up the
+    /// one re-resolution a peer that has just rotated needs for its reply to
+    /// verify. Still one forced refresh per DID per
+    /// [`FORCED_REFRESH_INTERVAL`], and only for the peers this service
+    /// addresses. Cheap: clones `Arc`s.
+    pub fn for_replies(&self) -> Self {
+        Self {
+            refresher: self.reply_refresher.clone(),
+            ..self.clone()
+        }
     }
 
     /// Verify an operational proof: everything [`ProofVerifier::verify`]
@@ -1103,6 +1128,36 @@ mod tests {
         let (v, refresher) = rotated_verifier(false);
         assert!(v.verify(&self_issued_doc().await).await.is_err());
         assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A reply to this service's own send has a forced-refresh allowance of
+    /// its own: with the inbound allowance spent, a reply from a peer that
+    /// has just rotated still gets its one re-resolution, and the inbound
+    /// path still gets none.
+    #[tokio::test]
+    async fn replies_have_their_own_forced_refresh_allowance() {
+        let refreshed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let inbound = Arc::new(FlagRefresher {
+            refreshed: refreshed.clone(),
+            calls: Default::default(),
+            allow: false,
+        });
+        let reply = Arc::new(FlagRefresher {
+            refreshed: refreshed.clone(),
+            calls: Default::default(),
+            allow: true,
+        });
+        let mut v = TransportBoundVerifier::with_resolver(Arc::new(RotatedResolver { refreshed }));
+        v.refresher = Some(inbound.clone());
+        v.reply_refresher = Some(reply.clone());
+
+        assert!(v.verify(&self_issued_doc().await).await.is_err());
+        v.for_replies()
+            .verify(&self_issued_doc().await)
+            .await
+            .expect("the reply gets its own refresh");
+        assert_eq!(inbound.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(reply.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// A failure a fresh document cannot cure (issuer binding) triggers no
