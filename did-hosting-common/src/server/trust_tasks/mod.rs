@@ -69,7 +69,7 @@ pub use bound::{
 /// a direct dependency on `didwebvh-rs`.
 pub use didwebvh_rs::host_policy::HostPolicy;
 pub use transport::{TSP_BINDING_URI, TspTransportHandler};
-pub use verifier::{TransportBoundVerifier, build_verifier, is_unreachable, unreachable_error};
+pub use verifier::{TransportBoundVerifier, VerifyFailure, VerifyFailureKind, build_verifier};
 
 use crate::tasks::acl::{change_role, grant, list, revoke, show};
 use chrono::Utc;

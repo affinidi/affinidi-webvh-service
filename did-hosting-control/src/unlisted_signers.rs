@@ -63,8 +63,7 @@ use did_hosting_common::server::rate_limit::KeyedRateLimiter;
 use did_hosting_common::server::replay::ReplayCache;
 use did_hosting_common::server::trust_tasks::verifier::controller_did;
 use did_hosting_common::server::trust_tasks::{
-    BoundError, TransportBoundVerifier, precheck_sender_bound, unreachable_error,
-    verify_sender_bound,
+    BoundError, TransportBoundVerifier, precheck_sender_bound, verify_sender_bound,
 };
 
 /// Records the sign-in cache holds across all signers (about 3 MB).
@@ -245,10 +244,10 @@ impl UnlistedSigners {
         .await
         {
             Ok(bound) => bound.map_err(Err),
-            Err(_) => Err(Err(BoundError::Proof(unreachable_error(format!(
+            Err(_) => Err(Err(BoundError::unreachable(format!(
                 "verification did not complete within {}s",
                 self.timeout.as_secs_f32()
-            ))))),
+            )))),
         }
     }
 
