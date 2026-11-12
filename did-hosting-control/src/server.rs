@@ -119,6 +119,10 @@ pub struct AppState {
     /// Both transports gate through it before dispatch to reject
     /// captured-and-resubmitted envelopes within the freshness window.
     pub replay_cache: Arc<crate::replay::ReplayCache>,
+    /// What signed documents from signers the ACL does not list may
+    /// consume: their own replay cache and bounded DID resolution. See
+    /// [`crate::unlisted_signers`].
+    pub unlisted_signers: Arc<crate::unlisted_signers::UnlistedSigners>,
     /// Per-mnemonic write lock. `register_did_atomic` (and any other
     /// read-then-write operation on the same path) holds the lock for
     /// the duration of its read + build + commit window so two
@@ -433,6 +437,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         stats_ks: stats_ks.clone(),
         timeseries_ks: timeseries_ks.clone(),
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
+        unlisted_signers: Default::default(),
         replay_cache: Arc::new(crate::replay::ReplayCache::with_config(replay_config)?),
         path_locks: crate::path_locks::PathLocks::new(),
         acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),

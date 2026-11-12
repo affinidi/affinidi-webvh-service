@@ -202,6 +202,7 @@ impl Topology {
             stats_ks: store.keyspace(KS_STATS).unwrap(),
             timeseries_ks: store.keyspace(KS_TIMESERIES).unwrap(),
             signing_key_bytes: None,
+            unlisted_signers: Default::default(),
             replay_cache: Arc::new(did_hosting_control::replay::ReplayCache::new()),
             path_locks: did_hosting_control::path_locks::PathLocks::new(),
             acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),

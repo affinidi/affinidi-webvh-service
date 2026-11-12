@@ -60,8 +60,8 @@ pub mod transport;
 pub mod verifier;
 
 pub use bound::{
-    BoundError, BoundKeyError, identity_signing_secret, sign_document, verify_bound_key,
-    verify_sender_bound, verify_sender_bound_approval,
+    BoundError, BoundKeyError, identity_signing_secret, precheck_sender_bound, sign_document,
+    verify_bound_key, verify_sender_bound, verify_sender_bound_approval,
 };
 /// The `did:webvh` log host policy a [`TransportBoundVerifier`] reads a signer's
 /// log under. Re-exported so a caller can build a verifier that trusts a
@@ -69,7 +69,7 @@ pub use bound::{
 /// a direct dependency on `didwebvh-rs`.
 pub use didwebvh_rs::host_policy::HostPolicy;
 pub use transport::{TSP_BINDING_URI, TspTransportHandler};
-pub use verifier::{TransportBoundVerifier, build_verifier, is_unreachable};
+pub use verifier::{TransportBoundVerifier, build_verifier, is_unreachable, unreachable_error};
 
 use crate::tasks::acl::{change_role, grant, list, revoke, show};
 use chrono::Utc;
