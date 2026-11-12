@@ -30,3 +30,13 @@ sooner; set `client_ipv6_prefix = 128` to count each address alone. A
 caller's first large document, before it has verified once, and every large
 document from a new address, competes for the 20-a-minute share. Log lines
 for a limited IPv6 client name its network, not its address.
+
+### Breaking — `did-hosting-common` `ServerConfig` has a `client_ipv6_prefix` field
+
+Rust callers that build `did_hosting_common::server::config::ServerConfig`
+with a struct literal must set `client_ipv6_prefix`; use
+`did_hosting_common::server::config::default_client_ipv6_prefix()` or
+`..ServerConfig::default()`. Build a service's `ClientIps` with
+`ClientIps::from_server_config(&config.server)` so the setting applies;
+`ClientIps::new` still works and counts an IPv6 client by its /64.
+Configuration files need no change.
