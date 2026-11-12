@@ -483,14 +483,19 @@ async fn apply_fate(
 }
 
 /// After a refresh redeemed `presented_refresh_token` and rotated the session
-/// `session_id`: if a settlement ended or demoted that session while the
-/// refresh was in flight, apply it again to the rotated row, which the
-/// refresh wrote from what it read before the settlement. Returns the fate
-/// applied, `None` when there was nothing to do.
+/// `session_id` to `rotated_refresh_token` and `rotated_token_id`: if a
+/// settlement ended or demoted that session while the refresh was in flight,
+/// apply it again to the rotated row, which the refresh wrote from what it
+/// read before the settlement. Only the row this refresh wrote is touched: one
+/// that has moved on since (a later refresh, a step-up) was written after the
+/// settlement and is left alone. Returns the fate applied, `None` when there
+/// was nothing to do.
 pub async fn settle_after_refresh(
     sessions: &KeyspaceHandle,
     presented_refresh_token: &str,
     session_id: &str,
+    rotated_refresh_token: &str,
+    rotated_token_id: &str,
 ) -> Result<Option<SessionFate>, AppError> {
     let _row = lock_session(session_id).await;
     let Some(bytes) = sessions
@@ -507,9 +512,15 @@ pub async fn settle_after_refresh(
         "demote" => SessionFate::Demote,
         _ => return Ok(None),
     };
-    if let Some(session) = get_session(sessions, session_id).await? {
-        apply_fate(sessions, session, fate, true).await?;
+    let Some(session) = get_session(sessions, session_id).await? else {
+        return Ok(None);
+    };
+    if session.refresh_token.as_deref() != Some(rotated_refresh_token)
+        || session.token_id.as_deref() != Some(rotated_token_id)
+    {
+        return Ok(None);
     }
+    apply_fate(sessions, session, fate, false).await?;
     Ok(Some(fate))
 }
 
@@ -1597,9 +1608,10 @@ mod settlement_tests {
                 .unwrap();
             assert!(get_session(&ks, id).await.unwrap().is_some());
 
-            let applied = settle_after_refresh(&ks, &format!("{id}-r1"), id)
-                .await
-                .unwrap();
+            let applied =
+                settle_after_refresh(&ks, &format!("{id}-r1"), id, &format!("{id}-r2"), "jti-2")
+                    .await
+                    .unwrap();
             assert_eq!(applied, Some(fate));
             match fate {
                 SessionFate::End => {
@@ -1619,11 +1631,57 @@ mod settlement_tests {
             }
             // A later refresh of an unsettled session finds no marker.
             assert_eq!(
-                settle_after_refresh(&ks, "never-settled", id)
+                settle_after_refresh(&ks, "never-settled", id, "r", "j")
                     .await
                     .unwrap(),
                 None
             );
         }
+    }
+
+    /// A row that moved on after the refresh wrote it (here a step-up that
+    /// elevated it again) is not demoted by that refresh's settle.
+    #[tokio::test]
+    async fn a_step_up_after_a_settled_refresh_is_kept() {
+        let (ks, _dir) = make_ks().await;
+        let id = "s-step-up";
+        let old = session("did:example:alice", id, "r1", &["did", "passkey"], "aal2");
+        store_session_with_refresh(&ks, &old, "r1", None)
+            .await
+            .unwrap();
+        take_session_id_by_refresh(&ks, "r1")
+            .await
+            .unwrap()
+            .unwrap();
+        let read = get_session(&ks, id).await.unwrap().unwrap();
+        settle_subject_sessions(&ks, "did:example:alice", |_| SessionFate::Demote)
+            .await
+            .unwrap();
+        let mut rotated = read.clone();
+        rotated.refresh_token = Some("r2".into());
+        rotated.token_id = Some("jti-2".into());
+        store_session_with_refresh(&ks, &rotated, "r2", None)
+            .await
+            .unwrap();
+        // A step-up lands before the refresh's settle: a new token id.
+        let mut stepped = rotated.clone();
+        stepped.token_id = Some("jti-3".into());
+        stepped.amr = vec!["did".into(), "passkey".into()];
+        stepped.acr = "aal2".into();
+        store_session(&ks, &stepped).await.unwrap();
+
+        let applied = settle_after_refresh(&ks, "r1", id, "r2", "jti-2")
+            .await
+            .unwrap();
+        assert_eq!(applied, None);
+        let row = get_session(&ks, id).await.unwrap().unwrap();
+        assert_eq!(row.acr, "aal2", "the step-up was undone");
+        // No fresh marker was left for the rotated token.
+        assert!(
+            ks.get_raw(settled_marker_key("r2"))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

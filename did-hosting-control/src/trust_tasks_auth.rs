@@ -895,10 +895,28 @@ async fn refresh_v2_arm(
     // A session ended or demoted while this refresh was in flight (its
     // passkey revoked, its ACL entry removed) stays so: the rotation was
     // written from the row as it stood before.
+    // The rotation this refresh wrote: a row that has moved on since is not
+    // this refresh's to settle.
+    let rotated_refresh_token = value["tokens"]["refreshToken"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let rotated_token_id = state
+        .jwt_keys
+        .as_deref()
+        .and_then(|keys| {
+            value["tokens"]["accessToken"]
+                .as_str()
+                .and_then(|t| keys.decode(t).ok())
+        })
+        .map(|claims| claims.jti)
+        .unwrap_or_default();
     match did_hosting_common::server::auth::session::settle_after_refresh(
         &state.sessions_ks,
         &presented_refresh_token,
         &new_session_id,
+        &rotated_refresh_token,
+        &rotated_token_id,
     )
     .await
     .map_err(|e| denied(&doc, "refresh/settled", e))?

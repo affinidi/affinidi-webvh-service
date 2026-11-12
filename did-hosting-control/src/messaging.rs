@@ -1817,17 +1817,46 @@ async fn route_trust_task_doc(
         // A removed ACL entry takes what it authorised with it. The removal
         // lock is held from before the entry goes until its invites are
         // withdrawn, so no invite redemption (which takes it too) runs in
-        // between and recreates the entry.
-        let removes_entry = acl_entry_removal_subject(&doc);
-        let _removal_guard = match removes_entry {
-            Some(_) => Some(
-                state
-                    .acl_locks
-                    .guard(crate::control_tasks::enrol::ACL_REMOVAL_LOCK_KEY)
-                    .await,
-            ),
-            None => None,
+        // between and recreates the entry. It is taken only for a removal the
+        // proven issuer may make (an administrator, or the subject itself), so
+        // a doomed one never holds up redemptions; and the gate above has
+        // already verified the proof, so the handler is not asked to verify it
+        // again (no DID resolution while the lock is held).
+        let removal = match acl_entry_removal_subject(&doc) {
+            Some(subject) if signed && may_remove_entry(state, &principal, &subject).await => {
+                Some(subject)
+            }
+            _ => None,
         };
+        let (_removal_guard, policy) = match removal {
+            Some(_) => {
+                let Ok(guard) = tokio::time::timeout(
+                    ACL_REMOVAL_LOCK_WAIT,
+                    state
+                        .acl_locks
+                        .guard(crate::control_tasks::enrol::ACL_REMOVAL_LOCK_KEY),
+                )
+                .await
+                else {
+                    warn!(%type_uri, "acl/revoke deferred: the ACL removal lock is busy");
+                    return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
+                        doc.reject_with(
+                            format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                            trust_tasks_rs::ErrorPayload::new(
+                                trust_tasks_rs::StandardCode::Unavailable,
+                            )
+                            .with_message("another ACL change is in progress; retry"),
+                        ),
+                    ))));
+                };
+                (
+                    Some(guard),
+                    trust_tasks_rs::ProofPolicy::<TransportBoundVerifier>::AcceptUnverified,
+                )
+            }
+            None => (None, policy),
+        };
+        let removes_entry = removal;
 
         // The framework path, and the only one whose outcome carries a reject code
         // — so it is handed back whole rather than serialised here, and HTTPS maps
@@ -1877,6 +1906,21 @@ fn acl_entry_removal_subject(doc: &trust_tasks_rs::TrustTask<Value>) -> Option<S
         .get("subject")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// The longest an `acl/revoke` waits for the ACL removal lock (R1.2).
+const ACL_REMOVAL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether `issuer` may remove `subject`'s ACL entry: an administrator, or
+/// the subject itself (`acl/revoke` permits self-revocation). The handler
+/// decides again under the ACL write lock; this only keeps a removal that is
+/// bound to be refused from taking the removal lock.
+async fn may_remove_entry(state: &AppState, issuer: &str, subject: &str) -> bool {
+    did_hosting_common::scid::same_reference(issuer, subject)
+        || matches!(
+            did_hosting_common::server::acl::check_acl(&state.acl_ks, issuer).await,
+            Ok(crate::acl::Role::Admin)
+        )
 }
 
 /// End what a removed ACL entry authorised: every session of its subject,

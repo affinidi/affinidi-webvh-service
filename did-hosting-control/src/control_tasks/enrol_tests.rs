@@ -2856,16 +2856,17 @@ async fn an_invite_from_a_former_administrator_enrols_nothing() {
     );
 }
 
-/// A redemption waits while an ACL removal is between removing the entry and
-/// withdrawing the subject's invites, so it finds the invite withdrawn rather
-/// than recreating the entry.
+/// A redemption of a role-conferring invite racing an `acl/revoke` of its
+/// subject never recreates the entry: the revoke holds the removal lock from
+/// before the entry goes until the invite is withdrawn, and the redemption
+/// waits for it.
 #[tokio::test]
-async fn a_redemption_waits_for_an_acl_removal_to_withdraw_its_invites() {
+async fn a_redemption_racing_an_acl_removal_does_not_recreate_the_entry() {
     let (state, _dir) = state().await;
     let admin = member(&state, 207, Role::Admin).await;
     let dana = member(&state, 208, Role::Owner).await;
     let invitee = stranger(209);
-    let issued = issue(&state, &admin, &dana.did, "stepUp").await;
+    let issued = issue(&state, &admin, &dana.did, "session").await;
     let reply = redeem_start(&state, Via::Tsp, &invitee, &issued.token, &issued.code).await;
     let start = ok(&reply, &t(REDEEM_START));
     let mut passkey = SoftPasskey::new();
@@ -2874,36 +2875,63 @@ async fn a_redemption_waits_for_an_acl_removal_to_withdraw_its_invites() {
         "credential": passkey.attest(&start["options"]),
     });
 
-    // A removal in progress: the entry is gone, its invites not yet.
-    let removal = state
+    // Hold the ACL write lock, so the revoke, once it holds the removal lock,
+    // waits inside its handler.
+    let acl_lock = state
         .acl_locks
-        .guard(super::enrol::ACL_REMOVAL_LOCK_KEY)
+        .guard(did_hosting_common::server::trust_tasks::ACL_WRITE_LOCK_KEY)
         .await;
-    did_hosting_common::server::acl::delete_acl_entry(&state.acl_ks, &dana.did)
-        .await
-        .unwrap();
-    let mut finish = Box::pin(unsigned(&state, Via::Tsp, &invitee, REDEEM_FINISH, payload));
-    tokio::select! {
-        reply = &mut finish => panic!("the redemption ran during a removal: {reply}"),
-        _ = tokio::time::sleep(std::time::Duration::from_millis(150)) => {}
-    }
-    did_hosting_common::server::acl_removal::withdraw_removed_member(&state.sessions_ks, &dana.did)
-        .await
-        .unwrap();
-    drop(removal);
-    let reply = finish.await;
+    let revoke = {
+        let state = state.clone();
+        // The same DID and key as `admin` (`member` seeds from its seed).
+        let admin = stranger(207);
+        let subject = dana.did.clone();
+        tokio::spawn(async move {
+            call(
+                &state,
+                Via::Tsp,
+                &admin,
+                &t("acl/revoke/0.2"),
+                json!({ "subject": subject, "revocation": { "kind": "entry" } }),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let finish = {
+        let state = state.clone();
+        let invitee = stranger(209);
+        tokio::spawn(
+            async move { unsigned(&state, Via::Tsp, &invitee, REDEEM_FINISH, payload).await },
+        )
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    drop(acl_lock);
+
+    let reply = revoke.await.unwrap();
+    assert!(
+        reply["type"]
+            .as_str()
+            .is_some_and(|ty| ty.ends_with("#response")),
+        "{reply}"
+    );
+    let reply = finish.await.unwrap();
     assert_eq!(
         code(&reply),
         "auth/passkey/enroll/redeem/finish:enrollmentNotFound",
         "{reply}"
     );
     assert!(
-        pk::get_passkey_user_by_cred(
-            &state.store.keyspace(KS_PASSKEY_STEP_UP).unwrap(),
-            &hex(&passkey.cred_id)
-        )
-        .await
-        .unwrap()
-        .is_none()
+        get_acl_entry(&state.acl_ks, &dana.did)
+            .await
+            .unwrap()
+            .is_none(),
+        "the redemption recreated the removed entry"
+    );
+    assert!(
+        pk::get_passkey_user_by_cred(&state.sessions_ks, &hex(&passkey.cred_id))
+            .await
+            .unwrap()
+            .is_none()
     );
 }
