@@ -57,7 +57,14 @@
 //! charges one address-scoped budget before granting the raised limit, and
 //! [`settle_large_document_charge`] doubles that address's next cost
 //! whenever the claim does not pan out (a verification failure, or a
-//! verified issuer that turns out to be someone else).
+//! verified issuer that turns out to be someone else). The raised cost
+//! halves every [`PENALTY_HALF_LIFE_SECS`] and on each claim that does
+//! verify, so an address is not held to it indefinitely.
+//!
+//! Claimed and verified issuers are compared as identities
+//! ([`crate::scid::identity`]): a `did:scid` issuer may carry a `?src=`
+//! locator that the verified identity does not, and that is the same
+//! issuer, not a mismatch.
 
 use trust_tasks_rs::{ErrorPayload, ErrorResponse, Payload, RejectReason, TrustTask};
 
@@ -164,14 +171,42 @@ const GLOBAL_LIMITER: &str = "large-document-global";
 /// Most addresses tracked at once, by the per-address budget and by the
 /// penalty table each. Past it the budget refuses a new address (after
 /// sweeping the ones whose allowance has refilled) while tracked ones are
-/// unaffected; the penalty table keeps every penalty it holds and records no
-/// new one (see [`LargeDocumentBudget::penalize`]).
+/// unaffected; the penalty table drops the penalties that have decayed away
+/// and otherwise keeps every one it holds, recording no new one (see
+/// [`LargeDocumentBudget::penalize`]).
 const MAX_TRACKED_ADDRESSES: usize = 10_000;
 
 /// The highest per-document cost a penalty raises an address to: one more
 /// than a whole window's allowance, which no address can ever pay. Doubling
 /// past it would change nothing but the number.
 const MAX_COST: u64 = LARGE_DOCUMENT_BUDGET_PER_WINDOW + 1;
+
+/// How long a raised per-document cost takes to halve with no further
+/// unverified claim from its address. The highest cost ([`MAX_COST`]) is back
+/// to 1 within two half-lives, so an address that once sent unverifiable
+/// large documents — or shares an egress address with one that did — is held
+/// to the raised cost for under an hour, not until the process restarts.
+pub const PENALTY_HALF_LIFE_SECS: u64 = 15 * 60;
+
+/// One address's raised per-document cost and when it last changed.
+#[derive(Debug, Clone, Copy)]
+struct Penalty {
+    cost: u64,
+    since: std::time::Instant,
+}
+
+impl Penalty {
+    /// The cost at `now`: halved once for every whole half-life since it last
+    /// changed, and never below 1.
+    fn cost_at(&self, now: std::time::Instant) -> u64 {
+        let halvings = now.saturating_duration_since(self.since).as_secs() / PENALTY_HALF_LIFE_SECS;
+        u32::try_from(halvings)
+            .ok()
+            .and_then(|h| self.cost.checked_shr(h))
+            .unwrap_or(0)
+            .max(1)
+    }
+}
 
 /// Per-address budget for documents [`check_for_known_issuer`] grants the
 /// raised limit to before their claimed issuer is verified. See the module
@@ -182,14 +217,16 @@ const MAX_COST: u64 = LARGE_DOCUMENT_BUDGET_PER_WINDOW + 1;
 /// this workspace. What is this budget's own is the penalty: an address whose
 /// claim did not verify pays double for its next large document, then double
 /// again, until it can pay for none. A penalty is against the address, not the
-/// minute it was earned in, so it outlives the address's bucket.
+/// minute it was earned in, so it outlives the address's bucket; it halves
+/// every [`PENALTY_HALF_LIFE_SECS`], and on each claim from the address that
+/// does verify, and is forgotten once back to 1.
 #[derive(Debug)]
 pub struct LargeDocumentBudget {
     per_address: KeyedRateLimiter<String>,
     global: KeyedRateLimiter<()>,
-    /// Each penalised address's cost per large document (always above 1; an
-    /// address that is absent costs 1).
-    penalties: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// Each penalised address's raised cost per large document (an address
+    /// that is absent, or whose penalty has decayed to 1, costs 1).
+    penalties: std::sync::Mutex<std::collections::HashMap<String, Penalty>>,
 }
 
 impl Default for LargeDocumentBudget {
@@ -221,8 +258,9 @@ impl LargeDocumentBudget {
     }
 
     /// Sweep addresses whose allowance has refilled out of the budget's
-    /// memory every minute until `shutdown` fires. Penalties are kept. Must
-    /// run on a Tokio runtime.
+    /// memory every minute until `shutdown` fires. Penalties are not swept
+    /// here: they decay, and [`Self::penalize`] drops the decayed ones when
+    /// the table is full. Must run on a Tokio runtime.
     pub fn spawn_gc(&self, shutdown: &tokio_util::sync::CancellationToken) {
         self.per_address.spawn_gc(shutdown.clone());
         self.global.spawn_gc(shutdown.clone());
@@ -248,22 +286,37 @@ impl LargeDocumentBudget {
     /// this budget let through turns out to have failed verification, or
     /// proven to be someone else. Persists across windows (a penalty is
     /// against the address, not the minute it earned it), up to a cost no
-    /// window's allowance covers.
+    /// window's allowance covers, and decays from there
+    /// ([`PENALTY_HALF_LIFE_SECS`]).
     ///
-    /// A full table keeps every penalty it holds and records no new one:
-    /// evicting a penalty to make room would let a flood of fresh addresses
-    /// wipe it on purpose, and refusing unpenalised addresses instead would
-    /// let one shut out every large document for good. A fresh address
+    /// A full table first drops the penalties that have decayed back to 1,
+    /// then keeps every live penalty it holds and records no new one:
+    /// evicting a live penalty to make room would let a flood of fresh
+    /// addresses wipe it on purpose, and refusing unpenalised addresses
+    /// instead would let one shut out every large document. A fresh address
     /// still meets both budgets.
     fn penalize(&self, address: &str) {
-        let mut penalties = self
-            .penalties
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(cost) = penalties.get_mut(address) {
-            *cost = cost.saturating_mul(2).min(MAX_COST);
-        } else if penalties.len() < MAX_TRACKED_ADDRESSES {
-            penalties.insert(address.to_owned(), 2);
+        self.penalize_at(address, std::time::Instant::now());
+    }
+
+    fn penalize_at(&self, address: &str, now: std::time::Instant) {
+        let mut penalties = self.lock_penalties();
+        if let Some(penalty) = penalties.get_mut(address) {
+            let cost = penalty.cost_at(now).saturating_mul(2).min(MAX_COST);
+            *penalty = Penalty { cost, since: now };
+            return;
+        }
+        if penalties.len() >= MAX_TRACKED_ADDRESSES {
+            penalties.retain(|_, penalty| penalty.cost_at(now) > 1);
+        }
+        if penalties.len() < MAX_TRACKED_ADDRESSES {
+            penalties.insert(
+                address.to_owned(),
+                Penalty {
+                    cost: 2,
+                    since: now,
+                },
+            );
         } else {
             tracing::warn!(
                 address,
@@ -272,14 +325,50 @@ impl LargeDocumentBudget {
         }
     }
 
+    /// Halve `address`'s raised cost — called once a claim from it verified
+    /// to exactly the issuer it named. A penalty earned by another sender
+    /// behind the same address (a shared egress, a proxy missing from
+    /// `trusted_proxies`) then does not hold back a caller that keeps proving
+    /// who it is.
+    fn relieve(&self, address: &str) {
+        self.relieve_at(address, std::time::Instant::now());
+    }
+
+    fn relieve_at(&self, address: &str, now: std::time::Instant) {
+        let mut penalties = self.lock_penalties();
+        let Some(penalty) = penalties.get_mut(address) else {
+            return;
+        };
+        let cost = penalty.cost_at(now) / 2;
+        if cost > 1 {
+            *penalty = Penalty { cost, since: now };
+        } else {
+            penalties.remove(address);
+        }
+    }
+
     /// `address`'s cost per large document: 1 unless penalised.
     fn cost(&self, address: &str) -> u64 {
+        self.cost_at(address, std::time::Instant::now())
+    }
+
+    fn cost_at(&self, address: &str, now: std::time::Instant) -> u64 {
+        let mut penalties = self.lock_penalties();
+        let Some(cost) = penalties.get(address).map(|p| p.cost_at(now)) else {
+            return 1;
+        };
+        if cost <= 1 {
+            penalties.remove(address);
+        }
+        cost
+    }
+
+    fn lock_penalties(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Penalty>> {
         self.penalties
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(address)
-            .copied()
-            .unwrap_or(1)
     }
 }
 
@@ -300,6 +389,7 @@ fn retry_after(refusal: crate::server::error::AppError) -> u64 {
 #[derive(Debug)]
 pub struct LargeDocumentCharge {
     address: String,
+    /// The claimed issuer's identity ([`crate::scid::identity`]).
     claimed_issuer: String,
 }
 
@@ -357,17 +447,21 @@ pub async fn check_for_known_issuer(
     check(body, served)?;
     Ok(Some(LargeDocumentCharge {
         address: address.to_string(),
-        claimed_issuer,
+        claimed_issuer: crate::scid::identity(&claimed_issuer),
     }))
 }
 
 /// Settle a [`LargeDocumentCharge`] once the caller's own proof verification
 /// concludes. `verified_issuer` is the proven signer on success, or `None`
-/// on any verification failure. A `verified_issuer` that is not exactly the
-/// one the charge was granted against — including a failure, which proves
-/// none at all — doubles the address's cost for its next large document
-/// ([`LargeDocumentBudget::penalize`]). A charge that verified to exactly
-/// its claimed issuer costs nothing extra.
+/// on any verification failure. A `verified_issuer` that is not the identity
+/// the charge was granted against — including a failure, which proves none at
+/// all — doubles the address's cost for its next large document
+/// ([`LargeDocumentBudget::penalize`]). A charge that verified to its claimed
+/// issuer costs nothing extra, and halves any raised cost the address holds.
+///
+/// The two are compared as identities ([`crate::scid::identity`]): a
+/// `did:scid` issuer's `?src=` locator is not part of who it is, and the
+/// verifier reports the identity without it.
 ///
 /// A no-op when `charge` is `None` — the document never carried one.
 pub fn settle_large_document_charge(
@@ -378,8 +472,11 @@ pub fn settle_large_document_charge(
     let Some(charge) = charge else {
         return;
     };
-    if verified_issuer != Some(charge.claimed_issuer.as_str()) {
-        budget.penalize(&charge.address);
+    match verified_issuer {
+        Some(verified) if crate::scid::identity(verified) == charge.claimed_issuer => {
+            budget.relieve(&charge.address);
+        }
+        _ => budget.penalize(&charge.address),
     }
 }
 
@@ -674,13 +771,131 @@ mod tests {
         {
             let mut penalties = budget.penalties.lock().unwrap();
             for i in 1..MAX_TRACKED_ADDRESSES {
-                penalties.insert(format!("ip:{i}"), 2);
+                penalties.insert(
+                    format!("ip:{i}"),
+                    Penalty {
+                        cost: 2,
+                        since: std::time::Instant::now(),
+                    },
+                );
             }
         }
         budget.penalize("ip:new");
         assert_eq!(budget.cost("ip:new"), 1, "no room for a new penalty");
         budget.penalize("ip:abuser");
         assert_eq!(budget.cost("ip:abuser"), 4, "a held penalty still grows");
+    }
+
+    /// A raised cost halves every half-life, and is forgotten once it is back
+    /// to 1.
+    #[test]
+    fn a_penalty_decays() {
+        use std::time::{Duration, Instant};
+        let budget = LargeDocumentBudget::new();
+        let start = Instant::now();
+        for _ in 0..10 {
+            budget.penalize_at("ip:shared", start);
+        }
+        assert_eq!(budget.cost_at("ip:shared", start), MAX_COST);
+        let half_life = Duration::from_secs(PENALTY_HALF_LIFE_SECS);
+        assert_eq!(
+            budget.cost_at("ip:shared", start + half_life - Duration::from_secs(1)),
+            MAX_COST
+        );
+        assert_eq!(budget.cost_at("ip:shared", start + half_life), MAX_COST / 2);
+        assert_eq!(budget.cost_at("ip:shared", start + half_life * 2), 1);
+        assert!(
+            budget.penalties.lock().unwrap().is_empty(),
+            "a decayed penalty is forgotten"
+        );
+
+        // A further unverified claim doubles the decayed cost, not the old one.
+        budget.penalize_at("ip:again", start);
+        budget.penalize_at("ip:again", start);
+        budget.penalize_at("ip:again", start + half_life);
+        assert_eq!(budget.cost_at("ip:again", start + half_life), 4);
+    }
+
+    /// A claim that verifies halves its address's raised cost.
+    #[tokio::test]
+    async fn a_verified_claim_relieves_its_address() {
+        let acl = acl_with("did:web:admin.example").await;
+        let served = [DID_REGISTER];
+        let budget = LargeDocumentBudget::new();
+        for _ in 0..2 {
+            budget.penalize("ip:shared");
+        }
+        assert_eq!(budget.cost("ip:shared"), 4);
+        let doc = register_doc("did:web:admin.example", 200 * 1024);
+        let charge = budget_charge(&doc, &served, &acl, &budget, "ip:shared").await;
+        settle_large_document_charge(&budget, Some(&charge), Some("did:web:admin.example"));
+        assert_eq!(budget.cost("ip:shared"), 2);
+        budget.relieve("ip:shared");
+        assert_eq!(budget.cost("ip:shared"), 1);
+        assert!(budget.penalties.lock().unwrap().is_empty());
+    }
+
+    /// A `did:scid` issuer that names its `?src=` locator is the identity the
+    /// verifier reports without it: not a mismatch, and not penalised.
+    #[tokio::test]
+    async fn a_did_scid_issuer_with_its_locator_is_not_penalised() {
+        let identity = "did:scid:vh:1:QmScidIssuer";
+        let acl = acl_with(identity).await;
+        let served = [DID_REGISTER];
+        let budget = LargeDocumentBudget::new();
+        let doc = register_doc(&format!("{identity}?src=hosting.example/alice"), 200 * 1024);
+        for _ in 0..LARGE_DOCUMENT_BUDGET_PER_WINDOW {
+            let charge = budget_charge(&doc, &served, &acl, &budget, "ip:scid").await;
+            settle_large_document_charge(&budget, Some(&charge), Some(identity));
+            assert_eq!(budget.cost("ip:scid"), 1);
+        }
+
+        // A different identity is still a mismatch.
+        let charge = LargeDocumentCharge {
+            address: "ip:scid".into(),
+            claimed_issuer: identity.into(),
+        };
+        settle_large_document_charge(&budget, Some(&charge), Some("did:scid:vh:1:QmOther"));
+        assert_eq!(budget.cost("ip:scid"), 2);
+    }
+
+    /// A full table makes room for a new penalty by dropping the ones that
+    /// have decayed.
+    #[test]
+    fn a_full_penalty_table_drops_decayed_penalties() {
+        use std::time::{Duration, Instant};
+        let budget = LargeDocumentBudget::new();
+        let start = Instant::now();
+        {
+            let mut penalties = budget.penalties.lock().unwrap();
+            for i in 0..MAX_TRACKED_ADDRESSES {
+                penalties.insert(
+                    format!("ip:{i}"),
+                    Penalty {
+                        cost: 2,
+                        since: start,
+                    },
+                );
+            }
+        }
+        let later = start + Duration::from_secs(PENALTY_HALF_LIFE_SECS);
+        budget.penalize_at("ip:live", later);
+        budget.penalize_at("ip:new", later);
+        assert_eq!(budget.cost_at("ip:new", later), 2);
+        assert_eq!(budget.penalties.lock().unwrap().len(), 2);
+    }
+
+    async fn budget_charge(
+        doc: &[u8],
+        served: &[&str],
+        acl: &crate::server::store::KeyspaceHandle,
+        budget: &LargeDocumentBudget,
+        address: &str,
+    ) -> LargeDocumentCharge {
+        check_for_known_issuer(doc, served, acl, budget, address)
+            .await
+            .expect("within budget")
+            .expect("a large document charges the budget")
     }
 
     #[test]
