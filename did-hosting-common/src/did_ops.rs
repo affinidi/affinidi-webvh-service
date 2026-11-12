@@ -28,6 +28,13 @@ pub struct DidRecord {
     pub content_size: u64,
     #[serde(default)]
     pub disabled: bool,
+    /// Set when an admin suspended the slot. Only an admin can then resume
+    /// it: the owner's `active` is refused, and a re-register or a forced
+    /// re-create carries the suspension forward. Cleared when an admin
+    /// resumes the slot. Records written before this field existed read as
+    /// `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled_by_admin: bool,
     /// Soft-delete timestamp. When set, the DID is treated as deleted but
     /// content is preserved for recovery within the retention period.
     #[serde(default)]
@@ -1267,6 +1274,7 @@ mod tests {
             did_id: None,
             content_size: 0,
             disabled: false,
+            disabled_by_admin: false,
             deleted_at: None,
             method: "web".into(),
             domain: "tenant-a.example.com".into(),

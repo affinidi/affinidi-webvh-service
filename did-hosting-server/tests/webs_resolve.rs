@@ -120,6 +120,7 @@ async fn seed_webs_did(state: &AppState, disabled: bool) {
         did_id: Some(did_id()),
         content_size: KERI.len() as u64,
         disabled,
+        disabled_by_admin: false,
         deleted_at: None,
         method: "webs".into(),
         domain: DOMAIN.into(),

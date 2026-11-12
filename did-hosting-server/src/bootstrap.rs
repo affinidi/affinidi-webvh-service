@@ -187,6 +187,7 @@ pub async fn bootstrap_did(
         did_id: Some(did_id.clone()),
         content_size: jsonl.len() as u64,
         disabled: false,
+        disabled_by_admin: false,
         deleted_at: None,
 
         // T12: legacy construction site; T13 migration fills `domain`.
@@ -405,6 +406,7 @@ pub async fn import_did_at_path(
         did_id: Some(did_id.clone()),
         content_size: jsonl.len() as u64,
         disabled: false,
+        disabled_by_admin: false,
         deleted_at: None,
 
         // T12: legacy construction site; T13 migration fills `domain`.

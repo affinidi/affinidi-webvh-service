@@ -3042,6 +3042,7 @@ mod resolution_cache_hook_tests {
             did_id: Some("did:webvh:Q1:a.example:alice".into()),
             content_size: 0,
             disabled,
+            disabled_by_admin: false,
             deleted_at: None,
             method: "webvh".into(),
             domain: "a.example".into(),

@@ -102,6 +102,7 @@ async fn seed(state: &AppState, name: &str, enabled: bool, disabled_did: bool) {
         did_id: Some(DID.into()),
         content_size: 0,
         disabled: disabled_did,
+        disabled_by_admin: false,
         deleted_at: None,
         method: "webvh".into(),
         domain: DOMAIN.into(),

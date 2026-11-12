@@ -189,6 +189,7 @@ mod tests {
             did_id: Some(format!("did:webvh:Q1:host.example:{mnemonic}")),
             content_size: 0,
             disabled: false,
+            disabled_by_admin: false,
             deleted_at: None,
             method: "webvh".into(),
             domain: "host.example".into(),

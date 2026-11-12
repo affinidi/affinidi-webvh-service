@@ -296,6 +296,7 @@ impl TestServer {
             did_id: Some(format!("did:webvh:abc:{mnemonic}")),
             content_size: 42,
             disabled: false,
+            disabled_by_admin: false,
             deleted_at: None,
             method: "webvh".to_string(),
             domain: String::new(),

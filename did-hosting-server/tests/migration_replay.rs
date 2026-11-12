@@ -86,6 +86,7 @@ fn pre_t12_record(mnemonic: &str, did_id: Option<&str>) -> DidRecord {
         did_id: did_id.map(|s| s.into()),
         content_size: 0,
         disabled: false,
+        disabled_by_admin: false,
         deleted_at: None,
         method: "webvh".into(),
         // Empty domain — what M-01 fills in.

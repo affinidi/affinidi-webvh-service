@@ -343,6 +343,7 @@ pub(crate) async fn seed_did(state: &AppState, owner: &str, mnemonic: &str) -> D
         did_id: Some(format!("did:webvh:abc:control.test:{mnemonic}")),
         content_size: 42,
         disabled: false,
+        disabled_by_admin: false,
         deleted_at: None,
         method: "webvh".to_string(),
         domain: String::new(),

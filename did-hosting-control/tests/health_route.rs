@@ -45,6 +45,7 @@ fn own_did_record(did_id: &str) -> DidRecord {
         did_id: Some(did_id.into()),
         content_size: 2,
         disabled: false,
+        disabled_by_admin: false,
         deleted_at: None,
         method: "webvh".into(),
         domain: String::new(),
