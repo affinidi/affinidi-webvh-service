@@ -39,10 +39,16 @@ npx --no-install expo export --platform web   # only if you touched the UI build
 
 All work lands on `main` by PR. Releases are `major.minor` (`0.9`) branches
 cut from `nightly` — the last fully green `main` — and patched only there.
-Two rules follow (details in [RELEASES.md](RELEASES.md)):
+Three rules follow (details in [RELEASES.md](RELEASES.md)):
 
 - **Never edit a `version =`.** The release tooling sets versions; the
   `branch rules` check fails a PR that changes one.
+- **Record user-facing changes as a `changelog.d/` fragment**, never in
+  `CHANGELOG.md`: add a new file `changelog.d/<short-kebab-name>.md` holding a
+  `### <Kind> — <title>` entry (format in
+  [changelog.d/README.md](changelog.d/README.md)). The release tooling
+  assembles the fragments into `CHANGELOG.md`, and the `branch rules` check
+  fails any other PR that edits it.
 - **Need a fix in a supported release?** Merge it to `main`, then label the PR
   `backport release/<major.minor>`; a bot opens the cherry-pick on that branch.
 

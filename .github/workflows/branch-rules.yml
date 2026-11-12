@@ -1,7 +1,8 @@
 name: Branch rules
 
 # Where a PR may go and what it may change: fixes reach a release branch by
-# backport, only the release tooling edits versions and RELEASE. See
+# backport, only the release tooling edits versions, RELEASE and CHANGELOG.md
+# (everyone else adds a changelog.d/ fragment). See
 # scripts/check-branch-rules.py and RELEASES.md.
 #
 # Its own workflow for the trigger: `labeled` / `unlabeled` must re-run it (the
