@@ -306,23 +306,39 @@ impl Webs {
     /// Reject an update that does not continue the stored key event log.
     ///
     /// A `did:webs` update republishes the entire stream, so nothing in
-    /// the bytes themselves stops a controller — or an attacker holding
-    /// a superseded key — from publishing a *shorter*, forked log that
-    /// verifies perfectly well on its own. The stored log is the record
+    /// the bytes themselves stops a controller, or anyone holding a
+    /// superseded key, from publishing a *shorter* log, or a different one,
+    /// that verifies perfectly well on its own. The stored log is the record
     /// of what this DID has already said, so the new one may only move
     /// forward from it.
     ///
-    /// Two rules, both against the verified key state rather than the
-    /// raw bytes (a stream may legitimately be re-serialized, or gain
-    /// witness receipts for events it already carried):
+    /// Compared as the AID's key events, by sequence number and SAID, rather
+    /// than as raw bytes: a stream may legitimately be re-serialized, or gain
+    /// witness receipts for events it already carried. The new log must hold
+    /// every stored event, in place, followed by zero or more new ones, with
+    /// one exception KERI defines: **superseding recovery**. Interaction
+    /// events (`ixn`) after the last establishment event can be superseded by
+    /// a rotation (`rot`, or `drt` for a delegated AID) at the sequence
+    /// number of the first of them. That is how a controller recovers after
+    /// interaction events signed with a compromised current key, so it is
+    /// accepted. Refused:
     ///
-    /// - same AID, and
-    /// - the new sequence number is greater than or equal to the old.
+    /// - a different AID;
+    /// - a rewind: the new log stops short of the stored one with no
+    ///   divergence;
+    /// - any other divergence: a stored establishment event (`icp`, `rot`,
+    ///   `dip`, `drt`) replaced, a stored rotation superseded by another
+    ///   rotation, or an interaction replaced by anything but a rotation.
+    ///
+    /// Only this AID's own key event log is held to its history. When the
+    /// AID is delegated, the delegator's log in the same stream is verified
+    /// (by `affinidi-did-webs`) but not compared with the stored one.
     ///
     /// # Errors
-    /// [`MethodError::Validation`] if the new stream rewinds the log or
-    /// establishes a different AID. An unreadable *existing* stream is
-    /// **not** an error — see below.
+    /// [`MethodError::Validation`] if the new stream does not verify, does
+    /// not establish the stored AID, rewinds the log or diverges from it
+    /// other than by superseding recovery. An *existing* stream that cannot
+    /// be parsed at all is **not** an error: see below.
     pub fn verify_continuation(
         did: &str,
         existing: &[u8],
@@ -330,38 +346,117 @@ impl Webs {
     ) -> Result<(), MethodError> {
         let parsed =
             DidWebs::parse(did).map_err(|e| MethodError::Malformed(format!("{did}: {e}")))?;
-
-        // An existing blob we cannot read is not a reason to refuse the
-        // update — it is a reason to want it. Corrupt or pre-migration
-        // bytes would otherwise wedge the slot permanently, with no way
-        // to publish the good log that fixes it.
-        let Ok(old_kels) = Kels::parse(existing) else {
-            return Ok(());
-        };
-        let Ok(old_state) = old_kels.key_state(parsed.aid()) else {
-            return Ok(());
-        };
+        let aid = parsed.aid();
 
         let new_kels = Kels::parse(new_data)
             .map_err(|e| MethodError::Validation(format!("keri.cesr could not be read: {e}")))?;
-        let new_state = new_kels
-            .key_state(parsed.aid())
+        new_kels
+            .key_state(aid)
             .map_err(|e| MethodError::Validation(format!("key event log did not verify: {e}")))?;
 
-        if new_state.prefix != old_state.prefix {
-            return Err(MethodError::Validation(format!(
-                "update establishes {} but the hosted log is for {}",
-                new_state.prefix, old_state.prefix,
-            )));
+        // A stored stream that cannot even be parsed is not a reason to
+        // refuse the update: it is a reason to want it. Corrupt bytes would
+        // otherwise wedge the slot permanently, with no way to publish the
+        // good log that fixes it. Every write path verifies a log before
+        // storing it, so this is corruption, and it is logged.
+        let old_kels = match Kels::parse(existing) {
+            Ok(kels) => kels,
+            Err(e) => {
+                tracing::warn!(
+                    did,
+                    error = %e,
+                    "the hosted keri.cesr cannot be parsed; the update is not checked \
+                     against it"
+                );
+                return Ok(());
+            }
+        };
+        // One that parses but does not verify is still compared, event by
+        // event: its SAIDs are what was served, whether or not this build
+        // can verify them now.
+        if let Err(e) = old_kels.key_state(aid) {
+            tracing::warn!(
+                did,
+                error = %e,
+                "the hosted key event log does not verify; the update is compared with \
+                 its events as stored"
+            );
         }
-        if new_state.sn < old_state.sn {
-            return Err(MethodError::Validation(format!(
-                "update rewinds the key event log: hosted is at sequence {}, update is at {}",
-                old_state.sn, new_state.sn,
-            )));
+
+        let held = key_events(&old_kels, aid)?;
+        let next = key_events(&new_kels, aid)?;
+        if held.is_empty() {
+            tracing::warn!(
+                did,
+                "the hosted keri.cesr carries no key events for this AID; the update is \
+                 not checked against it"
+            );
+            return Ok(());
         }
-        Ok(())
+        let Some(d) = held.iter().zip(&next).position(|(h, n)| h != n) else {
+            // No divergence: the new log is the stored one, extended, or it
+            // stops short of it.
+            if next.len() < held.len() {
+                return Err(MethodError::Validation(format!(
+                    "update rewinds the key event log: hosted is at sequence {}, update is at {}",
+                    held[held.len() - 1].sn,
+                    next.last().map(|e| e.sn).unwrap_or_default(),
+                )));
+            }
+            return Ok(());
+        };
+
+        let superseded = &held[d..];
+        let recovery = &next[d];
+        if superseded.iter().all(|e| e.ilk == "ixn")
+            && matches!(recovery.ilk.as_str(), "rot" | "drt")
+        {
+            tracing::info!(
+                did,
+                sn = recovery.sn,
+                superseded = superseded.len(),
+                "a rotation supersedes the hosted interaction events (KERI recovery)"
+            );
+            return Ok(());
+        }
+        Err(MethodError::Validation(format!(
+            "update diverges from the key event log at sequence {}: the hosted event is {} \
+             {}, the update's is {} {}. Only interaction events after the last \
+             establishment event can be superseded, and only by a rotation",
+            held[d].sn, held[d].ilk, held[d].said, recovery.ilk, recovery.said
+        )))
     }
+}
+
+/// One key event of an AID's log.
+#[derive(Debug, PartialEq, Eq)]
+struct KeyEvent {
+    sn: u64,
+    ilk: String,
+    said: String,
+}
+
+/// The key events (`icp`, `rot`, `ixn`, `dip`, `drt`) a stream carries for
+/// `aid`, in stream order.
+fn key_events(kels: &Kels, aid: &str) -> Result<Vec<KeyEvent>, MethodError> {
+    let mut events = Vec::new();
+    for message in kels.messages() {
+        let serder = &message.serder;
+        let Ok(ilk) = serder.ilk() else { continue };
+        if !matches!(ilk.as_str(), "icp" | "rot" | "ixn" | "dip" | "drt") {
+            continue;
+        }
+        if serder.prefix().ok().as_deref() != Some(aid) {
+            continue;
+        }
+        let unreadable = |e: &dyn std::fmt::Display| {
+            MethodError::Validation(format!("a key event of {aid}: {e}"))
+        };
+        let sn = serder.sn().map_err(|e| unreadable(&e))?;
+        let said = serder.said().map_err(|e| unreadable(&e))?;
+        events.push(KeyEvent { sn, ilk, said });
+    }
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -679,6 +774,57 @@ mod tests {
         // wedged forever.
         Webs::verify_continuation(DID, b"corrupt", KERI)
             .expect("an unreadable stored log must not block the update that repairs it");
+    }
+
+    /// The reference stream's key events alone: its first three messages
+    /// (`icp`, `ixn`, `ixn`), without the registry and credential messages
+    /// that follow them.
+    fn key_events_only() -> &'static [u8] {
+        let vcp = KERI
+            .windows(br#""t":"vcp""#.len())
+            .position(|w| w == br#""t":"vcp""#)
+            .expect("the stream carries a vcp");
+        let start = KERI[..vcp]
+            .windows(4)
+            .rposition(|w| w == br#"{"v""#)
+            .expect("the vcp message starts");
+        &KERI[..start]
+    }
+
+    /// Continuation compares events, not bytes: the same key events in a
+    /// stream carrying other messages, or none, are the same log.
+    #[test]
+    fn verify_continuation_compares_events_not_bytes() {
+        let bare = key_events_only();
+        assert_ne!(bare, KERI);
+        Webs::verify_continuation(DID, KERI, bare).expect("the other messages dropped");
+        Webs::verify_continuation(DID, bare, KERI).expect("the other messages added");
+    }
+
+    /// A stored stream that parses but no longer verifies is still history:
+    /// the update is compared with its events as stored.
+    #[test]
+    fn verify_continuation_compares_an_unverifiable_stored_log_by_its_events() {
+        // Alter one character of the inception's signature.
+        let mut stored = KERI.to_vec();
+        let sig = stored
+            .windows(7)
+            .position(|w| w == b"-AABAAD")
+            .expect("the inception's signature group")
+            + 10;
+        stored[sig] = if stored[sig] == b'A' { b'B' } else { b'A' };
+        let kels = Kels::parse(&stored).expect("still parses");
+        assert!(kels.key_state(AID).is_err(), "no longer verifies");
+
+        Webs::verify_continuation(DID, &stored, KERI).expect("the same events");
+        let inception_only = &KERI[..KERI[1..]
+            .windows(4)
+            .position(|w| w == br#"{"v""#)
+            .expect("a second message")
+            + 1];
+        let err = Webs::verify_continuation(DID, &stored, inception_only)
+            .expect_err("a rewind of the stored events");
+        assert!(err.to_string().contains("rewinds"), "{err}");
     }
 
     #[test]

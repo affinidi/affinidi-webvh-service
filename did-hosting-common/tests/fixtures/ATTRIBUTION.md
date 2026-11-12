@@ -23,3 +23,16 @@ this service and the wider KERI ecosystem disagreeing about what a valid
 They are used **unmodified**. Tests that need a bad stream (a tampered event, a
 rewound log, a document publishing keys the log never authorised) derive it
 from these at runtime, so the on-disk copy stays a faithful conformance vector.
+
+## `recovery/`
+
+Generated here, not copied: one `did:webs` identifier (`recovery/AID`) with
+three histories, for the tests of key event log continuation (superseding
+recovery and forks). `ixn-ixn.keri.cesr` is `icp, ixn, ixn`, `rot.keri.cesr`
+is `icp, rot` (a recovery of it), and `other-ixn.keri.cesr` is `icp, ixn'` (a
+different interaction at sequence 1). Regenerate with:
+
+    cargo test -p did-hosting-control --features method-webs \
+      --test webs_continuation -- --ignored regenerate_fixtures
+
+Generation is deterministic (a fixed salt), so a re-run reproduces the files.

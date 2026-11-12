@@ -109,15 +109,32 @@ before anything is stored, via `method::publication::verify_publication`:
 
 - **Slot binding.** The stream must establish exactly the AID the slot's
   identifier ends in. See below for why this is inverted from webvh.
-- **Continuation.** An update may not rewind or fork the hosted log — same AID,
-  and the new sequence number must be ≥ the stored one. A `did:webs` update
-  republishes the *whole* stream, so nothing in the bytes stops a controller (or
-  an attacker holding a superseded key) from publishing a shorter log that
-  verifies perfectly well on its own.
+- **Continuation.** An update must extend the hosted log: same AID, and every
+  key event the hosted log holds, at the same sequence number with the same
+  SAID, followed by zero or more new ones. A `did:webs` update republishes the
+  *whole* stream, so nothing in the bytes stops a controller, or someone holding
+  a superseded key, from publishing a shorter or different log that verifies
+  perfectly well on its own. The events are compared by SAID, not as bytes, so
+  republishing the same events (re-serialized, or with witness receipts added)
+  is accepted.
 
-An unreadable *stored* stream is deliberately not a reason to refuse an update —
-that would wedge a corrupt slot permanently, with no way to publish the log that
-repairs it.
+  The one divergence accepted is KERI's **superseding recovery**: interaction
+  events (`ixn`) after the last establishment event can be replaced by a
+  rotation (`rot`, or `drt` for a delegated AID) at the sequence number of the
+  first of them. That is how a controller recovers after its current key signed
+  interactions it disowns. Anything else is refused: a shorter log (a rewind),
+  a different interaction at the same sequence number, or a replaced
+  establishment event, a rotation superseding a rotation included.
+
+  Only the AID's own key event log is held to its history. For a delegated AID,
+  the delegator's log in the same stream is verified but is not compared with
+  the hosted one.
+
+A stored stream that cannot be parsed at all is deliberately not a reason to
+refuse an update: that would wedge a corrupt slot permanently, with no way to
+publish the log that repairs it. The check is skipped with a warning. A stored
+stream that parses but no longer verifies is still compared, event by event:
+its SAIDs are what resolvers were served.
 
 ## Where the identifier comes from — inverted from webvh
 
