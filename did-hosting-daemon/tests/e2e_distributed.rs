@@ -431,6 +431,7 @@ impl Topology {
             store: watcher_store_config,
             sync: webvh_watcher::config::SyncConfig {
                 source_dids: vec![control_did.clone()],
+                sources: Vec::new(),
             },
             ..webvh_watcher::config::AppConfig::default()
         };

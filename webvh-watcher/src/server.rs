@@ -94,8 +94,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
                 .into(),
         ));
     }
-    if config.sync.source_dids.is_empty() {
-        warn!("sync.source_dids is empty: this watcher will apply no sync from anyone");
+    if config.sync.source_count() == 0 {
+        warn!("no sync sources are configured: this watcher will apply no sync from anyone");
     }
 
     let identity = identity::load_identity(
@@ -123,7 +123,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let state = AppState::new(store.clone(), config, identity)?;
     info!(
         watcher_did = state.config.server_did.as_deref().unwrap_or_default(),
-        sources = state.config.sync.source_dids.len(),
+        sources = state.config.sync.source_count(),
         "watcher starting"
     );
 

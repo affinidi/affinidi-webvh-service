@@ -61,6 +61,55 @@ pub struct SyncConfig {
     /// means the watcher applies nothing.
     #[serde(default)]
     pub source_dids: Vec<String>,
+    /// Sources with settings (`[[sync.sources]]`). A DID listed here is a
+    /// configured source too, whether or not `source_dids` also lists it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<SourceConfig>,
+}
+
+/// One source, with the settings `source_dids` cannot carry.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceConfig {
+    /// The source's DID.
+    pub did: String,
+    /// The hosts this source may sync DIDs for, compared with the DID's host
+    /// (`host`, or `host:port` when the DID names a port), ignoring case. A
+    /// DID on any other host is refused `notAuthorized`. Empty: any host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<String>,
+}
+
+impl SyncConfig {
+    /// Whether `did` is a configured source.
+    pub fn is_source(&self, did: &str) -> bool {
+        self.source_dids.iter().any(|s| s == did) || self.sources.iter().any(|s| s.did == did)
+    }
+
+    /// How many distinct sources are configured.
+    pub fn source_count(&self) -> usize {
+        let mut all: Vec<&str> = self
+            .source_dids
+            .iter()
+            .map(String::as_str)
+            .chain(self.sources.iter().map(|s| s.did.as_str()))
+            .collect();
+        all.sort_unstable();
+        all.dedup();
+        all.len()
+    }
+
+    /// Whether `source` may sync a DID on `host`. A source with no domains
+    /// configured (in any `[[sync.sources]]` entry for it) may sync any host.
+    pub fn allows_host(&self, source: &str, host: &str) -> bool {
+        let mut domains = self
+            .sources
+            .iter()
+            .filter(|s| s.did == source)
+            .flat_map(|s| s.domains.iter())
+            .peekable();
+        domains.peek().is_none() || domains.any(|d| d.eq_ignore_ascii_case(host))
+    }
 }
 
 impl Default for AppConfig {
@@ -160,5 +209,42 @@ impl AppConfig {
         did_hosting_common::server::config::apply_fjall_env_overrides(&mut config.fjall)?;
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sources_with_domains_parse_beside_source_dids() {
+        let sync: SyncConfig = toml::from_str(
+            r#"
+            source_dids = ["did:example:a"]
+
+            [[sources]]
+            did = "did:example:b"
+            domains = ["b.example.com", "localhost:8534"]
+            "#,
+        )
+        .expect("parses");
+        assert!(sync.is_source("did:example:a"));
+        assert!(sync.is_source("did:example:b"));
+        assert!(!sync.is_source("did:example:c"));
+        assert_eq!(sync.source_count(), 2);
+        assert!(sync.allows_host("did:example:a", "anything.example.com"));
+        assert!(sync.allows_host("did:example:b", "B.Example.com"));
+        assert!(sync.allows_host("did:example:b", "localhost:8534"));
+        assert!(!sync.allows_host("did:example:b", "a.example.com"));
+        assert!(!sync.allows_host("did:example:b", "localhost"));
+
+        let unknown = toml::from_str::<SyncConfig>(
+            r#"
+            [[sources]]
+            did = "did:example:b"
+            domain = ["b.example.com"]
+            "#,
+        );
+        assert!(unknown.is_err(), "a misspelt setting is refused");
     }
 }

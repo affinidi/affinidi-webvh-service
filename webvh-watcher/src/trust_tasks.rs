@@ -5,7 +5,7 @@
 //! ([`crate::routes::trust_tasks`]) all land in [`dispatch_inbound_document`].
 //! The watcher is a replica: it applies `webvh/sync/update/0.2`,
 //! `webvh/sync/delete/0.2` and `webvh/sync/batch/0.1` from its configured
-//! sources (`sync.source_dids`) and from no one else.
+//! sources (`sync.source_dids` and `[[sync.sources]]`) and from no one else.
 //!
 //! ## Every sync is a document its source signed
 //!
@@ -105,7 +105,7 @@ pub async fn dispatch_inbound_document(
     // invalid proof gets, not a weaker one: only a claimed issuer that is
     // actually a configured source goes on to have its proof checked.
     match doc.issuer.as_deref() {
-        Some(issuer) if state.config.sync.source_dids.iter().any(|s| s == issuer) => {}
+        Some(issuer) if state.config.sync.is_source(issuer) => {}
         claimed => {
             warn!(
                 issuer = claimed.unwrap_or("unknown"),
@@ -132,7 +132,7 @@ pub async fn dispatch_inbound_document(
 
     // Authorise before remembering: see the module docs.
     let reply_id = || format!("urn:uuid:{}", uuid::Uuid::new_v4());
-    if !state.config.sync.source_dids.contains(&principal) {
+    if !state.config.sync.is_source(&principal) {
         warn!(issuer = %principal, %type_uri, "sync refused: the issuer is not a configured source");
         let message = format!("{principal} is not a source of this watcher");
         let payload = match not_authorized(&type_uri) {
@@ -320,9 +320,10 @@ async fn sync_update_task(
         u.disabled,
     );
     let _guard = state.sync_lock.lock().await;
-    let status = watcher_ops::apply_sync(&state.store, &state.dids_ks, source, &e)
-        .await
-        .map_err(refusal_payload)?;
+    let status =
+        watcher_ops::apply_sync(&state.store, &state.dids_ks, &state.config.sync, source, &e)
+            .await
+            .map_err(refusal_payload)?;
     info!(source, mnemonic = %e.mnemonic, ?status, "sync update applied");
     reply::<sync_update::Response>(json!({ "mnemonic": e.mnemonic, "status": status_str(status) }))
 }
@@ -348,7 +349,9 @@ async fn sync_batch_task(
             u.version_count.get(),
             u.disabled,
         );
-        match watcher_ops::apply_sync(&state.store, &state.dids_ks, source, &e).await {
+        match watcher_ops::apply_sync(&state.store, &state.dids_ks, &state.config.sync, source, &e)
+            .await
+        {
             Ok(status) => {
                 results.push(json!({ "mnemonic": e.mnemonic, "status": status_str(status) }))
             }
@@ -388,9 +391,15 @@ async fn sync_delete_task(
         })
     })?;
     let _guard = state.sync_lock.lock().await;
-    let held = watcher_ops::delete_record(&state.store, &state.dids_ks, mnemonic, source)
-        .await
-        .map_err(internal)?;
+    let held = watcher_ops::delete_record(
+        &state.store,
+        &state.dids_ks,
+        &state.config.sync,
+        mnemonic,
+        source,
+    )
+    .await
+    .map_err(internal)?;
     info!(source, mnemonic, held, "sync delete applied");
     reply::<sync_delete::Response>(json!({
         "mnemonic": mnemonic,
