@@ -267,6 +267,20 @@ impl UnlistedSigners {
         Ok(permit)
     }
 
+    /// The same limits, with each source's [`SIGN_IN_PER_SOURCE`] sign-in
+    /// records counted over `window_secs` rather than
+    /// [`SIGN_IN_WINDOW_SECS`]. The quota is a token bucket that gives a
+    /// source a record back every `window / SIGN_IN_PER_SOURCE` (half a
+    /// second by default), so a test that spends the whole quota through the
+    /// full request path would otherwise see a record returned whenever it
+    /// runs slower than that.
+    #[cfg(test)]
+    pub(crate) fn with_sign_in_window(mut self, window_secs: u64) -> Self {
+        self.sign_in_sources =
+            KeyedRateLimiter::new(SIGN_IN_LIMITER_NAME, SIGN_IN_PER_SOURCE, window_secs);
+        self
+    }
+
     /// Hold every resolution slot, as if that many resolutions were in
     /// flight.
     #[cfg(test)]

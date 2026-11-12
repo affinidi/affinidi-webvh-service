@@ -3451,10 +3451,16 @@ async fn bound_key_rows_do_not_touch_the_shared_replay_cache() {
 /// A bound-key row's admission runs before the gate does any proof work: past
 /// its per-address limit, a document is refused as rate limited whether or
 /// not its proof would verify.
+///
+/// The limit is counted over a day here rather than a minute: at the default
+/// an address gets a document back every half second, and these requests can
+/// take longer than that on a loaded machine, which would admit the one past
+/// the limit. A day returns one every 12 minutes.
 #[tokio::test]
 async fn bound_key_admission_runs_before_the_proof_check() {
     use crate::oob::http::OTHER_MAX_PER_MINUTE;
-    let (state, _dir) = state().await;
+    let (mut state, _dir) = state().await;
+    state.oob = std::sync::Arc::new(crate::oob::OobRuntime::default().with_other_window(86_400));
     let starter = stranger(67);
     for n in 0..OTHER_MAX_PER_MINUTE {
         let mut doc = redeem_doc(&starter, NO_SUCH_REQUEST, "authentication").await;
@@ -3828,9 +3834,16 @@ mod unlisted {
     }
 
     /// One source may add only so many sign-in records per window.
+    ///
+    /// The quota is counted over a day here rather than
+    /// `SIGN_IN_WINDOW_SECS`: at the default a source gets a record back
+    /// every half second, and these requests (each signed and verified) can
+    /// take longer than that on a loaded machine, which would admit the one
+    /// past the quota. A day returns one every 12 minutes.
     #[tokio::test]
     async fn sign_in_records_are_limited_per_source() {
-        let (state, _dir) = state().await;
+        let (mut state, _dir) = state().await;
+        state.unlisted_signers = Arc::new(UnlistedSigners::default().with_sign_in_window(86_400));
         for i in 0..SIGN_IN_PER_SOURCE {
             let caller = stranger((i % 200) as u8);
             let reply = send_signed(&state, Via::Https, &caller, CHALLENGE).await;
