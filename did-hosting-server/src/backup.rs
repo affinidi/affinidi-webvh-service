@@ -218,7 +218,8 @@ pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<
     let backup_config: AppConfig = serde_json::from_str(&backup.config)
         .map_err(|e| AppError::Config(format!("invalid config in backup: {e}")))?;
 
-    // Write config.toml from the backup
+    // Write config.toml from the backup. What it replaces is kept, and put
+    // back if the restore is refused.
     let config_file_path = config_path
         .clone()
         .or_else(|| {
@@ -230,6 +231,7 @@ pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<
 
     let config_toml = toml::to_string_pretty(&backup_config)
         .map_err(|e| AppError::Config(format!("failed to serialize config as TOML: {e}")))?;
+    let previous_config = std::fs::read(&config_file_path).ok();
     std::fs::write(&config_file_path, &config_toml).map_err(|e| {
         AppError::Config(format!(
             "failed to write config to {}: {e}",
@@ -242,6 +244,28 @@ pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<
     let store = Store::open(&config.store).await?;
 
     let dids_ks = store.keyspace(KS_DIDS)?;
+
+    // Every DID log the backup carries is held to the history this store has
+    // served, before anything is written: a refused restore changes nothing.
+    let dids_plan = match plan_dids_restore(&dids_ks, &backup.keyspaces.dids).await {
+        Ok(plan) => plan,
+        Err(e) => {
+            let reverted = match &previous_config {
+                Some(bytes) => std::fs::write(&config_file_path, bytes),
+                None => std::fs::remove_file(&config_file_path),
+            };
+            if let Err(revert) = reverted {
+                eprintln!(
+                    "  Could not put back the previous {}: {revert}",
+                    config_file_path.display()
+                );
+            } else {
+                eprintln!("  Config left as it was: {}", config_file_path.display());
+            }
+            return Err(e);
+        }
+    };
+
     let stats_ks = store.keyspace(KS_STATS)?;
     let domains_ks = store.keyspace(KS_DOMAINS)?;
     let assignments_ks = store.keyspace(KS_ASSIGNMENTS)?;
@@ -251,7 +275,7 @@ pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<
     let meta_ks = store.keyspace(KS_META)?;
     let witnesses_ks = store.keyspace(KS_WITNESSES)?;
 
-    let dids_count = restore_keyspace(&store, &dids_ks, &backup.keyspaces.dids).await?;
+    let dids_count = restore_dids(&store, &dids_ks, dids_plan).await?;
     let stats_count = restore_keyspace(&store, &stats_ks, &backup.keyspaces.stats).await?;
     let domains_count = restore_keyspace(&store, &domains_ks, &backup.keyspaces.domains).await?;
     let assignments_count =
@@ -293,31 +317,340 @@ pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<
     Ok(())
 }
 
+/// Entries written per restore batch.
+const BATCH_SIZE: usize = 1000;
+
+fn decode_entry(entry: &KvEntry) -> Result<RawKvPair, AppError> {
+    let key = BASE64
+        .decode(&entry.key)
+        .map_err(|e| AppError::Config(format!("invalid base64url key: {e}")))?;
+    let value = BASE64
+        .decode(&entry.value)
+        .map_err(|e| AppError::Config(format!("invalid base64url value: {e}")))?;
+    Ok((key, value))
+}
+
 async fn restore_keyspace(
     store: &Store,
     ks: &crate::store::KeyspaceHandle,
     entries: &[KvEntry],
 ) -> Result<usize, AppError> {
-    const BATCH_SIZE: usize = 1000;
+    let pairs = entries
+        .iter()
+        .map(decode_entry)
+        .collect::<Result<Vec<_>, _>>()?;
+    write_pairs(store, ks, pairs).await
+}
 
-    for chunk in entries.chunks(BATCH_SIZE) {
+async fn write_pairs(
+    store: &Store,
+    ks: &crate::store::KeyspaceHandle,
+    pairs: Vec<RawKvPair>,
+) -> Result<usize, AppError> {
+    let count = pairs.len();
+    for chunk in pairs.chunks(BATCH_SIZE) {
         let mut batch = store.batch();
-        for entry in chunk {
-            let key = BASE64
-                .decode(&entry.key)
-                .map_err(|e| AppError::Config(format!("invalid base64url key: {e}")))?;
-            let value = BASE64
-                .decode(&entry.value)
-                .map_err(|e| AppError::Config(format!("invalid base64url value: {e}")))?;
-            batch.insert_raw(ks, key, value);
+        for (key, value) in chunk {
+            batch.insert_raw(ks, key.clone(), value.clone());
         }
         // A restore is a bulk load that is safe to re-run, and a chunk of
         // 1,000 entries can be over one DynamoDB transaction, so it need
         // not land atomically.
         batch.commit_in_parts().await?;
     }
+    Ok(count)
+}
 
-    Ok(entries.len())
+/// A DID log a restore puts back, checked by
+/// [`crate::control_register::verify_history`].
+struct RestoredLog {
+    identity: String,
+    mnemonic: String,
+    did_id: String,
+    method: String,
+    log: String,
+}
+
+/// What a restore writes to the `dids` keyspace.
+struct DidsRestore {
+    /// Every entry to write as it is: all of the backup's, less the
+    /// high-water marks this store already holds further.
+    pairs: Vec<RawKvPair>,
+    /// The logs whose high-water marks are recorded once `pairs` is written.
+    logs: Vec<RestoredLog>,
+}
+
+/// Check the backup's `dids` keyspace against what this store has served,
+/// and decide what to write. Nothing is written here.
+///
+/// A restore replaces logs, so it is held to the rule every other path that
+/// replaces an edge's log is: each restored log of a method with a history
+/// (`did:webvh`, and `did:webs` in a build with `method-webs`) must strictly
+/// extend what this store holds for its DID and slot, and the high-water
+/// marks it keeps for that DID ([`crate::control_register::verify_history`]),
+/// and the backup's own mark for it. A backup's high-water mark is written
+/// only where this store holds none for that DID or it extends the one held;
+/// one this store already holds further is kept. Any restored log that would
+/// roll a history back, or a mark that diverges from the held one, refuses
+/// the whole restore. Into an empty store, every backup restores.
+async fn plan_dids_restore(
+    ks: &crate::store::KeyspaceHandle,
+    entries: &[KvEntry],
+) -> Result<DidsRestore, AppError> {
+    use crate::control_register::{
+        HIGH_WATER_IDENTITY_PREFIX, HIGH_WATER_SLOT_PREFIX, has_history, high_water_to_restore,
+        verify_extends, verify_history,
+    };
+    use crate::did_ops::{DidRecord, content_log_key};
+    use std::collections::BTreeMap;
+
+    let backup: BTreeMap<Vec<u8>, Vec<u8>> =
+        entries.iter().map(decode_entry).collect::<Result<_, _>>()?;
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+
+    let mut refusals = Vec::new();
+    let mut logs = Vec::new();
+    for (key, value) in &backup {
+        let Some(mnemonic) = key.strip_prefix(b"did:") else {
+            continue;
+        };
+        let mnemonic = text(mnemonic);
+        let record: DidRecord = serde_json::from_slice(value).map_err(|e| {
+            AppError::Config(format!(
+                "the backup's record for {mnemonic} is unreadable: {e}"
+            ))
+        })?;
+        let (Some(did_id), Some(log)) = (
+            record.did_id.clone(),
+            backup.get(content_log_key(&mnemonic).as_bytes()),
+        ) else {
+            continue;
+        };
+        if !has_history(&record.method) {
+            continue;
+        }
+        let log = text(log);
+        let checked = async {
+            let identity = verify_history(ks, &mnemonic, &did_id, &log, &record.method).await?;
+            let mark_key = format!("{HIGH_WATER_IDENTITY_PREFIX}{identity}");
+            if let Some(mark) = backup.get(mark_key.as_bytes()) {
+                verify_extends(&record.method, &did_id, &text(mark), &log)?;
+            }
+            Ok::<_, AppError>(identity)
+        }
+        .await;
+        match checked {
+            Ok(identity) => logs.push(RestoredLog {
+                identity,
+                mnemonic,
+                did_id,
+                method: record.method,
+                log,
+            }),
+            Err(e) => refusals.push(format!("{mnemonic} ({did_id}): {e}")),
+        }
+    }
+
+    let mut pairs = Vec::with_capacity(backup.len());
+    for (key, value) in backup {
+        if let Some(identity) = key.strip_prefix(HIGH_WATER_IDENTITY_PREFIX.as_bytes()) {
+            let identity = text(identity);
+            match high_water_to_restore(ks, &identity, &text(&value)).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    refusals.push(format!("{identity}: {e}"));
+                    continue;
+                }
+            }
+        } else if key.starts_with(HIGH_WATER_SLOT_PREFIX.as_bytes())
+            && ks.get_raw(key.clone()).await?.is_some()
+        {
+            // The slot's held record stays; a restored log records its own.
+            continue;
+        }
+        pairs.push((key, value));
+    }
+
+    if !refusals.is_empty() {
+        return Err(AppError::Validation(format!(
+            "restore refused, nothing was written: the backup would roll back {} DID \
+             histories this store has served. Restore into an empty store to start from \
+             the backup's state.\n  {}",
+            refusals.len(),
+            refusals.join("\n  ")
+        )));
+    }
+    Ok(DidsRestore { pairs, logs })
+}
+
+/// Write a [`plan_dids_restore`] plan: its entries, then the high-water marks
+/// of the logs it restored.
+async fn restore_dids(
+    store: &Store,
+    ks: &crate::store::KeyspaceHandle,
+    plan: DidsRestore,
+) -> Result<usize, AppError> {
+    let count = write_pairs(store, ks, plan.pairs).await?;
+    for chunk in plan.logs.chunks(BATCH_SIZE / 2) {
+        let mut batch = store.batch();
+        for log in chunk {
+            crate::control_register::stage_high_water(
+                &mut batch,
+                ks,
+                &log.identity,
+                &log.mnemonic,
+                &log.did_id,
+                &log.method,
+                &log.log,
+            )?;
+        }
+        batch.commit_in_parts().await?;
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use crate::bootstrap::{import_did_at_path, test_logs};
+    use crate::did_ops::{DidRecord, content_log_key, did_key};
+    use crate::store::KeyspaceHandle;
+    use did_hosting_common::server::config::StoreConfig;
+
+    async fn store() -> (tempfile::TempDir, Store, KeyspaceHandle) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open store");
+        let ks = store.keyspace(KS_DIDS).expect("dids keyspace");
+        (dir, store, ks)
+    }
+
+    /// The `dids` keyspace as a backup carries it.
+    async fn dump(ks: &KeyspaceHandle) -> Vec<KvEntry> {
+        encode_pairs(ks.iter_all().await.unwrap())
+    }
+
+    async fn held_log(ks: &KeyspaceHandle, mnemonic: &str) -> Option<String> {
+        ks.get_raw(content_log_key(mnemonic))
+            .await
+            .unwrap()
+            .map(|b| String::from_utf8(b).unwrap())
+    }
+
+    /// Into an empty store, a backup restores with its high-water marks.
+    #[tokio::test]
+    async fn a_backup_restores_into_an_empty_store_with_its_marks() {
+        let logs = test_logs::versions("example.com", "alice", 2).await;
+        let (_a, source, source_ks) = store().await;
+        import_did_at_path(&source, &source_ks, "alice", &logs[1], None)
+            .await
+            .unwrap();
+        let backup = dump(&source_ks).await;
+
+        let (_b, target, ks) = store().await;
+        let plan = plan_dids_restore(&ks, &backup).await.expect("restores");
+        restore_dids(&target, &ks, plan).await.unwrap();
+        assert_eq!(held_log(&ks, "alice").await.as_deref(), Some(&*logs[1]));
+
+        // The restored marks hold: an older version cannot be loaded.
+        let mut batch = target.batch();
+        batch.remove(&ks, did_key("alice"));
+        batch.remove(&ks, content_log_key("alice"));
+        batch.commit().await.unwrap();
+        assert!(
+            import_did_at_path(&target, &ks, "alice", &logs[0], None)
+                .await
+                .is_err()
+        );
+    }
+
+    /// A backup older than what the store has served is refused whole, and
+    /// nothing is written: neither its log nor its high-water marks.
+    #[tokio::test]
+    async fn an_older_backup_does_not_roll_a_held_log_back() {
+        let logs = test_logs::versions("example.com", "alice", 3).await;
+        let (_a, older, older_ks) = store().await;
+        import_did_at_path(&older, &older_ks, "alice", &logs[0], None)
+            .await
+            .unwrap();
+        let backup = dump(&older_ks).await;
+
+        let (_b, target, ks) = store().await;
+        import_did_at_path(&target, &ks, "alice", &logs[2], None)
+            .await
+            .unwrap();
+        let before = ks.iter_all().await.unwrap();
+        let Err(AppError::Validation(message)) = plan_dids_restore(&ks, &backup).await else {
+            panic!("an older backup must be refused");
+        };
+        assert!(message.contains("alice"), "{message}");
+        assert_eq!(ks.iter_all().await.unwrap(), before, "nothing was written");
+    }
+
+    /// The mark of a DID that has since been removed still counts: a backup
+    /// from before the DID's later versions cannot put an older log back.
+    #[tokio::test]
+    async fn an_older_backup_does_not_roll_a_removed_dids_history_back() {
+        let logs = test_logs::versions("example.com", "alice", 2).await;
+        let (_a, older, older_ks) = store().await;
+        import_did_at_path(&older, &older_ks, "alice", &logs[0], None)
+            .await
+            .unwrap();
+        let backup = dump(&older_ks).await;
+
+        let (_b, target, ks) = store().await;
+        import_did_at_path(&target, &ks, "alice", &logs[1], None)
+            .await
+            .unwrap();
+        let mut batch = target.batch();
+        batch.remove(&ks, did_key("alice"));
+        batch.remove(&ks, content_log_key("alice"));
+        batch.commit().await.unwrap();
+
+        assert!(plan_dids_restore(&ks, &backup).await.is_err());
+    }
+
+    /// A backup carrying only an older high-water mark (its DID removed
+    /// before the backup) leaves the further mark this store holds in place.
+    #[tokio::test]
+    async fn a_held_mark_further_than_the_backups_is_kept() {
+        let logs = test_logs::versions("example.com", "alice", 2).await;
+        let (_a, older, older_ks) = store().await;
+        import_did_at_path(&older, &older_ks, "alice", &logs[0], None)
+            .await
+            .unwrap();
+        let mut batch = older.batch();
+        batch.remove(&older_ks, did_key("alice"));
+        batch.remove(&older_ks, content_log_key("alice"));
+        batch.commit().await.unwrap();
+        let backup = dump(&older_ks).await;
+
+        let (_b, target, ks) = store().await;
+        import_did_at_path(&target, &ks, "alice", &logs[1], None)
+            .await
+            .unwrap();
+        let plan = plan_dids_restore(&ks, &backup).await.expect("restores");
+        restore_dids(&target, &ks, plan).await.unwrap();
+
+        // The held log and its mark are as they were: v1 is still refused.
+        assert_eq!(held_log(&ks, "alice").await.as_deref(), Some(&*logs[1]));
+        let record: DidRecord = ks.get(did_key("alice")).await.unwrap().unwrap();
+        assert_eq!(record.version_count, 2);
+        let mut batch = target.batch();
+        batch.remove(&ks, did_key("alice"));
+        batch.remove(&ks, content_log_key("alice"));
+        batch.commit().await.unwrap();
+        assert!(
+            import_did_at_path(&target, &ks, "alice", &logs[0], None)
+                .await
+                .is_err()
+        );
+    }
 }
 
 #[cfg(test)]

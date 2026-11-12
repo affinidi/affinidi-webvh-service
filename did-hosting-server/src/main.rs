@@ -168,13 +168,22 @@ enum Command {
         #[arg(short, long, default_value = "webvh-backup.json")]
         output: String,
     },
-    /// Restore server data from a backup file
+    /// Restore server data from a backup file.
+    ///
+    /// A restore never rolls a DID's history back: each restored did:webvh
+    /// (or did:webs) log must extend the log and high-water marks this store
+    /// already holds for that DID, or nothing is restored. Restore into an
+    /// empty store to start from the backup's state.
     Restore {
         /// Input backup file path
         #[arg(short, long)]
         input: String,
     },
-    /// Load a DID at an arbitrary path (e.g., "services/control")
+    /// Load a DID at an arbitrary path (e.g., "services/control").
+    ///
+    /// The log must verify (and its witness proofs, if it is witnessed) and
+    /// must extend every history this store has served for that DID,
+    /// including one since removed with `remove-did`.
     LoadDid {
         /// Path to store the DID at (e.g., "services/control")
         #[arg(long)]

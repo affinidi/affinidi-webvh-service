@@ -9,13 +9,16 @@ use did_hosting_common::did::{
 };
 use tracing::info;
 
+use crate::control_register::{stage_high_water, verify_history};
 use crate::did_ops::{
     DidRecord, content_log_key, content_witness_key, did_key, extract_did_id,
     extract_service_types, owner_key, validate_did_jsonl,
 };
 use crate::error::AppError;
 use crate::store::{KeyspaceHandle, Store};
+use did_hosting_common::did_ops::verify_did_log_and_witness_proofs;
 use did_hosting_common::server::auth::session::now_epoch;
+use did_hosting_common::server::domain::safety::extract_did_host;
 
 /// Result of bootstrapping the root DID.
 #[derive(Debug)]
@@ -175,6 +178,10 @@ pub async fn bootstrap_did(
     let did_id = extract_did_id(&jsonl)
         .ok_or_else(|| AppError::Internal("failed to extract DID id from log entry".into()))?;
 
+    // Held to the same history as a synced log, though it was just minted: a
+    // slot keeps its method, and the high-water marks record it.
+    let identity = verify_history(dids_ks, mnemonic, &did_id, &jsonl, "webvh").await?;
+
     let mnemonic = mnemonic.to_string();
     let now = now_epoch();
 
@@ -190,9 +197,10 @@ pub async fn bootstrap_did(
         disabled_by_admin: false,
         deleted_at: None,
 
-        // T12: legacy construction site; T13 migration fills `domain`.
         method: "webvh".to_string(),
-        domain: String::new(),
+        // The host the identifier names, as a synced record is tagged, so a
+        // purge of that domain selects it.
+        domain: extract_did_host(&did_id).unwrap_or_default(),
 
         // The server's own DID — its badges (WebVHHosting, and TSP and/or
         // DIDComm per `advertise_tsp` / `mediator_did` above) are exactly
@@ -213,6 +221,9 @@ pub async fn bootstrap_did(
         owner_key("system", &mnemonic),
         mnemonic.as_bytes().to_vec(),
     );
+    stage_high_water(
+        &mut batch, dids_ks, &identity, &mnemonic, &did_id, "webvh", &jsonl,
+    )?;
     batch.commit().await?;
 
     info!(did = %did_id, scid = %scid, path = %mnemonic, "DID bootstrapped");
@@ -359,6 +370,12 @@ pub fn stale_own_did_message(path: &str, existing: Option<&str>, minted: &str) -
 /// Generalisation of `import_root_did` — works for any mnemonic, not just
 /// `.well-known`. Guards against overwriting an existing entry at the same
 /// path. The DID is stored with owner `"system"`.
+///
+/// The log is held to what a synced one is: its chain and witness proofs
+/// must verify, and it must strictly extend every history this store has
+/// served for the same DID and slot ([`verify_history`]), including one
+/// since removed, so a remove followed by a load cannot put an older log
+/// back. The high-water marks then record it ([`stage_high_water`]).
 pub async fn import_did_at_path(
     store: &Store,
     dids_ks: &KeyspaceHandle,
@@ -393,6 +410,11 @@ pub async fn import_did_at_path(
         })?;
     }
 
+    // The chain (entry hashes, proofs, key rotation) and, for a witnessed
+    // DID, the witness proofs.
+    verify_did_log_and_witness_proofs(jsonl, witness_content).map_err(AppError::Validation)?;
+    let identity = verify_history(dids_ks, mnemonic, &did_id, jsonl, "webvh").await?;
+
     let mnemonic_str = mnemonic.to_string();
     let now = now_epoch();
     let version_count = jsonl.lines().filter(|l| !l.trim().is_empty()).count() as u64;
@@ -409,9 +431,10 @@ pub async fn import_did_at_path(
         disabled_by_admin: false,
         deleted_at: None,
 
-        // T12: legacy construction site; T13 migration fills `domain`.
         method: "webvh".to_string(),
-        domain: String::new(),
+        // The host the identifier names, as a synced record is tagged, so a
+        // purge of that domain selects it.
+        domain: extract_did_host(&did_id).unwrap_or_default(),
 
         services: extract_service_types(jsonl),
 
@@ -437,6 +460,15 @@ pub async fn import_did_at_path(
             witness.as_bytes().to_vec(),
         );
     }
+    stage_high_water(
+        &mut batch,
+        dids_ks,
+        &identity,
+        &mnemonic_str,
+        &did_id,
+        "webvh",
+        jsonl,
+    )?;
     batch.commit().await?;
 
     info!(did = %did_id, scid = %scid, path = %mnemonic_str, "DID imported from files");
@@ -612,6 +644,180 @@ mod own_did_import_tests {
         assert!(
             !msg.contains("bootstrap-did"),
             "the old advice hit the same guard: {msg}"
+        );
+    }
+}
+
+/// Signed `did:webvh` logs of several versions, for the history tests.
+#[cfg(test)]
+pub(crate) mod test_logs {
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+    use did_hosting_common::did::{DidDocumentOptions, build_did_document};
+    use std::sync::Arc;
+
+    fn at(hours_ago: i64) -> chrono::DateTime<chrono::FixedOffset> {
+        (chrono::Utc::now() - chrono::Duration::hours(hours_ago)).fixed_offset()
+    }
+
+    /// `versions` successive logs of one DID at `mnemonic` on `host`: the
+    /// first holds one entry, each next one more.
+    pub(crate) async fn versions(host: &str, mnemonic: &str, versions: usize) -> Vec<String> {
+        let secret = Secret::generate_ed25519(None, None);
+        let pk = secret.get_public_keymultibase().unwrap();
+        let mut signing = secret.clone();
+        signing.id = format!("did:key:{pk}#{pk}");
+        let params = didwebvh_rs::parameters::Parameters {
+            update_keys: Some(Arc::new(vec![pk.clone().into()])),
+            ..Default::default()
+        };
+        let mut doc = build_did_document(host, mnemonic, &pk, &DidDocumentOptions::default());
+        let mut state = didwebvh_rs::DIDWebVHState::default();
+        let mut logs = Vec::new();
+        for i in 0..versions {
+            state
+                .create_log_entry(Some(at(10 - i as i64)), &doc, &params, &signing)
+                .await
+                .expect("webvh log entry");
+            let log = state
+                .log_entries()
+                .iter()
+                .map(|e| serde_json::to_string(&e.log_entry).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Each later version restates the resolved document.
+            doc = serde_json::from_str::<serde_json::Value>(log.lines().last().unwrap())
+                .unwrap()["state"]
+                .clone();
+            logs.push(log);
+        }
+        logs
+    }
+}
+
+#[cfg(test)]
+mod local_history_tests {
+    use super::*;
+    use did_hosting_common::server::config::StoreConfig;
+    use did_hosting_common::server::store::KS_DIDS;
+
+    async fn store() -> (tempfile::TempDir, Store, KeyspaceHandle) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open store");
+        let ks = store.keyspace(KS_DIDS).expect("dids keyspace");
+        (dir, store, ks)
+    }
+
+    /// What `remove-did` removes: the record, its log, witness proofs and
+    /// owner index. The high-water marks stay.
+    async fn remove(store: &Store, ks: &KeyspaceHandle, mnemonic: &str) {
+        let mut batch = store.batch();
+        batch.remove(ks, did_key(mnemonic));
+        batch.remove(ks, content_log_key(mnemonic));
+        batch.remove(ks, content_witness_key(mnemonic));
+        batch.remove(ks, owner_key("system", mnemonic));
+        batch.commit().await.unwrap();
+    }
+
+    /// A removed DID cannot be loaded back at an older version: the store
+    /// remembers the furthest log it served for that DID. The same or a
+    /// later version loads.
+    #[tokio::test]
+    async fn a_removed_did_loads_back_only_at_its_latest_version_or_later() {
+        let (_dir, store, ks) = store().await;
+        let logs = test_logs::versions("example.com", "alice", 3).await;
+        import_did_at_path(&store, &ks, "alice", &logs[1], None)
+            .await
+            .expect("v2 loads");
+
+        remove(&store, &ks, "alice").await;
+        let err = import_did_at_path(&store, &ks, "alice", &logs[0], None)
+            .await
+            .expect_err("an older version is refused");
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        assert!(
+            ks.get::<DidRecord>(did_key("alice"))
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing was stored"
+        );
+
+        import_did_at_path(&store, &ks, "alice", &logs[1], None)
+            .await
+            .expect("the same version loads again");
+        remove(&store, &ks, "alice").await;
+        import_did_at_path(&store, &ks, "alice", &logs[2], None)
+            .await
+            .expect("a later version loads");
+
+        // Moving the DID to another slot does not escape its history either.
+        let err = import_did_at_path(&store, &ks, "elsewhere", &logs[0], None)
+            .await
+            .expect_err("an older version under another slot is refused");
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+    }
+
+    /// A log whose chain does not verify is refused, not only one that does
+    /// not parse.
+    #[tokio::test]
+    async fn a_log_that_does_not_verify_is_not_loaded() {
+        let (_dir, store, ks) = store().await;
+        let logs = test_logs::versions("example.com", "bob", 2).await;
+        let mut lines: Vec<serde_json::Value> = logs[1]
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        lines[1]["state"]["alsoKnownAs"] = serde_json::json!(["did:example:edited"]);
+        let edited = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let err = import_did_at_path(&store, &ks, "bob", &edited, None)
+            .await
+            .expect_err("an edited log is refused");
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        assert!(ks.get::<DidRecord>(did_key("bob")).await.unwrap().is_none());
+    }
+
+    /// A loaded DID is tagged with the host its identifier names, as a synced
+    /// one is, so a purge of that domain selects it.
+    #[tokio::test]
+    async fn a_loaded_did_is_tagged_with_its_domain() {
+        let (_dir, store, ks) = store().await;
+        let logs = test_logs::versions("example.com", "carol", 1).await;
+        import_did_at_path(&store, &ks, "carol", &logs[0], None)
+            .await
+            .unwrap();
+        let record: DidRecord = ks.get(did_key("carol")).await.unwrap().unwrap();
+        assert_eq!(record.domain, "example.com");
+    }
+
+    /// `recreate-did` and setup's reprovision put a new DID in a slot: a new
+    /// DID is a new history, so that is allowed, and the slot's mark moves.
+    #[tokio::test]
+    async fn a_slot_takes_a_new_did_after_its_old_one_is_removed() {
+        let (_dir, store, ks) = store().await;
+        let old = test_logs::versions("example.com", "dave", 2).await;
+        let new = test_logs::versions("example.com", "dave", 1).await;
+        import_did_at_path(&store, &ks, "dave", &old[1], None)
+            .await
+            .unwrap();
+        remove(&store, &ks, "dave").await;
+        import_did_at_path(&store, &ks, "dave", &new[0], None)
+            .await
+            .expect("a new DID in the slot");
+        // The removed DID's history is still remembered.
+        remove(&store, &ks, "dave").await;
+        assert!(
+            import_did_at_path(&store, &ks, "dave", &old[0], None)
+                .await
+                .is_err()
         );
     }
 }

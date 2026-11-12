@@ -490,6 +490,13 @@ did-hosting-server backup --output /path/to/backup.json
 did-hosting-server restore --input /path/to/backup.json
 ```
 
+A restore never rolls a DID's history back. Each restored log must extend
+what the store already holds for that DID, including the high-water mark it
+keeps after a delete. Otherwise the restore is refused and nothing is
+written. A restore into an empty data directory always succeeds.
+`load-did` follows the same rule, and also verifies the log's chain and
+witness proofs.
+
 The backup file is a single JSON document containing:
 
 - **config** — the effective server configuration at backup time
