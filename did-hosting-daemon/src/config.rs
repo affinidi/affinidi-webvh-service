@@ -156,89 +156,55 @@ impl Default for EnableConfig {
     }
 }
 
-/// The storage backend this binary was built with (exactly one; `build.rs`
-/// in `did-hosting-common` enforces it).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StoreBackendKind {
-    Fjall,
-    Redis,
-    DynamoDb,
-    Firestore,
-    CosmosDb,
+/// The reserved key prefix [`witness_store_shares_main_data`] writes under,
+/// in the ACL keyspace. ACL entries are read under `acl:` only, so a probe is
+/// never taken for an entry.
+pub const STORE_PROBE_PREFIX: &str = "store-probe:";
+
+/// Whether `witness` reads the same data as `main`, found by trying it: a
+/// random value is written under a reserved key in `main`'s ACL keyspace and
+/// looked for through `witness`'s, then removed (on every path). The witness
+/// and the control plane both keep their ACL in that keyspace, so a hit means
+/// the embedded witness would share the control plane's ACL. Comparing the two
+/// configs instead would miss spellings that name the same data (a Redis URL
+/// with and without its default port, a region from the environment, two
+/// paths to one directory).
+pub async fn witness_store_shares_main_data(
+    main: &did_hosting_common::server::store::Store,
+    witness: &did_hosting_common::server::store::Store,
+) -> Result<bool, AppError> {
+    use did_hosting_common::server::store::KS_ACL;
+    let main_acl = main.keyspace_consistent(KS_ACL)?;
+    let witness_acl = witness.keyspace_consistent(KS_ACL)?;
+    // A fresh random value: the public half of a throwaway Ed25519 key.
+    let nonce = affinidi_tdk::secrets_resolver::secrets::Secret::generate_ed25519(None, None)
+        .get_public_keymultibase()
+        .map_err(|e| AppError::Internal(format!("cannot make a probe value: {e}")))?;
+    let key = format!("{STORE_PROBE_PREFIX}{nonce}");
+    main_acl
+        .insert_raw(key.clone(), nonce.clone().into_bytes())
+        .await?;
+    let seen = witness_acl.get_raw(key.clone()).await;
+    let removed = main_acl.remove(key).await;
+    let seen = seen?;
+    removed?;
+    Ok(seen.as_deref() == Some(nonce.as_bytes()))
 }
 
-impl StoreBackendKind {
-    pub fn compiled() -> Self {
-        if cfg!(feature = "store-redis") {
-            Self::Redis
-        } else if cfg!(feature = "store-dynamodb") {
-            Self::DynamoDb
-        } else if cfg!(feature = "store-firestore") {
-            Self::Firestore
-        } else if cfg!(feature = "store-cosmosdb") {
-            Self::CosmosDb
-        } else {
-            Self::Fjall
-        }
-    }
-}
-
-/// Whether two store configs name the same data on `backend`: the same
-/// keyspaces, and so the same ACL. Each backend's defaults are applied as it
-/// applies them (DynamoDB's and Cosmos DB's `webvh`, Firestore's
-/// `(default)`).
-pub fn stores_share_namespace(backend: StoreBackendKind, a: &StoreConfig, b: &StoreConfig) -> bool {
-    let or = |v: &Option<String>, d: &str| v.clone().unwrap_or_else(|| d.to_string());
-    match backend {
-        StoreBackendKind::Fjall => a.data_dir == b.data_dir,
-        StoreBackendKind::Redis => a.redis_url == b.redis_url,
-        StoreBackendKind::DynamoDb => {
-            or(&a.dynamodb_table_prefix, "webvh") == or(&b.dynamodb_table_prefix, "webvh")
-                && a.dynamodb_region == b.dynamodb_region
-        }
-        StoreBackendKind::Firestore => {
-            a.firestore_project == b.firestore_project
-                && or(&a.firestore_database, "(default)") == or(&b.firestore_database, "(default)")
-        }
-        StoreBackendKind::CosmosDb => {
-            a.cosmosdb_connection_string == b.cosmosdb_connection_string
-                && or(&a.cosmosdb_database, "webvh") == or(&b.cosmosdb_database, "webvh")
-        }
-    }
+/// The refusal when [`witness_store_shares_main_data`] finds the stores
+/// shared.
+pub fn shared_witness_store_refusal() -> String {
+    "[witness_store] reaches the same data as [store], so the embedded witness would share \
+     the control plane's ACL, and every `service` entry there (each registered edge) could \
+     have the witness sign. Give [witness_store] its own data: a different `data_dir`, Redis \
+     database or server, `dynamodb_table_prefix` (for example \"webvh-witness\"), \
+     `firestore_database` or `cosmosdb_database`. To keep the witness identities and its \
+     ACL, copy the `witnesses` and `acl` keyspaces into the new location first (see the \
+     CHANGELOG)."
+        .to_string()
 }
 
 impl DaemonConfig {
-    /// Refuse a configuration whose embedded witness would share the main
-    /// store's keyspaces. The witness's ACL would then be the control plane's
-    /// ACL, and every control-plane `service` entry (each registered edge)
-    /// could have the witness sign. Checked only with the witness enabled.
-    pub fn check_witness_store_is_separate(&self) -> Result<(), String> {
-        if !self.enable.witness {
-            return Ok(());
-        }
-        let backend = StoreBackendKind::compiled();
-        if !stores_share_namespace(backend, &self.store, &self.witness_store) {
-            return Ok(());
-        }
-        let hint = match backend {
-            StoreBackendKind::Fjall => "a different `data_dir`",
-            StoreBackendKind::Redis => "a different `redis_url` (another database or server)",
-            StoreBackendKind::DynamoDb => {
-                "a different `dynamodb_table_prefix` (for example \"webvh-witness\")"
-            }
-            StoreBackendKind::Firestore => "a different `firestore_database`",
-            StoreBackendKind::CosmosDb => "a different `cosmosdb_database`",
-        };
-        Err(format!(
-            "[witness_store] names the same {backend:?} data as [store], so the embedded witness \
-             would share the control plane's ACL, and every `service` entry there could have \
-             the witness sign. Give [witness_store] {hint}. Witness identities and witness ACL \
-             entries already kept in the shared store stay there: recreate them in the new one \
-             (`webvh/witness/key/create`, `acl/grant`), and have DIDs that list the old \
-             identities move to the new ones."
-        ))
-    }
-
     pub fn load(config_path: Option<PathBuf>) -> Result<Self, AppError> {
         let path = config_path
             .or_else(|| std::env::var("DAEMON_CONFIG_PATH").ok().map(PathBuf::from))
@@ -448,60 +414,54 @@ impl DaemonConfig {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_witness_store_sharing_the_main_namespace_is_detected() {
-        use StoreBackendKind::*;
-        let base = StoreConfig::default();
-        let with = |f: &dyn Fn(&mut StoreConfig)| {
-            let mut c = base.clone();
-            f(&mut c);
-            c
-        };
-        // DynamoDB: both on the default prefix collide; a prefix separates.
-        assert!(stores_share_namespace(DynamoDb, &base, &base));
-        let explicit_default = with(&|c| c.dynamodb_table_prefix = Some("webvh".into()));
-        assert!(stores_share_namespace(DynamoDb, &base, &explicit_default));
-        let own = with(&|c| c.dynamodb_table_prefix = Some("webvh-witness".into()));
-        assert!(!stores_share_namespace(DynamoDb, &base, &own));
-        // Redis: one URL is one keyspace set.
-        let r = with(&|c| c.redis_url = Some("redis://h/0".into()));
-        let r1 = with(&|c| c.redis_url = Some("redis://h/1".into()));
-        assert!(stores_share_namespace(Redis, &r, &r));
-        assert!(!stores_share_namespace(Redis, &r, &r1));
-        // Firestore and Cosmos DB: the database names the data.
-        let f = with(&|c| c.firestore_project = Some("p".into()));
-        let f2 = with(&|c| {
-            c.firestore_project = Some("p".into());
-            c.firestore_database = Some("witness".into());
-        });
-        assert!(stores_share_namespace(Firestore, &f, &f));
-        assert!(!stores_share_namespace(Firestore, &f, &f2));
-        let cdb = with(&|c| c.cosmosdb_connection_string = Some("x".into()));
-        let cdb2 = with(&|c| {
-            c.cosmosdb_connection_string = Some("x".into());
-            c.cosmosdb_database = Some("webvh-witness".into());
-        });
-        assert!(stores_share_namespace(CosmosDb, &cdb, &cdb));
-        assert!(!stores_share_namespace(CosmosDb, &cdb, &cdb2));
-        // fjall: the directory.
-        assert!(!stores_share_namespace(
-            Fjall,
-            &default_store(),
-            &default_witness_store()
-        ));
+    async fn open(dir: &std::path::Path) -> did_hosting_common::server::store::Store {
+        did_hosting_common::server::store::Store::open(&StoreConfig {
+            data_dir: dir.to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .unwrap()
     }
 
+    /// One store reached through both handles (what any spelling of the
+    /// same Redis URL, DynamoDB prefix and region, or database gives) is
+    /// found shared; two stores are not; the probe leaves nothing behind.
+    #[tokio::test]
+    async fn a_witness_store_reaching_the_main_data_is_found_by_trying_it() {
+        use did_hosting_common::server::store::KS_ACL;
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let main = open(a.path()).await;
+        let witness = open(b.path()).await;
+
+        assert!(witness_store_shares_main_data(&main, &main).await.unwrap());
+        assert!(
+            !witness_store_shares_main_data(&main, &witness)
+                .await
+                .unwrap()
+        );
+        // A handle cloned from the main store is the same data too.
+        assert!(
+            witness_store_shares_main_data(&main, &main.clone())
+                .await
+                .unwrap()
+        );
+
+        for store in [&main, &witness] {
+            let left = store
+                .keyspace(KS_ACL)
+                .unwrap()
+                .prefix_iter_raw(STORE_PROBE_PREFIX)
+                .await
+                .unwrap();
+            assert!(left.is_empty(), "probe removed");
+        }
+    }
+
+    /// The default layout gives the witness its own directory.
     #[test]
     fn the_default_daemon_layout_keeps_the_witness_store_separate() {
-        let mut config: DaemonConfig = toml::from_str(VTA_DEFAULT_TOML).unwrap();
-        config.store = default_store();
-        config.witness_store = default_witness_store();
-        assert!(config.check_witness_store_is_separate().is_ok());
-        config.witness_store = config.store.clone();
-        let err = config.check_witness_store_is_separate().unwrap_err();
-        assert!(err.contains("[witness_store]"), "{err}");
-        config.enable.witness = false;
-        assert!(config.check_witness_store_is_separate().is_ok());
+        assert_ne!(default_store().data_dir, default_witness_store().data_dir);
     }
     use std::io::Write;
 

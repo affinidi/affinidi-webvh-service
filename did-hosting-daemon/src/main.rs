@@ -811,12 +811,6 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     init_tracing(&config.log);
 
-    // The embedded witness keeps its own ACL only if its store is its own.
-    if let Err(e) = config.check_witness_store_is_separate() {
-        eprintln!("Error: {e}");
-        std::process::exit(1);
-    }
-
     // Load secrets (shared across server, witness, control)
     let secrets = load_secrets(&config).await;
 
@@ -835,6 +829,23 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             error!("failed to open witness store: {e}");
             std::process::exit(1);
         });
+
+    // The embedded witness keeps its own ACL only if its store is its own.
+    // Found by trying it, so any spelling of the same data is caught.
+    if config.enable.witness {
+        match config::witness_store_shares_main_data(&main_store, &witness_store).await {
+            Ok(false) => {}
+            Ok(true) => {
+                error!("{}", config::shared_witness_store_refusal());
+                eprintln!("Error: {}", config::shared_witness_store_refusal());
+                std::process::exit(1);
+            }
+            Err(e) => {
+                error!("could not check that [witness_store] is separate from [store]: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Open keyspaces early — needed for bootstrap, stats seeding, and builders.
     // Strongly consistent: the storage task's DID cleanup re-reads a record

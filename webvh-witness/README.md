@@ -250,9 +250,11 @@ In `did-hosting-daemon` the embedded witness's ACL is kept in
 list it with `list-acl --witness`); after that the ACL Trust Tasks on
 `/witness/api/trust-tasks` manage it. There is no daemon CLI to remove a
 witness entry; use `acl/revoke`. The daemon refuses to start if `[witness_store]`
-names the same data as `[store]` (the same directory, Redis URL, DynamoDB
-table prefix and region, Firestore database or Cosmos DB database), since the
-witness would then share the control plane's ACL.
+reaches the same data as `[store]`, since the witness would then share the
+control plane's ACL. It checks by writing a probe value through `[store]` and
+looking for it through `[witness_store]`, so any spelling of the same Redis
+database, DynamoDB prefix and region, or Firestore or Cosmos DB database is
+caught. The CHANGELOG describes how to move a deployment that shares one.
 
 `webvh/witness/sign` carries the DID log up to and including the entry to
 witness, and the witness verifies it before signing: the chain must verify,
