@@ -306,23 +306,30 @@ impl Webs {
     /// Reject an update that does not continue the stored key event log.
     ///
     /// A `did:webs` update republishes the entire stream, so nothing in
-    /// the bytes themselves stops a controller — or an attacker holding
-    /// a superseded key — from publishing a *shorter*, forked log that
-    /// verifies perfectly well on its own. The stored log is the record
+    /// the bytes themselves stops a controller, or anyone holding a
+    /// superseded key, from publishing a *shorter* log, or a different one,
+    /// that verifies perfectly well on its own. The stored log is the record
     /// of what this DID has already said, so the new one may only move
-    /// forward from it.
+    /// forward from it: **its key event log must strictly extend the stored
+    /// one.**
     ///
-    /// Two rules, both against the verified key state rather than the
-    /// raw bytes (a stream may legitimately be re-serialized, or gain
-    /// witness receipts for events it already carried):
+    /// Compared as the AID's verified key events, by sequence number and
+    /// SAID, rather than as raw bytes: a stream may legitimately be
+    /// re-serialized, or gain witness receipts for events it already
+    /// carried, and republishing the same events is accepted. Refused:
     ///
-    /// - same AID, and
-    /// - the new sequence number is greater than or equal to the old.
+    /// - a different AID;
+    /// - a rewind: fewer events than the stored log;
+    /// - a fork: any stored event missing from the new log at its sequence
+    ///   number, including a different event at the stored tip's sequence
+    ///   number, or a longer log that diverges before it. Two verifying
+    ///   logs of one AID that disagree on an event are duplicity, and the
+    ///   stored one is what resolvers have already been served.
     ///
     /// # Errors
-    /// [`MethodError::Validation`] if the new stream rewinds the log or
-    /// establishes a different AID. An unreadable *existing* stream is
-    /// **not** an error — see below.
+    /// [`MethodError::Validation`] if the new stream does not verify, does
+    /// not establish the stored AID, rewinds the log or forks it. An
+    /// unreadable *existing* stream is **not** an error: see below.
     pub fn verify_continuation(
         did: &str,
         existing: &[u8],
@@ -331,10 +338,12 @@ impl Webs {
         let parsed =
             DidWebs::parse(did).map_err(|e| MethodError::Malformed(format!("{did}: {e}")))?;
 
-        // An existing blob we cannot read is not a reason to refuse the
-        // update — it is a reason to want it. Corrupt or pre-migration
-        // bytes would otherwise wedge the slot permanently, with no way
-        // to publish the good log that fixes it.
+        // An existing blob we cannot read or verify is not a reason to
+        // refuse the update: it is a reason to want it. Corrupt or
+        // pre-migration bytes would otherwise wedge the slot permanently,
+        // with no way to publish the good log that fixes it. A stored log
+        // only counts as history once it verifies; every write path verifies
+        // a log before storing it.
         let Ok(old_kels) = Kels::parse(existing) else {
             return Ok(());
         };
@@ -354,14 +363,51 @@ impl Webs {
                 new_state.prefix, old_state.prefix,
             )));
         }
-        if new_state.sn < old_state.sn {
+
+        // Both logs verified, so each is this AID's events in sequence order
+        // from inception (`Kels::key_state` replays them in stream order and
+        // refuses any that does not follow the last).
+        let held = key_events(&old_kels, parsed.aid())?;
+        let next = key_events(&new_kels, parsed.aid())?;
+        if next.len() < held.len() {
             return Err(MethodError::Validation(format!(
                 "update rewinds the key event log: hosted is at sequence {}, update is at {}",
                 old_state.sn, new_state.sn,
             )));
         }
+        if let Some(((sn, held_said), (_, next_said))) =
+            held.iter().zip(&next).find(|(held, next)| held != next)
+        {
+            return Err(MethodError::Validation(format!(
+                "update forks the key event log at sequence {sn}: the hosted event is \
+                 {held_said}, the update's is {next_said}"
+            )));
+        }
         Ok(())
     }
+}
+
+/// The key events (`icp`, `rot`, `ixn`, `dip`, `drt`) a stream carries for
+/// `aid`, as (sequence number, SAID), in stream order.
+fn key_events(kels: &Kels, aid: &str) -> Result<Vec<(u64, String)>, MethodError> {
+    let mut events = Vec::new();
+    for message in kels.messages() {
+        let serder = &message.serder;
+        let Ok(ilk) = serder.ilk() else { continue };
+        if !matches!(ilk.as_str(), "icp" | "rot" | "ixn" | "dip" | "drt") {
+            continue;
+        }
+        if serder.prefix().ok().as_deref() != Some(aid) {
+            continue;
+        }
+        let unreadable = |e: &dyn std::fmt::Display| {
+            MethodError::Validation(format!("a key event of {aid}: {e}"))
+        };
+        let sn = serder.sn().map_err(|e| unreadable(&e))?;
+        let said = serder.said().map_err(|e| unreadable(&e))?;
+        events.push((sn, said));
+    }
+    Ok(events)
 }
 
 #[cfg(test)]

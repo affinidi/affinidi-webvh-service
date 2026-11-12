@@ -109,15 +109,20 @@ before anything is stored, via `method::publication::verify_publication`:
 
 - **Slot binding.** The stream must establish exactly the AID the slot's
   identifier ends in. See below for why this is inverted from webvh.
-- **Continuation.** An update may not rewind or fork the hosted log — same AID,
-  and the new sequence number must be ≥ the stored one. A `did:webs` update
-  republishes the *whole* stream, so nothing in the bytes stops a controller (or
-  an attacker holding a superseded key) from publishing a shorter log that
-  verifies perfectly well on its own.
+- **Continuation.** An update must strictly extend the hosted log: same AID,
+  and every key event the hosted log holds, at the same sequence number with
+  the same SAID, followed by zero or more new ones. A shorter log, a different
+  event at the hosted tip's sequence number, or a longer log that diverges
+  before it is refused. A `did:webs` update republishes the *whole* stream, so
+  nothing in the bytes stops a controller, or someone holding a superseded key,
+  from publishing a shorter or different log that verifies perfectly well on
+  its own. The events are compared by SAID, not as bytes, so republishing the
+  same events (re-serialized, or with witness receipts added) is accepted.
 
-An unreadable *stored* stream is deliberately not a reason to refuse an update —
-that would wedge a corrupt slot permanently, with no way to publish the log that
-repairs it.
+An unreadable or unverifiable *stored* stream is deliberately not a reason to
+refuse an update: that would wedge a corrupt slot permanently, with no way to
+publish the log that repairs it. Every write path verifies a log before it
+stores it, so a stored log that does not verify is corrupt, not history.
 
 ## Where the identifier comes from — inverted from webvh
 
