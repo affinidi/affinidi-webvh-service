@@ -1012,6 +1012,75 @@ async fn a_directive_that_cannot_be_checked_yet_is_deferred_on_every_transport()
     }
 }
 
+/// A full replay cache defers a verified directive: `503` on HTTPS, with the
+/// replay cache's own `Retry-After`, and no reply on DIDComm or TSP. Nothing
+/// is applied.
+#[tokio::test]
+async fn a_full_replay_cache_defers_a_directive_on_every_transport() {
+    use did_hosting_common::server::config::ReplayConfig;
+    use did_hosting_common::server::replay::{
+        FULL_RETRY_AFTER_SECS, FULL_RETRY_JITTER_SECS, ReplayCache,
+    };
+    for via in VIAS {
+        let (mut state, _dir) = edge_state().await;
+        state.replay_cache = Arc::new(
+            ReplayCache::with_config(ReplayConfig {
+                max_entries: 1,
+                max_entries_per_signer: 1,
+            })
+            .unwrap(),
+        );
+        let cp = control();
+        let first = signed(
+            MSG_REPLICA_DOMAIN_ASSIGN,
+            &cp,
+            json!({ "domain": "one.example" }),
+        )
+        .await;
+        let reply = deliver(&state, via, &cp.0, first)
+            .await
+            .unwrap_or_else(|| panic!("{via:?}: the first directive is answered"));
+        answered(&reply, MSG_REPLICA_DOMAIN_ASSIGN);
+
+        let second = signed(
+            MSG_REPLICA_DOMAIN_ASSIGN,
+            &cp,
+            json!({ "domain": "two.example" }),
+        )
+        .await;
+        match via {
+            Via::Https => {
+                let (status, headers, body) = post_https(&state, &second).await;
+                assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+                let retry_after: u64 = headers
+                    .get(axum::http::header::RETRY_AFTER)
+                    .expect("Retry-After is set")
+                    .to_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(
+                    (FULL_RETRY_AFTER_SECS..=FULL_RETRY_AFTER_SECS + FULL_RETRY_JITTER_SECS)
+                        .contains(&retry_after),
+                    "the replay cache's own wait: {retry_after}"
+                );
+                assert!(body.is_empty(), "no document");
+            }
+            _ => assert!(
+                deliver(&state, via, &cp.0, second).await.is_none(),
+                "{via:?}: a deferred directive is not answered"
+            ),
+        }
+        assert!(
+            did_hosting_common::server::assignment::get(&state.store, "two.example")
+                .await
+                .unwrap()
+                .is_none(),
+            "{via:?}: nothing was applied"
+        );
+    }
+}
+
 /// A health ping is answered to the control plane only: a stranger's gets no
 /// reply at all, not even a refusal.
 #[tokio::test]

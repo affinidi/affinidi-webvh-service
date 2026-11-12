@@ -1314,6 +1314,50 @@ mod tests {
     use super::*;
     use crate::error::AppError;
 
+    /// The wait a deferred document is given: the refusal's own `retryAfter`
+    /// rounded up, never under a second, or the default when it names none.
+    /// Only a deferral has one.
+    #[test]
+    fn a_deferral_says_how_long_to_wait() {
+        use trust_tasks_rs::RejectReason;
+        let deferred = |retry_after| {
+            Refusal::Deferred(RejectReason::Unavailable { retry_after })
+                .deferred()
+                .expect("a deferral")
+                .retry_after_secs
+        };
+        let in_45 = chrono::Utc::now() + chrono::Duration::milliseconds(44_500);
+        assert_eq!(deferred(Some(in_45)), 45, "rounded up");
+        let past = chrono::Utc::now() - chrono::Duration::seconds(10);
+        assert_eq!(deferred(Some(past)), 1, "never under a second");
+        assert_eq!(deferred(None), DEFERRED_RETRY_AFTER_SECS);
+
+        let replay_full = did_hosting_common::server::replay::ReplayError::Full.reject_reason();
+        let secs = Refusal::Deferred(replay_full)
+            .deferred()
+            .unwrap()
+            .retry_after_secs;
+        let (least, most) = (
+            did_hosting_common::server::replay::FULL_RETRY_AFTER_SECS,
+            did_hosting_common::server::replay::FULL_RETRY_AFTER_SECS
+                + did_hosting_common::server::replay::FULL_RETRY_JITTER_SECS,
+        );
+        assert!((least..=most).contains(&secs), "{secs}");
+
+        assert!(
+            Refusal::Unverified(RejectReason::ProofRequired)
+                .deferred()
+                .is_none()
+        );
+        assert!(
+            Refusal::NotAuthorized {
+                issuer: "did:example:x".into()
+            }
+            .deferred()
+            .is_none()
+        );
+    }
+
     fn payload_of(err: OpError) -> Value {
         let doc: trust_tasks_rs::TrustTask<Value> = serde_json::from_value(json!({
             "id": "urn:uuid:00000000-0000-0000-0000-000000000001",
