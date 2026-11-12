@@ -3828,9 +3828,16 @@ mod unlisted {
     }
 
     /// One source may add only so many sign-in records per window.
+    ///
+    /// The quota is counted over a day here rather than
+    /// `SIGN_IN_WINDOW_SECS`: at the default a source gets a record back
+    /// every half second, and these requests (each signed and verified) can
+    /// take longer than that on a loaded machine, which would admit the one
+    /// past the quota. A day returns one every 12 minutes.
     #[tokio::test]
     async fn sign_in_records_are_limited_per_source() {
-        let (state, _dir) = state().await;
+        let (mut state, _dir) = state().await;
+        state.unlisted_signers = Arc::new(UnlistedSigners::default().with_sign_in_window(86_400));
         for i in 0..SIGN_IN_PER_SOURCE {
             let caller = stranger((i % 200) as u8);
             let reply = send_signed(&state, Via::Https, &caller, CHALLENGE).await;
