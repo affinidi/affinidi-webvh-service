@@ -15,14 +15,21 @@
 //! check whether the proof genuinely is theirs). A per-address limiter sits
 //! in front of both, so one address cannot force unbounded resolver work by
 //! posting documents quickly, whatever they claim.
+//!
+//! The limiter runs before the body is read: the handler takes the body
+//! unread and reads it only once the address is admitted, at most
+//! [`super::TRUST_TASKS_BODY_LIMIT_BYTES`] bytes and within the state's
+//! `body_read_timeout` (`413` / `408` otherwise).
 
 use std::net::SocketAddr;
 
 use axum::Json;
+use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use did_hosting_common::server::listener::read_body;
 use serde_json::Value;
 use tracing::error;
 use trust_tasks_rs::{RejectReason, TrustTask};
@@ -53,10 +60,11 @@ pub async fn receive(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    body: axum::body::Bytes,
+    body: Body,
 ) -> Response {
-    // Per-address rate limit, ahead of parsing and any DID resolution the
-    // document's verification would trigger.
+    // Per-address rate limit, ahead of reading the body, parsing it, and any
+    // DID resolution the document's verification would trigger: a refused
+    // address never has its body read.
     if let Err(refusal) =
         state
             .trust_tasks_rate_limiter
@@ -64,6 +72,16 @@ pub async fn receive(
     {
         return refusal.into_response();
     }
+    let body = match read_body(
+        body,
+        super::TRUST_TASKS_BODY_LIMIT_BYTES,
+        state.body_read_timeout,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(refusal) => return refusal.into_response(),
+    };
 
     let doc: TrustTask<Value> = match serde_json::from_slice(&body) {
         Ok(doc) => doc,

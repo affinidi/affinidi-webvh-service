@@ -68,6 +68,9 @@ pub struct AppState {
     /// once with the state and shared by the Trust Task listener and the
     /// resolution limit.
     pub client_ips: did_hosting_common::server::rate_limit::ClientIps,
+    /// How long `POST /api/trust-tasks` waits for a whole body, once the
+    /// address is admitted.
+    pub body_read_timeout: std::time::Duration,
 }
 
 impl AppState {
@@ -99,6 +102,7 @@ impl AppState {
             replay_cache,
             sign_lock: Arc::new(tokio::sync::Mutex::new(())),
             client_ips,
+            body_read_timeout: did_hosting_common::server::listener::BODY_READ_TIMEOUT,
             trust_tasks_rate_limiter: Arc::new(
                 did_hosting_common::server::rate_limit::IpRateLimiter::new(
                     did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
@@ -395,6 +399,7 @@ fn run_rest_thread(
             .trust_tasks_rate_limiter
             .spawn_gc(rate_limit_gc.clone());
 
+        let trusted_proxies = state.config.server.trusted_proxies.clone();
         let app = routes::router()
             .with_state(state)
             .layer(
@@ -414,8 +419,9 @@ fn run_rest_thread(
         let _ = ready_tx.send(());
 
         let shutdown_rx = shutdown_rx.clone();
+        // Header, idle, connection and per-address limits: see `listener`.
         axum::serve(
-            listener,
+            did_hosting_common::server::listener::bounded(listener, &trusted_proxies),
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .with_graceful_shutdown(async move {
