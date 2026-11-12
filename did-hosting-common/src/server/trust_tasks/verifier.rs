@@ -1434,7 +1434,7 @@ mod tests {
     async fn an_unresolvable_signer_is_not_resolved_twice() {
         let (v, refresher) = failing_verifier(VerifyFailureKind::Unreachable, "cannot resolve");
         let err = v
-            .check_operational(&self_issued_doc().await)
+            .check_approval(&self_issued_doc().await)
             .await
             .unwrap_err();
         assert!(err.is_unreachable(), "{err:?}");
@@ -1451,7 +1451,7 @@ mod tests {
 
         let lookalike = format!("did:example:x {UNREACHABLE} {DEACTIVATED} not in document");
         let (v, refresher) = failing_verifier(VerifyFailureKind::Invalid, &lookalike);
-        let err = v.check_operational(&doc).await.unwrap_err();
+        let err = v.check_approval(&doc).await.unwrap_err();
         assert_eq!(err.kind, VerifyFailureKind::Invalid, "{err:?}");
         assert_eq!(
             refresher.calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -1460,12 +1460,12 @@ mod tests {
         );
 
         let (v, refresher) = failing_verifier(VerifyFailureKind::Unreachable, "plain words");
-        let err = v.check_operational(&doc).await.unwrap_err();
+        let err = v.check_approval(&doc).await.unwrap_err();
         assert!(err.is_unreachable(), "{err:?}");
         assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         let (v, refresher) = failing_verifier(VerifyFailureKind::Deactivated, UNREACHABLE);
-        let err = v.check_operational(&doc).await.unwrap_err();
+        let err = v.check_approval(&doc).await.unwrap_err();
         assert_eq!(err.kind, VerifyFailureKind::Deactivated, "{err:?}");
         assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
@@ -1489,7 +1489,7 @@ mod tests {
         }
         let v = TransportBoundVerifier::with_resolver(Arc::new(SaysUnreachable));
         let err = v
-            .check_operational(&self_issued_doc().await)
+            .check_approval(&self_issued_doc().await)
             .await
             .unwrap_err();
         assert_eq!(err.kind, VerifyFailureKind::Invalid, "{err:?}");
@@ -1839,11 +1839,12 @@ mod tests {
             .await
             .map_err(|f| f.error)
             .expect("a live signer resolves");
-        let failure = signers
+        let Err(failure) = signers
             .resolve_signer(&format!("{dead}#key-1"), ProofPurpose::Authentication)
             .await
-            .err()
-            .expect("a deactivated signer is refused");
+        else {
+            panic!("a deactivated signer is refused");
+        };
         assert_eq!(
             failure.kind,
             VerifyFailureKind::Deactivated,
