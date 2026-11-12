@@ -36,6 +36,10 @@ jobs:
   fuzz:
     name: fuzz ${{ matrix.target }}
     runs-on: ubuntu-latest
+    # A scheduled run fuzzes each target for 300s; with the build, the slowest
+    # recent job took ~58 minutes. A manual dispatch can ask for any budget, so
+    # it keeps the 6-hour ceiling.
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 360 || 90 }}
     strategy:
       fail-fast: false
       matrix:
@@ -78,6 +82,8 @@ jobs:
             *.blob.core.windows.net:443
 
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
 

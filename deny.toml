@@ -1,16 +1,19 @@
+# Resolve the graph with every feature on, as the CI `cargo deny` job (the
+# cargo-deny action's default `--all-features`) does, so a local
+# `cargo deny check` sees the same crates: the storage and cloud-secret
+# backends are feature-gated, and several ignores below apply only to them.
+[graph]
+all-features = true
+
 [advisories]
 version = 2
+# An ignore whose advisory no longer matches any crate is an error, not a
+# warning: a stale entry would silently accept that advisory again if the
+# crate came back. When a dependency update drops an advisory's crate, delete
+# its ignore in the same PR.
+unused-ignored-advisory = "deny"
 ignore = [
   { id = "RUSTSEC-2023-0071", reason = "Marvin Attack on the `rsa` crate. Pulled in transitively by jsonwebtoken, but webvh JWTs use Ed25519 (EdDSA), so the RSA timing sidechannel is not on any code path we exercise." },
-  # The three advisories below all live in `rustls-webpki 0.101.7`, an OLD copy
-  # pulled only via `aws-smithy-http-client -> hyper-rustls 0.24.2` deep in the
-  # AWS SDK. We don't depend on it directly and can't bump it without an
-  # upstream AWS SDK release migrating off the old rustls stack; everything we
-  # control already resolves the maintained `rustls-webpki 0.103.x`.
-  # Re-evaluate when the AWS SDK drops rustls 0.21 / hyper-rustls 0.24.
-  { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 — transitive via AWS SDK's hyper-rustls 0.24.2 only; not directly depended on or bumpable by us." },
-  { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 — transitive via AWS SDK's hyper-rustls 0.24.2 only; not directly depended on or bumpable by us." },
-  { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 — transitive via AWS SDK's hyper-rustls 0.24.2 only; not directly depended on or bumpable by us." },
   # crypto-bigint 0.5.5 reaches us only through jsonwebtoken's `rust_crypto`
   # backend (elliptic-curve 0.13 -> p256/p384, for ES256/ES384). We sign and
   # verify EdDSA only (`server/auth/jwt.rs`), so no secret ever reaches that
@@ -19,49 +22,11 @@ ignore = [
   # 0.7 line, so a downgrade below 0.7.6 there would be silenced.
   # Re-evaluate when jsonwebtoken moves to the elliptic-curve 0.14 line.
   { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 — transitive via jsonwebtoken's p256/p384 only; our JWTs are EdDSA. No patched 0.5.x; our 0.7 copy is on 0.7.10." },
-  # Fourth advisory on the same legacy copy: distrusted emSign intermediates.
-  # The fixed release is 0.103.16 only — no patched 0.101.x — and our own
-  # 0.103 copy is pinned at 0.103.16 in the lockfile. As with the others, the
-  # ignore is by ID and so also covers the 0.103 line; a regression there would
-  # need an explicit downgrade. Exposure on 0.101.7: the AWS SDK's legacy
-  # client talking to AWS endpoints, whose chains do not run through emSign.
-  { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.101.7 — transitive via AWS SDK's hyper-rustls 0.24.2 only; no patched 0.101.x. Our 0.103 copy is on the fixed 0.103.16." },
-  # Same root cause as the three above: the AWS SDK still rides hyper 0.14,
-  # which pins `h2 0.3`. The advisory's only stated fix is ">= 0.4.16" — there
-  # is no patched 0.3.x — so this cannot be resolved from here.
-  #
-  # We DID fix the copy we control: `h2 0.4.15 -> 0.4.18` in the same commit
-  # that added this entry. The ignore is by advisory ID and so also covers the
-  # 0.4 line; that is the one thing to watch, because a future regression there
-  # would be silenced. `h2 0.4.18` is above the fixed version, and the lockfile
-  # pins it, so a regression would have to arrive via an explicit bump.
-  #
-  # Exposure on the remaining 0.3 copy is narrow: it is the *client* side of
-  # the optional aws-secrets / store-dynamodb backends talking to AWS
-  # endpoints over TLS, so the peer that would have to send the unbounded
-  # empty DATA frames is AWS itself. Advisory severity is Low.
-  # Re-evaluate when the AWS SDK moves to hyper 1.x, which also clears the
-  # three rustls-webpki entries above.
-  { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 — transitive via AWS SDK's hyper 0.14 only; no patched 0.3.x exists. The 0.4 copy we control is bumped to the fixed 0.4.18." },
-  # Same AWS SDK legacy stack again, this time `rustls 0.21.12` itself
-  # (aws-smithy-http-client -> hyper-rustls 0.24, reached through
-  # vti-secrets' aws-config). The only fixed version is 0.23.46, which the copy
-  # we control is on; there is no patched 0.21.x, and aws-smithy-http-client
-  # 1.5.0 (the newest vti-secrets' `aws-smithy-types < 1.9` bound admits) still
-  # carries 0.21. As for RUSTSEC-2026-0258, the
-  # ignore is by ID and so also covers the 0.23 line — it is pinned at the
-  # fixed 0.23.46 in the lockfile.
-  #
-  # Exposure on 0.21: 0346 needs a custom ClientSessionStore that logs session
-  # values with Debug (we have none); 0349 lets a network attacker drop later
-  # connections to the same AWS endpoint from hybrid post-quantum to classical
-  # key exchange — no key compromise or authentication bypass.
-  { id = "RUSTSEC-2026-0346", reason = "rustls 0.21.12 — transitive via AWS SDK's hyper-rustls 0.24 only; no patched 0.21.x. Our rustls 0.23 copy is on the fixed 0.23.46. Needs a custom ClientSessionStore logging with Debug; we have none." },
-  { id = "RUSTSEC-2026-0349", reason = "rustls 0.21.12 — transitive via AWS SDK's hyper-rustls 0.24 only; no patched 0.21.x. Our rustls 0.23 copy is on the fixed 0.23.46. Worst case is classical-only key exchange to AWS endpoints." },
   # Unmaintained-status advisories on transitive crates. These are not
   # exploitable vulnerabilities — the upstreams that pull them haven't migrated
   # yet, and we don't depend on any of them directly. Revisit as the relevant
-  # dependencies update.
+  # dependencies update. All three are reached only through feature-gated
+  # backends, which is why `[graph] all-features` above matters.
   { id = "RUSTSEC-2024-0384", reason = "`instant` unmaintained — transitive only (no direct dependency); upstreams haven't migrated to web-time." },
   { id = "RUSTSEC-2025-0012", reason = "`backoff` unmaintained — transitive only (no direct dependency)." },
   { id = "RUSTSEC-2026-0441", reason = "`pin-utils` unmaintained — transitive only, via aws-smithy-{http,runtime,types}; no safe upgrade exists. Revisit when the AWS SDK moves to `pin-project-lite` / `std::pin::pin!`." },
@@ -73,6 +38,11 @@ ignore = [
 # Removed by the workspace-wide `cargo update` in this release, which dropped
 # `rustls-pemfile` from the lock entirely:
 #   RUSTSEC-2025-0134 (rustls-pemfile unmaintained).
+# Removed once the AWS SDK's legacy TLS stack (hyper 0.14 / hyper-rustls 0.24)
+# left the lock; only rustls 0.23.46, rustls-webpki 0.103.16 and h2 0.4.20
+# remain, each at or above its advisory's fixed version:
+#   RUSTSEC-2026-0098, -0099, -0104, -0382 (rustls-webpki 0.101.7),
+#   RUSTSEC-2026-0258 (h2 0.3.27), RUSTSEC-2026-0346, -0349 (rustls 0.21.12).
 
 [bans]
 multiple-versions = "allow"

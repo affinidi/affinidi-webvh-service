@@ -1,0 +1,71 @@
+name: Advisories
+
+# `cargo deny check advisories` on a schedule, over `main` and every supported
+# release branch. ci.yml checks advisories only when something is pushed or a
+# PR is opened, so an advisory published against a dependency of a quiet
+# release branch would otherwise go unseen until its next backport. A red run
+# here means: update the dependency, or add a reasoned ignore to that branch's
+# deny.toml.
+#
+# The supported branches are read from the release table in RELEASES.md (rows
+# whose status starts with "supported"), so marking a release end of life
+# there also stops it being checked here.
+on:
+  schedule:
+    # 05:41 UTC every Monday (off the hour, to dodge scheduler congestion).
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  branches:
+    name: list supported branches
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      branches: ${{ steps.list.outputs.branches }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          sparse-checkout: RELEASES.md
+          sparse-checkout-cone-mode: false
+      - name: Read the supported release branches from RELEASES.md
+        id: list
+        shell: python
+        run: |
+          import json, os, re
+          branches = ["main"]
+          for line in open("RELEASES.md", encoding="utf-8"):
+              cells = [c.strip() for c in line.strip().strip("|").split("|")]
+              if len(cells) < 2 or not cells[-1].startswith("supported"):
+                  continue
+              m = re.fullmatch(r"`(release/\d+\.\d+)`", cells[1])
+              if m:
+                  branches.append(m.group(1))
+          print("Checking:", ", ".join(branches))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"branches={json.dumps(branches)}\n")
+
+  advisories:
+    name: cargo deny advisories (${{ matrix.branch }})
+    needs: branches
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJSON(needs.branches.outputs.branches) }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ matrix.branch }}
+          persist-credentials: false
+      # The same action and version as the `cargo deny` job in ci.yml, with
+      # its default `--all-features`, against the branch's own deny.toml.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check
+          command-arguments: advisories
