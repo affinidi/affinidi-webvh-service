@@ -369,22 +369,50 @@ pub struct SettledSessions {
     pub demoted: u64,
 }
 
+/// A settled session's refresh token, `session-settled:{refresh_token}` →
+/// [`SettledMarker`]: what [`settle_subject_sessions`] did to the session that
+/// token belonged to, kept until the token would have expired.
+///
+/// A refresh reads the session row, then writes the rotated row, and the
+/// canonical refresh handler does not hold the row lock in between. A
+/// settlement landing between the two would be undone by the write: the
+/// rotated row brings an ended session back, or a demoted one back to its
+/// elevation. The refresh path therefore checks for this marker after it has
+/// rotated ([`settle_after_refresh`]) and applies the settlement again. Keyed
+/// by the refresh token the settlement saw, which is the one an in-flight
+/// refresh presented, so a later sign-in that reuses a session id is never
+/// caught by it.
+fn settled_marker_key(refresh_token: &str) -> String {
+    format!("session-settled:{refresh_token}")
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SettledMarker {
+    fate: String,
+    /// When the refresh token it is keyed by stops redeeming; swept after.
+    expires_at: u64,
+}
+
 /// Apply `fate` to every live session of `subject`, each read and changed
 /// under its row lock, so a concurrent touch or elevation cannot write back a
-/// copy of a session this ended or demoted.
+/// copy of a session this ended or demoted; a concurrent refresh is caught by
+/// the marker it leaves ([`settle_after_refresh`]).
 ///
 /// Called when what a session rests on is withdrawn — the subject's ACL entry,
 /// or a passkey the session was established or elevated with. An ended
 /// session's next request finds no row and is refused, and its refresh token
 /// no longer redeems. Walks only `subject`'s sessions, via the
-/// `session-did:{subject}:` index.
+/// `session-did:` index; a session recorded under another reference to the
+/// same identity (a `did:scid` with or without its `src`) is included.
 pub async fn settle_subject_sessions(
     sessions: &KeyspaceHandle,
     subject: &str,
     fate: impl Fn(&Session) -> SessionFate,
 ) -> Result<SettledSessions, AppError> {
+    // No trailing colon: a `did:scid` session may be indexed with its `?src=`.
+    // Other DIDs the prefix also matches are filtered out below.
     let entries = sessions
-        .prefix_iter_raw(session_did_prefix(subject))
+        .prefix_iter_raw(format!("session-did:{}", crate::scid::identity(subject)))
         .await?;
     let mut settled = SettledSessions::default();
     for (_key, value) in entries {
@@ -392,34 +420,97 @@ pub async fn settle_subject_sessions(
             continue;
         };
         let _row = lock_session(&session_id).await;
-        let Some(mut session) = get_session(sessions, &session_id).await? else {
+        let Some(session) = get_session(sessions, &session_id).await? else {
             continue;
         };
-        if session.did != subject {
+        if !crate::scid::same_reference(&session.did, subject) {
             continue;
         }
-        match fate(&session) {
-            SessionFate::Keep => {}
-            SessionFate::Demote => {
-                session.amr = vec!["did".to_string()];
-                session.acr = "aal1".to_string();
-                session.acr_expires_at = None;
-                store_session(sessions, &session).await?;
-                settled.demoted += 1;
-            }
-            SessionFate::End => {
-                let mut batch = sessions.batch();
-                if let Some(ref token) = session.refresh_token {
-                    batch.remove(sessions, refresh_key(token));
-                }
-                batch.remove(sessions, session_key(&session_id));
-                batch.remove(sessions, session_did_key(subject, &session_id));
-                batch.commit().await?;
-                settled.ended.push(session_id);
+        let chosen = fate(&session);
+        if apply_fate(sessions, session, chosen, true).await? {
+            match chosen {
+                SessionFate::End => settled.ended.push(session_id),
+                SessionFate::Demote => settled.demoted += 1,
+                SessionFate::Keep => {}
             }
         }
     }
     Ok(settled)
+}
+
+/// Apply `fate` to `session`, whose row lock the caller holds. With `mark`,
+/// leave the [`SettledMarker`] for its refresh token in the same write.
+/// Whether anything changed.
+async fn apply_fate(
+    sessions: &KeyspaceHandle,
+    mut session: Session,
+    fate: SessionFate,
+    mark: bool,
+) -> Result<bool, AppError> {
+    let label = match fate {
+        SessionFate::Keep => return Ok(false),
+        SessionFate::Demote => "demote",
+        SessionFate::End => "end",
+    };
+    let mut batch = sessions.batch();
+    if mark && let Some(ref token) = session.refresh_token {
+        let marker = SettledMarker {
+            fate: label.to_string(),
+            expires_at: session
+                .refresh_expires_at
+                .unwrap_or_else(|| now_epoch() + 86_400),
+        };
+        batch.insert(sessions, settled_marker_key(token), &marker)?;
+    }
+    match fate {
+        SessionFate::Demote => {
+            session.amr = vec!["did".to_string()];
+            session.acr = "aal1".to_string();
+            session.acr_expires_at = None;
+            stage_session(sessions, &mut batch, &session)?;
+        }
+        SessionFate::End => {
+            if let Some(ref token) = session.refresh_token {
+                batch.remove(sessions, refresh_key(token));
+            }
+            batch.remove(sessions, session_key(&session.session_id));
+            batch.remove(sessions, session_did_key(&session.did, &session.session_id));
+        }
+        SessionFate::Keep => {}
+    }
+    batch.commit().await?;
+    Ok(true)
+}
+
+/// After a refresh redeemed `presented_refresh_token` and rotated the session
+/// `session_id`: if a settlement ended or demoted that session while the
+/// refresh was in flight, apply it again to the rotated row, which the
+/// refresh wrote from what it read before the settlement. Returns the fate
+/// applied, `None` when there was nothing to do.
+pub async fn settle_after_refresh(
+    sessions: &KeyspaceHandle,
+    presented_refresh_token: &str,
+    session_id: &str,
+) -> Result<Option<SessionFate>, AppError> {
+    let _row = lock_session(session_id).await;
+    let Some(bytes) = sessions
+        .take_raw(settled_marker_key(presented_refresh_token))
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Ok(marker) = serde_json::from_slice::<SettledMarker>(&bytes) else {
+        return Ok(None);
+    };
+    let fate = match marker.fate.as_str() {
+        "end" => SessionFate::End,
+        "demote" => SessionFate::Demote,
+        _ => return Ok(None),
+    };
+    if let Some(session) = get_session(sessions, session_id).await? {
+        apply_fate(sessions, session, fate, true).await?;
+    }
+    Ok(Some(fate))
 }
 
 /// The control plane's passkey login ceremony rows, `pk_task_meta:{authId}`.
@@ -510,6 +601,7 @@ pub async fn cleanup_expired_sessions(
         "pk_revoke:",
         "stepup-task:",
         "did_xfer:",
+        "session-settled:",
     ] {
         for (key, value) in sessions.prefix_iter_raw(prefix).await? {
             if let Ok(e) = serde_json::from_slice::<Expiry>(&value)
@@ -1370,5 +1462,168 @@ mod session_key_tests {
     fn non_ascii_input_is_refused_not_a_panic() {
         assert!(!is_ed25519_multikey("z6Mk\u{00e9}\u{1f600}"));
         assert!(!is_ed25519_multikey(""));
+    }
+}
+
+/// `settle_subject_sessions` and `settle_after_refresh`: a settlement reaches
+/// every reference to the subject, and a refresh in flight across it does not
+/// undo it.
+#[cfg(all(test, feature = "store-fjall"))]
+mod settlement_tests {
+    use super::*;
+    use crate::server::config::StoreConfig;
+    use crate::server::store::{KS_SESSIONS, Store};
+    use std::path::PathBuf;
+
+    async fn make_ks() -> (KeyspaceHandle, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&StoreConfig {
+            data_dir: PathBuf::from(dir.path()),
+            ..StoreConfig::default()
+        })
+        .await
+        .unwrap();
+        (store.keyspace(KS_SESSIONS).unwrap(), dir)
+    }
+
+    fn session(did: &str, session_id: &str, refresh: &str, amr: &[&str], acr: &str) -> Session {
+        Session {
+            session_id: session_id.to_string(),
+            did: did.to_string(),
+            challenge: String::new(),
+            state: SessionState::Authenticated,
+            created_at: now_epoch(),
+            last_seen: now_epoch(),
+            refresh_token: Some(refresh.to_string()),
+            refresh_expires_at: Some(now_epoch() + 3600),
+            tee_attested: false,
+            token_id: Some("jti-1".into()),
+            session_pubkey_b58btc: None,
+            amr: amr.iter().map(|m| m.to_string()).collect(),
+            acr: acr.to_string(),
+            acr_expires_at: None,
+            not_after: None,
+        }
+    }
+
+    /// A session recorded under a `did:scid` with its `src` locator is found
+    /// when the subject is named without it, and the reverse; a DID that only
+    /// shares a prefix is not.
+    #[tokio::test]
+    async fn a_settlement_reaches_every_reference_to_the_subject() {
+        let (ks, _dir) = make_ks().await;
+        let bare = "did:scid:vh:1:QmSubject";
+        let located = "did:scid:vh:1:QmSubject?src=hosting.example";
+        let other = "did:scid:vh:1:QmSubjectOther";
+        let with_src = session(located, "s-located", "r-located", &["did"], "aal1");
+        let without = session(bare, "s-bare", "r-bare", &["did"], "aal1");
+        let unrelated = session(other, "s-other", "r-other", &["did"], "aal1");
+        for s in [&with_src, &without, &unrelated] {
+            store_session_with_refresh(&ks, s, s.refresh_token.as_deref().unwrap(), None)
+                .await
+                .unwrap();
+        }
+
+        let settled = settle_subject_sessions(&ks, bare, |_| SessionFate::End)
+            .await
+            .unwrap();
+        let mut ended = settled.ended.clone();
+        ended.sort();
+        assert_eq!(ended, vec!["s-bare".to_string(), "s-located".to_string()]);
+        assert!(get_session(&ks, "s-located").await.unwrap().is_none());
+        assert!(
+            get_session_by_refresh(&ks, "r-located")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(get_session(&ks, "s-other").await.unwrap().is_some());
+
+        let again = session(located, "s-located-2", "r-2", &["did"], "aal1");
+        store_session_with_refresh(&ks, &again, "r-2", None)
+            .await
+            .unwrap();
+        let settled = settle_subject_sessions(&ks, located, |_| SessionFate::End)
+            .await
+            .unwrap();
+        assert_eq!(settled.ended, vec!["s-located-2".to_string()]);
+    }
+
+    /// A refresh that read the row before a settlement and wrote its rotation
+    /// after: the rotation is ended (or demoted) again, its new refresh token
+    /// with it.
+    #[tokio::test]
+    async fn a_refresh_in_flight_does_not_undo_a_settlement() {
+        let (ks, _dir) = make_ks().await;
+        for (fate, id) in [
+            (SessionFate::End, "s-end"),
+            (SessionFate::Demote, "s-demote"),
+        ] {
+            let old = session(
+                "did:example:alice",
+                id,
+                &format!("{id}-r1"),
+                &["did", "passkey"],
+                "aal2",
+            );
+            store_session_with_refresh(&ks, &old, &format!("{id}-r1"), None)
+                .await
+                .unwrap();
+
+            // The refresh redeems r1 and reads the row.
+            take_session_id_by_refresh(&ks, &format!("{id}-r1"))
+                .await
+                .unwrap()
+                .unwrap();
+            let read = get_session(&ks, id).await.unwrap().unwrap();
+
+            // The settlement lands.
+            settle_subject_sessions(&ks, "did:example:alice", |s| {
+                if s.session_id == id {
+                    fate
+                } else {
+                    SessionFate::Keep
+                }
+            })
+            .await
+            .unwrap();
+
+            // The refresh writes its rotation from what it read.
+            let mut rotated = read.clone();
+            rotated.refresh_token = Some(format!("{id}-r2"));
+            rotated.token_id = Some("jti-2".into());
+            store_session_with_refresh(&ks, &rotated, &format!("{id}-r2"), None)
+                .await
+                .unwrap();
+            assert!(get_session(&ks, id).await.unwrap().is_some());
+
+            let applied = settle_after_refresh(&ks, &format!("{id}-r1"), id)
+                .await
+                .unwrap();
+            assert_eq!(applied, Some(fate));
+            match fate {
+                SessionFate::End => {
+                    assert!(get_session(&ks, id).await.unwrap().is_none());
+                    assert!(
+                        get_session_by_refresh(&ks, &format!("{id}-r2"))
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+                _ => {
+                    let row = get_session(&ks, id).await.unwrap().unwrap();
+                    assert_eq!(row.acr, "aal1");
+                    assert_eq!(row.amr, vec!["did".to_string()]);
+                }
+            }
+            // A later refresh of an unsettled session finds no marker.
+            assert_eq!(
+                settle_after_refresh(&ks, "never-settled", id)
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
     }
 }

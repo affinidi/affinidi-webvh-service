@@ -1814,8 +1814,20 @@ async fn route_trust_task_doc(
             signing_oracle: false,
         };
 
-        // A removed ACL entry takes what it authorised with it.
+        // A removed ACL entry takes what it authorised with it. The removal
+        // lock is held from before the entry goes until its invites are
+        // withdrawn, so no invite redemption (which takes it too) runs in
+        // between and recreates the entry.
         let removes_entry = acl_entry_removal_subject(&doc);
+        let _removal_guard = match removes_entry {
+            Some(_) => Some(
+                state
+                    .acl_locks
+                    .guard(crate::control_tasks::enrol::ACL_REMOVAL_LOCK_KEY)
+                    .await,
+            ),
+            None => None,
+        };
 
         // The framework path, and the only one whose outcome carries a reject code
         // — so it is handed back whole rather than serialised here, and HTTPS maps
@@ -1868,23 +1880,33 @@ fn acl_entry_removal_subject(doc: &trust_tasks_rs::TrustTask<Value>) -> Option<S
 }
 
 /// End what a removed ACL entry authorised: every session of its subject,
-/// and every enrolment invite issued for it, so neither a live session nor a
+/// and every enrolment invite issued for it or by it, so neither a live session nor a
 /// later redemption carries on as the member it no longer is.
 ///
 /// Runs once the removal has committed. A failure here does not undo the
 /// removal, which already refuses the subject's next Trust Task; it is logged
 /// for the operator, and the sessions it missed end at their own expiry.
 pub(crate) async fn withdraw_removed_member(state: &AppState, subject: &str) {
-    use did_hosting_common::server::auth::session::SessionFate;
-    match crate::trust_tasks_auth::settle_subject_sessions(state, subject, |_| SessionFate::End)
-        .await
+    match did_hosting_common::server::acl_removal::withdraw_removed_member(
+        &state.sessions_ks,
+        subject,
+    )
+    .await
     {
-        Ok(settled) => {
-            if !settled.ended.is_empty() {
+        Ok((settled, withdrawn)) => {
+            for session_id in &settled.ended {
+                if let Err(e) =
+                    crate::trust_tasks_auth::delete_auth_proxy_meta(state, session_id).await
+                {
+                    warn!(session_id = %session_id, error = %e, "ended session's meta row was not removed");
+                }
+            }
+            if !settled.ended.is_empty() || withdrawn > 0 {
                 info!(
                     subject = %subject,
-                    ended = settled.ended.len(),
-                    "ACL entry removed: the subject's sessions were ended"
+                    sessions_ended = settled.ended.len(),
+                    invites_withdrawn = withdrawn,
+                    "ACL entry removed: the subject's sessions ended and its invites withdrawn"
                 );
             }
         }
@@ -1892,16 +1914,9 @@ pub(crate) async fn withdraw_removed_member(state: &AppState, subject: &str) {
             error!(
                 subject = %subject,
                 error = %e,
-                "ACL entry removed, but its sessions could not all be ended"
+                "ACL entry removed, but its sessions and invites could not all be withdrawn"
             );
         }
-    }
-    if let Err(e) = crate::control_tasks::enrol::withdraw_invites_for(state, subject).await {
-        error!(
-            subject = %subject,
-            error = %e,
-            "ACL entry removed, but its enrolment invites could not all be withdrawn"
-        );
     }
 }
 

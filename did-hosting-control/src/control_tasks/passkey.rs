@@ -318,15 +318,16 @@ fn passkey_revocation_fate(
     login_passkey: bool,
     keep: Option<&str>,
 ) -> SessionFate {
-    if keep == Some(session.session_id.as_str()) {
-        return SessionFate::Keep;
-    }
     let by_passkey = session.amr.iter().any(|m| m == "passkey");
     let by_did = session.amr.iter().any(|m| m == "did");
     match (by_passkey, by_did) {
-        // Signed in with a passkey.
-        (true, false) if login_passkey => SessionFate::End,
-        // Signed in with the subject's DID and elevated with a passkey.
+        // Signed in with a passkey. The session the revocation was made from
+        // is kept: its holder has just passed user verification.
+        (true, false) if login_passkey && keep != Some(session.session_id.as_str()) => {
+            SessionFate::End
+        }
+        // Signed in with the subject's DID and elevated with a passkey: the
+        // elevation goes, on the revoking session too.
         (true, true) => SessionFate::Demote,
         _ => SessionFate::Keep,
     }
@@ -438,19 +439,30 @@ pub(crate) async fn revoke_finish(
     // record which of its subject's passkeys established or elevated it, so
     // every one a passkey could have is settled: a session a login passkey
     // signed in ends, and a DID session a passkey elevated drops back to
-    // `aal1`. The session this request came in on is kept: its holder has
-    // just passed user verification to make the revocation.
+    // `aal1`. The passkey session this request came in on is kept: its
+    // holder has just passed user verification to make the revocation.
     let keep = cx
         .bearer_session()
         .filter(|b| b.did == ceremony.target_subject)
         .map(|b| b.session_id.clone());
     let login_passkey = ceremony.target_purpose == Purpose::Session;
+    // The credential is already gone, so a failure here is logged rather than
+    // reported as a failed revocation; the sessions it missed end at their own
+    // expiry.
     let settled = crate::trust_tasks_auth::settle_subject_sessions(
         state,
         &ceremony.target_subject,
         |session| passkey_revocation_fate(session, login_passkey, keep.as_deref()),
     )
-    .await?;
+    .await
+    .unwrap_or_else(|e| {
+        tracing::error!(
+            subject = %ceremony.target_subject,
+            error = %e,
+            "passkey revoked, but the sessions it vouched for could not all be settled"
+        );
+        Default::default()
+    });
 
     // Update the producer's own credential's use record, since it is the one
     // that was just asserted with — mirrors login/step-up's own bookkeeping.

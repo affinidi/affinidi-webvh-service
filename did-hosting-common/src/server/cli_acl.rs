@@ -124,6 +124,11 @@ pub async fn run_remove_acl(
 
     let entry = existing.unwrap();
     delete_acl_entry(&acl_ks, &did).await?;
+    // What the entry authorised goes with it, as on `acl/revoke`: the
+    // subject's sessions and the enrolment invites issued for it or by it.
+    let sessions_ks = store.keyspace(crate::server::store::KS_SESSIONS)?;
+    let (settled, withdrawn) =
+        super::acl_removal::withdraw_removed_member(&sessions_ks, &did).await?;
     store.persist().await?;
 
     eprintln!();
@@ -131,6 +136,8 @@ pub async fn run_remove_acl(
     eprintln!();
     eprintln!("  DID:  {}", entry.did);
     eprintln!("  Role: {}", entry.role);
+    eprintln!("  Sessions ended:    {}", settled.ended.len());
+    eprintln!("  Invites withdrawn: {withdrawn}");
     eprintln!();
 
     Ok(())
