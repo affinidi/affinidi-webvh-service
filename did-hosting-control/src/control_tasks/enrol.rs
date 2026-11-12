@@ -775,6 +775,27 @@ pub(crate) async fn redeem_finish(
     {
         return Err(not_found());
     }
+    // An invite carries its issuer's authority, so it is honoured only while
+    // the issuer still holds it: an administrator removed or demoted since
+    // issuing it no longer enrols anyone. Checked after the take, so the
+    // invite is spent either way.
+    let issuer_standing = match acl::check_acl(&state.acl_ks, &issued_by).await {
+        Ok(role) => role == Role::Admin,
+        Err(e) if acl::is_acl_refusal(&e) => false,
+        Err(e) => return Err(e.into()),
+    };
+    if !issuer_standing {
+        warn!(
+            invite_id = %invite_id,
+            issued_by = %issued_by,
+            subject = %ceremony.subject,
+            "invite redemption refused: its issuer no longer holds administrator standing"
+        );
+        return Err(TaskError::Standard(
+            trust_tasks_rs::StandardCode::PermissionDenied,
+            "the administrator who issued this invite no longer holds that standing".into(),
+        ));
+    }
     // An invite that confers a role decides whether to create the subject's
     // ACL entry from a read of the ACL, so — like `acl/grant`,
     // `acl/change-role` and `acl/revoke` — it holds the ACL write lock from
@@ -1219,6 +1240,26 @@ pub(crate) async fn invite_revoke(
         json!({ "inviteId": p.invite_id.as_str(), "revokedAt": chrono::Utc::now() }),
         "invite revoke response",
     )
+}
+
+/// Withdraw every enrolment invite issued for `subject`, or by it: called once
+/// `subject`'s ACL entry is removed, so neither a redemption for it nor one an
+/// administrator it no longer is had authorised can carry on. Returns how many
+/// were withdrawn.
+pub(crate) async fn withdraw_invites_for(
+    state: &AppState,
+    subject: &str,
+) -> Result<usize, AppError> {
+    let same = |did: &str| did_hosting_common::scid::same_reference(did, subject);
+    let mut withdrawn = 0;
+    for pending in invite::list(&state.sessions_ks).await? {
+        if (same(&pending.subject) || same(&pending.issued_by))
+            && invite::revoke(&state.sessions_ks, &pending.invite_id, "acl/revoke").await?
+        {
+            withdrawn += 1;
+        }
+    }
+    Ok(withdrawn)
 }
 
 #[cfg(test)]

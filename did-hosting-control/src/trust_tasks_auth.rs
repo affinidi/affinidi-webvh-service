@@ -100,7 +100,9 @@ use trust_tasks_rs::{
 };
 
 use did_hosting_common::epoch_to_rfc3339;
-use did_hosting_common::server::auth::session::{get_session, get_session_by_refresh, now_epoch};
+use did_hosting_common::server::auth::session::{
+    SessionFate, get_session, get_session_by_refresh, now_epoch,
+};
 use did_hosting_common::server::trust_tasks::{DispatchOutcome, run_pipeline};
 use vti_common::auth::backend::{AuthenticateInput, RefreshInput};
 use vti_common::auth::handlers::{handle_authenticate, handle_refresh};
@@ -607,6 +609,39 @@ pub(crate) async fn delete_auth_proxy_meta(
         .sessions_ks
         .remove(auth_proxy_meta_key(session_id))
         .await
+}
+
+/// Apply `fate` to every live session of `subject` (under the identifier as
+/// given and its `did:scid` identity, when they differ), and drop the
+/// auth-proxy meta row of each session it ends.
+///
+/// The one place the control plane ends or demotes sessions because what they
+/// rest on was withdrawn: an ACL entry removed, or a passkey revoked.
+pub(crate) async fn settle_subject_sessions(
+    state: &AppState,
+    subject: &str,
+    fate: impl Fn(&did_hosting_common::server::auth::session::Session) -> SessionFate + Copy,
+) -> Result<did_hosting_common::server::auth::session::SettledSessions, crate::error::AppError> {
+    let identity = did_hosting_common::scid::identity(subject);
+    let mut forms = vec![subject.to_string()];
+    if identity != subject {
+        forms.push(identity.to_string());
+    }
+    let mut settled = did_hosting_common::server::auth::session::SettledSessions::default();
+    for form in forms {
+        let one = did_hosting_common::server::auth::session::settle_subject_sessions(
+            &state.sessions_ks,
+            &form,
+            fate,
+        )
+        .await?;
+        for session_id in &one.ended {
+            delete_auth_proxy_meta(state, session_id).await?;
+        }
+        settled.ended.extend(one.ended);
+        settled.demoted += one.demoted;
+    }
+    Ok(settled)
 }
 
 #[allow(clippy::result_large_err)]

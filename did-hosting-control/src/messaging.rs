@@ -18,7 +18,7 @@ use did_hosting_common::didcomm_types::*;
 use did_hosting_common::server::problem_report::log_problem_report;
 use did_hosting_common::server::trust_tasks::ProofRule;
 use serde_json::{Value, json};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::acl::check_acl;
 use crate::server::AppState;
@@ -1814,12 +1814,20 @@ async fn route_trust_task_doc(
             signing_oracle: false,
         };
 
+        // A removed ACL entry takes what it authorised with it.
+        let removes_entry = acl_entry_removal_subject(&doc);
+
         // The framework path, and the only one whose outcome carries a reject code
         // — so it is handed back whole rather than serialised here, and HTTPS maps
         // it to a status.
-        Ok(RoutedReply::Framework(Box::new(
-            dispatch_inbound::<TransportBoundVerifier>(&ctx, transport, policy, doc).await,
-        )))
+        let outcome =
+            dispatch_inbound::<TransportBoundVerifier>(&ctx, transport, policy, doc).await;
+        if let Some(subject) = removes_entry
+            && matches!(outcome, DispatchOutcome::Handled(_))
+        {
+            withdraw_removed_member(state, &subject).await;
+        }
+        Ok(RoutedReply::Framework(Box::new(outcome)))
     }))
     .await;
 
@@ -1836,6 +1844,65 @@ async fn route_trust_task_doc(
         replay_cache.release(signer, id, *issued_at);
     }
     reply
+}
+
+/// The subject of `doc` when it is an `acl/revoke` that removes the subject's
+/// entry (`revocation.kind: entry`), not one that narrows its act scope.
+fn acl_entry_removal_subject(doc: &trust_tasks_rs::TrustTask<Value>) -> Option<String> {
+    use did_hosting_common::tasks::acl::revoke::v0_2 as revoke;
+    use trust_tasks_rs::Payload as _;
+    if doc.type_uri.to_string() != revoke::Payload::TYPE_URI {
+        return None;
+    }
+    let kind = doc
+        .payload
+        .pointer("/revocation/kind")
+        .and_then(Value::as_str);
+    if kind != Some("entry") {
+        return None;
+    }
+    doc.payload
+        .get("subject")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// End what a removed ACL entry authorised: every session of its subject,
+/// and every enrolment invite issued for it, so neither a live session nor a
+/// later redemption carries on as the member it no longer is.
+///
+/// Runs once the removal has committed. A failure here does not undo the
+/// removal, which already refuses the subject's next Trust Task; it is logged
+/// for the operator, and the sessions it missed end at their own expiry.
+pub(crate) async fn withdraw_removed_member(state: &AppState, subject: &str) {
+    use did_hosting_common::server::auth::session::SessionFate;
+    match crate::trust_tasks_auth::settle_subject_sessions(state, subject, |_| SessionFate::End)
+        .await
+    {
+        Ok(settled) => {
+            if !settled.ended.is_empty() {
+                info!(
+                    subject = %subject,
+                    ended = settled.ended.len(),
+                    "ACL entry removed: the subject's sessions were ended"
+                );
+            }
+        }
+        Err(e) => {
+            error!(
+                subject = %subject,
+                error = %e,
+                "ACL entry removed, but its sessions could not all be ended"
+            );
+        }
+    }
+    if let Err(e) = crate::control_tasks::enrol::withdraw_invites_for(state, subject).await {
+        error!(
+            subject = %subject,
+            error = %e,
+            "ACL entry removed, but its enrolment invites could not all be withdrawn"
+        );
+    }
 }
 
 /// What [`dispatch_trust_task_doc`] requires of `type_uri`'s proof.

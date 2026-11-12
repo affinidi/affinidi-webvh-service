@@ -349,6 +349,79 @@ pub async fn demote_non_passkey_step_up_sessions(
     Ok(demoted)
 }
 
+/// What [`settle_subject_sessions`] does with one of the subject's sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionFate {
+    /// Leave the session as it is.
+    Keep,
+    /// Drop its elevation: back to the base `aal1`/`["did"]` shape.
+    Demote,
+    /// End it: the row and its refresh and per-DID indexes are removed.
+    End,
+}
+
+/// What [`settle_subject_sessions`] did.
+#[derive(Debug, Default)]
+pub struct SettledSessions {
+    /// The ids of the sessions it ended.
+    pub ended: Vec<String>,
+    /// How many sessions it demoted.
+    pub demoted: u64,
+}
+
+/// Apply `fate` to every live session of `subject`, each read and changed
+/// under its row lock, so a concurrent touch or elevation cannot write back a
+/// copy of a session this ended or demoted.
+///
+/// Called when what a session rests on is withdrawn — the subject's ACL entry,
+/// or a passkey the session was established or elevated with. An ended
+/// session's next request finds no row and is refused, and its refresh token
+/// no longer redeems. Walks only `subject`'s sessions, via the
+/// `session-did:{subject}:` index.
+pub async fn settle_subject_sessions(
+    sessions: &KeyspaceHandle,
+    subject: &str,
+    fate: impl Fn(&Session) -> SessionFate,
+) -> Result<SettledSessions, AppError> {
+    let entries = sessions
+        .prefix_iter_raw(session_did_prefix(subject))
+        .await?;
+    let mut settled = SettledSessions::default();
+    for (_key, value) in entries {
+        let Ok(session_id) = String::from_utf8(value) else {
+            continue;
+        };
+        let _row = lock_session(&session_id).await;
+        let Some(mut session) = get_session(sessions, &session_id).await? else {
+            continue;
+        };
+        if session.did != subject {
+            continue;
+        }
+        match fate(&session) {
+            SessionFate::Keep => {}
+            SessionFate::Demote => {
+                session.amr = vec!["did".to_string()];
+                session.acr = "aal1".to_string();
+                session.acr_expires_at = None;
+                store_session(sessions, &session).await?;
+                settled.demoted += 1;
+            }
+            SessionFate::End => {
+                let mut batch = sessions.batch();
+                if let Some(ref token) = session.refresh_token {
+                    batch.remove(sessions, refresh_key(token));
+                }
+                batch.remove(sessions, session_key(&session_id));
+                batch.remove(sessions, session_did_key(subject, &session_id));
+                batch.commit().await?;
+                settled.ended.push(session_id);
+            }
+        }
+    }
+    Ok(settled)
+}
+
 /// The control plane's passkey login ceremony rows, `pk_task_meta:{authId}`.
 const LOGIN_CEREMONY_PREFIX: &str = "pk_task_meta:";
 

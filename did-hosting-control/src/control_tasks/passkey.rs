@@ -23,7 +23,7 @@ use tracing::{info, warn};
 use webauthn_rs::prelude::{CredentialID, Passkey, PublicKeyCredential};
 
 use did_hosting_common::server::acl::{Role, get_acl_entry};
-use did_hosting_common::server::auth::session::now_epoch;
+use did_hosting_common::server::auth::session::{SessionFate, now_epoch};
 use did_hosting_common::server::passkey::invite::Purpose;
 use did_hosting_common::server::passkey::store::{self as pk, PasskeyUser, cred_id_hex};
 
@@ -308,6 +308,30 @@ pub(crate) async fn revoke_start(
     )
 }
 
+/// What revoking one of a subject's passkeys does to one of its sessions.
+///
+/// `login_passkey`: the revoked passkey is a login (`session`) passkey, which
+/// can sign a session in; a step-up passkey only elevates one. `keep`: the
+/// session the revocation was made from.
+fn passkey_revocation_fate(
+    session: &did_hosting_common::server::auth::session::Session,
+    login_passkey: bool,
+    keep: Option<&str>,
+) -> SessionFate {
+    if keep == Some(session.session_id.as_str()) {
+        return SessionFate::Keep;
+    }
+    let by_passkey = session.amr.iter().any(|m| m == "passkey");
+    let by_did = session.amr.iter().any(|m| m == "did");
+    match (by_passkey, by_did) {
+        // Signed in with a passkey.
+        (true, false) if login_passkey => SessionFate::End,
+        // Signed in with the subject's DID and elevated with a passkey.
+        (true, true) => SessionFate::Demote,
+        _ => SessionFate::Keep,
+    }
+}
+
 /// `auth/passkey/revoke/finish/0.2`: verify the producer's user-verification
 /// assertion and, on success, unbind the credential the matching `start`
 /// bound server-side.
@@ -410,6 +434,24 @@ pub(crate) async fn revoke_finish(
         user.credentials.len()
     };
 
+    // What the revoked passkey vouched for stops counting. A session does not
+    // record which of its subject's passkeys established or elevated it, so
+    // every one a passkey could have is settled: a session a login passkey
+    // signed in ends, and a DID session a passkey elevated drops back to
+    // `aal1`. The session this request came in on is kept: its holder has
+    // just passed user verification to make the revocation.
+    let keep = cx
+        .bearer_session()
+        .filter(|b| b.did == ceremony.target_subject)
+        .map(|b| b.session_id.clone());
+    let login_passkey = ceremony.target_purpose == Purpose::Session;
+    let settled = crate::trust_tasks_auth::settle_subject_sessions(
+        state,
+        &ceremony.target_subject,
+        |session| passkey_revocation_fate(session, login_passkey, keep.as_deref()),
+    )
+    .await?;
+
     // Update the producer's own credential's use record, since it is the one
     // that was just asserted with — mirrors login/step-up's own bookkeeping.
     // Under the producer's own guard, taken only once the target's is
@@ -432,6 +474,8 @@ pub(crate) async fn revoke_finish(
         purpose = ceremony.target_purpose.as_str(),
         credential_id = %ceremony.target_credential_id_wire,
         revoked_by = %auth.did,
+        sessions_ended = settled.ended.len(),
+        sessions_demoted = settled.demoted,
         "passkey revoked"
     );
     typed(

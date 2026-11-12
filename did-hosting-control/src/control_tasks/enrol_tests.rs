@@ -2517,3 +2517,222 @@ async fn a_login_does_not_restore_a_revoked_credential() {
         "the revoked credential came back"
     );
 }
+
+/// A session for `subject` with the given `amr` and `acr`, as a login or a
+/// step-up leaves one; its id.
+async fn seeded_session(state: &AppState, subject: &Caller, amr: &[&str], acr: &str) -> String {
+    did_hosting_common::server::auth::session::create_authenticated_session(
+        &state.sessions_ks,
+        state.jwt_keys.as_deref().unwrap(),
+        &subject.did,
+        &subject.role,
+        900,
+        3600,
+        None,
+        Some((amr.iter().map(|m| m.to_string()).collect(), acr.to_string())),
+    )
+    .await
+    .unwrap()
+    .session_id
+}
+
+async fn session_row(
+    state: &AppState,
+    session_id: &str,
+) -> Option<did_hosting_common::server::auth::session::Session> {
+    did_hosting_common::server::auth::session::get_session(&state.sessions_ks, session_id)
+        .await
+        .unwrap()
+}
+
+/// Revoking a login passkey ends the subject's passkey-login sessions and
+/// drops a passkey elevation back to `aal1`; a session no passkey vouched for
+/// is left alone.
+#[tokio::test]
+async fn revoking_a_login_passkey_ends_the_sessions_it_vouched_for() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 190, Role::Admin).await;
+    let dana = member(&state, 191, Role::Owner).await;
+    let erin = member(&state, 192, Role::Owner).await;
+    let invitee = stranger(193);
+
+    let mut first = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut first, None).await,
+        &t(REDEEM_FINISH),
+    );
+    // A second login credential for Dana, rebound from Erin in the store: it
+    // is only the revoke target.
+    let mut second = SoftPasskey::new();
+    let issued = issue(&state, &admin, &erin.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut second, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let erins = pk::get_passkey_user_by_did(&state.sessions_ks, &erin.did)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut danas = pk::get_passkey_user_by_did(&state.sessions_ks, &dana.did)
+        .await
+        .unwrap()
+        .unwrap();
+    danas.credentials.push(erins.credentials[0].clone());
+    let mut batch = state.store.batch();
+    pk::stage_new_credential(
+        &mut batch,
+        &state.sessions_ks,
+        &danas,
+        &hex(&second.cred_id),
+    )
+    .unwrap();
+    batch.commit().await.unwrap();
+
+    let by_passkey = seeded_session(&state, &dana, &["passkey"], "aal2").await;
+    let elevated = seeded_session(&state, &dana, &["did", "passkey"], "aal2").await;
+    let by_did = seeded_session(&state, &dana, &["did"], "aal1").await;
+    let erins_session = seeded_session(&state, &erin, &["passkey"], "aal2").await;
+
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(PK_REVOKE_START),
+        json!({ "credentialId": second.id() }),
+    )
+    .await;
+    let start = ok(&reply, &t(PK_REVOKE_START));
+    let uv = first.assert(&start["uvOptions"]);
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(PK_REVOKE_FINISH),
+        json!({ "revocationId": start["revocationId"], "uvCredential": uv }),
+    )
+    .await;
+    ok(&reply, &t(PK_REVOKE_FINISH));
+
+    assert!(
+        session_row(&state, &by_passkey).await.is_none(),
+        "a passkey-login session outlived the revocation"
+    );
+    let demoted = session_row(&state, &elevated).await.expect("kept");
+    assert_eq!(demoted.acr, "aal1");
+    assert_eq!(demoted.amr, vec!["did".to_string()]);
+    let untouched = session_row(&state, &by_did).await.expect("kept");
+    assert_eq!(untouched.amr, vec!["did".to_string()]);
+    assert!(
+        session_row(&state, &erins_session).await.is_some(),
+        "another subject's session was ended"
+    );
+}
+
+/// Removing a subject's ACL entry ends every one of its sessions and
+/// withdraws the enrolment invites issued for it; narrowing its act scope
+/// does neither.
+#[tokio::test]
+async fn removing_an_acl_entry_ends_its_sessions_and_invites() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 194, Role::Admin).await;
+    let dana = member(&state, 195, Role::Owner).await;
+    let erin = member(&state, 196, Role::Owner).await;
+    let invitee = stranger(197);
+
+    let danas = [
+        seeded_session(&state, &dana, &["did"], "aal1").await,
+        seeded_session(&state, &dana, &["passkey"], "aal2").await,
+    ];
+    let erins = seeded_session(&state, &erin, &["did"], "aal1").await;
+    let issued = issue(&state, &admin, &dana.did, "stepUp").await;
+
+    // Narrowing is not removal.
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t("acl/revoke/0.2"),
+        json!({ "subject": dana.did, "revocation": { "kind": "act", "act": { "scope": "none" } } }),
+    )
+    .await;
+    assert!(
+        reply["type"]
+            .as_str()
+            .is_some_and(|ty| ty.ends_with("#response")),
+        "{reply}"
+    );
+    for id in &danas {
+        assert!(session_row(&state, id).await.is_some());
+    }
+
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t("acl/revoke/0.2"),
+        json!({ "subject": dana.did, "revocation": { "kind": "entry" } }),
+    )
+    .await;
+    assert!(
+        reply["type"]
+            .as_str()
+            .is_some_and(|ty| ty.ends_with("#response")),
+        "{reply}"
+    );
+    for id in &danas {
+        assert!(
+            session_row(&state, id).await.is_none(),
+            "a session outlived its subject's ACL entry"
+        );
+    }
+    assert!(session_row(&state, &erins).await.is_some());
+
+    // The invite issued for Dana is gone, so it cannot recreate her entry.
+    let reply = redeem_start(&state, Via::Https, &invitee, &issued.token, &issued.code).await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/redeem/start:inviteInvalid",
+        "{reply}"
+    );
+}
+
+/// An invite is honoured only while its issuer is still an administrator: one
+/// whose issuer was demoted meanwhile enrols nothing and grants no entry.
+#[tokio::test]
+async fn an_invite_from_a_former_administrator_enrols_nothing() {
+    let (state, _dir) = state().await;
+    let issuer = member(&state, 198, Role::Admin).await;
+    let _other_admin = member(&state, 199, Role::Admin).await;
+    let newcomer = stranger(200);
+    let invitee = stranger(201);
+
+    let issued = issue(&state, &issuer, &newcomer.did, "session").await;
+    // The issuer stops being an administrator before the redemption finishes.
+    let mut entry = get_acl_entry(&state.acl_ks, &issuer.did)
+        .await
+        .unwrap()
+        .unwrap();
+    entry.role = Role::Owner;
+    did_hosting_common::server::acl::store_acl_entry(&state.acl_ks, &entry)
+        .await
+        .unwrap();
+
+    let mut passkey = SoftPasskey::new();
+    let reply = redeem(&state, Via::Https, &invitee, &issued, &mut passkey, None).await;
+    assert_eq!(code(&reply), "permissionDenied", "{reply}");
+    assert!(
+        get_acl_entry(&state.acl_ks, &newcomer.did)
+            .await
+            .unwrap()
+            .is_none(),
+        "the invite granted an entry"
+    );
+    assert!(
+        pk::get_passkey_user_by_cred(&state.sessions_ks, &hex(&passkey.cred_id))
+            .await
+            .unwrap()
+            .is_none(),
+        "the invite enrolled a passkey"
+    );
+}
