@@ -253,7 +253,10 @@ async fn owner_usage(state: &AppState, owner: &str) -> Result<(u64, u64), AppErr
 /// lock alone lets two writes to different slots (a register and an accepted
 /// transfer, say) each see room for one more and both commit. Always taken
 /// after the slot's path lock, never before it.
-async fn owner_quota_guard(state: &AppState, owner: &str) -> tokio::sync::OwnedMutexGuard<()> {
+async fn owner_quota_guard(
+    state: &AppState,
+    owner: &str,
+) -> did_hosting_common::server::path_locks::PathGuard {
     state
         .path_locks
         .guard(&format!("::owner-quota:{owner}"))
@@ -271,7 +274,7 @@ async fn hold_size_quota(
     auth: &AuthClaims,
     mnemonic: &str,
     new_size: u64,
-) -> Result<tokio::sync::OwnedMutexGuard<()>, AppError> {
+) -> Result<did_hosting_common::server::path_locks::PathGuard, AppError> {
     let guard = owner_quota_guard(state, &auth.did).await;
     let old_size = state
         .dids_ks
@@ -1216,7 +1219,7 @@ async fn reconcile_agent_names(
 
 /// Per-name locks held across an agent-name check and the commit it
 /// authorises. Dropping it releases them.
-pub(crate) type AgentNameLocks = Vec<tokio::sync::OwnedMutexGuard<()>>;
+pub(crate) type AgentNameLocks = Vec<did_hosting_common::server::path_locks::PathGuard>;
 
 /// Take the per-name write lock for each agent-name index key in `index_keys`.
 ///

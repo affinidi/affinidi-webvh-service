@@ -160,7 +160,7 @@ impl SelfCertifiedWebs {
     pub(crate) async fn reserve(
         &self,
         state: &AppState,
-    ) -> Result<tokio::sync::OwnedMutexGuard<()>, AppError> {
+    ) -> Result<did_hosting_common::server::path_locks::PathGuard, AppError> {
         use did_hosting_common::server::acl::list_acl_entries;
         use did_hosting_common::server::domain::normalize_domain_name;
 

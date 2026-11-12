@@ -305,31 +305,79 @@ static DECOY: LazyLock<ClaimHash> = LazyLock::new(|| ClaimHash {
 /// not on this lock, for the lockout to hold.
 static ATTEMPT_LOCKS: LazyLock<PathLocks> = LazyLock::new(PathLocks::new);
 
-/// Claim-code hashes run at once, service-wide. Each takes
+/// Claim-code checks for redemptions that run at once in this process
+/// ([`HASH_PERMITS`]); invite issuance has its own [`MAX_CONCURRENT_ISSUE_HASHES`]
+/// on top, so at most the sum of the two hashes run at once. Each takes
 /// [`ARGON2_M_KIB`] of memory, and a stranger can ask for one per redemption
 /// attempt — from as many sources as they can mint VIDs — so the per-source
 /// rate limit alone does not bound the memory and CPU they can make the
-/// service spend. Past this many, attempts queue.
+/// service spend. Past this many, attempts wait for a permit, for at most the
+/// configured `auth.claim_code_hash_wait_ms`.
 const MAX_CONCURRENT_HASHES: usize = 8;
 
 static HASH_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(MAX_CONCURRENT_HASHES);
 
-/// Run one claim-code hash on the blocking pool, within [`HASH_PERMITS`].
+/// Claim-code hashes for [`issue`], kept apart from [`HASH_PERMITS`] so that
+/// a queue of redemption attempts cannot hold up an administrator issuing an
+/// invite.
+const MAX_CONCURRENT_ISSUE_HASHES: usize = 2;
+
+static ISSUE_HASH_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_ISSUE_HASHES);
+
+/// [`AppError::RateLimited::limiter`] for a claim-code hash that found no
+/// free permit within its wait.
+pub const LIMITER_CLAIM_CODE_HASHING: &str = "claim-code-hashing";
+
+/// The retry hint for [`LIMITER_CLAIM_CODE_HASHING`]. A hash takes well under
+/// a second, so permits free up quickly once the burst passes.
+const HASH_BUSY_RETRY_AFTER_SECS: u64 = 1;
+
+/// The refusal for a claim-code check that could not start within its wait.
+fn hashing_busy() -> AppError {
+    AppError::RateLimited {
+        limiter: LIMITER_CLAIM_CODE_HASHING,
+        message: "too many claim codes are being checked; retry shortly".into(),
+        retry_after_secs: HASH_BUSY_RETRY_AFTER_SECS,
+    }
+}
+
+/// Run one claim-code hash on the blocking pool, within `permits`.
+///
+/// Waits at most `wait` for a permit, then answers
+/// [`AppError::RateLimited`] (`unavailable` with a retry time on the Trust
+/// Task surface) rather than queueing without bound behind other attempts.
+///
+/// The permit moves into the blocking task, so it is held for as long as the
+/// hash runs, even if the caller stops waiting (a client that goes away, a
+/// dropped handler): a hash that keeps running keeps counting.
 async fn blocking<T: Send + 'static>(
+    permits: &'static tokio::sync::Semaphore,
+    wait: std::time::Duration,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, AppError> {
-    let _permit = HASH_PERMITS
-        .acquire()
+    let permit = tokio::time::timeout(wait, permits.acquire())
         .await
+        .map_err(|_| hashing_busy())?
         .map_err(|e| AppError::Internal(format!("hashing permits closed: {e}")))?;
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| AppError::Internal(format!("hashing task failed: {e}")))
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("hashing task failed: {e}")))
 }
 
 /// Issue and store an invite. The returned token and code are the only copy.
-pub async fn issue(ks: &KeyspaceHandle, req: InviteRequest) -> Result<IssuedInvite, AppError> {
+///
+/// `hash_wait` bounds the wait for a free hashing permit
+/// (`auth.claim_code_hash_wait_ms`).
+pub async fn issue(
+    ks: &KeyspaceHandle,
+    req: InviteRequest,
+    hash_wait: std::time::Duration,
+) -> Result<IssuedInvite, AppError> {
     if req.purpose == Purpose::StepUp && req.role.is_some() {
         return Err(AppError::Validation(
             "a step-up invite confers no role".into(),
@@ -338,7 +386,10 @@ pub async fn issue(ks: &KeyspaceHandle, req: InviteRequest) -> Result<IssuedInvi
     let token = generate_token();
     let claim_code = generate_claim_code();
     let code = claim_code.clone();
-    let claim = blocking(move || hash_claim_code(&code)).await??;
+    let claim = blocking(&ISSUE_HASH_PERMITS, hash_wait, move || {
+        hash_claim_code(&code)
+    })
+    .await??;
     let now = now_epoch();
     let invite = Invite {
         invite_id: uuid::Uuid::new_v4().to_string(),
@@ -493,10 +544,16 @@ pub async fn revoke(ks: &KeyspaceHandle, invite_id: &str, by: &str) -> Result<bo
 /// the [`MAX_WRONG_CODES`]th deletes it and answers
 /// [`Redemption::TooManyAttempts`]. A right code leaves the count alone and
 /// the invite unconsumed.
+///
+/// When the invite's attempt lock or every hashing permit stays busy for
+/// `hash_wait`
+/// (`auth.claim_code_hash_wait_ms`) the attempt is refused with
+/// [`AppError::RateLimited`] and counts against nothing.
 pub async fn redeem(
     ks: &KeyspaceHandle,
     token: &str,
     claim_code: &str,
+    hash_wait: std::time::Duration,
 ) -> Result<Redemption, AppError> {
     let token_hash = hash_token(token);
     let now = now_epoch();
@@ -506,8 +563,14 @@ pub async fn redeem(
     let exists = by_token_hash(ks, &token_hash)
         .await?
         .is_some_and(|i| !i.is_expired(now));
+    // The invite's attempt lock is waited for within the same bound as a
+    // hashing permit: the holder ahead may itself be waiting for one.
     let _guard = match exists {
-        true => Some(ATTEMPT_LOCKS.guard(&token_hash).await),
+        true => Some(
+            tokio::time::timeout(hash_wait, ATTEMPT_LOCKS.guard(&token_hash))
+                .await
+                .map_err(|_| hashing_busy())?,
+        ),
         false => None,
     };
     let invite = match exists {
@@ -515,11 +578,18 @@ pub async fn redeem(
         false => None,
     };
     let Some(mut invite) = invite.filter(|i| !i.is_expired(now)) else {
-        blocking(move || verify_claim_code(&DECOY, &code)).await?;
+        blocking(&HASH_PERMITS, hash_wait, move || {
+            verify_claim_code(&DECOY, &code)
+        })
+        .await?;
         return Ok(Redemption::Invalid);
     };
     let claim = invite.claim.clone();
-    if blocking(move || verify_claim_code(&claim, &code)).await? {
+    if blocking(&HASH_PERMITS, hash_wait, move || {
+        verify_claim_code(&claim, &code)
+    })
+    .await?
+    {
         return Ok(Redemption::Valid(Box::new(invite)));
     }
     // The lockout decision is made from the atomic counter, not from
@@ -564,6 +634,9 @@ mod tests {
     use super::*;
     use crate::server::config::StoreConfig;
     use crate::server::store::{KS_SESSIONS, Store};
+    use std::time::Duration;
+
+    const WAIT: Duration = Duration::from_secs(30);
 
     async fn ks() -> (KeyspaceHandle, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -609,7 +682,7 @@ mod tests {
     #[tokio::test]
     async fn an_invite_is_stored_hashed() {
         let (ks, _dir) = ks().await;
-        let issued = issue(&ks, request(Purpose::Session)).await.unwrap();
+        let issued = issue(&ks, request(Purpose::Session), WAIT).await.unwrap();
         let rows = ks.iter_all().await.unwrap();
         assert!(!rows.is_empty());
         let code = normalise_claim_code(&issued.claim_code);
@@ -637,10 +710,10 @@ mod tests {
     #[tokio::test]
     async fn both_halves_redeem_and_the_invite_stays_until_taken() {
         let (ks, _dir) = ks().await;
-        let issued = issue(&ks, request(Purpose::Session)).await.unwrap();
+        let issued = issue(&ks, request(Purpose::Session), WAIT).await.unwrap();
         for _ in 0..2 {
             assert!(matches!(
-                redeem(&ks, &issued.token, &issued.claim_code.to_lowercase())
+                redeem(&ks, &issued.token, &issued.claim_code.to_lowercase(), WAIT)
                     .await
                     .unwrap(),
                 Redemption::Valid(_)
@@ -660,7 +733,7 @@ mod tests {
                 .is_none()
         );
         assert!(matches!(
-            redeem(&ks, &issued.token, &issued.claim_code)
+            redeem(&ks, &issued.token, &issued.claim_code, WAIT)
                 .await
                 .unwrap(),
             Redemption::Invalid
@@ -676,11 +749,13 @@ mod tests {
     #[tokio::test]
     async fn wrong_codes_lock_the_invite_out() {
         let (ks, _dir) = ks().await;
-        let issued = issue(&ks, request(Purpose::StepUp)).await.unwrap();
+        let issued = issue(&ks, request(Purpose::StepUp), WAIT).await.unwrap();
         for n in 1..MAX_WRONG_CODES {
             assert!(
                 matches!(
-                    redeem(&ks, &issued.token, "0000-0000-0000").await.unwrap(),
+                    redeem(&ks, &issued.token, "0000-0000-0000", WAIT)
+                        .await
+                        .unwrap(),
                     Redemption::Invalid
                 ),
                 "wrong code {n}"
@@ -689,12 +764,14 @@ mod tests {
             assert_eq!(stored.wrong_codes, n);
         }
         assert!(matches!(
-            redeem(&ks, &issued.token, "0000-0000-0000").await.unwrap(),
+            redeem(&ks, &issued.token, "0000-0000-0000", WAIT)
+                .await
+                .unwrap(),
             Redemption::TooManyAttempts
         ));
         // Gone: the right code no longer redeems it.
         assert!(matches!(
-            redeem(&ks, &issued.token, &issued.claim_code)
+            redeem(&ks, &issued.token, &issued.claim_code, WAIT)
                 .await
                 .unwrap(),
             Redemption::Invalid
@@ -728,12 +805,14 @@ mod tests {
         let ks_a = store.keyspace(KS_SESSIONS).unwrap();
         let ks_b = store.keyspace(KS_SESSIONS).unwrap();
 
-        let issued = issue(&ks_a, request(Purpose::Session)).await.unwrap();
+        let issued = issue(&ks_a, request(Purpose::Session), WAIT).await.unwrap();
         for n in 1..MAX_WRONG_CODES {
             let ks = if n % 2 == 0 { &ks_a } else { &ks_b };
             assert!(
                 matches!(
-                    redeem(ks, &issued.token, "0000-0000-0000").await.unwrap(),
+                    redeem(ks, &issued.token, "0000-0000-0000", WAIT)
+                        .await
+                        .unwrap(),
                     Redemption::Invalid
                 ),
                 "wrong code {n}"
@@ -753,7 +832,7 @@ mod tests {
         // The last allowed wrong code, from whichever handle's turn it is,
         // locks the invite out.
         assert!(matches!(
-            redeem(&ks_b, &issued.token, "0000-0000-0000")
+            redeem(&ks_b, &issued.token, "0000-0000-0000", WAIT)
                 .await
                 .unwrap(),
             Redemption::TooManyAttempts
@@ -776,11 +855,11 @@ mod tests {
     #[tokio::test]
     async fn concurrent_wrong_codes_are_each_counted() {
         let (ks, _dir) = ks().await;
-        let issued = issue(&ks, request(Purpose::Session)).await.unwrap();
+        let issued = issue(&ks, request(Purpose::Session), WAIT).await.unwrap();
         let tries = (0..MAX_WRONG_CODES).map(|_| {
             let ks = ks.clone();
             let token = issued.token.clone();
-            tokio::spawn(async move { redeem(&ks, &token, "WRONGWRONG12").await.unwrap() })
+            tokio::spawn(async move { redeem(&ks, &token, "WRONGWRONG12", WAIT).await.unwrap() })
         });
         let outcomes = futures_join(tries).await;
         assert_eq!(
@@ -804,11 +883,13 @@ mod tests {
     async fn a_taken_invite_is_not_brought_back_by_a_racing_wrong_code() {
         let (ks, _dir) = ks().await;
         for _ in 0..8 {
-            let issued = issue(&ks, request(Purpose::Session)).await.unwrap();
+            let issued = issue(&ks, request(Purpose::Session), WAIT).await.unwrap();
             let wrong = {
                 let ks = ks.clone();
                 let token = issued.token.clone();
-                tokio::spawn(async move { redeem(&ks, &token, "WRONGWRONG12").await.unwrap() })
+                tokio::spawn(
+                    async move { redeem(&ks, &token, "WRONGWRONG12", WAIT).await.unwrap() },
+                )
             };
             let taken = {
                 let ks = ks.clone();
@@ -832,7 +913,7 @@ mod tests {
     #[tokio::test]
     async fn an_update_does_not_bring_back_a_taken_invite() {
         let (ks, _dir) = ks().await;
-        let issued = issue(&ks, request(Purpose::Session)).await.unwrap();
+        let issued = issue(&ks, request(Purpose::Session), WAIT).await.unwrap();
         assert!(
             take(&ks, &issued.invite.token_hash)
                 .await
@@ -865,12 +946,12 @@ mod tests {
     #[tokio::test]
     async fn an_expired_invite_redeems_nothing_and_is_swept() {
         let (ks, _dir) = ks().await;
-        let issued = issue(&ks, request(Purpose::Session)).await.unwrap();
+        let issued = issue(&ks, request(Purpose::Session), WAIT).await.unwrap();
         let mut invite = by_id(&ks, &issued.invite.invite_id).await.unwrap().unwrap();
         invite.expires_at = now_epoch() - 1;
         save(&ks, &invite).await.unwrap();
         assert!(matches!(
-            redeem(&ks, &issued.token, &issued.claim_code)
+            redeem(&ks, &issued.token, &issued.claim_code, WAIT)
                 .await
                 .unwrap(),
             Redemption::Invalid
@@ -900,6 +981,120 @@ mod tests {
         let (ks, _dir) = ks().await;
         let mut req = request(Purpose::StepUp);
         req.role = Some("admin".into());
-        assert!(issue(&ks, req).await.is_err());
+        assert!(issue(&ks, req, WAIT).await.is_err());
+    }
+
+    /// With every permit held, a hash waits only as long as it was given and
+    /// is then refused as a retryable load refusal, not queued.
+    #[tokio::test]
+    async fn a_hash_that_finds_no_permit_in_time_is_refused_as_busy() {
+        let permits: &'static tokio::sync::Semaphore =
+            Box::leak(Box::new(tokio::sync::Semaphore::new(1)));
+        let held = permits.acquire().await.unwrap();
+        let started = std::time::Instant::now();
+        let err = blocking(permits, Duration::from_millis(50), || ())
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            matches!(
+                err,
+                AppError::RateLimited {
+                    limiter: LIMITER_CLAIM_CODE_HASHING,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.retry_after_secs(), Some(HASH_BUSY_RETRY_AFTER_SECS));
+        drop(held);
+        assert_eq!(
+            blocking(permits, Duration::from_millis(50), || 7)
+                .await
+                .unwrap(),
+            7
+        );
+    }
+
+    /// A hash queued behind a busy permit still runs if one frees in time.
+    #[tokio::test]
+    async fn a_hash_runs_once_a_permit_frees_within_the_wait() {
+        let permits: &'static tokio::sync::Semaphore =
+            Box::leak(Box::new(tokio::sync::Semaphore::new(1)));
+        let held = permits.acquire().await.unwrap();
+        let waiter =
+            tokio::spawn(async move { blocking(permits, Duration::from_secs(10), || 1).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(held);
+        assert_eq!(waiter.await.unwrap().unwrap(), 1);
+    }
+
+    /// A caller that stops waiting does not free the permit while its hash
+    /// is still running on the blocking pool.
+    #[tokio::test]
+    async fn a_cancelled_caller_keeps_its_permit_until_the_hash_ends() {
+        let permits: &'static tokio::sync::Semaphore =
+            Box::leak(Box::new(tokio::sync::Semaphore::new(1)));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+        let caller = tokio::spawn(async move {
+            blocking(permits, Duration::from_secs(10), move || {
+                started_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+            })
+            .await
+        });
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "the hash still runs, so its permit is still taken"
+        );
+        finish_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while permits.available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the permit is released once the hash ends");
+    }
+
+    /// A redemption that cannot take its invite's attempt lock within the
+    /// wait is refused as busy, not queued.
+    #[tokio::test]
+    async fn a_redemption_waits_a_bounded_time_for_its_invite() {
+        let (ks, _dir) = ks().await;
+        let issued = issue(&ks, request(Purpose::Session), WAIT).await.unwrap();
+        let held = ATTEMPT_LOCKS.guard(&hash_token(&issued.token)).await;
+        let err = redeem(
+            &ks,
+            &issued.token,
+            &issued.claim_code,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AppError::RateLimited {
+                    limiter: LIMITER_CLAIM_CODE_HASHING,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        drop(held);
+        assert!(matches!(
+            redeem(&ks, &issued.token, &issued.claim_code, WAIT)
+                .await
+                .unwrap(),
+            Redemption::Valid(_)
+        ));
     }
 }

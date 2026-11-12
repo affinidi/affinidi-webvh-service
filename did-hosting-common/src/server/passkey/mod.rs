@@ -45,6 +45,7 @@ pub async fn run_cli_invite(
     ttl_secs: u64,
     did: &str,
     role: &str,
+    hash_wait: std::time::Duration,
 ) -> Result<(), AppError> {
     let did = crate::server::acl::validate_did_format(did)?;
     role.parse::<crate::server::acl::Role>()?;
@@ -66,6 +67,7 @@ pub async fn run_cli_invite(
             issued_by: "operator (CLI)".into(),
             ttl_secs,
         },
+        hash_wait,
     )
     .await?;
     let url = format!(

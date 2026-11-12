@@ -133,20 +133,61 @@ enum Ceremony {
     LoginStart,
 }
 
-/// Which limited ceremony `body` opens, if any.
-///
-/// Read exactly as [`dispatch_trust_task`] and the task table read it — the
-/// whole body as a `TrustTask`, its parsed `type` compared as the router
-/// compares it — so no body the router serves as one (duplicate members,
-/// escapes, any other quirk of a lighter parse) slips past the limit.
-fn ceremony_kind(body: &[u8]) -> Option<Ceremony> {
+/// The Type URIs of the ceremonies the route limits per client address.
+const LIMITED_CEREMONY_TYPES: [&str; 2] = {
     use did_hosting_common::tasks::auth::passkey::{enroll::redeem, login};
     use trust_tasks_rs::Payload;
-    let doc = serde_json::from_slice::<TrustTask<Value>>(body).ok()?;
-    let type_uri = doc.type_uri.to_string();
-    if type_uri == redeem::start::v0_1::Payload::TYPE_URI {
+    [
+        redeem::start::v0_1::Payload::TYPE_URI,
+        login::start::v0_2::Payload::TYPE_URI,
+    ]
+};
+
+/// Which limited ceremony `body` opens, if any.
+///
+/// Two steps, cheapest first, so a stranger's body costs no more here than
+/// the size gate in [`dispatch_trust_task`] would allow:
+///
+/// 1. A body larger than every limited ceremony's own document limit is not
+///    one. Its length is all that is read: whatever its `type`, the size
+///    gate refuses it before anything parses it, so it can never reach a
+///    ceremony's handler.
+/// 2. Otherwise only the top-level `type` is read, into the same [`TypeUri`]
+///    the router's `TrustTask<Value>` parse produces and compared as the
+///    router compares it, with every other member skipped. A body the router
+///    would serve as a ceremony therefore always classifies as one:
+///    duplicate members and escapes read the same way in both parses. A
+///    body that only this lighter read accepts is refused by the router as
+///    malformed, so counting it costs nobody a legitimate attempt.
+///
+/// [`TypeUri`]: trust_tasks_rs::TypeUri
+fn ceremony_kind(body: &[u8]) -> Option<Ceremony> {
+    let ceiling = LIMITED_CEREMONY_TYPES
+        .iter()
+        .map(|type_uri| {
+            did_hosting_common::server::trust_tasks::size::max_document_bytes(
+                type_uri,
+                &crate::control_tasks::SERVED_TRUST_TASK_URIS,
+            )
+        })
+        .max()
+        .unwrap_or(did_hosting_common::server::trust_tasks::size::DEFAULT_MAX_DOCUMENT_BYTES);
+    if body.len() > ceiling {
+        return None;
+    }
+    #[derive(serde::Deserialize)]
+    struct TypeOnly {
+        #[serde(rename = "type")]
+        type_uri: trust_tasks_rs::TypeUri,
+    }
+    let type_uri = serde_json::from_slice::<TypeOnly>(body)
+        .ok()?
+        .type_uri
+        .to_string();
+    let [redeem_start, login_start] = LIMITED_CEREMONY_TYPES;
+    if type_uri == redeem_start {
         Some(Ceremony::RedeemStart)
-    } else if type_uri == login::start::v0_2::Payload::TYPE_URI {
+    } else if type_uri == login_start {
         Some(Ceremony::LoginStart)
     } else {
         None
@@ -406,6 +447,11 @@ fn sealed_response(sealed: crate::control_tasks::SealedReply) -> Response {
 /// dispatched: routed to the document when the body parses as one, unrouted
 /// otherwise.
 fn refusal(body: &[u8], reject: RejectReason) -> trust_tasks_rs::ErrorResponse {
+    // A body larger than any type takes by default is not parsed just to
+    // address a refusal: the reply goes unrouted, as a parse failure's does.
+    if body.len() > did_hosting_common::server::trust_tasks::size::DEFAULT_MAX_DOCUMENT_BYTES {
+        return unrouted_error(reject);
+    }
     match serde_json::from_slice::<TrustTask<Value>>(body) {
         Ok(doc) => doc.reject_with(format!("urn:uuid:{}", Uuid::new_v4()), reject),
         Err(_) => unrouted_error(reject),
@@ -600,5 +646,94 @@ mod tests {
         let doc: trust_tasks_rs::TrustTask<serde_json::Value> =
             serde_json::from_value(body).expect("envelope parses");
         assert_eq!(doc.type_uri.to_string(), grant::Payload::TYPE_URI);
+    }
+
+    fn ceremony_body(type_uri: &str, padding: usize) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "id": "urn:uuid:5b3c5e2a-1b81-4d3e-9b51-7a3c89e3d1f2",
+            "type": type_uri,
+            "issuedAt": "2026-05-18T10:00:00Z",
+            "payload": {
+                "token": "inv_not-a-real-token",
+                "claimCode": "0000-0000-0000",
+                "padding": "x".repeat(padding),
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn ceremonies_are_classified_by_their_type() {
+        let [redeem_start, login_start] = super::LIMITED_CEREMONY_TYPES;
+        assert!(matches!(
+            super::ceremony_kind(&ceremony_body(redeem_start, 0)),
+            Some(super::Ceremony::RedeemStart)
+        ));
+        assert!(matches!(
+            super::ceremony_kind(&ceremony_body(login_start, 0)),
+            Some(super::Ceremony::LoginStart)
+        ));
+        assert!(super::ceremony_kind(&ceremony_body(grant::Payload::TYPE_URI, 0)).is_none());
+        assert!(super::ceremony_kind(b"not json").is_none());
+    }
+
+    /// A body over the ceremonies' own size limit is not classified, even
+    /// one whose content a parse would read as a ceremony: only its length
+    /// is looked at, and the size gate refuses it later before any parse.
+    #[test]
+    fn an_oversized_body_is_not_classified() {
+        use did_hosting_common::server::trust_tasks::size::DEFAULT_MAX_DOCUMENT_BYTES;
+        let [redeem_start, _] = super::LIMITED_CEREMONY_TYPES;
+        let body = ceremony_body(redeem_start, DEFAULT_MAX_DOCUMENT_BYTES);
+        assert!(body.len() > DEFAULT_MAX_DOCUMENT_BYTES);
+        // A full parse would read it as a redemption...
+        let doc: trust_tasks_rs::TrustTask<serde_json::Value> =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(doc.type_uri.to_string(), redeem_start);
+        // ...but it is not one here.
+        assert!(super::ceremony_kind(&body).is_none());
+
+        // A body of that length is refused for its size whatever comes after
+        // its first bytes, so nothing past them needs to be valid JSON.
+        let mut truncated = body[..body.len() / 2].to_vec();
+        truncated.resize(DEFAULT_MAX_DOCUMENT_BYTES + 1, b'x');
+        assert!(super::ceremony_kind(&truncated).is_none());
+    }
+
+    /// The light read and the router's full parse agree on what a `type`
+    /// is: a duplicate `type` is refused by both, so it cannot be served as
+    /// a ceremony while going uncounted.
+    #[test]
+    fn a_duplicate_type_is_refused_by_both_reads() {
+        let [redeem_start, _] = super::LIMITED_CEREMONY_TYPES;
+        let body = format!(
+            r#"{{"id":"urn:uuid:x","type":"{}","type":"{redeem_start}","payload":{{}}}}"#,
+            grant::Payload::TYPE_URI
+        );
+        assert!(super::ceremony_kind(body.as_bytes()).is_none());
+        assert!(
+            serde_json::from_str::<trust_tasks_rs::TrustTask<serde_json::Value>>(&body).is_err()
+        );
+    }
+
+    /// A refusal does not parse a body larger than the default limit to
+    /// address it.
+    #[test]
+    fn a_refusal_of_an_oversized_body_is_unrouted() {
+        use did_hosting_common::server::trust_tasks::size::DEFAULT_MAX_DOCUMENT_BYTES;
+        let [redeem_start, _] = super::LIMITED_CEREMONY_TYPES;
+        let reject = || trust_tasks_rs::RejectReason::MalformedRequest {
+            reason: "test".into(),
+        };
+        let small = super::refusal(&ceremony_body(redeem_start, 0), reject());
+        assert_eq!(
+            small.thread_id.as_deref(),
+            Some("urn:uuid:5b3c5e2a-1b81-4d3e-9b51-7a3c89e3d1f2")
+        );
+        let large = super::refusal(
+            &ceremony_body(redeem_start, DEFAULT_MAX_DOCUMENT_BYTES),
+            reject(),
+        );
+        assert!(large.thread_id.is_none());
     }
 }

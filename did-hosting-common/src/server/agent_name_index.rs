@@ -7,11 +7,9 @@
 //! ([`lock_key`]) after the slot's lock, and only ever removes entries that
 //! still point at its own slot ([`owned_keys`]).
 
-use tokio::sync::OwnedMutexGuard;
-
 use super::domain::safety::extract_did_host;
 use super::error::AppError;
-use super::path_locks::PathLocks;
+use super::path_locks::{PathGuard, PathLocks};
 use super::store::KeyspaceHandle;
 use crate::did_ops::{DidRecord, agent_name_key};
 
@@ -28,7 +26,7 @@ pub fn lock_key(index_key: &str) -> String {
 pub async fn lock_names(
     locks: &PathLocks,
     index_keys: impl IntoIterator<Item = String>,
-) -> Vec<OwnedMutexGuard<()>> {
+) -> Vec<PathGuard> {
     let mut keys: Vec<String> = index_keys.into_iter().map(|k| lock_key(&k)).collect();
     keys.sort();
     keys.dedup();
