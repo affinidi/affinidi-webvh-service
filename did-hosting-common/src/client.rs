@@ -305,7 +305,7 @@ impl WebVHClient {
     /// Resolve a DID log from the hosting URL (public, no proof required).
     pub async fn resolve_did(&self, mnemonic: &str) -> Result<String> {
         let host_url = self.hosting_url.as_deref().unwrap_or(&self.server_url);
-        let resp = crate::http::outbound_client()
+        let resp = crate::http::outbound_client()?
             .get(format!("{host_url}/{mnemonic}/did.jsonl"))
             .send()
             .await?;

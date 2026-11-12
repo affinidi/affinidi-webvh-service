@@ -251,12 +251,23 @@ pub async fn own_did_served_locally(
     )
 }
 
-/// HTTP GET with a 5-second timeout to verify connectivity.
+/// HTTP GET with a 5-second timeout to verify connectivity. Redirects are
+/// not followed: a 3xx is reported as the status it is.
 pub async fn check_url_reachable(label: &str, url: &str) -> bool {
-    let client = reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap();
+    {
+        Ok(client) => client,
+        Err(e) => {
+            fail(&format!(
+                "{label}: {url} — could not build an HTTP client: {e}"
+            ));
+            return false;
+        }
+    };
 
     match client.get(url).send().await {
         Ok(resp) => {
