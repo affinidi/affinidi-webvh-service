@@ -145,6 +145,51 @@ async fn is_path_available(dids_ks: &KeyspaceHandle, path: &str) -> Result<bool,
 // Auth helper
 // ---------------------------------------------------------------------------
 
+/// Validate the path of an operation on an existing slot.
+///
+/// The stored record decides the grammar, as on the publish path: a did:webs
+/// slot ends in its identifier's AID, case-sensitive base64url, which the
+/// shared lowercase-only grammar rejects, so only a slot already recorded as
+/// did:webs is accepted under `validate_webs_mnemonic`. Reading the method
+/// from the record rather than from anything the caller submits means a
+/// request cannot pick the looser grammar for itself. A path the shared
+/// grammar accepts needs no storage read.
+pub(crate) async fn validate_slot_mnemonic(
+    dids_ks: &KeyspaceHandle,
+    mnemonic: &str,
+) -> Result<(), AppError> {
+    let shared = validate_mnemonic(mnemonic);
+    if shared.is_ok()
+        || did_hosting_common::server::mnemonic::validate_webs_mnemonic(mnemonic).is_err()
+    {
+        return shared;
+    }
+    let record = dids_ks.get::<DidRecord>(did_key(mnemonic)).await?;
+    if record
+        .as_ref()
+        .is_some_and(|r| is_webs_record_for(r, mnemonic))
+    {
+        Ok(())
+    } else {
+        shared
+    }
+}
+
+/// Whether `record` is a `did:webs` record held at `mnemonic`: the method
+/// says so, the record names this same path, and its identifier is a
+/// `did:webs` whose final segment is the path's last segment (the AID).
+/// The webs grammar is chosen only when all three agree, so a record whose
+/// method field disagrees with what it holds never widens the path rules.
+fn is_webs_record_for(record: &DidRecord, mnemonic: &str) -> bool {
+    let aid = mnemonic.rsplit('/').next().unwrap_or(mnemonic);
+    record.method == "webs"
+        && record.mnemonic == mnemonic
+        && record
+            .did_id
+            .as_deref()
+            .is_some_and(|d| d.starts_with("did:webs:") && d.rsplit(':').next() == Some(aid))
+}
+
 /// Load a DID record and verify the caller is the owner (or admin).
 async fn get_authorized_record(
     dids_ks: &KeyspaceHandle,
@@ -845,21 +890,9 @@ async fn prepare_republish(
 ) -> Result<(DidRecord, String, Publication), AppError> {
     use crate::auth::session::now_epoch;
 
-    // The stored record decides how this slot's path is spelled — a
-    // did:webs slot ends in a mixed-case AID the shared grammar
-    // rejects. Reading it from the record rather than sniffing the
-    // submitted bytes means a malformed payload cannot talk its way
-    // into the looser validator.
-    let record_method = state
-        .dids_ks
-        .get::<DidRecord>(did_key(mnemonic))
-        .await?
-        .map(|r| r.method);
-    if record_method.as_deref() == Some("webs") {
-        did_hosting_common::server::mnemonic::validate_webs_mnemonic(mnemonic)?;
-    } else {
-        validate_mnemonic(mnemonic)?;
-    }
+    // The stored record decides how this slot's path is spelled; see
+    // `validate_slot_mnemonic`.
+    validate_slot_mnemonic(&state.dids_ks, mnemonic).await?;
 
     let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
@@ -1581,7 +1614,7 @@ pub async fn upload_witness(
     mnemonic: &str,
     witness_entry: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), AppError> {
-    validate_mnemonic(mnemonic)?;
+    validate_slot_mnemonic(&state.dids_ks, mnemonic).await?;
 
     // Same per-path write lock as `register_did_atomic`: merging a proof
     // into the stored witness file is a read-modify-write, and two
@@ -1589,9 +1622,19 @@ pub async fn upload_witness(
     // their own proof, silently dropping the other's.
     let _path_guard = state.path_locks.guard(mnemonic).await;
 
-    get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+    let record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
     use did_hosting_common::server::error::ValidationKind;
+
+    // did-witness.json is a did:webvh artifact. A did:webs slot's witness
+    // receipts travel inside its key event log, and are verified there.
+    if record.method == "webs" {
+        return Err(AppError::validation(
+            ValidationKind::InvalidWitness,
+            "a did:webs slot takes no did-witness.json: its witness receipts are part of \
+             its key event log",
+        ));
+    }
 
     // `webvh/witness/publish`'s `witness` member is one witness's proof for
     // one version — `{versionId, witness, proof}` — not the did-witness.json
@@ -1693,10 +1736,17 @@ pub async fn get_did_info(
     state: &AppState,
     mnemonic: &str,
 ) -> Result<(DidRecord, Option<LogMetadata>), AppError> {
-    validate_mnemonic(mnemonic)?;
+    validate_slot_mnemonic(&state.dids_ks, mnemonic).await?;
     let record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
-    let log_metadata = match state.dids_ks.get_raw(content_log_key(mnemonic)).await? {
+    // The metadata is read from a did:webvh log's last line. A did:webs
+    // slot stores a key event stream, which has none of those fields.
+    let stored_log = if record.method == "webs" {
+        None
+    } else {
+        state.dids_ks.get_raw(content_log_key(mnemonic)).await?
+    };
+    let log_metadata = match stored_log {
         Some(bytes) => {
             let content = String::from_utf8(bytes).unwrap_or_default();
             Some(extract_log_metadata(&content))
@@ -1715,7 +1765,7 @@ pub async fn get_did_log(
     state: &AppState,
     mnemonic: &str,
 ) -> Result<Vec<LogEntryInfo>, AppError> {
-    validate_mnemonic(mnemonic)?;
+    validate_slot_mnemonic(&state.dids_ks, mnemonic).await?;
     get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
     let bytes = state
@@ -1736,7 +1786,7 @@ pub async fn get_raw_log(
     state: &AppState,
     mnemonic: &str,
 ) -> Result<String, AppError> {
-    validate_mnemonic(mnemonic)?;
+    validate_slot_mnemonic(&state.dids_ks, mnemonic).await?;
     get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
     let bytes = state
@@ -1987,7 +2037,7 @@ pub async fn delete_did(
     mnemonic: &str,
     request_domain: Option<&str>,
 ) -> Result<Option<String>, AppError> {
-    validate_mnemonic(mnemonic)?;
+    validate_slot_mnemonic(&state.dids_ks, mnemonic).await?;
     // The per-path write lock, held from the read through the commit: the
     // record is re-read under it, so the owner-index entry removed is the
     // current owner's even if a transfer committed just before.
@@ -2206,7 +2256,7 @@ pub async fn change_did_owner(
 
     use crate::auth::session::now_epoch;
 
-    validate_mnemonic(mnemonic)?;
+    validate_slot_mnemonic(&state.dids_ks, mnemonic).await?;
 
     // Same per-path write lock as `register_did_atomic` — owner-change
     // is also a read-modify-write on the same key, so concurrent
@@ -2374,7 +2424,7 @@ pub async fn set_did_disabled(
     mnemonic: &str,
     disabled: bool,
 ) -> Result<DidRecord, AppError> {
-    validate_mnemonic(mnemonic)?;
+    validate_slot_mnemonic(&state.dids_ks, mnemonic).await?;
     // This writes the whole record back, so it must be read under the same
     // per-path lock every other record writer holds — otherwise a publish
     // committing in between is silently reverted to the stale copy.
@@ -2419,12 +2469,27 @@ pub async fn rollback_did_to(
 ) -> Result<(DidRecord, Option<LogMetadata>, u64), AppError> {
     use crate::auth::session::now_epoch;
 
-    validate_mnemonic(mnemonic)?;
+    validate_slot_mnemonic(&state.dids_ks, mnemonic).await?;
     // Held from the record and log reads through the commit: a publish
     // landing in between would otherwise be overwritten by a truncation of
     // the log as it stood before it.
     let _path_guard = state.path_locks.guard(mnemonic).await;
     let mut record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+
+    // Rollback truncates a did:webvh log by line, so it applies to did:webvh
+    // alone (an empty method is a slot from before methods were recorded,
+    // which is did:webvh). Any other method's content is not one entry per
+    // line: a did:web did.json may be pretty-printed, and cutting it by line
+    // leaves invalid JSON; a did:webs key event stream is only ever extended
+    // by its controller (a publish may not rewind it either, see
+    // `Webs::verify_continuation`).
+    if !record.method.is_empty() && record.method != "webvh" {
+        return Err(AppError::Validation(format!(
+            "a did:{} slot cannot be rolled back: rollback removes did:webvh log \
+             entries, and this method's content is not a did:webvh log",
+            record.method
+        )));
+    }
 
     // Re-check DomainScope at time-of-use (SEC-4045 W7).
     if let Some(did_id) = record.did_id.as_deref() {
@@ -2584,7 +2649,7 @@ pub async fn list_agent_names(
     mnemonic: &str,
     request_domain: Option<&str>,
 ) -> Result<(String, Vec<AgentNameEntry>), AppError> {
-    validate_mnemonic(mnemonic)?;
+    validate_slot_mnemonic(&state.dids_ks, mnemonic).await?;
     let record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
     ensure_slot_domain_matches(&record, request_domain)?;
 
@@ -4432,6 +4497,61 @@ mod tests_atomic {
             .expect("register");
     }
 
+    /// Rollback removes did:webvh log entries by line. A did:web slot's
+    /// did.json may be pretty-printed over several lines; cutting it would
+    /// leave invalid JSON, so the slot is refused and left as it was.
+    #[tokio::test]
+    async fn a_did_web_slot_is_not_rolled_back() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:web-owner";
+        let did_json = serde_json::to_string_pretty(&serde_json::json!({
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "id": "did:web:control.test:plain",
+        }))
+        .unwrap();
+        assert!(did_json.lines().count() > 2, "a multi-line document");
+        // Stored as a did:web publication stores it: the document's bytes
+        // unchanged under the slot's content key, and the record tagged
+        // `web`.
+        register_owned(&state, owner, "plain").await;
+        let mut record = get_record(&state, "plain").await;
+        record.method = "web".into();
+        record.did_id = Some("did:web:control.test:plain".into());
+        record.version_count = 1;
+        record.content_size = did_json.len() as u64;
+        state
+            .dids_ks
+            .insert(did_key("plain"), &record)
+            .await
+            .unwrap();
+        state
+            .dids_ks
+            .insert_raw(content_log_key("plain"), did_json.as_bytes().to_vec())
+            .await
+            .unwrap();
+        let before = get_record(&state, "plain").await;
+
+        for target in [None, Some(1)] {
+            let err = rollback_did_to(&owner_auth(owner), &state, "plain", target)
+                .await
+                .expect_err("rollback refused");
+            assert!(
+                matches!(&err, AppError::Validation(m) if m.contains("did:web slot")),
+                "got {err:?}"
+            );
+        }
+        let stored = state
+            .dids_ks
+            .get_raw(content_log_key("plain"))
+            .await
+            .unwrap()
+            .expect("stored document");
+        assert_eq!(stored, did_json.as_bytes(), "the document is unchanged");
+        let after = get_record(&state, "plain").await;
+        assert_eq!(after.did_id, before.did_id);
+        assert_eq!(after.version_count, before.version_count);
+    }
+
     /// Test shims over `update_agent_name` keeping the historical verb
     /// names readable in the assertions below: `set` / `enable` are both
     /// `state: active` (the declarative spec folds bind / refresh / resume
@@ -6098,6 +6218,163 @@ mod tests_atomic {
             .expect("the method-aware validator must accept an AID slot");
         }
 
+        async fn register_webs(state: &AppState, owner: &str) {
+            register_did_atomic(&owner_auth(owner), state, AID, &keri(), false, Some(DOMAIN))
+                .await
+                .expect("register");
+        }
+
+        /// Reading a did:webs slot: the record and its stored stream, and no
+        /// did:webvh log metadata read out of a key event stream.
+        #[tokio::test]
+        async fn a_webs_slot_can_be_inspected() {
+            let (state, _dir) = test_state().await;
+            let owner = "did:example:webs-owner";
+            register_webs(&state, owner).await;
+
+            let (record, metadata) = get_did_info(&owner_auth(owner), &state, AID)
+                .await
+                .expect("info");
+            assert_eq!(record.method, "webs");
+            assert!(
+                metadata.is_none(),
+                "a key event stream has no webvh metadata"
+            );
+
+            let raw = get_raw_log(&owner_auth(owner), &state, AID)
+                .await
+                .expect("raw log");
+            assert_eq!(raw.as_bytes(), KERI);
+
+            let (domain, names) = list_agent_names(&owner_auth(owner), &state, AID, None)
+                .await
+                .expect("agent names");
+            assert_eq!(domain, DOMAIN);
+            assert!(names.is_empty());
+        }
+
+        /// Suspending and resuming a did:webs slot.
+        #[tokio::test]
+        async fn a_webs_slot_can_be_suspended_and_resumed() {
+            let (state, _dir) = test_state().await;
+            let owner = "did:example:webs-owner";
+            register_webs(&state, owner).await;
+
+            let record = set_did_disabled(&owner_auth(owner), &state, AID, true)
+                .await
+                .expect("suspend");
+            assert!(record.disabled);
+            assert!(record_for(&state, AID).await.disabled);
+
+            let record = set_did_disabled(&owner_auth(owner), &state, AID, false)
+                .await
+                .expect("resume");
+            assert!(!record.disabled);
+        }
+
+        /// Deleting a did:webs slot removes its record and its key event log.
+        #[tokio::test]
+        async fn a_webs_slot_can_be_deleted() {
+            let (state, _dir) = test_state().await;
+            let owner = "did:example:webs-owner";
+            register_webs(&state, owner).await;
+
+            let did_id = delete_did(&admin_auth("did:example:admin"), &state, AID, Some(DOMAIN))
+                .await
+                .expect("delete");
+            assert_eq!(did_id, Some(format!("did:webs:{DOMAIN}:{AID}")));
+            assert!(
+                state
+                    .dids_ks
+                    .get::<DidRecord>(did_key(AID))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                state
+                    .dids_ks
+                    .get_raw(content_log_key(AID))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        /// Rollback truncates a did:webvh log by line; it does not apply to a
+        /// key event stream, which is left as it was.
+        #[tokio::test]
+        async fn a_webs_slot_is_not_rolled_back() {
+            let (state, _dir) = test_state().await;
+            let owner = "did:example:webs-owner";
+            register_webs(&state, owner).await;
+
+            let err = rollback_did_to(&owner_auth(owner), &state, AID, Some(1))
+                .await
+                .expect_err("rollback refused");
+            assert!(
+                matches!(&err, AppError::Validation(m) if m.contains("did:webs")),
+                "got {err:?}"
+            );
+            let stored = state
+                .dids_ks
+                .get_raw(content_log_key(AID))
+                .await
+                .unwrap()
+                .expect("stored log");
+            assert_eq!(stored, KERI);
+        }
+
+        /// did-witness.json is a did:webvh artifact.
+        #[tokio::test]
+        async fn a_webs_slot_takes_no_witness_file() {
+            let (state, _dir) = test_state().await;
+            let owner = "did:example:webs-owner";
+            register_webs(&state, owner).await;
+
+            let witness = serde_json::json!({ "versionId": "1-x", "proof": {} });
+            let err = upload_witness(
+                &owner_auth(owner),
+                &state,
+                AID,
+                witness.as_object().unwrap(),
+            )
+            .await
+            .expect_err("refused");
+            assert!(err.to_string().contains("did:webs"), "got {err}");
+        }
+
+        /// The looser grammar applies only to a slot recorded as did:webs: an
+        /// AID-shaped path with no record, or one holding another method, is
+        /// refused by the shared grammar as before.
+        #[tokio::test]
+        async fn the_aid_grammar_applies_only_to_a_webs_record() {
+            let (state, _dir) = test_state().await;
+            let owner = "did:example:webs-owner";
+
+            let err = get_did_info(&owner_auth(owner), &state, AID)
+                .await
+                .expect_err("no record");
+            assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+
+            register_webs(&state, owner).await;
+            let mut record = record_for(&state, AID).await;
+            record.method = "webvh".into();
+            state.dids_ks.insert(did_key(AID), &record).await.unwrap();
+            let err = delete_did(&owner_auth(owner), &state, AID, None)
+                .await
+                .expect_err("not a did:webs slot");
+            assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+            assert!(
+                state
+                    .dids_ks
+                    .get::<DidRecord>(did_key(AID))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
         #[tokio::test]
         async fn refuses_a_webs_registration_without_a_domain() {
             let (state, _dir) = test_state().await;
@@ -6113,5 +6390,54 @@ mod tests_atomic {
             .expect_err("a did:webs DID cannot be built without its domain");
             assert!(matches!(err, AppError::Validation(_)));
         }
+    }
+}
+
+#[cfg(test)]
+mod webs_record_tests {
+    use super::*;
+
+    fn record(method: &str, mnemonic: &str, did_id: Option<&str>) -> DidRecord {
+        DidRecord {
+            owner: "did:key:z6Mkowner".to_string(),
+            mnemonic: mnemonic.to_string(),
+            created_at: 0,
+            updated_at: 0,
+            version_count: 1,
+            did_id: did_id.map(str::to_string),
+            content_size: 0,
+            disabled: false,
+            deleted_at: None,
+            method: method.to_string(),
+            domain: "example.com".to_string(),
+            services: None,
+            agent_names: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_webs_grammar_needs_the_record_to_be_a_webs_record_for_the_path() {
+        let path = "people/EAbCdEf";
+        let did = "did:webs:example.com:people:EAbCdEf";
+        assert!(is_webs_record_for(&record("webs", path, Some(did)), path));
+        // The method field alone is not enough.
+        assert!(!is_webs_record_for(
+            &record(
+                "webs",
+                path,
+                Some("did:webvh:scid:example.com:people:EAbCdEf")
+            ),
+            path
+        ));
+        assert!(!is_webs_record_for(&record("webs", path, None), path));
+        assert!(!is_webs_record_for(
+            &record("webs", path, Some("did:webs:example.com:people:EOther")),
+            path
+        ));
+        assert!(!is_webs_record_for(
+            &record("webs", "people/EOther", Some(did)),
+            path
+        ));
+        assert!(!is_webs_record_for(&record("webvh", path, Some(did)), path));
     }
 }

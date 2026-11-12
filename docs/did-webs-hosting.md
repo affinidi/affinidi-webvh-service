@@ -84,6 +84,12 @@ There is a regression guard (`the_shared_validator_rejects_every_aid`) asserting
 the shared grammar really would have blocked it. If that ever starts failing,
 the split can be revisited.
 
+Every operation on an existing slot (`did/info`, `did/log`, `did/set-state`,
+`did/change-owner`, `did/delete`, `did/rollback`, `agent-name/*`,
+`webvh/witness/publish`) takes the path's grammar from the stored record
+(`validate_slot_mnemonic`), never from the request: the AID grammar applies
+only to a slot already recorded as `did:webs`.
+
 ## What is verified, and where
 
 Verification is what makes this a *host* rather than a file server. It runs
@@ -154,6 +160,23 @@ percent-encoded when the identifier is built (`%3A`), idempotently.
 Records store the **decoded** form, matching every other record and matching
 what an edge derives, so the control plane and its edges agree about the same
 DID.
+
+## Managing a `did:webs` slot
+
+A `did:webs` slot is read, suspended, transferred and deleted through the same
+Trust Tasks as any other slot. Two do not apply to it:
+
+- **`did/rollback` is refused.** It truncates a `did:webvh` log by line. A key
+  event log is not line-delimited, and only its controller moves it on, by
+  publishing a longer one; a publish may not rewind it either (see
+  *Continuation* above).
+- **`webvh/witness/publish` is refused** (`invalidWitness`). A `did:webs`
+  slot's witness receipts are part of its key event log.
+
+`did/info` returns no `logSummary`, which is read from a `did:webvh` log line.
+`did/log` returns one entry, the document the stored stream implies now
+(re-verified, as on resolution), and `raw` returns the stream verbatim.
+Earlier establishment events are not listed yet.
 
 ## No `.well-known` form
 
