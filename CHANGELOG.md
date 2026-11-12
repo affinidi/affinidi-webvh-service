@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+### Breaking — `did-hosting-common` lock-guard and invite signatures
+
+Rust callers of `did-hosting-common` must update for the two changes below:
+
+- `PathLocks::guard` returns `did_hosting_common::server::path_locks::PathGuard`
+  instead of `tokio::sync::OwnedMutexGuard<()>`. Code that only holds the
+  guard and drops it needs no change; code that names the type does.
+- `passkey::invite::issue`, `passkey::invite::redeem` and
+  `passkey::run_cli_invite` take a final `std::time::Duration` argument, the
+  longest wait for a claim-code hashing slot. Pass
+  `config.auth.claim_code_hash_wait()`.
+
+This change is for the next release and will not be backported.
+
+### Fixed — per-key write locks are released when no longer in use
+
+`PathLocks` (the per-slot, per-name and ACL write locks) kept one entry for
+every key ever locked, for the life of the process, including keys that named
+no stored record. An entry is now removed as soon as no task holds or waits
+for its key, so the lock table stays as small as the set of keys in use.
+Same-key callers still serialise exactly as before.
+
+### Changed — a claim-code check waits a bounded time for a hashing slot
+
+Passkey invite claim codes are checked with Argon2 in a small fixed number of
+concurrent slots. A check that found every slot busy used to wait for as long
+as it took. It now waits at most `auth.claim_code_hash_wait_ms` (default
+5000 ms, at most 60000; env `*_AUTH_CLAIM_CODE_HASH_WAIT_MS`) and is then
+answered `unavailable` with a retry time (`RateLimited`, limiter
+`claim-code-hashing`). The same bound applies to a redemption waiting behind
+another attempt on the same invite. A refused check counts no wrong code
+against the invite. A slot is now held until its hash finishes, even if the
+caller has gone away; before this, a cancelled request freed its slot while
+its hash was still running. Issuing an invite has its own two slots, so
+redemption attempts cannot hold up an administrator issuing one. A config
+file with a wait above 60000 ms is refused at load.
+
+### Fixed — the HTTPS listener classifies a passkey ceremony without a full parse
+
+`POST /api/trust-tasks` decides whether a request opens an invite redemption
+or a passkey login (to apply its per-address limit) before the per-type size
+limit runs. It used to parse every body, up to the route's largest limit, as
+a whole Trust Task document to decide. It now looks only at the body's length
+first (a body over those ceremonies' 64 KiB limit cannot be one and is refused
+later by the size limit, before any parse), and otherwise reads only the
+top-level `type`. A body over 64 KiB that is refused before dispatch is
+answered with an unrouted error document instead of one addressed to it. A
+redemption or login body that names the ceremony's `type` but is otherwise
+malformed now counts against the per-address limit.
+
 ### Fixed — a DID an administrator suspended stays suspended until an administrator resumes it
 
 `did/set-state` stored only whether a slot was suspended, not who

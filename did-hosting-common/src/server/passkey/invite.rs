@@ -305,7 +305,9 @@ static DECOY: LazyLock<ClaimHash> = LazyLock::new(|| ClaimHash {
 /// not on this lock, for the lockout to hold.
 static ATTEMPT_LOCKS: LazyLock<PathLocks> = LazyLock::new(PathLocks::new);
 
-/// Claim-code checks run at once, service-wide. Each takes
+/// Claim-code checks for redemptions that run at once in this process
+/// ([`HASH_PERMITS`]); invite issuance has its own [`MAX_CONCURRENT_ISSUE_HASHES`]
+/// on top, so at most the sum of the two hashes run at once. Each takes
 /// [`ARGON2_M_KIB`] of memory, and a stranger can ask for one per redemption
 /// attempt — from as many sources as they can mint VIDs — so the per-source
 /// rate limit alone does not bound the memory and CPU they can make the
@@ -332,31 +334,39 @@ pub const LIMITER_CLAIM_CODE_HASHING: &str = "claim-code-hashing";
 /// a second, so permits free up quickly once the burst passes.
 const HASH_BUSY_RETRY_AFTER_SECS: u64 = 1;
 
+/// The refusal for a claim-code check that could not start within its wait.
+fn hashing_busy() -> AppError {
+    AppError::RateLimited {
+        limiter: LIMITER_CLAIM_CODE_HASHING,
+        message: "too many claim codes are being checked; retry shortly".into(),
+        retry_after_secs: HASH_BUSY_RETRY_AFTER_SECS,
+    }
+}
+
 /// Run one claim-code hash on the blocking pool, within `permits`.
 ///
 /// Waits at most `wait` for a permit, then answers
 /// [`AppError::RateLimited`] (`unavailable` with a retry time on the Trust
 /// Task surface) rather than queueing without bound behind other attempts.
+///
+/// The permit moves into the blocking task, so it is held for as long as the
+/// hash runs, even if the caller stops waiting (a client that goes away, a
+/// dropped handler): a hash that keeps running keeps counting.
 async fn blocking<T: Send + 'static>(
-    permits: &tokio::sync::Semaphore,
+    permits: &'static tokio::sync::Semaphore,
     wait: std::time::Duration,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, AppError> {
-    let _permit = match tokio::time::timeout(wait, permits.acquire()).await {
-        Ok(permit) => {
-            permit.map_err(|e| AppError::Internal(format!("hashing permits closed: {e}")))?
-        }
-        Err(_) => {
-            return Err(AppError::RateLimited {
-                limiter: LIMITER_CLAIM_CODE_HASHING,
-                message: "too many claim codes are being checked; retry shortly".into(),
-                retry_after_secs: HASH_BUSY_RETRY_AFTER_SECS,
-            });
-        }
-    };
-    tokio::task::spawn_blocking(f)
+    let permit = tokio::time::timeout(wait, permits.acquire())
         .await
-        .map_err(|e| AppError::Internal(format!("hashing task failed: {e}")))
+        .map_err(|_| hashing_busy())?
+        .map_err(|e| AppError::Internal(format!("hashing permits closed: {e}")))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("hashing task failed: {e}")))
 }
 
 /// Issue and store an invite. The returned token and code are the only copy.
@@ -535,7 +545,8 @@ pub async fn revoke(ks: &KeyspaceHandle, invite_id: &str, by: &str) -> Result<bo
 /// [`Redemption::TooManyAttempts`]. A right code leaves the count alone and
 /// the invite unconsumed.
 ///
-/// When every hashing permit stays busy for `hash_wait`
+/// When the invite's attempt lock or every hashing permit stays busy for
+/// `hash_wait`
 /// (`auth.claim_code_hash_wait_ms`) the attempt is refused with
 /// [`AppError::RateLimited`] and counts against nothing.
 pub async fn redeem(
@@ -552,8 +563,14 @@ pub async fn redeem(
     let exists = by_token_hash(ks, &token_hash)
         .await?
         .is_some_and(|i| !i.is_expired(now));
+    // The invite's attempt lock is waited for within the same bound as a
+    // hashing permit: the holder ahead may itself be waiting for one.
     let _guard = match exists {
-        true => Some(ATTEMPT_LOCKS.guard(&token_hash).await),
+        true => Some(
+            tokio::time::timeout(hash_wait, ATTEMPT_LOCKS.guard(&token_hash))
+                .await
+                .map_err(|_| hashing_busy())?,
+        ),
         false => None,
     };
     let invite = match exists {
@@ -971,10 +988,11 @@ mod tests {
     /// is then refused as a retryable load refusal, not queued.
     #[tokio::test]
     async fn a_hash_that_finds_no_permit_in_time_is_refused_as_busy() {
-        let permits = tokio::sync::Semaphore::new(1);
+        let permits: &'static tokio::sync::Semaphore =
+            Box::leak(Box::new(tokio::sync::Semaphore::new(1)));
         let held = permits.acquire().await.unwrap();
         let started = std::time::Instant::now();
-        let err = blocking(&permits, Duration::from_millis(50), || ())
+        let err = blocking(permits, Duration::from_millis(50), || ())
             .await
             .unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -991,7 +1009,7 @@ mod tests {
         assert_eq!(err.retry_after_secs(), Some(HASH_BUSY_RETRY_AFTER_SECS));
         drop(held);
         assert_eq!(
-            blocking(&permits, Duration::from_millis(50), || 7)
+            blocking(permits, Duration::from_millis(50), || 7)
                 .await
                 .unwrap(),
             7
@@ -1001,14 +1019,82 @@ mod tests {
     /// A hash queued behind a busy permit still runs if one frees in time.
     #[tokio::test]
     async fn a_hash_runs_once_a_permit_frees_within_the_wait() {
-        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-        let held = permits.clone().acquire_owned().await.unwrap();
-        let waiter = {
-            let permits = permits.clone();
-            tokio::spawn(async move { blocking(&permits, Duration::from_secs(10), || 1).await })
-        };
+        let permits: &'static tokio::sync::Semaphore =
+            Box::leak(Box::new(tokio::sync::Semaphore::new(1)));
+        let held = permits.acquire().await.unwrap();
+        let waiter =
+            tokio::spawn(async move { blocking(permits, Duration::from_secs(10), || 1).await });
         tokio::time::sleep(Duration::from_millis(20)).await;
         drop(held);
         assert_eq!(waiter.await.unwrap().unwrap(), 1);
+    }
+
+    /// A caller that stops waiting does not free the permit while its hash
+    /// is still running on the blocking pool.
+    #[tokio::test]
+    async fn a_cancelled_caller_keeps_its_permit_until_the_hash_ends() {
+        let permits: &'static tokio::sync::Semaphore =
+            Box::leak(Box::new(tokio::sync::Semaphore::new(1)));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+        let caller = tokio::spawn(async move {
+            blocking(permits, Duration::from_secs(10), move || {
+                started_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+            })
+            .await
+        });
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "the hash still runs, so its permit is still taken"
+        );
+        finish_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while permits.available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the permit is released once the hash ends");
+    }
+
+    /// A redemption that cannot take its invite's attempt lock within the
+    /// wait is refused as busy, not queued.
+    #[tokio::test]
+    async fn a_redemption_waits_a_bounded_time_for_its_invite() {
+        let (ks, _dir) = ks().await;
+        let issued = issue(&ks, request(Purpose::Session), WAIT).await.unwrap();
+        let held = ATTEMPT_LOCKS.guard(&hash_token(&issued.token)).await;
+        let err = redeem(
+            &ks,
+            &issued.token,
+            &issued.claim_code,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AppError::RateLimited {
+                    limiter: LIMITER_CLAIM_CODE_HASHING,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        drop(held);
+        assert!(matches!(
+            redeem(&ks, &issued.token, &issued.claim_code, WAIT)
+                .await
+                .unwrap(),
+            Redemption::Valid(_)
+        ));
     }
 }

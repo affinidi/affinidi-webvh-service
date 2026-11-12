@@ -1052,6 +1052,9 @@ fn default_passkey_enrollment_ttl() -> u64 {
     86400
 }
 
+/// Upper bound on [`AuthConfig::claim_code_hash_wait_ms`]: one minute.
+pub const MAX_CLAIM_CODE_HASH_WAIT_MS: u64 = 60_000;
+
 fn default_claim_code_hash_wait_ms() -> u64 {
     5000
 }
@@ -1104,6 +1107,13 @@ impl AuthConfig {
             return Err(AppError::Config(
                 "admin_idle_timeout must be at least 60 seconds".into(),
             ));
+        }
+        // The wait exists to bound how long a burst of redemption attempts
+        // holds the others up; a wait of minutes no longer does that.
+        if self.claim_code_hash_wait_ms > MAX_CLAIM_CODE_HASH_WAIT_MS {
+            return Err(AppError::Config(format!(
+                "claim_code_hash_wait_ms must be at most {MAX_CLAIM_CODE_HASH_WAIT_MS}"
+            )));
         }
         if self.access_token_expiry < 30 {
             return Err(AppError::Config(
@@ -1962,6 +1972,17 @@ mod tests {
             auth.claim_code_hash_wait(),
             std::time::Duration::from_millis(250)
         );
+        assert!(AuthConfig::default().validate().is_ok());
+        let at_cap = AuthConfig {
+            claim_code_hash_wait_ms: MAX_CLAIM_CODE_HASH_WAIT_MS,
+            ..AuthConfig::default()
+        };
+        assert!(at_cap.validate().is_ok());
+        let over = AuthConfig {
+            claim_code_hash_wait_ms: MAX_CLAIM_CODE_HASH_WAIT_MS + 1,
+            ..AuthConfig::default()
+        };
+        assert!(over.validate().is_err());
     }
 
     /// `did:webs` self-registration is off unless a domain opts in, and a
