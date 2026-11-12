@@ -168,6 +168,56 @@ webvh-witness list-witnesses
 webvh-witness delete-witness --id z6Mk...
 ```
 
+#### Where the signing keys are kept
+
+A witness identity's record in the data store (`[store]`) holds its public
+metadata (`witness_id`, DID, label, counters) and its Ed25519 private key
+**sealed** (HPKE: X25519, HKDF-SHA256, ChaCha20-Poly1305) to the witness
+key-encryption key. That key is held in the secret store configured under
+`[secrets]`, in an entry of its own beside the service's keys:
+
+| Backend | Service keys | Witness key-encryption key |
+| ------- | ------------ | -------------------------- |
+| keyring | account `server_secrets` | account `witness_key_encryption_key` (same service) |
+| aws / gcp / azure | `<secret name>` | `<secret name>-witness-kek` |
+| vault | `<secret path>` | `<secret path>-witness-kek` |
+| kubernetes | Secret `<name>` | Secret `<name>-witness-kek` |
+| plaintext (tests) | `<config>.secrets.plaintext` | `<config>.witness-kek.plaintext` |
+
+The witness creates the key on its first start (or the first
+`create-witness`) and only reads it afterwards. On the cloud, Vault and
+Kubernetes backends, the witness's credentials need permission to create and
+read that second entry. So:
+
+- A data-store backup (or a copy of `data_dir`, or a table export) holds no
+  usable signing key. Back up the key-encryption key's entry as well:
+  without it no identity can sign after a restore.
+- The data store records the key-encryption key's public half. A witness
+  whose secret store holds no key, or a different one, while its identities
+  are sealed to the recorded key refuses to start and names the entry to
+  restore. It does not create a new one over them.
+- `setup` re-run with another backend, and `export-sealed` /
+  `import-sealed`, move the service's own keys only, not the key-encryption
+  key: copy its entry across yourself.
+- If a first start stops after claiming the key's creation but before
+  writing it, the next start waits 30 s and then says so; run
+  `webvh-witness reset-witness-kek-claim` (`did-hosting-daemon
+  reset-witness-kek-claim` for the embedded witness; refused once a key is
+  held or recorded) and start again. A first write the secret store refuses
+  releases the claim itself.
+- Earlier releases kept each private key in clear in the record. On its
+  first start after the upgrade, the witness seals every such key in place,
+  checking first that each key belongs to its identity (startup is refused,
+  naming the identity and changing nothing, if one does not). It logs the
+  witness ids sealed, never keys. Keys are not changed, so no DID's witness
+  list needs updating. Copies of the old records in earlier backups or
+  snapshots still hold the keys in clear, and restoring one brings clear
+  keys back into the store until the witness next starts. An identity whose
+  key cannot be opened is named in a warning at startup.
+- Rolling back to an earlier release after the upgrade does not work: an
+  earlier release cannot read a sealed record. Nothing is lost; upgrading
+  again works.
+
 ## Trust Tasks
 
 The witness has no REST management API. Every operation is a

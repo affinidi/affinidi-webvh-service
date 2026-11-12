@@ -5,9 +5,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::AppError;
 use crate::signing::WitnessSigner;
 use crate::store::{KeyspaceHandle, Store};
+use crate::witness_keys::WitnessKeys;
 
-/// A witness identity managed by this service.
-#[derive(Clone, Serialize, Deserialize)]
+/// A witness identity managed by this service. Its private key is held only
+/// sealed to the witness key-encryption key (see [`crate::witness_keys`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WitnessRecord {
     /// Multibase-encoded public key (z6Mk...) — used as the primary identifier.
     pub witness_id: String,
@@ -15,8 +17,11 @@ pub struct WitnessRecord {
     pub did: String,
     /// Optional VTA key reference for remote signing.
     pub vta_key_id: Option<String>,
-    /// Multibase-encoded Ed25519 private key.
-    pub private_key_multibase: String,
+    /// The Ed25519 private key, HPKE-sealed to the witness key-encryption key
+    /// (multibase). Empty on a record from before keys were sealed, until the
+    /// witness's startup migration seals it.
+    #[serde(default)]
+    pub sealed_private_key: String,
     /// Multibase-encoded Ed25519 public key.
     pub public_key_multibase: String,
     /// Optional human-readable label.
@@ -27,26 +32,11 @@ pub struct WitnessRecord {
     pub proofs_signed: u64,
 }
 
-// `Debug` redacts `private_key_multibase` so that a careless
-// `tracing::debug!(?record)` does not leak the witness's signing key.
-impl std::fmt::Debug for WitnessRecord {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WitnessRecord")
-            .field("witness_id", &self.witness_id)
-            .field("did", &self.did)
-            .field("vta_key_id", &self.vta_key_id)
-            .field("private_key_multibase", &"<redacted>")
-            .field("public_key_multibase", &self.public_key_multibase)
-            .field("label", &self.label)
-            .field("created_at", &self.created_at)
-            .field("proofs_signed", &self.proofs_signed)
-            .finish()
-    }
-}
-
-/// Create a new witness identity and store it.
+/// Create a new witness identity and store it: one record, its private key
+/// sealed to the witness key-encryption key held by `keys`.
 pub async fn create_witness(
     witnesses_ks: &KeyspaceHandle,
+    keys: &WitnessKeys,
     label: Option<String>,
 ) -> Result<WitnessRecord, AppError> {
     let secret = Secret::generate_ed25519(None, None);
@@ -55,9 +45,12 @@ pub async fn create_witness(
         .get_public_keymultibase()
         .map_err(|e| AppError::Internal(format!("failed to get public key multibase: {e}")))?;
 
-    let private_key_multibase = secret
-        .get_private_keymultibase()
-        .map_err(|e| AppError::Internal(format!("failed to get private key multibase: {e}")))?;
+    let sealed_private_key = keys.seal(
+        &public_key_multibase,
+        &secret
+            .get_private_keymultibase()
+            .map_err(|e| AppError::Internal(format!("failed to encode the private key: {e}")))?,
+    )?;
 
     let did = format!("did:key:{public_key_multibase}");
 
@@ -67,7 +60,7 @@ pub async fn create_witness(
         witness_id: public_key_multibase.clone(),
         did,
         vta_key_id: None,
-        private_key_multibase,
+        sealed_private_key,
         public_key_multibase,
         label,
         created_at: now,
@@ -111,8 +104,9 @@ pub async fn list_witnesses(witnesses_ks: &KeyspaceHandle) -> Result<Vec<Witness
 
 /// Delete a witness record by its ID, with every witnessed mark it holds.
 ///
-/// One atomic write: the record and its marks go together, so a crash
-/// mid-delete cannot leave orphaned marks behind a deleted identity.
+/// One atomic write: the record (and the sealed key in it) and its marks go
+/// together, so a crash mid-delete cannot leave orphaned marks behind a
+/// deleted identity.
 pub async fn delete_witness(
     store: &Store,
     witnesses_ks: &KeyspaceHandle,
@@ -270,7 +264,8 @@ mod tests {
 
         let (store, _dir) = temp_store().await;
         let ks = store.keyspace(crate::store::KS_WITNESSES).unwrap();
-        let record = create_witness(&ks, None).await.unwrap();
+        let keys = std::sync::Arc::new(WitnessKeys::generate().unwrap());
+        let record = create_witness(&ks, &keys, None).await.unwrap();
         let witness_id = record.witness_id.clone();
 
         let done = Arc::new(AtomicBool::new(false));
@@ -305,7 +300,7 @@ mod tests {
             sign_witness_proof(
                 &store,
                 &ks,
-                &crate::signing::LocalSigner,
+                &crate::signing::LocalSigner::new(keys.clone()),
                 &witness_id,
                 &version_id,
                 Some(("scid", &mark)),
@@ -333,8 +328,9 @@ mod tests {
     async fn delete_witness_removes_its_marks() {
         let (store, _dir) = temp_store().await;
         let ks = store.keyspace(crate::store::KS_WITNESSES).unwrap();
-        let record = create_witness(&ks, None).await.unwrap();
-        let other = create_witness(&ks, None).await.unwrap();
+        let keys = WitnessKeys::generate().unwrap();
+        let record = create_witness(&ks, &keys, None).await.unwrap();
+        let other = create_witness(&ks, &keys, None).await.unwrap();
         let mark = WitnessedMark {
             version_number: 1,
             version_id: "1-Qm".into(),
@@ -375,6 +371,33 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// A new identity's private key is in its record only sealed, and opens
+    /// to the identity's own key.
+    #[tokio::test]
+    async fn a_created_identity_keeps_its_private_key_sealed() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace(crate::store::KS_WITNESSES).unwrap();
+        let keys = WitnessKeys::generate().unwrap();
+        let record = create_witness(&ks, &keys, Some("w".into())).await.unwrap();
+
+        let secret = keys
+            .open(&record.did, &record.witness_id, &record.sealed_private_key)
+            .unwrap();
+        let private = secret.get_private_keymultibase().unwrap();
+
+        let raw = ks
+            .get_raw(format!("witness:{}", record.witness_id))
+            .await
+            .unwrap()
+            .expect("record stored");
+        let text = String::from_utf8(raw).unwrap();
+        assert!(!text.contains(&private), "{text}");
+        assert!(
+            !text.contains(crate::witness_keys::LEGACY_KEY_MEMBER),
+            "{text}"
         );
     }
 }

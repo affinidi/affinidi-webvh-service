@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 use trust_tasks_rs::Payload;
 use webvh_witness::config::AppConfig;
 use webvh_witness::server::AppState;
-use webvh_witness::signing::LocalSigner;
+use webvh_witness::witness_keys::WitnessKeys;
 use webvh_witness::witness_ops;
 
 /// A fresh loopback address, distinct from every other call in this process.
@@ -111,7 +111,7 @@ async fn witness_state() -> (AppState, tempfile::TempDir) {
     let identity = ServiceIdentity::from_signing_secret(&my_did, my_key)
         .await
         .unwrap();
-    let mut state = AppState::new(store, config, Some(identity), Arc::new(LocalSigner)).unwrap();
+    let mut state = AppState::new(store, config, Some(identity), test_witness_keys(&dir)).unwrap();
     state.trust_tasks_verifier = Some(Arc::new(TransportBoundVerifier::with_resolver(Arc::new(
         DidKeyResolver,
     ))));
@@ -132,6 +132,11 @@ async fn witness_state() -> (AppState, tempfile::TempDir) {
         .unwrap();
     }
     (state, dir)
+}
+
+/// A witness key-encryption key for one test witness.
+fn test_witness_keys(_dir: &tempfile::TempDir) -> Arc<WitnessKeys> {
+    Arc::new(WitnessKeys::generate().expect("key-encryption key"))
 }
 
 /// How a test document is signed.
@@ -324,9 +329,10 @@ fn last_version_id(log: &str) -> String {
 
 /// A witness identity on `state`, and a log that names it.
 async fn identity_and_log(state: &AppState) -> (witness_ops::WitnessRecord, String) {
-    let record = witness_ops::create_witness(&state.witnesses_ks, Some("w".into()))
-        .await
-        .unwrap();
+    let record =
+        witness_ops::create_witness(&state.witnesses_ks, &state.witness_keys, Some("w".into()))
+            .await
+            .unwrap();
     let log = witnessed_log(&record.witness_id, false).await;
     (record, log)
 }
@@ -743,7 +749,7 @@ async fn sign_verifies_the_log_before_signing() {
 #[tokio::test]
 async fn sign_witnesses_the_deactivating_entry() {
     let (state, _dir) = witness_state().await;
-    let record = witness_ops::create_witness(&state.witnesses_ks, None)
+    let record = witness_ops::create_witness(&state.witnesses_ks, &state.witness_keys, None)
         .await
         .unwrap();
     let deactivated = witnessed_log(&record.witness_id, true).await;
@@ -882,7 +888,7 @@ async fn sign_ok(state: &AppState, witness_id: &str, log: &str) {
 #[tokio::test]
 async fn sign_refuses_a_fork_or_a_rollback_of_what_it_witnessed() {
     let (state, _dir) = witness_state().await;
-    let record = witness_ops::create_witness(&state.witnesses_ks, None)
+    let record = witness_ops::create_witness(&state.witnesses_ks, &state.witness_keys, None)
         .await
         .unwrap();
     let chain = witnessed_chain(&record.witness_id).await;

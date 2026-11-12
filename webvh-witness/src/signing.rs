@@ -1,11 +1,12 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
-use affinidi_tdk::secrets_resolver::secrets::Secret;
 use serde_json::json;
 
 use crate::error::AppError;
+use crate::witness_keys::WitnessKeys;
 use crate::witness_ops::WitnessRecord;
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -19,8 +20,18 @@ pub trait WitnessSigner: Send + Sync {
     ) -> BoxFuture<'a, Result<DataIntegrityProof, AppError>>;
 }
 
-/// Signs witness proofs locally using the stored Ed25519 private key.
-pub struct LocalSigner;
+/// Signs witness proofs locally: opens the identity's sealed key from its
+/// record with the witness key-encryption key ([`WitnessKeys`]), in memory.
+/// No secret-store read happens here.
+pub struct LocalSigner {
+    keys: Arc<WitnessKeys>,
+}
+
+impl LocalSigner {
+    pub fn new(keys: Arc<WitnessKeys>) -> Self {
+        Self { keys }
+    }
+}
 
 impl WitnessSigner for LocalSigner {
     fn sign_proof<'a>(
@@ -29,14 +40,20 @@ impl WitnessSigner for LocalSigner {
         version_id: &'a str,
     ) -> BoxFuture<'a, Result<DataIntegrityProof, AppError>> {
         Box::pin(async move {
-            // Reconstruct the Secret from stored multibase private key.
-            // The KID must be the full verification method DID URL:
-            //   did:key:z6Mk...#z6Mk...
-            let kid = format!("{}#{}", witness.did, witness.witness_id);
-            let secret = Secret::from_multibase(&witness.private_key_multibase, Some(&kid))
-                .map_err(|e| {
-                    AppError::Internal(format!("failed to reconstruct signing key: {e}"))
-                })?;
+            if witness.sealed_private_key.is_empty() {
+                return Err(AppError::Internal(format!(
+                    "witness {} has no sealed signing key",
+                    witness.witness_id
+                )));
+            }
+            // The KID is the full verification method DID URL
+            // (did:key:z6Mk...#z6Mk...), and the key must be the one the
+            // identity's id names.
+            let secret = self.keys.open(
+                &witness.did,
+                &witness.witness_id,
+                &witness.sealed_private_key,
+            )?;
 
             // Sign the canonical {"versionId": "..."} document via the
             // 0.6 API (async, Signer-based, SignOptions for cryptosuite/
@@ -59,19 +76,20 @@ mod tests {
     use super::*;
     use affinidi_tdk::secrets_resolver::secrets::Secret;
 
-    fn make_witness() -> WitnessRecord {
-        // Generate a real Ed25519 secret so the data-integrity sign step can
-        // produce a verifiable proof. Pass the secret through multibase to
-        // exercise `Secret::from_multibase` exactly the way the production
-        // path does.
+    fn make_witness(keys: &WitnessKeys) -> WitnessRecord {
         let secret = Secret::generate_ed25519(None, None);
-        let private_key_multibase = secret.get_private_keymultibase().unwrap();
         let public_key_multibase = secret.get_public_keymultibase().unwrap();
+        let sealed_private_key = keys
+            .seal(
+                &public_key_multibase,
+                &secret.get_private_keymultibase().unwrap(),
+            )
+            .unwrap();
         WitnessRecord {
             witness_id: public_key_multibase.clone(),
             did: format!("did:key:{public_key_multibase}"),
             vta_key_id: None,
-            private_key_multibase,
+            sealed_private_key,
             public_key_multibase,
             label: Some("test-witness".into()),
             created_at: 0,
@@ -79,10 +97,15 @@ mod tests {
         }
     }
 
+    fn signer() -> (LocalSigner, Arc<WitnessKeys>) {
+        let keys = Arc::new(WitnessKeys::generate().unwrap());
+        (LocalSigner::new(keys.clone()), keys)
+    }
+
     #[tokio::test]
     async fn local_signer_produces_signed_proof() {
-        let signer = LocalSigner;
-        let witness = make_witness();
+        let (signer, keys) = signer();
+        let witness = make_witness(&keys);
         let proof = signer
             .sign_proof(&witness, "1-test-version")
             .await
@@ -101,8 +124,8 @@ mod tests {
         // Different version_ids must yield different signatures — same secret,
         // different message. Catches a regression where the canonical input is
         // accidentally constant.
-        let signer = LocalSigner;
-        let witness = make_witness();
+        let (signer, keys) = signer();
+        let witness = make_witness(&keys);
         let proof_a = signer.sign_proof(&witness, "1-aaa").await.unwrap();
         let proof_b = signer.sign_proof(&witness, "2-bbb").await.unwrap();
         let json_a = serde_json::to_value(&proof_a).unwrap();
@@ -111,14 +134,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_signer_rejects_witness_with_bad_private_key() {
-        let signer = LocalSigner;
-        let mut witness = make_witness();
-        witness.private_key_multibase = "z6MkBOGUS".into();
-        let err = signer
-            .sign_proof(&witness, "1-version")
-            .await
-            .expect_err("invalid multibase key must error");
-        assert!(matches!(err, AppError::Internal(_)));
+    async fn local_signer_refuses_a_witness_it_cannot_open() {
+        let (signer, keys) = signer();
+        let mut witness = make_witness(&keys);
+        witness.sealed_private_key = String::new();
+        assert!(matches!(
+            signer.sign_proof(&witness, "1-version").await,
+            Err(AppError::Internal(_))
+        ));
+        // Sealed to another key-encryption key.
+        let witness = make_witness(&WitnessKeys::generate().unwrap());
+        assert!(matches!(
+            signer.sign_proof(&witness, "1-version").await,
+            Err(AppError::Internal(_))
+        ));
+        let mut witness = make_witness(&keys);
+        witness.sealed_private_key = "z6MkBOGUS".into();
+        assert!(matches!(
+            signer.sign_proof(&witness, "1-version").await,
+            Err(AppError::Internal(_))
+        ));
     }
 }

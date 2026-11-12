@@ -401,7 +401,10 @@ impl Topology {
             witness_store,
             witness_config,
             Some(witness_identity),
-            Arc::new(webvh_witness::signing::LocalSigner),
+            Arc::new(
+                webvh_witness::witness_keys::WitnessKeys::generate()
+                    .expect("witness key-encryption key"),
+            ),
         )
         .expect("witness state");
         witness.trust_tasks_verifier = Some(Arc::new(TransportBoundVerifier::with_did_cache(

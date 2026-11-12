@@ -367,6 +367,7 @@ fn stored_secrets_debug_redacts_the_seed() {
     let env = StoredSecrets {
         secrets: Some(sample()),
         bootstrap_seed: Some(StoredSecrets::encode_seed(&[9u8; 32])),
+        other: Default::default(),
     };
     let dbg = format!("{env:?}");
     assert!(!dbg.contains("z6Mksigning_test"), "{dbg}");
@@ -415,9 +416,27 @@ async fn keyring_round_trip_when_backend_available() {
     assert_eq!(store.get_bootstrap_seed().await.unwrap(), Some([7u8; 32]));
     store.clear_bootstrap_seed().await.unwrap();
 
-    // Leave the operator's keyring tidy.
+    // The witness key-encryption key: its own account under the same
+    // service, untouched by the envelope's writes.
+    let kek_store = create_witness_kek_store(&secrets, &dir.path().join("config.toml")).unwrap();
+    let kek = affinidi_secrets_resolver::secrets::Secret::generate_x25519(None, None).unwrap();
+    let kek_result = kek_store.set(&kek).await;
+    let kek_read = kek_store.get().await;
+    store.set(&sample()).await.unwrap();
+    let kek_after = kek_store.get().await;
+
+    // Leave the operator's keyring tidy, whatever the assertions below say.
     let entry = keyring_core::Entry::new(&secrets.keyring_service, KEYRING_USER).unwrap();
     let _ = entry.delete_credential();
+    let kek_entry =
+        keyring_core::Entry::new(&secrets.keyring_service, witness_kek::KEYRING_USER).unwrap();
+    let _ = kek_entry.delete_credential();
+
+    kek_result.expect("set the witness key-encryption key");
+    for read in [kek_read, kek_after] {
+        let read = read.expect("read it").expect("held");
+        assert_eq!(read.get_public_bytes(), kek.get_public_bytes());
+    }
 }
 
 #[test]
@@ -428,4 +447,41 @@ fn the_plaintext_warning_is_logged_once_per_file() {
     assert!(first_plaintext_open(&a));
     assert!(!first_plaintext_open(&a));
     assert!(first_plaintext_open(&b));
+}
+
+/// A member written by a newer release survives this release's writes of the
+/// envelope (a rotation, an expiry sweep, the bootstrap seed).
+#[tokio::test]
+async fn members_this_release_does_not_know_survive_its_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("n.toml");
+    // The plaintext backend stores the envelope hex-encoded.
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    std::fs::write(
+        plaintext_path(&config),
+        hex(br#"{"bootstrap_seed":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","from_a_newer_release":{"k":"secret-value"}}"#),
+    )
+    .unwrap();
+    let store = create_secret_store(&plaintext_config(), &config).unwrap();
+    store.set(&sample()).await.unwrap();
+    store.clear_bootstrap_seed().await.unwrap();
+    store.set_bootstrap_seed(&[1u8; 32]).await.unwrap();
+
+    let stored = std::fs::read_to_string(plaintext_path(&config)).unwrap();
+    let stored = stored.trim();
+    let raw = String::from_utf8(
+        (0..stored.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&stored[i..i + 2], 16).unwrap())
+            .collect(),
+    )
+    .unwrap();
+    let env: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(env["from_a_newer_release"]["k"], "secret-value", "{raw}");
+    assert!(env["secrets"].is_object(), "{raw}");
+
+    let parsed = StoredSecrets::from_bytes(raw.as_bytes()).unwrap();
+    let dbg = format!("{parsed:?}");
+    assert!(dbg.contains("from_a_newer_release"), "{dbg}");
+    assert!(!dbg.contains("secret-value"), "{dbg}");
 }

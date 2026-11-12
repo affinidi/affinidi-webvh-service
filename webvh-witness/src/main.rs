@@ -88,6 +88,9 @@ enum Command {
         #[arg(long)]
         id: String,
     },
+    /// Clear a key-encryption-key creation claim left by a witness process
+    /// that stopped while creating it. Refused once a key is recorded.
+    ResetWitnessKekClaim,
     /// Step 1/2 of the offline (air-gapped VTA) setup wizard.
     ///
     /// Runs the interactive prompts, writes the bootstrap-request.json +
@@ -310,6 +313,12 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Command::ResetWitnessKekClaim) => {
+            if let Err(e) = run_reset_witness_kek_claim(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
         Some(Command::SetupOfflinePrepare { request, state }) => {
             if let Err(e) = setup::run_setup_offline_prepare(cli.config, request, state).await {
                 eprintln!("Setup error: {e}");
@@ -446,7 +455,14 @@ async fn run_create_witness(
     let store = store::Store::open(&config.store).await?;
     let witnesses_ks = store.keyspace(KS_WITNESSES)?;
 
-    let record = witness_ops::create_witness(&witnesses_ks, label).await?;
+    // The private key is stored sealed to the witness key-encryption key,
+    // which the configured secret store holds (created here on first use).
+    let keys = webvh_witness::witness_keys::load_or_create(
+        &secret_store::create_witness_kek_store(&config.secrets, &config.config_path)?,
+        &witnesses_ks,
+    )
+    .await?;
+    let record = witness_ops::create_witness(&witnesses_ks, &keys, label).await?;
 
     eprintln!();
     eprintln!("  Witness created!");
@@ -521,6 +537,24 @@ async fn run_delete_witness(
     eprintln!("  Witness deleted: {witness_id}");
     eprintln!();
 
+    Ok(())
+}
+
+async fn run_reset_witness_kek_claim(
+    config_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    let store = store::Store::open(&config.store).await?;
+    let witnesses_ks = store.keyspace(KS_WITNESSES)?;
+    let kek_store = secret_store::create_witness_kek_store(&config.secrets, &config.config_path)?;
+    let had = webvh_witness::witness_keys::reset_kek_claim(&kek_store, &witnesses_ks).await?;
+    eprintln!();
+    if had {
+        eprintln!("  Key-encryption-key creation claim cleared; start the witness again.");
+    } else {
+        eprintln!("  No key-encryption-key creation claim was held.");
+    }
+    eprintln!();
     Ok(())
 }
 

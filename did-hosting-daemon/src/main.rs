@@ -133,6 +133,10 @@ enum Command {
     },
     /// List all ACL entries
     ListAcl,
+    /// Clear the embedded witness's key-encryption-key creation claim left
+    /// by a start that stopped while creating the key (`[witness_store]`).
+    /// Refused once a key is held or recorded.
+    ResetWitnessKekClaim,
     /// Show a DID's statistics resolution, recorded tier and totals
     /// (offline; stop the service first).
     StatsShow {
@@ -589,6 +593,12 @@ async fn main() {
         }
         Some(Command::IdentityRetireNow { generation }) => {
             if let Err(e) = run_identity_retire_now(cli.config, generation).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::ResetWitnessKekClaim) => {
+            if let Err(e) = run_reset_witness_kek_claim(cli.config).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1593,18 +1603,33 @@ async fn build_witness(
     rate_limit_gc: &CancellationToken,
 ) -> ServiceResult {
     use webvh_witness::server::AppState;
-    use webvh_witness::signing::LocalSigner;
+    use webvh_witness::witness_keys;
 
     // The daemon's embedded witness runs no messaging listener of its own —
     // the control plane's carries the mediator connection — so its Trust Task
     // listener is the HTTPS binding, `POST /witness/api/trust-tasks`, under the
     // daemon's DID. Its `didcomm_service` slot stays empty, which is what makes
     // the witness's rotation path an inert no-op here.
+    // Witness signing keys are sealed to a key-encryption key held in the
+    // daemon's secret store, in an entry of its own. Load it (creating it on a
+    // first start) and seal any key a record from an earlier release holds in
+    // clear before the witness serves anything, as the standalone witness does.
+    let witness_keys = Arc::new(
+        witness_keys::prepare(
+            store,
+            &store.keyspace(did_hosting_common::server::store::KS_WITNESSES)?,
+            &did_hosting_common::server::secret_store::create_witness_kek_store(
+                &config.secrets,
+                &config.config_path,
+            )?,
+        )
+        .await?,
+    );
     let mut state = AppState::new(
         store.clone(),
         config.witness_config(),
         identity,
-        Arc::new(LocalSigner),
+        witness_keys,
     )?;
     state.client_ips = client_ips.clone();
     state
@@ -1903,6 +1928,28 @@ async fn run_add_acl(
         None,
     )
     .await
+}
+
+async fn run_reset_witness_kek_claim(
+    config_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = DaemonConfig::load(config_path)?;
+    let store = Store::open(&config.witness_store).await?;
+    let witnesses_ks = store.keyspace(did_hosting_common::server::store::KS_WITNESSES)?;
+    let kek_store = did_hosting_common::server::secret_store::create_witness_kek_store(
+        &config.secrets,
+        &config.config_path,
+    )?;
+    let had = webvh_witness::witness_keys::reset_kek_claim(&kek_store, &witnesses_ks).await?;
+    store.persist().await?;
+    eprintln!();
+    if had {
+        eprintln!("  Key-encryption-key creation claim cleared; start the daemon again.");
+    } else {
+        eprintln!("  No key-encryption-key creation claim was held.");
+    }
+    eprintln!();
+    Ok(())
 }
 
 async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {

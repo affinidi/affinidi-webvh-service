@@ -386,9 +386,13 @@ fn witness_key(record: &WitnessRecord) -> Value {
 /// `webvh/witness/key/create/0.1`.
 async fn key_create_task(state: &AppState, doc: &TrustTask<Value>) -> Result<Value, ErrorPayload> {
     let p: key_create::Payload = payload(doc)?;
-    let record = witness_ops::create_witness(&state.witnesses_ks, p.label.map(|l| l.to_string()))
-        .await
-        .map_err(store_failure)?;
+    let record = witness_ops::create_witness(
+        &state.witnesses_ks,
+        &state.witness_keys,
+        p.label.map(|l| l.to_string()),
+    )
+    .await
+    .map_err(store_failure)?;
     info!(audit = true, witness_id = %record.witness_id, did = %record.did, "witness identity created");
     reply::<key_create::Response>(json!({ "key": witness_key(&record) }))
 }
