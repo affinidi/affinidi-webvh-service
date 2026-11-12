@@ -1023,6 +1023,7 @@ async fn an_unverified_document_gets_no_reply() {
             forged
         )
         .await
+        .into_reply()
         .is_none(),
         "a forged op is dropped silently"
     );
@@ -1039,6 +1040,7 @@ async fn an_unverified_document_gets_no_reply() {
     assert!(
         did_hosting_server::messaging::dispatch_inbound_document(&state, Some(&attacker.0), ping)
             .await
+            .into_reply()
             .is_none(),
         "a stranger's ping is not answered"
     );
@@ -1059,6 +1061,7 @@ async fn an_unverified_document_gets_no_reply() {
         genuine,
     )
     .await
+    .into_reply()
     .expect("the control plane's op is answered");
     assert_eq!(reply["type"], MSG_SYNC_UPDATE_ACK);
     assert!(reply.get("proof").is_some(), "{reply}");

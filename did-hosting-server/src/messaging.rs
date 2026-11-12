@@ -21,7 +21,12 @@
 //! - it is fresh (`issuedAt`) and not a replay of a document already applied.
 //!
 //! A document that does not verify gets **no reply at all**: a signed refusal
-//! would settle a directive the control plane never sent.
+//! would settle a directive the control plane never sent, and an unsigned one
+//! is an answer too. A document that could not be checked *just now* (its
+//! signer's DID could not be resolved, the replay cache is full) is
+//! [`Inbound::Deferred`]: still unanswered over DIDComm and TSP, where the
+//! control plane re-sends what it is not answered, and `503` with
+//! `Retry-After` and no body on the HTTPS binding.
 //!
 //! ## The claimed issuer is checked before its DID is ever resolved
 //!
@@ -130,17 +135,52 @@ pub enum Refusal {
         /// The proven issuer.
         issuer: String,
     },
+    /// The document could not be checked just now — its signer's DID could
+    /// not be resolved, or the replay cache is full — and may verify when
+    /// sent again. It gets no reply either; the HTTPS binding says it is
+    /// worth re-sending ([`Inbound::Deferred`]).
+    Deferred(trust_tasks_rs::RejectReason),
+}
+
+/// The `Retry-After` a deferred document is given when its refusal names no
+/// time of its own (an unresolvable signer DID).
+pub const DEFERRED_RETRY_AFTER_SECS: u64 = 30;
+
+/// A document that could not be checked just now: send it again after
+/// `retry_after_secs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Deferred {
+    /// Seconds to wait before re-sending, at least 1.
+    pub retry_after_secs: u64,
 }
 
 impl Refusal {
     /// The framework rejection this refusal is logged (or answered) as.
     pub fn reject_reason(&self) -> trust_tasks_rs::RejectReason {
         match self {
-            Refusal::Unverified(reason) => reason.clone(),
+            Refusal::Unverified(reason) | Refusal::Deferred(reason) => reason.clone(),
             Refusal::NotAuthorized { issuer } => trust_tasks_rs::RejectReason::PermissionDenied {
                 reason: format!("{issuer} is not this server's control plane"),
             },
         }
+    }
+
+    /// When the document is worth sending again: `Some` for
+    /// [`Refusal::Deferred`] only.
+    pub fn deferred(&self) -> Option<Deferred> {
+        let Refusal::Deferred(reason) = self else {
+            return None;
+        };
+        let retry_after_secs = match reason {
+            trust_tasks_rs::RejectReason::Unavailable {
+                retry_after: Some(at),
+            } => {
+                let millis = (*at - chrono::Utc::now()).num_milliseconds().max(0) as u64;
+                millis.div_ceil(1000).max(1)
+            }
+            _ => DEFERRED_RETRY_AFTER_SECS,
+        };
+        Some(Deferred { retry_after_secs })
     }
 }
 
@@ -209,7 +249,11 @@ where
                     "control-plane document rejected: it does not verify"
                 );
             }
-            Refusal::Unverified(e.reject_reason())
+            if e.is_transient() {
+                Refusal::Deferred(e.reject_reason())
+            } else {
+                Refusal::Unverified(e.reject_reason())
+            }
         })?;
     // Defense in depth: the pre-check above already refused any document
     // whose claimed issuer isn't `control_did`, and `verify_sender_bound`
@@ -233,7 +277,8 @@ where
                 warn!(did, doc_id = %doc.id, "control-plane document rejected: replay")
             }
             ReplayError::Full => {
-                warn!(did, doc_id = %doc.id, "control-plane document deferred: replay cache full")
+                warn!(did, doc_id = %doc.id, "control-plane document deferred: replay cache full");
+                return Err(Refusal::Deferred(e.reject_reason()));
             }
             ReplayError::Stale => {
                 warn!(did, doc_id = %doc.id, "control-plane document rejected: outside the replay window")
@@ -260,13 +305,19 @@ pub enum ControlPlaneReply {
     /// plane, or answer a stranger. The error document is kept for logs and
     /// tests only.
     Unverified(trust_tasks_rs::TrustTask<Value>),
+    /// The document could not be checked just now ([`Refusal::Deferred`]).
+    /// Nothing is sent back either; the error document is kept for logs and
+    /// tests only.
+    Deferred(trust_tasks_rs::TrustTask<Value>, Deferred),
 }
 
 impl ControlPlaneReply {
     /// The reply document, whichever kind it is.
     pub fn into_document(self) -> trust_tasks_rs::TrustTask<Value> {
         match self {
-            ControlPlaneReply::Reply(d) | ControlPlaneReply::Unverified(d) => d,
+            ControlPlaneReply::Reply(d)
+            | ControlPlaneReply::Unverified(d)
+            | ControlPlaneReply::Deferred(d, _) => d,
         }
     }
 }
@@ -370,9 +421,11 @@ pub async fn dispatch_control_plane_op(
             )));
         }
         Err(refusal) => {
-            return Some(ControlPlaneReply::Unverified(error_value(
-                doc.reject_with(reply_id, refusal.reject_reason()),
-            )));
+            let error = error_value(doc.reject_with(reply_id, refusal.reject_reason()));
+            return Some(match refusal.deferred() {
+                Some(deferred) => ControlPlaneReply::Deferred(error, deferred),
+                None => ControlPlaneReply::Unverified(error),
+            });
         }
     };
 
@@ -538,42 +591,84 @@ pub async fn run_trust_tasks_envelope(
             return None;
         }
     };
-    let reply = dispatch_inbound_document(state, sender, doc).await?;
+    // Over DIDComm a deferred document is left unanswered too: the control
+    // plane re-sends what it is not answered.
+    let reply = dispatch_inbound_document(state, sender, doc)
+        .await
+        .into_reply()?;
     Some((trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), reply))
 }
 
-/// Route an inbound Trust Task document — from either transport — to the
-/// control-plane operations or the infrastructure ops, returning the sealed
-/// reply, if any.
+/// What the edge does with one inbound Trust Task document, whichever
+/// transport carried it.
+#[derive(Debug)]
+pub enum Inbound {
+    /// Send back this signed reply.
+    Reply(Value),
+    /// Send nothing back: the document failed [`verify_control_plane`], is
+    /// of a type that takes no answer, or the reply could not be signed.
+    /// The HTTPS binding answers a bare `403`, with no document.
+    NoReply,
+    /// The document could not be checked just now ([`Refusal::Deferred`]).
+    /// Nothing is sent back over DIDComm or TSP; the HTTPS binding answers
+    /// `503` with `Retry-After` and no document.
+    Deferred(Deferred),
+}
+
+impl Inbound {
+    /// The reply to send back, if any.
+    pub fn into_reply(self) -> Option<Value> {
+        match self {
+            Inbound::Reply(reply) => Some(reply),
+            Inbound::NoReply | Inbound::Deferred(_) => None,
+        }
+    }
+}
+
+impl From<Option<Value>> for Inbound {
+    fn from(reply: Option<Value>) -> Self {
+        reply.map_or(Inbound::NoReply, Inbound::Reply)
+    }
+}
+
+/// Route an inbound Trust Task document — from any transport — to the
+/// control-plane operations or the infrastructure ops, and say what to send
+/// back.
 pub async fn dispatch_inbound_document(
     state: &AppState,
     sender: Option<&str>,
     doc: trust_tasks_rs::TrustTask<Value>,
-) -> Option<Value> {
+) -> Inbound {
     // A reply to a request this edge sent (its reconcile listing) goes to the
     // task awaiting it, which verifies it; it is never dispatched as a request.
-    let doc = crate::replication::deliver_reply(doc)?;
+    let Some(doc) = crate::replication::deliver_reply(doc) else {
+        return Inbound::NoReply;
+    };
     let type_uri = doc.type_uri.to_string();
     if CONTROL_PLANE_OPS.contains(&type_uri.as_str()) {
         let Some(verifier) = state_verifier(state) else {
             warn!(%type_uri, "control-plane document refused: no DID resolver configured to verify it");
-            return None;
+            return Inbound::NoReply;
         };
-        return match dispatch_control_plane_op(state, sender, doc, &verifier).await? {
-            ControlPlaneReply::Reply(reply) => seal_reply(state, reply).await,
-            ControlPlaneReply::Unverified(_) => None,
+        return match dispatch_control_plane_op(state, sender, doc, &verifier).await {
+            Some(ControlPlaneReply::Reply(reply)) => seal_reply(state, reply).await.into(),
+            Some(ControlPlaneReply::Unverified(_)) | None => Inbound::NoReply,
+            Some(ControlPlaneReply::Deferred(_, deferred)) => Inbound::Deferred(deferred),
         };
     }
     if crate::trust_tasks_infra::owns(&type_uri) {
-        let reply = crate::trust_tasks_infra::dispatch(state, sender, doc).await?;
-        return seal_reply(state, reply).await;
+        return match crate::trust_tasks_infra::dispatch(state, sender, doc).await {
+            Ok(Some(reply)) => seal_reply(state, reply).await.into(),
+            Ok(None) => Inbound::NoReply,
+            Err(deferred) => Inbound::Deferred(deferred),
+        };
     }
     warn!(
         sender,
         %type_uri,
         "trust task of a type this server does not implement"
     );
-    None
+    Inbound::NoReply
 }
 
 async fn handle_fallback(

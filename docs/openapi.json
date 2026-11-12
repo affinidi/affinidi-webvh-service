@@ -68,7 +68,7 @@
           "trust-tasks"
         ],
         "summary": "Hand the posted document to the edge's one inbound dispatch and answer with\nits signed reply.",
-        "description": "A document that does not verify gets no signed answer — a signed refusal\nwould settle a directive the control plane never sent — so it is answered\n`403` with an unsigned, detail-free error document, which settles nothing.",
+        "description": "A document that fails `verify_control_plane` gets no answer, signed or\nunsigned: a signed refusal would settle a directive the control plane never\nsent, and an error document is an answer too. It is refused with a bare\n`403` and an empty body, as is a document that takes no reply. One that\ncould not be checked just now (its signer's DID could not be resolved, the\nreplay cache is full) is answered `503` with `Retry-After` and an empty\nbody, so the sender keeps it and sends it again.",
         "operationId": "receive",
         "requestBody": {
           "description": "A signed Trust Task document",
@@ -95,16 +95,16 @@
             }
           },
           "403": {
-            "description": "The document was not accepted; an unsigned refusal",
-            "content": {
-              "application/json": {}
-            }
+            "description": "The document was not accepted, or takes no reply; empty body"
           },
           "429": {
             "description": "This address's request rate exceeds the limit",
             "content": {
               "application/json": {}
             }
+          },
+          "503": {
+            "description": "The document could not be checked just now; send it again after `Retry-After`. Empty body"
           }
         }
       }

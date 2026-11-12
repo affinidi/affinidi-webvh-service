@@ -33,7 +33,9 @@ pub fn owns(type_uri: &str) -> bool {
 }
 
 /// Handle an infrastructure trust task, returning the (unsigned) reply document,
-/// or `None` when the op is terminal (an ack is an answer, not a question).
+/// `None` when the op is terminal (an ack is an answer, not a question), or
+/// the [`crate::messaging::Deferred`] of a ping that could not be checked just
+/// now.
 ///
 /// A health ping is answered only when the control plane signed it (see
 /// [`crate::messaging::verify_control_plane`]); any other ping gets no reply
@@ -45,30 +47,40 @@ pub async fn dispatch(
     state: &AppState,
     sender: Option<&str>,
     doc: trust_tasks_rs::TrustTask<Value>,
-) -> Option<trust_tasks_rs::TrustTask<Value>> {
+) -> Result<Option<trust_tasks_rs::TrustTask<Value>>, crate::messaging::Deferred> {
     match doc.type_uri.to_string().as_str() {
         MSG_HEALTH_PING => {
-            let verifier = crate::messaging::state_verifier(state)?;
+            let Some(verifier) = crate::messaging::state_verifier(state) else {
+                return Ok(None);
+            };
             // A ping that is not the control plane's gets no answer — not even
             // a (signed) refusal, which would make this server answer
-            // strangers. `verify_control_plane` has logged why.
-            crate::messaging::verify_control_plane(state, sender, &doc, &verifier)
-                .await
-                .ok()?;
+            // strangers. `verify_control_plane` has logged why. One that could
+            // not be checked just now is reported as worth re-sending.
+            if let Err(refusal) =
+                crate::messaging::verify_control_plane(state, sender, &doc, &verifier).await
+            {
+                return match refusal.deferred() {
+                    Some(deferred) => Err(deferred),
+                    None => Ok(None),
+                };
+            }
             let pong = do_health_ping(state).await;
             debug!(sender, "health ping answered (trust task)");
-            Some(doc.respond_with(uuid::Uuid::new_v4().to_string(), pong))
+            Ok(Some(
+                doc.respond_with(uuid::Uuid::new_v4().to_string(), pong),
+            ))
         }
         MSG_SERVER_REGISTER_ACK => {
             do_register_ack(&doc.payload);
-            None
+            Ok(None)
         }
         // Advisory: stats are fire-and-forget. Owned so the ack isn't warned
         // about as an unimplemented type on every sync tick.
-        MSG_STATS_ACK => None,
+        MSG_STATS_ACK => Ok(None),
         other => {
             warn!(type_uri = other, "trust_tasks_infra: unowned type URI");
-            None
+            Ok(None)
         }
     }
 }
