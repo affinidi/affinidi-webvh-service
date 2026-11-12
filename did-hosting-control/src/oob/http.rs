@@ -127,6 +127,19 @@ impl OobRuntime {
         }
     }
 
+    /// The same limits, with each address's [`OTHER_MAX_PER_MINUTE`] other
+    /// documents counted over `window_secs` rather than a minute. The limit
+    /// is a token bucket that gives an address a document back every
+    /// `window / OTHER_MAX_PER_MINUTE` (half a second by default), so a test
+    /// that spends the whole limit through the full request path would
+    /// otherwise see a document returned whenever it runs slower than that.
+    #[cfg(test)]
+    pub(crate) fn with_other_window(mut self, window_secs: u64) -> Self {
+        self.other_limiter =
+            IpRateLimiter::new("auth-oob-per-ip", OTHER_MAX_PER_MINUTE, window_secs);
+        self
+    }
+
     /// Sweep idle clients out of the sign-in limiters' memory until
     /// `shutdown` fires.
     pub fn spawn_rate_limit_gc(&self, shutdown: &CancellationToken) {

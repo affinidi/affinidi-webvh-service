@@ -3451,10 +3451,16 @@ async fn bound_key_rows_do_not_touch_the_shared_replay_cache() {
 /// A bound-key row's admission runs before the gate does any proof work: past
 /// its per-address limit, a document is refused as rate limited whether or
 /// not its proof would verify.
+///
+/// The limit is counted over a day here rather than a minute: at the default
+/// an address gets a document back every half second, and these requests can
+/// take longer than that on a loaded machine, which would admit the one past
+/// the limit. A day returns one every 12 minutes.
 #[tokio::test]
 async fn bound_key_admission_runs_before_the_proof_check() {
     use crate::oob::http::OTHER_MAX_PER_MINUTE;
-    let (state, _dir) = state().await;
+    let (mut state, _dir) = state().await;
+    state.oob = std::sync::Arc::new(crate::oob::OobRuntime::default().with_other_window(86_400));
     let starter = stranger(67);
     for n in 0..OTHER_MAX_PER_MINUTE {
         let mut doc = redeem_doc(&starter, NO_SUCH_REQUEST, "authentication").await;
