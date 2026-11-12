@@ -321,6 +321,46 @@ const MANDATE_EVIDENCE_KIND: &str = "mandateCredential";
 const MANDATE_EVIDENCE_TYPE_URI: &str =
     "https://trusttasks.org/spec/local/did-hosting-auth-mandate/0.1";
 
+/// The longest a `mandateCredential` may be valid for, `issuedAt` to
+/// `expiresAt`: the default absolute session lifetime. A mandate is a
+/// standing grant to log in as its principal, so it must name its own end.
+pub(crate) const MAX_MANDATE_LIFETIME_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// How far ahead of this service's clock a mandate's `issuedAt` may be.
+const MANDATE_CLOCK_SKEW_SECS: i64 = 60;
+
+/// Check a mandate's validity window at `now` and return its `expiresAt` in
+/// epoch seconds. Both `issuedAt` and `expiresAt` are required; `issuedAt`
+/// may not be in the future (beyond a small skew), `expiresAt` must follow
+/// it and be in the future, and the window may not exceed
+/// [`MAX_MANDATE_LIFETIME_SECS`].
+fn mandate_validity(
+    mandate: &TrustTask<Value>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<u64, String> {
+    let issued_at = mandate
+        .issued_at
+        .ok_or_else(|| "credential has no issuedAt".to_string())?;
+    let expires_at = mandate
+        .expires_at
+        .ok_or_else(|| "credential has no expiresAt".to_string())?;
+    if issued_at > now + chrono::Duration::seconds(MANDATE_CLOCK_SKEW_SECS) {
+        return Err("credential issuedAt is in the future".into());
+    }
+    if expires_at <= issued_at {
+        return Err("credential expiresAt is not after its issuedAt".into());
+    }
+    if (expires_at - issued_at).num_seconds() > MAX_MANDATE_LIFETIME_SECS {
+        return Err(format!(
+            "credential is valid for longer than {MAX_MANDATE_LIFETIME_SECS} seconds"
+        ));
+    }
+    if expires_at <= now {
+        return Err("credential has expired".into());
+    }
+    u64::try_from(expires_at.timestamp()).map_err(|_| "credential expiresAt is out of range".into())
+}
+
 /// `payload.delegate` on a `mandateCredential`: the delegate the principal is
 /// entitling, which MUST equal the authenticate document's own signer.
 #[derive(serde::Deserialize)]
@@ -362,8 +402,13 @@ struct SiopIdTokenCredential {
 ///   `proofPurpose: assertionMethod` — an attestation, over the principal's
 ///   *own* key, never a session-key delegation — that
 ///   [`AppState::trust_tasks_verifier`] resolves through the principal's own
-///   DID document and verifies. A standing grant: usable for any login until
-///   the mandate's own `expiresAt`.
+///   DID document and verifies as a decision
+///   (`TransportBoundVerifier::verify_approval`: the key under the
+///   principal's `assertionMethod`, and a principal that has not deactivated
+///   its DID). A standing grant, but a bounded one: `issuedAt` and
+///   `expiresAt` are required, the mandate may be valid for at most
+///   [`MAX_MANDATE_LIFETIME_SECS`], and a session it backs ends no later than
+///   its `expiresAt`.
 /// - **`siopIdToken`** — `credential.idToken`, the compact SIOPv2 `id_token`
 ///   `vault/proxy-login`'s custodial signing already produces: `iss`/`sub`
 ///   MUST be the principal, `aud` MUST be this service, and — the freshness
@@ -380,6 +425,9 @@ struct SiopIdTokenCredential {
 /// principal themselves said, in a signature only they could produce, that
 /// this delegate may act for them at this service.
 ///
+/// Returns, on success, the instant (epoch seconds) after which the evidence
+/// no longer entitles the delegate — a mandate's `expiresAt` — so the session
+/// it backs ends no later; `None` for evidence bound to this login alone.
 /// Returns the refusal reason (operator-log detail only; the wire refusal is
 /// the same opaque `delegationNotRecognized` for every cause) on failure.
 ///
@@ -393,7 +441,7 @@ async fn verify_delegation_evidence(
     delegate: &str,
     challenge: &str,
     evidence: &authenticate::PayloadDelegationEvidence,
-) -> Result<(), String> {
+) -> Result<Option<u64>, String> {
     match evidence.kind.as_str() {
         MANDATE_EVIDENCE_KIND => {
             if evidence.credential.is_empty() {
@@ -417,11 +465,7 @@ async fn verify_delegation_evidence(
             if mandate.recipient.as_deref() != state.config.server_did.as_deref() {
                 return Err("credential.recipient does not name this service".into());
             }
-            if let Some(expires_at) = mandate.expires_at
-                && expires_at < chrono::Utc::now()
-            {
-                return Err("credential has expired".into());
-            }
+            let expires_at = mandate_validity(&mandate, chrono::Utc::now())?;
             let mandate_payload: MandatePayload =
                 serde_json::from_value(mandate.payload.clone())
                     .map_err(|e| format!("credential.payload does not name a delegate: {e}"))?;
@@ -435,11 +479,18 @@ async fn verify_delegation_evidence(
                 .trust_tasks_verifier
                 .as_ref()
                 .ok_or_else(|| "no proof verifier configured".to_string())?;
-            tokio::time::timeout(state.unlisted_signers.timeout(), verifier.verify(&mandate))
-                .await
-                .map_err(|_| "credential proof verification timed out".to_string())?
-                .map_err(|e| format!("credential proof failed verification: {e}"))?;
-            Ok(())
+            // A mandate is the principal's decision, so it is held to the
+            // rules every decision is: an `assertionMethod` key of the
+            // principal's own, never a session delegate, and a signer that has
+            // not deactivated its DID.
+            tokio::time::timeout(
+                state.unlisted_signers.timeout(),
+                verifier.verify_approval(&mandate),
+            )
+            .await
+            .map_err(|_| "credential proof verification timed out".to_string())?
+            .map_err(|e| format!("credential proof failed verification: {e}"))?;
+            Ok(Some(expires_at))
         }
         SIOP_ID_TOKEN_EVIDENCE_KIND => {
             if evidence.credential.is_empty() {
@@ -497,7 +548,7 @@ async fn verify_delegation_evidence(
             if verified.issued_at > verified.expires_at {
                 return Err("id_token iat is after exp".into());
             }
-            Ok(())
+            Ok(None)
         }
         other => Err(format!("unrecognized delegationEvidence.kind {other:?}")),
     }
@@ -674,6 +725,8 @@ async fn authenticate_v3_arm(
         signer_did.clone()
     };
 
+    // When the evidence that let the delegate in stops entitling it.
+    let mut evidence_ends_at = None;
     if proxied {
         let Some(evidence) = doc.payload.delegation_evidence.as_ref() else {
             return Err(doc.reject_with(
@@ -693,7 +746,7 @@ async fn authenticate_v3_arm(
                 format!("proxied principal {acting_party} has no ACL entry"),
             ));
         }
-        if let Err(reason) = verify_delegation_evidence(
+        match verify_delegation_evidence(
             state,
             &acting_party,
             &signer_did,
@@ -702,17 +755,20 @@ async fn authenticate_v3_arm(
         )
         .await
         {
-            warn!(
-                principal = %acting_party,
-                delegate = %signer_did,
-                reason = %reason,
-                "proxied authenticate refused: delegation not recognized",
-            );
-            return Err(doc.reject_with(
-                format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-                ErrorPayload::from(authenticate::error_codes::DELEGATION_NOT_RECOGNIZED)
-                    .with_message("delegation evidence did not establish the entitlement"),
-            ));
+            Ok(until) => evidence_ends_at = until,
+            Err(reason) => {
+                warn!(
+                    principal = %acting_party,
+                    delegate = %signer_did,
+                    reason = %reason,
+                    "proxied authenticate refused: delegation not recognized",
+                );
+                return Err(doc.reject_with(
+                    format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                    ErrorPayload::from(authenticate::error_codes::DELEGATION_NOT_RECOGNIZED)
+                        .with_message("delegation evidence did not establish the entitlement"),
+                ));
+            }
         }
     }
 
@@ -752,7 +808,11 @@ async fn authenticate_v3_arm(
     // challenge it was written under was released a line above — no refresh
     // could ever find it again, so neither the absolute lifetime cap nor
     // `actor` ever actually reached a refresh.
-    let absolute_expires_at = now_epoch() + state.config.auth.absolute_session_lifetime;
+    //
+    // A session a mandate backs ends when the mandate does: the mandate is
+    // the only thing that entitles the delegate to act as the principal.
+    let absolute_expires_at = (now_epoch() + state.config.auth.absolute_session_lifetime)
+        .min(evidence_ends_at.unwrap_or(u64::MAX));
     let actor = proxied.then(|| signer_did.clone());
     store_auth_proxy_meta(state, &resp.session.id, actor.clone(), absolute_expires_at)
         .await
@@ -766,11 +826,65 @@ async fn authenticate_v3_arm(
     if let Some(actor) = actor {
         value["session"]["actor"] = Value::String(actor);
     }
+    // A session a mandate backs ends when the mandate does, tokens included.
+    // One whose mandate ends before its refresh token would is not refreshed:
+    // its delegate logs in again with its mandate.
+    if let Some(mandate_end) = evidence_ends_at {
+        bound_session_to_mandate(state, &resp.session.id, mandate_end, &mut value)
+            .await
+            .map_err(|e| denied(&doc, "authenticate/meta", e))?;
+    }
     value["session"]["absoluteExpiresAt"] = Value::String(epoch_to_rfc3339(absolute_expires_at));
     let payload: authenticate::Response =
         serde_json::from_value(value).map_err(|e| denied(&doc, "authenticate/response", e))?;
 
     Ok(doc.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload))
+}
+
+/// End the session `session_id` a mandate backs no later than the mandate:
+/// its row's `not_after` (which `auth/refresh` clamps every rotation to, and
+/// the bearer extractor refuses past), its refresh token's expiry, and the
+/// first access token, re-signed with the earlier `exp` when it would outlive
+/// the mandate. `value` is the authenticate response, adjusted to match.
+async fn bound_session_to_mandate(
+    state: &AppState,
+    session_id: &str,
+    mandate_end: u64,
+    value: &mut Value,
+) -> Result<(), crate::error::AppError> {
+    use crate::error::AppError;
+    let now = now_epoch();
+    let left = mandate_end.saturating_sub(now).max(1);
+    let mut session = get_session(&state.sessions_ks, session_id)
+        .await?
+        .ok_or_else(|| AppError::Internal("the session just created is missing".into()))?;
+    session.not_after = Some(mandate_end);
+    if session
+        .refresh_expires_at
+        .is_some_and(|expires| expires > mandate_end)
+    {
+        session.refresh_expires_at = Some(mandate_end);
+        if value["tokens"].get("refreshExpiresIn").is_some() {
+            value["tokens"]["refreshExpiresIn"] = serde_json::json!(left);
+        }
+    }
+    did_hosting_common::server::auth::session::store_session(&state.sessions_ks, &session).await?;
+
+    let jwt_keys = state
+        .jwt_keys
+        .as_deref()
+        .ok_or_else(|| AppError::Config("auth not configured".into()))?;
+    if let Some(token) = value["tokens"]["accessToken"].as_str() {
+        let mut claims = jwt_keys.decode(token)?;
+        if claims.exp > mandate_end {
+            // Same `jti`, so the session's token pin still matches.
+            claims.exp = mandate_end;
+            value["tokens"]["accessToken"] = Value::String(jwt_keys.encode(&claims)?);
+            value["tokens"]["expiresIn"] = serde_json::json!(left);
+            value["session"]["expiresAt"] = Value::String(epoch_to_rfc3339(mandate_end));
+        }
+    }
+    Ok(())
 }
 
 /// Re-type `doc` as the framework's untyped `TrustTask<Value>`, for
@@ -1008,5 +1122,161 @@ mod tests {
         assert!(!owns("https://trusttasks.org/spec/auth/authenticate/0.2"));
         assert!(!owns("https://trusttasks.org/spec/auth/refresh/0.1"));
         assert!(!owns("not a uri"));
+    }
+
+    /// The validity window a mandate must carry, checked at a fixed instant.
+    #[test]
+    fn a_mandate_must_name_a_bounded_validity_window() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let hour = chrono::Duration::hours(1);
+        let mandate = |issued: Option<chrono::DateTime<chrono::Utc>>,
+                       expires: Option<chrono::DateTime<chrono::Utc>>| {
+            let mut doc = serde_json::json!({
+                "id": "urn:uuid:00000000-0000-4000-8000-000000000000",
+                "type": MANDATE_EVIDENCE_TYPE_URI,
+                "payload": { "delegate": "did:example:delegate" },
+            });
+            if let Some(t) = issued {
+                doc["issuedAt"] = serde_json::json!(t.to_rfc3339());
+            }
+            if let Some(t) = expires {
+                doc["expiresAt"] = serde_json::json!(t.to_rfc3339());
+            }
+            serde_json::from_value::<TrustTask<Value>>(doc).unwrap()
+        };
+        let max = chrono::Duration::seconds(MAX_MANDATE_LIFETIME_SECS);
+
+        assert_eq!(
+            mandate_validity(&mandate(Some(now - hour), Some(now + hour)), now),
+            Ok(u64::try_from((now + hour).timestamp()).unwrap())
+        );
+        assert!(mandate_validity(&mandate(Some(now), Some(now + max)), now).is_ok());
+
+        for (case, issued, expires) in [
+            ("no expiresAt", Some(now), None),
+            ("no issuedAt", None, Some(now + hour)),
+            ("expired", Some(now - hour - hour), Some(now - hour)),
+            ("expires at issue", Some(now), Some(now)),
+            (
+                "issued in the future",
+                Some(now + hour),
+                Some(now + hour + hour),
+            ),
+            (
+                "valid too long",
+                Some(now),
+                Some(now + max + chrono::Duration::seconds(1)),
+            ),
+        ] {
+            assert!(
+                mandate_validity(&mandate(issued, expires), now).is_err(),
+                "{case} was accepted"
+            );
+        }
+    }
+
+    /// A mandate is checked as a decision: from a principal whose `did:webvh`
+    /// is deactivated it is refused, though the same mandate from a live one
+    /// verifies; and an `assertionMethod` proof by a key the principal lists
+    /// only under `authentication` is refused.
+    #[tokio::test]
+    async fn a_mandate_is_checked_as_the_principals_decision() {
+        use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+        use affinidi_tdk::did_common::Document;
+        use affinidi_tdk::secrets_resolver::secrets::Secret;
+        use trust_tasks_proof::affinidi::{CryptoSuite, SignOptions, sign_trust_task};
+
+        let (mut state, _dir) = crate::control_tasks::harness::state().await;
+        let delegate = "did:key:z6MkDelegate";
+        let key = |seed: u8, did: &str| {
+            let mut secret = Secret::generate_ed25519(None, Some(&[seed; 32]));
+            secret.id = format!("{did}#key-1");
+            secret
+        };
+        let document = |did: &str, signer: &Secret, assertion: bool| -> Document {
+            let mut doc = serde_json::json!({
+                "id": did,
+                "verificationMethod": [{
+                    "id": format!("{did}#key-1"),
+                    "type": "Multikey",
+                    "controller": did,
+                    "publicKeyMultibase": signer.get_public_keymultibase().unwrap(),
+                }],
+                "authentication": [format!("{did}#key-1")],
+            });
+            if assertion {
+                doc["assertionMethod"] = serde_json::json!([format!("{did}#key-1")]);
+            }
+            serde_json::from_value(doc).unwrap()
+        };
+        let live = "did:webvh:QmLive:live.example";
+        let dead = "did:webvh:QmDead:dead.example";
+        let auth_only = "did:webvh:QmAuth:auth-only.example";
+        let (live_key, dead_key, auth_key) = (key(1, live), key(2, dead), key(3, auth_only));
+        let mut client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .unwrap();
+        client
+            .add_did_document(live, document(live, &live_key, true))
+            .await;
+        client
+            .add_did_document(dead, document(dead, &dead_key, true))
+            .await;
+        client
+            .add_did_document(auth_only, document(auth_only, &auth_key, false))
+            .await;
+        let verifier =
+            did_hosting_common::server::trust_tasks::build_verifier(Some(&client)).unwrap();
+        for did in [live, auth_only] {
+            verifier.record_deactivation_verdict(did, false);
+        }
+        verifier.record_deactivation_verdict(dead, true);
+        state.trust_tasks_verifier = Some(verifier);
+
+        let evidence = |principal: String, signer: Secret| async move {
+            let now = chrono::Utc::now();
+            let mandate = serde_json::json!({
+                "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                "type": MANDATE_EVIDENCE_TYPE_URI,
+                "issuer": principal,
+                "recipient": crate::control_tasks::harness::CONTROL,
+                "issuedAt": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "expiresAt": (now + chrono::Duration::hours(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "payload": { "delegate": delegate },
+            });
+            let signed = sign_trust_task(
+                &mandate,
+                &signer,
+                SignOptions::new()
+                    .with_proof_purpose("assertionMethod")
+                    .with_cryptosuite(CryptoSuite::EddsaJcs2022),
+            )
+            .await
+            .unwrap();
+            serde_json::from_value::<authenticate::PayloadDelegationEvidence>(serde_json::json!({
+                "kind": MANDATE_EVIDENCE_KIND,
+                "credential": signed,
+            }))
+            .unwrap()
+        };
+
+        let ok = evidence(live.to_string(), live_key).await;
+        verify_delegation_evidence(&state, live, delegate, "challenge", &ok)
+            .await
+            .expect("a live principal's mandate verifies");
+
+        let refused = evidence(dead.to_string(), dead_key).await;
+        let err = verify_delegation_evidence(&state, dead, delegate, "challenge", &refused)
+            .await
+            .unwrap_err();
+        assert!(err.contains("deactivated"), "{err}");
+
+        let refused = evidence(auth_only.to_string(), auth_key).await;
+        verify_delegation_evidence(&state, auth_only, delegate, "challenge", &refused)
+            .await
+            .expect_err("an authentication-only key made a decision");
     }
 }

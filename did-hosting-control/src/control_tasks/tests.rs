@@ -3946,15 +3946,16 @@ mod unlisted {
         mandate_signer: &Secret,
         named_delegate: &str,
     ) -> Value {
-        let mandate = signed_as_assertion(
-            request(
-                "https://trusttasks.org/spec/local/did-hosting-auth-mandate/0.1",
-                principal,
-                json!({ "delegate": named_delegate }),
-            ),
-            mandate_signer,
-        )
-        .await;
+        let mut mandate = request(
+            "https://trusttasks.org/spec/local/did-hosting-auth-mandate/0.1",
+            principal,
+            json!({ "delegate": named_delegate }),
+        );
+        mandate["expiresAt"] = json!(
+            (chrono::Utc::now() + chrono::Duration::hours(1))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        );
+        let mandate = signed_as_assertion(mandate, mandate_signer).await;
         signed(
             request(
                 &t("auth/authenticate/0.3"),
