@@ -186,8 +186,10 @@ read that second entry. So:
   key: copy its entry across yourself.
 - If a first start stops after claiming the key's creation but before
   writing it, the next start waits 30 s and then says so; run
-  `webvh-witness reset-witness-kek-claim` (refused once a key is recorded)
-  and start again.
+  `webvh-witness reset-witness-kek-claim` (`did-hosting-daemon
+  reset-witness-kek-claim` for the embedded witness; refused once a key is
+  held or recorded) and start again. A first write the secret store refuses
+  releases the claim itself.
 - Earlier releases kept each private key in clear in the record. On its
   first start after the upgrade, the witness seals every such key in place,
   checking first that each key belongs to its identity (startup is refused,

@@ -133,6 +133,10 @@ enum Command {
     },
     /// List all ACL entries
     ListAcl,
+    /// Clear the embedded witness's key-encryption-key creation claim left
+    /// by a start that stopped while creating the key (`[witness_store]`).
+    /// Refused once a key is held or recorded.
+    ResetWitnessKekClaim,
     /// Show a DID's statistics resolution, recorded tier and totals
     /// (offline; stop the service first).
     StatsShow {
@@ -589,6 +593,12 @@ async fn main() {
         }
         Some(Command::IdentityRetireNow { generation }) => {
             if let Err(e) = run_identity_retire_now(cli.config, generation).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::ResetWitnessKekClaim) => {
+            if let Err(e) = run_reset_witness_kek_claim(cli.config).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -1918,6 +1928,28 @@ async fn run_add_acl(
         None,
     )
     .await
+}
+
+async fn run_reset_witness_kek_claim(
+    config_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = DaemonConfig::load(config_path)?;
+    let store = Store::open(&config.witness_store).await?;
+    let witnesses_ks = store.keyspace(did_hosting_common::server::store::KS_WITNESSES)?;
+    let kek_store = did_hosting_common::server::secret_store::create_witness_kek_store(
+        &config.secrets,
+        &config.config_path,
+    )?;
+    let had = webvh_witness::witness_keys::reset_kek_claim(&kek_store, &witnesses_ks).await?;
+    store.persist().await?;
+    eprintln!();
+    if had {
+        eprintln!("  Key-encryption-key creation claim cleared; start the daemon again.");
+    } else {
+        eprintln!("  No key-encryption-key creation claim was held.");
+    }
+    eprintln!();
+    Ok(())
 }
 
 async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {

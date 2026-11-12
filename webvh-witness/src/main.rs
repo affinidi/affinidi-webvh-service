@@ -546,7 +546,8 @@ async fn run_reset_witness_kek_claim(
     let config = AppConfig::load(config_path)?;
     let store = store::Store::open(&config.store).await?;
     let witnesses_ks = store.keyspace(KS_WITNESSES)?;
-    let had = webvh_witness::witness_keys::reset_kek_claim(&witnesses_ks).await?;
+    let kek_store = secret_store::create_witness_kek_store(&config.secrets, &config.config_path)?;
+    let had = webvh_witness::witness_keys::reset_kek_claim(&kek_store, &witnesses_ks).await?;
     eprintln!();
     if had {
         eprintln!("  Key-encryption-key creation claim cleared; start the witness again.");

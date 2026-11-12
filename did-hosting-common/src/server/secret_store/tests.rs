@@ -416,9 +416,27 @@ async fn keyring_round_trip_when_backend_available() {
     assert_eq!(store.get_bootstrap_seed().await.unwrap(), Some([7u8; 32]));
     store.clear_bootstrap_seed().await.unwrap();
 
-    // Leave the operator's keyring tidy.
+    // The witness key-encryption key: its own account under the same
+    // service, untouched by the envelope's writes.
+    let kek_store = create_witness_kek_store(&secrets, &dir.path().join("config.toml")).unwrap();
+    let kek = affinidi_secrets_resolver::secrets::Secret::generate_x25519(None, None).unwrap();
+    let kek_result = kek_store.set(&kek).await;
+    let kek_read = kek_store.get().await;
+    store.set(&sample()).await.unwrap();
+    let kek_after = kek_store.get().await;
+
+    // Leave the operator's keyring tidy, whatever the assertions below say.
     let entry = keyring_core::Entry::new(&secrets.keyring_service, KEYRING_USER).unwrap();
     let _ = entry.delete_credential();
+    let kek_entry =
+        keyring_core::Entry::new(&secrets.keyring_service, witness_kek::KEYRING_USER).unwrap();
+    let _ = kek_entry.delete_credential();
+
+    kek_result.expect("set the witness key-encryption key");
+    for read in [kek_read, kek_after] {
+        let read = read.expect("read it").expect("held");
+        assert_eq!(read.get_public_bytes(), kek.get_public_bytes());
+    }
 }
 
 #[test]

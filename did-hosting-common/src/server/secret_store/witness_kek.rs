@@ -32,7 +32,7 @@ use crate::server::error::AppError;
 /// Suffix of the key-encryption key's entry name on the named backends.
 const NAME_SUFFIX: &str = "-witness-kek";
 /// The keyring entry (`user`) under `secrets.keyring_service`.
-const KEYRING_USER: &str = "witness_key_encryption_key";
+pub(super) const KEYRING_USER: &str = "witness_key_encryption_key";
 
 /// Bound on one read or write of the key-encryption key's entry. The cloud and
 /// Vault backends are network calls; none of them is made on a request path,
@@ -65,6 +65,23 @@ pub fn witness_kek_location(secrets: &SecretsConfig, config_path: &Path) -> Stri
 
 fn kek_plaintext_path(config_path: &Path) -> PathBuf {
     plaintext_path_named(config_path, "witness-kek")
+}
+
+/// Why a write of the key-encryption key did not succeed.
+#[derive(Debug)]
+pub enum KekWriteFailure {
+    /// The backend answered with an error: nothing was stored.
+    Refused(AppError),
+    /// No answer in time: the write may or may not have landed.
+    Unknown(AppError),
+}
+
+impl KekWriteFailure {
+    pub fn into_error(self) -> AppError {
+        match self {
+            Self::Refused(e) | Self::Unknown(e) => e,
+        }
+    }
 }
 
 /// The witness key-encryption key's entry.
@@ -136,14 +153,21 @@ impl WitnessKekStore {
 
     /// Store `kek` (an X25519 secret).
     pub async fn set(&self, kek: &Secret) -> Result<(), AppError> {
-        let encoded = kek
-            .get_private_keymultibase()
-            .map_err(|e| AppError::SecretStore(format!("cannot encode the key: {e}")))?;
+        self.try_set(kek).await.map_err(KekWriteFailure::into_error)
+    }
+
+    /// [`Self::set`], telling a write the backend refused (nothing stored)
+    /// from one whose outcome is unknown (it timed out, and may have landed).
+    pub async fn try_set(&self, kek: &Secret) -> Result<(), KekWriteFailure> {
+        let encoded = kek.get_private_keymultibase().map_err(|e| {
+            KekWriteFailure::Refused(AppError::SecretStore(format!("cannot encode the key: {e}")))
+        })?;
         let mut bytes = encoded.into_bytes();
-        let result = tokio::time::timeout(WITNESS_KEK_TIMEOUT, self.inner.set(&bytes))
-            .await
-            .map_err(|_| self.timed_out("write"))
-            .and_then(|r| r.map_err(from_vti));
+        let result = match tokio::time::timeout(WITNESS_KEK_TIMEOUT, self.inner.set(&bytes)).await {
+            Err(_) => Err(KekWriteFailure::Unknown(self.timed_out("write"))),
+            Ok(Err(e)) => Err(KekWriteFailure::Refused(from_vti(e))),
+            Ok(Ok(())) => Ok(()),
+        };
         bytes.iter_mut().for_each(|b| *b = 0);
         result
     }

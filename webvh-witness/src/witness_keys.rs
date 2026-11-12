@@ -38,7 +38,7 @@
 use std::time::Duration;
 
 use affinidi_tdk::secrets_resolver::secrets::Secret;
-use did_hosting_common::server::secret_store::WitnessKekStore;
+use did_hosting_common::server::secret_store::{KekWriteFailure, WitnessKekStore};
 use serde_json::Value;
 use tracing::{info, warn};
 use vta_sdk::sealed_transfer::hpke;
@@ -214,7 +214,20 @@ async fn load_or_create_waiting(
 
     if witnesses_ks.incr_raw(KEK_CLAIM_KEY).await? == 1 {
         let keys = WitnessKeys::generate()?;
-        kek_store.set(&keys.kek).await?;
+        match kek_store.try_set(&keys.kek).await {
+            Ok(()) => {}
+            // Nothing was stored: release the claim, so the next start can
+            // create the key without an operator step.
+            Err(KekWriteFailure::Refused(e)) => {
+                if let Err(release) = witnesses_ks.remove(KEK_CLAIM_KEY).await {
+                    warn!(error = %release, "could not release the key-encryption-key claim");
+                }
+                return Err(e);
+            }
+            // It may have landed: keep the claim. The next start reads the
+            // secret store first and adopts a key that is there.
+            Err(KekWriteFailure::Unknown(e)) => return Err(e),
+        }
         let read = kek_store.get().await?.ok_or_else(|| {
             AppError::SecretStore(format!(
                 "the witness key-encryption key written to {} did not read back",
@@ -231,6 +244,15 @@ async fn load_or_create_waiting(
         witnesses_ks
             .insert(KEK_PUBLIC_KEY, &keys.public_multibase())
             .await?;
+        let recorded: Option<String> = witnesses_ks.get(KEK_PUBLIC_KEY).await?;
+        if recorded.as_deref() != Some(keys.public_multibase().as_str()) {
+            return Err(AppError::Config(format!(
+                "the witness key-encryption key recorded in the data store changed while it was \
+                 being created (now {}); another process created one too. Nothing has been \
+                 sealed to either; stop the other witness processes and start again.",
+                recorded.as_deref().unwrap_or("absent")
+            )));
+        }
         info!(
             location = kek_store.location(),
             "created the witness key-encryption key"
@@ -256,8 +278,8 @@ async fn load_or_create_waiting(
     Err(AppError::Config(format!(
         "another process claimed the creation of the witness key-encryption key, but none \
          appeared in {} within {}s. If no other witness process is starting, the claim was \
-         left by one that stopped part-way: run `webvh-witness reset-witness-kek-claim` and \
-         start again.",
+         left by one that stopped part-way: run `webvh-witness reset-witness-kek-claim` (or \
+         `did-hosting-daemon reset-witness-kek-claim`) and start again.",
         kek_store.location(),
         claim_wait.as_secs()
     )))
@@ -287,9 +309,20 @@ async fn accept(
 }
 
 /// Remove a creation claim left by a process that stopped part-way, so the
-/// next start can create the key-encryption key. Refused once a key has been
-/// recorded: the claim is then settled.
-pub async fn reset_kek_claim(witnesses_ks: &KeyspaceHandle) -> Result<bool, AppError> {
+/// next start can create the key-encryption key. Refused once a key is held
+/// in the secret store or recorded in the data store: the claim is then
+/// settled, and resetting it could let a second key be made.
+pub async fn reset_kek_claim(
+    kek_store: &WitnessKekStore,
+    witnesses_ks: &KeyspaceHandle,
+) -> Result<bool, AppError> {
+    if kek_store.get().await?.is_some() {
+        return Err(AppError::Config(format!(
+            "the secret store already holds a witness key-encryption key ({}); start the \
+             witness and it is adopted. The claim is not reset.",
+            kek_store.location()
+        )));
+    }
     if witnesses_ks.get::<String>(KEK_PUBLIC_KEY).await?.is_some() {
         return Err(AppError::Config(
             "a witness key-encryption key is recorded for this data store; its creation \
@@ -530,8 +563,15 @@ mod tests {
             ks.get::<String>(KEK_PUBLIC_KEY).await.unwrap(),
             Some(first.public_multibase())
         );
-        // The claim is settled: it cannot be reset.
-        assert!(reset_kek_claim(&ks).await.is_err());
+        // The claim is settled: it cannot be reset, whether the key is in the
+        // secret store or only recorded in the data store.
+        assert!(
+            reset_kek_claim(&kek_store(&secrets_dir), &ks)
+                .await
+                .is_err()
+        );
+        let empty_dir = tempfile::tempdir().unwrap();
+        assert!(reset_kek_claim(&kek_store(&empty_dir), &ks).await.is_err());
     }
 
     /// A secret store without the recorded key, or with another one, refuses
@@ -575,7 +615,11 @@ mod tests {
             .err()
             .expect("waited out");
         assert!(err.to_string().contains("reset-witness-kek-claim"), "{err}");
-        assert!(reset_kek_claim(&ks).await.unwrap());
+        assert!(
+            reset_kek_claim(&kek_store(&secrets_dir), &ks)
+                .await
+                .unwrap()
+        );
         assert!(load_or_create(&kek_store(&secrets_dir), &ks).await.is_ok());
     }
 
@@ -692,5 +736,87 @@ mod tests {
         .unwrap();
         let report = migrate_record_keys(&store, &ks, &keys).await.unwrap();
         assert_eq!(report.unusable, vec![record.witness_id]);
+    }
+
+    /// A key held in the secret store with no claim recorded (or one the
+    /// data store lost) is adopted; the reset is refused while it is held.
+    #[tokio::test]
+    async fn a_reset_is_refused_while_the_secret_store_holds_a_key() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace(crate::store::KS_WITNESSES).unwrap();
+        let secrets_dir = tempfile::tempdir().unwrap();
+        kek_store(&secrets_dir)
+            .set(&Secret::generate_x25519(None, None).unwrap())
+            .await
+            .unwrap();
+        ks.incr_raw(KEK_CLAIM_KEY).await.unwrap();
+        assert!(
+            reset_kek_claim(&kek_store(&secrets_dir), &ks)
+                .await
+                .is_err()
+        );
+        assert!(ks.get_raw(KEK_CLAIM_KEY).await.unwrap().is_some());
+    }
+
+    /// Two processes starting together on one store and one secret store
+    /// make one key: both end with it, it is recorded once, and the claim
+    /// was taken twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_starts_at_once_make_one_key() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace(crate::store::KS_WITNESSES).unwrap();
+        let secrets_dir = tempfile::tempdir().unwrap();
+        let (a_store, b_store) = (kek_store(&secrets_dir), kek_store(&secrets_dir));
+        let (a, b) = tokio::join!(load_or_create(&a_store, &ks), load_or_create(&b_store, &ks));
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(a.public_multibase(), b.public_multibase());
+        assert_eq!(
+            ks.get::<String>(KEK_PUBLIC_KEY).await.unwrap(),
+            Some(a.public_multibase())
+        );
+        // The counter is now at 2; one more increment shows it.
+        assert_eq!(ks.incr_raw(KEK_CLAIM_KEY).await.unwrap(), 3);
+    }
+
+    /// A create the secret store refused releases its claim, so the next
+    /// start creates the key without an operator step.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_first_write_releases_the_claim() {
+        use std::os::unix::fs::PermissionsExt;
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace(crate::store::KS_WITNESSES).unwrap();
+        let secrets_dir = tempfile::tempdir().unwrap();
+        let locked = secrets_dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let secrets = crate::config::SecretsConfig {
+            backend: Some(crate::secret_store::SecretBackend::Plaintext),
+            confirm_plaintext: true,
+            ..Default::default()
+        };
+        let locked_store = did_hosting_common::server::secret_store::create_witness_kek_store(
+            &secrets,
+            &locked.join("w.toml"),
+        )
+        .unwrap();
+
+        let refused = load_or_create(&locked_store, &ks).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            refused.is_err(),
+            "the write into a read-only directory fails"
+        );
+        assert!(
+            ks.get_raw(KEK_CLAIM_KEY).await.unwrap().is_none(),
+            "claim released"
+        );
+        assert!(ks.get::<String>(KEK_PUBLIC_KEY).await.unwrap().is_none());
+
+        let keys = load_or_create(&locked_store, &ks).await.unwrap();
+        assert_eq!(
+            ks.get::<String>(KEK_PUBLIC_KEY).await.unwrap(),
+            Some(keys.public_multibase())
+        );
     }
 }

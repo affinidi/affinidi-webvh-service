@@ -22,7 +22,8 @@ mod witness_kek;
 pub mod wizard;
 
 pub use witness_kek::{
-    WITNESS_KEK_TIMEOUT, WitnessKekStore, create_witness_kek_store, witness_kek_location,
+    KekWriteFailure, WITNESS_KEK_TIMEOUT, WitnessKekStore, create_witness_kek_store,
+    witness_kek_location,
 };
 
 pub use vti_secrets::SecretBackend;
