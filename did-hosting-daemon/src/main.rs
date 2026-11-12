@@ -1593,18 +1593,33 @@ async fn build_witness(
     rate_limit_gc: &CancellationToken,
 ) -> ServiceResult {
     use webvh_witness::server::AppState;
-    use webvh_witness::signing::LocalSigner;
+    use webvh_witness::witness_keys::{self, WitnessKeys};
 
     // The daemon's embedded witness runs no messaging listener of its own —
     // the control plane's carries the mediator connection — so its Trust Task
     // listener is the HTTPS binding, `POST /witness/api/trust-tasks`, under the
     // daemon's DID. Its `didcomm_service` slot stays empty, which is what makes
     // the witness's rotation path an inert no-op here.
+    // Witness signing keys live in the daemon's secret store, beside its own
+    // keys. Move any a record from an earlier release still holds before the
+    // witness serves anything, as the standalone witness does.
+    let witness_keys = Arc::new(WitnessKeys::new(
+        did_hosting_common::server::secret_store::create_secret_store(
+            &config.secrets,
+            &config.config_path,
+        )?,
+    ));
+    witness_keys::prepare(
+        store,
+        &store.keyspace(did_hosting_common::server::store::KS_WITNESSES)?,
+        &witness_keys,
+    )
+    .await?;
     let mut state = AppState::new(
         store.clone(),
         config.witness_config(),
         identity,
-        Arc::new(LocalSigner),
+        witness_keys,
     )?;
     state.client_ips = client_ips.clone();
     state

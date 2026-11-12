@@ -31,4 +31,5 @@ pub mod signing;
 pub mod store;
 pub mod trust_tasks;
 pub mod tsp;
+pub mod witness_keys;
 pub mod witness_ops;

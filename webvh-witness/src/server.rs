@@ -23,6 +23,7 @@ use crate::routes;
 use crate::secret_store::ServerSecrets;
 use crate::signing::{LocalSigner, WitnessSigner};
 use crate::store::{KeyspaceHandle, Store};
+use crate::witness_keys::WitnessKeys;
 use axum::routing::get;
 use tokio::sync::{oneshot, watch};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
@@ -48,6 +49,8 @@ pub struct AppState {
     /// never replaced — only its one listener — and a `OnceLock` suffices.
     pub didcomm_service: Arc<OnceLock<DIDCommService>>,
     pub signer: Arc<dyn WitnessSigner>,
+    /// The witness identities' private keys, held in the secret store.
+    pub witness_keys: Arc<WitnessKeys>,
     /// Verifies every inbound Trust Task's proof. `None` when no resolver is
     /// configured, in which case no request is accepted.
     pub trust_tasks_verifier: Option<Arc<TransportBoundVerifier>>,
@@ -72,13 +75,18 @@ pub struct AppState {
 
 impl AppState {
     /// A witness state over `store`, with the Trust Task machinery built from
-    /// `identity`'s resolver.
+    /// `identity`'s resolver, signing with the keys `witness_keys` holds
+    /// ([`LocalSigner`]; replace `signer` for another backend).
+    ///
+    /// Run [`crate::witness_keys::prepare`] on the store first, so no
+    /// identity's key is still in its data-store record.
     pub fn new(
         store: Store,
         config: AppConfig,
         identity: Option<Arc<ServiceIdentity>>,
-        signer: Arc<dyn WitnessSigner>,
+        witness_keys: Arc<WitnessKeys>,
     ) -> Result<Self, AppError> {
+        let signer: Arc<dyn WitnessSigner> = Arc::new(LocalSigner::new(witness_keys.clone()));
         let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
         let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
         let replay_cache = Arc::new(ReplayCache::with_config(config.replay.clone())?);
@@ -95,6 +103,7 @@ impl AppState {
             identity,
             didcomm_service: Arc::new(OnceLock::new()),
             signer,
+            witness_keys,
             acl_locks: PathLocks::new(),
             replay_cache,
             sign_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -111,6 +120,13 @@ impl AppState {
 }
 
 pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
+    // Witness signing keys live in the secret store. Move any a record from an
+    // earlier release still holds before anything is served.
+    let witness_keys = Arc::new(WitnessKeys::new(crate::secret_store::create_secret_store(
+        &config,
+    )?));
+    crate::witness_keys::prepare(&store, &store.keyspace(KS_WITNESSES)?, &witness_keys).await?;
+
     // Load the service's own identity (requires server_did). Resolves the DID
     // document for the *real* verification-method key IDs and seeds the secrets
     // resolver under them, rather than assuming `#key-0` / `#key-1`.
@@ -137,7 +153,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         None
     };
 
-    let state = AppState::new(store.clone(), config, identity, Arc::new(LocalSigner))?;
+    let state = AppState::new(store.clone(), config, identity, witness_keys)?;
 
     // Log startup configuration
     info!("--- enabled services ---");

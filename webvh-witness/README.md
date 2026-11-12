@@ -153,6 +153,36 @@ webvh-witness list-witnesses
 webvh-witness delete-witness --id z6Mk...
 ```
 
+#### Where the signing keys are kept
+
+A witness identity's Ed25519 private key is held in the secret store
+configured under `[secrets]` (OS keyring, AWS Secrets Manager, GCP Secret
+Manager, Azure Key Vault, HashiCorp Vault or a Kubernetes `Secret`), in the
+same entry as the witness service's own keys. The data store (`[store]`)
+holds only each identity's public metadata (`witness_id`, DID, label,
+counters) and the marks of what it has witnessed. So:
+
+- A data-store backup (or a copy of `data_dir`, or a table export) holds no
+  signing key. Back up the secret store as well, or the identities cannot
+  sign after a restore. An identity whose key the secret store does not hold
+  is named in a warning at startup; requests to sign with it fail.
+- `create-witness` and `delete-witness` need the secret store as well as the
+  data store, as the service does.
+- Earlier releases kept the private key in the data-store record. On its
+  first start after the upgrade, the witness moves each such key into the secret store,
+  checks it reads back, and then removes it from the record; it logs the
+  witness ids it moved (never the keys). The identities and their DIDs are
+  unchanged. Startup is refused, with the identity named, if a record's key
+  does not belong to it or the secret store already holds a different key
+  for it. Copies of the old records in earlier backups or snapshots still
+  contain the keys; see the CHANGELOG.
+- The secret store has no compare-and-swap. Writes from within one process
+  are serialised, but a `create-witness` or `delete-witness` run against a
+  shared secret store while the service is rewriting the same entry (its
+  identity rotation) could undo one of the two changes. Prefer the
+  `webvh/witness/key/create` and `key/delete` Trust Tasks on a running
+  witness; an identity left without a key is named at the next start.
+
 ## Trust Tasks
 
 The witness has no REST management API. Every operation is a

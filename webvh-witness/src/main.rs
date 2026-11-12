@@ -446,7 +446,11 @@ async fn run_create_witness(
     let store = store::Store::open(&config.store).await?;
     let witnesses_ks = store.keyspace(KS_WITNESSES)?;
 
-    let record = witness_ops::create_witness(&witnesses_ks, label).await?;
+    // The private key goes to the configured secret store; the data store gets
+    // only the identity's public metadata.
+    let keys =
+        webvh_witness::witness_keys::WitnessKeys::new(secret_store::create_secret_store(&config)?);
+    let record = witness_ops::create_witness(&witnesses_ks, &keys, label).await?;
 
     eprintln!();
     eprintln!("  Witness created!");
@@ -515,7 +519,9 @@ async fn run_delete_witness(
         return Err(format!("witness not found: {witness_id}").into());
     }
 
-    witness_ops::delete_witness(&store, &witnesses_ks, &witness_id).await?;
+    let keys =
+        webvh_witness::witness_keys::WitnessKeys::new(secret_store::create_secret_store(&config)?);
+    witness_ops::delete_witness(&store, &witnesses_ks, &keys, &witness_id).await?;
 
     eprintln!();
     eprintln!("  Witness deleted: {witness_id}");
