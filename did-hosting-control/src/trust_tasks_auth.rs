@@ -826,31 +826,65 @@ async fn authenticate_v3_arm(
     if let Some(actor) = actor {
         value["session"]["actor"] = Value::String(actor);
     }
-    // A mandate that ends before the refresh token would is the ceiling for
-    // the refresh token too, as `refresh_v2_arm` clamps a rotated one. Such a
-    // session is not refreshed: its delegate logs in again with its mandate.
-    if evidence_ends_at.is_some()
-        && let Some(mut session) = get_session(&state.sessions_ks, &resp.session.id)
-            .await
-            .map_err(|e| denied(&doc, "authenticate/meta", e))?
-        && session
-            .refresh_expires_at
-            .is_some_and(|expires| expires > absolute_expires_at)
-    {
-        session.refresh_expires_at = Some(absolute_expires_at);
-        did_hosting_common::server::auth::session::store_session(&state.sessions_ks, &session)
+    // A session a mandate backs ends when the mandate does, tokens included.
+    // One whose mandate ends before its refresh token would is not refreshed:
+    // its delegate logs in again with its mandate.
+    if let Some(mandate_end) = evidence_ends_at {
+        bound_session_to_mandate(state, &resp.session.id, mandate_end, &mut value)
             .await
             .map_err(|e| denied(&doc, "authenticate/meta", e))?;
-        if value["tokens"].get("refreshExpiresIn").is_some() {
-            value["tokens"]["refreshExpiresIn"] =
-                serde_json::json!(absolute_expires_at.saturating_sub(now_epoch()).max(1));
-        }
     }
     value["session"]["absoluteExpiresAt"] = Value::String(epoch_to_rfc3339(absolute_expires_at));
     let payload: authenticate::Response =
         serde_json::from_value(value).map_err(|e| denied(&doc, "authenticate/response", e))?;
 
     Ok(doc.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload))
+}
+
+/// End the session `session_id` a mandate backs no later than the mandate:
+/// its row's `not_after` (which `auth/refresh` clamps every rotation to, and
+/// the bearer extractor refuses past), its refresh token's expiry, and the
+/// first access token, re-signed with the earlier `exp` when it would outlive
+/// the mandate. `value` is the authenticate response, adjusted to match.
+async fn bound_session_to_mandate(
+    state: &AppState,
+    session_id: &str,
+    mandate_end: u64,
+    value: &mut Value,
+) -> Result<(), crate::error::AppError> {
+    use crate::error::AppError;
+    let now = now_epoch();
+    let left = mandate_end.saturating_sub(now).max(1);
+    let mut session = get_session(&state.sessions_ks, session_id)
+        .await?
+        .ok_or_else(|| AppError::Internal("the session just created is missing".into()))?;
+    session.not_after = Some(mandate_end);
+    if session
+        .refresh_expires_at
+        .is_some_and(|expires| expires > mandate_end)
+    {
+        session.refresh_expires_at = Some(mandate_end);
+        if value["tokens"].get("refreshExpiresIn").is_some() {
+            value["tokens"]["refreshExpiresIn"] = serde_json::json!(left);
+        }
+    }
+    did_hosting_common::server::auth::session::store_session(&state.sessions_ks, &session).await?;
+
+    let jwt_keys = state
+        .jwt_keys
+        .as_deref()
+        .ok_or_else(|| AppError::Config("auth not configured".into()))?;
+    if let Some(token) = value["tokens"]["accessToken"].as_str() {
+        let mut claims = jwt_keys.decode(token)?;
+        if claims.exp > mandate_end {
+            // Same `jti`, so the session's token pin still matches.
+            claims.exp = mandate_end;
+            value["tokens"]["accessToken"] = Value::String(jwt_keys.encode(&claims)?);
+            value["tokens"]["expiresIn"] = serde_json::json!(left);
+            value["session"]["expiresAt"] = Value::String(epoch_to_rfc3339(mandate_end));
+        }
+    }
+    Ok(())
 }
 
 /// Re-type `doc` as the framework's untyped `TrustTask<Value>`, for
@@ -1141,5 +1175,108 @@ mod tests {
                 "{case} was accepted"
             );
         }
+    }
+
+    /// A mandate is checked as a decision: from a principal whose `did:webvh`
+    /// is deactivated it is refused, though the same mandate from a live one
+    /// verifies; and an `assertionMethod` proof by a key the principal lists
+    /// only under `authentication` is refused.
+    #[tokio::test]
+    async fn a_mandate_is_checked_as_the_principals_decision() {
+        use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+        use affinidi_tdk::did_common::Document;
+        use affinidi_tdk::secrets_resolver::secrets::Secret;
+        use trust_tasks_proof::affinidi::{CryptoSuite, SignOptions, sign_trust_task};
+
+        let (mut state, _dir) = crate::control_tasks::harness::state().await;
+        let delegate = "did:key:z6MkDelegate";
+        let key = |seed: u8, did: &str| {
+            let mut secret = Secret::generate_ed25519(None, Some(&[seed; 32]));
+            secret.id = format!("{did}#key-1");
+            secret
+        };
+        let document = |did: &str, signer: &Secret, assertion: bool| -> Document {
+            let mut doc = serde_json::json!({
+                "id": did,
+                "verificationMethod": [{
+                    "id": format!("{did}#key-1"),
+                    "type": "Multikey",
+                    "controller": did,
+                    "publicKeyMultibase": signer.get_public_keymultibase().unwrap(),
+                }],
+                "authentication": [format!("{did}#key-1")],
+            });
+            if assertion {
+                doc["assertionMethod"] = serde_json::json!([format!("{did}#key-1")]);
+            }
+            serde_json::from_value(doc).unwrap()
+        };
+        let live = "did:webvh:QmLive:live.example";
+        let dead = "did:webvh:QmDead:dead.example";
+        let auth_only = "did:webvh:QmAuth:auth-only.example";
+        let (live_key, dead_key, auth_key) = (key(1, live), key(2, dead), key(3, auth_only));
+        let mut client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .unwrap();
+        client
+            .add_did_document(live, document(live, &live_key, true))
+            .await;
+        client
+            .add_did_document(dead, document(dead, &dead_key, true))
+            .await;
+        client
+            .add_did_document(auth_only, document(auth_only, &auth_key, false))
+            .await;
+        let verifier =
+            did_hosting_common::server::trust_tasks::build_verifier(Some(&client)).unwrap();
+        for did in [live, auth_only] {
+            verifier.record_deactivation_verdict(did, false);
+        }
+        verifier.record_deactivation_verdict(dead, true);
+        state.trust_tasks_verifier = Some(verifier);
+
+        let evidence = |principal: String, signer: Secret| async move {
+            let now = chrono::Utc::now();
+            let mandate = serde_json::json!({
+                "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                "type": MANDATE_EVIDENCE_TYPE_URI,
+                "issuer": principal,
+                "recipient": crate::control_tasks::harness::CONTROL,
+                "issuedAt": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "expiresAt": (now + chrono::Duration::hours(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "payload": { "delegate": delegate },
+            });
+            let signed = sign_trust_task(
+                &mandate,
+                &signer,
+                SignOptions::new()
+                    .with_proof_purpose("assertionMethod")
+                    .with_cryptosuite(CryptoSuite::EddsaJcs2022),
+            )
+            .await
+            .unwrap();
+            serde_json::from_value::<authenticate::PayloadDelegationEvidence>(serde_json::json!({
+                "kind": MANDATE_EVIDENCE_KIND,
+                "credential": signed,
+            }))
+            .unwrap()
+        };
+
+        let ok = evidence(live.to_string(), live_key).await;
+        verify_delegation_evidence(&state, live, delegate, "challenge", &ok)
+            .await
+            .expect("a live principal's mandate verifies");
+
+        let refused = evidence(dead.to_string(), dead_key).await;
+        let err = verify_delegation_evidence(&state, dead, delegate, "challenge", &refused)
+            .await
+            .unwrap_err();
+        assert!(err.contains("deactivated"), "{err}");
+
+        let refused = evidence(auth_only.to_string(), auth_key).await;
+        verify_delegation_evidence(&state, auth_only, delegate, "challenge", &refused)
+            .await
+            .expect_err("an authentication-only key made a decision");
     }
 }

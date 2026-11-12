@@ -324,6 +324,59 @@ async fn a_mandate_session_ends_with_its_mandate() {
     );
 }
 
+/// The first access token of a session a short mandate backs expires with
+/// the mandate, and the session row carries the mandate's end.
+#[tokio::test]
+async fn a_mandate_session_access_token_ends_with_its_mandate() {
+    let h = harness().await;
+    let (principal, delegate) = (key(36), key(37));
+    h.add_acl(&principal.did, Role::Owner).await;
+
+    let (challenge, session_id) = challenge(&h, &principal).await;
+    let mandate =
+        mandate_credential_valid_for(&principal.did, &delegate.did, &principal, Some(60)).await;
+    let mandate_expires_at =
+        chrono::DateTime::parse_from_rfc3339(mandate["expiresAt"].as_str().expect("expiresAt"))
+            .unwrap();
+    let d = proxied_authenticate(
+        &delegate,
+        &principal.did,
+        &challenge,
+        &session_id,
+        delegation_evidence("mandateCredential", mandate),
+        None,
+    )
+    .await;
+
+    let (status, body) = post(&h, &d).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let expires_in = body["payload"]["tokens"]["expiresIn"]
+        .as_u64()
+        .expect("expiresIn");
+    assert!(
+        expires_in <= 60,
+        "the access token outlives the mandate: {expires_in}s"
+    );
+    let session_expires = chrono::DateTime::parse_from_rfc3339(
+        body["payload"]["session"]["expiresAt"]
+            .as_str()
+            .expect("expiresAt"),
+    )
+    .unwrap();
+    assert!(session_expires <= mandate_expires_at, "{body}");
+    let row = did_hosting_common::server::auth::session::get_session(
+        &h.state.sessions_ks,
+        body["payload"]["session"]["id"].as_str().unwrap(),
+    )
+    .await
+    .unwrap()
+    .expect("session row");
+    assert_eq!(
+        row.not_after,
+        Some(u64::try_from(mandate_expires_at.timestamp()).unwrap())
+    );
+}
+
 /// A mandate must name its own end, within the longest validity this service
 /// accepts, and not be over.
 #[tokio::test]

@@ -113,6 +113,13 @@ impl<S: AuthState> FromRequestParts<S> for AuthClaims {
             return Err(AppError::Unauthorized("session not authenticated".into()));
         }
 
+        // A session issued under a bound (`not_after`, e.g. the mandate a
+        // proxied login rests on) ends there, whatever its token still says.
+        if session.past_end(now_epoch()) {
+            warn!(session_id = %claims.session_id, "auth rejected: session past its absolute end");
+            return Err(AppError::Unauthorized("session has ended".into()));
+        }
+
         // Validate token_id matches — prevents use of old tokens after refresh.
         //
         // The empty-jti branch is closed: when the session has a `token_id`,
@@ -459,6 +466,33 @@ mod tests {
         claims.amr = amr;
         claims.acr = acr.into();
         state.keys.encode(&claims).unwrap()
+    }
+
+    /// A session past its `not_after` is refused, however live its token.
+    #[tokio::test]
+    async fn a_session_past_its_end_is_refused() {
+        let (state, _dir) = make_state().await;
+        let session_id = seed_session(&state, Role::Owner, "tok-1").await;
+        let mut session = crate::server::auth::session::get_session(&state.ks, &session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        session.not_after = Some(now_epoch().saturating_sub(1));
+        store_session(&state.ks, &session).await.unwrap();
+        let token = issue(&state, &session_id, "owner", "tok-1");
+        let mut parts = parts_with_bearer(&token);
+        let refused = AuthClaims::from_request_parts(&mut parts, &state).await;
+        assert!(
+            matches!(refused, Err(AppError::Unauthorized(_))),
+            "{refused:?}"
+        );
+
+        session.not_after = Some(now_epoch() + 3600);
+        store_session(&state.ks, &session).await.unwrap();
+        let mut parts = parts_with_bearer(&token);
+        AuthClaims::from_request_parts(&mut parts, &state)
+            .await
+            .expect("a session before its end is accepted");
     }
 
     #[tokio::test]
