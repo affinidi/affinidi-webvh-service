@@ -2054,6 +2054,10 @@ pub async fn delete_did(
     // current owner's even if a transfer committed just before.
     let _path_guard = state.path_locks.guard(mnemonic).await;
     let record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
+    // Deleting is a hard delete, and a later re-register starts a fresh,
+    // active slot: deleting a slot an admin suspended would lift the
+    // suspension, so it is the admin's to do.
+    refuse_lifting_admin_suspension(auth, &record, mnemonic, "delete")?;
 
     let did_id = record.did_id.clone();
 
@@ -2428,6 +2432,28 @@ async fn commit_owner_change(
     Ok(prev_owner)
 }
 
+/// Refuse `action` by anyone but an admin on a slot an admin suspended: it
+/// would lift the suspension.
+fn refuse_lifting_admin_suspension(
+    auth: &AuthClaims,
+    record: &DidRecord,
+    mnemonic: &str,
+    action: &str,
+) -> Result<(), AppError> {
+    if record.disabled_by_admin && auth.role != crate::acl::Role::Admin {
+        warn!(
+            caller = %auth.did,
+            mnemonic = %mnemonic,
+            action,
+            "denied: the slot was suspended by an admin"
+        );
+        return Err(AppError::Forbidden(
+            "this DID was suspended by an admin; only an admin can resume or delete it".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Toggle the `disabled` flag on a DID record.
 pub async fn set_did_disabled(
     auth: &AuthClaims,
@@ -2451,16 +2477,7 @@ pub async fn set_did_disabled(
         // lift it; an owner suspending an admin-suspended slot changes nothing.
         record.disabled_by_admin |= is_admin;
     } else if record.disabled_by_admin {
-        if !is_admin {
-            warn!(
-                caller = %auth.did,
-                mnemonic = %mnemonic,
-                "resume denied: the slot was suspended by an admin"
-            );
-            return Err(AppError::Forbidden(
-                "this DID was suspended by an admin; only an admin can resume it".into(),
-            ));
-        }
+        refuse_lifting_admin_suspension(auth, &record, mnemonic, "resume")?;
         record.disabled_by_admin = false;
     }
     record.disabled = disabled;
@@ -3435,6 +3452,89 @@ mod tests_atomic {
             .await
             .expect("admin resumes");
         assert!(!record.disabled && !record.disabled_by_admin);
+    }
+
+    /// Deleting a slot and registering it again would start it afresh, so the
+    /// owner may not delete a slot an admin suspended; an admin may.
+    #[tokio::test]
+    async fn an_owner_cannot_delete_its_way_out_of_an_admin_suspension() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let admin = "did:example:admin";
+        let path = "held-delete";
+        let did_log = build_test_did_log("scid-held-delete", "control.test", path).await;
+        create_did(&owner_auth(owner), &state, Some(path), false, None)
+            .await
+            .expect("reserve");
+        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
+            .await
+            .expect("register");
+        set_did_disabled(&admin_auth(admin), &state, path, true)
+            .await
+            .expect("admin suspends");
+
+        let refused = delete_did(&owner_auth(owner), &state, path, None).await;
+        assert!(
+            matches!(refused, Err(AppError::Forbidden(_))),
+            "the owner deleted an admin-suspended slot: {refused:?}"
+        );
+        // Still there, and a re-register keeps it suspended.
+        let record = register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
+            .await
+            .expect("re-register");
+        assert!(record.disabled && record.disabled_by_admin);
+
+        delete_did(&admin_auth(admin), &state, path, None)
+            .await
+            .expect("an admin may delete it");
+        assert!(
+            state
+                .dids_ks
+                .get::<DidRecord>(did_key(path))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A transfer moves the slot with its suspension.
+    #[tokio::test]
+    async fn a_transfer_keeps_an_admin_suspension() {
+        use did_hosting_common::server::domain::DomainScope;
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let recipient = "did:example:recipient";
+        let admin = "did:example:admin";
+        let path = "held-transfer";
+        seed_caller_acl(&state, recipient, Role::Owner, DomainScope::All).await;
+        let did_log = build_test_did_log("scid-held-transfer", "control.test", path).await;
+        create_did(&owner_auth(owner), &state, Some(path), false, None)
+            .await
+            .expect("reserve");
+        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
+            .await
+            .expect("register");
+        set_did_disabled(&admin_auth(admin), &state, path, true)
+            .await
+            .expect("admin suspends");
+
+        // The owner offers the slot; the recipient accepts it.
+        change_did_owner(&owner_auth(owner), &state, path, recipient, None)
+            .await
+            .map_err(|_| "offer")
+            .unwrap();
+        let moved = change_did_owner(&owner_auth(recipient), &state, path, recipient, None)
+            .await
+            .map_err(|_| "accept")
+            .unwrap();
+        assert_eq!(moved.record.owner, recipient);
+        assert!(moved.record.disabled && moved.record.disabled_by_admin);
+
+        let refused = set_did_disabled(&owner_auth(recipient), &state, path, false).await;
+        assert!(
+            matches!(refused, Err(AppError::Forbidden(_))),
+            "{refused:?}"
+        );
     }
 
     /// An owner's own suspension stays the owner's to lift, and a re-register

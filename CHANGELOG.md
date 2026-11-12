@@ -17,7 +17,15 @@ keeps the slot suspended. An administrator's `active` clears it.
 Behaviour change: a re-register (`did/register` of an existing slot) and a
 forced re-create no longer resume a suspended slot, whoever suspended it;
 the slot is resumed with `did/set-state active`. An owner can still
-suspend and resume a slot it suspended itself.
+suspend and resume a slot it suspended itself. An owner can no longer
+delete a slot an administrator suspended (`permissionDenied`): the delete
+is final, so a later re-register would start the slot afresh. An
+administrator can still delete it.
+
+Upgrade note: a binary from before this change does not know the marker
+and drops it when it rewrites a record. After a downgrade, or while
+replicas of mixed versions share a store, re-apply administrator
+suspensions once every replica runs this version.
 
 ### Fixed — the large-document cost of an address decays, and a `did:scid` issuer's `?src=` is not a mismatch
 
