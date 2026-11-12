@@ -36,7 +36,8 @@ pub struct BootstrapResult {
 /// The request is signed by the new DID itself (its `#key-0`, the
 /// `authentication` key [`bootstrap_did`] gives it), so the witness resolves
 /// that DID to verify the request: the DID must already be served where its
-/// identifier says, and the witness must list it as an administrator. The
+/// identifier says, and the witness's ACL must list it with role `service`
+/// (enough to request signatures) or `admin`. The
 /// witness verifies the whole log before it signs, and its signed reply is
 /// verified against `witness_did` before the proof is used.
 pub async fn request_witness_proof(

@@ -62,8 +62,12 @@ enum Command {
         /// DID to grant access to
         #[arg(long)]
         did: String,
-        /// Role: admin or owner
-        #[arg(long, default_value = "owner")]
+        /// Role, required: `admin` (create, list and delete witness
+        /// identities, administer this ACL, and request signatures) or
+        /// `service` (request signatures only: for a control plane, VTA or
+        /// edge that needs proofs). `owner` and `metricsReader` entries can
+        /// do nothing on a witness.
+        #[arg(long)]
         role: String,
     },
     /// List all access control entries

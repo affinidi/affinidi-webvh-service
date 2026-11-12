@@ -185,9 +185,9 @@ pub fn act_of_domains(domains: &DomainScope) -> AuthorityScope {
 
 /// The key scope a local entry holds. `signing_oracle` is whether this
 /// service will sign on an ACL member's behalf (the witness does, for an
-/// `Admin`, with any witness key).
+/// `Admin` or a `Service`, with any witness key).
 pub fn keys_of(role: &Role, signing_oracle: bool) -> KeyScope {
-    if signing_oracle && matches!(role, Role::Admin) {
+    if signing_oracle && matches!(role, Role::Admin | Role::Service) {
         KeyScope::All
     } else {
         KeyScope::None
@@ -553,6 +553,10 @@ mod tests {
         assert_eq!(keys_of(&Role::Admin, false), KeyScope::None);
         assert_eq!(keys_of(&Role::Admin, true), KeyScope::All);
         assert_eq!(keys_of(&Role::Owner, true), KeyScope::None);
+        // A witness's `service` entries may have it sign, and say so.
+        assert_eq!(keys_of(&Role::Service, true), KeyScope::All);
+        assert_eq!(keys_of(&Role::Service, false), KeyScope::None);
+        assert_eq!(keys_of(&Role::MetricsReader, true), KeyScope::None);
     }
 
     fn admin(act: serde_json::Value) -> serde_json::Value {

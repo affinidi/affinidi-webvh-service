@@ -145,7 +145,7 @@ rather than to the proxy.
 ```
 webvh-witness                                  # Run witness (default)
 webvh-witness setup                            # Interactive config wizard
-webvh-witness add-acl --did <DID> [--role admin|owner]  # Add ACL entry
+webvh-witness add-acl --did <DID> --role admin|service  # Add ACL entry
 webvh-witness list-acl                         # List ACL entries
 webvh-witness create-witness [--label <name>]  # Create witness identity
 webvh-witness list-witnesses                   # List witness identities
@@ -234,8 +234,15 @@ every transport:
 | `webvh/witness/key/create/0.1` | an Admin |
 | `webvh/witness/key/list/0.1` | an Admin |
 | `webvh/witness/key/delete/0.1` | an Admin |
-| `webvh/witness/sign/0.1` | an Admin |
-| `acl/grant\|revoke\|change-role\|show\|list/0.1` | per the ACL family's rules |
+| `webvh/witness/sign/0.1` | an Admin or a Service |
+| `acl/grant\|revoke\|change-role\|show\|list/0.1` | an Admin; any member may also show or revoke its own entry |
+
+Enter a caller that only needs proofs — a control plane, a VTA, an edge
+bootstrapping its DID — with role `service`: it can request signatures with
+any of the witness's identities (its ACL entry states `keys: all`) and
+cannot create or delete identities or change the ACL. Keep `admin` for the
+operators who manage the witness. An `owner` or `metricsReader` entry can do
+nothing on a witness.
 
 `webvh/witness/sign` carries the DID log up to and including the entry to
 witness, and the witness verifies it before signing: the chain must verify,

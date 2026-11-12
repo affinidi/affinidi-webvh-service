@@ -9,8 +9,9 @@
 //! - `webvh/witness/key/create|list|delete/0.1` — administer witness identities;
 //! - `webvh/witness/sign/0.1` — witness one log entry, after verifying the log;
 //! - `acl/grant|revoke|change-role|show/0.2`, `acl/list/0.3` — the witness's
-//!   own ACL. An `Admin` may have the witness sign with any of its keys, so
-//!   the witness's entries state `keys: all` for an `Admin` (AclEntry 0.2).
+//!   own ACL. An `Admin` or a `Service` may have the witness sign with any of
+//!   its keys, so the witness's entries state `keys: all` for both (AclEntry
+//!   0.2). Only an `Admin` may administer keys or the ACL.
 //!
 //! ## Every request is a document its issuer signed
 //!
@@ -92,13 +93,24 @@ pub fn build_verifier(
     did_hosting_common::server::trust_tasks::build_verifier(did_resolver)
 }
 
-/// Whether `role` authorises `type_uri`: a witness-admin task
-/// ([`WITNESS_TASKS`]) requires [`Role::Admin`]; every other task (the shared
-/// ACL family, and anything unsupported) requires only some ACL entry. Used
-/// both for the cheap pre-check against a claimed issuer and the real check
-/// against the proven one, so the two can never drift apart.
-fn task_authorised(type_uri: &str, role: Option<Role>) -> bool {
-    if WITNESS_TASKS.contains(&type_uri) {
+/// Whether `role` authorises `type_uri`:
+///
+/// - `webvh/witness/sign` — [`Role::Admin`] or [`Role::Service`]. A caller
+///   that only needs proofs (a control plane, a VTA, an edge bootstrapping a
+///   DID) is entered as `service`: it can have the witness sign, and nothing
+///   else.
+/// - the other witness tasks (`key/create|list|delete`) — [`Role::Admin`]
+///   only.
+/// - every other task (the shared ACL family, and anything unsupported) —
+///   some ACL entry; the ACL family's handlers then require `Admin` for
+///   every operation themselves.
+///
+/// Used both for the cheap pre-check against a claimed issuer and the real
+/// check against the proven one, so the two can never drift apart.
+pub fn task_authorised(type_uri: &str, role: Option<Role>) -> bool {
+    if type_uri == sign::Payload::TYPE_URI {
+        matches!(role, Some(Role::Admin | Role::Service))
+    } else if WITNESS_TASKS.contains(&type_uri) {
         role == Some(Role::Admin)
     } else {
         role.is_some()
@@ -561,6 +573,26 @@ async fn sign_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_service_entry_may_sign_and_do_nothing_else() {
+        for role in [Role::Admin, Role::Service] {
+            assert!(task_authorised(sign::Payload::TYPE_URI, Some(role)));
+        }
+        for role in [None, Some(Role::Owner), Some(Role::MetricsReader)] {
+            assert!(!task_authorised(sign::Payload::TYPE_URI, role));
+        }
+        for type_uri in [
+            key_create::Payload::TYPE_URI,
+            key_list::Payload::TYPE_URI,
+            key_delete::Payload::TYPE_URI,
+        ] {
+            assert!(task_authorised(type_uri, Some(Role::Admin)), "{type_uri}");
+            for role in [Role::Service, Role::Owner, Role::MetricsReader] {
+                assert!(!task_authorised(type_uri, Some(role)), "{type_uri}");
+            }
+        }
+    }
 
     #[test]
     fn a_throttled_store_asks_for_a_retry_and_nothing_internal_reaches_the_wire() {
