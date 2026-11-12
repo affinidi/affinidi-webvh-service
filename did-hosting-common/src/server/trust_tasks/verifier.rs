@@ -1703,7 +1703,8 @@ mod tests {
             decode: CachedDidResolver::new(Arc::new(client)),
             deactivation: Some(deactivation),
         };
-        let resolver = PurposeBound::new(&signers, ProofPurpose::Authentication);
+        let recording = Recording::new(&signers);
+        let resolver = PurposeBound::new(&recording, ProofPurpose::Authentication);
         resolver
             .resolve_vm(&format!("{live}#key-1"))
             .await
@@ -1713,6 +1714,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("deactivated"), "{err}");
+        assert_eq!(
+            recording.failure_kind(),
+            Some(VerifyFailureKind::Deactivated)
+        );
     }
 
     /// A signed did:webvh log for `localhost:{port}` with `secret` as its
