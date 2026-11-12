@@ -107,7 +107,7 @@ pub fn build_verifier(
 ///
 /// Used both for the cheap pre-check against a claimed issuer and the real
 /// check against the proven one, so the two can never drift apart.
-pub fn task_authorised(type_uri: &str, role: Option<Role>) -> bool {
+fn task_authorised(type_uri: &str, role: Option<Role>) -> bool {
     if type_uri == sign::Payload::TYPE_URI {
         matches!(role, Some(Role::Admin | Role::Service))
     } else if WITNESS_TASKS.contains(&type_uri) {

@@ -263,8 +263,8 @@ the root fallback, which also serves the UI.
 did-hosting-daemon                      # Run daemon (default)
 did-hosting-daemon setup                # Interactive config wizard
 did-hosting-daemon health               # Run health check diagnostics
-did-hosting-daemon add-acl              # Add ACL entry
-did-hosting-daemon list-acl             # List ACL entries
+did-hosting-daemon add-acl              # Add ACL entry (--witness: to the embedded witness's ACL)
+did-hosting-daemon list-acl             # List ACL entries (--witness: the embedded witness's ACL)
 did-hosting-daemon reset-witness-kek-claim  # Clear a stuck witness key-encryption-key creation claim
 did-hosting-daemon remove-acl           # Remove ACL entry
 did-hosting-daemon invite               # Create passkey enrollment invite

@@ -130,9 +130,19 @@ enum Command {
         /// Optional label
         #[arg(long)]
         label: Option<String>,
+        /// Add the entry to the embedded witness's ACL (`[witness_store]`)
+        /// instead of the control plane's. The role must then be `admin`
+        /// or `service` (request witness signatures only).
+        #[arg(long)]
+        witness: bool,
     },
     /// List all ACL entries
-    ListAcl,
+    ListAcl {
+        /// List the embedded witness's ACL (`[witness_store]`) instead of
+        /// the control plane's.
+        #[arg(long)]
+        witness: bool,
+    },
     /// Clear the embedded witness's key-encryption-key creation claim left
     /// by a start that stopped while creating the key (`[witness_store]`).
     /// Refused once a key is held or recorded.
@@ -489,8 +499,13 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::AddAcl { did, role, label }) => {
-            if let Err(e) = run_add_acl(cli.config, did, role, label).await {
+        Some(Command::AddAcl {
+            did,
+            role,
+            label,
+            witness,
+        }) => {
+            if let Err(e) = run_add_acl(cli.config, did, role, label, witness).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -544,8 +559,8 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::ListAcl) => {
-            if let Err(e) = run_list_acl(cli.config).await {
+        Some(Command::ListAcl { witness }) => {
+            if let Err(e) = run_list_acl(cli.config, witness).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -795,6 +810,12 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     };
 
     init_tracing(&config.log);
+
+    // The embedded witness keeps its own ACL only if its store is its own.
+    if let Err(e) = config.check_witness_store_is_separate() {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
 
     // Load secrets (shared across server, witness, control)
     let secrets = load_secrets(&config).await;
@@ -1930,17 +1951,22 @@ async fn run_add_acl(
     did: String,
     role_str: String,
     label: Option<String>,
+    witness: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = DaemonConfig::load(config_path)?;
-    did_hosting_common::server::cli_acl::run_add_acl(
-        &config.store,
-        did,
-        role_str,
-        label,
-        None,
-        None,
-    )
-    .await
+    let store = if witness {
+        // Only these do anything on a witness.
+        if !matches!(role_str.as_str(), "admin" | "service") {
+            return Err(format!(
+                "a witness ACL entry's role is `admin` or `service`, not '{role_str}'"
+            )
+            .into());
+        }
+        &config.witness_store
+    } else {
+        &config.store
+    };
+    did_hosting_common::server::cli_acl::run_add_acl(store, did, role_str, label, None, None).await
 }
 
 async fn run_reset_witness_kek_claim(
@@ -1965,9 +1991,17 @@ async fn run_reset_witness_kek_claim(
     Ok(())
 }
 
-async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_list_acl(
+    config_path: Option<PathBuf>,
+    witness: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let config = DaemonConfig::load(config_path)?;
-    did_hosting_common::server::cli_acl::run_list_acl(&config.store).await
+    let store = if witness {
+        &config.witness_store
+    } else {
+        &config.store
+    };
+    did_hosting_common::server::cli_acl::run_list_acl(store).await
 }
 
 /// Read the daemon's counters over the authenticated `server/metrics/0.1`

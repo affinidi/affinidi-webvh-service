@@ -1147,3 +1147,166 @@ async fn a_witness_service_entry_states_every_key() {
     assert_eq!(payload["entry"]["keys"]["scope"], "all", "{payload}");
     assert_eq!(payload["entry"]["role"], "service", "{payload}");
 }
+
+/// A grant on a witness stating a key list is refused: the witness holds
+/// `all` or `none`, never a list.
+#[tokio::test]
+async fn a_witness_grant_with_listed_keys_is_refused() {
+    use did_hosting_common::tasks::acl::grant;
+    let (state, _dir) = witness_state().await;
+    let a = admin();
+    let subject = signer(92).0;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(
+            grant::v0_2::Payload::TYPE_URI,
+            &a,
+            json!({ "entry": {
+                "subject": subject,
+                "role": "service",
+                "act": { "scope": "all" },
+                "keys": { "scope": "listed", "keys": ["z6MkSomeWitnessKey"] },
+                "capabilities": { "scope": "ceiling" },
+            } }),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(refused(&reply, &a.0), "taskFailed", "{reply}");
+    assert!(
+        did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &subject)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// The migration path for an existing caller: an admin moves it from
+/// `admin` to `service`, and it can still request signatures but no longer
+/// administer the witness.
+#[tokio::test]
+async fn an_admin_moved_to_service_still_signs_and_no_longer_administers() {
+    use did_hosting_common::tasks::acl::change_role;
+    let (state, _dir) = witness_state().await;
+    let caller = service_caller();
+    store_acl_entry(
+        &state.acl_ks,
+        &AclEntry {
+            did: caller.0.clone(),
+            role: Role::Admin,
+            label: None,
+            created_at: 1_700_000_000,
+            max_total_size: None,
+            max_did_count: None,
+            domains: DomainScope::All,
+        },
+    )
+    .await
+    .unwrap();
+    let a = admin();
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(
+            change_role::v0_2::Payload::TYPE_URI,
+            &a,
+            json!({
+                "subject": caller.0,
+                "fromRole": "admin",
+                "toRole": "service",
+                "reason": "signatures only",
+            }),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    answered(&reply, change_role::v0_2::Payload::TYPE_URI);
+
+    let (record, log) = identity_and_log(&state).await;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &caller.0,
+        signed(
+            sign::Payload::TYPE_URI,
+            &caller,
+            sign_payload(&record.witness_id, &log),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        reply["type"],
+        format!("{}#response", sign::Payload::TYPE_URI),
+        "{reply}"
+    );
+    assert_eq!(
+        deliver(
+            &state,
+            Via::Https,
+            &caller.0,
+            signed(
+                key_delete::Payload::TYPE_URI,
+                &caller,
+                json!({ "witnessId": record.witness_id }),
+            )
+            .await,
+        )
+        .await,
+        None
+    );
+}
+
+/// A `service` caller may read its own entry but not list the ACL or read
+/// another member's entry.
+#[tokio::test]
+async fn a_service_entry_cannot_read_the_acl() {
+    let (state, _dir) = witness_state().await;
+    add_service_entry(&state).await;
+    let svc = service_caller();
+    for (type_uri, payload) in [
+        (acl_list::v0_3::Payload::TYPE_URI, json!({})),
+        (
+            acl_show::v0_2::Payload::TYPE_URI,
+            json!({ "subject": admin().0 }),
+        ),
+    ] {
+        let reply = deliver(
+            &state,
+            Via::Https,
+            &svc.0,
+            signed(type_uri, &svc, payload).await,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(
+            refused(&reply, &svc.0),
+            "permissionDenied",
+            "{type_uri}: {reply}"
+        );
+    }
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &svc.0,
+        signed(
+            acl_show::v0_2::Payload::TYPE_URI,
+            &svc,
+            json!({ "subject": svc.0 }),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        reply["type"],
+        format!("{}#response", acl_show::v0_2::Payload::TYPE_URI),
+        "{reply}"
+    );
+}

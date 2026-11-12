@@ -235,14 +235,24 @@ every transport:
 | `webvh/witness/key/list/0.1` | an Admin |
 | `webvh/witness/key/delete/0.1` | an Admin |
 | `webvh/witness/sign/0.1` | an Admin or a Service |
-| `acl/grant\|revoke\|change-role\|show\|list/0.1` | an Admin; any member may also show or revoke its own entry |
+| `acl/grant\|revoke\|change-role\|show/0.2`, `acl/list/0.3` | an Admin; any member may also show or revoke its own entry |
 
 Enter a caller that only needs proofs — a control plane, a VTA, an edge
 bootstrapping its DID — with role `service`: it can request signatures with
 any of the witness's identities (its ACL entry states `keys: all`) and
 cannot create or delete identities or change the ACL. Keep `admin` for the
 operators who manage the witness. An `owner` or `metricsReader` entry can do
-nothing on a witness.
+nothing on a witness, and `add-acl` accepts only `admin` and `service`.
+
+In `did-hosting-daemon` the embedded witness's ACL is kept in
+`[witness_store]`, apart from the control plane's. Add the first entry with
+`did-hosting-daemon add-acl --witness --did <DID> --role admin|service` (and
+list it with `list-acl --witness`); after that the ACL Trust Tasks on
+`/witness/api/trust-tasks` manage it. There is no daemon CLI to remove a
+witness entry; use `acl/revoke`. The daemon refuses to start if `[witness_store]`
+names the same data as `[store]` (the same directory, Redis URL, DynamoDB
+table prefix and region, Firestore database or Cosmos DB database), since the
+witness would then share the control plane's ACL.
 
 `webvh/witness/sign` carries the DID log up to and including the entry to
 witness, and the witness verifies it before signing: the chain must verify,
