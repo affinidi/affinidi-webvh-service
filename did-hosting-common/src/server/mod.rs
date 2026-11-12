@@ -20,6 +20,7 @@ pub mod identity_drain;
 pub mod identity_rotate;
 pub mod identity_scid_alias;
 pub mod init;
+pub mod listener;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod migrations;

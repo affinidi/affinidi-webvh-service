@@ -159,7 +159,7 @@ impl Pair {
                     axum::extract::State(self.watcher.clone()),
                     axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
                     axum::http::HeaderMap::new(),
-                    axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
+                    axum::body::Body::from(serde_json::to_vec(&doc).unwrap()),
                 )
                 .await
                 .into_response();

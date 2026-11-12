@@ -125,6 +125,19 @@ The replay settings live in `[replay]` (`max_entries`,
 entries witnessed (about 600 a second at the default). The control plane's README explains the
 bounds ("Replay cache bounds").
 
+### Connection limits and a reverse proxy
+
+The HTTP listener applies its own limits: at most 256 connections are
+served at once (more wait for a free slot); a request's headers must arrive
+within 20 seconds of its first byte; a connection waiting for its next
+request, or not reading its response, is closed after 60 seconds; and a
+`POST /api/trust-tasks` body is read only after the sender's address passes
+its rate limit, at most 1 MiB and within 30 seconds (`413` / `408`
+otherwise). These are a backstop. The listener binds `0.0.0.0` by default;
+put a reverse proxy in front of it for TLS and its own limits, and list the
+proxy in `server.trusted_proxies` so per-address limits apply to clients
+rather than to the proxy.
+
 ## CLI Commands
 
 ```

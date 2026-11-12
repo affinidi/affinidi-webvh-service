@@ -52,6 +52,9 @@ pub struct AppState {
     /// once with the state and shared by the Trust Task listener and the
     /// resolution limit.
     pub client_ips: did_hosting_common::server::rate_limit::ClientIps,
+    /// How long `POST /api/trust-tasks` waits for a whole body, once the
+    /// address is admitted.
+    pub body_read_timeout: std::time::Duration,
 }
 
 impl AppState {
@@ -76,6 +79,7 @@ impl AppState {
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
             didcomm_service: Arc::new(OnceLock::new()),
             client_ips,
+            body_read_timeout: did_hosting_common::server::listener::BODY_READ_TIMEOUT,
             trust_tasks_rate_limiter: Arc::new(
                 did_hosting_common::server::rate_limit::IpRateLimiter::new(
                     did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
@@ -320,8 +324,9 @@ fn run_rest_thread(
             .route("/api/health", get(routes::health::health));
         let _ = ready_tx.send(());
         let mut rx = shutdown_rx.clone();
+        // Header, idle and connection limits: see `listener`.
         axum::serve(
-            listener,
+            did_hosting_common::server::listener::bounded(listener),
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .with_graceful_shutdown(async move {

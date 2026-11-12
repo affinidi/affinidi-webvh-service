@@ -201,7 +201,7 @@ async fn deliver(state: &AppState, via: Via, sender: &str, doc: Value) -> Option
                 axum::extract::State(state.clone()),
                 axum::extract::ConnectInfo(fresh_https_addr()),
                 axum::http::HeaderMap::new(),
-                axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
+                axum::body::Body::from(serde_json::to_vec(&doc).unwrap()),
             )
             .await
             .into_response();
