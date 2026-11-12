@@ -123,6 +123,7 @@ async fn seed_did(state: &AppState, mnemonic: &str, did_id: &str, body: &str) {
                 did_id: Some(did_id.into()),
                 content_size: body.len() as u64,
                 disabled: false,
+                disabled_by_admin: false,
                 deleted_at: None,
                 method: "webvh".into(),
                 domain: String::new(),
@@ -549,6 +550,7 @@ async fn resolve_side_safety_blocks_cross_domain_and_disabled_domain() {
         did_id: Some(did_id.into()),
         content_size: body.len() as u64,
         disabled: false,
+        disabled_by_admin: false,
         deleted_at: None,
         method: "webvh".into(),
         domain: "domain-a.example".into(),
@@ -842,6 +844,7 @@ async fn first_boot_init_seeds_domain_and_backfills_legacy_records() {
         did_id: Some(did_id.into()),
         content_size: 0,
         disabled: false,
+        disabled_by_admin: false,
         deleted_at: None,
         method: "webvh".into(),
         domain: String::new(), // legacy state

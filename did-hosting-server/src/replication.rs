@@ -553,6 +553,7 @@ mod tests {
             did_id: Some("did:webvh:Q1:example.com:slot".into()),
             content_size: 0,
             disabled,
+            disabled_by_admin: false,
             deleted_at: None,
             method: "webvh".into(),
             domain: "example.com".into(),

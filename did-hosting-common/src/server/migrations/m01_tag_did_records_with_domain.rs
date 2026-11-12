@@ -201,6 +201,7 @@ mod tests {
             did_id: did_id.map(|s| s.to_string()),
             content_size: 0,
             disabled: false,
+            disabled_by_admin: false,
             deleted_at: None,
             method: "webvh".into(),
             domain: String::new(), // legacy state
@@ -219,6 +220,7 @@ mod tests {
             did_id: None,
             content_size: 0,
             disabled: false,
+            disabled_by_admin: false,
             deleted_at: None,
             method: "webvh".into(),
             domain: domain.into(),

@@ -2097,6 +2097,7 @@ mod tests {
             did_id: Some(format!("did:webvh:abc:{mnemonic}")),
             content_size: 42,
             disabled: false,
+            disabled_by_admin: false,
             deleted_at: None,
 
             // T12: legacy construction site; T13 migration fills `domain`.
@@ -3112,6 +3113,7 @@ mod tests {
             did_id: Some(did_id.into()),
             content_size: 1,
             disabled: false,
+            disabled_by_admin: false,
             deleted_at: None,
             method: "webvh".into(),
             domain: String::new(),

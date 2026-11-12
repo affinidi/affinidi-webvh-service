@@ -669,6 +669,7 @@ pub async fn apply_single_update(
         // The source's disabled state travels with the content: a disabled
         // slot stops resolving here until an update carries `false`.
         disabled: update.disabled,
+        disabled_by_admin: false,
         deleted_at: None,
 
         // Tagged from the content, not from the push: the host the DID

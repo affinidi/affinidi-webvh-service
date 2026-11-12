@@ -315,6 +315,7 @@ mod own_did_served_locally_tests {
             did_id: Some(did_id.into()),
             content_size: 2,
             disabled: false,
+            disabled_by_admin: false,
             deleted_at: None,
             method: "webvh".into(),
             domain: String::new(),
