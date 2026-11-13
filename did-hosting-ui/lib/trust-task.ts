@@ -441,7 +441,7 @@ async function sign(
   // `session_pubkey_b58btc` on `/auth/` — and the control plane accepts it as
   // the subject for that session only. It signs every call, with no wallet
   // prompt. A step-up's decision is not signed here: the wallet signs it as
-  // the subject (`approveStepUpRequest`), since a session key may never sign
+  // the subject (`approveSessionStepUp`), since a session key may never sign
   // an approval.
   //
   // The key is restored from IndexedDB after a reload. When it is gone, the

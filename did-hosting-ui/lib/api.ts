@@ -1300,7 +1300,7 @@ export const api = {
    *    bound to this session and its subject, that lapses on its own.
    * 2. The wallet gets that approve-request and nothing else. It verifies it,
    *    asks the user, and returns its `approve-response`, signed as the
-   *    subject (`approveStepUpRequest`). A session key may never sign an
+   *    subject (`approveSessionStepUp`). A session key may never sign an
    *    approval, so this is the one step the wallet is needed for.
    * 3. The console sends the decision. The control plane checks it answers
    *    the pending challenge for this session, signed by its subject, and
@@ -1315,7 +1315,7 @@ export const api = {
     await restoreSession();
     const wallet = typeof window !== "undefined" ? window.vtaWallet : undefined;
     const sessionId = getSessionId();
-    if (getAuthMethod() !== "wallet" || !wallet?.approveStepUpRequest) {
+    if (getAuthMethod() !== "wallet" || !wallet?.approveSessionStepUp) {
       throw new ApiError(
         403,
         "This action needs a stepped-up session. Sign in again with a passkey, or with a wallet that supports step-up.",
@@ -1340,7 +1340,7 @@ export const api = {
       throw new ApiError(502, "the control plane answered the step-up with no request for this session");
     }
 
-    const { approveResponse } = await wallet.approveStepUpRequest({
+    const { approveResponse } = await wallet.approveSessionStepUp({
       rpDid: serviceDid,
       approveRequest: approveRequest as unknown as Record<string, unknown>,
     });

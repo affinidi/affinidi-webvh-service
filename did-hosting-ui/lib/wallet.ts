@@ -132,7 +132,7 @@ interface VtaWalletProvider {
    *  renews the session with its own session key.
    *
    *  The wallet never sees the session's access or refresh token. */
-  approveStepUpRequest?(params: {
+  approveSessionStepUp?(params: {
     rpDid: string;
     approveRequest: Record<string, unknown>;
   }): Promise<{ approveResponse: Record<string, unknown> }>;

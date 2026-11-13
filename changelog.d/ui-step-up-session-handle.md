@@ -10,7 +10,7 @@ decision and renewed the session itself. Now the console keeps both tokens:
    `auth/step-up/approve-request/0.5`, a single-use challenge bound to this
    session and its subject that lapses on its own (300 seconds).
 2. The wallet is handed that approve-request and the service DID, nothing
-   else (`window.vtaWallet.approveStepUpRequest({ rpDid, approveRequest })`).
+   else (`window.vtaWallet.approveSessionStepUp({ rpDid, approveRequest })`).
    It verifies the request, asks the user, and returns its
    `auth/step-up/approve-response/0.7`, signed as the subject
    (`assertionMethod`); a session key may never sign an approval.

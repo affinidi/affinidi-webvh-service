@@ -16,7 +16,7 @@
  *
  * From then on `trust-task.ts` signs this session's ordinary calls with the
  * session key. A step-up's decision still goes to the wallet
- * (`approveStepUpRequest`): the control plane never accepts a session key
+ * (`approveSessionStepUp`): the control plane never accepts a session key
  * where an `assertionMethod` approval is required. The wallet gets the
  * step-up's signed approve-request only, never the session's tokens.
  *

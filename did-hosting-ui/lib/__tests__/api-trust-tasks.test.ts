@@ -728,16 +728,16 @@ describe("step-up (wallet session)", () => {
     },
   });
 
-  function stubWallet<M>(approveStepUpRequest: M): M {
+  function stubWallet<M>(approveSessionStepUp: M): M {
     vi.stubGlobal("window", {
       location: { origin: "https://console.example.com" },
       dispatchEvent: vi.fn(),
       vtaWallet: {
         signTrustTask: vi.fn(),
-        approveStepUpRequest,
+        approveSessionStepUp,
       },
     });
-    return approveStepUpRequest;
+    return approveSessionStepUp;
   }
 
   /** A control plane that refuses the first `operation` with `refusal`,
