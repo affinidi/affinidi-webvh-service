@@ -181,13 +181,19 @@ export async function restoreSessionKeypair(): Promise<void> {
  * synchronous logout handlers don't have to await it.
  */
 export function clearSessionKeypair(): void {
-  sessionKeypair = null;
-  sessionPubkeyMultikey = null;
-  sessionDidKey = null;
+  forgetSessionKeypair();
   void idbDelete(KEYPAIR_KEY).catch((e) => {
     // eslint-disable-next-line no-console
     console.warn("session-key: IDB clear failed", e);
   });
+}
+
+/** Drop the keypair from memory only — for a tab told that another tab has
+ *  signed out, which has already deleted the stored copy. */
+export function forgetSessionKeypair(): void {
+  sessionKeypair = null;
+  sessionPubkeyMultikey = null;
+  sessionDidKey = null;
 }
 
 // ---------------------------------------------------------------------------

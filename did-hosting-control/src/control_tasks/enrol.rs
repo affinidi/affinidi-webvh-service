@@ -577,7 +577,9 @@ pub(crate) async fn invite(
         json!({
             "invite": {
                 "token": issued.token,
-                "url": format!("{base}/enroll?token={}", issued.token),
+                // In the fragment, which a browser never sends: the token
+                // stays out of the request line, access logs and `Referer`.
+                "url": format!("{base}/enroll#token={}", issued.token),
             },
             "subject": subject,
             "purpose": purpose.as_str(),

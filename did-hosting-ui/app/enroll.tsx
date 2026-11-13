@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   View,
   Text,
@@ -9,6 +9,7 @@ import {
 } from "react-native";
 import { useRouter, useLocalSearchParams } from "expo-router";
 import { AffinidiLogo } from "../components/AffinidiLogo";
+import { readPageParam, setNoReferrer, stripPageParam } from "../lib/address-bar";
 import type { RedeemFinishResponse, RedeemStartResponse } from "../lib/api";
 import {
   completeRedemption,
@@ -31,7 +32,17 @@ type EnrollState =
  * passkey this will be, and what it may do, before the browser creates it.
  */
 export default function Enroll() {
-  const { token } = useLocalSearchParams<{ token: string }>();
+  const params = useLocalSearchParams<{ token: string }>();
+  // Links carry the token in the fragment (`/enroll#token=…`), which the
+  // browser never sends to the web host; links issued before carried it in
+  // the query, which the router also exposes. Read once and kept here, then
+  // taken out of the address bar and the history entry, so it is not left on
+  // screen, in the browser's history or in a bookmark.
+  const [token] = useState(() => readPageParam("token") ?? params.token);
+  useEffect(() => {
+    setNoReferrer();
+    stripPageParam("token");
+  }, []);
   const router = useRouter();
   const [claimCode, setClaimCode] = useState("");
   const [label, setLabel] = useState("");
