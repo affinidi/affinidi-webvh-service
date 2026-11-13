@@ -40,7 +40,7 @@ use serde::Serialize;
 use serde_json::Value;
 use trust_tasks_rs::{RejectReason, TrustTask, VerificationError};
 
-use super::verifier::{TransportBoundVerifier, controller_did};
+use super::verifier::{TransportBoundVerifier, VerifyFailure, VerifyFailureKind, controller_did};
 use crate::scid::same_reference;
 use crate::server::didcomm_unpack::{FRESHNESS_WINDOW_SECS, FUTURE_SKEW_SECS};
 
@@ -67,13 +67,38 @@ pub enum BoundError {
     Expired(DateTime<Utc>),
     #[error("proof verification failed: {0}")]
     Proof(#[from] VerificationError),
+    /// The signer's DID could not be resolved, or its status read, so the
+    /// proof could not be checked. May clear on its own.
+    #[error("proof could not be checked: {0}")]
+    Unreachable(VerificationError),
+}
+
+/// A verification failure keeps the kind the verifier decided: an
+/// unreachable signer is [`BoundError::Unreachable`], anything else a final
+/// [`BoundError::Proof`].
+impl From<VerifyFailure> for BoundError {
+    fn from(failure: VerifyFailure) -> Self {
+        match failure.kind {
+            VerifyFailureKind::Unreachable => BoundError::Unreachable(failure.error),
+            _ => BoundError::Proof(failure.error),
+        }
+    }
 }
 
 impl BoundError {
+    /// A [`BoundError::Unreachable`] for a caller that gave up waiting on the
+    /// signer's DID: `detail` says why.
+    pub fn unreachable(detail: impl std::fmt::Display) -> Self {
+        BoundError::Unreachable(VerificationError::Other(format!(
+            "signer DID unreachable: {detail}"
+        )))
+    }
+
     /// Whether the failure may clear on its own — the signer's DID could not be
     /// resolved, or its status read — so the same document is worth re-sending.
+    /// Decided by the variant, never by an error message.
     pub fn is_transient(&self) -> bool {
-        matches!(self, BoundError::Proof(e) if super::verifier::is_unreachable(e))
+        matches!(self, BoundError::Unreachable(_))
     }
 
     /// The framework rejection this failure is reported as on the wire. A
@@ -109,6 +134,7 @@ impl BoundError {
             BoundError::Proof(e) => RejectReason::ProofInvalid {
                 reason: e.to_string(),
             },
+            BoundError::Unreachable(_) => RejectReason::Unavailable { retry_after: None },
         }
     }
 }
@@ -215,8 +241,8 @@ where
 {
     precheck_sender_bound(doc, expected_issuer, transport_sender, my_vid, now)?;
     match relationship {
-        Relationship::Authentication => verifier.verify_operational(doc).await?,
-        Relationship::AssertionMethod => verifier.verify_approval(doc).await?,
+        Relationship::Authentication => verifier.check_operational(doc).await?,
+        Relationship::AssertionMethod => verifier.check_approval(doc).await?,
     }
     // The identity, not the reference: a did:scid issuer may carry the `src`
     // its recipient needed to resolve it, which is not part of who it is.
@@ -698,6 +724,41 @@ mod tests {
             err.reject_reason(),
             RejectReason::Unavailable { .. }
         ));
+    }
+
+    /// Whether a failure is retryable follows the kind the verifier decided,
+    /// never the message: a message that reads like an unreachable signer is
+    /// still final, and an unreachable signer is retryable whatever its text.
+    #[test]
+    fn transience_follows_the_verifier_kind_not_the_message() {
+        let lookalike = BoundError::from(VerifyFailure {
+            kind: VerifyFailureKind::Invalid,
+            error: VerificationError::Other(
+                "signer DID unreachable: did:example:x is deactivated".into(),
+            ),
+        });
+        assert!(!lookalike.is_transient(), "{lookalike:?}");
+        assert!(matches!(
+            lookalike.reject_reason(),
+            RejectReason::ProofInvalid { .. }
+        ));
+
+        let deactivated = BoundError::from(VerifyFailure {
+            kind: VerifyFailureKind::Deactivated,
+            error: VerificationError::Other("signer DID unreachable".into()),
+        });
+        assert!(!deactivated.is_transient(), "{deactivated:?}");
+
+        let unreachable = BoundError::from(VerifyFailure {
+            kind: VerifyFailureKind::Unreachable,
+            error: VerificationError::SignatureInvalid,
+        });
+        assert!(unreachable.is_transient(), "{unreachable:?}");
+        assert!(matches!(
+            unreachable.reject_reason(),
+            RejectReason::Unavailable { .. }
+        ));
+        assert!(BoundError::unreachable("gave up waiting").is_transient());
     }
 
     #[test]

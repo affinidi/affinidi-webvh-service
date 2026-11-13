@@ -485,3 +485,136 @@ async fn members_this_release_does_not_know_survive_its_writes() {
     assert!(dbg.contains("from_a_newer_release"), "{dbg}");
     assert!(!dbg.contains("secret-value"), "{dbg}");
 }
+
+/// A backend that pauses inside every read and write, so concurrent
+/// read-modify-writes interleave if nothing orders them.
+#[derive(Default)]
+struct SlowBackend {
+    bytes: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    hang_reads: bool,
+}
+
+type VtiFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, vti_common::error::AppError>> + Send + 'a>>;
+
+impl SeedStore for SlowBackend {
+    fn get(&self) -> VtiFuture<'_, Option<Vec<u8>>> {
+        Box::pin(async move {
+            if self.hang_reads {
+                std::future::pending::<()>().await;
+            }
+            let bytes = self.bytes.lock().unwrap().clone();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(bytes)
+        })
+    }
+
+    fn set(&self, secret: &[u8]) -> VtiFuture<'_, ()> {
+        let secret = secret.to_vec();
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            *self.bytes.lock().unwrap() = Some(secret);
+            Ok(())
+        })
+    }
+}
+
+/// Writes of the keys and of the bootstrap seed, racing in one process, both
+/// land: neither overwrites the other with the envelope it read first. Two
+/// stores over the same entry share its write slot, as the stores the
+/// service rebuilds do.
+#[tokio::test]
+async fn concurrent_envelope_writes_do_not_lose_each_other() {
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let location = format!("test entry {}", uuid::Uuid::new_v4());
+    let backend = || SlowBackend {
+        bytes: shared.clone(),
+        hang_reads: false,
+    };
+    let a = EnvelopeStore::new(Box::new(backend()), location.clone());
+    let b = EnvelopeStore::new(Box::new(backend()), location.clone());
+    let keys = sample();
+    let (set, seed) = tokio::join!(a.set(&keys), b.set_bootstrap_seed(&[9u8; 32]));
+    set.unwrap();
+    seed.unwrap();
+    assert_eq!(
+        a.get().await.unwrap().map(|s| s.signing_key),
+        Some(keys.signing_key.clone())
+    );
+    assert_eq!(a.get_bootstrap_seed().await.unwrap(), Some([9u8; 32]));
+
+    let (cleared, set) = tokio::join!(b.clear_bootstrap_seed(), a.set(&keys));
+    cleared.unwrap();
+    set.unwrap();
+    assert!(b.get_bootstrap_seed().await.unwrap().is_none());
+    assert!(b.get().await.unwrap().is_some());
+}
+
+/// A backend read that never returns fails the update after the I/O bound,
+/// releasing the entry's slot for the next one, and writes nothing.
+#[tokio::test]
+async fn a_wedged_backend_fails_the_update_and_frees_the_slot() {
+    let location = format!("test entry {}", uuid::Uuid::new_v4());
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let mut wedged = EnvelopeStore::new(
+        Box::new(SlowBackend {
+            bytes: shared.clone(),
+            hang_reads: true,
+        }),
+        location.clone(),
+    );
+    wedged.io_timeout = Duration::from_millis(50);
+    let err = wedged.set(&sample()).await.unwrap_err();
+    assert!(
+        matches!(err, AppError::SecretStore(ref m) if m.contains("timed out")),
+        "{err:?}"
+    );
+    assert!(shared.lock().unwrap().is_none(), "nothing was written");
+
+    let next = EnvelopeStore::new(
+        Box::new(SlowBackend {
+            bytes: shared.clone(),
+            hang_reads: false,
+        }),
+        location,
+    );
+    next.set_bootstrap_seed(&[3u8; 32]).await.unwrap();
+    assert_eq!(next.get_bootstrap_seed().await.unwrap(), Some([3u8; 32]));
+}
+
+/// A waiter gives up once the update wait passes rather than queueing
+/// indefinitely behind a slow update of the same entry.
+#[tokio::test]
+async fn a_waiter_gives_up_after_the_update_wait() {
+    let location = format!("test entry {}", uuid::Uuid::new_v4());
+    let slot = envelope_write_slot(&location);
+    let held = slot.lock().await;
+    let mut store = EnvelopeStore::new(Box::new(SlowBackend::default()), location);
+    store.wait = Duration::from_millis(50);
+    let err = store.set_bootstrap_seed(&[1u8; 32]).await.unwrap_err();
+    assert!(
+        matches!(err, AppError::SecretStore(ref m) if m.contains("waiting")),
+        "{err:?}"
+    );
+    drop(held);
+    store.set_bootstrap_seed(&[1u8; 32]).await.unwrap();
+}
+
+#[test]
+fn the_envelope_location_names_its_entry() {
+    let p = Path::new("/etc/svc/config.toml");
+    assert_eq!(
+        envelope_location(&plaintext_config(), p),
+        format!("file {}", plaintext_path(p).display())
+    );
+    let aws = SecretsConfig {
+        aws_secret_name: Some("svc-secrets".into()),
+        ..SecretsConfig::default()
+    };
+    assert_eq!(envelope_location(&aws, p), "AWS secret \"svc-secrets\"");
+    assert_ne!(
+        envelope_location(&aws, p),
+        witness_kek_location(&aws, p),
+        "the key-encryption key's entry is separate"
+    );
+}

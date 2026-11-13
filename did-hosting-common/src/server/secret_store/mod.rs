@@ -31,6 +31,8 @@ pub use vti_secrets::SecretBackend;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use vti_secrets::SeedStore;
@@ -236,13 +238,86 @@ pub trait SecretStore: Send + Sync {
     fn clear_bootstrap_seed(&self) -> BoxFuture<'_, Result<(), AppError>>;
 }
 
+/// Longest an envelope update waits for another update of the same entry in
+/// this process to finish before it gives up.
+pub const ENVELOPE_UPDATE_WAIT: Duration = Duration::from_secs(60);
+
+/// Bound on one backend read or write made by an envelope update. The cloud
+/// and Vault backends are network calls; an update holds its entry's write
+/// slot for at most twice this.
+pub const ENVELOPE_IO_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The write slot of each envelope entry in this process, by
+/// [`envelope_location`]. A store is rebuilt wherever it is needed (the
+/// identity sweep does so every minute), so the slot belongs to the entry,
+/// not to one store value. Holds one slot per entry a process has written,
+/// which is a handful.
+fn envelope_write_slot(location: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static SLOTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    SLOTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(location.to_owned())
+        .or_default()
+        .clone()
+}
+
+/// Where the service envelope is kept for `secrets`: the entry an operator
+/// grants access to, backs up or restores, and the key of its write slot.
+pub fn envelope_location(secrets: &SecretsConfig, config_path: &Path) -> String {
+    let named = |n: &Option<String>| n.as_deref().unwrap_or("").to_string();
+    match resolve_backend(secrets) {
+        SecretBackend::Keyring => format!(
+            "OS keyring service \"{}\", account \"{KEYRING_USER}\"",
+            secrets.keyring_service
+        ),
+        SecretBackend::Aws => format!("AWS secret \"{}\"", named(&secrets.aws_secret_name)),
+        SecretBackend::Gcp => format!("GCP secret \"{}\"", named(&secrets.gcp_secret_name)),
+        SecretBackend::Azure => format!(
+            "Azure Key Vault secret \"{}\"",
+            named(&secrets.azure_secret_name)
+        ),
+        SecretBackend::Vault => format!("Vault path \"{}\"", named(&secrets.vault_secret_path)),
+        SecretBackend::Kubernetes => {
+            format!("Kubernetes Secret \"{}\"", named(&secrets.k8s_secret_name))
+        }
+        SecretBackend::Plaintext => format!("file {}", plaintext_path(config_path).display()),
+        other => format!("backend {other:?}"),
+    }
+}
+
 /// A [`SecretStore`] over any `vti-secrets` backend: the [`StoredSecrets`]
 /// envelope is the backend's payload.
+///
+/// Every write is a read-modify-write of the whole envelope ([`Self::update`]).
+/// Updates of one entry in this process take turns through the entry's write
+/// slot, so a rotation writing `secrets` and a phase writing or clearing the
+/// bootstrap seed cannot overwrite each other with a stale envelope. The
+/// backends offer no compare-and-swap, so this does not order writers in
+/// different processes; those are the setup CLI and the running service,
+/// which an operator does not run against one entry at once.
 struct EnvelopeStore {
     inner: Box<dyn SeedStore>,
+    location: String,
+    slot: Arc<tokio::sync::Mutex<()>>,
+    wait: Duration,
+    io_timeout: Duration,
 }
 
 impl EnvelopeStore {
+    fn new(inner: Box<dyn SeedStore>, location: String) -> Self {
+        Self {
+            inner,
+            slot: envelope_write_slot(&location),
+            location,
+            wait: ENVELOPE_UPDATE_WAIT,
+            io_timeout: ENVELOPE_IO_TIMEOUT,
+        }
+    }
+
     async fn load(&self) -> Result<StoredSecrets, AppError> {
         match self.inner.get().await.map_err(from_vti)? {
             Some(bytes) => StoredSecrets::from_bytes(&bytes),
@@ -250,8 +325,42 @@ impl EnvelopeStore {
         }
     }
 
-    async fn save(&self, env: &StoredSecrets) -> Result<(), AppError> {
-        self.inner.set(&env.to_bytes()?).await.map_err(from_vti)
+    /// Read the envelope, apply `change`, and write it back if `change` says
+    /// it changed anything, as one step with respect to every other update
+    /// of this entry in this process.
+    ///
+    /// The write slot is held across the backend read and write: without a
+    /// compare-and-swap on the backend, that is what makes the step atomic.
+    /// Both calls are bounded by the I/O timeout, so the slot is never held
+    /// for longer than twice it, and a waiter gives up after the update wait
+    /// rather than queueing behind a wedged backend. Either timeout is an
+    /// error; nothing is written on a failed or timed-out read.
+    async fn update(
+        &self,
+        change: impl FnOnce(&mut StoredSecrets) -> bool + Send,
+    ) -> Result<(), AppError> {
+        let _turn = tokio::time::timeout(self.wait, self.slot.lock())
+            .await
+            .map_err(|_| self.timed_out("waiting for another update of", self.wait))?;
+        let mut env = tokio::time::timeout(self.io_timeout, self.load())
+            .await
+            .map_err(|_| self.timed_out("reading", self.io_timeout))??;
+        if !change(&mut env) {
+            return Ok(());
+        }
+        let bytes = env.to_bytes()?;
+        tokio::time::timeout(self.io_timeout, self.inner.set(&bytes))
+            .await
+            .map_err(|_| self.timed_out("writing", self.io_timeout))?
+            .map_err(from_vti)
+    }
+
+    fn timed_out(&self, what: &str, after: Duration) -> AppError {
+        AppError::SecretStore(format!(
+            "timed out after {}s {what} the secrets envelope at {}",
+            after.as_secs(),
+            self.location
+        ))
     }
 }
 
@@ -263,9 +372,11 @@ impl SecretStore for EnvelopeStore {
     fn set(&self, secrets: &ServerSecrets) -> BoxFuture<'_, Result<(), AppError>> {
         let secrets = secrets.clone();
         Box::pin(async move {
-            let mut env = self.load().await?;
-            env.secrets = Some(secrets);
-            self.save(&env).await
+            self.update(|env| {
+                env.secrets = Some(secrets);
+                true
+            })
+            .await
         })
     }
 
@@ -283,20 +394,16 @@ impl SecretStore for EnvelopeStore {
     fn set_bootstrap_seed(&self, seed: &[u8; 32]) -> BoxFuture<'_, Result<(), AppError>> {
         let encoded = StoredSecrets::encode_seed(seed);
         Box::pin(async move {
-            let mut env = self.load().await?;
-            env.bootstrap_seed = Some(encoded);
-            self.save(&env).await
+            self.update(|env| {
+                env.bootstrap_seed = Some(encoded);
+                true
+            })
+            .await
         })
     }
 
     fn clear_bootstrap_seed(&self) -> BoxFuture<'_, Result<(), AppError>> {
-        Box::pin(async move {
-            let mut env = self.load().await?;
-            if env.bootstrap_seed.take().is_none() {
-                return Ok(());
-            }
-            self.save(&env).await
-        })
+        Box::pin(async move { self.update(|env| env.bootstrap_seed.take().is_some()).await })
     }
 }
 
@@ -588,7 +695,10 @@ pub fn create_secret_store(
         // refuses one this binary was compiled without.
         _ => vti_secrets::create_seed_store(&vti, Path::new(".")).map_err(from_vti)?,
     };
-    Ok(Box::new(EnvelopeStore { inner }))
+    Ok(Box::new(EnvelopeStore::new(
+        inner,
+        envelope_location(secrets, config_path),
+    )))
 }
 
 fn keyring_store(vti: &vti_secrets::SecretsConfig) -> Result<Box<dyn SeedStore>, AppError> {

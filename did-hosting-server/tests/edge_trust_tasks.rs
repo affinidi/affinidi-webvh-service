@@ -948,7 +948,8 @@ async fn a_directive_that_cannot_be_checked_yet_is_deferred_on_every_transport()
             _purpose: trust_tasks_proof::affinidi::ProofPurpose,
         ) -> Result<affinidi_data_integrity::ResolvedKey, affinidi_data_integrity::DataIntegrityError>
         {
-            // The wording the verifier reports an unresolvable signer with.
+            // An unresolvable signer; the verifier is told every refusal from
+            // this resolver is one (`with_unreachable_resolver`).
             Err(affinidi_data_integrity::DataIntegrityError::Resolver(
                 format!("signer DID unreachable: cannot resolve {vm}"),
             ))
@@ -958,9 +959,9 @@ async fn a_directive_that_cannot_be_checked_yet_is_deferred_on_every_transport()
     for via in VIAS {
         let (mut state, _dir) = edge_state().await;
         let resolvable = state.trust_tasks_verifier.take();
-        state.trust_tasks_verifier = Some(Arc::new(TransportBoundVerifier::with_resolver(
-            Arc::new(Unreachable),
-        )));
+        state.trust_tasks_verifier = Some(Arc::new(
+            TransportBoundVerifier::with_unreachable_resolver(Arc::new(Unreachable)),
+        ));
         let cp = control();
         let directive = signed(
             MSG_REPLICA_DOMAIN_ASSIGN,

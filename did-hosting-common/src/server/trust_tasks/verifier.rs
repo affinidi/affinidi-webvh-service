@@ -74,9 +74,11 @@
 //! ## Unreachable signers
 //!
 //! A signer whose DID cannot be resolved (its log is unreachable, or its status
-//! cannot be read) is refused with an error that says so
-//! ([`is_unreachable`]); callers report it as retryable, since the same
-//! document may verify once the DID is reachable again.
+//! cannot be read) is refused as [`VerifyFailureKind::Unreachable`]; callers
+//! report it as retryable, since the same document may verify once the DID is
+//! reachable again. The kind is a typed value carried from the resolver that
+//! decided it ([`VerifyFailure`]), never read back out of an error message:
+//! the messages name the signer's DID, which the document's sender chooses.
 //!
 //! ## Key rotation and the DID cache
 //!
@@ -109,28 +111,167 @@ pub const OPERATIONAL_PROOF_PURPOSE: &str = "authentication";
 /// The only `proofPurpose` a human approver's decision may carry.
 pub const APPROVAL_PROOF_PURPOSE: &str = "assertionMethod";
 
-/// Marks a verification failure caused by a signer's DID being unreachable
-/// (not by anything wrong with the proof). See [`is_unreachable`].
+/// Opens the message of a failure to resolve a signer's DID, for people
+/// reading it. The failure's kind is [`VerifyFailureKind::Unreachable`]; this
+/// text is never used to decide it.
 const UNREACHABLE: &str = "signer DID unreachable";
 
-/// Marks a refusal because the signer deactivated its DID. Final: a
-/// `did:webvh` deactivation cannot be undone, so no fresh resolution is tried.
+/// Ends the message of a refusal because the signer deactivated its DID. The
+/// failure's kind is [`VerifyFailureKind::Deactivated`]; this text is never
+/// used to decide it.
 const DEACTIVATED: &str = "is deactivated; its keys are no longer valid";
 
 /// Most DIDs whose deactivation verdict is remembered at once.
 const DEACTIVATION_CACHE_CAPACITY: usize = 4096;
 
-/// Whether a verification failure was caused by the signer's DID being
-/// unreachable — a condition that may clear, unlike a bad proof.
-pub fn is_unreachable(err: &VerificationError) -> bool {
-    matches!(err, VerificationError::Other(m) if m.contains(UNREACHABLE))
+/// What kind of failure a proof verification was: whether it may clear on its
+/// own, and whether a fresh resolution of the signer could change it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VerifyFailureKind {
+    /// The signer's DID could not be resolved, or its status read. May clear:
+    /// the same document is worth sending again.
+    Unreachable,
+    /// The signer has deactivated its DID. Final; no fresh resolution is
+    /// tried, since a `did:webvh` deactivation cannot be undone.
+    Deactivated,
+    /// Anything else: the proof itself is wrong for this signer. Final.
+    Invalid,
 }
 
-/// A verification failure reporting that the signer's DID could not be
-/// resolved in time, which [`is_unreachable`] recognises (and callers report
-/// as retryable). For a caller that bounds how long it waits on a resolution.
-pub fn unreachable_error(detail: impl std::fmt::Display) -> VerificationError {
-    VerificationError::Other(format!("{UNREACHABLE}: {detail}"))
+/// A failed proof verification: the framework's [`VerificationError`], for the
+/// wire and the logs, and the [`VerifyFailureKind`] the verifier decided,
+/// which is what callers act on.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct VerifyFailure {
+    pub kind: VerifyFailureKind,
+    pub error: VerificationError,
+}
+
+impl VerifyFailure {
+    /// Whether the signer's DID could not be resolved — a condition that may
+    /// clear, unlike a bad proof.
+    pub fn is_unreachable(&self) -> bool {
+        self.kind == VerifyFailureKind::Unreachable
+    }
+}
+
+/// A failure the verifier did not classify further is a bad proof.
+impl From<VerificationError> for VerifyFailure {
+    fn from(error: VerificationError) -> Self {
+        Self {
+            kind: VerifyFailureKind::Invalid,
+            error,
+        }
+    }
+}
+
+impl From<VerifyFailure> for VerificationError {
+    fn from(failure: VerifyFailure) -> Self {
+        failure.error
+    }
+}
+
+/// A signer-key resolution failure and its kind.
+struct ResolveFailure {
+    kind: VerifyFailureKind,
+    error: DataIntegrityError,
+}
+
+impl ResolveFailure {
+    fn new(kind: VerifyFailureKind, error: DataIntegrityError) -> Self {
+        Self { kind, error }
+    }
+}
+
+/// Resolves a signer's key for a proof purpose and says what kind of failure
+/// a refusal is.
+#[async_trait]
+trait SignerResolve: Send + Sync {
+    async fn resolve_signer(
+        &self,
+        vm: &str,
+        purpose: ProofPurpose,
+    ) -> Result<ResolvedKey, ResolveFailure>;
+}
+
+/// A caller-supplied resolver, which cannot say what kind a failure is: every
+/// refusal from it is [`VerifyFailureKind::Invalid`].
+struct Unclassified<R>(R);
+
+#[async_trait]
+impl<R: ProofPurposeResolver> SignerResolve for Unclassified<R> {
+    async fn resolve_signer(
+        &self,
+        vm: &str,
+        purpose: ProofPurpose,
+    ) -> Result<ResolvedKey, ResolveFailure> {
+        self.0
+            .resolve_vm_for_purpose(vm, purpose)
+            .await
+            .map_err(|e| ResolveFailure::new(VerifyFailureKind::Invalid, e))
+    }
+}
+
+/// A caller-supplied resolver whose every refusal is an unreachable signer:
+/// the test seam [`TransportBoundVerifier::with_unreachable_resolver`].
+#[cfg(any(test, feature = "test-support"))]
+struct AllUnreachable<R>(R);
+
+#[cfg(any(test, feature = "test-support"))]
+#[async_trait]
+impl<R: ProofPurposeResolver> SignerResolve for AllUnreachable<R> {
+    async fn resolve_signer(
+        &self,
+        vm: &str,
+        purpose: ProofPurpose,
+    ) -> Result<ResolvedKey, ResolveFailure> {
+        self.0
+            .resolve_vm_for_purpose(vm, purpose)
+            .await
+            .map_err(|e| ResolveFailure::new(VerifyFailureKind::Unreachable, e))
+    }
+}
+
+/// One verification attempt's view of a [`SignerResolve`]: the library's
+/// resolver interface, remembering the kind of the failure the library will
+/// report, which its error type has no room for. Built per attempt, so
+/// concurrent verifications never see each other's failures.
+struct Recording<'a> {
+    inner: &'a dyn SignerResolve,
+    kind: Mutex<Option<VerifyFailureKind>>,
+}
+
+impl<'a> Recording<'a> {
+    fn new(inner: &'a dyn SignerResolve) -> Self {
+        Self {
+            inner,
+            kind: Mutex::new(None),
+        }
+    }
+
+    /// The kind of the last resolution failure, if a resolution failed.
+    fn failure_kind(&self) -> Option<VerifyFailureKind> {
+        *self.kind.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+#[async_trait]
+impl ProofPurposeResolver for Recording<'_> {
+    async fn resolve_vm_for_purpose(
+        &self,
+        vm: &str,
+        purpose: ProofPurpose,
+    ) -> Result<ResolvedKey, DataIntegrityError> {
+        self.inner
+            .resolve_signer(vm, purpose)
+            .await
+            .map_err(|failure| {
+                *self.kind.lock().unwrap_or_else(|p| p.into_inner()) = Some(failure.kind);
+                failure.error
+            })
+    }
 }
 
 /// Minimum spacing between forced re-resolutions of one DID.
@@ -324,12 +465,13 @@ struct SignerKeyResolver {
 }
 
 #[async_trait]
-impl ProofPurposeResolver for SignerKeyResolver {
-    async fn resolve_vm_for_purpose(
+impl SignerResolve for SignerKeyResolver {
+    async fn resolve_signer(
         &self,
         vm: &str,
         purpose: ProofPurpose,
-    ) -> Result<ResolvedKey, DataIntegrityError> {
+    ) -> Result<ResolvedKey, ResolveFailure> {
+        use VerifyFailureKind::{Deactivated, Invalid, Unreachable};
         // A did:scid reference may carry the `src` its recipient needs to
         // resolve it (VTI-KEY-163): resolve through it, so the source is known,
         // then dereference by DID and fragment, as the document lists its keys.
@@ -345,19 +487,26 @@ impl ProofPurposeResolver for SignerKeyResolver {
                     && let Some(deactivation) = &self.deactivation
                     && let Ok(true) = deactivation.is_deactivated(&log_did, false).await
                 {
-                    return Err(DataIntegrityError::Resolver(format!("{did} {DEACTIVATED}")));
+                    return Err(ResolveFailure::new(
+                        Deactivated,
+                        DataIntegrityError::Resolver(format!("{did} {DEACTIVATED}")),
+                    ));
                 }
-                return Err(DataIntegrityError::Resolver(format!(
-                    "{UNREACHABLE}: cannot resolve {did} (is its DID document reachable from \
-                     this service?): {e}"
-                )));
+                return Err(ResolveFailure::new(
+                    Unreachable,
+                    DataIntegrityError::Resolver(format!(
+                        "{UNREACHABLE}: cannot resolve {did} (is its DID document reachable \
+                         from this service?): {e}"
+                    )),
+                ));
             }
         };
         // The relationship check (and key decoding) is the library's.
         let key = self
             .decode
             .resolve_vm_for_purpose(&crate::scid::strip_scid_src(vm), purpose)
-            .await?;
+            .await
+            .map_err(|e| ResolveFailure::new(Invalid, e))?;
         // A deactivated DID's keys sign nothing — a did:scid's no more than
         // the did:webvh log that verifies it.
         let document = serde_json::to_value(&resolved.doc).ok();
@@ -365,9 +514,13 @@ impl ProofPurposeResolver for SignerKeyResolver {
             && let Some(deactivation) = &self.deactivation
             && deactivation
                 .is_deactivated(&log_did, resolved.cache_hit)
-                .await?
+                .await
+                .map_err(|e| ResolveFailure::new(Unreachable, e))?
         {
-            return Err(DataIntegrityError::Resolver(format!("{did} {DEACTIVATED}")));
+            return Err(ResolveFailure::new(
+                Deactivated,
+                DataIntegrityError::Resolver(format!("{did} {DEACTIVATED}")),
+            ));
         }
         Ok(key)
     }
@@ -380,8 +533,8 @@ pub struct TransportBoundVerifier {
     /// Resolves keys for [`ProofVerifier::verify`].
     resolver: Arc<dyn ProofPurposeResolver>,
     /// Resolves keys for the operational and approval checks, which also
-    /// refuse a deactivated signer.
-    signer_resolver: Arc<dyn ProofPurposeResolver>,
+    /// refuse a deactivated signer, and says what kind a refusal is.
+    signer_resolver: Arc<dyn SignerResolve>,
     refresher: Option<Arc<dyn StaleKeyRefresh>>,
     options: VerifyOptions,
     delegate: Option<SessionDelegate>,
@@ -399,7 +552,7 @@ pub struct TransportBoundVerifier {
 /// Build the proof verifier a service checks inbound Trust Task documents with,
 /// over its configured DID cache: [`TransportBoundVerifier::with_did_cache`],
 /// so a deactivated `did:webvh` signer is refused, an unreachable signer is
-/// reported as retryable ([`is_unreachable`]), and a proof failing against a
+/// reported as retryable ([`VerifyFailure::is_unreachable`]), and a proof failing against a
 /// cached document is retried once against a fresh one (at most one forced
 /// re-resolution per DID per [`FORCED_REFRESH_INTERVAL`]).
 ///
@@ -425,13 +578,25 @@ impl TransportBoundVerifier {
     /// [`Self::with_did_cache`].
     pub fn with_resolver(resolver: Arc<dyn ProofPurposeResolver>) -> Self {
         Self {
-            signer_resolver: resolver.clone(),
+            signer_resolver: Arc::new(Unclassified(resolver.clone())),
             resolver,
             refresher: None,
             options: VerifyOptions::default(),
             delegate: None,
             deactivation: None,
             reply_refresher: None,
+        }
+    }
+
+    /// [`Self::with_resolver`], but the operational and approval checks report
+    /// every refusal from `resolver` as an unreachable signer
+    /// ([`VerifyFailureKind::Unreachable`]), so a test can stand in for a
+    /// signer DID that cannot be resolved without a network.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_unreachable_resolver(resolver: Arc<dyn ProofPurposeResolver>) -> Self {
+        Self {
+            signer_resolver: Arc::new(AllUnreachable(resolver.clone())),
+            ..Self::with_resolver(resolver)
         }
     }
 
@@ -550,13 +715,24 @@ impl TransportBoundVerifier {
     where
         P: Serialize + Send + Sync,
     {
+        self.check_operational(doc).await.map_err(Into::into)
+    }
+
+    /// [`Self::verify_operational`], reporting what kind of failure a refusal
+    /// is ([`VerifyFailure`]): whether the signer was unreachable (retryable),
+    /// deactivated, or the proof is wrong.
+    pub async fn check_operational<P>(&self, doc: &TrustTask<P>) -> Result<(), VerifyFailure>
+    where
+        P: Serialize + Send + Sync,
+    {
         if let Some(proof) = &doc.proof
             && proof.proof_purpose != OPERATIONAL_PROOF_PURPOSE
         {
             return Err(VerificationError::MalformedProof(format!(
                 "proofPurpose must be `{OPERATIONAL_PROOF_PURPOSE}` for this message, not `{}`",
                 proof.proof_purpose
-            )));
+            ))
+            .into());
         }
         self.verify_with(
             doc,
@@ -583,13 +759,23 @@ impl TransportBoundVerifier {
     where
         P: Serialize + Send + Sync,
     {
+        self.check_approval(doc).await.map_err(Into::into)
+    }
+
+    /// [`Self::verify_approval`], reporting what kind of failure a refusal is
+    /// ([`VerifyFailure`]).
+    pub async fn check_approval<P>(&self, doc: &TrustTask<P>) -> Result<(), VerifyFailure>
+    where
+        P: Serialize + Send + Sync,
+    {
         if let Some(proof) = &doc.proof
             && proof.proof_purpose != APPROVAL_PROOF_PURPOSE
         {
             return Err(VerificationError::MalformedProof(format!(
                 "proofPurpose must be `{APPROVAL_PROOF_PURPOSE}` for an approver's decision, not `{}`",
                 proof.proof_purpose
-            )));
+            ))
+            .into());
         }
         self.verify_with(
             doc,
@@ -605,32 +791,40 @@ impl TransportBoundVerifier {
     async fn verify_with<P>(
         &self,
         doc: &TrustTask<P>,
-        resolver: &dyn ProofPurposeResolver,
+        resolver: &dyn SignerResolve,
         purpose: ProofPurpose,
         delegation: Delegation,
-    ) -> Result<(), VerificationError>
+    ) -> Result<(), VerifyFailure>
     where
         P: Serialize + Send + Sync,
     {
         let (parsed_proof, doc_value) = self.prepare(doc, delegation)?;
-        let resolver = PurposeBound::new(resolver, purpose);
+        let recording = Recording::new(resolver);
         let attempt = parsed_proof
-            .verify(&doc_value, &resolver, self.options.clone())
+            .verify(
+                &doc_value,
+                &PurposeBound::new(&recording, purpose),
+                self.options.clone(),
+            )
             .await;
         let err = match attempt {
             Ok(_) => return Ok(()),
             Err(e) => e,
         };
+        let kind = recording.failure_kind();
         // Only a failure that a different document could cure is worth a fresh
         // resolution: the key was not found, or the key found did not match.
         // A deactivated signer is final — deactivation cannot be undone. A
         // DID that could not be resolved at all had no cached document to
         // replace, and is already reported as retryable to the caller, so it
-        // is not resolved a second time here.
-        let retryable = match &err {
-            DataIntegrityError::Resolver(m) => !m.contains(DEACTIVATED) && !m.contains(UNREACHABLE),
-            DataIntegrityError::InvalidSignature { .. } => true,
-            _ => false,
+        // is not resolved a second time here. Decided on the kind the
+        // resolver reported, never on the message, which names the signer.
+        let retryable = match kind {
+            Some(VerifyFailureKind::Deactivated | VerifyFailureKind::Unreachable) => false,
+            _ => matches!(
+                err,
+                DataIntegrityError::Resolver(_) | DataIntegrityError::InvalidSignature { .. }
+            ),
         };
         let vm = doc
             .proof
@@ -642,13 +836,18 @@ impl TransportBoundVerifier {
             && refresher.refresh(controller_did(&vm)).await
         {
             tracing::debug!(vm, error = %err, "proof failed against cached DID document; retrying fresh");
+            let recording = Recording::new(resolver);
             return parsed_proof
-                .verify(&doc_value, &resolver, self.options.clone())
+                .verify(
+                    &doc_value,
+                    &PurposeBound::new(&recording, purpose),
+                    self.options.clone(),
+                )
                 .await
                 .map(|_| ())
-                .map_err(map_error);
+                .map_err(|err| classified(err, recording.failure_kind()));
         }
-        Err(map_error(err))
+        Err(classified(err, kind))
     }
 
     /// Steps shared by every verification: parse the proof, strip it from the
@@ -756,8 +955,9 @@ impl ProofVerifier for TransportBoundVerifier {
         } else {
             Delegation::Allowed
         };
-        self.verify_with(doc, &*self.resolver, purpose, delegation)
+        self.verify_with(doc, &Unclassified(&*self.resolver), purpose, delegation)
             .await
+            .map_err(Into::into)
     }
 }
 
@@ -769,6 +969,15 @@ enum Delegation {
     Allowed,
     /// An attestation: only the signer's own key counts.
     Refused,
+}
+
+/// A library failure as a [`VerifyFailure`] of the kind the resolver reported
+/// (a bad proof when it reported none).
+fn classified(err: DataIntegrityError, kind: Option<VerifyFailureKind>) -> VerifyFailure {
+    VerifyFailure {
+        kind: kind.unwrap_or(VerifyFailureKind::Invalid),
+        error: map_error(err),
+    }
 }
 
 /// Map [`DataIntegrityError`] into the framework's [`VerificationError`]
@@ -1269,13 +1478,94 @@ mod tests {
         assert!(!limiter.allow(&long, t0 + FORCED_REFRESH_INTERVAL));
     }
 
+    /// A signer resolver that fails every resolution with `kind` and a
+    /// message of the caller's choosing.
+    struct Failing {
+        kind: VerifyFailureKind,
+        message: String,
+    }
+
+    #[async_trait]
+    impl SignerResolve for Failing {
+        async fn resolve_signer(
+            &self,
+            _vm: &str,
+            _purpose: ProofPurpose,
+        ) -> Result<ResolvedKey, ResolveFailure> {
+            Err(ResolveFailure::new(
+                self.kind,
+                DataIntegrityError::Resolver(self.message.clone()),
+            ))
+        }
+    }
+
+    fn failing_verifier(
+        kind: VerifyFailureKind,
+        message: &str,
+    ) -> (TransportBoundVerifier, Arc<FlagRefresher>) {
+        let refresher = Arc::new(FlagRefresher {
+            refreshed: Default::default(),
+            calls: Default::default(),
+            allow: true,
+        });
+        let mut v = TransportBoundVerifier::with_resolver(Arc::new(DidKeyResolver));
+        v.signer_resolver = Arc::new(Failing {
+            kind,
+            message: message.to_string(),
+        });
+        v.refresher = Some(refresher.clone());
+        (v, refresher)
+    }
+
     /// A signer whose DID could not be resolved at all is not resolved a
     /// second time: the failure is reported as unreachable straight away.
     #[tokio::test]
     async fn an_unresolvable_signer_is_not_resolved_twice() {
-        struct Unreachable;
+        let (v, refresher) = failing_verifier(VerifyFailureKind::Unreachable, "cannot resolve");
+        let err = v
+            .check_approval(&self_issued_doc().await)
+            .await
+            .unwrap_err();
+        assert!(err.is_unreachable(), "{err:?}");
+        assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// The kind decides, not the text: a failure whose message reads like an
+    /// unreachable or deactivated signer (a DID can be made to say anything)
+    /// is still the kind its resolver reported, and an unreachable signer
+    /// stays unreachable whatever its message says.
+    #[tokio::test]
+    async fn failure_kinds_do_not_depend_on_message_text() {
+        let doc = self_issued_doc().await;
+
+        let lookalike = format!("did:example:x {UNREACHABLE} {DEACTIVATED} not in document");
+        let (v, refresher) = failing_verifier(VerifyFailureKind::Invalid, &lookalike);
+        let err = v.check_approval(&doc).await.unwrap_err();
+        assert_eq!(err.kind, VerifyFailureKind::Invalid, "{err:?}");
+        assert_eq!(
+            refresher.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a key-not-found failure is retried once, whatever its text"
+        );
+
+        let (v, refresher) = failing_verifier(VerifyFailureKind::Unreachable, "plain words");
+        let err = v.check_approval(&doc).await.unwrap_err();
+        assert!(err.is_unreachable(), "{err:?}");
+        assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let (v, refresher) = failing_verifier(VerifyFailureKind::Deactivated, UNREACHABLE);
+        let err = v.check_approval(&doc).await.unwrap_err();
+        assert_eq!(err.kind, VerifyFailureKind::Deactivated, "{err:?}");
+        assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A caller-supplied resolver cannot classify its failures: they are bad
+    /// proofs, whatever they say.
+    #[tokio::test]
+    async fn a_caller_supplied_resolver_reports_invalid() {
+        struct SaysUnreachable;
         #[async_trait]
-        impl ProofPurposeResolver for Unreachable {
+        impl ProofPurposeResolver for SaysUnreachable {
             async fn resolve_vm_for_purpose(
                 &self,
                 vm: &str,
@@ -1286,16 +1576,12 @@ mod tests {
                 )))
             }
         }
-        let refresher = Arc::new(FlagRefresher {
-            refreshed: Default::default(),
-            calls: Default::default(),
-            allow: true,
-        });
-        let mut v = TransportBoundVerifier::with_resolver(Arc::new(Unreachable));
-        v.refresher = Some(refresher.clone());
-        let err = v.verify(&self_issued_doc().await).await.unwrap_err();
-        assert!(is_unreachable(&err), "{err:?}");
-        assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let v = TransportBoundVerifier::with_resolver(Arc::new(SaysUnreachable));
+        let err = v
+            .check_approval(&self_issued_doc().await)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, VerifyFailureKind::Invalid, "{err:?}");
     }
 
     /// `without_forced_refresh` refuses a proof that fails against the cached
@@ -1357,7 +1643,8 @@ mod tests {
             decode: CachedDidResolver::new(Arc::new(client)),
             deactivation: None,
         };
-        let resolver = PurposeBound::new(&signers, ProofPurpose::Authentication);
+        let recording = Recording::new(&signers);
+        let resolver = PurposeBound::new(&recording, ProofPurpose::Authentication);
         resolver
             .resolve_vm("did:web:auth.example#key-1")
             .await
@@ -1373,7 +1660,7 @@ mod tests {
 
         // An approver's decision is the mirror image: its key must be listed
         // under `assertionMethod`, and an authentication-only key is refused.
-        let approvals = PurposeBound::new(&signers, ProofPurpose::AssertionMethod);
+        let approvals = PurposeBound::new(&recording, ProofPurpose::AssertionMethod);
         approvals
             .resolve_vm("did:web:assert.example#key-1")
             .await
@@ -1422,20 +1709,24 @@ mod tests {
         );
     }
 
-    /// A resolution failure is reported as the signer being unreachable — the
-    /// retryable case — and nothing else is.
+    /// A failure carries its kind and the framework error alongside; an
+    /// unclassified framework error is a bad proof.
     #[test]
     fn unreachable_signers_are_distinguished_from_bad_proofs() {
-        let unreachable = map_error(DataIntegrityError::Resolver(format!(
-            "{UNREACHABLE}: cannot resolve did:webvh:QmX:gone.example"
-        )));
-        assert!(is_unreachable(&unreachable), "{unreachable:?}");
+        let unreachable = classified(
+            DataIntegrityError::Resolver(format!(
+                "{UNREACHABLE}: cannot resolve did:webvh:QmX:gone.example"
+            )),
+            Some(VerifyFailureKind::Unreachable),
+        );
+        assert!(unreachable.is_unreachable(), "{unreachable:?}");
         assert!(unreachable.to_string().contains("gone.example"));
-        let not_listed = map_error(DataIntegrityError::Resolver(
-            "verificationMethod is not listed under authentication in its DID document".into(),
-        ));
-        assert!(!is_unreachable(&not_listed));
-        assert!(!is_unreachable(&VerificationError::SignatureInvalid));
+        let not_listed = classified(
+            DataIntegrityError::Resolver(format!("{UNREACHABLE}: not listed under authentication")),
+            None,
+        );
+        assert!(!not_listed.is_unreachable());
+        assert!(!VerifyFailure::from(VerificationError::SignatureInvalid).is_unreachable());
     }
 
     /// The deactivation verdict follows the DID cache: reused while the cache
@@ -1501,7 +1792,8 @@ mod tests {
             decode: CachedDidResolver::new(Arc::new(client)),
             deactivation: Some(deactivation),
         };
-        let resolver = PurposeBound::new(&signers, ProofPurpose::Authentication);
+        let recording = Recording::new(&signers);
+        let resolver = PurposeBound::new(&recording, ProofPurpose::Authentication);
         resolver
             .resolve_vm(&format!("{live}#key-1"))
             .await
@@ -1511,6 +1803,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("deactivated"), "{err}");
+        assert_eq!(
+            recording.failure_kind(),
+            Some(VerifyFailureKind::Deactivated)
+        );
     }
 
     /// A signed did:webvh log for `localhost:{port}` with `secret` as its
@@ -1627,26 +1923,24 @@ mod tests {
                 ..DeactivationCache::default()
             })),
         };
-        let resolver = PurposeBound::new(&signers, ProofPurpose::Authentication);
-
-        resolver
-            .resolve_vm(&format!("{live}#key-1"))
+        signers
+            .resolve_signer(&format!("{live}#key-1"), ProofPurpose::Authentication)
             .await
+            .map_err(|f| f.error)
             .expect("a live signer resolves");
-        let err = resolver
-            .resolve_vm(&format!("{dead}#key-1"))
+        let Err(failure) = signers
+            .resolve_signer(&format!("{dead}#key-1"), ProofPurpose::Authentication)
             .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains(DEACTIVATED), "{err}");
-        assert!(
-            !err.contains(UNREACHABLE),
-            "a deactivated signer is final: {err}"
+        else {
+            panic!("a deactivated signer is refused");
+        };
+        assert_eq!(
+            failure.kind,
+            VerifyFailureKind::Deactivated,
+            "a deactivated signer is final: {}",
+            failure.error
         );
-        assert!(
-            !is_unreachable(&map_error(DataIntegrityError::Resolver(err.clone()))),
-            "{err}"
-        );
+        assert!(failure.error.to_string().contains(DEACTIVATED));
     }
 
     // ─── Cross-language interop with the JS wallet ───
