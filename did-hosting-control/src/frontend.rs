@@ -61,3 +61,30 @@ fn html(body: std::borrow::Cow<'static, [u8]>) -> Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every console page, `/enroll` included (it is served `index.html` by
+    /// the client-side-routing fallback), goes out with no referrer, so an
+    /// invite link's address never reaches another site.
+    #[test]
+    fn console_pages_are_sent_with_no_referrer() {
+        let response = html(std::borrow::Cow::Borrowed(b"<html></html>".as_slice()));
+        assert_eq!(
+            response
+                .headers()
+                .get(header::REFERRER_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-referrer")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+    }
+}

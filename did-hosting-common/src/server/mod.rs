@@ -79,9 +79,10 @@ pub mod vta_setup;
 /// - `Content-Security-Policy: default-src 'self'; ...` — restrict resource
 ///   loads to same-origin. Allows inline styles (the React/Expo bundle pulls
 ///   styles from `<style>` tags); inline scripts are *not* allowed.
-/// - `Referrer-Policy: no-referrer` — prevent the enrollment URL (which can
-///   contain a single-use invite token in its query string) from leaking via
-///   the `Referer` header on outbound link clicks.
+/// - `Referrer-Policy: no-referrer` — prevent the enrollment URL from leaking
+///   via the `Referer` header on outbound link clicks. Invite links carry the
+///   token in the fragment, which is never sent; links issued before carried
+///   it in the query.
 /// - `Strict-Transport-Security: max-age=31536000` — pin TLS for one year on
 ///   any caller that has reached us over HTTPS. Browsers ignore this header
 ///   when delivered over plaintext HTTP, so it is harmless on plain-HTTP

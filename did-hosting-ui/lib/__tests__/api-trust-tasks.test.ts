@@ -762,7 +762,7 @@ describe("step-up (wallet session)", () => {
             payload: { code: "permissionDenied", message: "step_up_required", retryable: false },
           }
         : seal(req, {
-            invite: { token: "t", url: "https://control.example/enroll?token=t" },
+            invite: { token: "t", url: "https://control.example/enroll#token=t" },
             subject: "did:example:new",
             purpose: "session",
             expiresAt: "2026-01-01T00:00:00Z",

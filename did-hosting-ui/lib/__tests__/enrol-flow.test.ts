@@ -77,7 +77,7 @@ describe("issuing an invite", () => {
   it("is a signed invite/0.3, and hands back the link and the claim code apart", async () => {
     const sent = installControlPlane((req) =>
       seal(req, {
-        invite: { token: "inv_tok", url: "https://control.example.com/enroll?token=inv_tok" },
+        invite: { token: "inv_tok", url: "https://control.example.com/enroll#token=inv_tok" },
         subject: "did:example:carol",
         purpose: "session",
         expiresAt: "2026-09-25T11:00:00Z",
@@ -86,7 +86,7 @@ describe("issuing an invite", () => {
     );
     const invite = await api.createInvite("did:example:carol", "owner");
     expect(invite).toEqual({
-      inviteUrl: "https://control.example.com/enroll?token=inv_tok",
+      inviteUrl: "https://control.example.com/enroll#token=inv_tok",
       claimCode: "7KQ4-MX2P-9TDA",
       subject: "did:example:carol",
       purpose: "session",
@@ -103,7 +103,7 @@ describe("issuing an invite", () => {
   it("a step-up invite names its purpose and no role", async () => {
     const sent = installControlPlane((req) =>
       seal(req, {
-        invite: { token: "inv_tok", url: "https://control.example.com/enroll?token=inv_tok" },
+        invite: { token: "inv_tok", url: "https://control.example.com/enroll#token=inv_tok" },
         subject: "did:example:carol",
         purpose: "stepUp",
         expiresAt: "2026-09-25T11:00:00Z",

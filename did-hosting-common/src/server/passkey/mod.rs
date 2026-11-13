@@ -70,8 +70,10 @@ pub async fn run_cli_invite(
         hash_wait,
     )
     .await?;
+    // The token goes in the fragment, which a browser never sends: it stays
+    // out of the web host's request line, its access log and any `Referer`.
     let url = format!(
-        "{}/enroll?token={}",
+        "{}/enroll#token={}",
         public_url.trim_end_matches('/'),
         issued.token
     );
