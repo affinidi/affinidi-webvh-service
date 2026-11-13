@@ -138,6 +138,26 @@ export function needsStepUp(e: unknown): boolean {
   );
 }
 
+/**
+ * Run `send`, and when the control plane answers that it needs a stepped-up
+ * session, step this session up (`api.stepUp`) and run it once more.
+ *
+ * The control plane asks for one on its destructive and privilege-raising
+ * tasks when they come from a session: purging a domain (and its content on
+ * one edge), deleting a DID, retiring an identity generation, issuing an
+ * enrolment invite, and making a subject an administrator or service account.
+ * A passkey login is already stepped up, so it never sees the refusal.
+ */
+async function withStepUp<R>(send: () => Promise<R>): Promise<R> {
+  try {
+    return await send();
+  } catch (e) {
+    if (!needsStepUp(e)) throw e;
+    await api.stepUp();
+    return send();
+  }
+}
+
 /** What `changeOwner` did: `offer` is set when the DID did not move yet and
  *  waits for its recipient to accept. */
 export interface OwnerChangeResult {
@@ -700,11 +720,14 @@ export const api = {
   /**
    * Stop honouring a superseded generation immediately — the kill switch.
    * The key is dropped from the live secrets resolver before this returns.
+   * Needs a stepped-up session (`withStepUp`).
    */
   retireIdentityGeneration: async (id: number): Promise<void> => {
-    await trustTask<IdentityRetire.Payload, IdentityRetire.Response>(T.identityRetire, {
-      generationId: id,
-    });
+    await withStepUp(() =>
+      trustTask<IdentityRetire.Payload, IdentityRetire.Response>(T.identityRetire, {
+        generationId: id,
+      }),
+    );
   },
 
   // ---- DIDs ----
@@ -850,8 +873,11 @@ export const api = {
     });
   },
 
+  /** Delete a DID slot. Needs a stepped-up session (`withStepUp`). */
   deleteDid: async (mnemonic: string): Promise<void> => {
-    await trustTask<DidDelete.Payload, DidDelete.Response>(T.didDelete, { mnemonic });
+    await withStepUp(() =>
+      trustTask<DidDelete.Payload, DidDelete.Response>(T.didDelete, { mnemonic }),
+    );
   },
 
   /** Discard the last log entry: roll back to `versionCount - 1`. */
@@ -962,11 +988,14 @@ export const api = {
   },
 
   /** Admin "Purge now" on one edge. Refused while the domain is still
-   *  assigned to that edge (`stillAssigned`). */
+   *  assigned to that edge (`stillAssigned`). Needs a stepped-up session
+   *  (`withStepUp`). */
   purgeDomainOnServer: async (instanceId: string, domain: string): Promise<void> => {
-    await trustTask<RegistryPurgeDomain.Payload, RegistryPurgeDomain.Response>(
-      T.registryPurgeDomain,
-      { instanceId, domain },
+    await withStepUp(() =>
+      trustTask<RegistryPurgeDomain.Payload, RegistryPurgeDomain.Response>(
+        T.registryPurgeDomain,
+        { instanceId, domain },
+      ),
     );
   },
 
@@ -1060,16 +1089,19 @@ export const api = {
     },
   ): Promise<AclEntry> => {
     const did = await api.resolveAclSubject(subject);
-    const resp = await trustTask<AclGrant.Payload, AclGrant.Response>(T.aclGrant, {
-      entry: aclGrantEntry(
-        did,
-        role,
-        opts?.domains ?? { kind: "all" },
-        opts?.label,
-        opts?.maxTotalSize,
-        opts?.maxDidCount,
-      ),
-    });
+    // Granting an admin or service entry needs a stepped-up session.
+    const resp = await withStepUp(() =>
+      trustTask<AclGrant.Payload, AclGrant.Response>(T.aclGrant, {
+        entry: aclGrantEntry(
+          did,
+          role,
+          opts?.domains ?? { kind: "all" },
+          opts?.label,
+          opts?.maxTotalSize,
+          opts?.maxDidCount,
+        ),
+      }),
+    );
     return aclEntryFromWire(resp.entry);
   },
 
@@ -1098,9 +1130,14 @@ export const api = {
       const current = await api.aclShow(did);
       if (!current) throw notFound();
       if (current.role !== updates.role) {
-        const resp = await trustTask<AclChangeRole.Payload, AclChangeRole.Response>(
-          T.aclChangeRole,
-          { subject: did, fromRole: current.role, toRole: updates.role },
+        // A move to admin or service needs a stepped-up session.
+        const toRole = updates.role;
+        const resp = await withStepUp(() =>
+          trustTask<AclChangeRole.Payload, AclChangeRole.Response>(T.aclChangeRole, {
+            subject: did,
+            fromRole: current.role,
+            toRole,
+          }),
         );
         entry = aclEntryFromWire(resp.entry);
       } else {
@@ -1130,16 +1167,20 @@ export const api = {
         if (!revoked.entry) throw notFound();
         base = aclEntryFromWire(revoked.entry);
       }
-      const resp = await trustTask<AclGrant.Payload, AclGrant.Response>(T.aclGrant, {
-        entry: aclGrantEntry(
-          did,
-          base.role,
-          domains,
-          updates.label === undefined ? base.label : updates.label,
-          updates.maxTotalSize === undefined ? base.max_total_size : updates.maxTotalSize,
-          updates.maxDidCount === undefined ? base.max_did_count : updates.maxDidCount,
-        ),
-      });
+      const granted = base;
+      // Re-asserting an admin or service entry needs a stepped-up session.
+      const resp = await withStepUp(() =>
+        trustTask<AclGrant.Payload, AclGrant.Response>(T.aclGrant, {
+          entry: aclGrantEntry(
+            did,
+            granted.role,
+            domains,
+            updates.label === undefined ? granted.label : updates.label,
+            updates.maxTotalSize === undefined ? granted.max_total_size : updates.maxTotalSize,
+            updates.maxDidCount === undefined ? granted.max_did_count : updates.maxDidCount,
+          ),
+        }),
+      );
       entry = aclEntryFromWire(resp.entry);
     }
 
@@ -1239,18 +1280,12 @@ export const api = {
    * `purgeServers` also sends the purge to every edge serving the domain.
    */
   deleteDomain: async (name: string, opts?: { purgeServers?: boolean }): Promise<void> => {
-    const purge = () =>
+    await withStepUp(() =>
       trustTask<DomainPurge.Payload, DomainPurge.Response>(T.domainPurge, {
         name,
         ...(opts?.purgeServers ? { purgeServers: true } : {}),
-      });
-    try {
-      await purge();
-    } catch (e) {
-      if (!needsStepUp(e)) throw e;
-      await api.stepUp();
-      await purge();
-    }
+      }),
+    );
   },
 
   /**
@@ -1425,14 +1460,7 @@ export const api = {
         subject: did,
         ...(purpose === "session" ? { role } : { purpose }),
       });
-    let r: Invite.Response;
-    try {
-      r = await send();
-    } catch (e) {
-      if (!needsStepUp(e)) throw e;
-      await api.stepUp();
-      r = await send();
-    }
+    const r = await withStepUp(send);
     return {
       inviteUrl: r.invite.url,
       claimCode: r.claimCode,

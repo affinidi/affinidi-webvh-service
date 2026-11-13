@@ -873,6 +873,78 @@ describe("step-up (wallet session)", () => {
     expect(all[4]!.bearer).toBe(`Bearer ${ELEVATED}`);
   });
 
+  it("steps up when a DID delete is refused as step_up_required, then deletes it", async () => {
+    stubStorage({
+      webvh_token: TOKEN,
+      webvh_refresh_token: "refresh-1",
+      webvh_auth_method: "wallet",
+    });
+    await generateSessionKeypair();
+    const approve = stubWallet(
+      vi.fn(async ({ approveRequest: request }: { approveRequest: Doc }) => ({
+        approveResponse: approveResponse(request),
+      })),
+    );
+    const DELETE = `${DM}did/delete/0.1`;
+    const sent = controlPlane(
+      DELETE,
+      {
+        ...rejection("permissionDenied"),
+        payload: { code: "permissionDenied", message: "step_up_required", retryable: false },
+      },
+      (req) =>
+        seal(req, {
+          record: {
+            mnemonic: "alpha",
+            owner: SUBJECT,
+            createdAt: "2026-01-01T00:00:00Z",
+            updatedAt: "2026-01-01T00:00:00Z",
+            versionCount: 1,
+            contentSize: 0,
+          },
+        }),
+    );
+
+    await api.deleteDid("alpha");
+
+    expect(approve).toHaveBeenCalledTimes(1);
+    const all = tasks(sent);
+    expect(all.map((s) => s.doc.type)).toEqual([DELETE, START, APPROVE_RESPONSE, REFRESH, DELETE]);
+    expect(all[4]!.doc.payload).toEqual({ mnemonic: "alpha" });
+    expect(all[4]!.bearer).toBe(`Bearer ${ELEVATED}`);
+  });
+
+  it("steps up when granting an administrator is refused as step_up_required", async () => {
+    stubStorage({
+      webvh_token: TOKEN,
+      webvh_refresh_token: "refresh-1",
+      webvh_auth_method: "wallet",
+    });
+    await generateSessionKeypair();
+    const approve = stubWallet(
+      vi.fn(async ({ approveRequest: request }: { approveRequest: Doc }) => ({
+        approveResponse: approveResponse(request),
+      })),
+    );
+    const GRANT = `${TT}acl/grant/0.2`;
+    const sent = controlPlane(
+      GRANT,
+      {
+        ...rejection("permissionDenied"),
+        payload: { code: "permissionDenied", message: "step_up_required", retryable: false },
+      },
+      (req) => seal(req, { entry: req.payload.entry }),
+    );
+
+    const entry = await api.createAcl("did:example:new-admin", "admin");
+
+    expect(approve).toHaveBeenCalledTimes(1);
+    expect(entry.role).toBe("admin");
+    const all = tasks(sent);
+    expect(all.map((s) => s.doc.type)).toEqual([GRANT, START, APPROVE_RESPONSE, REFRESH, GRANT]);
+    expect(all[4]!.bearer).toBe(`Bearer ${ELEVATED}`);
+  });
+
   it("sends nothing on when the wallet answers a different challenge", async () => {
     const store = stubStorage({ webvh_token: TOKEN, webvh_refresh_token: "refresh-1", webvh_auth_method: "wallet" });
     await generateSessionKeypair();

@@ -388,6 +388,30 @@ DIDComm), with WebAuthn's ceremony data inside their payloads:
 A `stepUp` invite enrols a step-up-only passkey, kept in its own keyspace
 (`passkey_step_up`) that the login ceremony never reads.
 
+### Stepped-up sessions
+
+A request that presents a console session (a bearer token on
+`POST /api/trust-tasks`) needs that session at `aal2` for the destructive and
+privilege-raising tasks below. A wallet session is stepped up with
+`auth/step-up/start/0.2` and the wallet's `auth/step-up/approve-response/0.7`;
+a passkey login is `aal2` from the start.
+
+| Trust Task | Needs `aal2` from a session |
+| --- | --- |
+| `did-management/domain/purge/0.1` | always (also from a request with no session) |
+| `did-management/registry/purge-domain/0.1` | yes |
+| `did-management/did/delete/0.1` | yes |
+| `did-management/identity/retire/0.1` | yes |
+| `acl/grant/0.2` | when the entry's role is `admin` or `service` |
+| `acl/change-role/0.2` | when `toRole` is `admin` or `service` |
+| `auth/passkey/enroll/invite/0.3` | yes, unless the request is signed with the administrator's own DID key |
+
+The refusal is `permissionDenied` with the message `step_up_required`; the
+console answers it by stepping the session up and sending the request again.
+A request with no session — a VTA sending signed Trust Tasks over DIDComm,
+TSP or HTTPS — is authorised by its own proof and is not asked for one
+(`domain/purge` aside).
+
 ## Library Usage
 
 The did-hosting-control crate can be used as a library (e.g., by the

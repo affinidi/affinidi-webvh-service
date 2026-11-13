@@ -1919,6 +1919,33 @@ async fn route_trust_task_doc(
             signing_oracle: false,
         };
 
+        // Making a subject an administrator (or a service account) from a
+        // session needs that session stepped up, as every other destructive
+        // or privilege-raising task does. A request with no bearer session is
+        // authorised by its own proof alone and is not affected. Asked only
+        // of an administrator, so anybody else still gets the handler's own
+        // refusal rather than a step-up that could not help them.
+        if signed
+            && raises_to_privileged_role(&doc)
+            && crate::control_tasks::session_needs_step_up(bearer, &principal)
+            && matches!(
+                did_hosting_common::server::acl::check_acl(&state.acl_ks, &principal).await,
+                Ok(crate::acl::Role::Admin)
+            )
+        {
+            return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
+                doc.reject_with(
+                    format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                    trust_tasks_rs::ErrorPayload::new(
+                        trust_tasks_rs::StandardCode::PermissionDenied,
+                    )
+                    .with_message(
+                        crate::error::AppError::StepUpRequired(String::new()).user_message(),
+                    ),
+                ),
+            ))));
+        }
+
         // A removed ACL entry takes what it authorised with it. The removal
         // lock is held from before the entry goes until its invites are
         // withdrawn, so no invite redemption (which takes it too) runs in
@@ -2011,6 +2038,28 @@ fn acl_entry_removal_subject(doc: &trust_tasks_rs::TrustTask<Value>) -> Option<S
         .get("subject")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// Whether `doc` gives its subject a privileged role: an `acl/grant` of an
+/// `admin` or `service` entry, or an `acl/change-role` to one of those. Those
+/// roles act across every domain, so granting one from a console session needs
+/// it stepped up.
+fn raises_to_privileged_role(doc: &trust_tasks_rs::TrustTask<Value>) -> bool {
+    use did_hosting_common::tasks::acl::{change_role::v0_2 as change_role, grant::v0_2 as grant};
+    use trust_tasks_rs::Payload as _;
+    let type_uri = doc.type_uri.to_string();
+    let role = if type_uri == grant::Payload::TYPE_URI {
+        doc.payload.pointer("/entry/role")
+    } else if type_uri == change_role::Payload::TYPE_URI {
+        doc.payload.get("toRole")
+    } else {
+        return false;
+    };
+    matches!(
+        role.and_then(Value::as_str)
+            .and_then(|r| r.parse::<crate::acl::Role>().ok()),
+        Some(crate::acl::Role::Admin | crate::acl::Role::Service)
+    )
 }
 
 /// The longest an `acl/revoke` waits for the ACL removal lock (R1.2).

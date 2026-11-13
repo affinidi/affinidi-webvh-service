@@ -515,7 +515,8 @@ pub(crate) async fn identity_list(
 
 /// `identity/retire/0.1`: the kill switch — drop a superseded generation's
 /// keys now. Admin, and never the service itself: a document the service
-/// signed is not an administrator's decision.
+/// signed is not an administrator's decision. A request carrying a bearer
+/// session needs it stepped up (`aal2`).
 pub(crate) async fn identity_retire(
     cx: &Cx<'_>,
     p: identity_retire::v0_1::Payload,
@@ -523,6 +524,7 @@ pub(crate) async fn identity_retire(
     use identity_retire::v0_1::error_codes;
 
     let auth = cx.admin().await?;
+    cx.require_stepped_up_session(&auth, "retiring an identity generation")?;
     let state = cx.state;
     let own = state
         .identity

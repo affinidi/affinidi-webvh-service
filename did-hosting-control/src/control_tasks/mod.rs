@@ -439,6 +439,29 @@ impl Cx<'_> {
         self.bearer
     }
 
+    /// Refuse a request that carries a bearer session below `aal2`, with the
+    /// `step_up_required` refusal the console answers by stepping the session
+    /// up and sending the request again.
+    ///
+    /// For the destructive control-plane tasks (`did/delete`,
+    /// `identity/retire`, `registry/purge-domain`). A request with no bearer
+    /// session is a single document its signer's own key authorises — a VTA
+    /// sending signed Trust Tasks over messaging — and is not affected.
+    /// `what` completes "… requires a stepped-up (aal2) session".
+    pub fn require_stepped_up_session(
+        &self,
+        auth: &AuthClaims,
+        what: &str,
+    ) -> Result<(), TaskError> {
+        if session_needs_step_up(self.bearer, &auth.did) {
+            return Err(AppError::StepUpRequired(format!(
+                "{what} requires a stepped-up (aal2) session"
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
     /// [`Cx::auth`], refused with `permissionDenied` unless the caller is an
     /// administrator.
     pub async fn admin(&self) -> Result<AuthClaims, TaskError> {
@@ -536,6 +559,20 @@ impl Cx<'_> {
             amr: vec!["did".to_string()],
             acr: "aal1".to_string(),
         })
+    }
+}
+
+/// Whether a request that presented `bearer` and was proven to come from
+/// `caller` is below the `aal2` a destructive task needs from a session.
+///
+/// No bearer session: `false` — the document's own proof is its authority.
+/// A bearer session counts only for its own subject (as in
+/// [`Cx::authenticated_claims`]); one for anybody else lends the request no
+/// assurance, so it is held to the base level and refused.
+pub(crate) fn session_needs_step_up(bearer: Option<&AuthClaims>, caller: &str) -> bool {
+    match bearer {
+        None => false,
+        Some(b) => b.did != caller || b.acr != "aal2",
     }
 }
 
