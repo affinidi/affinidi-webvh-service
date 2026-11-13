@@ -46,7 +46,7 @@ pub const SYNCED_EVENT_MAX_AGE_SECS: u64 = 1800;
 /// synced delta comes from a peer, and a counter that wrapped would read as
 /// almost nothing.
 fn saturating_fetch_add(counter: &std::sync::atomic::AtomicU64, n: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
         Some(v.saturating_add(n))
     });
 }
