@@ -60,6 +60,9 @@ import type * as AclRevoke from "./trust-tasks/acl/revoke/0.2/payload";
 import type * as AclChangeRole from "./trust-tasks/acl/change-role/0.2/payload";
 import type { Response as ServerInfo } from "./trust-tasks/did-management/server/info/0.1/payload";
 import type * as RevokeSession from "./trust-tasks/auth/revoke-session/0.2/payload";
+import type * as StepUpStart from "./trust-tasks/auth/step-up/start/0.2/payload";
+import type * as StepUpApprove from "./trust-tasks/auth/step-up/approve-response/0.7/payload";
+import type * as StepUpApproveRequest from "./trust-tasks/auth/step-up/approve-request/0.5/payload";
 
 import { ApiError, request } from "./http";
 import {
@@ -68,12 +71,17 @@ import {
   getRefreshToken,
   getSessionId,
   getToken,
+  renewSessionNow,
   restoreSession,
-  setRefreshToken,
-  setToken,
 } from "./session";
 import { hasSessionKeypair, restoreSessionKeypair } from "./session-key";
-import { getServiceInfo, isRejection, trustTask } from "./trust-task";
+import {
+  getServiceInfo,
+  isRejection,
+  sendSignedTrustTask,
+  trustTask,
+  type TrustTaskDocument,
+} from "./trust-task";
 import { getApiBase } from "./api-base";
 import {
   aclEntryFromWire,
@@ -566,6 +574,9 @@ const T = {
   passkeyRevokeFinish: `${TT}auth/passkey/revoke/finish/0.2` as const satisfies typeof PasskeyRevokeFinish.TYPE_URI,
   aclList: `${TT}acl/list/0.3` as const satisfies typeof AclList.TYPE_URI,
   revokeSession: `${TT}auth/revoke-session/0.2` as const satisfies typeof RevokeSession.TYPE_URI,
+  stepUpStart: `${TT}auth/step-up/start/0.2` as const satisfies typeof StepUpStart.TYPE_URI,
+  stepUpApproveRequest: `${TT}auth/step-up/approve-request/0.5` as const satisfies typeof StepUpApproveRequest.TYPE_URI,
+  stepUpApproveResponse: `${TT}auth/step-up/approve-response/0.7` as const satisfies typeof StepUpApprove.TYPE_URI,
   aclShow: `${TT}acl/show/0.2` as const satisfies typeof AclShow.TYPE_URI,
   aclGrant: `${TT}acl/grant/0.2` as const satisfies typeof AclGrant.TYPE_URI,
   aclRevoke: `${TT}acl/revoke/0.2` as const satisfies typeof AclRevoke.TYPE_URI,
@@ -1280,38 +1291,82 @@ export const api = {
   },
 
   /**
-   * Raise this session to `aal2` through the wallet: the wallet sends
-   * `auth/step-up/start`, verifies the signed approve-request it gets back,
-   * asks the user, answers with a signed `approve-response`, and renews the
-   * session with `auth/refresh`. The new tokens replace the old ones here.
+   * Raise this session to `aal2` through the wallet, without handing the
+   * wallet any of the session's tokens:
+   *
+   * 1. The console opens the step-up itself: `auth/step-up/start`, signed by
+   *    the session key bound at login, for this session. The control plane
+   *    answers with its signed `approve-request` — a single-use challenge
+   *    bound to this session and its subject, that lapses on its own.
+   * 2. The wallet gets that approve-request and nothing else. It verifies it,
+   *    asks the user, and returns its `approve-response`, signed as the
+   *    subject (`approveSessionStepUp`). A session key may never sign an
+   *    approval, so this is the one step the wallet is needed for.
+   * 3. The console sends the decision. The control plane checks it answers
+   *    the pending challenge for this session, signed by its subject, and
+   *    raises the session's level.
+   * 4. The console renews the session with `auth/refresh`, signed by the
+   *    session key with the refresh token held here, so the new tokens carry
+   *    the raised level.
    *
    * Only a wallet session can do this; a passkey session is `aal2` from login.
    */
   stepUp: async (): Promise<void> => {
     await restoreSession();
     const wallet = typeof window !== "undefined" ? window.vtaWallet : undefined;
-    const accessToken = getToken();
-    const refreshToken = getRefreshToken();
     const sessionId = getSessionId();
-    if (getAuthMethod() !== "wallet" || !wallet?.stepUpVta) {
+    if (getAuthMethod() !== "wallet" || !wallet?.approveSessionStepUp) {
       throw new ApiError(
         403,
         "This action needs a stepped-up session. Sign in again with a passkey, or with a wallet that supports step-up.",
       );
     }
-    if (!accessToken || !refreshToken || !sessionId) {
+    if (!getToken() || !getRefreshToken() || !sessionId) {
       throw new ApiError(401, "No session to step up — sign in again.");
     }
     const { serviceDid } = await getServiceInfo();
-    const result = await wallet.stepUpVta({
-      baseUrl: getApiBase(),
+
+    const { approveRequest } = await trustTask<StepUpStart.Payload, StepUpStart.Response>(
+      T.stepUpStart,
+      { sessionId },
+    );
+    const challenge = approveRequest?.payload?.challenge;
+    if (
+      approveRequest?.type !== T.stepUpApproveRequest ||
+      approveRequest.issuer !== serviceDid ||
+      approveRequest.payload?.sessionId !== sessionId ||
+      typeof challenge !== "string"
+    ) {
+      throw new ApiError(502, "the control plane answered the step-up with no request for this session");
+    }
+
+    const { approveResponse } = await wallet.approveSessionStepUp({
       rpDid: serviceDid,
-      accessToken,
-      refreshToken,
-      sessionId,
+      approveRequest: approveRequest as unknown as Record<string, unknown>,
     });
-    setToken(result.accessToken);
-    setRefreshToken(result.refreshToken);
+    const decision = approveResponse as unknown as TrustTaskDocument<StepUpApprove.Payload>;
+    if (
+      decision?.type !== T.stepUpApproveResponse ||
+      decision.recipient !== serviceDid ||
+      decision.payload?.challenge !== challenge ||
+      decision.payload?.sessionId !== sessionId ||
+      !decision.proof
+    ) {
+      throw new ApiError(400, "the wallet did not answer this step-up");
+    }
+    if (decision.payload.decision !== "approved") {
+      throw new ApiError(403, "The step-up was declined in the wallet.");
+    }
+
+    const ack = await sendSignedTrustTask<StepUpApprove.Response>(decision);
+    if (ack.status !== "elevated") {
+      throw new ApiError(403, `The control plane did not raise the session (${ack.status}).`);
+    }
+    try {
+      await renewSessionNow();
+    } catch (e) {
+      throw new ApiError(401, e instanceof Error ? e.message : "could not renew the session");
+    }
   },
 
   // ---- Passkey login (Trust Tasks) ----

@@ -120,18 +120,22 @@ interface VtaWalletProvider {
     target?: { kind: string; [k: string]: unknown };
     ttlSecondsHint?: number;
   }): Promise<ProxyLoginWireResult>;
-  /** Raise an existing session to `aal2`. The wallet sends
-   *  `auth/step-up/start/0.1` to `{baseUrl}/trust-tasks`, verifies the signed
-   *  reply and the approve-request inside it (issuer `rpDid`, this session),
-   *  asks the user, answers with a signed `approve-response/0.5`, and renews
-   *  the session with `auth/refresh/0.1`. Resolves with the renewed tokens. */
-  stepUpVta?(params: {
-    baseUrl: string;
+  /** Answer a step-up for an existing session. The console opens the step-up
+   *  itself — `auth/step-up/start/0.2`, signed by the session key bound at
+   *  login — and hands the wallet only the relying party's signed
+   *  `approve-request/0.5` that came back: a single-use challenge, bound to
+   *  this session and its subject, that lapses on its own (a few minutes).
+   *  The wallet verifies it (signed by `rpDid`, addressed to and naming the
+   *  wallet's own holder DID, not expired), asks the user, and returns its
+   *  signed `approve-response/0.7` (`assertionMethod`, as the holder). It
+   *  sends nothing to the relying party: the console sends the decision and
+   *  renews the session with its own session key.
+   *
+   *  The wallet never sees the session's access or refresh token. */
+  approveSessionStepUp?(params: {
     rpDid: string;
-    accessToken: string;
-    refreshToken: string;
-    sessionId: string;
-  }): Promise<VtaWalletLoginResult>;
+    approveRequest: Record<string, unknown>;
+  }): Promise<{ approveResponse: Record<string, unknown> }>;
   /** Which persona this site knows the user as, resolving or binding one.
    *  Mints nothing and issues no session. Present from the wallet build that
    *  added first-use persona binding (OpenVTC/vta-browser-plugin#145). */
@@ -227,10 +231,8 @@ export function isWalletProxyAvailable(): boolean {
  * Ask the wallet which persona this RP knows the operator as, binding one if
  * this is a first sign-in.
  *
- * Returns a `ProxyVaultEntry` so it drops into `loginWithWalletProxy` and the
- * visualization below is unchanged — the demo's whole point is showing the
- * round-trip, and the round-trip did not move. Only the way the entry is found
- * did: `listProxyCandidates()` asks the wallet to enumerate *every* entry
+ * Returns a `ProxyVaultEntry` so it drops into `loginWithWalletProxy`
+ * unchanged. Only the way the entry is found differs: `listProxyCandidates()` asks the wallet to enumerate *every* entry
  * pinned to this RP in order to find one, which discloses the operator's vault
  * to answer a question about a single entry, and on a fresh wallet returns
  * nothing at all.
@@ -278,64 +280,13 @@ export async function resolveProxyEntry(): Promise<{
 // ─── M2B.4 VTA-proxied login (vault/proxy-login/0.1) ──────────────────
 //
 // Three round-trips:
-//   1. Ask the wallet for did-self-issued entries pinned to this RP's DID
-//      via `vtaWallet.vaultList({ targetDid, secretKind })`.
-//   2. POST /api/auth/challenge with `did: principalDid` to get a
+//   1. POST /api/auth/challenge with `did: principalDid` to get a
 //      challenge nonce bound to that principal.
-//   3. Ask the wallet to mint a SIOP id_token for the chosen entry with
+//   2. Ask the wallet to mint a SIOP id_token for the chosen entry with
 //      the challenge as nonce via `vtaWallet.proxyLogin({...})`.
-//   4. POST /api/auth/ with `{ id_token, session_id }` — the server
-//      verifies and returns a TokenResponse.
-//
-// Each step is timed and captured into a `ProxyLoginViz` value so the
-// login UI can render a sequence diagram + decoded id_token after the
-// flow completes. The visualization is the M2B.4 demo deliverable;
-// auth still works without rendering it.
-
-/** One step in the visualisation. Captured with timing so the UI can
- *  render relative durations. */
-export interface ProxyLoginVizStep {
-  label: string;
-  description: string;
-  durationMs: number;
-  detail?: Record<string, unknown>;
-}
-
-/** Decoded JWT header + payload, parsed from the SIOP id_token after
- *  the proxy-login round-trip. Surfaced in the UI so the demo can show
- *  the user what the VTA actually minted. */
-export interface DecodedIdToken {
-  header: Record<string, unknown>;
-  payload: Record<string, unknown>;
-  /** Compact JWS (header.payload.signature). */
-  compact: string;
-}
-
-export interface ProxyLoginViz {
-  rpDid: string;
-  apiBase: string;
-  chosenEntry: {
-    id: string;
-    label: string;
-    contextId: string;
-    principalDid: string;
-  };
-  steps: ProxyLoginVizStep[];
-  idToken?: DecodedIdToken;
-  sessionBlob?: {
-    sessionId: string;
-    expiresAt: string;
-    bindOrigin?: string;
-    headerCount: number;
-    cookieCount: number;
-  };
-  totalMs: number;
-}
-
-export interface ProxyLoginOutcome {
-  result: VtaWalletLoginResult;
-  viz: ProxyLoginViz;
-}
+//   3. Post the id_token, wrapped as an `auth/authenticate/0.3` proxied
+//      authenticate, to /trust-tasks — the server verifies and returns
+//      the session's tokens.
 
 /** Strip "Bearer " prefix from an Authorization header value and return
  *  the trimmed token. Returns null if the value doesn't look like a
@@ -343,43 +294,6 @@ export interface ProxyLoginOutcome {
 function extractBearer(headerValue: string): string | null {
   const m = /^\s*Bearer\s+(.+)\s*$/i.exec(headerValue);
   return m && m[1] ? m[1] : null;
-}
-
-/** Base64url-decode a JWS segment to a JSON object. JWT compact form
- *  segments are URL-safe base64 without padding, so we restore padding
- *  before decoding. */
-function decodeJwtSegment(seg: string): Record<string, unknown> {
-  const pad = "=".repeat((4 - (seg.length % 4)) % 4);
-  const b64 = (seg + pad).replace(/-/g, "+").replace(/_/g, "/");
-  // `atob` is present in all our target runtimes (browser + Hermes); the
-  // Node `Buffer` path is a defensive fallback. Reach it through a typed
-  // `globalThis` guard rather than the ambient Node global, which isn't
-  // resolvable under this project's bundler/react-native type resolution
-  // (and we deliberately don't pull `@types/node` into a React Native app).
-  const json =
-    typeof atob === "function"
-      ? atob(b64)
-      : (
-          globalThis as unknown as {
-            Buffer: { from(s: string, enc: string): { toString(enc: string): string } };
-          }
-        ).Buffer.from(b64, "base64").toString("utf8");
-  return JSON.parse(json) as Record<string, unknown>;
-}
-
-/** Parse a compact JWS into its header + payload (signature ignored —
- *  the server already verified it before returning the access token,
- *  and this helper is for display only). Throws on malformed input. */
-export function decodeIdToken(compact: string): DecodedIdToken {
-  const parts = compact.split(".");
-  if (parts.length !== 3) {
-    throw new Error(`id_token is not a compact JWS (got ${parts.length} parts)`);
-  }
-  return {
-    header: decodeJwtSegment(parts[0]!),
-    payload: decodeJwtSegment(parts[1]!),
-    compact,
-  };
 }
 
 /** Enumerate proxy-login candidates for this RP via the wallet's
@@ -403,17 +317,15 @@ export async function listProxyCandidates(): Promise<ProxyVaultEntry[]> {
   return wire.entries.filter((e) => Boolean(e.principalDid));
 }
 
-/** Run the full VTA-proxied login flow against a chosen entry. Returns
- *  both the auth result (suitable for `AuthProvider.login`) and a
- *  visualization payload describing what happened, for the demo's
- *  walkthrough UI. *
+/** Run the full VTA-proxied login flow against a chosen entry. Returns the
+ *  auth result, suitable for `AuthProvider.login`. *
  * @deprecated Contract C7: SIOPv2 / extension login is legacy. Use wallet
  * sign-in with a trigger link (`oob-sign-in.ts`); kept, behind "Using an
  * older wallet?", until a removal date is set.
  */
 export async function loginWithWalletProxy(
   entry: ProxyVaultEntry,
-): Promise<ProxyLoginOutcome> {
+): Promise<VtaWalletLoginResult> {
   if (!isWalletProxyAvailable()) {
     throw new Error(
       "VTI Wallet doesn't expose proxy-login APIs (extension may be out of date).",
@@ -430,11 +342,8 @@ export async function loginWithWalletProxy(
   clearSessionKeypair();
   const rpDid = await getRpDid();
   const apiBase = getApiBase().replace(/\/+$/, "");
-  const steps: ProxyLoginVizStep[] = [];
-  const t0 = performance.now();
 
   // ─── Step 1: fetch a challenge keyed on the entry's principal DID.
-  const tCh = performance.now();
   const chRes = await fetch(`${apiBase}/auth/challenge`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -444,16 +353,9 @@ export async function loginWithWalletProxy(
     const text = await chRes.text();
     throw new Error(`/auth/challenge failed (${chRes.status}): ${text}`);
   }
-  // Wire-format asymmetry in did-hosting-control:
-  //   - ChallengeResponse uses camelCase (`#[serde(rename_all =
-  //     "camelCase")]` in did-hosting-common's types.rs) →
-  //     `{ challenge, sessionId, expiresAt }` on the wire.
-  //   - AuthenticatePayload has NO rename_all → still snake_case
-  //     (`{ id_token, session_id, ... }`).
-  // The original draft of this file read `session_id` from both,
-  // which left the auth POST with `session_id: undefined` and the
-  // server complaining "missing field `session_id`". Read camelCase
-  // here; emit snake_case in step 3.
+  // `ChallengeResponse` is camelCase on the wire (`{ challenge, sessionId,
+  // expiresAt }`, `#[serde(rename_all = "camelCase")]` in
+  // did-hosting-common's types.rs).
   const chJson = (await chRes.json()) as {
     challenge: string;
     sessionId: string;
@@ -464,21 +366,10 @@ export async function loginWithWalletProxy(
       `/auth/challenge: malformed response (missing sessionId or challenge): ${JSON.stringify(chJson)}`,
     );
   }
-  steps.push({
-    label: "1. Fetch challenge",
-    description: `Page POSTs /auth/challenge with the entry's principal DID. The RP returns a one-shot nonce bound to that DID.`,
-    durationMs: Math.round(performance.now() - tCh),
-    detail: {
-      url: `${apiBase}/auth/challenge`,
-      requestBody: { did: entry.principalDid },
-      response: chJson,
-    },
-  });
 
   // ─── Step 2: ask the wallet (via VTA) to mint a SIOP id_token with
   //            this challenge as nonce. The long-term key never leaves
   //            the VTA — wallet only sees the resulting SessionBlob.
-  const tPl = performance.now();
   const pl = await window.vtaWallet!.proxyLogin!({
     entryId: entry.id,
     nonce: chJson.challenge,
@@ -493,19 +384,6 @@ export async function loginWithWalletProxy(
       "vault/proxy-login: SessionBlob has no Authorization header — did-self-issued driver expected to emit one.",
     );
   }
-  const decoded = decodeIdToken(idTokenCompact);
-  steps.push({
-    label: "2. VTA mints SIOP id_token",
-    description: `Wallet asks the VTA via vault/proxy-login/0.1 to mint an id_token signed by the entry's DID, embedding the RP's challenge as nonce. The wallet receives a SessionBlob with the id_token in an Authorization header.`,
-    durationMs: Math.round(performance.now() - tPl),
-    detail: {
-      vaultEntryId: entry.id,
-      principalDid: entry.principalDid,
-      sessionId: pl.sessionId,
-      expiresAt: pl.expiresAt,
-      idTokenClaims: decoded.payload,
-    },
-  });
 
   // ─── Step 3: post the id_token, wrapped as an `auth/authenticate/0.3`
   //            proxied authenticate, to /trust-tasks. The server verifies
@@ -516,68 +394,21 @@ export async function loginWithWalletProxy(
   //            issues access tokens for a session bound to that same fresh
   //            key, so the session's calls are signed without a wallet
   //            prompt each.
-  const tAuth = performance.now();
-  const { response: tokenResp, sent: authEnv } = await authenticateIdTokenBindingSessionKey(
-    apiBase,
-    {
-      idToken: idTokenCompact,
-      sessionId: chJson.sessionId,
-      challenge: chJson.challenge,
-      principalDid: entry.principalDid,
-      rpDid,
-    },
-  );
-  steps.push({
-    label: "3. Server verifies + issues bearer",
-    description: `Server verifies the outer document's proof from the session key (the delegate), independently verifies the id_token as delegationEvidence for the principal DID, checks its nonce matches the challenge from step 1, and issues a bearer access token bound to the principal DID — and to the session key this browser generated, which signs the session's calls from here on.`,
-    durationMs: Math.round(performance.now() - tAuth),
-    detail: {
-      url: `${apiBase}/trust-tasks`,
-      requestBody: authEnv,
-      response: {
-        sessionId: tokenResp.session.id,
-        sessionSubject: tokenResp.session.subject,
-        accessToken: `${tokenResp.tokens.accessToken.slice(0, 12)}…(redacted)`,
-        tokenType: tokenResp.tokens.tokenType,
-        expiresIn: tokenResp.tokens.expiresIn,
-      },
-    },
+  const tokenResp = await authenticateIdTokenBindingSessionKey(apiBase, {
+    idToken: idTokenCompact,
+    sessionId: chJson.sessionId,
+    challenge: chJson.challenge,
+    principalDid: entry.principalDid,
+    rpDid,
   });
 
-  const totalMs = Math.round(performance.now() - t0);
-
   return {
-    result: {
-      accessToken: tokenResp.tokens.accessToken,
-      refreshToken: tokenResp.tokens.refreshToken ?? "",
-      sessionId: tokenResp.session.id,
-      holderDid: entry.principalDid,
-    },
-    viz: {
-      rpDid,
-      apiBase,
-      chosenEntry: {
-        id: entry.id,
-        label: entry.label,
-        contextId: entry.contextId,
-        principalDid: entry.principalDid,
-      },
-      steps,
-      idToken: decoded,
-      sessionBlob: {
-        sessionId: pl.sessionBlob.sessionId,
-        expiresAt: pl.sessionBlob.expiresAt,
-        ...(pl.sessionBlob.bindOrigin
-          ? { bindOrigin: pl.sessionBlob.bindOrigin }
-          : {}),
-        headerCount: pl.sessionBlob.headers?.length ?? 0,
-        cookieCount: pl.sessionBlob.cookies?.length ?? 0,
-      },
-      totalMs,
-    },
+    accessToken: tokenResp.tokens.accessToken,
+    refreshToken: tokenResp.tokens.refreshToken ?? "",
+    sessionId: tokenResp.session.id,
+    holderDid: entry.principalDid,
   };
 }
-
 
 // ─── Delegated task execution (requestTask) ───────────────────────────
 //

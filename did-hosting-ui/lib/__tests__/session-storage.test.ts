@@ -94,7 +94,7 @@ describe("session token storage", () => {
     setRefreshToken("secret-refresh-token");
     // Simulate the app's own, unrelated localStorage use (a UI preference) —
     // this must not carry a token along with it.
-    localStorage.setItem("didhosting:proxyLoginViz", "1");
+    localStorage.setItem("didhosting:uiPreference", "1");
 
     const written = calls.filter((c) => c.method === "setItem").map((c) => c.value);
     expect(written).toEqual(["1"]);

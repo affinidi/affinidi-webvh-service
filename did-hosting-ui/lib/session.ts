@@ -43,7 +43,7 @@ import {
 // TrustTaskRejection extends ApiError` at module-eval time, and whichever of
 // the two modules a caller reaches first leaves the other only partially
 // evaluated when that class body runs — `ApiError` is still unbound and the
-// `extends` throws. A dynamic `import()` inside `renewIfNeeded` below defers
+// `extends` throws. A dynamic `import()` inside `refreshWithSessionKey` below defers
 // the load until first call, by which point both modules have finished
 // evaluating.
 
@@ -294,41 +294,7 @@ export async function renewIfNeeded(): Promise<void> {
 
   renewInFlight = (async () => {
     try {
-      // After a reload the key is only in IndexedDB. Without restoring it
-      // first, the refresh would go out unsigned and be refused — every
-      // login this UI offers binds one, so in practice this always signs.
-      if (!hasSessionKeypair()) {
-        await restoreSessionKeypair();
-      }
-      if (!hasSessionKeypair()) return;
-
-      const { TRUST_TASKS_PATH, getServiceInfo } = await import("./trust-task");
-      const { serviceDid } = await getServiceInfo();
-      let envelope: Record<string, unknown> = {
-        type: REFRESH_TASK_URI,
-        id: crypto.randomUUID(),
-        recipient: serviceDid,
-        issuedAt: new Date().toISOString(),
-        // The auth family verifies a proof bound to its own `issuer` — the
-        // session key signs as *itself*, not as a delegate for the
-        // session's subject (unlike an ordinary authenticated call; see
-        // `trust-task.ts`'s `"session"` signer). Mirrors the session-key
-        // binding `auth/authenticate/0.2`/`0.3` established at login.
-        issuer: getSessionDidKey(),
-        payload: { refreshToken: refresh },
-      };
-      envelope = await signEnvelope(envelope);
-      const res = await fetch(TRUST_TASKS_PATH, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(envelope),
-      });
-      if (!res.ok) return;
-      const body = await res.json();
-      const nextAccess = body?.payload?.tokens?.accessToken;
-      const nextRefresh = body?.payload?.tokens?.refreshToken;
-      if (typeof nextAccess === "string") setToken(nextAccess);
-      if (typeof nextRefresh === "string") setRefreshToken(nextRefresh);
+      await refreshWithSessionKey(refresh);
     } catch {
       // Swallowed by design — see the doc comment.
     } finally {
@@ -336,6 +302,87 @@ export async function renewIfNeeded(): Promise<void> {
     }
   })();
   return renewInFlight;
+}
+
+/**
+ * Renew the session now, whatever the access token's remaining life, and
+ * throw if it does not renew. A step-up calls this once the control plane has
+ * raised the session's level: `auth/refresh` re-reads the session, so the
+ * tokens it mints carry the new level.
+ *
+ * The renewal is signed by this browser's session key and spends the refresh
+ * token held here — neither leaves the console. A timer renewal already in
+ * flight is waited for first, because it rotates the refresh token this one
+ * would otherwise present.
+ */
+export async function renewSessionNow(): Promise<void> {
+  await restoreSession();
+  if (renewInFlight) await renewInFlight;
+  const refresh = getRefreshToken();
+  if (!refresh) {
+    throw new Error("No refresh token for this session — sign in again.");
+  }
+  const run = refreshWithSessionKey(refresh);
+  const slot: Promise<void> = run
+    .then(
+      () => undefined,
+      () => undefined,
+    )
+    .finally(() => {
+      if (renewInFlight === slot) renewInFlight = null;
+    });
+  renewInFlight = slot;
+  lastRenewAttemptMs = Date.now();
+  await run;
+}
+
+/**
+ * Send one `auth/refresh/0.2`, signed by the session key, and keep the tokens
+ * it returns. Throws on any failure; the callers decide whether that matters.
+ */
+async function refreshWithSessionKey(refresh: string): Promise<void> {
+  // After a reload the key is only in IndexedDB. Without restoring it
+  // first, the refresh would go out unsigned and be refused — every
+  // login this UI offers binds one, so in practice this always signs.
+  if (!hasSessionKeypair()) {
+    await restoreSessionKeypair();
+  }
+  if (!hasSessionKeypair()) {
+    throw new Error("This browser no longer holds the session key — sign in again.");
+  }
+
+  const { TRUST_TASKS_PATH, getServiceInfo } = await import("./trust-task");
+  const { serviceDid } = await getServiceInfo();
+  let envelope: Record<string, unknown> = {
+    type: REFRESH_TASK_URI,
+    id: crypto.randomUUID(),
+    recipient: serviceDid,
+    issuedAt: new Date().toISOString(),
+    // The auth family verifies a proof bound to its own `issuer` — the
+    // session key signs as *itself*, not as a delegate for the
+    // session's subject (unlike an ordinary authenticated call; see
+    // `trust-task.ts`'s `"session"` signer). Mirrors the session-key
+    // binding `auth/authenticate/0.2`/`0.3` established at login.
+    issuer: getSessionDidKey(),
+    payload: { refreshToken: refresh },
+  };
+  envelope = await signEnvelope(envelope);
+  const res = await fetch(TRUST_TASKS_PATH, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(envelope),
+  });
+  if (!res.ok) {
+    throw new Error(`auth/refresh was refused (${res.status})`);
+  }
+  const body = await res.json();
+  const nextAccess = body?.payload?.tokens?.accessToken;
+  const nextRefresh = body?.payload?.tokens?.refreshToken;
+  if (typeof nextAccess !== "string" || nextAccess === "") {
+    throw new Error("auth/refresh answered without an access token");
+  }
+  setToken(nextAccess);
+  if (typeof nextRefresh === "string") setRefreshToken(nextRefresh);
 }
 
 export function getAuthMethod(): AuthMethod | null {

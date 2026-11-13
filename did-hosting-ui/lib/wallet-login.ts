@@ -15,9 +15,10 @@
  *     session keys would ignore the parameter and sign in without one.
  *
  * From then on `trust-task.ts` signs this session's ordinary calls with the
- * session key. Step-up still goes to the wallet (`stepUpVta`): the control
- * plane never accepts a session key where an `assertionMethod` approval is
- * required.
+ * session key. A step-up's decision still goes to the wallet
+ * (`approveSessionStepUp`): the control plane never accepts a session key
+ * where an `assertionMethod` approval is required. The wallet gets the
+ * step-up's signed approve-request only, never the session's tokens.
  *
  * A proxy login cannot go through `wallet.login`: the VTA mints the persona's
  * `id_token`, and the page wraps it as `auth/authenticate/0.3` proxied
@@ -116,14 +117,12 @@ const AUTH_AUTHENTICATE_V0_3 = "https://trusttasks.org/spec/auth/authenticate/0.
  * once. The control plane refuses a key it cannot bind rather than dropping
  * it, so a success means the key is bound. On any failure the key pair is
  * dropped, as in {@link loginBindingSessionKey}.
- *
- * Returns the envelope sent, for the login screen's walkthrough.
  */
 export async function authenticateIdTokenBindingSessionKey(
   apiBase: string,
   args: { idToken: string; sessionId: string; challenge: string; principalDid: string; rpDid: string },
   fetchFn: typeof fetch = fetch,
-): Promise<{ response: IdTokenAuthResponse; sent: Record<string, unknown> }> {
+): Promise<IdTokenAuthResponse> {
   const { didKey } = await generateSessionKeypair();
   let sent: Record<string, unknown> = {
     id: cryptoRandomUuid(),
@@ -160,7 +159,7 @@ export async function authenticateIdTokenBindingSessionKey(
         `auth/authenticate/0.3: missing payload.tokens.accessToken in response — got ${JSON.stringify(reply).slice(0, 200)}`,
       );
     }
-    return { response, sent };
+    return response;
   } catch (err) {
     clearSessionKeypair();
     throw err;
