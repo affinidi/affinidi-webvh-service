@@ -981,6 +981,23 @@ async fn two_processes_sharing_a_store_never_both_witness_a_fork() {
             .unwrap();
         let left = witnessed_branch(&record.witness_id, base, 0).await;
         let right = witnessed_branch(&record.witness_id, base, 7).await;
+        // Both branches start from the same first entry: the same versionId.
+        // Its proof carries the second it was signed in, so two builds of it
+        // can differ there; the right branch takes the left's copy, so the
+        // shared entry is byte-identical whatever the clock did.
+        let version_id = |log: &str| -> Value {
+            serde_json::from_str::<Value>(log.lines().next().unwrap()).unwrap()["versionId"].clone()
+        };
+        assert_eq!(version_id(&left[0]), version_id(&right[0]), "one DID");
+        let right: Vec<String> = right
+            .iter()
+            .map(|log| {
+                std::iter::once(left[0].as_str())
+                    .chain(log.lines().skip(1))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect();
         assert_eq!(left[0], right[0], "one DID");
         assert_ne!(left[1], right[1], "two histories");
         sign_ok(&first, &record.witness_id, &left[0]).await;
