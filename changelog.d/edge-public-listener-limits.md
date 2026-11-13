@@ -46,3 +46,10 @@ The two lists answer different questions: which client sent a request
 (`trusted_proxies`) and which host it addresses (`trusted_proxy_cidrs`).
 Behind a reverse proxy, list the proxy in both. The edge and the daemon now
 warn at startup when only one of them is set.
+
+### Breaking — `did_hosting_server::routes::trust_tasks::receive` takes the body unread
+
+Rust callers that invoke the handler directly: it now takes
+`Extension<trust_tasks::BodyLimit>` (after `ConnectInfo`) and an
+`axum::body::Body` instead of `Bytes`, and reads the body itself after its
+rate limit. Mounted through `routes::router*`, nothing changes.
