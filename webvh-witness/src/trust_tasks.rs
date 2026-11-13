@@ -446,6 +446,10 @@ async fn key_delete_task(state: &AppState, doc: &TrustTask<Value>) -> Result<Val
     }))
 }
 
+/// How many times a sign request re-reads and re-checks the witnessed mark
+/// when another process sharing the store moves it first.
+const MARK_ATTEMPTS: usize = 4;
+
 /// `webvh/witness/sign/0.1`: the witness signs only an entry it has verified —
 /// the log's chain up to the entry, that the entry is the last, that no
 /// entry before it already deactivated the DID (the deactivating entry
@@ -503,53 +507,81 @@ async fn sign_task(
     // The log must extend what this witness identity has already witnessed for
     // the DID: a witness proof on entry N vouches for every entry before it, so
     // witnessing a fork — or an older entry than one already witnessed — would
-    // put this identity's name behind two histories of one DID. The check, the
-    // signature and the record are one step under `sign_lock`.
+    // put this identity's name behind two histories of one DID.
+    //
+    // The mark is moved in the store, from exactly the state the check read,
+    // before anything is signed: another process sharing the store (a second
+    // replica, or the CLI) that checked a different log against the same mark
+    // cannot also move it, and re-checks against the mark this one left.
+    // `sign_lock` only spares this process's own requests that round trip.
     let _guard = state.sign_lock.lock().await;
     let version_number = witnessed.version_ids.len() as u64;
-    let mark = witness_ops::get_witnessed_mark(&state.witnesses_ks, witness_id, &witnessed.scid)
+    let mut attempt = 0;
+    loop {
+        let held =
+            witness_ops::read_witnessed_mark(&state.witnesses_ks, witness_id, &witnessed.scid)
+                .await
+                .map_err(store_failure)?;
+        if let Some(mark) = held.mark.as_ref() {
+            let extends = version_number >= mark.version_number
+                && usize::try_from(mark.version_number)
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .and_then(|i| witnessed.version_ids.get(i))
+                    == Some(&mark.version_id);
+            if !extends {
+                warn!(
+                    requester,
+                    witness_id,
+                    version_id,
+                    witnessed = %mark.version_id,
+                    "witness sign refused: the log does not extend what this witness has witnessed"
+                );
+                return Err(invalid_log(format!(
+                    "the log does not extend {}, which this witness identity has already \
+                     witnessed for this DID",
+                    mark.version_id
+                )));
+            }
+            // Re-witnessing the entry the mark already holds leaves it as it
+            // is: the mark only ever moves forward.
+            if version_number == mark.version_number {
+                break;
+            }
+        }
+        let advance = witness_ops::WitnessedMark {
+            version_number,
+            version_id: version_id.to_string(),
+        };
+        if witness_ops::advance_witnessed_mark(
+            &state.store,
+            &state.witnesses_ks,
+            witness_id,
+            &witnessed.scid,
+            &held,
+            &advance,
+        )
         .await
-        .map_err(store_failure)?;
-    if let Some(mark) = mark.as_ref() {
-        let extends = version_number >= mark.version_number
-            && usize::try_from(mark.version_number)
-                .ok()
-                .and_then(|n| n.checked_sub(1))
-                .and_then(|i| witnessed.version_ids.get(i))
-                == Some(&mark.version_id);
-        if !extends {
+        .map_err(store_failure)?
+        {
+            break;
+        }
+        attempt += 1;
+        if attempt == MARK_ATTEMPTS {
             warn!(
                 requester,
-                witness_id,
-                version_id,
-                witnessed = %mark.version_id,
-                "witness sign refused: the log does not extend what this witness has witnessed"
+                witness_id, version_id, "witness sign deferred: the mark kept moving"
             );
-            return Err(invalid_log(format!(
-                "the log does not extend {}, which this witness identity has already witnessed \
-                 for this DID",
-                mark.version_id
-            )));
+            return Err(store_failure(AppError::store_throttled()));
         }
     }
 
-    // The mark only ever moves forward; re-witnessing an entry already
-    // witnessed leaves it as it is. It is recorded — and made durable —
-    // inside `sign_witness_proof`, before the proof can leave this function.
-    let advance = mark
-        .as_ref()
-        .is_none_or(|m| version_number > m.version_number)
-        .then(|| witness_ops::WitnessedMark {
-            version_number,
-            version_id: version_id.to_string(),
-        });
     let (version_id, proof) = witness_ops::sign_witness_proof(
         &state.store,
         &state.witnesses_ks,
         state.signer.as_ref(),
         witness_id,
         version_id,
-        advance.as_ref().map(|m| (witnessed.scid.as_str(), m)),
     )
     .await
     .map_err(store_failure)?;

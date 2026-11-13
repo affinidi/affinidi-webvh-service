@@ -177,6 +177,28 @@ pub trait KeyspaceOps: Send + Sync {
     /// Only fjall — single-process by construction — uses a process-local
     /// mutex.
     fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>>;
+
+    /// Atomically write `new` under `key` only if the key currently holds
+    /// exactly `expected` (`None`: the key is absent). Returns whether the
+    /// write happened; `false` means the key held something else, and
+    /// nothing was written.
+    ///
+    /// **Required for state that must move forward once across replicas**
+    /// — a witness's furthest-witnessed mark is the first user. A plain
+    /// `get` + check + `insert` lets two processes sharing a store both pass
+    /// the check against the same old value and both write.
+    ///
+    /// Every shared backend decides the comparison in the store itself:
+    /// Redis a Lua script, DynamoDB a conditional `PutItem`, Cosmos DB a
+    /// create or an `If-Match` replace, Firestore a read-write transaction.
+    /// Only fjall, single-process by construction, uses a process-local
+    /// mutex.
+    fn compare_and_swap_raw(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        new: Vec<u8>,
+    ) -> BoxFuture<'_, Result<bool, AppError>>;
 }
 
 /// Atomic multi-key write batch identified by keyspace name.
@@ -479,6 +501,24 @@ impl KeyspaceHandle {
         self.inner.incr_raw(key.into()).await
     }
 
+    /// Atomically replace a key's raw bytes, only if it still holds
+    /// `expected` (`None`: only if it is absent). Returns whether it wrote.
+    ///
+    /// Backed by `KeyspaceOps::compare_and_swap_raw` — safe across replicas
+    /// that share a store: of several callers swapping from the same
+    /// `expected`, at most one sees `true`.
+    pub async fn compare_and_swap_raw(
+        &self,
+        key: impl Into<Vec<u8>>,
+        expected: Option<Vec<u8>>,
+        new: impl Into<Vec<u8>>,
+    ) -> Result<bool, AppError> {
+        note_write();
+        self.inner
+            .compare_and_swap_raw(key.into(), expected, new.into())
+            .await
+    }
+
     pub async fn remove(&self, key: impl Into<Vec<u8>>) -> Result<(), AppError> {
         note_write();
         self.inner.remove(key.into()).await
@@ -746,6 +786,17 @@ impl KeyspaceOps for FailingWrites {
             self.inner.incr_raw(key).await
         })
     }
+    fn compare_and_swap_raw(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        new: Vec<u8>,
+    ) -> BoxFuture<'_, Result<bool, AppError>> {
+        Box::pin(async move {
+            self.take_write()?;
+            self.inner.compare_and_swap_raw(key, expected, new).await
+        })
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -809,6 +860,14 @@ impl KeyspaceOps for FailingReads {
     fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
         self.inner.incr_raw(key)
     }
+    fn compare_and_swap_raw(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        new: Vec<u8>,
+    ) -> BoxFuture<'_, Result<bool, AppError>> {
+        self.inner.compare_and_swap_raw(key, expected, new)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -858,6 +917,14 @@ impl KeyspaceOps for Unordered {
     }
     fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
         self.inner.incr_raw(key)
+    }
+    fn compare_and_swap_raw(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        new: Vec<u8>,
+    ) -> BoxFuture<'_, Result<bool, AppError>> {
+        self.inner.compare_and_swap_raw(key, expected, new)
     }
 }
 
@@ -947,5 +1014,13 @@ impl KeyspaceOps for HashOrdered {
     }
     fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
         self.inner.incr_raw(key)
+    }
+    fn compare_and_swap_raw(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        new: Vec<u8>,
+    ) -> BoxFuture<'_, Result<bool, AppError>> {
+        self.inner.compare_and_swap_raw(key, expected, new)
     }
 }

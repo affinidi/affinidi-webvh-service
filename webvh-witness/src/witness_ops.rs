@@ -124,26 +124,25 @@ pub async fn delete_witness(
     batch.commit().await
 }
 
-/// Sign a witness proof for a given version ID, and record it.
+/// How many times the identity's `proofs_signed` counter is re-read and
+/// swapped when another process updates the record at the same moment.
+const COUNTER_ATTEMPTS: usize = 8;
+
+/// Sign a witness proof for a given version ID, and count it.
 ///
-/// The record — the identity's `proofs_signed` counter and, when `advance`
-/// names a DID, the furthest-witnessed mark for it — is one atomic write,
-/// made durable with [`Store::persist`] (an fsync) **before** the proof is
-/// returned. The mark is the witness's anti-equivocation memory: were a
-/// proof released while its mark was still only in the OS page cache, a
-/// power loss would forget it, and the witness would then sign a fork of a
-/// history it had already vouched for. A proof whose record cannot be made
-/// durable is never returned.
+/// The caller has already advanced — durably — the identity's mark for the
+/// DID ([`advance_witnessed_mark`]), or found it already at this entry: a
+/// proof is never signed for an entry the mark does not hold.
 ///
-/// The caller holds `sign_lock` across its extends-the-mark check and this
-/// call, so the check, the signature and the record are one step.
+/// The counter is swapped over the record it was read from, so a process
+/// sharing the store that rewrites or deletes the record at the same moment
+/// is neither overwritten nor undone.
 pub async fn sign_witness_proof(
     store: &Store,
     witnesses_ks: &KeyspaceHandle,
     signer: &dyn WitnessSigner,
     witness_id: &str,
     version_id: &str,
-    advance: Option<(&str, &WitnessedMark)>,
 ) -> Result<(String, DataIntegrityProof), AppError> {
     // Validate version_id format: <number>-<hash>
     if !is_valid_version_id(version_id) {
@@ -158,19 +157,32 @@ pub async fn sign_witness_proof(
 
     let proof = signer.sign_proof(&witness, version_id).await?;
 
-    let mut updated = witness;
-    updated.proofs_signed += 1;
-    let mut batch = store.batch();
-    batch.insert(
-        witnesses_ks,
-        format!("witness:{}", updated.witness_id),
-        &updated,
-    )?;
-    if let Some((scid, mark)) = advance {
-        batch.insert(witnesses_ks, witnessed_key(witness_id, scid), mark)?;
+    let key = format!("witness:{witness_id}");
+    let mut counted = false;
+    for _ in 0..COUNTER_ATTEMPTS {
+        let Some(stored) = witnesses_ks.get_raw(key.as_str()).await? else {
+            // Deleted meanwhile: nothing left to count on.
+            counted = true;
+            break;
+        };
+        let mut updated: WitnessRecord = serde_json::from_slice(&stored)?;
+        updated.proofs_signed += 1;
+        if witnesses_ks
+            .compare_and_swap_raw(key.as_str(), Some(stored), serde_json::to_vec(&updated)?)
+            .await?
+        {
+            counted = true;
+            break;
+        }
     }
-    batch.commit().await?;
-    store.persist().await?;
+    if counted {
+        store.persist().await?;
+    } else {
+        tracing::warn!(
+            witness_id,
+            "witness proof signed but not counted: the record kept changing"
+        );
+    }
 
     Ok((version_id.to_string(), proof))
 }
@@ -184,6 +196,15 @@ pub struct WitnessedMark {
     pub version_id: String,
 }
 
+/// A mark as read from the store, with the exact bytes it was read as, so
+/// [`advance_witnessed_mark`] can move it only from that state.
+#[derive(Debug, Clone, Default)]
+pub struct HeldMark {
+    /// The mark, or `None` if this identity has witnessed nothing for the DID.
+    pub mark: Option<WitnessedMark>,
+    stored: Option<Vec<u8>>,
+}
+
 fn witnessed_key(witness_id: &str, scid: &str) -> String {
     format!("witnessed:{witness_id}:{scid}")
 }
@@ -194,10 +215,62 @@ pub async fn get_witnessed_mark(
     witness_id: &str,
     scid: &str,
 ) -> Result<Option<WitnessedMark>, AppError> {
-    witnesses_ks.get(witnessed_key(witness_id, scid)).await
+    Ok(read_witnessed_mark(witnesses_ks, witness_id, scid)
+        .await?
+        .mark)
 }
 
-/// Record that `witness_id` has witnessed `mark` for the DID `scid`.
+/// [`get_witnessed_mark`], kept with the bytes it was read as.
+pub async fn read_witnessed_mark(
+    witnesses_ks: &KeyspaceHandle,
+    witness_id: &str,
+    scid: &str,
+) -> Result<HeldMark, AppError> {
+    let stored = witnesses_ks
+        .get_raw(witnessed_key(witness_id, scid))
+        .await?;
+    let mark = stored.as_deref().map(serde_json::from_slice).transpose()?;
+    Ok(HeldMark { mark, stored })
+}
+
+/// Move `witness_id`'s mark for the DID `scid` from `from` to `to`, only if
+/// the store still holds `from`, and make it durable ([`Store::persist`], an
+/// fsync on the embedded store) before returning `true`.
+///
+/// The mark is the witness's anti-equivocation memory, and the store — not
+/// this process — decides the swap: of two witness processes sharing a store
+/// that each checked a request against the same mark, at most one moves it.
+/// The other gets `false`, and must read the mark again and re-check before
+/// it may sign. A restarted process reads the mark the last one left.
+///
+/// Advance the mark **before** signing: a proof released while its mark
+/// could still be lost (another process's swap, or a power loss before the
+/// fsync) would let the witness sign a fork of a history it had already
+/// vouched for.
+pub async fn advance_witnessed_mark(
+    store: &Store,
+    witnesses_ks: &KeyspaceHandle,
+    witness_id: &str,
+    scid: &str,
+    from: &HeldMark,
+    to: &WitnessedMark,
+) -> Result<bool, AppError> {
+    let swapped = witnesses_ks
+        .compare_and_swap_raw(
+            witnessed_key(witness_id, scid),
+            from.stored.clone(),
+            serde_json::to_vec(to)?,
+        )
+        .await?;
+    if swapped {
+        store.persist().await?;
+    }
+    Ok(swapped)
+}
+
+/// Record that `witness_id` has witnessed `mark` for the DID `scid`,
+/// whatever it held before. For tests and repair only: signing moves the
+/// mark with [`advance_witnessed_mark`].
 pub async fn set_witnessed_mark(
     witnesses_ks: &KeyspaceHandle,
     witness_id: &str,
@@ -251,12 +324,11 @@ mod tests {
         (Store::open(&config).await.unwrap(), dir)
     }
 
-    /// The counter and the witnessed mark are one write. Read the counter
-    /// first, then the mark: if each proof's record is atomic, the mark
-    /// read afterwards is never behind the count read before it. Two
-    /// separate writes expose "counted, but the mark not yet advanced" —
-    /// the state a crash (or, before the record was fsynced, a power loss)
-    /// would freeze while the proof was already out.
+    /// The mark moves before the proof is signed and counted. Read the
+    /// counter first, then the mark: the mark read afterwards is never
+    /// behind the count read before it. The other order would expose
+    /// "counted, but the mark not yet advanced", the state a crash would
+    /// freeze while the proof was already out.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn a_signed_proof_is_never_recorded_without_its_mark() {
         use std::sync::Arc;
@@ -297,13 +369,18 @@ mod tests {
                 version_number: n,
                 version_id: version_id.clone(),
             };
+            let held = read_witnessed_mark(&ks, &witness_id, "scid").await.unwrap();
+            assert!(
+                advance_witnessed_mark(&store, &ks, &witness_id, "scid", &held, &mark)
+                    .await
+                    .unwrap()
+            );
             sign_witness_proof(
                 &store,
                 &ks,
                 &crate::signing::LocalSigner::new(keys.clone()),
                 &witness_id,
                 &version_id,
-                Some(("scid", &mark)),
             )
             .await
             .unwrap();
@@ -320,6 +397,60 @@ mod tests {
                 version_number: 150,
                 version_id: "150-QmHash150".into()
             })
+        );
+    }
+
+    /// The mark moves only from the state it was read in: a second process
+    /// that read the same mark before the first one moved it cannot move it
+    /// again, and must re-read.
+    #[tokio::test]
+    async fn a_mark_moves_only_from_the_state_it_was_read_in() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace(crate::store::KS_WITNESSES).unwrap();
+        let first = WitnessedMark {
+            version_number: 1,
+            version_id: "1-QmOne".into(),
+        };
+        let left = WitnessedMark {
+            version_number: 2,
+            version_id: "2-QmLeft".into(),
+        };
+        let right = WitnessedMark {
+            version_number: 3,
+            version_id: "3-QmRight".into(),
+        };
+
+        let none = read_witnessed_mark(&ks, "w", "scid").await.unwrap();
+        assert!(none.mark.is_none());
+        assert!(
+            advance_witnessed_mark(&store, &ks, "w", "scid", &none, &first)
+                .await
+                .unwrap()
+        );
+        // A stale "nothing witnessed yet" cannot overwrite it.
+        assert!(
+            !advance_witnessed_mark(&store, &ks, "w", "scid", &none, &left)
+                .await
+                .unwrap()
+        );
+
+        // Two readers of the same mark: one moves it, the other is refused.
+        let a = read_witnessed_mark(&ks, "w", "scid").await.unwrap();
+        let b = read_witnessed_mark(&ks, "w", "scid").await.unwrap();
+        assert_eq!(a.mark.as_ref(), Some(&first));
+        assert!(
+            advance_witnessed_mark(&store, &ks, "w", "scid", &a, &left)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !advance_witnessed_mark(&store, &ks, "w", "scid", &b, &right)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            get_witnessed_mark(&ks, "w", "scid").await.unwrap(),
+            Some(left)
         );
     }
 
