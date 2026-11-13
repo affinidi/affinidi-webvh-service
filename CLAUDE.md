@@ -294,7 +294,8 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
   an issuer-absent path; the passkey session delegate is per-request, HTTPS-only
   (`with_session_delegate`).
 - **A proof failing against a cached DID document is re-resolved once**
-  (rate-limited per DID identity, bounded map) before refusal, so a rotation
+  (rate-limited per DID with its path, query and fragment removed, bounded
+  map) before refusal, so a rotation
   doesn't strand a peer; the cache TTL is `DID_CACHE_TTL_SECS`. A DID that
   could not be resolved at all is not re-resolved (it is reported retryable).
 - **Signers outside the ACL never touch the shared replay cache.**

@@ -390,7 +390,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // "unknown". Read off the runtime's workers — it can be 100+ MB.
     let geoip = open_geoip(&config.geoip).await?;
     let client_ips =
-        did_hosting_common::server::rate_limit::ClientIps::new(&config.server.trusted_proxies)?;
+        did_hosting_common::server::rate_limit::ClientIps::from_server_config(&config.server)?;
 
     let state = AppState {
         store: store.clone(),

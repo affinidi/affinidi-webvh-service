@@ -1,8 +1,13 @@
 //! This workspace's rate limits, built on `affinidi-rate-limit`: the per-address
 //! limit on each Trust Task listener (below), wallet sign-in's and the control
 //! plane's limits, and the limit on public DID resolution
-//! ([`ResolveRateLimiter`], `[server.resolve_rate_limit]`, off by default; an
-//! IPv6 client counts by its /64).
+//! ([`ResolveRateLimiter`], `[server.resolve_rate_limit]`, off by default).
+//!
+//! Every per-address limit counts an IPv6 client by its network, not its full
+//! address: `server.client_ipv6_prefix` (default
+//! [`DEFAULT_CLIENT_IPV6_PREFIX`], the block one host is normally given), so
+//! rotating addresses inside that block draws on one allowance
+//! ([`ClientIps::key_of`]). IPv4 clients count by their address.
 //!
 //! `POST /api/trust-tasks` is reachable by anyone who can resolve a service's
 //! DID document and reach its HTTPS binding — it carries its own proof, so
@@ -73,10 +78,10 @@ pub const TRUST_TASKS_WINDOW_SECS: u64 = 60;
 /// The `limiter` name of the per-address limit on public DID resolution.
 pub const RESOLVE_RATE_LIMIT_NAME: &str = "resolve-per-address";
 
-/// The prefix an IPv6 client is counted by on resolution: the block one host
-/// is normally given, so rotating addresses inside it does not escape the
-/// limit.
-const RESOLVE_IPV6_PREFIX: u8 = 64;
+/// The prefix an IPv6 client is counted by when `server.client_ipv6_prefix`
+/// is not set: the block one host is normally given, so rotating addresses
+/// inside it does not draw on a fresh allowance.
+pub const DEFAULT_CLIENT_IPV6_PREFIX: u8 = 64;
 
 /// A named limit of `max_per_window` requests per `window_secs` for each key
 /// (a client address, an authenticated source, or `()` for one budget shared
@@ -159,8 +164,8 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> KeyedRateLimiter<K> {
 
 impl IpRateLimiter {
     /// Admit one request from `peer` carrying `headers`, charged to its client
-    /// address ([`ClientIps::client_ip`]): the client address, or the refusal
-    /// to send — [`AppError::InvalidForwardedFor`] (`400`, the same body the
+    /// address's key ([`ClientIps::key_of`]: an IPv6 client's network). Returns
+    /// the client address ([`ClientIps::client_ip`]), or the refusal to send — [`AppError::InvalidForwardedFor`] (`400`, the same body the
     /// resolution limit sends) for an unreadable chain from a trusted proxy,
     /// [`AppError::RateLimited`] (`429`) past the limit.
     pub fn admit(
@@ -174,7 +179,7 @@ impl IpRateLimiter {
             .map_err(|InvalidForwardedFor| AppError::InvalidForwardedFor {
                 limiter: self.limiter,
             })?;
-        self.try_consume(client_ip)?;
+        self.try_consume(clients.key_of(client_ip))?;
         Ok(client_ip)
     }
 }
@@ -220,11 +225,10 @@ impl ResolveRateLimiter {
         .with_source(RATE_LIMIT_SOURCE)
         .with_limiter_name(RESOLVE_RATE_LIMIT_NAME);
         // A clone of the handlers' extractor, so a proxy's invalid chain is
-        // logged once a minute whichever path met it.
-        let clients = (*clients.0)
-            .clone()
-            .ipv6_prefix(RESOLVE_IPV6_PREFIX)
-            .expect("64 is a valid IPv6 prefix length");
+        // logged once a minute whichever path met it. It carries the
+        // service's IPv6 prefix, so the layer counts a client as the
+        // handlers' limits do.
+        let clients = (*clients.extractor).clone();
         let layer = RateLimitLayer::new(state.clone()).client_ip_extractor(clients);
         Self { state, layer }
     }
@@ -260,18 +264,64 @@ impl ResolveRateLimiter {
 /// service's state. Clones share one extractor, so a proxy's invalid chain is
 /// logged once a minute whichever path met it.
 ///
-/// The default trusts no proxy: every request is its TCP peer.
-#[derive(Clone, Debug, Default)]
-pub struct ClientIps(Arc<ClientIpExtractor>);
+/// It also says what a per-address limit counts a client as
+/// ([`Self::key_of`]): an IPv6 client by its network of the configured prefix.
+///
+/// The default trusts no proxy (every request is its TCP peer) and counts an
+/// IPv6 client by its [`DEFAULT_CLIENT_IPV6_PREFIX`] network.
+#[derive(Clone, Debug)]
+pub struct ClientIps {
+    extractor: Arc<ClientIpExtractor>,
+    ipv6_prefix: u8,
+}
+
+impl Default for ClientIps {
+    fn default() -> Self {
+        Self {
+            extractor: Arc::new(
+                ClientIpExtractor::default()
+                    .ipv6_prefix(DEFAULT_CLIENT_IPV6_PREFIX)
+                    .expect("64 is a valid IPv6 prefix length"),
+            ),
+            ipv6_prefix: DEFAULT_CLIENT_IPV6_PREFIX,
+        }
+    }
+}
 
 impl ClientIps {
-    /// The rule for `trusted_proxies`.
+    /// The rule for `trusted_proxies`, counting an IPv6 client by its
+    /// [`DEFAULT_CLIENT_IPV6_PREFIX`] network.
     ///
     /// # Errors
     ///
     /// [`AppError::Config`] for a range covering every address, which
     /// configuration loading already refuses.
     pub fn new(trusted_proxies: &[IpNetwork]) -> Result<Self, AppError> {
+        Self::with_ipv6_prefix(trusted_proxies, DEFAULT_CLIENT_IPV6_PREFIX)
+    }
+
+    /// The rule a service's `[server]` section describes:
+    /// `trusted_proxies` and `client_ipv6_prefix`.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::Config`] for a `trusted_proxies` range covering every
+    /// address, or a `client_ipv6_prefix` outside 1 to 128.
+    pub fn from_server_config(server: &ServerConfig) -> Result<Self, AppError> {
+        Self::with_ipv6_prefix(&server.trusted_proxies, server.client_ipv6_prefix)
+    }
+
+    /// The rule for `trusted_proxies`, counting an IPv6 client by its network
+    /// of `ipv6_prefix` bits.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::Config`] for a range covering every address, or a prefix
+    /// outside 1 to 128 (0 would count every IPv6 client as one).
+    pub fn with_ipv6_prefix(
+        trusted_proxies: &[IpNetwork],
+        ipv6_prefix: u8,
+    ) -> Result<Self, AppError> {
         let ranges = trusted_proxies
             .iter()
             .map(|network| {
@@ -279,9 +329,26 @@ impl ClientIps {
                     .expect("an IpNetwork's prefix is valid for its address family")
             })
             .collect();
-        ClientIpExtractor::trusted_proxies(ranges)
-            .map(|extractor| Self(Arc::new(extractor)))
-            .map_err(|e| AppError::Config(format!("server.trusted_proxies: {e}")))
+        let extractor = ClientIpExtractor::trusted_proxies(ranges)
+            .map_err(|e| AppError::Config(format!("server.trusted_proxies: {e}")))?
+            .ipv6_prefix(ipv6_prefix)
+            .map_err(|e| AppError::Config(format!("server.client_ipv6_prefix: {e}")))?;
+        Ok(Self {
+            extractor: Arc::new(extractor),
+            ipv6_prefix,
+        })
+    }
+
+    /// What a per-address limit counts `client` (a [`Self::client_ip`]) as:
+    /// an IPv6 address's network of the configured prefix, so one host
+    /// cannot draw a fresh allowance from each address in its block; an IPv4
+    /// address as itself.
+    pub fn key_of(&self, client: IpAddr) -> IpAddr {
+        match client {
+            IpAddr::V6(address) => ipnetwork::Ipv6Network::new(address, self.ipv6_prefix)
+                .map_or(client, |network| IpAddr::V6(network.network())),
+            IpAddr::V4(_) => client,
+        }
     }
 
     /// The client address of a request from `peer` carrying `headers`:
@@ -300,7 +367,7 @@ impl ClientIps {
         peer: IpAddr,
         headers: &HeaderMap,
     ) -> Result<IpAddr, InvalidForwardedFor> {
-        self.0.client_ip(peer, headers)
+        self.extractor.client_ip(peer, headers)
     }
 }
 
@@ -384,7 +451,7 @@ mod tests {
     #[test]
     fn clones_of_client_ips_share_one_extractor() {
         let clients = ClientIps::new(&nets(&["10.0.0.0/8"])).unwrap();
-        assert!(Arc::ptr_eq(&clients.0, &clients.clone().0));
+        assert!(Arc::ptr_eq(&clients.extractor, &clients.clone().extractor));
     }
 
     /// A limit on what a source proves, and one budget for everyone.
@@ -506,6 +573,100 @@ mod tests {
                 .admit(&clients, ip("10.0.0.1"), &xff(&["198.51.100.7"]))
                 .unwrap(),
             ip("198.51.100.7")
+        );
+    }
+
+    /// A per-address limit counts an IPv6 client by its /64 by default: a
+    /// host stepping through the addresses of its block shares one allowance,
+    /// while the next /64 and an IPv4 client have their own. The address
+    /// handed back is still the client's own.
+    #[test]
+    fn admit_counts_an_ipv6_client_by_its_network() {
+        let limiter = IpRateLimiter::new("test-limiter", 2, 60);
+        let clients = ClientIps::new(&[]).unwrap();
+        let headers = HeaderMap::new();
+        assert_eq!(
+            limiter
+                .admit(&clients, ip("2001:db8:1:1::1"), &headers)
+                .unwrap(),
+            ip("2001:db8:1:1::1")
+        );
+        limiter
+            .admit(&clients, ip("2001:db8:1:1:ffff::2"), &headers)
+            .unwrap();
+        assert!(matches!(
+            limiter.admit(&clients, ip("2001:db8:1:1:abcd::3"), &headers),
+            Err(AppError::RateLimited { .. })
+        ));
+        limiter
+            .admit(&clients, ip("2001:db8:1:2::1"), &headers)
+            .unwrap();
+        limiter
+            .admit(&clients, ip("203.0.113.1"), &headers)
+            .unwrap();
+        limiter
+            .admit(&clients, ip("203.0.113.2"), &headers)
+            .unwrap();
+    }
+
+    /// The prefix is configurable, IPv4 is never masked, and a prefix that
+    /// would count every IPv6 client as one, or is not a prefix at all, is
+    /// refused at startup.
+    #[test]
+    fn the_ipv6_prefix_is_configurable_and_validated() {
+        let mut server = ServerConfig::default();
+        assert_eq!(server.client_ipv6_prefix, DEFAULT_CLIENT_IPV6_PREFIX);
+        assert_eq!(
+            ClientIps::default().key_of(ip("2001:db8:1:1:2:3:4:5")),
+            ip("2001:db8:1:1::")
+        );
+        server.client_ipv6_prefix = 48;
+        let clients = ClientIps::from_server_config(&server).unwrap();
+        assert_eq!(
+            clients.key_of(ip("2001:db8:1:1:2:3:4:5")),
+            ip("2001:db8:1::")
+        );
+        assert_eq!(clients.key_of(ip("203.0.113.9")), ip("203.0.113.9"));
+        server.client_ipv6_prefix = 128;
+        assert_eq!(
+            ClientIps::from_server_config(&server)
+                .unwrap()
+                .key_of(ip("2001:db8::5")),
+            ip("2001:db8::5")
+        );
+        for refused in [0, 129] {
+            server.client_ipv6_prefix = refused;
+            assert!(
+                matches!(
+                    ClientIps::from_server_config(&server),
+                    Err(AppError::Config(_))
+                ),
+                "prefix {refused} should be refused"
+            );
+        }
+    }
+
+    /// The resolution layer counts an IPv6 client by the service's
+    /// configured network, as the handlers' limits do.
+    #[tokio::test]
+    async fn the_resolution_layer_uses_the_configured_ipv6_prefix() {
+        let mut server = ServerConfig::default();
+        server.resolve_rate_limit.max_per_window = Some(1);
+        server.client_ipv6_prefix = 48;
+        let limiter =
+            ResolveRateLimiter::new(&server, &ClientIps::from_server_config(&server).unwrap());
+        let app = app(&limiter);
+        assert_eq!(
+            status(&app, request("2001:db8:1:1::1", None)).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&app, request("2001:db8:1:2::1", None)).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            status(&app, request("2001:db8:2::1", None)).await,
+            StatusCode::OK
         );
     }
 

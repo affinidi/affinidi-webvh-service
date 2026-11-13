@@ -61,6 +61,12 @@
 //! halves every [`PENALTY_HALF_LIFE_SECS`] and on each claim that does
 //! verify, so an address is not held to it indefinitely.
 //!
+//! The budget across every address is split. An address whose large claim has
+//! verified within [`PROVEN_ADDRESS_TTL_SECS`] draws on a share that no other
+//! address can spend; every other address draws only on
+//! [`LARGE_DOCUMENT_UNPROVEN_SHARE_PER_WINDOW`]. Claims that never verify can
+//! then use up that share, but not what proven callers rely on.
+//!
 //! Claimed and verified issuers are compared as identities
 //! ([`crate::scid::identity`]): a `did:scid` issuer may carry a `?src=`
 //! locator that the verified identity does not, and that is the same
@@ -162,10 +168,25 @@ pub const LARGE_DOCUMENT_BUDGET_WINDOW_SECS: u64 = 60;
 /// deployment registers far fewer large DIDs than this per minute.
 pub const LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW: u64 = 60;
 
+/// The part of [`LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW`] that addresses
+/// with no recently verified large claim may spend between them per window.
+/// The rest is kept for proven addresses (see [`PROVEN_ADDRESS_TTL_SECS`]),
+/// which fall back to this share only once theirs is spent. A caller's first
+/// large document, before it has proven anything, comes from this share.
+pub const LARGE_DOCUMENT_UNPROVEN_SHARE_PER_WINDOW: u64 = 20;
+
+/// How long an address counts as proven after a large document from it
+/// verified to exactly the issuer it claimed. Each further verified claim
+/// renews it; a claim that does not verify ends it.
+pub const PROVEN_ADDRESS_TTL_SECS: u64 = 60 * 60;
+
+/// The `limiter` the proven addresses' share logs its refusals under.
+const GLOBAL_PROVEN_LIMITER: &str = "large-document-global-proven";
+
 /// The `limiter` the per-address budget logs its refusals under.
 const PER_ADDRESS_LIMITER: &str = "large-document-per-address";
 
-/// The `limiter` the every-address budget logs its refusals under.
+/// The `limiter` the share for unproven addresses logs its refusals under.
 const GLOBAL_LIMITER: &str = "large-document-global";
 
 /// Most addresses tracked at once, by the per-address budget and by the
@@ -223,7 +244,14 @@ impl Penalty {
 #[derive(Debug)]
 pub struct LargeDocumentBudget {
     per_address: KeyedRateLimiter<String>,
+    /// The every-address share open to any address
+    /// ([`LARGE_DOCUMENT_UNPROVEN_SHARE_PER_WINDOW`]).
     global: KeyedRateLimiter<()>,
+    /// The rest of the every-address budget, open only to proven addresses.
+    global_proven: KeyedRateLimiter<()>,
+    /// Addresses whose large claim last verified, and when; bounded by
+    /// [`MAX_TRACKED_ADDRESSES`].
+    proven: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// Each penalised address's raised cost per large document (an address
     /// that is absent, or whose penalty has decayed to 1, costs 1).
     penalties: std::sync::Mutex<std::collections::HashMap<String, Penalty>>,
@@ -250,9 +278,15 @@ impl LargeDocumentBudget {
             .with_max_tracked_keys(max_tracked),
             global: KeyedRateLimiter::new(
                 GLOBAL_LIMITER,
-                LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW,
+                LARGE_DOCUMENT_UNPROVEN_SHARE_PER_WINDOW,
                 LARGE_DOCUMENT_BUDGET_WINDOW_SECS,
             ),
+            global_proven: KeyedRateLimiter::new(
+                GLOBAL_PROVEN_LIMITER,
+                LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW - LARGE_DOCUMENT_UNPROVEN_SHARE_PER_WINDOW,
+                LARGE_DOCUMENT_BUDGET_WINDOW_SECS,
+            ),
+            proven: Default::default(),
             penalties: Default::default(),
         }
     }
@@ -264,22 +298,68 @@ impl LargeDocumentBudget {
     pub fn spawn_gc(&self, shutdown: &tokio_util::sync::CancellationToken) {
         self.per_address.spawn_gc(shutdown.clone());
         self.global.spawn_gc(shutdown.clone());
+        self.global_proven.spawn_gc(shutdown.clone());
     }
 
     /// Charge `address` for one large document, at its current per-document
-    /// cost, then the every-address budget for one. `Err` is the number of
+    /// cost, then the every-address budget for one: a proven address's own
+    /// share first, then the share open to all. `Err` is the number of
     /// seconds until a retry can succeed.
     ///
     /// The address is charged first, so an address over its own budget never
     /// spends the shared one. A penalised address that cannot pay its whole
     /// cost loses what it could pay: it has already been caught once.
     fn try_charge(&self, address: &str) -> Result<(), u64> {
-        for _ in 0..self.cost(address) {
+        self.try_charge_at(address, std::time::Instant::now())
+    }
+
+    fn try_charge_at(&self, address: &str, now: std::time::Instant) -> Result<(), u64> {
+        for _ in 0..self.cost_at(address, now) {
             self.per_address
                 .try_consume(address.to_owned())
                 .map_err(retry_after)?;
         }
+        if self.is_proven_at(address, now) && self.global_proven.try_consume(()).is_ok() {
+            return Ok(());
+        }
         self.global.try_consume(()).map_err(retry_after)
+    }
+
+    /// Whether a large claim from `address` verified within
+    /// [`PROVEN_ADDRESS_TTL_SECS`] of `now`.
+    fn is_proven_at(&self, address: &str, now: std::time::Instant) -> bool {
+        self.lock_proven().get(address).is_some_and(|at| {
+            now.saturating_duration_since(*at).as_secs() < PROVEN_ADDRESS_TTL_SECS
+        })
+    }
+
+    /// Record that a large claim from `address` verified at `now`. A full
+    /// table drops the expired entries, then the oldest: only verified
+    /// callers add entries, so no stranger can push one out.
+    fn mark_proven_at(&self, address: &str, now: std::time::Instant) {
+        let mut proven = self.lock_proven();
+        if proven.len() >= MAX_TRACKED_ADDRESSES && !proven.contains_key(address) {
+            proven.retain(|_, at| {
+                now.saturating_duration_since(*at).as_secs() < PROVEN_ADDRESS_TTL_SECS
+            });
+            if proven.len() >= MAX_TRACKED_ADDRESSES
+                && let Some(oldest) = proven
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(k, _)| k.clone())
+            {
+                proven.remove(&oldest);
+            }
+        }
+        proven.insert(address.to_owned(), now);
+    }
+
+    fn lock_proven(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, std::time::Instant>> {
+        self.proven
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Double `address`'s per-document cost — called once a claimed issuer
@@ -300,6 +380,8 @@ impl LargeDocumentBudget {
     }
 
     fn penalize_at(&self, address: &str, now: std::time::Instant) {
+        // A claim that did not verify ends the address's proven standing.
+        self.lock_proven().remove(address);
         let mut penalties = self.lock_penalties();
         if let Some(penalty) = penalties.get_mut(address) {
             let cost = penalty.cost_at(now).saturating_mul(2).min(MAX_COST);
@@ -325,16 +407,17 @@ impl LargeDocumentBudget {
         }
     }
 
-    /// Halve `address`'s raised cost — called once a claim from it verified
-    /// to exactly the issuer it named. A penalty earned by another sender
-    /// behind the same address (a shared egress, a proxy missing from
-    /// `trusted_proxies`) then does not hold back a caller that keeps proving
-    /// who it is.
+    /// Halve `address`'s raised cost, and count it as proven — called once a
+    /// claim from it verified to exactly the issuer it named. A penalty earned
+    /// by another sender behind the same address (a shared egress, a proxy
+    /// missing from `trusted_proxies`) then does not hold back a caller that
+    /// keeps proving who it is.
     fn relieve(&self, address: &str) {
         self.relieve_at(address, std::time::Instant::now());
     }
 
     fn relieve_at(&self, address: &str, now: std::time::Instant) {
+        self.mark_proven_at(address, now);
         let mut penalties = self.lock_penalties();
         let Some(penalty) = penalties.get_mut(address) else {
             return;
@@ -348,6 +431,7 @@ impl LargeDocumentBudget {
     }
 
     /// `address`'s cost per large document: 1 unless penalised.
+    #[cfg(test)]
     fn cost(&self, address: &str) -> u64 {
         self.cost_at(address, std::time::Instant::now())
     }
@@ -722,13 +806,79 @@ mod tests {
     #[test]
     fn many_addresses_together_are_held_to_the_global_budget() {
         let budget = LargeDocumentBudget::new();
-        for i in 0..LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW {
+        for i in 0..LARGE_DOCUMENT_UNPROVEN_SHARE_PER_WINDOW {
             assert!(budget.try_charge(&format!("vid:{i}")).is_ok());
         }
         assert!(
             budget.try_charge("vid:fresh").is_err(),
             "a fresh address does not escape the service-wide cap"
         );
+    }
+
+    /// Addresses that have never proven a claim can spend only their share of
+    /// the every-address budget: a proven address still gets the rest, and
+    /// together they never exceed the whole.
+    #[test]
+    fn unproven_addresses_cannot_spend_the_proven_share() {
+        let budget = LargeDocumentBudget::new();
+        let proven = (0..LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW)
+            .map(|i| format!("ip:proven-{i}"))
+            .collect::<Vec<_>>();
+        for address in &proven {
+            budget.relieve(address);
+        }
+        for i in 0..LARGE_DOCUMENT_UNPROVEN_SHARE_PER_WINDOW {
+            budget.try_charge(&format!("vid:stranger-{i}")).unwrap();
+        }
+        assert!(
+            budget.try_charge("vid:another-stranger").is_err(),
+            "strangers have spent their share"
+        );
+        let proven_share =
+            LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW - LARGE_DOCUMENT_UNPROVEN_SHARE_PER_WINDOW;
+        for address in proven.iter().take(proven_share as usize) {
+            assert!(
+                budget.try_charge(address).is_ok(),
+                "a proven address is admitted though strangers spent theirs"
+            );
+        }
+        assert!(
+            budget.try_charge(&proven[proven_share as usize]).is_err(),
+            "the whole budget is still the cap"
+        );
+    }
+
+    /// A proven address draws on the open share once its own is spent.
+    #[test]
+    fn a_proven_address_falls_back_to_the_open_share() {
+        let budget = LargeDocumentBudget::new();
+        let proven_share =
+            LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW - LARGE_DOCUMENT_UNPROVEN_SHARE_PER_WINDOW;
+        for _ in 0..proven_share {
+            budget.global_proven.try_consume(()).unwrap();
+        }
+        budget.relieve("ip:proven");
+        assert!(budget.try_charge("ip:proven").is_ok());
+    }
+
+    /// Proven standing lapses after its time, and ends at once when a claim
+    /// from the address does not verify.
+    #[test]
+    fn proven_standing_lapses_and_ends_on_a_failed_claim() {
+        use std::time::{Duration, Instant};
+        let budget = LargeDocumentBudget::new();
+        let start = Instant::now();
+        budget.relieve_at("ip:a", start);
+        assert!(budget.is_proven_at("ip:a", start));
+        assert!(!budget.is_proven_at("ip:a", start + Duration::from_secs(PROVEN_ADDRESS_TTL_SECS)));
+
+        budget.relieve_at("ip:b", start);
+        let charge = LargeDocumentCharge {
+            address: "ip:b".into(),
+            claimed_issuer: "did:web:admin.example".into(),
+        };
+        settle_large_document_charge(&budget, Some(&charge), None);
+        assert!(!budget.is_proven_at("ip:b", start));
     }
 
     /// An address over its own budget does not spend the shared one.
@@ -741,7 +891,7 @@ mod tests {
         for _ in 0..LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW {
             assert!(budget.try_charge("ip:busy").is_err());
         }
-        for i in 0..(LARGE_DOCUMENT_GLOBAL_BUDGET_PER_WINDOW - LARGE_DOCUMENT_BUDGET_PER_WINDOW) {
+        for i in 0..(LARGE_DOCUMENT_UNPROVEN_SHARE_PER_WINDOW - LARGE_DOCUMENT_BUDGET_PER_WINDOW) {
             assert!(budget.try_charge(&format!("vid:{i}")).is_ok());
         }
     }

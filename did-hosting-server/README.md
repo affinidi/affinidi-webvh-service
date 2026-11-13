@@ -134,6 +134,7 @@ didcomm = true
 host = "0.0.0.0"    # Bind address
 port = 8530          # Bind port
 # trusted_proxies = ["10.0.0.0/20"]  # load balancer addresses or subnets: read X-Forwarded-For
+# client_ipv6_prefix = 64            # per-address limits count an IPv6 client by this network (1-128)
 
 [server.resolve_cache]                      # Cache-Control on DID resolution
 max_age_secs = 300                          # max-age; 0 sends no-cache (default 300)
@@ -423,7 +424,9 @@ gets `429 Too Many Requests` with `Retry-After` until its next request, and
 the service logs one warning per client per window. It is off by default. The Trust Task listener has its
 own limiter and is not counted.
 
-A client is its address, and an IPv6 client its /64. The address is the TCP
+A client is its address, and an IPv6 client its network of
+`server.client_ipv6_prefix` bits (default 64), as in every other
+per-address limit. The address is the TCP
 peer unless the peer is in `server.trusted_proxies`, in which case it is
 read from `X-Forwarded-For`. Behind a load balancer, set `trusted_proxies`
 first, to the load balancer's addresses or subnets (CIDR ranges such as

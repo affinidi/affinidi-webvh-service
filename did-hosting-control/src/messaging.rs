@@ -1719,9 +1719,10 @@ async fn route_trust_task_doc(
             Some(crate::replay::ReplayError::Duplicate.reject_reason())
         } else if std::ptr::eq(cache, &state.unlisted_signers.sign_in)
             && let Err(reason) = state.unlisted_signers.charge_sign_in(match https {
-                Some(h) => {
-                    h.ip.map_or_else(|| "ip:unknown".to_string(), |ip| format!("ip:{ip}"))
-                }
+                Some(h) => h.ip.map_or_else(
+                    || "ip:unknown".to_string(),
+                    |ip| format!("ip:{}", state.client_ips.key_of(ip)),
+                ),
                 None => format!("vid:{sender}"),
             })
         {

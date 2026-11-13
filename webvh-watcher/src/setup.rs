@@ -317,6 +317,7 @@ pub async fn apply_recipe(
                 .port
                 .unwrap_or_else(|| SetupRecipe::default_port(ServiceKind::Watcher)),
             trusted_proxies: Vec::new(),
+            client_ipv6_prefix: did_hosting_common::server::config::default_client_ipv6_prefix(),
             trusted_proxy_cidrs: Vec::new(),
             resolve_cache: Default::default(),
             resolve_rate_limit: Default::default(),

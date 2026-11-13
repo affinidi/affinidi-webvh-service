@@ -1012,7 +1012,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     // and every handler that charges a client address, so a proxy's invalid
     // chain is logged once a minute whichever path met it.
     let client_ips =
-        did_hosting_common::server::rate_limit::ClientIps::new(&config.server.trusted_proxies)
+        did_hosting_common::server::rate_limit::ClientIps::from_server_config(&config.server)
             .unwrap_or_else(|e| {
                 error!("failed to build the client-address rule: {e}");
                 std::process::exit(1);

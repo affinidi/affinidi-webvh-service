@@ -122,6 +122,8 @@ impl Default for AppConfig {
                 host: "0.0.0.0".into(),
                 port: 8533,
                 trusted_proxies: Vec::new(),
+                client_ipv6_prefix: did_hosting_common::server::config::default_client_ipv6_prefix(
+                ),
                 trusted_proxy_cidrs: Vec::new(),
                 resolve_cache: Default::default(),
                 resolve_rate_limit: Default::default(),

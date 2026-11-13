@@ -192,6 +192,15 @@ pub struct ServerConfig {
     /// refused at load.
     #[serde(default, with = "ip_networks")]
     pub trusted_proxies: Vec<IpNetwork>,
+    /// The network prefix an IPv6 client is counted by in every per-address
+    /// limit (the Trust Task listener, sign-in, invite redemption, wallet
+    /// sign-in, the large-document budget, and `resolve_rate_limit`): one
+    /// host is normally given a whole block, and could otherwise draw a fresh
+    /// allowance from each address in it. Default 64; 1 to 128 (128 counts
+    /// each address on its own). An IPv4 client is always counted by its
+    /// address. See [`crate::server::rate_limit::ClientIps::key_of`].
+    #[serde(default = "default_client_ipv6_prefix")]
+    pub client_ipv6_prefix: u8,
     /// Trusted reverse-proxy CIDRs whose `Forwarded` (RFC 7239) and
     /// `X-Forwarded-Host` headers are honoured for **request host /
     /// domain detection** (multi-domain feature, T19). Distinct from
@@ -1185,6 +1194,11 @@ fn default_host() -> String {
     "0.0.0.0".to_string()
 }
 
+/// The `server.client_ipv6_prefix` default.
+pub fn default_client_ipv6_prefix() -> u8 {
+    crate::server::rate_limit::DEFAULT_CLIENT_IPV6_PREFIX
+}
+
 fn default_port() -> u16 {
     8530
 }
@@ -1203,6 +1217,7 @@ impl Default for ServerConfig {
             host: default_host(),
             port: default_port(),
             trusted_proxies: Vec::new(),
+            client_ipv6_prefix: default_client_ipv6_prefix(),
             trusted_proxy_cidrs: Vec::new(),
             resolve_cache: Default::default(),
             resolve_rate_limit: Default::default(),

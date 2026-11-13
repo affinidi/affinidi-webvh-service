@@ -105,7 +105,9 @@ pub async fn trust_tasks_endpoint(
         None => None,
     };
     if let Some(limiter) = limiter {
-        let limited = limiter.try_consume(format!("ip:{ip}"));
+        // Counted by the client's network (an IPv6 client's block), as every
+        // per-address limit is.
+        let limited = limiter.try_consume(format!("ip:{}", state.client_ips.key_of(ip)));
         if let Err(AppError::RateLimited {
             retry_after_secs, ..
         }) = limited
@@ -250,8 +252,10 @@ pub async fn dispatch_trust_task(
     //         against that address's large-document budget first — see
     //         `size`'s module docs for why an unverified claim alone would
     //         otherwise be a DoS amplifier.
+    //         The address is the client's network (an IPv6 client's
+    //         block, `ClientIps::key_of`), as for every per-address limit.
     let address = client_ip
-        .map(|ip| format!("ip:{ip}"))
+        .map(|ip| format!("ip:{}", state.client_ips.key_of(ip)))
         .unwrap_or_else(|| "ip:unknown".to_string());
     let large_doc_charge =
         match did_hosting_common::server::trust_tasks::size::check_for_known_issuer(

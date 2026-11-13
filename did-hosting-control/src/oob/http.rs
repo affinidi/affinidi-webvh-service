@@ -316,13 +316,16 @@ pub(crate) async fn admit(
         return Err(refuse(OobErrorCode::MalformedRequest, "document too large"));
     }
     let ip = https.ip.unwrap_or(NO_ADDRESS);
+    // Counted by the client's network (an IPv6 client's block), as every
+    // per-address limit is.
+    let key = state.client_ips.key_of(ip);
     let type_uri = doc.type_uri.to_string();
     let limiter = if type_uri == TYPE_REQUEST {
         &state.oob.request_limiter
     } else {
         &state.oob.other_limiter
     };
-    if limiter.try_consume(ip).is_err() {
+    if limiter.try_consume(key).is_err() {
         return Err(refuse(OobErrorCode::RateLimited, "too many requests"));
     }
     if type_uri == TYPE_REQUEST {
@@ -408,6 +411,7 @@ pub(crate) async fn exchange(
     let (browser, os) = parse_user_agent(ua);
     let conn = Connection {
         ip: https.ip.map(|ip| ip.to_string()),
+        address_key: https.ip.map(|ip| state.client_ips.key_of(ip).to_string()),
         // From the local GeoIP database only (base design §12.6); `None` is
         // sent as "unknown", which the wallet shows as a warning.
         location: https.ip.and_then(|ip| state.oob.geoip.locate(ip)),
