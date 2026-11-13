@@ -786,9 +786,23 @@ pub async fn register_did_atomic(
         // then reconcile against the new document below. The carry-over is what
         // preserves a *parked* name — deliberately absent from `alsoKnownAs`,
         // so the log alone can't express the reservation.
+        //
+        // An admin takeover is the exception: a parked name is the previous
+        // holder's reservation, and does not pass to the new owner with the
+        // slot. Every carried name is treated as served, so the reconcile
+        // below keeps only those the new document claims and releases the
+        // rest, index entries included.
         agent_names: existing
             .as_ref()
-            .map(|r| r.agent_names.clone())
+            .map(|r| {
+                let mut names = r.agent_names.clone();
+                if owner_changed {
+                    for entry in &mut names {
+                        entry.enabled = true;
+                    }
+                }
+                names
+            })
             .unwrap_or_default(),
     };
 
@@ -1429,8 +1443,10 @@ pub async fn update_agent_name(
 }
 
 /// Release an agent name so anyone may reclaim it. The submitted document must
-/// no longer claim the name via `alsoKnownAs`. Destructive — consumers gate
-/// this behind operator step-up (enforced at the Trust-Task surface, not here).
+/// no longer claim the name via `alsoKnownAs`. Destructive. This service does
+/// not require a stepped-up (`aal2`) session for it, here or at the
+/// Trust-Task surface: the owner (a VTA) is expected to gate it behind its
+/// own operator step-up before signing the request.
 /// See `did-management/agent-name/remove`.
 pub async fn remove_agent_name(
     auth: &AuthClaims,
@@ -1722,7 +1738,19 @@ pub async fn upload_witness(
         .find(|e| e.get("versionId").and_then(|v| v.as_str()) == Some(version_id.as_str()))
     {
         Some(entry) => match entry.get_mut("proof").and_then(|p| p.as_array_mut()) {
-            Some(proofs) => proofs.push(proof),
+            // One proof per witness per version: a witness publishing again
+            // (a retry, a re-sign) replaces its earlier proof rather than
+            // growing the file with copies.
+            Some(proofs) => {
+                let signer = proof_signer(&proof).map(str::to_string);
+                match proofs
+                    .iter_mut()
+                    .find(|p| signer.is_some() && proof_signer(p) == signer.as_deref())
+                {
+                    Some(earlier) => *earlier = proof,
+                    None => proofs.push(proof),
+                }
+            }
             None => {
                 entry["proof"] = serde_json::json!([proof]);
             }
@@ -1742,6 +1770,16 @@ pub async fn upload_witness(
     info!(did = %auth.did, mnemonic = %mnemonic, %version_id, "did-witness.json uploaded on control plane");
 
     Ok(())
+}
+
+/// The DID whose key made a witness proof: its `verificationMethod` without
+/// the fragment.
+fn proof_signer(proof: &serde_json::Value) -> Option<&str> {
+    proof
+        .get("verificationMethod")
+        .and_then(|v| v.as_str())
+        .map(|vm| vm.split('#').next().unwrap_or(vm))
+        .filter(|d| !d.is_empty())
 }
 
 /// Get detailed information about a DID.
@@ -4740,6 +4778,53 @@ mod tests_atomic {
         jsonl
     }
 
+    /// An admin takeover does not hand the new owner the previous holder's
+    /// parked names: the reservation and its index entry are released, and a
+    /// name the new document claims is still registered.
+    #[tokio::test]
+    async fn an_admin_takeover_releases_the_previous_holders_parked_names() {
+        let (state, _dir) = test_state().await;
+        let path = "takeover-names";
+        let owner = "did:example:names-owner";
+        let admin = "did:example:names-admin";
+        let named = build_test_did_log_with_names("control.test", path, &["kept", "parked"]).await;
+        register_did_atomic(&owner_auth(owner), &state, path, &named, false, None)
+            .await
+            .expect("register with names");
+        // Park one name, as `agent-name/set { state: parked }` leaves it: in
+        // the registry, disabled, with its index entry kept.
+        let mut record = get_record(&state, path).await;
+        for entry in &mut record.agent_names {
+            if entry.name == "parked" {
+                entry.enabled = false;
+            }
+        }
+        state.dids_ks.insert(did_key(path), &record).await.unwrap();
+        assert_eq!(
+            index_target(&state, "control.test", "parked")
+                .await
+                .as_deref(),
+            Some(path)
+        );
+
+        let takeover = build_test_did_log_with_names("control.test", path, &["kept"]).await;
+        register_did_atomic(&admin_auth(admin), &state, path, &takeover, true, None)
+            .await
+            .expect("admin takeover");
+
+        let record = get_record(&state, path).await;
+        assert_eq!(record.owner, admin);
+        let names: Vec<&str> = record.agent_names.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["kept"], "{:?}", record.agent_names);
+        assert_eq!(index_target(&state, "control.test", "parked").await, None);
+        assert_eq!(
+            index_target(&state, "control.test", "kept")
+                .await
+                .as_deref(),
+            Some(path)
+        );
+    }
+
     async fn get_record(state: &AppState, path: &str) -> DidRecord {
         state
             .dids_ks
@@ -6315,6 +6400,142 @@ mod tests_atomic {
         let extended_jsonl = to_jsonl(&state);
 
         (genesis_jsonl, extended_jsonl, genesis_version_id)
+    }
+
+    /// A witness publishing its proof for a version again replaces its
+    /// earlier proof: the stored file keeps one proof per witness per
+    /// version.
+    #[tokio::test]
+    async fn a_witness_publishing_again_replaces_its_proof() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:dedupe-owner";
+        let path = "race";
+        let (witness_key, witness_did) = race_witness_identity();
+        let (genesis_jsonl, _, genesis_version_id) =
+            race_witnessed_log_and_extension(&witness_did).await;
+        register_did_atomic(
+            &owner_auth(owner),
+            &state,
+            path,
+            &genesis_jsonl,
+            false,
+            None,
+        )
+        .await
+        .expect("register");
+
+        for _ in 0..3 {
+            let proof = race_sign_witness_proof(&witness_key, &genesis_version_id).await;
+            let witness_entry = serde_json::json!({
+                "versionId": genesis_version_id,
+                "proof": serde_json::to_value(&proof).unwrap(),
+            });
+            upload_witness(
+                &owner_auth(owner),
+                &state,
+                path,
+                witness_entry.as_object().unwrap(),
+            )
+            .await
+            .expect("witness proof stored");
+        }
+
+        let stored: Vec<serde_json::Value> = serde_json::from_slice(
+            &state
+                .dids_ks
+                .get_raw(content_witness_key(path))
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored.len(), 1, "{stored:?}");
+        assert_eq!(
+            stored[0]["proof"].as_array().map(Vec::len),
+            Some(1),
+            "{stored:?}"
+        );
+    }
+
+    /// A republish of the DID a slot already holds must extend the stored
+    /// log, as every edge requires of what it is sent: a log one entry
+    /// shorter is refused on both register and publish, and the stored log is
+    /// left as it was. An extension is accepted.
+    #[tokio::test]
+    async fn a_republish_of_the_same_did_must_extend_the_stored_log() {
+        use didwebvh_rs::Multibase;
+        use didwebvh_rs::parameters::Parameters;
+
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:extends";
+        let path = "extends";
+        let key = race_signing_key();
+        let params = Parameters {
+            update_keys: Some(Arc::new(vec![Multibase::new(
+                key.get_public_keymultibase().unwrap(),
+            )])),
+            portable: Some(false),
+            ..Default::default()
+        };
+        let doc = race_doc_with_key("did:webvh:{SCID}:control.test:extends", &key);
+        let base_time = (chrono::Utc::now() - chrono::Duration::seconds(10)).fixed_offset();
+        let to_jsonl = |state: &didwebvh_rs::DIDWebVHState| {
+            state
+                .log_entries()
+                .iter()
+                .map(|e| serde_json::to_string(&e.log_entry).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut log = didwebvh_rs::DIDWebVHState::default();
+        log.create_log_entry(Some(base_time), &doc, &params, &key)
+            .await
+            .expect("genesis entry");
+        let genesis = to_jsonl(&log);
+        let genesis_doc = log.log_entries().last().unwrap().get_state().clone();
+        log.create_log_entry(
+            Some(base_time + chrono::Duration::seconds(1)),
+            &genesis_doc,
+            &Parameters::default(),
+            &key,
+        )
+        .await
+        .expect("second entry");
+        let two = to_jsonl(&log);
+        let second_doc = log.log_entries().last().unwrap().get_state().clone();
+        log.create_log_entry(
+            Some(base_time + chrono::Duration::seconds(2)),
+            &second_doc,
+            &Parameters::default(),
+            &key,
+        )
+        .await
+        .expect("third entry");
+        let three = to_jsonl(&log);
+
+        register_did_atomic(&owner_auth(owner), &state, path, &two, false, None)
+            .await
+            .expect("register two entries");
+
+        let err = register_did_atomic(&owner_auth(owner), &state, path, &genesis, false, None)
+            .await
+            .expect_err("a shorter log is refused on register");
+        assert!(err.to_string().contains("extension"), "{err}");
+        let err = publish_did(&owner_auth(owner), &state, path, &genesis, None)
+            .await
+            .expect_err("a shorter log is refused on publish");
+        assert!(err.to_string().contains("extension"), "{err}");
+        let stored = state
+            .dids_ks
+            .get_raw(content_log_key(path))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(String::from_utf8(stored).unwrap(), two);
+
+        publish_did(&owner_auth(owner), &state, path, &three, None)
+            .await
+            .expect("an extension is accepted");
     }
 
     /// Regression for the write-time TOCTOU behind SEC finding #166:

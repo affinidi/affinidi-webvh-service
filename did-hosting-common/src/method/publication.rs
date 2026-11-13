@@ -173,6 +173,27 @@ fn verify_webvh(
         .unwrap_or(0);
     let existing_witness_text = existing_witness.map(|w| String::from_utf8_lossy(w));
 
+    // A republish of the DID the slot already holds must extend the stored
+    // log: same entries, then any new ones. An edge applies the same rule to
+    // every log it is sent (`verify_history`), so a shorter or diverging log
+    // accepted here would be stored as the control plane's record while every
+    // edge kept serving the previous one. A different DID in the slot (another
+    // SCID) is a replacement, not a continuation, and is not compared.
+    if let Some(existing) = existing.map(|bytes| String::from_utf8_lossy(bytes)) {
+        let scid = |log: &str| {
+            crate::did_ops::extract_did_id(log)
+                .as_deref()
+                .and_then(webvh_scid)
+                .map(str::to_string)
+        };
+        if let Some(held) = scid(&existing)
+            && scid(text).as_deref() == Some(held.as_str())
+        {
+            crate::did_ops::verify_log_extends(Some(&existing), text)
+                .map_err(MethodError::Validation)?;
+        }
+    }
+
     crate::did_ops::verify_did_log_for_publish(
         text,
         existing_witness_text.as_deref(),
@@ -195,6 +216,16 @@ fn verify_webvh(
         document,
         content: content.to_vec(),
     })
+}
+
+/// The SCID of a `did:webvh:{scid}:…` identifier.
+#[cfg(feature = "method-webvh")]
+fn webvh_scid(did_id: &str) -> Option<&str> {
+    did_id
+        .strip_prefix("did:webvh:")?
+        .split(':')
+        .next()
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(feature = "method-web")]

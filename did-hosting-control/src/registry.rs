@@ -184,8 +184,8 @@ async fn update_instance(
     did: &str,
     change: impl FnOnce(&mut ServiceInstance),
 ) {
-    let id = did.replace(':', "_");
-    match get_instance(registry_ks, &id).await {
+    let id = instance_id_for(did);
+    match get_instance_for_did(registry_ks, did).await {
         Ok(Some(mut instance)) => {
             change(&mut instance);
             if let Err(e) = register_instance(registry_ks, &instance).await {
@@ -238,6 +238,27 @@ pub async fn get_instance(
     instance_id: &str,
 ) -> Result<Option<ServiceInstance>, AppError> {
     registry_ks.get(instance_key(instance_id)).await
+}
+
+/// The registry id a server registering as `did` is kept under.
+///
+/// Not one-to-one: `did:web:h:a_b` and `did:web:h:a:b` share an id. Look a
+/// server up by its DID with [`get_instance_for_did`], which checks the
+/// record is that DID's.
+pub fn instance_id_for(did: &str) -> String {
+    did.replace(':', "_")
+}
+
+/// The instance `did` registered: the record under [`instance_id_for`],
+/// only if it was registered by `did` (`metadata.did`). Another DID whose id
+/// collides gets `None`, so it can neither update nor be mistaken for it.
+pub async fn get_instance_for_did(
+    registry_ks: &KeyspaceHandle,
+    did: &str,
+) -> Result<Option<ServiceInstance>, AppError> {
+    Ok(get_instance(registry_ks, &instance_id_for(did))
+        .await?
+        .filter(|instance| instance.did() == Some(did)))
 }
 
 pub async fn list_instances(

@@ -207,13 +207,20 @@ pub(crate) async fn do_stats_sync(
         ));
     }
 
+    // The body is typed and closed (R3.2): a member this service does not
+    // read is refused rather than silently dropped.
+    let body: StatsSyncBody = serde_json::from_value(body.clone()).map_err(|e| {
+        warn!(did = signer, error = %e, "stats sync rejected: malformed payload");
+        InfraRejection::new(
+            "e.p.stats.malformed",
+            "not a stats-sync payload this service reads",
+        )
+    })?;
+
     // Bind the payload to the transport-proven signer, as the REST handler
     // binds it to the JWT. `server_did` keys the replay window, so accepting a
     // foreign one would let one server advance — and so suppress — another's.
-    let server_did = body
-        .get("server_did")
-        .and_then(|v| v.as_str())
-        .unwrap_or(signer);
+    let server_did = body.server_did.as_deref().unwrap_or(signer);
     if server_did != signer {
         warn!(
             did = signer,
@@ -225,7 +232,7 @@ pub(crate) async fn do_stats_sync(
         ));
     }
 
-    let seq = body.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+    let seq = body.seq;
 
     // Idempotency check
     if !accept_seq(server_did, seq) {
@@ -233,11 +240,7 @@ pub(crate) async fn do_stats_sync(
         return Ok(json!({ "status": "skipped", "reason": "stale_seq" }));
     }
 
-    let deltas = body
-        .get("did_deltas")
-        .and_then(|v| v.as_array())
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+    let deltas = body.did_deltas.as_slice();
     if deltas.len() > did_hosting_common::server::stats_collector::MAX_STATS_SYNC_DELTAS {
         warn!(
             did = signer,
@@ -254,13 +257,22 @@ pub(crate) async fn do_stats_sync(
     // Lookups left for paths outside the current grammar (see below).
     let mut lookups_left = MAX_HOSTED_LOOKUPS_PER_SYNC;
     for d in deltas {
-        let mnemonic = d.get("mnemonic").and_then(|v| v.as_str()).unwrap_or("");
+        let mnemonic = d.mnemonic.as_str();
         // The path keys `stats:` and `ts:` rows: only a hosted-path shape is
         // accepted, and never the server-wide series name. A path stored
         // before the current path rules is accepted if it is hosted here;
         // that costs a read, so only a few are looked up per sync.
-        let mut accepted = is_stats_mnemonic(mnemonic);
-        if !accepted && lookups_left > 0 && is_key_safe_stats_path(mnemonic) {
+        // A count one edge could not have seen in one sync interval is not
+        // a count: it is refused with the delta rather than added.
+        let mut accepted = d.resolve_delta <= MAX_SYNCED_COUNT
+            && d.update_delta <= MAX_SYNCED_COUNT
+            && is_stats_mnemonic(mnemonic);
+        if !accepted
+            && d.resolve_delta <= MAX_SYNCED_COUNT
+            && d.update_delta <= MAX_SYNCED_COUNT
+            && lookups_left > 0
+            && is_key_safe_stats_path(mnemonic)
+        {
             lookups_left -= 1;
             accepted = state
                 .dids_ks
@@ -275,17 +287,12 @@ pub(crate) async fn do_stats_sync(
             }
             continue;
         }
-        let resolve_delta = d.get("resolve_delta").and_then(|v| v.as_u64()).unwrap_or(0);
-        let update_delta = d.get("update_delta").and_then(|v| v.as_u64()).unwrap_or(0);
-        let last_resolved_at = d.get("last_resolved_at").and_then(|v| v.as_u64());
-        let last_updated_at = d.get("last_updated_at").and_then(|v| v.as_u64());
-
         state.stats_collector.record_deltas(
             mnemonic,
-            resolve_delta,
-            update_delta,
-            last_resolved_at,
-            last_updated_at,
+            d.resolve_delta,
+            d.update_delta,
+            d.last_resolved_at,
+            d.last_updated_at,
         );
     }
 
@@ -306,6 +313,39 @@ pub(crate) async fn do_stats_sync(
 
     Ok(json!({ "status": "accepted" }))
 }
+
+/// The `server/stats-sync` body an edge sends (`did-hosting-server`'s
+/// `stats::sync`), closed.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatsSyncBody {
+    #[serde(default)]
+    server_did: Option<String>,
+    #[serde(default)]
+    seq: u64,
+    #[serde(default)]
+    did_deltas: Vec<StatsSyncDelta>,
+}
+
+/// One DID's counts in a [`StatsSyncBody`].
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatsSyncDelta {
+    mnemonic: String,
+    #[serde(default)]
+    resolve_delta: u64,
+    #[serde(default)]
+    update_delta: u64,
+    #[serde(default)]
+    last_resolved_at: Option<u64>,
+    #[serde(default)]
+    last_updated_at: Option<u64>,
+}
+
+/// The largest resolve or update count one delta may carry: far above what
+/// one edge serves one DID between two syncs, far below what could wrap a
+/// running total.
+const MAX_SYNCED_COUNT: u64 = 1_000_000_000;
 
 /// Most odd-shaped stats-sync paths one sync may have looked up in the
 /// store to see whether they are hosted here.
@@ -374,17 +414,20 @@ pub(crate) async fn do_health_pong(state: &AppState, signer: &str, body: &Value)
 
     debug!(signer, status, version, "health pong received from server");
 
-    // Find the instance by signer DID and mark it active
-    let instance_id = signer.replace(':', "_");
+    // Find the instance the signer registered and mark it active. Another
+    // DID whose registry id collides with it is not that instance.
+    let instance_id = registry::instance_id_for(signer);
     let now = crate::auth::session::now_epoch();
-    if let Err(e) = registry::update_instance_status(
-        &state.registry_ks,
-        &instance_id,
-        ServiceStatus::Active,
-        now,
-    )
-    .await
-    {
+    let updated = match registry::get_instance_for_did(&state.registry_ks, signer).await {
+        Ok(Some(mut instance)) => {
+            instance.status = ServiceStatus::Active;
+            instance.last_health_check = Some(now);
+            registry::register_instance(&state.registry_ks, &instance).await
+        }
+        Ok(None) => Ok(()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = updated {
         warn!(instance_id, error = %e, "failed to update instance status from health pong");
     }
 }
@@ -455,6 +498,25 @@ pub(crate) async fn do_domain_ack(state: &AppState, signer: &str, type_uri: &str
         MSG_REPLICA_DOMAIN_UNASSIGN_ACK => "unassign",
         _ => "purge",
     };
+    // The acknowledgement must be its task's response type (R3.2): a body
+    // that is not is acted on in no way.
+    {
+        use did_hosting_common::tasks::did_management::replica::domain::{
+            assign::v0_1 as assign, purge::v0_1 as purge, unassign::v0_1 as unassign,
+        };
+        let conforms = match op {
+            "assign" => serde_json::from_value::<assign::Response>(body.clone()).is_ok(),
+            "unassign" => serde_json::from_value::<unassign::Response>(body.clone()).is_ok(),
+            _ => serde_json::from_value::<purge::Response>(body.clone()).is_ok(),
+        };
+        if !conforms {
+            warn!(
+                signer,
+                domain, op, "domain ack ignored: not a {op} response this service reads"
+            );
+            return;
+        }
+    }
     info!(
         signer,
         domain, status, op, "server acknowledged domain {op}"
@@ -489,8 +551,8 @@ pub(crate) async fn do_domain_ack(state: &AppState, signer: &str, type_uri: &str
     };
     crate::server_push::settle_domain_intent(state, signer, domain, settled).await;
 
-    let instance_id = signer.replace(':', "_");
-    match crate::registry::get_instance(&state.registry_ks, &instance_id).await {
+    let instance_id = crate::registry::instance_id_for(signer);
+    match crate::registry::get_instance_for_did(&state.registry_ks, signer).await {
         Ok(Some(mut instance)) => {
             // `replica/domain/assign/0.1` answers only `applied`.
             let add = op == "assign" && status == "applied";
@@ -638,7 +700,7 @@ pub(crate) async fn do_server_register(
             )
         })?;
     // Use the signer DID as a stable instance ID (one registration per DID).
-    let instance_id = signer.replace(':', "_");
+    let instance_id = registry::instance_id_for(signer);
     if payload.did.as_str() != signer || payload.instance_id.as_str() != instance_id {
         warn!(
             did = signer,
@@ -647,6 +709,27 @@ pub(crate) async fn do_server_register(
         return Err(InfraRejection::new(
             "e.p.registration.malformed",
             format!("`did` must be the signer and `instanceId` must be `{instance_id}`"),
+        ));
+    }
+    // The registry id is not one-to-one with DIDs (`instance_id_for`): a
+    // record under this id that another DID registered stays that DID's.
+    let previous = match registry::get_instance(&state.registry_ks, &instance_id).await {
+        Ok(previous) => previous,
+        Err(e) => {
+            warn!(did = signer, error = %e, "server registration deferred: registry lookup failed");
+            return Err(InfraRejection::lookup_failed(&e));
+        }
+    };
+    if let Some(holder) = previous.as_ref().and_then(|p| p.did())
+        && holder != signer
+    {
+        warn!(
+            did = signer,
+            holder, instance_id, "server registration rejected: instance id held by another DID"
+        );
+        return Err(InfraRejection::new(
+            "e.p.registration.conflict",
+            "another server's registration holds this instance id",
         ));
     }
     // This service's hints (`ext`, in its namespace). A server that sends none
@@ -697,29 +780,47 @@ pub(crate) async fn do_server_register(
             .collect()
     };
     let claimed_served_domains: Vec<String> = payload.served_domains.clone();
-    // Defense against a misbehaving server fabricating `served_domains`
-    // entries to mislead operators (and the purge-fanout in
-    // `delete_domain_route`). We intersect the self-asserted list
-    // against the control plane's authoritative DomainEntry registry,
-    // dropping names the control plane has no record of. This filters
-    // the "fabricate-a-domain-name" attack vector.
+    // A server's claim to serve a domain is kept only if the control plane
+    // assigned it the domain: its latest recorded domain operation for this
+    // server is an assign (`server_push::DomainIntent`). A claim to a domain
+    // the control plane has no record of, or assigned to another server only,
+    // is dropped, so it cannot block `registry/purge-domain` with
+    // `STILL_ASSIGNED` or mislead the purge fan-out.
     //
-    // KNOWN GAP (tracked for follow-up): we can't yet verify that the
-    // server is actually *authorised* to host the domains it claims —
-    // the control plane fires assign/unassign messages without
-    // recording them. A peer Service-role server could still claim to
-    // host a real but unrelated tenant's domain. Closing that gap
-    // requires a new control-plane-side dispatched-assignments table
-    // (one row per outbound replica/domain/{assign,unassign}) the register
-    // handler can intersect against. Out of scope for this security
-    // fix; HIGH-1 (control-plane pinning on the server-side handlers)
-    // already removes the most damaging exploit (a peer issuing
-    // forged domain.purge to wipe data).
+    // A server with no recorded domain operation at all was assigned its
+    // domains before they were recorded: it keeps a claim the registry
+    // already listed for it, and nothing new.
     let served_domains: Vec<String> = if claimed_served_domains.is_empty() {
         Vec::new()
     } else {
+        let intents = match crate::server_push::domain_intents(state, signer).await {
+            Ok(intents) => intents,
+            Err(e) => {
+                warn!(did = signer, error = %e, "server registration deferred: domain intents lookup failed");
+                return Err(InfraRejection::lookup_failed(&e));
+            }
+        };
+        let assigned = |name: &str| {
+            if intents.is_empty() {
+                previous
+                    .as_ref()
+                    .is_some_and(|p| p.served_domains.iter().any(|d| d == name))
+            } else {
+                intents
+                    .iter()
+                    .any(|i| i.domain == name && i.op == crate::server_push::DomainOp::Assign)
+            }
+        };
         let mut keep = Vec::with_capacity(claimed_served_domains.len());
         for name in claimed_served_domains {
+            if !assigned(&name) {
+                warn!(
+                    did = signer,
+                    domain = %name,
+                    "register: dropping served_domains entry — this server was not assigned the domain"
+                );
+                continue;
+            }
             match did_hosting_common::server::domain::get_domain(&state.store, &name).await {
                 Ok(Some(_)) => keep.push(name),
                 Ok(None) => warn!(
@@ -755,14 +856,11 @@ pub(crate) async fn do_server_register(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // `register_instance` overwrites the whole record, so carry the previous
-    // badge cache forward rather than blanking it. The refresh below
-    // re-resolves and supersedes this; if that resolve fails, the operator
-    // keeps seeing the last known services instead of an empty badge row.
-    let previous = registry::get_instance(&state.registry_ks, &instance_id)
-        .await
-        .ok()
-        .flatten();
+    // `register_instance` overwrites the whole record, so `previous` (read
+    // above) carries the badge cache forward rather than blanking it. The
+    // refresh below re-resolves and supersedes this; if that resolve fails,
+    // the operator keeps seeing the last known services instead of an empty
+    // badge row.
 
     let instance = ServiceInstance {
         instance_id: instance_id.clone(),
@@ -797,10 +895,16 @@ pub(crate) async fn do_server_register(
 
     if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {
         warn!(did = signer, error = %e, "server registration failed");
-        return Err(InfraRejection::new(
-            "e.p.registration.internal-error",
-            e.to_string(),
-        ));
+        // The store's own text stays in the log: it describes this service,
+        // not the request.
+        return Err(InfraRejection {
+            code: "e.p.registration.internal-error",
+            comment: "the registration could not be stored".into(),
+            reason: e
+                .retry_after_secs()
+                .is_some()
+                .then(|| Box::new(e.failure_reject_reason())),
+        });
     }
 
     info!(
@@ -3501,6 +3605,151 @@ mod tests {
             domain_intents(&state, edge).await.unwrap()[0].op,
             DomainOp::Unassign,
             "another DID's ack settles nothing"
+        );
+    }
+
+    /// Two DIDs whose registry ids collide (`a_b` and `a:b`): the second
+    /// cannot register over the first, nor mark it alive.
+    #[tokio::test]
+    async fn a_registry_id_another_did_holds_is_not_taken_over() {
+        let (state, _dir) = test_state().await;
+        let first = "did:web:edge.example:a_b";
+        let second = "did:web:edge.example:a:b";
+        assert_eq!(
+            crate::registry::instance_id_for(first),
+            crate::registry::instance_id_for(second)
+        );
+        seed_service(&state, first).await;
+        seed_service(&state, second).await;
+
+        assert!(
+            do_server_register(&state, first, &register_payload(first))
+                .await
+                .is_ok()
+        );
+        let Err(rej) = do_server_register(&state, second, &register_payload(second)).await else {
+            panic!("the colliding DID must not register over the first");
+        };
+        assert_eq!(rej.code, "e.p.registration.conflict");
+
+        async fn held(state: &AppState, did: &str) -> crate::registry::ServiceInstance {
+            crate::registry::get_instance(
+                &state.registry_ks,
+                &crate::registry::instance_id_for(did),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+        assert_eq!(held(&state, first).await.did(), Some(first));
+        let before = held(&state, first).await.last_health_check;
+        do_health_pong(&state, second, &json!({ "status": "ok" })).await;
+        assert_eq!(
+            held(&state, first).await.last_health_check,
+            before,
+            "not the second's"
+        );
+        do_health_pong(&state, first, &json!({ "status": "ok" })).await;
+        assert!(held(&state, first).await.last_health_check.is_some());
+    }
+
+    /// A server's `servedDomains` claim is kept only for a domain the control
+    /// plane assigned it.
+    #[tokio::test]
+    async fn a_served_domain_is_kept_only_when_it_was_assigned() {
+        let (state, _dir) = test_state().await;
+        let edge = "did:example:edge-claims";
+        seed_service(&state, edge).await;
+        for name in ["assigned.example", "claimed.example"] {
+            did_hosting_common::server::domain::create_domain(
+                &state.store,
+                &did_hosting_common::server::domain::DomainEntry {
+                    name: name.into(),
+                    label: None,
+                    scheme: did_hosting_common::server::domain::DomainUrlScheme::Https,
+                    status: did_hosting_common::server::domain::DomainStatus::Active,
+                    created_at: 1,
+                    default_domain: false,
+                    branding: None,
+                    witnesses: None,
+                    watchers: None,
+                    quota: None,
+                    well_known_enabled: false,
+                    disabled_at: None,
+                    purge_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        crate::server_push::send_domain_assign(&state, edge, "assigned.example")
+            .await
+            .unwrap();
+
+        let mut payload = register_payload(edge);
+        payload["servedDomains"] = json!(["assigned.example", "claimed.example"]);
+        assert!(do_server_register(&state, edge, &payload).await.is_ok());
+        let instance = crate::registry::get_instance_for_did(&state.registry_ks, edge)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(instance.served_domains, ["assigned.example"]);
+    }
+
+    /// A stats sync is a closed shape: an unknown member refuses it. A count
+    /// no edge could have served in one interval is not added.
+    #[tokio::test]
+    async fn stats_sync_is_typed_and_its_counts_bounded() {
+        let (state, _dir) = test_state().await;
+        let edge = "did:example:stats-typed-edge";
+        seed_role(&state, edge, Role::Service).await;
+
+        let extra = json!({ "server_did": edge, "seq": 1, "did_deltas": [], "credit": "all" });
+        let Err(rej) = do_stats_sync(&state, edge, &extra).await else {
+            panic!("an unknown member must refuse the sync");
+        };
+        assert_eq!(rej.code, "e.p.stats.malformed");
+
+        let body = json!({
+            "server_did": edge,
+            "seq": 2,
+            "did_deltas": [
+                {"mnemonic": "counted", "resolve_delta": 3, "update_delta": 0,
+                 "last_resolved_at": null, "last_updated_at": null},
+                {"mnemonic": "inflated", "resolve_delta": u64::MAX, "update_delta": 0},
+            ],
+        });
+        assert!(do_stats_sync(&state, edge, &body).await.is_ok());
+        let counted: Vec<_> = state
+            .stats_collector
+            .drain_for_sync()
+            .into_iter()
+            .map(|d| (d.mnemonic, d.resolve_delta))
+            .collect();
+        assert_eq!(counted, [("counted".to_string(), 3)]);
+    }
+
+    /// A domain acknowledgement that is not its task's response is ignored.
+    #[tokio::test]
+    async fn a_domain_ack_that_is_not_its_response_type_is_ignored() {
+        use crate::server_push::{DomainOp, domain_intents, send_domain_unassign};
+        let (state, _dir) = test_state().await;
+        let edge = "did:example:edge-ack-shape";
+        seed_service(&state, edge).await;
+        send_domain_unassign(&state, edge, "a.example")
+            .await
+            .unwrap();
+        do_domain_ack(
+            &state,
+            edge,
+            MSG_REPLICA_DOMAIN_UNASSIGN_ACK,
+            &json!({ "domain": "a.example", "status": 7 }),
+        )
+        .await;
+        assert_eq!(
+            domain_intents(&state, edge).await.unwrap()[0].op,
+            DomainOp::Unassign,
+            "a malformed ack settles nothing"
         );
     }
 }

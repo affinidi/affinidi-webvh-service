@@ -42,6 +42,15 @@ pub const MAX_STATS_SYNC_DELTAS: usize = 10_000;
 /// times come from a skewed peer clock and are filed at receipt instead.
 pub const SYNCED_EVENT_MAX_AGE_SECS: u64 = 1800;
 
+/// Add `n` to `counter`, stopping at `u64::MAX` rather than wrapping: a
+/// synced delta comes from a peer, and a counter that wrapped would read as
+/// almost nothing.
+fn saturating_fetch_add(counter: &std::sync::atomic::AtomicU64, n: u64) {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_add(n))
+    });
+}
+
 /// Per-DID counter deltas accumulated since the last drain.
 #[derive(Debug, Default)]
 struct MnemonicDeltas {
@@ -195,10 +204,8 @@ impl StatsCollector {
         last_resolved_at: Option<u64>,
         last_updated_at: Option<u64>,
     ) {
-        self.agg_total_resolves
-            .fetch_add(resolve_delta, Ordering::Relaxed);
-        self.agg_total_updates
-            .fetch_add(update_delta, Ordering::Relaxed);
+        saturating_fetch_add(&self.agg_total_resolves, resolve_delta);
+        saturating_fetch_add(&self.agg_total_updates, update_delta);
         if let Some(ts) = last_resolved_at {
             self.agg_last_resolved_at.fetch_max(ts, Ordering::Relaxed);
         }
@@ -291,8 +298,8 @@ impl StatsCollector {
             return false;
         }
         let entry = deltas.entry(mnemonic).or_default();
-        entry.resolves += resolves;
-        entry.updates += updates;
+        entry.resolves = entry.resolves.saturating_add(resolves);
+        entry.updates = entry.updates.saturating_add(updates);
         entry.last_resolved_at = entry.last_resolved_at.max(last_resolved_at);
         entry.last_updated_at = entry.last_updated_at.max(last_updated_at);
         true
@@ -309,16 +316,16 @@ impl StatsCollector {
         let key = (mnemonic.to_string(), epoch);
         if buckets.len() < MAX_PENDING_BUCKETS || buckets.contains_key(&key) {
             let b = buckets.entry(key).or_insert((0, 0));
-            b.0 += resolves;
-            b.1 += updates;
+            b.0 = b.0.saturating_add(resolves);
+            b.1 = b.1.saturating_add(updates);
         } else {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
         let g = buckets
             .entry((ALL_SERIES.to_string(), epoch))
             .or_insert((0, 0));
-        g.0 += resolves;
-        g.1 += updates;
+        g.0 = g.0.saturating_add(resolves);
+        g.1 = g.1.saturating_add(updates);
     }
 
     /// Drain all accumulated per-DID deltas for sync to the control plane.
@@ -419,8 +426,8 @@ impl StatsCollector {
         let mut slots = self.slot_retry.lock().unwrap();
         for b in failed {
             let entry = slots.entry((b.mnemonic, b.epoch)).or_insert((0, 0));
-            entry.0 += b.resolves;
-            entry.1 += b.updates;
+            entry.0 = entry.0.saturating_add(b.resolves);
+            entry.1 = entry.1.saturating_add(b.updates);
         }
     }
 
@@ -507,8 +514,8 @@ impl StatsCollector {
                 continue;
             }
             let entry = buckets.entry(key).or_insert((0, 0));
-            entry.0 += b.resolves;
-            entry.1 += b.updates;
+            entry.0 = entry.0.saturating_add(b.resolves);
+            entry.1 = entry.1.saturating_add(b.updates);
         }
     }
 

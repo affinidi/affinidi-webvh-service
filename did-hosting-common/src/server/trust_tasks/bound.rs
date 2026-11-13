@@ -132,7 +132,7 @@ impl BoundError {
                 }
             }
             BoundError::Proof(e) => RejectReason::ProofInvalid {
-                reason: e.to_string(),
+                reason: proof_failure_reason(e).into(),
             },
             BoundError::Unreachable(_) => RejectReason::Unavailable { retry_after: None },
         }
@@ -337,10 +337,33 @@ impl BoundKeyError {
             BoundKeyError::KeyUnsupported => RejectReason::PermissionDenied {
                 reason: self.to_string(),
             },
+            BoundKeyError::Proof(e) => RejectReason::ProofInvalid {
+                reason: proof_failure_reason(e).into(),
+            },
             _ => RejectReason::ProofInvalid {
                 reason: self.to_string(),
             },
         }
+    }
+}
+
+/// What a sender is told about a proof that did not verify: the kind of
+/// failure, never the verifier's own text. That text can carry a resolver's
+/// or a cryptosuite library's detail about this service's lookups; it is
+/// logged here instead.
+pub fn proof_failure_reason(e: &VerificationError) -> &'static str {
+    tracing::debug!(error = %e, "proof did not verify");
+    match e {
+        VerificationError::UnsupportedCryptosuite(_) => "unsupported cryptosuite",
+        VerificationError::MalformedProof(_) => {
+            "malformed proof, or a proof purpose or verification relationship this task does \
+             not accept"
+        }
+        VerificationError::IssuerMismatch(_) => {
+            "the proof's verification method is not controlled by the document's issuer"
+        }
+        VerificationError::SignatureInvalid => "signature verification failed",
+        VerificationError::Other(_) => "proof verification failed",
     }
 }
 
@@ -486,6 +509,23 @@ mod tests {
     }
 
     const PURPOSES: &[&str] = &["authentication", "assertionMethod"];
+
+    /// A proof failure tells the sender its kind, not the verifier's text.
+    #[test]
+    fn a_proof_failure_is_reported_by_kind_only() {
+        let detail = "resolver https://internal.example/1.2.3 said: connection refused";
+        for e in [
+            VerificationError::MalformedProof(detail.into()),
+            VerificationError::IssuerMismatch(detail.into()),
+            VerificationError::UnsupportedCryptosuite(detail.into()),
+            VerificationError::Other(detail.into()),
+        ] {
+            let RejectReason::ProofInvalid { reason } = BoundError::Proof(e).reject_reason() else {
+                panic!("not proofInvalid");
+            };
+            assert!(!reason.contains("internal.example"), "{reason}");
+        }
+    }
 
     #[tokio::test]
     async fn a_bound_key_document_verifies_locally_to_its_issuer() {
