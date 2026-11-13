@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   View,
   Text,
@@ -9,6 +9,7 @@ import {
 } from "react-native";
 import { useRouter, useLocalSearchParams } from "expo-router";
 import { AffinidiLogo } from "../components/AffinidiLogo";
+import { stripQueryParam } from "../lib/address-bar";
 import type { RedeemFinishResponse, RedeemStartResponse } from "../lib/api";
 import {
   completeRedemption,
@@ -31,7 +32,14 @@ type EnrollState =
  * passkey this will be, and what it may do, before the browser creates it.
  */
 export default function Enroll() {
-  const { token } = useLocalSearchParams<{ token: string }>();
+  const params = useLocalSearchParams<{ token: string }>();
+  // Read once and kept here: the token is then taken out of the address bar
+  // and the history entry, so it is not left on screen, in the browser's
+  // history or in a bookmark.
+  const [token] = useState(() => params.token);
+  useEffect(() => {
+    stripQueryParam("token");
+  }, []);
   const router = useRouter();
   const [claimCode, setClaimCode] = useState("");
   const [label, setLabel] = useState("");

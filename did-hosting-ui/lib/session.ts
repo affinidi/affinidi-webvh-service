@@ -10,17 +10,28 @@
  * in-memory cache first — every read in this module is synchronous and never
  * touches storage. The cache is mirrored to IndexedDB (fire-and-forget on
  * write) so a reload can restore it, and lazily restored from there the same
- * way `session-key.ts` restores the signing keypair. Never `localStorage`:
- * it is a flat, synchronous, string-keyed object any script on the origin can
- * enumerate in one line (`Object.entries(localStorage)`), which is exactly
- * the shape a generic exfiltration payload greps for. IndexedDB holds the
- * same bytes but needs a targeted, asynchronous lookup, so it does not fall
- * to that class of blanket scrape — the same reasoning that already put the
- * session signing key there instead of `localStorage`.
+ * way `session-key.ts` restores the signing keypair. Never `localStorage`,
+ * which a generic scrape enumerates in one line
+ * (`Object.entries(localStorage)`).
+ *
+ * IndexedDB is not a boundary, though: any script running on this origin can
+ * read these tokens from it, or from this module's memory. What protects a
+ * session against such a script is the session keypair, which is generated
+ * non-extractable (`session-key.ts`) and so cannot be copied out. The control
+ * plane requires a proof on every task that acts (a bearer token alone is
+ * refused with `proofRequired`), and a browser session's proofs are made with
+ * that key; refreshing a session that bound a key also needs its proof. A
+ * script on the origin can still use the key while the page is open — keeping
+ * script off the origin (the CSP) is the boundary for that.
+ *
+ * Sign-out reaches every tab: `clearToken` announces it on a
+ * `BroadcastChannel`, and a tab holding the same session drops its copy
+ * ([`listenForSignOut`]).
  */
 
 import {
   clearSessionKeypair,
+  forgetSessionKeypair,
   getSessionDidKey,
   hasSessionKeypair,
   restoreSessionKeypair,
@@ -337,6 +348,7 @@ export function setAuthMethod(method: AuthMethod): void {
 }
 
 export function clearToken(): void {
+  announceSignOut(getSessionId());
   accessTokenMem = null;
   // Clear the renewal credential too: a refresh token outliving a logout
   // would leave the browser able to mint fresh access tokens.
@@ -385,4 +397,58 @@ export function getSessionSubjectDid(): string | null {
 export function getSessionId(): string | null {
   const sid = tokenClaims()?.session_id;
   return typeof sid === "string" && sid.length > 0 ? sid : null;
+}
+
+// ---------------------------------------------------------------------------
+// Sign-out across tabs
+// ---------------------------------------------------------------------------
+
+/** The `BroadcastChannel` a sign-out is announced on. */
+const SIGN_OUT_CHANNEL = "did-hosting-ui-session";
+
+type SignOutMessage = { type: "signed-out"; sessionId: string | null };
+
+/** Tell the other tabs of this origin that `sessionId` has signed out. Not
+ *  delivered to the posting channel itself. No-op where `BroadcastChannel`
+ *  does not exist (native builds). */
+function announceSignOut(sessionId: string | null): void {
+  if (typeof BroadcastChannel === "undefined") return;
+  try {
+    const channel = new BroadcastChannel(SIGN_OUT_CHANNEL);
+    const message: SignOutMessage = { type: "signed-out", sessionId };
+    channel.postMessage(message);
+    channel.close();
+  } catch {
+    // Best effort: the other tabs still find out on their next request.
+  }
+}
+
+/**
+ * Drop this tab's copy of the session when another tab signs it out, then
+ * call `onSignedOut`. A message for a different session (this tab signed in
+ * again since) is ignored. Storage is not touched: the tab that signed out
+ * has already cleared it. Returns a function that stops listening.
+ */
+export function listenForSignOut(onSignedOut: () => void): () => void {
+  if (typeof BroadcastChannel === "undefined") return () => {};
+  let channel: BroadcastChannel;
+  try {
+    channel = new BroadcastChannel(SIGN_OUT_CHANNEL);
+  } catch {
+    return () => {};
+  }
+  channel.onmessage = (event: MessageEvent) => {
+    const message = event.data as Partial<SignOutMessage> | null;
+    if (message?.type !== "signed-out") return;
+    if (accessTokenMem === null) return;
+    const mine = getSessionId();
+    if (message.sessionId && mine && message.sessionId !== mine) return;
+    accessTokenMem = null;
+    refreshTokenMem = null;
+    authMethodMem = null;
+    sessionRestored = true;
+    forgetSessionKeypair();
+    onSignedOut();
+  };
+  return () => channel.close();
 }

@@ -1,5 +1,11 @@
 import React, { createContext, useContext, useState, useCallback, useEffect } from "react";
-import { api, getToken, restoreSession, setToken as storeToken } from "../lib/api";
+import {
+  api,
+  getToken,
+  listenForSignOut,
+  restoreSession,
+  setToken as storeToken,
+} from "../lib/api";
 
 interface AuthState {
   token: string | null;
@@ -60,9 +66,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     // Clear React state when the API client detects an expired/invalid token
     const onUnauthorized = () => setTokenState(null);
     window.addEventListener("webvh:unauthorized", onUnauthorized);
+    // ...and when another tab signs this session out.
+    const stopListening = listenForSignOut(() => setTokenState(null));
     return () => {
       cancelled = true;
       window.removeEventListener("webvh:unauthorized", onUnauthorized);
+      stopListening();
     };
   }, []);
 
