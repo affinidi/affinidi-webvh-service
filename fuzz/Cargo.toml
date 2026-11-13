@@ -27,8 +27,20 @@ serde_json = "1"
 didwebvh-rs = { version = "0.8", features = ["arbitrary"] }
 
 # The crate under test. Default features (method-webvh + method-web) are enough
-# for `did_ops`; server-core and the store/secret backends are not pulled in.
+# for `did_ops`; server-core and the store/secret backends are not pulled in
+# unless this crate's `server-core` feature is enabled (below).
 did-hosting-common = { path = "../did-hosting-common" }
+
+# Only for the `server-core` targets: names the `TrustTask<Value>` document
+# type the listeners parse. Same requirement as the workspace's.
+trust-tasks-rs = { version = "0.36.1", default-features = false, optional = true }
+
+[features]
+# The targets for code that exists only in server builds (the Trust Task
+# envelope and size gate, the TSP binding, the URL-path validators, the
+# wire-side witness-proof check). Run them with
+# `cargo +nightly fuzz run --features server-core <target>`.
+server-core = ["did-hosting-common/server-core", "dep:trust-tasks-rs"]
 
 # Keep some debug info for useful crash backtraces without killing throughput.
 [profile.release]
@@ -61,3 +73,55 @@ path = "fuzz_targets/validate_did_id_matches_request.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "verify_log_for_witnessing"
+path = "fuzz_targets/verify_log_for_witnessing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "verify_did_log_with_witness_proofs"
+path = "fuzz_targets/verify_did_log_with_witness_proofs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "verify_log_extends"
+path = "fuzz_targets/verify_log_extends.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "log_metadata"
+path = "fuzz_targets/log_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "trust_task_envelope"
+path = "fuzz_targets/trust_task_envelope.rs"
+test = false
+doc = false
+bench = false
+required-features = ["server-core"]
+
+[[bin]]
+name = "mnemonic"
+path = "fuzz_targets/mnemonic.rs"
+test = false
+doc = false
+bench = false
+required-features = ["server-core"]
+
+[[bin]]
+name = "witness_proof_for_version"
+path = "fuzz_targets/witness_proof_for_version.rs"
+test = false
+doc = false
+bench = false
+required-features = ["server-core"]

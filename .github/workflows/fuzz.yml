@@ -1,12 +1,19 @@
 name: Fuzz
 
-# Coverage-guided fuzzing of the `did_ops` validators (issue #47).
+# Coverage-guided fuzzing of the `did_ops` validators (issue #47) and the
+# server-side readers of inbound requests.
 #
 # cargo-fuzz needs the nightly toolchain and builds the libfuzzer runtime, so
-# this is kept OUT of PR CI — it runs on a nightly cron (and on demand) instead.
-# A regression that slips past PR review is caught within a day rather than
-# adding minutes + nightly flakiness to every pull request.
+# the long pass runs on a nightly cron (and on demand). A pull request that
+# touches the fuzzed crate or the fuzz harness gets a short smoke pass per
+# target instead, so a broken target or a stale fuzz/Cargo.lock shows up on
+# the PR rather than in the next morning's run; other PRs do not run it.
 on:
+  pull_request:
+    paths:
+      - "did-hosting-common/**"
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
   schedule:
     # 03:17 UTC daily (off the top of the hour to dodge scheduler congestion).
     - cron: "17 3 * * *"
@@ -28,9 +35,9 @@ env:
   # Pin the target to the pre-installed gnu host (matches tdk-rs fuzz.yaml). Do
   # not remove without also adding `targets: x86_64-unknown-linux-musl` above.
   CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
-  # Per-target wall-clock budget. The cron run uses the default; a manual
-  # dispatch can override it.
-  MAX_TOTAL_TIME: ${{ github.event.inputs.max_total_time || '300' }}
+  # Per-target wall-clock budget. The cron run uses the default, a manual
+  # dispatch can override it, and a pull request gets a 60s smoke pass.
+  MAX_TOTAL_TIME: ${{ github.event_name == 'pull_request' && '60' || github.event.inputs.max_total_time || '300' }}
 
 jobs:
   fuzz:
@@ -43,11 +50,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - validate_did_jsonl
-          - verify_did_log_proofs
-          - verify_did_log_proofs_structured
-          - validate_did_id_matches_request
+        # `features: server-core` marks a target over code that exists only in
+        # server builds; it is built with that feature of the fuzz crate.
+        include:
+          - target: validate_did_jsonl
+          - target: verify_did_log_proofs
+          - target: verify_did_log_proofs_structured
+          - target: validate_did_id_matches_request
+          - target: verify_log_for_witnessing
+          - target: verify_did_log_with_witness_proofs
+          - target: verify_log_extends
+          - target: log_metadata
+          - target: trust_task_envelope
+            features: server-core
+          - target: mnemonic
+            features: server-core
+          - target: witness_proof_for_version
+            features: server-core
     steps:
       # Restrict runner egress (SEC-3897). A fuzz build compiles and runs
       # third-party crate build scripts; block any network destination except
@@ -118,8 +137,9 @@ jobs:
       - name: Fuzz ${{ matrix.target }} for ${{ env.MAX_TOTAL_TIME }}s
         env:
           CARGO_NET_OFFLINE: "true"
+          FUZZ_FEATURES: ${{ matrix.features }}
         run: |
-          cargo +nightly fuzz run "${{ matrix.target }}" -- \
+          cargo +nightly fuzz run ${FUZZ_FEATURES:+--features "$FUZZ_FEATURES"} "${{ matrix.target }}" -- \
             -max_total_time="${{ env.MAX_TOTAL_TIME }}" \
             -print_final_stats=1
 

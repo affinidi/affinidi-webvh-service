@@ -1,0 +1,1 @@
+{"type":"https://trusttasks.org/binding/tsp/0.1/envelope","document":{"id": "urn:uuid:7f1c6c0e-3b0a-4e57-9b3e-2f6d6f1a7a10", "type": "https://trusttasks.org/spec/messaging/ping/0.1", "issuer": "did:key:z6Mkt6fnqQfFYMaTUhPVNaQSjRADSERw8C9p8BoCY1VGTyXT", "recipient": "did:web:fuzz.example.com", "issuedAt": "2026-01-01T00:00:00Z", "payload": {}}}
