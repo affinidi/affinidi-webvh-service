@@ -503,11 +503,11 @@ Also worth knowing before you go looking for them:
 
   The tooling (`scripts/release_lib.py::set_version`) also moves the internal
   path-dep pins and refreshes `fuzz/Cargo.lock`. That detached workspace's
-  committed lock records `did-hosting-common`'s version, and the nightly Fuzz
-  job gates on `cargo fetch --locked` with no PR check exercising it — so a
-  **dependency-requirement bump** in a normal PR still needs `cargo
-  generate-lockfile --manifest-path fuzz/Cargo.toml`, or the fuzz job turns red
-  the next morning with no fuzzing having run.
+  committed lock records `did-hosting-common`'s version, and the Fuzz job
+  gates on `cargo fetch --locked` — so a **dependency-requirement bump** in a
+  normal PR also needs `fuzz/Cargo.lock` refreshed (`cargo update
+  --manifest-path fuzz/Cargo.toml -p <crate>`), or the Fuzz job's short PR
+  pass (run for changes under `did-hosting-common/` or `fuzz/`) fails.
 
 - **Never edit `CHANGELOG.md` in a PR.** Record a user-facing change as a new
   file `changelog.d/<short-kebab-name>.md` holding one or more
