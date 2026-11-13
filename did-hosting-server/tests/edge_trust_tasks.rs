@@ -232,8 +232,11 @@ async fn post_https(
     let response = did_hosting_server::routes::trust_tasks::receive(
         axum::extract::State(state.clone()),
         axum::extract::ConnectInfo(fresh_https_addr()),
+        axum::Extension(did_hosting_server::routes::trust_tasks::BodyLimit(
+            did_hosting_server::routes::TRUST_TASKS_BODY_LIMIT_BYTES,
+        )),
         axum::http::HeaderMap::new(),
-        axum::body::Bytes::from(serde_json::to_vec(doc).unwrap()),
+        axum::body::Body::from(serde_json::to_vec(doc).unwrap()),
     )
     .await
     .into_response();
@@ -1200,8 +1203,11 @@ async fn an_unreadable_forwarded_chain_from_a_trusted_proxy_is_refused() {
             let response = did_hosting_server::routes::trust_tasks::receive(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo("10.0.0.5:443".parse().unwrap()),
+                axum::Extension(did_hosting_server::routes::trust_tasks::BodyLimit(
+                    did_hosting_server::routes::TRUST_TASKS_BODY_LIMIT_BYTES,
+                )),
                 headers,
-                axum::body::Bytes::from_static(b"not a document"),
+                axum::body::Body::from(&b"not a document"[..]),
             )
             .await
             .into_response();
@@ -1224,4 +1230,22 @@ async fn an_unreadable_forwarded_chain_from_a_trusted_proxy_is_refused() {
         body["error"], "malformed_request",
         "a readable chain reaches the document check: {body}"
     );
+}
+
+/// The HTTPS binding reads the body itself, after the rate limit, and
+/// refuses one larger than the route's limit with `413` before parsing it.
+#[tokio::test]
+async fn an_oversized_body_is_refused_unread() {
+    use axum::response::IntoResponse;
+    let (state, _dir) = edge_state().await;
+    let response = did_hosting_server::routes::trust_tasks::receive(
+        axum::extract::State(state),
+        axum::extract::ConnectInfo(fresh_https_addr()),
+        axum::Extension(did_hosting_server::routes::trust_tasks::BodyLimit(16)),
+        axum::http::HeaderMap::new(),
+        axum::body::Body::from(vec![b'{'; 64]),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
 }

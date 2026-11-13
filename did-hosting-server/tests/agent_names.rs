@@ -366,3 +366,86 @@ async fn community_name_404s_when_the_feature_is_off() {
     let (status, _) = get(state, "/@").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// A name on a disabled domain answers as the DID's own documents do (503),
+/// not with a redirect to a DID that domain no longer serves.
+#[tokio::test]
+async fn a_name_on_a_disabled_domain_does_not_redirect() {
+    use did_hosting_common::server::domain::{
+        DomainEntry, DomainStatus, DomainUrlScheme, create_domain,
+    };
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "alice", true, false).await;
+    create_domain(
+        &state.store,
+        &DomainEntry {
+            name: DOMAIN.into(),
+            label: None,
+            scheme: DomainUrlScheme::Https,
+            status: DomainStatus::Disabled,
+            created_at: 0,
+            default_domain: false,
+            branding: None,
+            witnesses: None,
+            watchers: None,
+            quota: None,
+            well_known_enabled: false,
+            disabled_at: None,
+            purge_at: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (status, location) = get(state.clone(), "/@alice").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(location, None);
+    // The same answer the DID's own log gets on that domain.
+    let (status, _) = get(state, "/alice-did/did.jsonl").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// Resolution is read-only: any method but GET and HEAD is refused with 405
+/// before a lookup, and does not return the log.
+#[tokio::test]
+async fn resolution_refuses_methods_other_than_get_and_head() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "alice", true, false).await;
+    for method in ["POST", "PUT", "DELETE", "PATCH"] {
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/alice-did/did.jsonl")
+                    .header("host", DOMAIN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("allow")
+                .and_then(|v| v.to_str().ok()),
+            Some("GET, HEAD")
+        );
+    }
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/alice-did/did.jsonl")
+                .header("host", DOMAIN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}

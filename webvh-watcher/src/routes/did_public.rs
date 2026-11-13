@@ -1,5 +1,5 @@
 use axum::extract::State;
-use axum::http::{StatusCode, Uri};
+use axum::http::{HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 
 use did_hosting_common::server::mnemonic::validate_mnemonic;
@@ -75,7 +75,16 @@ pub async fn serve_root_witness(State(state): State<AppState>) -> Result<Respons
 
 /// Combined fallback handler: serves DID documents for any path ending
 /// in `/did.jsonl` or `/did-witness.json`.
-pub async fn serve_public(State(state): State<AppState>, uri: Uri) -> Response {
+pub async fn serve_public(State(state): State<AppState>, method: Method, uri: Uri) -> Response {
+    // Resolution is read-only: anything but GET or HEAD is refused before a
+    // lookup, so it neither returns the content nor counts as a resolve.
+    if method != Method::GET && method != Method::HEAD {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(header::ALLOW, HeaderValue::from_static("GET, HEAD"))],
+        )
+            .into_response();
+    }
     let path = uri.path().trim_start_matches('/');
 
     // Check for DID log: <mnemonic>/did.jsonl

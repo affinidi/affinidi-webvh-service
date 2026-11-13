@@ -37,7 +37,9 @@ use std::net::IpAddr;
 use std::str::FromStr;
 
 use ipnetwork::IpNetwork;
-use tracing::warn;
+use tracing::{debug, warn};
+
+use crate::server::log_limit::{DEFAULT_INTERVAL_SECS, WarnLimit};
 
 /// Headers + peer IP the resolver needs. Decoupled from Axum so this
 /// is testable as a pure function.
@@ -92,11 +94,21 @@ pub fn resolve_request_host<'a>(
         // forwarded host. Almost always benign (a misconfigured load
         // balancer, a curl with `-H "X-Forwarded-Host: ..."` from a
         // dev box), but it's worth a warn-log so operators can spot
-        // a deployment misconfig before it bites them in production.
-        warn!(
-            peer = ?peer_ip,
-            "request from untrusted peer claims Forwarded / X-Forwarded-Host; ignoring"
-        );
+        // a deployment misconfig before it bites them in production. Any
+        // client can send the header, so at most one warning a minute.
+        static UNTRUSTED_FORWARDED: WarnLimit = WarnLimit::new(DEFAULT_INTERVAL_SECS);
+        match UNTRUSTED_FORWARDED.admit() {
+            Some(held) => warn!(
+                peer = ?peer_ip,
+                more_since_last_warning = held,
+                "request from a peer outside server.trusted_proxy_cidrs claims Forwarded / \
+                 X-Forwarded-Host; ignoring the header"
+            ),
+            None => debug!(
+                peer = ?peer_ip,
+                "request from untrusted peer claims Forwarded / X-Forwarded-Host; ignoring"
+            ),
+        }
     }
 
     headers.host

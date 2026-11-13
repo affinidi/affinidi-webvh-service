@@ -1241,10 +1241,12 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     info!("daemon listening on {addr}");
 
     let (http_ready_tx, http_ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let trusted_proxies = config.server.trusted_proxies.clone();
     let http_handle = tokio::spawn(async move {
         let _ = http_ready_tx.send(());
+        // Header, idle, connection and per-address limits: see `listener`.
         axum::serve(
-            listener,
+            did_hosting_common::server::listener::bounded(listener, &trusted_proxies),
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .with_graceful_shutdown(init::shutdown_signal())

@@ -35,7 +35,7 @@ use did_hosting_common::did_ops::{self, DidRecord, agent_name_key};
 use did_hosting_common::server::mnemonic::validate_agent_name;
 use tracing::debug;
 
-use super::resolve_shared::extract_request_host;
+use super::resolve_shared::{assert_gate_allows, extract_request_host};
 use crate::error::AppError;
 use crate::server::AppState;
 
@@ -161,6 +161,11 @@ async fn resolve(state: &AppState, raw_name: &str, parts: &Parts) -> Result<Resp
         // to.
         return Err(AppError::NotFound(format!("no such agent name: @{name}")));
     };
+
+    // The same domain gate the DID's own content passes: a name on a
+    // disabled domain answers as that DID's documents do (503), and a host
+    // that does not own the DID is refused.
+    assert_gate_allows(state, Some(host), &did).await?;
 
     debug!(%name, %did, "agent name resolved");
 

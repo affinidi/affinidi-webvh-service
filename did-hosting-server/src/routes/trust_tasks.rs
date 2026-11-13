@@ -23,11 +23,13 @@
 
 use std::net::SocketAddr;
 
-use axum::Json;
+use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use axum::{Extension, Json};
+use did_hosting_common::server::listener::{BODY_READ_TIMEOUT, read_body};
 use serde_json::Value;
 use tracing::error;
 use trust_tasks_rs::TrustTask;
@@ -42,6 +44,10 @@ use crate::server::AppState;
 /// the router directly), `receive`'s own `ConnectInfo` extractor already
 /// fails the request closed with a 500 rather than sharing a fallback
 /// address — this only makes that otherwise-silent rejection visible.
+/// Largest request body `receive` reads, set where the route is mounted.
+#[derive(Debug, Clone, Copy)]
+pub struct BodyLimit(pub usize);
+
 pub async fn log_missing_connect_info(req: Request, next: Next) -> Response {
     if req.extensions().get::<ConnectInfo<SocketAddr>>().is_none() {
         error!("trust-tasks request has no ConnectInfo<SocketAddr>; it will be refused with a 500");
@@ -68,6 +74,8 @@ pub async fn log_missing_connect_info(req: Request, next: Next) -> Response {
         (status = 200, description = "The edge's signed reply document", content_type = "application/json"),
         (status = 400, description = "The body is not a Trust Task document", content_type = "application/json"),
         (status = 403, description = "The document was not accepted, or takes no reply; empty body"),
+        (status = 408, description = "The body did not arrive in time"),
+        (status = 413, description = "The body is larger than the listener accepts"),
         (status = 429, description = "This address's request rate exceeds the limit", content_type = "application/json"),
         (status = 503, description = "The document could not be checked just now; send it again after `Retry-After`. Empty body"),
     ),
@@ -75,11 +83,13 @@ pub async fn log_missing_connect_info(req: Request, next: Next) -> Response {
 pub async fn receive(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Extension(BodyLimit(limit)): Extension<BodyLimit>,
     headers: HeaderMap,
-    body: axum::body::Bytes,
+    body: Body,
 ) -> Response {
-    // Per-address rate limit, ahead of parsing and any DID resolution the
-    // document's verification would trigger.
+    // Per-address rate limit, ahead of reading the body, parsing it, and any
+    // DID resolution the document's verification would trigger: a refused
+    // address never has its body read.
     if let Err(refusal) =
         state
             .trust_tasks_rate_limiter
@@ -87,6 +97,10 @@ pub async fn receive(
     {
         return refusal.into_response();
     }
+    let body = match read_body(body, limit, BODY_READ_TIMEOUT).await {
+        Ok(body) => body,
+        Err(refusal) => return refusal.into_response(),
+    };
 
     let doc: TrustTask<Value> = match serde_json::from_slice(&body) {
         Ok(doc) => doc,

@@ -217,8 +217,11 @@ impl Fleet {
                 let response = did_hosting_server::routes::trust_tasks::receive(
                     axum::extract::State(self.edge.clone()),
                     axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+                    axum::Extension(did_hosting_server::routes::trust_tasks::BodyLimit(
+                        did_hosting_server::routes::TRUST_TASKS_BODY_LIMIT_BYTES,
+                    )),
                     axum::http::HeaderMap::new(),
-                    axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
+                    axum::body::Body::from(serde_json::to_vec(&doc).unwrap()),
                 )
                 .await
                 .into_response();

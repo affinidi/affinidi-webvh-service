@@ -403,18 +403,16 @@ async fn reserve_https_port() -> (String, tokio::net::TcpListener) {
 }
 
 /// Serve the edge's production `POST /api/trust-tasks` route
-/// (`did_hosting_server::routes::trust_tasks::receive`, unmodified) on
+/// (`did_hosting_server::routes::trust_task_listener`, unmodified) on
 /// `listener`. Returns the task's handle — aborted at test end.
 fn serve_https_edge(
     listener: tokio::net::TcpListener,
     state: did_hosting_server::server::AppState,
 ) -> tokio::task::JoinHandle<()> {
-    let app = axum::Router::new()
-        .route(
-            "/api/trust-tasks",
-            axum::routing::post(did_hosting_server::routes::trust_tasks::receive),
-        )
-        .with_state(state);
+    let app = did_hosting_server::routes::trust_task_listener(
+        did_hosting_server::routes::TRUST_TASKS_BODY_LIMIT_BYTES,
+    )
+    .with_state(state);
     tokio::spawn(async move {
         axum::serve(
             listener,

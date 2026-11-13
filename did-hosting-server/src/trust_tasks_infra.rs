@@ -72,7 +72,18 @@ pub async fn dispatch(
             ))
         }
         MSG_SERVER_REGISTER_ACK => {
-            do_register_ack(&doc.payload);
+            // Advisory, so a failed check changes nothing but the log line:
+            // an acknowledgement is reported at `info` only when the control
+            // plane signed it. Anyone can post one to the HTTPS listener.
+            let verified = match crate::messaging::state_verifier(state) {
+                Some(verifier) => {
+                    crate::messaging::verify_control_plane(state, sender, &doc, &verifier)
+                        .await
+                        .is_ok()
+                }
+                None => false,
+            };
+            do_register_ack(&doc.payload, verified);
             Ok(None)
         }
         // Advisory: stats are fire-and-forget. Owned so the ack isn't warned
@@ -104,7 +115,13 @@ pub(crate) async fn do_health_ping(state: &AppState) -> Value {
 }
 
 /// Transport-agnostic core of the registration ack — informational only.
-pub(crate) fn do_register_ack(body: &Value) {
+/// `verified`: the document is the control plane's (`verify_control_plane`);
+/// an unverified one is logged at `debug` and its `instanceId` is not.
+pub(crate) fn do_register_ack(body: &Value, verified: bool) {
+    if !verified {
+        debug!("registration acknowledgement not verified as the control plane's; ignored");
+        return;
+    }
     // `server/register/0.2`'s response.
     let instance_id = body
         .get("instanceId")
