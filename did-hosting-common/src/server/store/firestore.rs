@@ -312,6 +312,58 @@ impl KeyspaceOps for FirestoreKeyspace {
         })
     }
 
+    fn compare_and_swap_raw(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        new: Vec<u8>,
+    ) -> BoxFuture<'_, Result<bool, AppError>> {
+        // Read-compare-write inside a Firestore read-write transaction: a
+        // replica that wrote the document meanwhile aborts this commit, and
+        // `run_transaction` re-runs the comparison against its value.
+        Box::pin(async move {
+            let doc_id = encode_doc_id(&key);
+            let doc = KvDoc {
+                key: doc_id.clone(),
+                data: BASE64.encode(&new),
+            };
+            check_document_size(&self.collection, &doc)?;
+            let collection = self.collection.clone();
+            let expected = expected.map(|v| BASE64.encode(v));
+            self.db
+                .run_transaction(move |db, tx| {
+                    let doc_id = doc_id.clone();
+                    let collection = collection.clone();
+                    let expected = expected.clone();
+                    let doc = KvDoc {
+                        key: doc.key.clone(),
+                        data: doc.data.clone(),
+                    };
+                    Box::pin(async move {
+                        let current: Option<KvDoc> = db
+                            .fluent()
+                            .select()
+                            .by_id_in(&collection)
+                            .obj()
+                            .one(&doc_id)
+                            .await?;
+                        if current.map(|d| d.data) != expected {
+                            return Ok(false);
+                        }
+                        db.fluent()
+                            .update()
+                            .in_col(&collection)
+                            .document_id(&doc_id)
+                            .object(&doc)
+                            .add_to_transaction(tx)?;
+                        Ok(true)
+                    })
+                })
+                .await
+                .map_err(|e| AppError::Store(format!("firestore compare-and-swap: {e}")))
+        })
+    }
+
     fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
         Box::pin(async move {
             let mut stream = self

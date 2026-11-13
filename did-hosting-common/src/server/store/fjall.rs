@@ -39,6 +39,9 @@ struct KeyspaceLocks {
     /// Held across the get-then-write of `incr_raw`. Same single-process
     /// rationale as `take`.
     incr: Mutex<()>,
+    /// Held across the get-compare-write of `compare_and_swap_raw`. Same
+    /// single-process rationale as `take`.
+    cas: Mutex<()>,
 }
 
 /// fjall's own rule (`fjall::keyspace::name::is_valid_keyspace_name`) —
@@ -344,6 +347,36 @@ impl KeyspaceOps for FjallKeyspace {
             Ok(next)
         })
     }
+
+    fn compare_and_swap_raw(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        new: Vec<u8>,
+    ) -> BoxFuture<'_, Result<bool, AppError>> {
+        Box::pin(async move {
+            // Per-keyspace mutex serialises the get-compare-write. fjall is
+            // single-process, so process-local mutual exclusion is the
+            // correct primitive.
+            let _guard = self.locks.cas.lock().await;
+            let (db, ks) = (self.db.clone(), self.keyspace.clone());
+            let key2 = key.clone();
+            let current = tokio::task::spawn_blocking(move || db.snapshot().get(&ks, key2))
+                .await
+                .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
+                .map_err(|e| AppError::Store(e.to_string()))?
+                .map(|v| v.to_vec());
+            if current != expected {
+                return Ok(false);
+            }
+            let ks = self.keyspace.clone();
+            tokio::task::spawn_blocking(move || ks.insert(key, new))
+                .await
+                .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
+                .map_err(|e| AppError::Store(e.to_string()))?;
+            Ok(true)
+        })
+    }
 }
 
 /// A counter as 8 big-endian bytes. Malformed or short values decode to 0
@@ -558,6 +591,55 @@ mod tests {
             (1..=N).collect::<Vec<_>>(),
             "lost or duplicate increment across handles"
         );
+    }
+
+    /// `compare_and_swap_raw` writes only over the value it expects, and of
+    /// many callers swapping from the same value through separately
+    /// obtained handles exactly one wins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn compare_and_swap_raw_writes_once_per_expected_value() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace("test").unwrap();
+
+        // Absent: only a swap from `None` writes.
+        assert!(
+            !ks.compare_and_swap_raw("mark", Some(b"a".to_vec()), b"b".to_vec())
+                .await
+                .unwrap()
+        );
+        assert!(ks.get_raw("mark").await.unwrap().is_none());
+        assert!(
+            ks.compare_and_swap_raw("mark", None, b"a".to_vec())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !ks.compare_and_swap_raw("mark", None, b"z".to_vec())
+                .await
+                .unwrap()
+        );
+        assert_eq!(ks.get_raw("mark").await.unwrap(), Some(b"a".to_vec()));
+
+        const RACERS: usize = 32;
+        let mut handles = Vec::new();
+        for n in 0..RACERS {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                let ks = store.keyspace("test").unwrap();
+                ks.compare_and_swap_raw("mark", Some(b"a".to_vec()), format!("b{n}"))
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut winners = 0;
+        for h in handles {
+            if h.await.unwrap() {
+                winners += 1;
+            }
+        }
+        assert_eq!(winners, 1, "exactly one swap from the same value may win");
+        let held = ks.get_raw("mark").await.unwrap().unwrap();
+        assert!(held.starts_with(b"b"), "{held:?}");
     }
 
     /// `take_raw` across separately obtained handles: exactly one winner

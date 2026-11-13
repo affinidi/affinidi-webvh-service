@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
+use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{
@@ -367,6 +368,50 @@ impl KeyspaceOps for DynamoDbKeyspace {
                     AppError::Store("dynamodb incr: no numeric counter in response".into())
                 })?;
             Ok(n)
+        })
+    }
+
+    fn compare_and_swap_raw(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        new: Vec<u8>,
+    ) -> BoxFuture<'_, Result<bool, AppError>> {
+        Box::pin(async move {
+            check_item_size(&key, &new)?;
+            ensure_table(&self.client, &self.table, &self.verified).await?;
+            // A conditional `PutItem`: DynamoDB evaluates the condition and
+            // writes under the partition key's lock, so of any number of
+            // replicas swapping from the same value, one wins and the rest
+            // fail the condition.
+            let request = self
+                .client
+                .put_item()
+                .table_name(&self.table)
+                .item(PK_ATTR, AttributeValue::B(Blob::new(key)))
+                .item(VAL_ATTR, AttributeValue::B(Blob::new(new)));
+            let request = match expected {
+                Some(expected) => request
+                    .condition_expression("#val = :expected")
+                    .expression_attribute_names("#val", VAL_ATTR)
+                    .expression_attribute_values(
+                        ":expected",
+                        AttributeValue::B(Blob::new(expected)),
+                    ),
+                None => request
+                    .condition_expression("attribute_not_exists(#pk)")
+                    .expression_attribute_names("#pk", PK_ATTR),
+            };
+            match request.send().await {
+                Ok(_) => Ok(true),
+                Err(e)
+                    if e.as_service_error()
+                        .is_some_and(PutItemError::is_conditional_check_failed_exception) =>
+                {
+                    Ok(false)
+                }
+                Err(e) => Err(request_error("put (compare-and-swap)", e)),
+            }
         })
     }
 

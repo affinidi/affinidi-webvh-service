@@ -58,9 +58,12 @@ pub struct AppState {
     pub acl_locks: PathLocks,
     /// Requests already acted on, keyed on `(proven issuer, document id)`.
     pub replay_cache: Arc<ReplayCache>,
-    /// Serialises `witness/sign`: the check that an entry extends what the
-    /// witness has already witnessed, the signature, and the record of it are
-    /// one step, so two forks of the same DID cannot both be witnessed.
+    /// Serialises this process's `witness/sign` requests. What keeps two
+    /// forks of one DID from both being witnessed is not this lock but the
+    /// store: the witnessed mark is moved by compare-and-swap before signing
+    /// (`witness_ops::advance_witnessed_mark`), which holds across processes
+    /// sharing a store and across restarts. The lock only spares this
+    /// process's own concurrent requests the swap's retry.
     pub sign_lock: Arc<tokio::sync::Mutex<()>>,
     /// Per-address rate limiter for `POST /api/trust-tasks`. Applied before
     /// the document's claimed issuer is checked against the ACL, so a single

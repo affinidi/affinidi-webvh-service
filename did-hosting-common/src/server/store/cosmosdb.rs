@@ -334,6 +334,67 @@ impl KeyspaceOps for CosmosDbKeyspace {
         })
     }
 
+    fn compare_and_swap_raw(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        new: Vec<u8>,
+    ) -> BoxFuture<'_, Result<bool, AppError>> {
+        // Expecting absence: a create, which 409s if the item exists.
+        // Expecting a value: read it with its ETag, compare, and replace
+        // `If-Match` that ETag, which 412s if any writer on any replica got
+        // there first. Either refusal means the key no longer holds what the
+        // caller expected.
+        Box::pin(async move {
+            let container = self.container().await?;
+            let doc_id = encode_doc_id(&key);
+            let doc = KvDoc {
+                id: doc_id.clone(),
+                pk: PARTITION_VALUE.to_string(),
+                data: BASE64.encode(&new),
+            };
+            let Some(expected) = expected else {
+                return match container
+                    .create_item(PARTITION_VALUE, &doc_id, doc, None)
+                    .await
+                {
+                    Ok(_) => Ok(true),
+                    Err(e) if e.status().is_conflict() => Ok(false),
+                    Err(e) => Err(AppError::Store(format!("cosmosdb create: {e}"))),
+                };
+            };
+            let resp = match container.read_item(PARTITION_VALUE, &doc_id, None).await {
+                Ok(resp) => resp,
+                Err(e) if is_not_found(&e) => return Ok(false),
+                Err(e) => return Err(AppError::Store(format!("cosmosdb read: {e}"))),
+            };
+            let etag = resp
+                .headers()
+                .etag()
+                .cloned()
+                .ok_or_else(|| AppError::Store("cosmosdb read: no etag".into()))?;
+            let current: KvDoc = resp
+                .into_model()
+                .map_err(|e| AppError::Store(format!("cosmosdb read body: {e}")))?;
+            let current = BASE64
+                .decode(&current.data)
+                .map_err(|e| AppError::Store(format!("cosmosdb decode: {e}")))?;
+            if current != expected {
+                return Ok(false);
+            }
+            let options =
+                ItemWriteOptions::default().with_precondition(Precondition::if_match(etag));
+            match container
+                .replace_item(PARTITION_VALUE, &doc_id, doc, Some(options))
+                .await
+            {
+                Ok(_) => Ok(true),
+                Err(e) if e.status().is_precondition_failed() || is_not_found(&e) => Ok(false),
+                Err(e) => Err(AppError::Store(format!("cosmosdb replace: {e}"))),
+            }
+        })
+    }
+
     fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
         Box::pin(async move {
             let container = self.container().await?;

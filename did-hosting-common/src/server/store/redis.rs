@@ -96,6 +96,20 @@ impl StorageBackend for RedisBackend {
     }
 }
 
+/// `KEYS[1]`: the key. `ARGV[1]`: `1` if a current value is expected, `0`
+/// if the key must be absent. `ARGV[2]`: the expected value. `ARGV[3]`: the
+/// new value. Returns 1 if it wrote, 0 if the key held anything else.
+const COMPARE_AND_SWAP_SCRIPT: &str = r#"
+local current = redis.call('GET', KEYS[1])
+if ARGV[1] == '1' then
+  if current ~= ARGV[2] then return 0 end
+elseif current then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[3])
+return 1
+"#;
+
 struct RedisKeyspace {
     conn: redis::aio::MultiplexedConnection,
     prefix: String,
@@ -185,6 +199,36 @@ impl KeyspaceOps for RedisKeyspace {
                 .await
                 .map_err(|e| AppError::Store(format!("redis INCR: {e}")))?;
             Ok(next)
+        })
+    }
+
+    fn compare_and_swap_raw(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        new: Vec<u8>,
+    ) -> BoxFuture<'_, Result<bool, AppError>> {
+        Box::pin(async move {
+            // A Lua script runs atomically on the server: no other command
+            // touches the key between its `GET` and its `SET`, so of any
+            // number of replicas swapping from the same value, one wins.
+            let fk = self.full_key(&key);
+            let mut conn = self.conn.clone();
+            let (has_expected, expected) = match expected {
+                Some(v) => ("1", v),
+                None => ("0", Vec::new()),
+            };
+            let swapped: i64 = redis::cmd("EVAL")
+                .arg(COMPARE_AND_SWAP_SCRIPT)
+                .arg(1)
+                .arg(fk)
+                .arg(has_expected)
+                .arg(expected)
+                .arg(new)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| AppError::Store(format!("redis compare-and-swap: {e}")))?;
+            Ok(swapped == 1)
         })
     }
 

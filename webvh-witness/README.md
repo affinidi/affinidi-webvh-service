@@ -260,6 +260,14 @@ caught. The CHANGELOG describes how to move a deployment that shares one.
 witness, and the witness verifies it before signing: the chain must verify,
 `versionId` must be the last entry, the DID must not be deactivated, and the
 witness parameter in force for the entry must name the witness identity.
+The log must also extend the furthest entry that identity has already
+witnessed for the DID (its *mark*): an older entry, or another history of
+the DID, is refused with `invalidLog`. The mark is moved in the store, by an
+atomic compare-and-swap, before anything is signed, so witness replicas
+sharing one store (Redis, DynamoDB, Firestore or Cosmos DB), a restarted
+witness, and the CLI all keep to it: two forks of one DID are never both
+witnessed. A replica whose swap loses re-checks against the mark the other
+left; one that keeps losing answers `unavailable` with `retryAfter`.
 
 A document that does not verify — unsigned, signed with the wrong proof
 purpose, not addressed to this witness, stale, or a replay — gets no reply

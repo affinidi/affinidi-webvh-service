@@ -817,6 +817,17 @@ async fn the_signed_proof_satisfies_the_log() {
 /// A three-entry did:webvh log that names `witness` throughout, as each of
 /// its prefixes: `[1 entry, 2 entries, 3 entries]`.
 async fn witnessed_chain(witness: &str) -> Vec<String> {
+    witnessed_branch(witness, chrono::Utc::now() - chrono::Duration::hours(1), 0).await
+}
+
+/// [`witnessed_chain`] from a fixed `base` time, its entries after the first
+/// written `branch` minutes later: two branches of one `base` share their
+/// first entry (one DID) and diverge from the second (a fork).
+async fn witnessed_branch(
+    witness: &str,
+    base: chrono::DateTime<chrono::Utc>,
+    branch: i64,
+) -> Vec<String> {
     use didwebvh_rs::witness::{Witness, Witnesses};
     let secret = Secret::generate_ed25519(None, Some(&[9u8; 32]));
     let pk_mb = secret.get_public_keymultibase().unwrap();
@@ -839,7 +850,6 @@ async fn witnessed_chain(witness: &str) -> Vec<String> {
         ..Default::default()
     };
     let mut state = didwebvh_rs::DIDWebVHState::default();
-    let base = chrono::Utc::now() - chrono::Duration::hours(1);
     let mut prefixes = Vec::new();
     for i in 0..3i64 {
         let current = match state.log_entries().last() {
@@ -853,7 +863,10 @@ async fn witnessed_chain(witness: &str) -> Vec<String> {
         };
         state
             .create_log_entry(
-                Some((base + chrono::Duration::minutes(i)).fixed_offset()),
+                Some(
+                    (base + chrono::Duration::minutes(if i == 0 { 0 } else { i + branch }))
+                        .fixed_offset(),
+                ),
                 &current,
                 &p,
                 &signing,
@@ -935,6 +948,66 @@ async fn sign_refuses_a_fork_or_a_rollback_of_what_it_witnessed() {
             .proofs_signed,
         3
     );
+}
+
+/// Whether a sign request was answered with a proof (`true`) or refused.
+async fn try_sign(state: &AppState, witness_id: &str, log: &str) -> bool {
+    let a = admin();
+    let reply = deliver(
+        state,
+        Via::Https,
+        &a.0,
+        signed(sign::Payload::TYPE_URI, &a, sign_payload(witness_id, log)).await,
+    )
+    .await
+    .expect("answered");
+    reply["type"] == format!("{}#response", sign::Payload::TYPE_URI)
+}
+
+/// Two witness processes sharing one store — each with its own in-process
+/// lock — asked at the same moment to witness two forks of one DID: at most
+/// one of them signs, whichever order the store sees them in, and a process
+/// started afterwards on the same store refuses the other fork too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_processes_sharing_a_store_never_both_witness_a_fork() {
+    let (first, _dir) = witness_state().await;
+    let base = chrono::Utc::now() - chrono::Duration::hours(1);
+
+    for round in 0..8 {
+        // Each round on its own identity, so each starts from one witnessed
+        // first entry.
+        let record = witness_ops::create_witness(&first.witnesses_ks, &first.witness_keys, None)
+            .await
+            .unwrap();
+        let left = witnessed_branch(&record.witness_id, base, 0).await;
+        let right = witnessed_branch(&record.witness_id, base, 7).await;
+        assert_eq!(left[0], right[0], "one DID");
+        assert_ne!(left[1], right[1], "two histories");
+        sign_ok(&first, &record.witness_id, &left[0]).await;
+
+        let mut second = first.clone();
+        second.sign_lock = Arc::new(tokio::sync::Mutex::new(()));
+        // One process asked for the left fork's second entry, the other for
+        // the right fork's third: both extend the shared first entry.
+        let (a, b) = tokio::join!(
+            try_sign(&first, &record.witness_id, &left[1]),
+            try_sign(&second, &record.witness_id, &right[2]),
+        );
+        assert!(!(a && b), "round {round}: both forks were witnessed");
+        assert!(a || b, "round {round}: neither fork was witnessed");
+
+        // A process started later on the same store keeps to the fork
+        // already witnessed.
+        let mut restarted = first.clone();
+        restarted.sign_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let (signed, other) = if a {
+            (&left[1], &right[2])
+        } else {
+            (&right[2], &left[1])
+        };
+        assert!(!try_sign(&restarted, &record.witness_id, other).await);
+        assert!(try_sign(&restarted, &record.witness_id, signed).await);
+    }
 }
 
 // ---------------------------------------------------------------------------
