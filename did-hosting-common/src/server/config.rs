@@ -190,6 +190,13 @@ pub struct ServerConfig {
     /// [`crate::server::rate_limit::ClientIps`]. An entry that is
     /// neither an address nor a CIDR, or a range covering every address, is
     /// refused at load.
+    ///
+    /// **Set together with [`Self::trusted_proxy_cidrs`].** The two lists
+    /// answer different questions (who the client is; which host the request
+    /// addresses), so a deployment behind a reverse proxy normally lists the
+    /// same proxies in both. The edge and the daemon warn at startup when
+    /// only one is set. Trusted proxies are also exempt from the listener's
+    /// per-address connection cap.
     #[serde(default, with = "ip_networks")]
     pub trusted_proxies: Vec<IpNetwork>,
     /// The network prefix an IPv6 client is counted by in every per-address
@@ -211,7 +218,8 @@ pub struct ServerConfig {
     ///
     /// Empty (default) disables `Forwarded` / `X-Forwarded-Host`
     /// trust — appropriate for deployments not behind a reverse
-    /// proxy. CIDRs accept `1.2.3.0/24` or `2001:db8::/32`.
+    /// proxy. CIDRs accept `1.2.3.0/24` or `2001:db8::/32`. Behind a
+    /// proxy, list it here **and** in `trusted_proxies`.
     #[serde(default)]
     pub trusted_proxy_cidrs: Vec<String>,
     /// `Cache-Control` policy for public DID-resolution responses

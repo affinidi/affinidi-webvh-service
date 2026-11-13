@@ -15,8 +15,8 @@ pub mod trust_tasks;
 
 use std::sync::Arc;
 
+use axum::Extension;
 use axum::Router;
-use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use did_hosting_common::server::rate_limit::ResolveRateLimiter;
 
@@ -60,9 +60,11 @@ fn trust_task_routes(body_limit: usize) -> Router<AppState> {
     Router::new()
         .route(
             "/trust-tasks",
-            post(trust_tasks::receive).layer(DefaultBodyLimit::max(
+            // `receive` reads the body itself, after its rate limit, bounded
+            // in size by this and in time by the listener's body timeout.
+            post(trust_tasks::receive).layer(Extension(trust_tasks::BodyLimit(
                 body_limit.max(TRUST_TASKS_BODY_LIMIT_BYTES),
-            )),
+            ))),
         )
         // `receive`'s rate limiter reads `ConnectInfo<SocketAddr>`, supplied
         // per real connection in production by

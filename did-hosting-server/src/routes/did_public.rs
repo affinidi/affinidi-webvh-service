@@ -36,7 +36,7 @@
 //! route didn't match, try the next one".
 
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 #[cfg(feature = "method-web")]
@@ -60,10 +60,16 @@ use crate::server::AppState;
     responses(
         (status = 200, description = "did:webvh log (JSONL) or did:web document for the slot", content_type = "application/jsonl+json"),
         (status = 404, description = "No DID hosted at this path"),
+        (status = 405, description = "A method other than GET or HEAD"),
         (status = 429, description = "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`", content_type = "application/json"),
     ),
 ))]
 pub async fn serve_public(State(state): State<AppState>, request: Request) -> Response {
+    // Resolution is read-only: anything but GET or HEAD is refused before a
+    // lookup, so it neither returns the content nor counts as a resolve.
+    if let Some(refused) = refuse_method(request.method()) {
+        return refused;
+    }
     let (parts, _) = request.into_parts();
 
     // Order matters when methods share suffixes; today they don't, but
@@ -100,4 +106,19 @@ pub async fn serve_public(State(state): State<AppState>, request: Request) -> Re
     let _ = parts;
 
     StatusCode::NOT_FOUND.into_response()
+}
+
+/// `405 Method Not Allowed` (with `Allow: GET, HEAD`) for any method but
+/// `GET` and `HEAD`.
+pub fn refuse_method(method: &Method) -> Option<Response> {
+    if method == Method::GET || method == Method::HEAD {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(header::ALLOW, HeaderValue::from_static("GET, HEAD"))],
+        )
+            .into_response(),
+    )
 }

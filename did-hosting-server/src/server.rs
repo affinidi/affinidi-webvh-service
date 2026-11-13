@@ -108,6 +108,17 @@ impl AppState {
                 "server.trusted_proxy_cidrs contains unparseable entries; ignoring them"
             );
         }
+        // The two proxy lists are read separately (client address vs. request
+        // host), and a deployment behind a proxy almost always needs both.
+        if parsed_cidrs.is_empty() != config.server.trusted_proxies.is_empty() {
+            warn!(
+                trusted_proxies = config.server.trusted_proxies.len(),
+                trusted_proxy_cidrs = parsed_cidrs.len(),
+                "only one of server.trusted_proxies (client address) and \
+                 server.trusted_proxy_cidrs (request host) is set; behind a reverse proxy, \
+                 list the proxy in both"
+            );
+        }
         let replay_cache = Arc::new(
             did_hosting_common::server::replay::ReplayCache::with_config(config.replay.clone())?,
         );
@@ -794,6 +805,7 @@ fn run_rest_thread(
         // layers), so it closes over its own `AppState` rather than using
         // axum's `State` extractor.
         let health_state = state.clone();
+        let trusted_proxies = state.config.server.trusted_proxies.clone();
         let app = base_router
             .with_state(state)
             .layer(
@@ -823,8 +835,9 @@ fn run_rest_thread(
         let _ = ready_tx.send(());
 
         let shutdown_rx = shutdown_rx.clone();
+        // Header, idle, connection and per-address limits: see `listener`.
         axum::serve(
-            listener,
+            did_hosting_common::server::listener::bounded(listener, &trusted_proxies),
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .with_graceful_shutdown(async move {

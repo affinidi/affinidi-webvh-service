@@ -351,20 +351,42 @@ impl ResolutionDomains {
     /// [`assert_resolution_allowed`] against these entries.
     pub fn assert_allowed(&self, request_host: Option<&str>, did_id: &str) -> Result<(), AppError> {
         if self.entries.is_empty() {
-            tracing::warn!(
-                did = %did_id,
-                request_host = ?request_host,
-                "domains keyspace is empty — skipping resolve-side safety check"
-            );
+            // Reached on every resolution until a domain is configured, so
+            // at most one warning a minute.
+            static NO_DOMAINS: crate::server::log_limit::WarnLimit =
+                crate::server::log_limit::WarnLimit::new(
+                    crate::server::log_limit::DEFAULT_INTERVAL_SECS,
+                );
+            match NO_DOMAINS.admit() {
+                Some(held) => tracing::warn!(
+                    did = %did_id,
+                    request_host = ?request_host,
+                    more_since_last_warning = held,
+                    "domains keyspace is empty — skipping resolve-side safety check"
+                ),
+                None => tracing::debug!(
+                    did = %did_id,
+                    "domains keyspace is empty — skipping resolve-side safety check"
+                ),
+            }
             return Ok(());
         }
         let Some(request_host) = request_host else {
-            tracing::warn!(
-                did = %did_id,
-                "no resolvable request host (no Host header, and none of Forwarded / \
-                 X-Forwarded-Host from a trusted peer); refusing to serve now that at least \
-                 one domain is configured"
-            );
+            // Any client can omit `Host`, so at most one warning a minute.
+            static NO_HOST: crate::server::log_limit::WarnLimit =
+                crate::server::log_limit::WarnLimit::new(
+                    crate::server::log_limit::DEFAULT_INTERVAL_SECS,
+                );
+            match NO_HOST.admit() {
+                Some(held) => tracing::warn!(
+                    did = %did_id,
+                    more_since_last_warning = held,
+                    "no resolvable request host (no Host header, and none of Forwarded / \
+                     X-Forwarded-Host from a trusted peer); refusing to serve now that at \
+                     least one domain is configured"
+                ),
+                None => tracing::debug!(did = %did_id, "no resolvable request host; refusing"),
+            }
             return Err(AppError::NotFound(format!(
                 "no resolvable request host for {did_id}"
             )));
