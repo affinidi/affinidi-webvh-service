@@ -293,13 +293,13 @@ impl SpecAclEntry {
     /// Project a spec-wire entry back to our local storage shape, refusing
     /// anything this maintainer cannot hold exactly.
     ///
-    /// `created_at_fallback` is used when the inbound entry has no
-    /// `createdAt` (typical on a create). The provenance members
-    /// (`createdAt`/`By`, `updatedAt`/`By`, `delegatedBy`) are the
-    /// maintainer's to set and are otherwise ignored.
+    /// The provenance members (`createdAt`/`By`, `updatedAt`/`By`,
+    /// `delegatedBy`) are the maintainer's to set, so the inbound values are
+    /// ignored: the local entry's creation time is `created_at`, whatever
+    /// the entry says.
     pub fn into_local(
         self,
-        created_at_fallback: u64,
+        created_at: u64,
         signing_oracle: bool,
     ) -> Result<LocalAclEntry, EntryRefusal> {
         let role: Role = self
@@ -433,11 +433,6 @@ impl SpecAclEntry {
             DomainScope::All
         };
 
-        let created_at = self
-            .created_at
-            .map(|dt| dt.timestamp().max(0) as u64)
-            .unwrap_or(created_at_fallback);
-
         Ok(LocalAclEntry {
             // Recorded under the identity: a did:scid subject without the
             // `src` locator a request may carry (VTI-KEY-160).
@@ -521,7 +516,7 @@ mod tests {
             1_048_576
         );
 
-        let back = parse(value).into_local(0, false).unwrap();
+        let back = parse(value).into_local(local.created_at, false).unwrap();
         assert_eq!(back.did, local.did);
         assert_eq!(back.role, local.role);
         assert_eq!(back.label, local.label);
@@ -567,6 +562,15 @@ mod tests {
             "keys": { "scope": "none" },
             "capabilities": { "scope": "ceiling" }
         })
+    }
+
+    /// `createdAt` is the maintainer's to set: an inbound value is ignored.
+    #[test]
+    fn an_inbound_created_at_is_ignored() {
+        let mut v = admin(json!({ "scope": "all" }));
+        v["createdAt"] = json!("2001-01-01T00:00:00Z");
+        let local = parse(v).into_local(1_700_000_002, false).unwrap();
+        assert_eq!(local.created_at, 1_700_000_002);
     }
 
     #[test]

@@ -84,6 +84,16 @@ impl SessionStore for DidHostingSessionStore {
         session::take_session_id_by_refresh(&self.inner, refresh_token).await
     }
 
+    /// Read from the session row, which keeps the token's digest rather
+    /// than the token. The canonical handler's fallback would hash the row's
+    /// value again, and no presented token would ever match.
+    async fn current_refresh_hash(&self, session_id: &str) -> Result<Option<String>, Self::Error> {
+        Ok(session::get_session(&self.inner, session_id)
+            .await?
+            .and_then(|s| s.refresh_token)
+            .map(|stored| session::refresh_hash_of_stored(&stored)))
+    }
+
     /// O(N) prefix-scan implementation. did-hosting historically
     /// kept an O(1) per-DID tracker on control but not on
     /// server/witness; this canonical path uses the shared O(N)

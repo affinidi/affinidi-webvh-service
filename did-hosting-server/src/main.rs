@@ -1270,7 +1270,7 @@ async fn run_import_secrets(
     // not, and the service would come back unable to decrypt traffic still
     // addressed to the old key.
     let retired = match secret_store.get().await {
-        Ok(Some(existing)) => existing.retired,
+        Ok(Some(mut existing)) => std::mem::take(&mut existing.retired),
         _ => Vec::new(),
     };
     if !retired.is_empty() {
@@ -1500,7 +1500,7 @@ async fn run_import_sealed(
     // not, and the service would come back unable to decrypt traffic still
     // addressed to the old key.
     let retired = match secret_store.get().await {
-        Ok(Some(existing)) => existing.retired,
+        Ok(Some(mut existing)) => std::mem::take(&mut existing.retired),
         _ => Vec::new(),
     };
     if !retired.is_empty() {

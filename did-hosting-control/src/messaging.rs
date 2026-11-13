@@ -2182,7 +2182,6 @@ mod tests {
             stats_collector: Arc::new(StatsCollector::new()),
             stats_ks: stats_ks.clone(),
             timeseries_ks: store.keyspace(KS_TIMESERIES).expect("timeseries ks"),
-            signing_key_bytes: None,
             unlisted_signers: Default::default(),
             replay_cache: Arc::new(crate::replay::ReplayCache::new()),
             path_locks: crate::path_locks::PathLocks::new(),

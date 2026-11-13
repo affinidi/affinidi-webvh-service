@@ -2594,6 +2594,26 @@ pub async fn rollback_did_to(
     // one that added `TSPTransport`, the badge must go with it.
     record.services = extract_service_types(&truncated);
 
+    // The rolled-back document is now the signed document of record, so the
+    // agent-name registry follows it exactly as on a publish: names it claims
+    // are served, names it no longer claims are released, parked names stay
+    // parked. The same preconditions apply — a rollback to an entry claiming a
+    // name another DID now holds (or a reserved one) is refused, so a rollback
+    // never moves a name between DIDs.
+    let domain = if !record.domain.is_empty() {
+        record.domain.clone()
+    } else {
+        record
+            .did_id
+            .as_deref()
+            .and_then(|d| did_hosting_common::server::domain::extract_did_host(d).ok())
+            .unwrap_or_default()
+    };
+    let claims = did_ops::extract_agent_names(&truncated, &domain);
+    let now = record.updated_at;
+    let (claimed, released, name_locks) =
+        reconcile_agent_names(state, &mut record, mnemonic, &claims, &domain, now).await?;
+
     let mut batch = state.store.batch();
     batch.insert_raw(
         &state.dids_ks,
@@ -2602,7 +2622,18 @@ pub async fn rollback_did_to(
     );
     batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
     batch.remove(&state.dids_ks, content_witness_key(mnemonic));
+    for name in &claimed {
+        batch.insert_raw(
+            &state.dids_ks,
+            agent_name_key(&domain, name),
+            mnemonic.as_bytes().to_vec(),
+        );
+    }
+    for name in &released {
+        batch.remove(&state.dids_ks, agent_name_key(&domain, name));
+    }
     batch.commit().await?;
+    drop(name_locks);
     invalidate_cached_content(state, mnemonic);
 
     let log_metadata = Some(extract_log_metadata(&truncated));
@@ -3077,7 +3108,6 @@ mod tests_atomic {
             stats_collector: Arc::new(StatsCollector::new()),
             stats_ks: stats_ks.clone(),
             timeseries_ks: store.keyspace(KS_TIMESERIES).expect("timeseries ks"),
-            signing_key_bytes: None,
             unlisted_signers: Default::default(),
             replay_cache: Arc::new(crate::replay::ReplayCache::new()),
             path_locks: crate::path_locks::PathLocks::new(),
@@ -4789,6 +4819,133 @@ mod tests_atomic {
         let after = get_record(&state, "plain").await;
         assert_eq!(after.did_id, before.did_id);
         assert_eq!(after.version_count, before.version_count);
+    }
+
+    /// Store a two-entry log at `path` (`first` then `second`, each a
+    /// one-entry log) and set the record's version count to match, so a
+    /// rollback has an entry to drop. The registry is left as it is.
+    async fn store_two_entry_log(state: &AppState, path: &str, first: &str, second: &str) {
+        let content = format!("{}\n{}", first.trim_end(), second.trim_end());
+        state
+            .dids_ks
+            .insert_raw(content_log_key(path), content.as_bytes().to_vec())
+            .await
+            .unwrap();
+        let mut record = get_record(state, path).await;
+        record.version_count = 2;
+        record.content_size = content.len() as u64;
+        state.dids_ks.insert(did_key(path), &record).await.unwrap();
+    }
+
+    /// A rollback that drops the entry which added a name releases it: the
+    /// registry follows the document the slot now serves.
+    #[tokio::test]
+    async fn rollback_releases_a_name_only_the_dropped_entry_claimed() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:a";
+        register_owned(&state, owner, "slot-a").await;
+        let named = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
+        publish_did(&owner_auth(owner), &state, "slot-a", &named, None)
+            .await
+            .expect("bind alice");
+        let plain = build_test_did_log_with_names("control.test", "slot-a", &[]).await;
+        store_two_entry_log(&state, "slot-a", &plain, &named).await;
+
+        let (record, _, removed) = rollback_did_to(&owner_auth(owner), &state, "slot-a", None)
+            .await
+            .expect("rollback");
+        assert_eq!(removed, 1);
+        assert!(
+            !record.agent_names.iter().any(|e| e.name == "alice"),
+            "the returned record no longer lists the name"
+        );
+        assert!(
+            !get_record(&state, "slot-a")
+                .await
+                .agent_names
+                .iter()
+                .any(|e| e.name == "alice"),
+            "the stored record no longer lists the name"
+        );
+        assert_eq!(index_target(&state, "control.test", "alice").await, None);
+    }
+
+    /// A rollback to an entry that claims a free name registers it, as a
+    /// publish of that entry would.
+    #[tokio::test]
+    async fn rollback_registers_a_free_name_the_kept_entry_claims() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:a";
+        register_owned(&state, owner, "slot-a").await;
+        let named = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
+        let plain = build_test_did_log_with_names("control.test", "slot-a", &[]).await;
+        store_two_entry_log(&state, "slot-a", &named, &plain).await;
+        assert_eq!(index_target(&state, "control.test", "alice").await, None);
+
+        rollback_did_to(&owner_auth(owner), &state, "slot-a", None)
+            .await
+            .expect("rollback");
+        assert!(
+            get_record(&state, "slot-a")
+                .await
+                .agent_names
+                .iter()
+                .any(|e| e.name == "alice" && e.enabled),
+            "the name the kept entry claims is registered"
+        );
+        assert_eq!(
+            index_target(&state, "control.test", "alice")
+                .await
+                .as_deref(),
+            Some("slot-a")
+        );
+    }
+
+    /// A rollback to an entry claiming a name another DID now holds is
+    /// refused and changes nothing: a name changes holder only through an
+    /// explicit `remove` by its holder.
+    #[tokio::test]
+    async fn rollback_is_refused_when_the_kept_entry_claims_a_name_held_elsewhere() {
+        let (state, _dir) = test_state().await;
+        let owner_a = "did:example:a";
+        let owner_b = "did:example:b";
+        register_owned(&state, owner_a, "slot-a").await;
+        register_owned(&state, owner_b, "slot-b").await;
+        let held = build_test_did_log_with_names("control.test", "slot-b", &["alice"]).await;
+        publish_did(&owner_auth(owner_b), &state, "slot-b", &held, None)
+            .await
+            .expect("B binds alice");
+
+        let named = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
+        let plain = build_test_did_log_with_names("control.test", "slot-a", &[]).await;
+        store_two_entry_log(&state, "slot-a", &named, &plain).await;
+        let before = state
+            .dids_ks
+            .get_raw(content_log_key("slot-a"))
+            .await
+            .unwrap();
+
+        let err = rollback_did_to(&owner_auth(owner_a), &state, "slot-a", None)
+            .await
+            .expect_err("rollback refused");
+        assert!(
+            matches!(err, AppError::AgentName(AgentNameError::Taken)),
+            "expected Taken, got {err:?}"
+        );
+        let after = state
+            .dids_ks
+            .get_raw(content_log_key("slot-a"))
+            .await
+            .unwrap();
+        assert_eq!(after, before, "the log is unchanged");
+        assert_eq!(get_record(&state, "slot-a").await.version_count, 2);
+        assert_eq!(
+            index_target(&state, "control.test", "alice")
+                .await
+                .as_deref(),
+            Some("slot-b"),
+            "the name stays with its holder"
+        );
     }
 
     /// Test shims over `update_agent_name` keeping the historical verb

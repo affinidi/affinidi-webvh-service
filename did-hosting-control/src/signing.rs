@@ -34,14 +34,13 @@ use crate::server::AppState;
 
 /// Load the control DID's operational (`authentication`) key as a signing [`Secret`].
 ///
-/// Sourced from [`AppState::identity`], not `signing_key_bytes`: the identity
+/// Sourced from [`AppState::identity`]: the identity
 /// is the single source of truth for *which kid* the key answers to — its
 /// current generation's `signing_kid` is resolved from the DID document's
 /// `authentication` entry (the same key `build_did_document` also lists under
 /// `assertionMethod`), and a rotation replaces the live set in place, so the
 /// proof's `verificationMethod` always names a key the published document
-/// still advertises. `signing_key_bytes` is the same seed but decoded once at
-/// boot with no kid attached, so it goes stale across a rotation.
+/// still advertises.
 ///
 /// `control_did` must be the configured `server_did`; a mismatch with the
 /// current identity generation means the identity store and config disagree,

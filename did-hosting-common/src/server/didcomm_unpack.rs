@@ -1,74 +1,22 @@
-//! Helper for unpacking DIDComm signed (JWS) messages using DID resolution.
-//!
-//! The v0.13 `affinidi-messaging-didcomm` crate removed the async `Message::unpack_string`
-//! method that internally resolved DIDs. This module provides an equivalent by:
-//!
-//! 1. Parsing the JWS protected header to extract the signer's key ID (kid).
-//! 2. Resolving the DID document via `DIDCacheClient` to obtain the Ed25519 verifying key.
-//! 3. Calling the low-level `unpack()` function with the resolved public key.
+//! Freshness bounds for signed messages and documents, and verification of a
+//! SIOPv2 self-issued `id_token` against its issuer's resolved DID document.
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_tdk::did_common::DocumentExt;
-use affinidi_tdk::didcomm::Message;
-use affinidi_tdk::didcomm::UnpackResult;
-use affinidi_tdk::didcomm::jws::envelope::{Jws, JwsProtectedHeader};
-use affinidi_tdk::didcomm::message::unpack;
+use affinidi_tdk::didcomm::jws::envelope::JwsProtectedHeader;
 use base64::Engine;
 
 use super::error::AppError;
 
-/// Maximum age of a DIDComm message accepted by `unpack_signed`, in
-/// seconds. Messages older than this are rejected as stale; replay
-/// caches use the same window as their TTL so a message that's still
-/// fresh enough to accept is still tracked for replay detection.
+/// Maximum age of a signed message or document accepted, in seconds.
+/// Older ones are refused as stale; replay caches keep entries at least
+/// this long, so one still fresh enough to accept is still tracked for
+/// replay detection.
 pub const FRESHNESS_WINDOW_SECS: u64 = 300;
 
 /// How far into the future a signed message or document's timestamp may sit
 /// and still be accepted, absorbing ordinary clock skew between peers.
 pub const FUTURE_SKEW_SECS: u64 = 60;
-
-/// How long a replay cache must remember an accepted `(sender, id)` pair.
-///
-/// Not just [`FRESHNESS_WINDOW_SECS`]: a message stamped at the edge of the
-/// future tolerance stays inside the freshness window for
-/// `FRESHNESS_WINDOW_SECS + FUTURE_SKEW_SECS` after it was first accepted, so
-/// a cache that forgot it sooner would accept it a second time.
-pub const REPLAY_WINDOW_SECS: u64 = FRESHNESS_WINDOW_SECS + FUTURE_SKEW_SECS;
-
-/// Extract the signer's key ID from a JWS protected header without verifying the signature.
-///
-/// Rejects multi-signature JWS envelopes outright — the threat model assumes a
-/// single signer and accepting additional signatures silently would create
-/// surprising states (which signature did we verify? which one bound the
-/// `from` field?). If multi-sig becomes a real requirement, the decision
-/// belongs in a separate, deliberate API.
-fn extract_signer_kid(jws_str: &str) -> Result<String, AppError> {
-    let jws: Jws = serde_json::from_str(jws_str)
-        .map_err(|e| AppError::Authentication(format!("invalid JWS JSON: {e}")))?;
-
-    if jws.signatures.is_empty() {
-        return Err(AppError::Authentication("JWS has no signatures".into()));
-    }
-    if jws.signatures.len() > 1 {
-        return Err(AppError::Authentication(format!(
-            "JWS has {} signatures; only single-signer envelopes are accepted",
-            jws.signatures.len()
-        )));
-    }
-
-    let sig = &jws.signatures[0];
-
-    let header_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(&sig.protected)
-        .map_err(|e| AppError::Authentication(format!("invalid JWS protected header: {e}")))?;
-
-    let header: JwsProtectedHeader = serde_json::from_slice(&header_bytes)
-        .map_err(|e| AppError::Authentication(format!("invalid JWS header JSON: {e}")))?;
-
-    header
-        .kid
-        .ok_or_else(|| AppError::Authentication("JWS header missing kid".into()))
-}
 
 /// Resolve an Ed25519 verifying key from a DID document given a key ID (DID URL fragment).
 ///
@@ -142,143 +90,6 @@ async fn resolve_verifying_key(
     pk_bytes
         .try_into()
         .map_err(|_| AppError::Authentication("public key must be 32 bytes".into()))
-}
-
-/// Refuse a signed sign-in message not addressed to this service
-/// (affinidi-webvh-service#207; the rule is SPEC §7.2 item 5, as in VTI #1638).
-///
-/// A JWS-signed message is readable and forwardable by anyone holding it — the
-/// signature proves who wrote it, not who it was for. Without this check a
-/// service the holder signed in to could relay the message to this one and be
-/// issued a session as the holder. So the message must name exactly one
-/// recipient, and it must be this service's own DID, by exact string equality.
-///
-/// Call it on every sign-in path that accepts a signed (not encrypted)
-/// envelope, before the canonical handler runs.
-pub fn require_addressed_to(msg: &Message, own_did: Option<&str>) -> Result<(), AppError> {
-    let own = own_did.ok_or_else(|| {
-        AppError::Config(
-            "server_did not configured; a signed sign-in cannot be addressed to this service"
-                .into(),
-        )
-    })?;
-    match msg.to.as_deref() {
-        None | Some([]) => Err(AppError::Validation(
-            "malformedRequest: a signed sign-in message must name this service in `to`".into(),
-        )),
-        Some([one]) if one == own => Ok(()),
-        Some(to) => Err(AppError::Authentication(format!(
-            "wrongRecipient: this message is addressed to {}, not to this service ({own})",
-            to.join(", ")
-        ))),
-    }
-}
-
-/// Unpack a DIDComm signed (JWS) message and verify the JWS signer matches `msg.from`.
-///
-/// Resolves the signer's public key from the JWS protected-header `kid`, verifies
-/// the signature, then asserts that the verified signer's DID equals the message's
-/// `from` DID (compared on base, ignoring `#fragment`). Returns the unpacked `Message`
-/// and the *verified* signer base DID.
-///
-/// **Security:** Callers must use the returned base DID for sender identification.
-/// Trusting `msg.from` directly allows an attacker who controls any DID to forge the
-/// `from` field while signing with their own key.
-///
-/// The message must:
-/// - Be signed (plaintext and encrypted-only payloads are rejected — those would not
-///   carry a verified signer identity).
-/// - Carry a `from` field whose base DID matches the JWS signer.
-/// - Have a `created_time` inside the 5-minute freshness window (with 60s future tolerance).
-pub async fn unpack_signed(
-    input: &str,
-    did_resolver: &DIDCacheClient,
-) -> Result<(Message, String), AppError> {
-    let kid = extract_signer_kid(input)?;
-    let verifying_key = resolve_verifying_key(did_resolver, &kid).await?;
-
-    // Verify under the resolved key *as the key of `kid`*: the reported
-    // `signer_kid` is then the key id the signature was checked against.
-    let verify_key = affinidi_tdk::didcomm::jws::verify::VerifyKey::Ed25519(verifying_key);
-    let signer = affinidi_tdk::didcomm::SignerKey::new(&kid, &verify_key);
-    let result = unpack::unpack_bound(input, None, None, None, Some(signer))
-        .map_err(|e| AppError::Authentication(format!("failed to unpack message: {e}")))?;
-
-    let (message, signer_kid) = match result {
-        UnpackResult::Signed {
-            message,
-            signer_kid,
-        } => (message, signer_kid),
-        UnpackResult::Plaintext(_) => {
-            return Err(AppError::Authentication(
-                "message is not signed; refusing to authenticate plaintext".into(),
-            ));
-        }
-        UnpackResult::Encrypted { .. } => {
-            return Err(AppError::Authentication(
-                "message is encrypted-only; expected JWS-signed envelope".into(),
-            ));
-        }
-        // `UnpackResult` is `#[non_exhaustive]` as of didcomm 0.14: reject any
-        // future envelope shape we don't explicitly accept (fail closed — this
-        // is an authentication path that must only trust verified JWS signers).
-        _ => {
-            return Err(AppError::Authentication(
-                "unsupported DIDComm envelope shape; expected JWS-signed message".into(),
-            ));
-        }
-    };
-
-    // Signer kid is always present for Signed results; the resolver already used it.
-    let signer_kid = signer_kid.unwrap_or(kid);
-    let signer_base = signer_kid
-        .split('#')
-        .next()
-        .unwrap_or(&signer_kid)
-        .to_string();
-
-    let claimed_from = message
-        .from
-        .as_deref()
-        .ok_or_else(|| AppError::Authentication("signed message is missing `from` field".into()))?;
-    let claimed_base = claimed_from.split('#').next().unwrap_or(claimed_from);
-    if signer_base != claimed_base {
-        return Err(AppError::Authentication(
-            "JWS signer does not match message `from` DID".into(),
-        ));
-    }
-
-    // `created_time` is REQUIRED, not optional. Freshness and the DIDComm
-    // replay cache are a matched pair (the cache TTL equals the freshness
-    // window and prunes entries past it), so a signed envelope with no
-    // `created_time` would never become "stale" and could be replayed to
-    // re-trigger a state-changing DID op once its replay-cache entry aged out.
-    // `created_time` is inside the JWS-signed payload, so an attacker can't add
-    // or strip it — every compliant sender sets it (this service's own clients,
-    // and the VTA's webvh client, all do), so treating its absence as a
-    // rejection closes the gap without refusing any real client.
-    let created_time = message.created_time.ok_or_else(|| {
-        AppError::Authentication(
-            "signed message is missing `created_time` (required for freshness/replay protection)"
-                .into(),
-        )
-    })?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if now.saturating_sub(created_time) > FRESHNESS_WINDOW_SECS {
-        return Err(AppError::Authentication(
-            "message too old (created_time exceeds 5-minute window)".into(),
-        ));
-    }
-    if created_time > now + FUTURE_SKEW_SECS {
-        return Err(AppError::Authentication(
-            "message created_time is in the future".into(),
-        ));
-    }
-
-    Ok((message, signer_base))
 }
 
 // ---------------------------------------------------------------------------
@@ -363,8 +174,8 @@ pub fn siop_id_token_claimed_issuer(id_token: &str) -> Option<String> {
 ///    `iss == sub`.
 /// 3. Resolve the authentication key for `iss`. The `kid` is honoured
 ///    for the verification-method lookup (resolved via
-///    [`resolve_verifying_key`], the same DID-resolve + Ed25519
-///    key-extraction primitive `unpack_signed` uses), and the resolved
+///    [`resolve_verifying_key`], which also requires the key to be listed
+///    under `authentication`), and the resolved
 ///    key's base DID must equal `iss`. Works for any DID method the
 ///    resolver supports — `did:key` (in-tree) and `did:webvh` (DID
 ///    document fetched) alike. For `did:key`, which is self-certifying,
@@ -474,8 +285,7 @@ pub async fn verify_siop_id_token(
 }
 
 /// Extract the `kid` from a base64url-encoded compact-JWS protected
-/// header. Mirrors [`extract_signer_kid`] (which reads a DIDComm
-/// general-JSON JWS) for the compact serialization used by SIOPv2.
+/// header, the compact serialization SIOPv2 uses.
 fn extract_signer_kid_compact(header_b64: &str) -> Result<String, AppError> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -490,124 +300,8 @@ fn extract_signer_kid_compact(header_b64: &str) -> Result<String, AppError> {
 }
 
 #[cfg(test)]
-mod addressed_to_tests {
-    use super::require_addressed_to;
-    use affinidi_tdk::didcomm::Message;
-    use serde_json::json;
-
-    fn msg(to: Option<Vec<&str>>) -> Message {
-        let mut m = Message::build("id-1".to_string(), "t".to_string(), json!({})).finalize();
-        m.to = to.map(|v| v.into_iter().map(String::from).collect());
-        m
-    }
-
-    /// affinidi-webvh-service#207: only a message addressed to this service,
-    /// and to it alone, signs in here.
-    #[test]
-    fn a_signed_sign_in_must_be_addressed_to_this_service_alone() {
-        let own = Some("did:web:svc.example");
-        assert!(require_addressed_to(&msg(Some(vec!["did:web:svc.example"])), own).is_ok());
-        // Another service — the relay.
-        assert!(require_addressed_to(&msg(Some(vec!["did:web:other.example"])), own).is_err());
-        // Several recipients: valid at each, so not bound to this one.
-        assert!(
-            require_addressed_to(
-                &msg(Some(vec!["did:web:svc.example", "did:web:other.example"])),
-                own
-            )
-            .is_err()
-        );
-        // None.
-        assert!(require_addressed_to(&msg(None), own).is_err());
-        assert!(require_addressed_to(&msg(Some(vec![])), own).is_err());
-        // Exact equality, no normalisation.
-        assert!(require_addressed_to(&msg(Some(vec!["did:web:svc.example "])), own).is_err());
-        // A service with no DID cannot be addressed.
-        assert!(require_addressed_to(&msg(Some(vec!["did:web:svc.example"])), None).is_err());
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `extract_signer_kid` must return the kid embedded in the JWS protected
-    /// header. This is the input to the signer-verification flow; if it
-    /// regressed to "the first available kid" or similar, the bypass would
-    /// reopen.
-    #[test]
-    fn extract_signer_kid_reads_protected_header_kid() {
-        // Build a synthetic JWS envelope with a known kid.
-        // protected = base64url({"kid":"did:example:123#key-1","alg":"EdDSA"})
-        let header_json = serde_json::json!({
-            "kid": "did:example:123#key-1",
-            "alg": "EdDSA",
-        });
-        let protected_b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            serde_json::to_vec(&header_json).unwrap(),
-        );
-        let jws = serde_json::json!({
-            "payload": "ignored",
-            "signatures": [
-                {
-                    "protected": protected_b64,
-                    "signature": "ignored",
-                }
-            ],
-        });
-        let kid = extract_signer_kid(&jws.to_string()).unwrap();
-        assert_eq!(kid, "did:example:123#key-1");
-    }
-
-    #[test]
-    fn extract_signer_kid_rejects_envelope_without_signatures() {
-        let jws = serde_json::json!({ "payload": "ignored", "signatures": [] });
-        assert!(extract_signer_kid(&jws.to_string()).is_err());
-    }
-
-    #[test]
-    fn extract_signer_kid_rejects_envelope_with_no_kid() {
-        let header_json = serde_json::json!({ "alg": "EdDSA" });
-        let protected_b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            serde_json::to_vec(&header_json).unwrap(),
-        );
-        let jws = serde_json::json!({
-            "payload": "ignored",
-            "signatures": [{ "protected": protected_b64, "signature": "ignored" }],
-        });
-        assert!(extract_signer_kid(&jws.to_string()).is_err());
-    }
-
-    #[test]
-    fn extract_signer_kid_rejects_invalid_json() {
-        assert!(extract_signer_kid("not-json").is_err());
-    }
-
-    #[test]
-    fn extract_signer_kid_rejects_multi_signature_envelope() {
-        let header_json = serde_json::json!({ "kid": "did:example:123#key-1", "alg": "EdDSA" });
-        let protected_b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            serde_json::to_vec(&header_json).unwrap(),
-        );
-        let jws = serde_json::json!({
-            "payload": "ignored",
-            "signatures": [
-                { "protected": protected_b64.clone(), "signature": "ignored" },
-                { "protected": protected_b64, "signature": "second" },
-            ],
-        });
-        let err = extract_signer_kid(&jws.to_string()).unwrap_err();
-        match err {
-            AppError::Authentication(msg) => assert!(
-                msg.contains("only single-signer"),
-                "expected multi-sig rejection message, got: {msg}",
-            ),
-            other => panic!("expected Authentication, got {other:?}"),
-        }
-    }
 
     // ---- SIOPv2 id_token helpers ----
 

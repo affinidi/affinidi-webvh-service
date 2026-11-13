@@ -444,16 +444,12 @@ pub fn identity_signing_secret(
             generation.did
         )));
     }
-    identity
-        .secrets()
-        .into_iter()
-        .find(|s| s.id == generation.signing_kid)
-        .ok_or_else(|| {
-            SignError(format!(
-                "no signing secret loaded for {}",
-                generation.signing_kid
-            ))
-        })
+    identity.secret(&generation.signing_kid).ok_or_else(|| {
+        SignError(format!(
+            "no signing secret loaded for {}",
+            generation.signing_kid
+        ))
+    })
 }
 
 #[cfg(test)]

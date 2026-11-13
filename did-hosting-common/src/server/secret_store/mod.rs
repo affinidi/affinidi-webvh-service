@@ -37,6 +37,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use vti_secrets::SeedStore;
 use vti_secrets::seed_store::PlaintextSeedStore;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::server::config::SecretsConfig;
 use crate::server::error::AppError;
@@ -52,7 +53,11 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// This encoding is self-describing: the multicodec prefix identifies the key
 /// type (Ed25519, X25519, etc.), so a `Secret` can be reconstructed directly
 /// via `Secret::from_multibase(key, kid)`.
-#[derive(Clone, Serialize, Deserialize)]
+///
+/// Every key is wiped from memory when the value is dropped
+/// (`ZeroizeOnDrop`), clones included. Take a field out with `clone()` or
+/// `std::mem::take`; it cannot be moved out of the struct.
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct ServerSecrets {
     /// Ed25519 private key for server DID signing (multibase-encoded).
     pub signing_key: String,
@@ -94,7 +99,9 @@ pub struct ServerSecrets {
 /// be tagged with to be found during unpack, it is self-describing, and it
 /// avoids having to agree with a generation id that is assigned later, on a
 /// different write, in a different store.
-#[derive(Clone, Serialize, Deserialize)]
+///
+/// Wiped from memory when dropped, like [`ServerSecrets`].
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct RetiredKeys {
     /// The `keyAgreement` verification-method id this generation's DID document
     /// advertised. Inbound JWEs from peers with a stale document are addressed
@@ -149,7 +156,9 @@ impl std::fmt::Debug for ServerSecrets {
 /// ```json
 /// { "secrets": { ... } | absent, "bootstrap_seed": "base64url..." | absent }
 /// ```
-#[derive(Default, Clone, Serialize, Deserialize)]
+///
+/// The keys and the seed are wiped from memory when the value is dropped.
+#[derive(Default, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct StoredSecrets {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<ServerSecrets>,
@@ -159,6 +168,7 @@ pub struct StoredSecrets {
     /// the envelope (a rotation, an expiry sweep) never drops what a newer
     /// release stored in it.
     #[serde(flatten)]
+    #[zeroize(skip)]
     pub other: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -187,8 +197,10 @@ impl StoredSecrets {
         })
     }
 
-    fn to_bytes(&self) -> Result<Vec<u8>, AppError> {
+    /// The serialised envelope, wiped from memory once written.
+    fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>, AppError> {
         serde_json::to_vec(self)
+            .map(Zeroizing::new)
             .map_err(|e| AppError::SecretStore(format!("failed to serialise secrets: {e}")))
     }
 
@@ -320,7 +332,7 @@ impl EnvelopeStore {
 
     async fn load(&self) -> Result<StoredSecrets, AppError> {
         match self.inner.get().await.map_err(from_vti)? {
-            Some(bytes) => StoredSecrets::from_bytes(&bytes),
+            Some(bytes) => StoredSecrets::from_bytes(&Zeroizing::new(bytes)),
             None => Ok(StoredSecrets::default()),
         }
     }
@@ -366,7 +378,7 @@ impl EnvelopeStore {
 
 impl SecretStore for EnvelopeStore {
     fn get(&self) -> BoxFuture<'_, Result<Option<ServerSecrets>, AppError>> {
-        Box::pin(async move { Ok(self.load().await?.secrets) })
+        Box::pin(async move { Ok(self.load().await?.secrets.take()) })
     }
 
     fn set(&self, secrets: &ServerSecrets) -> BoxFuture<'_, Result<(), AppError>> {

@@ -91,6 +91,10 @@ rand = "0.10"
 ed25519-dalek = "3"
 multibase = "0.9"
 sha2 = "0.11"
+# Already in the lock through the Affinidi stack (affinidi-secrets-resolver
+# derives `ZeroizeOnDrop` on its `Secret`); used directly to wipe the
+# service's own key material when it is dropped.
+zeroize = { version = "1.8", features = ["derive"] }
 
 # JWT — still deliberately held at 10, but the reason has changed and the old
 # one no longer applies. It used to be that `trust-tasks-https`'s `jwt` feature

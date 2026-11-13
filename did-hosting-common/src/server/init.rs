@@ -25,7 +25,7 @@ pub fn decode_multibase_ed25519_key(multibase_key: &str) -> Result<[u8; 32], App
 /// Returns `None` (with a warning) if the key cannot be decoded or constructed.
 pub fn init_jwt_keys(secrets: &ServerSecrets) -> Option<Arc<JwtKeys>> {
     match decode_multibase_ed25519_key(&secrets.jwt_signing_key) {
-        Ok(key_bytes) => match JwtKeys::from_ed25519_bytes(&key_bytes) {
+        Ok(key_bytes) => match JwtKeys::from_ed25519_bytes(&zeroize::Zeroizing::new(key_bytes)) {
             Ok(keys) => {
                 debug!("JWT signing key loaded");
                 Some(Arc::new(keys))

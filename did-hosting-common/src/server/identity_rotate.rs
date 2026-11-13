@@ -470,11 +470,16 @@ pub async fn rotate_keys(
             signing_key: secrets.signing_key.clone(),
         });
     }
+    // `replace` rather than assignment, so the outgoing copy is wiped here
+    // instead of being freed with its bytes intact.
     if let Some(private) = new_ka_private {
-        secrets.key_agreement_key = private;
+        zeroize::Zeroize::zeroize(&mut std::mem::replace(
+            &mut secrets.key_agreement_key,
+            private,
+        ));
     }
     if let Some(private) = new_signing_private {
-        secrets.signing_key = private;
+        zeroize::Zeroize::zeroize(&mut std::mem::replace(&mut secrets.signing_key, private));
     }
     secret_store.set(&secrets).await?;
 

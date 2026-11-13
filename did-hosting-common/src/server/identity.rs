@@ -268,6 +268,18 @@ impl ServiceIdentity {
         self.live.read().expect("identity lock").secrets.clone()
     }
 
+    /// The live secret with key id `kid`, if any — one copy rather than
+    /// every live key, for a caller that signs with a single key.
+    pub fn secret(&self, kid: &str) -> Option<Secret> {
+        self.live
+            .read()
+            .expect("identity lock")
+            .secrets
+            .iter()
+            .find(|s| s.id == kid)
+            .cloned()
+    }
+
     /// The union of every live generation's protocols.
     ///
     /// A generation retiring out of DIDComm while the current one is TSP-only

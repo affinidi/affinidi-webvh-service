@@ -87,7 +87,6 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
         stats_collector: Arc::new(StatsCollector::new()),
         stats_ks: stats_ks.clone(),
         timeseries_ks: store.keyspace(KS_TIMESERIES).expect("timeseries ks"),
-        signing_key_bytes: None,
         unlisted_signers: Default::default(),
         replay_cache: Arc::new(did_hosting_control::replay::ReplayCache::new()),
         path_locks: did_hosting_control::path_locks::PathLocks::new(),
