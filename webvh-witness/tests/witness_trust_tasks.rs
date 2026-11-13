@@ -936,3 +936,377 @@ async fn sign_refuses_a_fork_or_a_rollback_of_what_it_witnessed() {
         3
     );
 }
+
+// ---------------------------------------------------------------------------
+// A `service` entry may request signatures and nothing else
+// ---------------------------------------------------------------------------
+
+fn service_caller() -> (String, Secret) {
+    signer(64)
+}
+
+async fn add_service_entry(state: &AppState) {
+    store_acl_entry(
+        &state.acl_ks,
+        &AclEntry {
+            did: service_caller().0,
+            role: Role::Service,
+            label: None,
+            created_at: 1_700_000_000,
+            max_total_size: None,
+            max_did_count: None,
+            domains: DomainScope::All,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// A `service` caller has the witness sign, on every transport.
+#[tokio::test]
+async fn a_service_entry_may_request_a_signature() {
+    for via in VIAS {
+        let (state, _dir) = witness_state().await;
+        add_service_entry(&state).await;
+        let (record, log) = identity_and_log(&state).await;
+        let svc = service_caller();
+        let reply = deliver(
+            &state,
+            via,
+            &svc.0,
+            signed(
+                sign::Payload::TYPE_URI,
+                &svc,
+                sign_payload(&record.witness_id, &log),
+            )
+            .await,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(
+            reply["type"],
+            format!("{}#response", sign::Payload::TYPE_URI),
+            "{via:?}: {reply}"
+        );
+        signed_by_the_witness(&reply, &svc.0);
+        assert!(reply["payload"]["proof"].is_object(), "{reply}");
+    }
+}
+
+/// A `service` caller cannot create, list or delete witness identities (no
+/// reply: refused before its proof is checked), nor grant, revoke another's
+/// entry, or change a role (a signed `permissionDenied`). Nothing changes.
+#[tokio::test]
+async fn a_service_entry_cannot_administer_keys_or_the_acl() {
+    use did_hosting_common::tasks::acl::{change_role, grant, revoke};
+    for via in VIAS {
+        let (state, _dir) = witness_state().await;
+        add_service_entry(&state).await;
+        let (record, _log) = identity_and_log(&state).await;
+        let svc = service_caller();
+        let before = snapshot(&state).await;
+
+        for (type_uri, payload) in [
+            (key_create::Payload::TYPE_URI, json!({})),
+            (key_list::Payload::TYPE_URI, json!({})),
+            (
+                key_delete::Payload::TYPE_URI,
+                json!({ "witnessId": record.witness_id }),
+            ),
+        ] {
+            assert_eq!(
+                deliver(&state, via, &svc.0, signed(type_uri, &svc, payload).await).await,
+                None,
+                "{via:?} {type_uri}: a service entry must not be answered"
+            );
+        }
+
+        let subject = signer(80 + via as u8).0;
+        for (type_uri, payload) in [
+            (
+                grant::v0_2::Payload::TYPE_URI,
+                json!({ "entry": {
+                    "subject": subject,
+                    "role": "admin",
+                    "act": { "scope": "all" },
+                    "keys": { "scope": "all" },
+                    "capabilities": { "scope": "ceiling" },
+                } }),
+            ),
+            (
+                revoke::v0_2::Payload::TYPE_URI,
+                json!({
+                    "subject": admin().0,
+                    "revocation": { "kind": "entry" },
+                    "reason": "test",
+                }),
+            ),
+            (
+                change_role::v0_2::Payload::TYPE_URI,
+                json!({
+                    "subject": svc.0,
+                    "fromRole": "service",
+                    "toRole": "admin",
+                    "reason": "test",
+                }),
+            ),
+        ] {
+            let reply = deliver(&state, via, &svc.0, signed(type_uri, &svc, payload).await)
+                .await
+                .unwrap_or_else(|| panic!("{via:?} {type_uri}: refused with a reply"));
+            assert_eq!(
+                refused(&reply, &svc.0),
+                "permissionDenied",
+                "{via:?} {type_uri}: {reply}"
+            );
+        }
+
+        assert_eq!(
+            snapshot(&state).await,
+            before,
+            "{via:?}: no identity changed"
+        );
+        let acl = |did: String| {
+            let ks = state.acl_ks.clone();
+            async move {
+                did_hosting_common::server::acl::get_acl_entry(&ks, &did)
+                    .await
+                    .unwrap()
+                    .map(|e| e.role)
+            }
+        };
+        assert_eq!(acl(subject).await, None, "{via:?}");
+        assert_eq!(acl(admin().0).await, Some(Role::Admin), "{via:?}");
+        assert_eq!(acl(svc.0.clone()).await, Some(Role::Service), "{via:?}");
+    }
+}
+
+/// On a witness a `service` entry states that it may have any key used
+/// (`keys: all`), and a grant of one must say so.
+#[tokio::test]
+async fn a_witness_service_entry_states_every_key() {
+    use did_hosting_common::tasks::acl::grant;
+    let (state, _dir) = witness_state().await;
+    let a = admin();
+    let entry = |subject: &str, keys: &str| {
+        json!({ "entry": {
+            "subject": subject,
+            "role": "service",
+            "act": { "scope": "all" },
+            "keys": { "scope": keys },
+            "capabilities": { "scope": "ceiling" },
+        } })
+    };
+
+    let refused_subject = signer(90).0;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(
+            grant::v0_2::Payload::TYPE_URI,
+            &a,
+            entry(&refused_subject, "none"),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(refused(&reply, &a.0), "taskFailed", "{reply}");
+    assert_eq!(
+        reply["payload"]["details"]["reason"], "notSupportedByMaintainer",
+        "a service entry with no keys is not what the witness holds: {reply}"
+    );
+
+    let subject = signer(91).0;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(grant::v0_2::Payload::TYPE_URI, &a, entry(&subject, "all")).await,
+    )
+    .await
+    .expect("answered");
+    let payload = answered(&reply, grant::v0_2::Payload::TYPE_URI);
+    assert_eq!(payload["entry"]["keys"]["scope"], "all", "{payload}");
+
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(
+            acl_show::v0_2::Payload::TYPE_URI,
+            &a,
+            json!({ "subject": subject }),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    let payload = answered(&reply, acl_show::v0_2::Payload::TYPE_URI);
+    assert_eq!(payload["entry"]["keys"]["scope"], "all", "{payload}");
+    assert_eq!(payload["entry"]["role"], "service", "{payload}");
+}
+
+/// A grant on a witness stating a key list is refused: the witness holds
+/// `all` or `none`, never a list.
+#[tokio::test]
+async fn a_witness_grant_with_listed_keys_is_refused() {
+    use did_hosting_common::tasks::acl::grant;
+    let (state, _dir) = witness_state().await;
+    let a = admin();
+    let subject = signer(92).0;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(
+            grant::v0_2::Payload::TYPE_URI,
+            &a,
+            json!({ "entry": {
+                "subject": subject,
+                "role": "service",
+                "act": { "scope": "all" },
+                "keys": { "scope": "listed", "keys": ["z6MkSomeWitnessKey"] },
+                "capabilities": { "scope": "ceiling" },
+            } }),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(refused(&reply, &a.0), "taskFailed", "{reply}");
+    assert!(
+        did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &subject)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// The migration path for an existing caller: an admin moves it from
+/// `admin` to `service`, and it can still request signatures but no longer
+/// administer the witness.
+#[tokio::test]
+async fn an_admin_moved_to_service_still_signs_and_no_longer_administers() {
+    use did_hosting_common::tasks::acl::change_role;
+    let (state, _dir) = witness_state().await;
+    let caller = service_caller();
+    store_acl_entry(
+        &state.acl_ks,
+        &AclEntry {
+            did: caller.0.clone(),
+            role: Role::Admin,
+            label: None,
+            created_at: 1_700_000_000,
+            max_total_size: None,
+            max_did_count: None,
+            domains: DomainScope::All,
+        },
+    )
+    .await
+    .unwrap();
+    let a = admin();
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(
+            change_role::v0_2::Payload::TYPE_URI,
+            &a,
+            json!({
+                "subject": caller.0,
+                "fromRole": "admin",
+                "toRole": "service",
+                "reason": "signatures only",
+            }),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    answered(&reply, change_role::v0_2::Payload::TYPE_URI);
+
+    let (record, log) = identity_and_log(&state).await;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &caller.0,
+        signed(
+            sign::Payload::TYPE_URI,
+            &caller,
+            sign_payload(&record.witness_id, &log),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        reply["type"],
+        format!("{}#response", sign::Payload::TYPE_URI),
+        "{reply}"
+    );
+    assert_eq!(
+        deliver(
+            &state,
+            Via::Https,
+            &caller.0,
+            signed(
+                key_delete::Payload::TYPE_URI,
+                &caller,
+                json!({ "witnessId": record.witness_id }),
+            )
+            .await,
+        )
+        .await,
+        None
+    );
+}
+
+/// A `service` caller may read its own entry but not list the ACL or read
+/// another member's entry.
+#[tokio::test]
+async fn a_service_entry_cannot_read_the_acl() {
+    let (state, _dir) = witness_state().await;
+    add_service_entry(&state).await;
+    let svc = service_caller();
+    for (type_uri, payload) in [
+        (acl_list::v0_3::Payload::TYPE_URI, json!({})),
+        (
+            acl_show::v0_2::Payload::TYPE_URI,
+            json!({ "subject": admin().0 }),
+        ),
+    ] {
+        let reply = deliver(
+            &state,
+            Via::Https,
+            &svc.0,
+            signed(type_uri, &svc, payload).await,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(
+            refused(&reply, &svc.0),
+            "permissionDenied",
+            "{type_uri}: {reply}"
+        );
+    }
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &svc.0,
+        signed(
+            acl_show::v0_2::Payload::TYPE_URI,
+            &svc,
+            json!({ "subject": svc.0 }),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        reply["type"],
+        format!("{}#response", acl_show::v0_2::Payload::TYPE_URI),
+        "{reply}"
+    );
+}

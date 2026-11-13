@@ -145,7 +145,7 @@ rather than to the proxy.
 ```
 webvh-witness                                  # Run witness (default)
 webvh-witness setup                            # Interactive config wizard
-webvh-witness add-acl --did <DID> [--role admin|owner]  # Add ACL entry
+webvh-witness add-acl --did <DID> --role admin|service  # Add ACL entry
 webvh-witness list-acl                         # List ACL entries
 webvh-witness create-witness [--label <name>]  # Create witness identity
 webvh-witness list-witnesses                   # List witness identities
@@ -234,8 +234,27 @@ every transport:
 | `webvh/witness/key/create/0.1` | an Admin |
 | `webvh/witness/key/list/0.1` | an Admin |
 | `webvh/witness/key/delete/0.1` | an Admin |
-| `webvh/witness/sign/0.1` | an Admin |
-| `acl/grant\|revoke\|change-role\|show\|list/0.1` | per the ACL family's rules |
+| `webvh/witness/sign/0.1` | an Admin or a Service |
+| `acl/grant\|revoke\|change-role\|show/0.2`, `acl/list/0.3` | an Admin; any member may also show or revoke its own entry |
+
+Enter a caller that only needs proofs — a control plane, a VTA, an edge
+bootstrapping its DID — with role `service`: it can request signatures with
+any of the witness's identities (its ACL entry states `keys: all`) and
+cannot create or delete identities or change the ACL. Keep `admin` for the
+operators who manage the witness. An `owner` or `metricsReader` entry can do
+nothing on a witness, and `add-acl` accepts only `admin` and `service`.
+
+In `did-hosting-daemon` the embedded witness's ACL is kept in
+`[witness_store]`, apart from the control plane's. Add the first entry with
+`did-hosting-daemon add-acl --witness --did <DID> --role admin|service` (and
+list it with `list-acl --witness`); after that the ACL Trust Tasks on
+`/witness/api/trust-tasks` manage it. There is no daemon CLI to remove a
+witness entry; use `acl/revoke`. The daemon refuses to start if `[witness_store]`
+reaches the same data as `[store]`, since the witness would then share the
+control plane's ACL. It checks by writing a probe value through `[store]` and
+looking for it through `[witness_store]`, so any spelling of the same Redis
+database, DynamoDB prefix and region, or Firestore or Cosmos DB database is
+caught. The CHANGELOG describes how to move a deployment that shares one.
 
 `webvh/witness/sign` carries the DID log up to and including the entry to
 witness, and the witness verifies it before signing: the chain must verify,

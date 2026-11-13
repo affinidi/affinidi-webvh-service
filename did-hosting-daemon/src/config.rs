@@ -157,6 +157,54 @@ impl Default for EnableConfig {
     }
 }
 
+/// The reserved key prefix [`witness_store_shares_main_data`] writes under,
+/// in the ACL keyspace. ACL entries are read under `acl:` only, so a probe is
+/// never taken for an entry.
+pub const STORE_PROBE_PREFIX: &str = "store-probe:";
+
+/// Whether `witness` reads the same data as `main`, found by trying it: a
+/// random value is written under a reserved key in `main`'s ACL keyspace and
+/// looked for through `witness`'s, then removed (on every path). The witness
+/// and the control plane both keep their ACL in that keyspace, so a hit means
+/// the embedded witness would share the control plane's ACL. Comparing the two
+/// configs instead would miss spellings that name the same data (a Redis URL
+/// with and without its default port, a region from the environment, two
+/// paths to one directory).
+pub async fn witness_store_shares_main_data(
+    main: &did_hosting_common::server::store::Store,
+    witness: &did_hosting_common::server::store::Store,
+) -> Result<bool, AppError> {
+    use did_hosting_common::server::store::KS_ACL;
+    let main_acl = main.keyspace_consistent(KS_ACL)?;
+    let witness_acl = witness.keyspace_consistent(KS_ACL)?;
+    // A fresh random value: the public half of a throwaway Ed25519 key.
+    let nonce = affinidi_tdk::secrets_resolver::secrets::Secret::generate_ed25519(None, None)
+        .get_public_keymultibase()
+        .map_err(|e| AppError::Internal(format!("cannot make a probe value: {e}")))?;
+    let key = format!("{STORE_PROBE_PREFIX}{nonce}");
+    main_acl
+        .insert_raw(key.clone(), nonce.clone().into_bytes())
+        .await?;
+    let seen = witness_acl.get_raw(key.clone()).await;
+    let removed = main_acl.remove(key).await;
+    let seen = seen?;
+    removed?;
+    Ok(seen.as_deref() == Some(nonce.as_bytes()))
+}
+
+/// The refusal when [`witness_store_shares_main_data`] finds the stores
+/// shared.
+pub fn shared_witness_store_refusal() -> String {
+    "[witness_store] reaches the same data as [store], so the embedded witness would share \
+     the control plane's ACL, and every `service` entry there (each registered edge) could \
+     have the witness sign. Give [witness_store] its own data: a different `data_dir`, Redis \
+     database or server, `dynamodb_table_prefix` (for example \"webvh-witness\"), \
+     `firestore_database` or `cosmosdb_database`. To keep the witness identities and its \
+     ACL, copy the `witnesses` and `acl` keyspaces into the new location first (see the \
+     CHANGELOG)."
+        .to_string()
+}
+
 impl DaemonConfig {
     pub fn load(config_path: Option<PathBuf>) -> Result<Self, AppError> {
         let path = config_path
@@ -366,6 +414,56 @@ impl DaemonConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn open(dir: &std::path::Path) -> did_hosting_common::server::store::Store {
+        did_hosting_common::server::store::Store::open(&StoreConfig {
+            data_dir: dir.to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// One store reached through both handles (what any spelling of the
+    /// same Redis URL, DynamoDB prefix and region, or database gives) is
+    /// found shared; two stores are not; the probe leaves nothing behind.
+    #[tokio::test]
+    async fn a_witness_store_reaching_the_main_data_is_found_by_trying_it() {
+        use did_hosting_common::server::store::KS_ACL;
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let main = open(a.path()).await;
+        let witness = open(b.path()).await;
+
+        assert!(witness_store_shares_main_data(&main, &main).await.unwrap());
+        assert!(
+            !witness_store_shares_main_data(&main, &witness)
+                .await
+                .unwrap()
+        );
+        // A handle cloned from the main store is the same data too.
+        assert!(
+            witness_store_shares_main_data(&main, &main.clone())
+                .await
+                .unwrap()
+        );
+
+        for store in [&main, &witness] {
+            let left = store
+                .keyspace(KS_ACL)
+                .unwrap()
+                .prefix_iter_raw(STORE_PROBE_PREFIX)
+                .await
+                .unwrap();
+            assert!(left.is_empty(), "probe removed");
+        }
+    }
+
+    /// The default layout gives the witness its own directory.
+    #[test]
+    fn the_default_daemon_layout_keeps_the_witness_store_separate() {
+        assert_ne!(default_store().data_dir, default_witness_store().data_dir);
+    }
     use std::io::Write;
 
     /// Minimal self-managed config: `[identity] mode = "self-managed"`,

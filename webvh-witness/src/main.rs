@@ -62,8 +62,12 @@ enum Command {
         /// DID to grant access to
         #[arg(long)]
         did: String,
-        /// Role: admin or owner
-        #[arg(long, default_value = "owner")]
+        /// Role, required: `admin` (create, list and delete witness
+        /// identities, administer this ACL, and request signatures) or
+        /// `service` (request signatures only: for a control plane, VTA or
+        /// edge that needs proofs). No other role can do anything on a
+        /// witness, so no other is accepted.
+        #[arg(long, value_parser = ["admin", "service"])]
         role: String,
     },
     /// List all access control entries
@@ -814,4 +818,48 @@ fn print_banner() {
 "#,
         version = env!("CARGO_PKG_VERSION"),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_acl_takes_only_a_role_that_does_something_on_a_witness() {
+        for role in ["admin", "service"] {
+            assert!(
+                Cli::try_parse_from([
+                    "webvh-witness",
+                    "add-acl",
+                    "--did",
+                    "did:key:z",
+                    "--role",
+                    role
+                ])
+                .is_ok(),
+                "{role}"
+            );
+        }
+        for args in [
+            vec!["webvh-witness", "add-acl", "--did", "did:key:z"],
+            vec![
+                "webvh-witness",
+                "add-acl",
+                "--did",
+                "did:key:z",
+                "--role",
+                "owner",
+            ],
+            vec![
+                "webvh-witness",
+                "add-acl",
+                "--did",
+                "did:key:z",
+                "--role",
+                "metricsReader",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+        }
+    }
 }
