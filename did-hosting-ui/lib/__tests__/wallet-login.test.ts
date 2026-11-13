@@ -97,7 +97,7 @@ describe("wallet proxy login", () => {
       return new Response(JSON.stringify(OK), { status: 200 });
     }) as unknown as typeof fetch;
 
-    const { response } = await authenticateIdTokenBindingSessionKey(API, ARGS, fetchFn);
+    const response = await authenticateIdTokenBindingSessionKey(API, ARGS, fetchFn);
 
     expect(fetchFn).toHaveBeenCalledWith(`${API}/trust-tasks`, expect.anything());
     expect(sent!.type).toBe("https://trusttasks.org/spec/auth/authenticate/0.3");

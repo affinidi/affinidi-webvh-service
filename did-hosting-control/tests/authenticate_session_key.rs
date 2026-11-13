@@ -439,6 +439,159 @@ async fn the_session_key_cannot_approve_a_step_up() {
     );
 }
 
+/// The console's step-up for a wallet session, with no token leaving it: the
+/// session key opens the step-up for its own session, the subject's own key
+/// signs the decision over the approve-request that came back, and the
+/// session key renews the session at the raised level with the refresh token
+/// the console holds. The wallet's only input is the signed approve-request.
+#[tokio::test]
+async fn the_session_key_opens_a_step_up_that_the_subject_alone_approves() {
+    let h = harness().await;
+    let (alice, browser) = (key(23), key(24));
+    h.add_acl(&alice.did, Role::Admin).await;
+    let (token, body) = login(&h, &alice, Some(&browser)).await;
+    let session_id = body["payload"]["session"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let refresh_token = body["payload"]["tokens"]["refreshToken"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 1. The session key, for the subject, opens the step-up.
+    let d = sign(
+        doc(
+            "auth/step-up/start/0.2",
+            &alice.did,
+            json!({ "sessionId": session_id }),
+        ),
+        &browser,
+        "authentication",
+    )
+    .await;
+    let (status, body) = post(&h, Some(&token), &d).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let request = body["payload"]["approveRequest"].clone();
+    assert_eq!(
+        request["type"],
+        format!("{TT}auth/step-up/approve-request/0.5")
+    );
+    assert_eq!(request["issuer"], CONTROL);
+    assert_eq!(request["recipient"], alice.did);
+    assert_eq!(request["payload"]["subject"], alice.did);
+    assert_eq!(request["payload"]["sessionId"], session_id);
+    assert!(request["proof"].is_object(), "{request}");
+    let challenge = request["payload"]["challenge"].as_str().unwrap();
+
+    // 2. The subject's own key answers that approve-request.
+    let decision = json!({
+        "subject": alice.did,
+        "sessionId": session_id,
+        "challenge": challenge,
+        "decision": "approved",
+    });
+    let d = sign(
+        doc("auth/step-up/approve-response/0.7", &alice.did, decision),
+        &alice,
+        "assertionMethod",
+    )
+    .await;
+    let (status, body) = post(&h, Some(&token), &d).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["payload"]["status"], "elevated", "{body}");
+
+    // 3. The session key renews the session at the raised level.
+    let d = sign(
+        doc(
+            "auth/refresh/0.2",
+            &browser.did,
+            json!({ "refreshToken": refresh_token }),
+        ),
+        &browser,
+        "authentication",
+    )
+    .await;
+    let (status, body) = post(&h, None, &d).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["payload"]["session"]["acr"], "aal2", "{body}");
+    let access = body["payload"]["tokens"]["accessToken"].as_str().unwrap();
+    let claims = h.state.jwt_keys.as_deref().unwrap().decode(access).unwrap();
+    assert_eq!(claims.acr, "aal2");
+}
+
+/// The approve-request the session key obtains is answered by the subject
+/// only: another member's decision sent in the session is refused before it
+/// can use the challenge up.
+#[tokio::test]
+async fn a_step_up_the_session_key_opened_is_approved_by_its_subject_only() {
+    let h = harness().await;
+    let (alice, browser, mallory) = (key(25), key(26), key(27));
+    h.add_acl(&alice.did, Role::Admin).await;
+    h.add_acl(&mallory.did, Role::Admin).await;
+    let (token, body) = login(&h, &alice, Some(&browser)).await;
+    let session_id = body["payload"]["session"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let d = sign(
+        doc(
+            "auth/step-up/start/0.2",
+            &alice.did,
+            json!({ "sessionId": session_id }),
+        ),
+        &browser,
+        "authentication",
+    )
+    .await;
+    let (status, body) = post(&h, Some(&token), &d).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let challenge = body["payload"]["approveRequest"]["payload"]["challenge"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let decision = |subject: &str| {
+        json!({
+            "subject": subject,
+            "sessionId": session_id,
+            "challenge": challenge,
+            "decision": "approved",
+        })
+    };
+
+    // Another member's decision, as themselves, in this session: refused at
+    // the proof gate, before the pending step-up is looked at.
+    let d = sign(
+        doc(
+            "auth/step-up/approve-response/0.7",
+            &mallory.did,
+            decision(&alice.did),
+        ),
+        &mallory,
+        "assertionMethod",
+    )
+    .await;
+    let (status, body) = post(&h, Some(&token), &d).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(code(&body), "proofInvalid", "{body}");
+
+    // So the subject's own decision still finds the challenge.
+    let d = sign(
+        doc(
+            "auth/step-up/approve-response/0.7",
+            &alice.did,
+            decision(&alice.did),
+        ),
+        &alice,
+        "assertionMethod",
+    )
+    .await;
+    let (status, body) = post(&h, Some(&token), &d).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["payload"]["status"], "elevated", "{body}");
+}
+
 #[tokio::test]
 async fn the_session_key_cannot_mint_or_refresh_a_session() {
     let h = harness().await;

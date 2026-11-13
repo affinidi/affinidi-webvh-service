@@ -31,7 +31,6 @@ import {
   loginWithWallet,
   loginWithWalletProxy,
   resolveProxyEntry,
-  type ProxyLoginViz,
   type ProxyVaultEntry,
 } from "../lib/wallet";
 
@@ -86,22 +85,6 @@ export default function Login() {
     ProxyVaultEntry[] | null
   >(null);
   const [proxyPicking, setProxyPicking] = useState(false);
-  const [proxyViz, setProxyViz] = useState<ProxyLoginViz | null>(null);
-  // Opt-in flow visualization. Off by default — the visualization is
-  // a demo aid, not the everyday auth UX. Persists across reloads so
-  // a presenter can flip it on once for a session. Stored as a string
-  // (`"1"` / `"0"`) to keep the JSON.parse boundary trivial.
-  const VIZ_PREF_KEY = "didhosting:proxyLoginViz";
-  const [showProxyViz, setShowProxyViz] = useState<boolean>(() => {
-    if (typeof window === "undefined") return false;
-    return window.localStorage.getItem(VIZ_PREF_KEY) === "1";
-  });
-  const toggleShowProxyViz = (next: boolean) => {
-    setShowProxyViz(next);
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem(VIZ_PREF_KEY, next ? "1" : "0");
-    }
-  };
 
   // Fetch the server's own DID so the operator can see it on the
   // login page — they need it when granting wallet access (the DID
@@ -195,7 +178,6 @@ export default function Login() {
   const handleProxyLoginStart = async () => {
     setProxyLoading(true);
     setProxyError(null);
-    setProxyViz(null);
     try {
       const { entry, bound } = await resolveProxyEntry();
       await runProxyLogin(entry, bound);
@@ -214,7 +196,6 @@ export default function Login() {
   const handleChooseIdentity = async () => {
     setProxyLoading(true);
     setProxyError(null);
-    setProxyViz(null);
     try {
       const candidates = await listProxyCandidates();
       if (candidates.length === 0) {
@@ -241,22 +222,14 @@ export default function Login() {
     setProxyError(null);
     setProxyPicking(false);
     try {
-      const outcome = await loginWithWalletProxy(entry);
+      const result = await loginWithWalletProxy(entry);
       setAuthMethod("wallet");
       // The session is the entry's principal DID (the id_token's iss/sub),
       // and it is bound to the session key the login generated, which
       // signs as that principal from here on (`trust-task.ts`).
-      setRefreshToken(outcome.result.refreshToken || null);
-      login(outcome.result.accessToken);
-      // When the operator has enabled the flow visualization, stash
-      // it and let the modal hold the redirect. Otherwise (the
-      // default), go straight to the dashboard — the visualization
-      // is a demo aid, not the everyday UX.
-      if (showProxyViz) {
-        setProxyViz(outcome.viz);
-      } else {
-        router.replace("/");
-      }
+      setRefreshToken(result.refreshToken || null);
+      login(result.accessToken);
+      router.replace("/");
     } catch (err: any) {
       const base = err?.message || "VTA-proxied login failed.";
       // A persona bound a moment ago has never been seen by this RP, so its
@@ -272,24 +245,13 @@ export default function Login() {
     }
   };
 
-  // Redirect to the dashboard whenever auth state is "logged in" — UNLESS
-  // the proxy-login visualization modal is showing, in which case the
-  // user is mid-demo and the modal owns the "Continue" → redirect step.
-  //
-  // This used to be an `if (isAuthenticated) return <Authenticated />`
-  // early-return that rendered a holding-page card. That had two
-  // problems: (a) nothing in the app linked to it (the dashboard is
-  // where authenticated users belong), and (b) `runProxyLogin` calls
-  // `login()` BEFORE setting the viz state, so the holding page
-  // rendered first and the viz modal — which lives in the login
-  // form's return tree — never got to mount. Replacing with a
-  // useEffect makes the "viz first, dashboard second" ordering work
-  // and eliminates the dead screen.
+  // Redirect to the dashboard whenever auth state is "logged in": the
+  // dashboard is where authenticated users belong.
   useEffect(() => {
-    if (isAuthenticated && !proxyViz) {
+    if (isAuthenticated) {
       router.replace("/");
     }
-  }, [isAuthenticated, proxyViz, router]);
+  }, [isAuthenticated, router]);
 
   return (
     <View style={styles.container}>
@@ -450,17 +412,6 @@ export default function Login() {
               entry's long-term signing key never leaves the VTA — the
               page only sees the short-lived id_token.
             </Text>
-            <Pressable
-              onPress={() => toggleShowProxyViz(!showProxyViz)}
-              style={styles.vizToggleRow}
-              accessibilityRole="checkbox"
-              accessibilityState={{ checked: showProxyViz }}
-            >
-              <Text style={styles.vizToggleBox}>{showProxyViz ? "☑" : "☐"}</Text>
-              <Text style={styles.vizToggleLabel}>
-                Show flow visualization (demo)
-              </Text>
-            </Pressable>
             {proxyError && <Text style={styles.errorText}>{proxyError}</Text>}
           </>
         )}
@@ -484,13 +435,6 @@ export default function Login() {
           candidates={proxyCandidates}
           onCancel={() => setProxyPicking(false)}
           onPick={(entry) => void runProxyLogin(entry)}
-        />
-      )}
-
-      {proxyViz && (
-        <ProxyLoginVisualization
-          viz={proxyViz}
-          onContinue={() => router.replace("/")}
         />
       )}
     </View>
@@ -531,73 +475,6 @@ function ProxyCandidatePicker({
         ))}
         <Pressable style={styles.dangerButton} onPress={onCancel}>
           <Text style={styles.dangerButtonText}>Cancel</Text>
-        </Pressable>
-      </View>
-    </View>
-  );
-}
-
-// ─── M2B.4 visualization ───
-// Shows the user what just happened: timeline of the three round-trips
-// (RP /auth/challenge → VTA proxy-login → RP /auth/), the decoded SIOP
-// id_token claims, the SessionBlob summary, total elapsed time. The
-// "Continue" button drives the redirect into the authenticated app.
-function ProxyLoginVisualization({
-  viz,
-  onContinue,
-}: {
-  viz: ProxyLoginViz;
-  onContinue: () => void;
-}) {
-  return (
-    <View style={styles.modalBackdrop}>
-      <View style={[styles.card, { maxWidth: 720, maxHeight: "90%" }]}>
-        <Text style={styles.title}>VTA-proxied login flow</Text>
-        <Text style={styles.hint}>
-          Authenticated in {viz.totalMs} ms. The long-term signing key for{" "}
-          <Text style={styles.mono}>{viz.chosenEntry.principalDid}</Text>{" "}
-          never left the VTA — the wallet only ever saw the short-lived id_token.
-        </Text>
-
-        <View style={styles.vizScroll}>
-          {viz.steps.map((s, i) => (
-            <View key={i} style={styles.vizStep}>
-              <View style={styles.vizStepHeader}>
-                <Text style={styles.vizStepLabel}>{s.label}</Text>
-                <Text style={styles.vizStepDuration}>{s.durationMs} ms</Text>
-              </View>
-              <Text style={styles.vizStepDesc}>{s.description}</Text>
-            </View>
-          ))}
-          {viz.idToken && (
-            <View style={styles.vizStep}>
-              <Text style={styles.vizStepLabel}>SIOP id_token claims</Text>
-              <Text style={[styles.mono, styles.vizCodeBlock]}>
-                {JSON.stringify(viz.idToken.payload, null, 2)}
-              </Text>
-            </View>
-          )}
-          {viz.sessionBlob && (
-            <View style={styles.vizStep}>
-              <Text style={styles.vizStepLabel}>SessionBlob summary</Text>
-              <Text style={styles.vizStepDesc}>
-                sessionId: <Text style={styles.mono}>{viz.sessionBlob.sessionId}</Text>
-                {"\n"}expiresAt: <Text style={styles.mono}>{viz.sessionBlob.expiresAt}</Text>
-                {viz.sessionBlob.bindOrigin && (
-                  <>
-                    {"\n"}bindOrigin:{" "}
-                    <Text style={styles.mono}>{viz.sessionBlob.bindOrigin}</Text>
-                  </>
-                )}
-                {"\n"}{viz.sessionBlob.headerCount} header(s),{" "}
-                {viz.sessionBlob.cookieCount} cookie(s)
-              </Text>
-            </View>
-          )}
-        </View>
-
-        <Pressable style={styles.button} onPress={onContinue}>
-          <Text style={styles.buttonText}>Continue</Text>
         </Pressable>
       </View>
     </View>
@@ -784,27 +661,6 @@ const styles = StyleSheet.create({
     lineHeight: 19,
     marginBottom: spacing.sm,
   },
-  vizToggleRow: {
-    flexDirection: "row" as const,
-    alignItems: "center" as const,
-    gap: spacing.xs,
-    marginTop: -spacing.xs,
-    marginBottom: spacing.sm,
-  },
-  vizToggleBox: {
-    fontSize: 14,
-    color: colors.textSecondary,
-  },
-  vizToggleLabel: {
-    fontSize: 12,
-    fontFamily: fonts.regular,
-    color: colors.textTertiary,
-  },
-  mono: {
-    fontFamily: "ui-monospace, monospace",
-    fontSize: 12,
-    color: colors.textSecondary,
-  },
   modalBackdrop: {
     position: "absolute" as const,
     top: 0,
@@ -815,46 +671,5 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     padding: spacing.lg,
-  },
-  vizScroll: {
-    marginTop: spacing.md,
-    marginBottom: spacing.lg,
-    gap: spacing.md,
-  },
-  vizStep: {
-    padding: spacing.md,
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: colors.bgPrimary,
-    gap: spacing.xs,
-  },
-  vizStepHeader: {
-    flexDirection: "row" as const,
-    justifyContent: "space-between" as const,
-    alignItems: "center" as const,
-  },
-  vizStepLabel: {
-    fontFamily: fonts.semibold,
-    fontSize: 13,
-    color: colors.textPrimary,
-  },
-  vizStepDuration: {
-    fontSize: 11,
-    fontFamily: fonts.regular,
-    color: colors.textTertiary,
-  },
-  vizStepDesc: {
-    fontSize: 12,
-    fontFamily: fonts.regular,
-    color: colors.textSecondary,
-    lineHeight: 18,
-  },
-  vizCodeBlock: {
-    padding: spacing.sm,
-    backgroundColor: colors.bgSecondary,
-    borderRadius: radii.sm,
-    fontSize: 11,
-    lineHeight: 16,
   },
 });

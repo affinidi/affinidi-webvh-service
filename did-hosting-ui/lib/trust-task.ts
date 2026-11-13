@@ -440,7 +440,9 @@ async function sign(
   // `auth/authenticate/0.2`, a wallet proxy login through
   // `session_pubkey_b58btc` on `/auth/` — and the control plane accepts it as
   // the subject for that session only. It signs every call, with no wallet
-  // prompt. A step-up is not signed here: it goes to the wallet (`stepUpVta`).
+  // prompt. A step-up's decision is not signed here: the wallet signs it as
+  // the subject (`approveStepUpRequest`), since a session key may never sign
+  // an approval.
   //
   // The key is restored from IndexedDB after a reload. When it is gone, the
   // session ends and the user signs in again. There is deliberately no
@@ -531,6 +533,30 @@ async function sendOnce<Req, Resp>(
     anonymous: opts.anonymous,
     background: opts.background,
   });
+  checkReply(doc, reply, serviceDid);
+  return reply.payload;
+}
+
+/**
+ * Send a document someone else built and signed — the wallet's
+ * `approve-response`, signed as the session's subject — exactly as it is,
+ * and return the checked reply payload.
+ *
+ * Sent once, never re-issued: this side cannot re-sign it, and a bit-for-bit
+ * resend would be refused as a replay. The bearer goes with it as context
+ * only; the document's own proof is what the control plane authorises.
+ */
+export async function sendSignedTrustTask<Resp>(
+  doc: TrustTaskDocument<unknown>,
+): Promise<Resp> {
+  const { serviceDid } = await getServiceInfo();
+  if (doc.recipient !== serviceDid) {
+    throw new ApiError(
+      400,
+      `refused to send ${String(doc.type)}: it is addressed to ${String(doc.recipient)}, not this service`,
+    );
+  }
+  const reply = await post<Resp>(doc);
   checkReply(doc, reply, serviceDid);
   return reply.payload;
 }

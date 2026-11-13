@@ -673,69 +673,166 @@ describe("updateAcl (AclEntry 0.2: a grant never narrows)", () => {
 // ---------------------------------------------------------------------------
 
 describe("step-up (wallet session)", () => {
-  function stubWallet(stepUpVta = vi.fn()) {
+  const START = `${TT}auth/step-up/start/0.2`;
+  const APPROVE_REQUEST = `${TT}auth/step-up/approve-request/0.5`;
+  const APPROVE_RESPONSE = `${TT}auth/step-up/approve-response/0.7`;
+  const REFRESH = `${TT}auth/refresh/0.2`;
+  const CHALLENGE = "c".repeat(64);
+  const ELEVATED = tokenFor(SUBJECT, { session_id: "sess-1", acr: "aal2" });
+
+  /** The control plane's signed approve-request for `sess-1`. */
+  const approveRequest = (over: Doc = {}): Doc => ({
+    id: `urn:uuid:${crypto.randomUUID()}`,
+    type: APPROVE_REQUEST,
+    issuer: SERVICE_DID,
+    recipient: SUBJECT,
+    issuedAt: new Date().toISOString(),
+    payload: {
+      subject: SUBJECT,
+      sessionId: "sess-1",
+      challenge: CHALLENGE,
+      reason: "Elevate this session to aal2",
+      targetAcr: "aal2",
+      accepts: ["didSigned"],
+    },
+    proof: {
+      type: "DataIntegrityProof",
+      cryptosuite: "eddsa-jcs-2022",
+      verificationMethod: `${SERVICE_DID}#key-0`,
+      proofPurpose: "authentication",
+      proofValue: "zService",
+    },
+    ...over,
+  });
+
+  /** The wallet's signed decision over `request`. */
+  const approveResponse = (request: Doc, payload: Doc = {}): Doc => ({
+    id: `urn:uuid:${crypto.randomUUID()}`,
+    type: APPROVE_RESPONSE,
+    issuer: SUBJECT,
+    recipient: SERVICE_DID,
+    issuedAt: new Date().toISOString(),
+    payload: {
+      subject: request.payload.subject,
+      sessionId: request.payload.sessionId,
+      challenge: request.payload.challenge,
+      decision: "approved",
+      ...payload,
+    },
+    proof: {
+      type: "DataIntegrityProof",
+      cryptosuite: "eddsa-jcs-2022",
+      verificationMethod: `${SUBJECT}#key-1`,
+      proofPurpose: "assertionMethod",
+      proofValue: "zWallet",
+    },
+  });
+
+  function stubWallet<M>(approveStepUpRequest: M): M {
     vi.stubGlobal("window", {
       location: { origin: "https://console.example.com" },
       dispatchEvent: vi.fn(),
       vtaWallet: {
-        signTrustTask: async ({ envelope }: { envelope: Doc }) => ({
-          signedEnvelope: {
-            ...envelope,
-            proof: {
-              type: "DataIntegrityProof",
-              cryptosuite: "eddsa-jcs-2022",
-              verificationMethod: `${SUBJECT}#key-1`,
-              proofPurpose: "authentication",
-              proofValue: "zWallet",
-            },
-          },
-          holderDid: SUBJECT,
-        }),
-        stepUpVta,
+        signTrustTask: vi.fn(),
+        approveStepUpRequest,
       },
     });
-    return stepUpVta;
+    return approveStepUpRequest;
   }
 
-  it("steps up through the wallet when the purge asks for it, then purges", async () => {
+  /** A control plane that refuses the first `operation` with `refusal`,
+   *  runs the step-up, and answers the retried operation with `done`. */
+  function controlPlane(
+    operation: string,
+    refusal: Doc,
+    done: (req: Doc) => Doc,
+    over: { request?: Doc; ack?: Doc } = {},
+  ) {
+    let attempts = 0;
+    return installControlPlane((req) => {
+      switch (req.type) {
+        case operation:
+          return ++attempts === 1 ? refusal : done(req);
+        case START:
+          return seal(req, { approveRequest: over.request ?? approveRequest() });
+        case APPROVE_RESPONSE:
+          return seal(
+            req,
+            over.ack ?? {
+              status: "elevated",
+              session: {
+                id: "sess-1",
+                subject: SUBJECT,
+                issuedAt: "2026-01-01T00:00:00Z",
+                expiresAt: "2026-01-01T01:00:00Z",
+                acr: "aal2",
+              },
+            },
+          );
+        case REFRESH:
+          return seal(req, {
+            tokens: { accessToken: ELEVATED, refreshToken: "refresh-2", tokenType: "Bearer", expiresIn: 900 },
+          });
+        default:
+          return undefined;
+      }
+    });
+  }
+
+  const PURGE = `${DM}domain/purge/0.1`;
+  const purged = (req: Doc) => seal(req, { name: "old.example", purgedAt: "2026-01-01T00:00:00Z" });
+
+  it("opens the step-up with the session key, hands the wallet only the approve-request, and renews here", async () => {
     const store = stubStorage({
       webvh_token: TOKEN,
       webvh_refresh_token: "refresh-1",
       webvh_auth_method: "wallet",
     });
-    // The session key the wallet login bound signs the purge; only the
-    // step-up goes to the wallet.
-    await generateSessionKeypair();
-    const elevated = tokenFor(SUBJECT, { session_id: "sess-1", acr: "aal2" });
-    const stepUpVta = stubWallet(
-      vi.fn().mockResolvedValue({
-        accessToken: elevated,
-        refreshToken: "refresh-2",
-        sessionId: "sess-1",
-        holderDid: SUBJECT,
+    const { didKey } = await generateSessionKeypair();
+    let decision: Doc | undefined;
+    const approve = stubWallet(
+      vi.fn(async ({ approveRequest: request }: { approveRequest: Doc }) => {
+        decision = approveResponse(request);
+        return { approveResponse: decision };
       }),
     );
-    let purges = 0;
-    const sent = installControlPlane((req) =>
-      ++purges === 1
-        ? rejection("stepUpRequired")
-        : seal(req, { name: "old.example", purgedAt: "2026-01-01T00:00:00Z" }),
-    );
+    const sent = controlPlane(PURGE, rejection("stepUpRequired"), purged);
 
     await api.deleteDomain("old.example");
 
-    expect(stepUpVta).toHaveBeenCalledWith({
-      baseUrl: "https://console.example.com/api",
-      rpDid: SERVICE_DID,
-      accessToken: TOKEN,
-      refreshToken: "refresh-1",
-      sessionId: "sess-1",
-    });
-    expect(store.get("webvh_token")).toBe(elevated);
+    expect(tasks(sent).map((s) => s.doc.type)).toEqual([PURGE, START, APPROVE_RESPONSE, REFRESH, PURGE]);
+    const [, start, answer, refresh, retried] = tasks(sent);
+
+    // 1. The session key opens the step-up for its own session.
+    expect(start!.doc.payload).toEqual({ sessionId: "sess-1" });
+    expect(start!.doc.issuer).toBe(SUBJECT);
+    expect(start!.doc.proof.verificationMethod).toBe(`${didKey}#${didKey.slice("did:key:".length)}`);
+    expect(start!.bearer).toBe(`Bearer ${TOKEN}`);
+
+    // 2. The wallet gets the service's signed approve-request and nothing
+    //    else: no access token, no refresh token, no session id of its own.
+    expect(approve).toHaveBeenCalledTimes(1);
+    const params = approve.mock.calls[0]![0] as Record<string, unknown>;
+    expect(Object.keys(params).sort()).toEqual(["approveRequest", "rpDid"]);
+    expect(params.rpDid).toBe(SERVICE_DID);
+    expect((params.approveRequest as Doc).type).toBe(APPROVE_REQUEST);
+    const handed = JSON.stringify(params);
+    expect(handed).not.toContain(TOKEN);
+    expect(handed).not.toContain("refresh-1");
+
+    // 3. The wallet's decision is sent exactly as it signed it.
+    expect(answer!.doc).toEqual(decision);
+
+    // 4. The console renews with its own session key and refresh token.
+    expect(refresh!.doc.issuer).toBe(didKey);
+    expect(refresh!.doc.payload).toEqual({ refreshToken: "refresh-1" });
+    expect(refresh!.doc.proof.verificationMethod).toBe(`${didKey}#${didKey.slice("did:key:".length)}`);
+    expect(refresh!.bearer).toBeUndefined();
+
+    expect(store.get("webvh_token")).toBe(ELEVATED);
     expect(store.get("webvh_refresh_token")).toBe("refresh-2");
-    expect(tasks(sent)).toHaveLength(2);
     // The retried purge carries the stepped-up session.
-    expect(tasks(sent)[1]!.bearer).toBe(`Bearer ${elevated}`);
+    expect(retried!.bearer).toBe(`Bearer ${ELEVATED}`);
   });
 
   it("steps up when an invite is refused as step_up_required, then issues it", async () => {
@@ -745,63 +842,113 @@ describe("step-up (wallet session)", () => {
       webvh_auth_method: "wallet",
     });
     await generateSessionKeypair();
-    const elevated = tokenFor(SUBJECT, { session_id: "sess-1", acr: "aal2" });
-    const stepUpVta = stubWallet(
-      vi.fn().mockResolvedValue({
-        accessToken: elevated,
-        refreshToken: "refresh-2",
-        sessionId: "sess-1",
-        holderDid: SUBJECT,
-      }),
+    const approve = stubWallet(
+      vi.fn(async ({ approveRequest: request }: { approveRequest: Doc }) => ({
+        approveResponse: approveResponse(request),
+      })),
     );
-    let invites = 0;
-    const sent = installControlPlane((req) =>
-      ++invites === 1
-        ? {
-            ...rejection("permissionDenied"),
-            payload: { code: "permissionDenied", message: "step_up_required", retryable: false },
-          }
-        : seal(req, {
-            invite: { token: "t", url: "https://control.example/enroll#token=t" },
-            subject: "did:example:new",
-            purpose: "session",
-            expiresAt: "2026-01-01T00:00:00Z",
-            claimCode: "ABCD-EFGH-IJKL",
-          }),
+    const INVITE = `${TT}auth/passkey/enroll/invite/0.3`;
+    const sent = controlPlane(
+      INVITE,
+      {
+        ...rejection("permissionDenied"),
+        payload: { code: "permissionDenied", message: "step_up_required", retryable: false },
+      },
+      (req) =>
+        seal(req, {
+          invite: { token: "t", url: "https://control.example/enroll#token=t" },
+          subject: "did:example:new",
+          purpose: "session",
+          expiresAt: "2026-01-01T00:00:00Z",
+          claimCode: "ABCD-EFGH-IJKL",
+        }),
     );
 
     const issued = await api.createInvite("did:example:new", "owner");
 
-    expect(stepUpVta).toHaveBeenCalledTimes(1);
+    expect(approve).toHaveBeenCalledTimes(1);
     expect(issued.claimCode).toBe("ABCD-EFGH-IJKL");
-    expect(tasks(sent)).toHaveLength(2);
-    expect(tasks(sent)[1]!.bearer).toBe(`Bearer ${elevated}`);
+    const all = tasks(sent);
+    expect(all.map((s) => s.doc.type)).toEqual([INVITE, START, APPROVE_RESPONSE, REFRESH, INVITE]);
+    expect(all[4]!.bearer).toBe(`Bearer ${ELEVATED}`);
+  });
+
+  it("sends nothing on when the wallet answers a different challenge", async () => {
+    const store = stubStorage({ webvh_token: TOKEN, webvh_refresh_token: "refresh-1", webvh_auth_method: "wallet" });
+    await generateSessionKeypair();
+    stubWallet(
+      vi.fn(async ({ approveRequest: request }: { approveRequest: Doc }) => ({
+        approveResponse: approveResponse(request, { challenge: "d".repeat(64) }),
+      })),
+    );
+    const sent = controlPlane(PURGE, rejection("stepUpRequired"), purged);
+
+    await expect(api.deleteDomain("old.example")).rejects.toThrow(/did not answer this step-up/);
+    expect(tasks(sent).map((s) => s.doc.type)).toEqual([PURGE, START]);
+    expect(store.get("webvh_token")).toBe(TOKEN);
+  });
+
+  it("sends nothing on when the wallet declines", async () => {
+    stubStorage({ webvh_token: TOKEN, webvh_refresh_token: "refresh-1", webvh_auth_method: "wallet" });
+    await generateSessionKeypair();
+    stubWallet(vi.fn().mockRejectedValue(new Error("step-up denied by user")));
+    const sent = controlPlane(PURGE, rejection("stepUpRequired"), purged);
+
+    await expect(api.deleteDomain("old.example")).rejects.toThrow(/denied/);
+    expect(tasks(sent).map((s) => s.doc.type)).toEqual([PURGE, START]);
+  });
+
+  it("does not hand the wallet an approve-request for another session", async () => {
+    stubStorage({ webvh_token: TOKEN, webvh_refresh_token: "refresh-1", webvh_auth_method: "wallet" });
+    await generateSessionKeypair();
+    const approve = stubWallet(vi.fn());
+    const other = approveRequest();
+    other.payload.sessionId = "sess-2";
+    controlPlane(PURGE, rejection("stepUpRequired"), purged, { request: other });
+
+    await expect(api.deleteDomain("old.example")).rejects.toThrow(/no request for this session/);
+    expect(approve).not.toHaveBeenCalled();
+  });
+
+  it("does not renew when the control plane does not raise the session", async () => {
+    const store = stubStorage({ webvh_token: TOKEN, webvh_refresh_token: "refresh-1", webvh_auth_method: "wallet" });
+    await generateSessionKeypair();
+    stubWallet(
+      vi.fn(async ({ approveRequest: request }: { approveRequest: Doc }) => ({
+        approveResponse: approveResponse(request),
+      })),
+    );
+    const sent = controlPlane(PURGE, rejection("stepUpRequired"), purged, {
+      ack: { status: "rejected", reason: "no" },
+    });
+
+    await expect(api.deleteDomain("old.example")).rejects.toThrow(/did not raise the session/);
+    expect(tasks(sent).map((s) => s.doc.type)).toEqual([PURGE, START, APPROVE_RESPONSE]);
+    expect(store.get("webvh_refresh_token")).toBe("refresh-1");
   });
 
   it("does not step up for any other permissionDenied", async () => {
     stubStorage({ webvh_token: TOKEN, webvh_refresh_token: "r", webvh_auth_method: "wallet" });
     await generateSessionKeypair();
-    const stepUpVta = stubWallet();
+    const approve = stubWallet(vi.fn());
     installControlPlane(() => rejection("permissionDenied"));
     await expect(api.createInvite("did:example:new", "owner")).rejects.toThrow();
-    expect(stepUpVta).not.toHaveBeenCalled();
+    expect(approve).not.toHaveBeenCalled();
   });
 
-  it("says so when the session cannot step up", async () => {
+  it("never hands tokens to a wallet that only offers the older token-carrying step-up", async () => {
     stubStorage({ webvh_token: TOKEN, webvh_refresh_token: "r", webvh_auth_method: "wallet" });
     await generateSessionKeypair();
+    const stepUpVta = vi.fn();
     vi.stubGlobal("window", {
       location: { origin: "https://console.example.com" },
       dispatchEvent: vi.fn(),
-      vtaWallet: {
-        signTrustTask: async ({ envelope }: { envelope: Doc }) => ({
-          signedEnvelope: { ...envelope, proof: { proofValue: "z" } },
-          holderDid: SUBJECT,
-        }),
-      },
+      vtaWallet: { signTrustTask: vi.fn(), stepUpVta },
     });
-    installControlPlane(() => rejection("stepUpRequired"));
+    const sent = installControlPlane(() => rejection("stepUpRequired"));
     await expect(api.deleteDomain("old.example")).rejects.toThrow(/stepped-up session/);
+    expect(stepUpVta).not.toHaveBeenCalled();
+    expect(tasks(sent)).toHaveLength(1);
   });
 });
 
