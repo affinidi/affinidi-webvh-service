@@ -125,7 +125,7 @@ async fn assert_witness_kek_round_trip(cfg: &SecretsConfig) {
         .get()
         .await
         .expect("get secrets")
-        .map(|s| s.signing_key);
+        .map(|s| s.signing_key.clone());
     envelope
         .set(&sample_secrets())
         .await

@@ -538,7 +538,7 @@ async fn concurrent_envelope_writes_do_not_lose_each_other() {
     set.unwrap();
     seed.unwrap();
     assert_eq!(
-        a.get().await.unwrap().map(|s| s.signing_key),
+        a.get().await.unwrap().map(|s| s.signing_key.clone()),
         Some(keys.signing_key.clone())
     );
     assert_eq!(a.get_bootstrap_seed().await.unwrap(), Some([9u8; 32]));
@@ -617,4 +617,34 @@ fn the_envelope_location_names_its_entry() {
         witness_kek_location(&aws, p),
         "the key-encryption key's entry is separate"
     );
+}
+
+/// The derived wipe reaches every key the envelope holds, retired ones and
+/// the bootstrap seed included; it is what runs when one is dropped.
+#[test]
+fn zeroize_clears_every_key() {
+    use zeroize::Zeroize;
+    let mut keys = sample();
+    keys.retired.push(RetiredKeys {
+        ka_kid: "did:example:a#key-2".into(),
+        key_agreement_key: "z6LSretired".into(),
+        signing_kid: "did:example:a#key-1".into(),
+        signing_key: "z6Mkretired".into(),
+    });
+    let mut env = StoredSecrets {
+        secrets: Some(keys),
+        bootstrap_seed: Some("seed".into()),
+        other: Default::default(),
+    };
+    env.zeroize();
+    assert!(env.bootstrap_seed.is_none());
+    assert!(env.secrets.is_none());
+
+    let mut keys = sample();
+    keys.vta_credential = Some("credential".into());
+    keys.zeroize();
+    assert!(keys.signing_key.is_empty());
+    assert!(keys.key_agreement_key.is_empty());
+    assert!(keys.jwt_signing_key.is_empty());
+    assert!(keys.vta_credential.is_none());
 }

@@ -1827,7 +1827,6 @@ async fn build_control(
         stats_collector: stats_collector.clone(),
         stats_ks,
         timeseries_ks,
-        signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
         unlisted_signers: Default::default(),
         replay_cache: Arc::new(did_hosting_control::replay::ReplayCache::with_config(
             config.replay.clone(),
@@ -2489,7 +2488,7 @@ async fn run_import_secrets(
     // so keeping them is harmless even when the imported keys are for a wholly
     // different identity.
     let retired = match secret_store.get().await {
-        Ok(Some(existing)) => existing.retired,
+        Ok(Some(mut existing)) => std::mem::take(&mut existing.retired),
         _ => Vec::new(),
     };
     if !retired.is_empty() {

@@ -86,7 +86,8 @@ impl JwtKeys {
         // Build PKCS8 v1 DER for the private key (used by EncodingKey).
         // Structure follows RFC 8410 §7 (Ed25519 private key) and SEC 1 §C.4:
         //   SEQUENCE { INTEGER 0, AlgorithmIdentifier(Ed25519), OCTET STRING { OCTET STRING key } }
-        let mut pkcs8 = Vec::with_capacity(48);
+        // Wiped when this returns; `EncodingKey` keeps its own copy.
+        let mut pkcs8 = zeroize::Zeroizing::new(Vec::with_capacity(48));
         pkcs8.extend_from_slice(&[
             0x30, 0x2e, // SEQUENCE, 46 bytes
             0x02, 0x01, 0x00, // INTEGER 0 (version v1)

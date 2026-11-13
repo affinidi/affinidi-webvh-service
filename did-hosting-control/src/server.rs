@@ -106,15 +106,6 @@ pub struct AppState {
     /// future `prefix_iter_raw("")` over either keyspace returns
     /// homogeneous-shaped values rather than two different schemas.
     pub timeseries_ks: KeyspaceHandle,
-    /// Ed25519 signing key bytes for packing DIDComm responses (REST endpoint).
-    ///
-    /// SECURITY: this is a raw 32-byte seed. `AppState` deliberately does
-    /// NOT derive `Debug` — adding it would format this field via the
-    /// default tuple printer and the seed would land in any subsequent
-    /// `tracing::*` macro that takes `?state` or `state = ?state`. If a
-    /// `Debug` derive is added later, wrap this in a redacting newtype
-    /// (or `secrecy::SecretBox`) at the same time.
-    pub signing_key_bytes: Option<[u8; 32]>,
     /// Anti-replay cache for inbound DIDComm `(sender, msg.id)` pairs.
     /// Both transports gate through it before dispatch to reject
     /// captured-and-resubmitted envelopes within the freshness window.
@@ -436,7 +427,6 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         },
         stats_ks: stats_ks.clone(),
         timeseries_ks: timeseries_ks.clone(),
-        signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
         unlisted_signers: Default::default(),
         replay_cache: Arc::new(crate::replay::ReplayCache::with_config(replay_config)?),
         path_locks: crate::path_locks::PathLocks::new(),

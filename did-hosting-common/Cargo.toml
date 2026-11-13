@@ -43,6 +43,7 @@ server-core = [
     "dep:affinidi-messaging-didcomm-service", "dep:affinidi-messaging-didcomm",
     "dep:affinidi-tsp", "dep:affinidi-messaging-sdk",
     "dep:trust-tasks-build", "dep:affinidi-rate-limit", "dep:affinidi-net-guard",
+    "dep:zeroize",
 ]
 store-fjall = ["server-core", "dep:fjall"]
 store-redis = ["server-core", "dep:redis"]
@@ -229,6 +230,7 @@ webauthn-rs-proto = { workspace = true, optional = true }
 argon2 = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
 
 # base64 (needed by firestore/cosmosdb store backends)
 base64 = { workspace = true }
