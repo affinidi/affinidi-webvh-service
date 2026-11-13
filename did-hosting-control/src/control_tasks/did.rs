@@ -544,12 +544,14 @@ fn unknown_domain(domain: &str) -> TaskError {
     )
 }
 
-/// `did/delete/0.1`: answers with the record as it stood.
+/// `did/delete/0.1`: answers with the record as it stood. Irreversible, so a
+/// request carrying a bearer session needs it stepped up (`aal2`).
 pub(crate) async fn delete(
     cx: &Cx<'_>,
     p: delete::v0_1::Payload,
 ) -> Result<delete::v0_1::Response, TaskError> {
     let auth = cx.auth().await?;
+    cx.require_stepped_up_session(&auth, "deleting a DID")?;
     let state = cx.state;
     let (record, _) = did_ops::get_did_info(&auth, state, &p.mnemonic).await?;
     did_ops::delete_did(&auth, state, &p.mnemonic, p.domain.as_deref()).await?;

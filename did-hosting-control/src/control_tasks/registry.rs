@@ -261,7 +261,8 @@ pub(crate) async fn deregister(
 /// `registry/purge-domain/0.1`: queue a purge of a domain's content on one
 /// server, now. Refused while the registry still records the domain as
 /// assigned to that server — a purge must follow an unassignment, never race
-/// one — and queued in the durable outbox, signed at send time.
+/// one — and queued in the durable outbox, signed at send time. A request
+/// carrying a bearer session needs it stepped up (`aal2`).
 pub(crate) async fn purge_domain(
     cx: &Cx<'_>,
     p: purge_domain::v0_1::Payload,
@@ -269,6 +270,7 @@ pub(crate) async fn purge_domain(
     use purge_domain::v0_1::error_codes as codes;
 
     let auth = cx.admin().await?;
+    cx.require_stepped_up_session(&auth, "purging a domain from a server")?;
     let state = cx.state;
     let instance = registry::get_instance(&state.registry_ks, &p.instance_id)
         .await?
