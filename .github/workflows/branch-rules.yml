@@ -1,9 +1,7 @@
 name: Branch rules
 
 # Where a PR may go and what it may change: fixes reach a release branch by
-# backport, only the release tooling edits versions, RELEASE and CHANGELOG.md
-# (everyone else adds a changelog.d/ fragment). See
-# scripts/check-branch-rules.py and RELEASES.md.
+# backport, only the release tooling edits versions and RELEASE (RELEASES.md).
 #
 # Its own workflow for the trigger: `labeled` / `unlabeled` must re-run it (the
 # `release-direct` label changes the verdict), and adding those to ci.yml would
@@ -15,6 +13,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read  # who added release-direct
 
 jobs:
   rules:
@@ -22,12 +21,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: affinidi/pipeline-rust/.github/actions/release-branch-rules@main
         with:
-          # The merge commit and its first parent: the PR's effect on the base.
-          fetch-depth: 2
-          persist-credentials: false
-      - name: Check the PR against the branch rules
+          # Transitional: maintainers may still cut or prep locally; drop once both use the release workflows.
+          maintainer-releases: "true"
+      # The local rules too, for what the shared check lacks: only the release
+      # tooling edits CHANGELOG.md (changelog.d/README.md).
+      - name: Local branch rules
         env:
           BASE_REF: ${{ github.base_ref }}
           HEAD_REF: ${{ github.head_ref }}

@@ -24,11 +24,17 @@ jobs:
     name: Prepare ${{ inputs.kind }} on ${{ github.ref_name }}
     if: startsWith(github.ref, 'refs/heads/release/')
     runs-on: ubuntu-latest
+    # RELEASE_BOT_PRIVATE_KEY is a secret of this environment.
+    environment: release
     timeout-minutes: 30
-    permissions:
-      contents: write
-      pull-requests: write
     steps:
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           # Tags: a patch's changelog is the commits since the last `v…` tag.
@@ -41,9 +47,9 @@ jobs:
         run: python3 scripts/prepare-release.py --kind "$KIND" --pr-body "$RUNNER_TEMP/body.md"
       - name: Open the PR
         env:
-          # RELEASE_TOKEN: the enterprise does not allow GITHUB_TOKEN to open
-          # pull requests, and one it opened would run no CI (RELEASES.md).
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          # The release bot app: `branch rules` accepts a prep PR only from it
+          # (or a maintainer), and one GITHUB_TOKEN opened would run no CI.
+          GH_TOKEN: ${{ steps.app.outputs.token }}
           BASE: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
         run: |
