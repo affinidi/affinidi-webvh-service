@@ -214,6 +214,26 @@ impl<R: ProofPurposeResolver> SignerResolve for Unclassified<R> {
     }
 }
 
+/// A caller-supplied resolver whose every refusal is an unreachable signer:
+/// the test seam [`TransportBoundVerifier::with_unreachable_resolver`].
+#[cfg(any(test, feature = "test-support"))]
+struct AllUnreachable<R>(R);
+
+#[cfg(any(test, feature = "test-support"))]
+#[async_trait]
+impl<R: ProofPurposeResolver> SignerResolve for AllUnreachable<R> {
+    async fn resolve_signer(
+        &self,
+        vm: &str,
+        purpose: ProofPurpose,
+    ) -> Result<ResolvedKey, ResolveFailure> {
+        self.0
+            .resolve_vm_for_purpose(vm, purpose)
+            .await
+            .map_err(|e| ResolveFailure::new(VerifyFailureKind::Unreachable, e))
+    }
+}
+
 /// One verification attempt's view of a [`SignerResolve`]: the library's
 /// resolver interface, remembering the kind of the failure the library will
 /// report, which its error type has no room for. Built per attempt, so
@@ -563,6 +583,18 @@ impl TransportBoundVerifier {
             delegate: None,
             deactivation: None,
             reply_refresher: None,
+        }
+    }
+
+    /// [`Self::with_resolver`], but the operational and approval checks report
+    /// every refusal from `resolver` as an unreachable signer
+    /// ([`VerifyFailureKind::Unreachable`]), so a test can stand in for a
+    /// signer DID that cannot be resolved without a network.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_unreachable_resolver(resolver: Arc<dyn ProofPurposeResolver>) -> Self {
+        Self {
+            signer_resolver: Arc::new(AllUnreachable(resolver.clone())),
+            ..Self::with_resolver(resolver)
         }
     }
 

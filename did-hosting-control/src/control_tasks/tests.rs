@@ -3705,12 +3705,14 @@ mod unlisted {
     /// unlisted signers; the count of network resolutions.
     fn counting(state: &mut AppState, hang: bool, limits: UnlistedSigners) -> Arc<AtomicUsize> {
         let calls = Arc::new(AtomicUsize::new(0));
-        state.trust_tasks_verifier = Some(Arc::new(TransportBoundVerifier::with_resolver(
-            Arc::new(CountingResolver {
+        // Every refusal from it is an unreachable signer: its failures stand
+        // in for a DID that cannot be resolved.
+        state.trust_tasks_verifier = Some(Arc::new(
+            TransportBoundVerifier::with_unreachable_resolver(Arc::new(CountingResolver {
                 calls: calls.clone(),
                 hang,
-            }),
-        )));
+            })),
+        ));
         state.unlisted_signers = Arc::new(limits);
         calls
     }
