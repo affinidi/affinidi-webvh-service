@@ -929,6 +929,27 @@ async fn https_redemption_is_rate_limited_per_client_ip() {
     assert!(last["payload"]["retryAfter"].is_string(), "{last}");
 }
 
+/// The mounted route reads the body itself, bounded: a body over the largest
+/// document any served task accepts is refused `413` before it is read.
+#[tokio::test]
+async fn the_mounted_route_refuses_an_oversized_body_before_reading_it() {
+    use axum::response::IntoResponse;
+
+    let (state, _dir) = state().await;
+    let addr: std::net::SocketAddr = "203.0.113.9:4000".parse().unwrap();
+    let oversized = vec![b' '; crate::routes::trust_tasks_body_limit_bytes() + 1];
+    let response = crate::routes::trust_tasks::trust_tasks_route(
+        None,
+        axum::extract::State(state.clone()),
+        Ok(axum::extract::ConnectInfo(addr)),
+        axum::http::HeaderMap::new(),
+        axum::body::Body::from(oversized),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+}
+
 /// An IPv6 client is counted by its /64: stepping to a new address inside the
 /// block for each attempt does not earn a fresh allowance.
 #[tokio::test]

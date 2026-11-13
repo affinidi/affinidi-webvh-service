@@ -981,6 +981,7 @@ fn run_rest_thread(
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .expect("failed to convert std TcpListener to tokio TcpListener");
 
+        let trusted_proxies = state.config.server.trusted_proxies.clone();
         let app = routes::router()
             .with_state(state)
             .layer(
@@ -999,8 +1000,9 @@ fn run_rest_thread(
         let _ = ready_tx.send(());
 
         let mut rx = shutdown_rx.clone();
+        // Header, idle, connection and per-address limits: see `listener`.
         axum::serve(
-            listener,
+            did_hosting_common::server::listener::bounded(listener, &trusted_proxies),
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .with_graceful_shutdown(async move {

@@ -42,6 +42,37 @@ use crate::auth::AuthClaims;
 use crate::error::AppError;
 use crate::server::AppState;
 
+/// The mounted `POST /api/trust-tasks` route: reads the body, at most
+/// [`crate::routes::trust_tasks_body_limit_bytes`] and within
+/// [`BODY_READ_TIMEOUT`](did_hosting_common::server::listener::BODY_READ_TIMEOUT)
+/// (`413` / `408` otherwise), then hands it to [`trust_tasks_endpoint`]. A
+/// client sending its body a byte at a time no longer holds the handler, and
+/// its connection slot, for as long as it likes.
+pub async fn trust_tasks_route(
+    auth: Option<AuthClaims>,
+    State(state): State<AppState>,
+    connect: Result<
+        axum::extract::ConnectInfo<std::net::SocketAddr>,
+        <axum::extract::ConnectInfo<std::net::SocketAddr> as axum::extract::FromRequestParts<
+            AppState,
+        >>::Rejection,
+    >,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> Result<Response, AppError> {
+    let body = match did_hosting_common::server::listener::read_body(
+        body,
+        crate::routes::trust_tasks_body_limit_bytes(),
+        did_hosting_common::server::listener::BODY_READ_TIMEOUT,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(refusal) => return Ok(refusal.into_response()),
+    };
+    trust_tasks_endpoint(auth, State(state), connect, headers, body).await
+}
+
 /// The mounted `POST /api/trust-tasks` route: [`dispatch_trust_task`], after
 /// the per-source limit on invite redemption.
 ///

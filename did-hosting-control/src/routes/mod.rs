@@ -52,7 +52,7 @@ pub fn router_without_fallback() -> Router<AppState> {
     Router::new()
         .route(
             "/api/trust-tasks",
-            post(trust_tasks::trust_tasks_endpoint)
+            post(trust_tasks::trust_tasks_route)
                 .layer(DefaultBodyLimit::max(trust_tasks_body_limit_bytes())),
         )
         .route(

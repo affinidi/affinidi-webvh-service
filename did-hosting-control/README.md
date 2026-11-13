@@ -333,6 +333,16 @@ See
 [`docs/geoip.md`](../docs/geoip.md) for choosing a database (DB-IP City Lite
 or MaxMind GeoLite2 City), attribution and a monthly update job.
 
+### Connection limits
+
+The HTTPS listener applies the same limits as the edge's: at most 256
+connections are served at once, at most 32 of them from one IPv4 address or
+IPv6 /64 (addresses in `[server] trusted_proxies` are exempt); a request's
+headers must arrive within 20 seconds of its first byte; a connection idle
+for 60 seconds is closed; and a `POST /api/trust-tasks` body must arrive
+within 30 seconds (`408`). They are a backstop: put a reverse proxy in front
+for TLS and its own limits.
+
 ### Health Checking
 
 Registered service instances are periodically health-checked.
