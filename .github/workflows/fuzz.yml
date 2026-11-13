@@ -104,6 +104,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # Swap and disk, as every Rust job in ci.yml has. Without it the
+      # sanitizer-instrumented release build of did-hosting-common outgrows the
+      # standard runner and is killed mid-compile with a shutdown signal (exit
+      # 143) before any fuzzing runs.
+      - uses: ./.github/actions/prepare-runner
+
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
 
       # Cache the detached fuzz crate's build artifacts keyed on its own lock.
