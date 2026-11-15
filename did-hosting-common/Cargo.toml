@@ -53,6 +53,15 @@ store-redis = ["server-core", "dep:redis"]
 store-dynamodb = ["server-core", "dep:aws-sdk-dynamodb", "dep:aws-config"]
 store-firestore = ["server-core", "dep:firestore", "dep:futures"]
 store-cosmosdb = ["server-core", "dep:azure_data_cosmos", "dep:azure_core", "dep:futures"]
+# Runs the Cosmos DB backend's unit tests against the Cosmos DB SDK's
+# in-memory emulator (an unstable, test-only SDK feature). Tests only.
+cosmosdb-emulator = [
+    "store-cosmosdb",
+    "test-support",
+    "azure_data_cosmos/__internal_in_memory_emulator",
+    "dep:azure_data_cosmos_driver",
+    "azure_data_cosmos_driver/__internal_in_memory_emulator",
+]
 # Secret-store backends. Every one is `vti-secrets`' implementation — the
 # same code the VTA and VTC use — wrapped by `server::secret_store`, which
 # stores the service's key envelope as the backend's payload.
@@ -212,7 +221,10 @@ redis = { version = "1.0", features = ["tokio-comp", "aio"], optional = true }
 aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 firestore = { version = "0.61", optional = true }
 futures = { version = "0.3", optional = true }
-azure_data_cosmos = { version = "1", features = ["key_auth"], optional = true }
+azure_data_cosmos = { version = "1", features = ["key_auth", "control_plane"], optional = true }
+# Only for `cosmosdb-emulator`: the SDK's in-memory emulator, which the
+# Cosmos DB backend's tests run the store conformance suite against.
+azure_data_cosmos_driver = { version = "1", optional = true }
 azure_core = { version = "1.0", optional = true }
 # Used by the DynamoDB store backend.
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }

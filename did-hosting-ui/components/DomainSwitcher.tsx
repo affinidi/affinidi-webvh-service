@@ -17,14 +17,8 @@
  */
 
 import { memo, useState } from "react";
-import {
-  Modal,
-  Pressable,
-  StyleSheet,
-  Text,
-  View,
-  ScrollView,
-} from "react-native";
+import { Pressable, StyleSheet, Text, View, ScrollView } from "react-native";
+import { Dialog } from "./Dialog";
 import { useDomains } from "./DomainProvider";
 import { useAuth } from "./AuthProvider";
 import { colors, fonts, radii, spacing } from "../lib/theme";
@@ -38,10 +32,7 @@ export const DomainSwitcher = memo(function DomainSwitcher() {
     return null;
   }
 
-  const label =
-    currentDomain === null
-      ? "All domains"
-      : currentDomain;
+  const label = currentDomain === null ? "All domains" : currentDomain;
 
   const showAllOption = role === "admin";
 
@@ -53,13 +44,11 @@ export const DomainSwitcher = memo(function DomainSwitcher() {
   return (
     <View>
       <Pressable
-        accessibilityRole="button"
-        accessibilityLabel={`Current domain: ${label}. Tap to switch.`}
+        role="button"
+        aria-label={`Current domain: ${label}. Tap to switch.`}
+        aria-expanded={open}
         onPress={() => setOpen(true)}
-        style={({ pressed }) => [
-          styles.chip,
-          pressed && styles.chipPressed,
-        ]}
+        style={({ pressed }) => [styles.chip, pressed && styles.chipPressed]}
       >
         <View style={styles.chipDot} />
         <Text style={styles.chipText} numberOfLines={1}>
@@ -68,44 +57,39 @@ export const DomainSwitcher = memo(function DomainSwitcher() {
         <Text style={styles.chipCaret}>▾</Text>
       </Pressable>
 
-      <Modal
+      <Dialog
         visible={open}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setOpen(false)}
+        title="Switch domain"
+        onClose={() => setOpen(false)}
+        style={styles.popover}
       >
-        <Pressable style={styles.overlay} onPress={() => setOpen(false)}>
-          <Pressable style={styles.popover} onPress={(e) => e.stopPropagation()}>
-            <Text style={styles.popoverTitle}>Switch domain</Text>
-            <ScrollView style={styles.list}>
-              {showAllOption && (
-                <DomainOption
-                  label="All domains"
-                  hint="Show DIDs from every configured domain"
-                  active={currentDomain === null}
-                  onPress={() => pickAndClose(null)}
-                />
-              )}
-              {domains.map((d) => (
-                <DomainOption
-                  key={d.name}
-                  label={d.name}
-                  hint={[
-                    d.defaultDomain ? "Default" : null,
-                    d.status === "disabled" ? "Disabled" : null,
-                    d.label ?? null,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")}
-                  active={currentDomain === d.name}
-                  disabled={d.status === "disabled"}
-                  onPress={() => pickAndClose(d.name)}
-                />
-              ))}
-            </ScrollView>
-          </Pressable>
-        </Pressable>
-      </Modal>
+        <ScrollView style={styles.list} role="radiogroup" aria-label="Domain">
+          {showAllOption && (
+            <DomainOption
+              label="All domains"
+              hint="Show DIDs from every configured domain"
+              active={currentDomain === null}
+              onPress={() => pickAndClose(null)}
+            />
+          )}
+          {domains.map((d) => (
+            <DomainOption
+              key={d.name}
+              label={d.name}
+              hint={[
+                d.defaultDomain ? "Default" : null,
+                d.status === "disabled" ? "Disabled" : null,
+                d.label ?? null,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+              active={currentDomain === d.name}
+              disabled={d.status === "disabled"}
+              onPress={() => pickAndClose(d.name)}
+            />
+          ))}
+        </ScrollView>
+      </Dialog>
     </View>
   );
 });
@@ -125,8 +109,10 @@ const DomainOption = memo(function DomainOption({
 }) {
   return (
     <Pressable
-      accessibilityRole="button"
-      accessibilityState={{ selected: active, disabled }}
+      role="radio"
+      aria-checked={active}
+      aria-disabled={!!disabled}
+      aria-label={hint ? `${label}, ${hint}` : label}
       onPress={onPress}
       disabled={disabled}
       style={({ pressed }) => [
@@ -188,13 +174,6 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: colors.textTertiary,
   },
-  overlay: {
-    flex: 1,
-    backgroundColor: colors.overlay,
-    alignItems: "center",
-    justifyContent: "flex-start",
-    paddingTop: 72,
-  },
   popover: {
     width: "100%",
     maxWidth: 420,
@@ -205,14 +184,6 @@ const styles = StyleSheet.create({
     borderColor: colors.border,
     padding: spacing.md,
     gap: spacing.sm,
-  },
-  popoverTitle: {
-    fontFamily: fonts.semibold,
-    fontSize: 13,
-    color: colors.textTertiary,
-    textTransform: "uppercase",
-    letterSpacing: 0.8,
-    paddingHorizontal: spacing.sm,
   },
   list: {
     marginTop: spacing.xs,

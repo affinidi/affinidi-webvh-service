@@ -34,8 +34,13 @@
  * login. The default is wallet sign-in with a trigger link (`oob-sign-in.ts`).
  */
 
-import { clearSessionKeypair, generateSessionKeypair, signEnvelope } from "./session-key";
+import { clearSessionKeypair, generateSessionKeypair } from "./session-key";
 import { T } from "./task-types";
+import { trustTask } from "./trust-task";
+import type {
+  Payload as AuthenticatePayload,
+  Response as AuthenticateResponse,
+} from "./trust-tasks/auth/authenticate/0.3/payload";
 
 export interface VtaWalletLoginParams {
   rpDid: string;
@@ -84,23 +89,14 @@ export async function loginBindingSessionKey(
 
 /** The `auth/authenticate/0.3` response payload: `{ session, tokens }`, both
  *  camelCase. */
-export interface IdTokenAuthResponse {
-  session: { id: string; subject: string; issuedAt: string; expiresAt: string };
-  tokens: {
-    accessToken: string;
-    refreshToken?: string;
-    tokenType: string;
-    expiresIn: number;
-    refreshExpiresIn?: number;
-  };
-}
+export type IdTokenAuthResponse = AuthenticateResponse;
 
 const AUTH_AUTHENTICATE_V0_3 = T.authenticate;
 
 /**
  * Wrap a proxy login's `id_token` as an `auth/authenticate/0.3` proxied
- * authenticate, sent to `{apiBase}/trust-tasks`, and bind a fresh session key
- * to the new session.
+ * authenticate, sent through the console's Trust Task client
+ * (`POST /api/trust-tasks`), and bind a fresh session key to the new session.
  *
  * A fresh Ed25519 `did:key` plays two roles in the one document: it is the
  * document's own `issuer` (the *delegate* the proxied form names, verified by
@@ -112,6 +108,11 @@ const AUTH_AUTHENTICATE_V0_3 = T.authenticate;
  * document, checks its `nonce` against this same `challenge`, and only then
  * honors `principal`.
  *
+ * Going through `trustTask` (signer `"session-key"`, no bearer) means the
+ * reply is checked like every other: the service's own signed answer to this
+ * request, addressed back to the key that asked. A reply that is not is
+ * refused before its tokens are used.
+ *
  * The persona's own key lives at the VTA, so without a session key every call
  * the session makes would be signed through the wallet's `signTrustTask` —
  * which asks the human each time, by design, and a page load fires several at
@@ -119,68 +120,34 @@ const AUTH_AUTHENTICATE_V0_3 = T.authenticate;
  * it, so a success means the key is bound. On any failure the key pair is
  * dropped, as in {@link loginBindingSessionKey}.
  */
-export async function authenticateIdTokenBindingSessionKey(
-  apiBase: string,
-  args: { idToken: string; sessionId: string; challenge: string; principalDid: string; rpDid: string },
-  fetchFn: typeof fetch = fetch,
-): Promise<IdTokenAuthResponse> {
+export async function authenticateIdTokenBindingSessionKey(args: {
+  idToken: string;
+  sessionId: string;
+  challenge: string;
+  principalDid: string;
+}): Promise<IdTokenAuthResponse> {
   const { didKey } = await generateSessionKeypair();
-  let sent: Record<string, unknown> = {
-    id: cryptoRandomUuid(),
-    type: AUTH_AUTHENTICATE_V0_3,
-    issuer: didKey,
-    recipient: args.rpDid,
-    issuedAt: new Date().toISOString(),
-    payload: {
-      challenge: args.challenge,
-      sessionId: args.sessionId,
-      principal: args.principalDid,
-      delegationEvidence: {
-        kind: "siopIdToken",
-        credential: { idToken: args.idToken },
-      },
-      sessionKey: didKey,
-    },
-  };
   try {
-    sent = await signEnvelope(sent);
-    const res = await fetchFn(`${apiBase}/trust-tasks`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(sent),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`auth/authenticate/0.3 failed (${res.status}): ${text}`);
-    }
-    const reply = (await res.json()) as { payload?: IdTokenAuthResponse };
-    const response = reply?.payload;
+    const response = await trustTask<AuthenticatePayload, AuthenticateResponse>(
+      AUTH_AUTHENTICATE_V0_3,
+      {
+        challenge: args.challenge,
+        sessionId: args.sessionId,
+        principal: args.principalDid,
+        delegationEvidence: {
+          kind: "siopIdToken",
+          credential: { idToken: args.idToken },
+        },
+        sessionKey: didKey,
+      },
+      { signer: "session-key", anonymous: true },
+    );
     if (!response?.tokens?.accessToken) {
-      throw new Error(
-        `auth/authenticate/0.3: missing payload.tokens.accessToken in response — got ${JSON.stringify(reply).slice(0, 200)}`,
-      );
+      throw new Error("auth/authenticate/0.3: the reply carries no access token");
     }
     return response;
   } catch (err) {
     clearSessionKeypair();
     throw err;
   }
-}
-
-/** Browser-safe UUIDv4. Falls back to a polyfill where `crypto.randomUUID`
- *  isn't available. Duplicated from `trust-task.ts` rather than imported: this
- *  module is intentionally free of the rest of that file's dependencies (see
- *  the module doc). */
-function cryptoRandomUuid(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  const bytes = new Uint8Array(16);
-  crypto.getRandomValues(bytes);
-  bytes[6] = (bytes[6] & 0x0f) | 0x40;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0"));
-  return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex
-    .slice(6, 8)
-    .join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
 }

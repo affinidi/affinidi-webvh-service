@@ -83,7 +83,11 @@ describe("background requests", () => {
     const before = tasks(sent).length;
     await api.resolveAgentNames(["did:example:a"]).catch(() => undefined);
     await api.getStats("abc").catch(() => undefined);
-    expect(tasks(sent).slice(before).map((s) => s.background)).toEqual([false, false]);
+    expect(
+      tasks(sent)
+        .slice(before)
+        .map((s) => s.background),
+    ).toEqual([false, false]);
   });
 });
 

@@ -1,11 +1,13 @@
-import React, { createContext, useContext, useState, useCallback, useEffect } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import {
   api,
+  decodeJwtPayload,
   getToken,
   listenForSignOut,
   restoreSession,
   setToken as storeToken,
 } from "../lib/api";
+import { clearQueryCache } from "../lib/query";
 
 interface AuthState {
   token: string | null;
@@ -21,16 +23,10 @@ interface AuthState {
 
 /** Decode the JWT payload (no verification) to extract claims. */
 function decodeJwtClaims(token: string): { role: "admin" | "owner" | null; did: string | null } {
-  try {
-    const payload = token.split(".")[1];
-    if (!payload) return { role: null, did: null };
-    const json = JSON.parse(atob(payload));
-    const role = json.role === "admin" || json.role === "owner" ? json.role : null;
-    const did = typeof json.sub === "string" ? json.sub : null;
-    return { role, did };
-  } catch {
-    return { role: null, did: null };
-  }
+  const claims = decodeJwtPayload(token);
+  const role = claims?.role === "admin" || claims?.role === "owner" ? claims.role : null;
+  const did = typeof claims?.sub === "string" ? claims.sub : null;
+  return { role, did };
 }
 
 const AuthContext = createContext<AuthState>({
@@ -80,6 +76,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setTokenState(t);
   }, []);
 
+  const claims = useMemo(
+    () => (token ? decodeJwtClaims(token) : { role: null, did: null }),
+    [token],
+  );
+
+  // Reads are cached per key, not per session: when the signed-in subject
+  // changes (sign-out, or another account), drop what the last one loaded so
+  // it is never painted for the next.
+  useEffect(() => () => clearQueryCache(), [claims.did]);
+
   const logout = useCallback(() => {
     // Revoke at the control plane before the session key is dropped: the
     // revoke is signed with it. The screen signs out at once either way.
@@ -91,7 +97,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     <AuthContext.Provider
       value={{
         token,
-        ...( token ? decodeJwtClaims(token) : { role: null, did: null }),
+        ...claims,
         isAuthenticated: !!token,
         restored,
         login,

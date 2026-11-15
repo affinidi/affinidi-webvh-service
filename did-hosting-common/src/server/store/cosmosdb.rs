@@ -1,21 +1,46 @@
+//! Azure Cosmos DB backend.
+//!
+//! **One container, one partition.** Every keyspace lives in one container
+//! (`store.cosmosdb_container`, default `kv`, partitioned on `/pk`), every
+//! item under the partition key value `kv`. An item's id is the base64url
+//! encoding of `keyspace \0 key`. That is what makes a [`BatchOps`] commit
+//! atomic: Cosmos DB's transactional batch covers one partition of one
+//! container, so a batch spanning keyspaces is still one transactional batch.
+//! The cost is that one logical partition holds everything, and Cosmos DB
+//! caps a logical partition at 20 GB.
+//!
+//! Earlier releases kept one container per keyspace. On open, each keyspace
+//! still in such a container is copied in once ([`CosmosDbBackend::migrate`]);
+//! the old containers are left for the operator to delete.
+
 use std::sync::Arc;
 
-use azure_data_cosmos::FeedScope;
+use azure_data_cosmos::clients::{ContainerClient, DatabaseClient};
+use azure_data_cosmos::models::ContainerProperties;
 use azure_data_cosmos::options::{ItemWriteOptions, Precondition, Region};
-use azure_data_cosmos::{AccountEndpoint, AccountReference, CosmosClient, RoutingStrategy};
+use azure_data_cosmos::{
+    AccountEndpoint, AccountReference, CosmosClient, FeedScope, Query, RoutingStrategy,
+    TransactionalBatch,
+};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use futures::StreamExt;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::server::config::StoreConfig;
-use crate::server::error::AppError;
+use crate::server::error::{AppError, QuotaKind};
 
-use super::{BatchOps, BoxFuture, KeyspaceOps, RawKvPair, StorageBackend};
+use super::{
+    ALL_KEYSPACES, BatchOps, BoxFuture, KeyspaceOps, PrefixPage, RawKvPair, StorageBackend,
+};
 
 /// The partition key value used for all items (single-partition design).
 const PARTITION_VALUE: &str = "kv";
+
+/// The container every keyspace lives in, unless configured otherwise.
+const DEFAULT_CONTAINER: &str = "kv";
 
 /// How many times a conditional (ETag) write is retried under contention
 /// before `take_raw_atomic`/`incr_raw` give up with an error. Each retry
@@ -23,10 +48,33 @@ const PARTITION_VALUE: &str = "kv";
 /// race on one key.
 const CONDITIONAL_WRITE_ATTEMPTS: usize = 16;
 
+/// How many times a batch is re-run when an item it deletes vanished
+/// between the existence check and the batch (see [`send_batch`]).
+const BATCH_ATTEMPTS: usize = 5;
+
+/// Cosmos DB's transactional batch takes at most 100 operations.
+const MAX_BATCH_OPS: usize = 100;
+
+/// ... and a request of at most 2 MB. Counted as 2,000,000 bytes of
+/// serialized operations, so the bound errs on the side of refusing.
+const MAX_BATCH_BYTES: usize = 2_000_000;
+
+/// Cosmos DB's item limit is 2 MB of JSON; counted as 2,000,000 bytes of
+/// id, value and [`DOC_OVERHEAD`].
+const MAX_DOC_BYTES: usize = 2_000_000;
+
+/// The JSON framing of a [`KvDoc`] (field names, quotes, the partition key)
+/// and the system properties Cosmos DB adds.
+const DOC_OVERHEAD: usize = 256;
+
+/// The keyspace migration markers ([`CosmosDbBackend::migrate`]) live in
+/// this keyspace. No keyspace a caller opens has this name.
+const LAYOUT_KEYSPACE: &str = "__layout__";
+
 /// Document model stored in Cosmos DB.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct KvDoc {
-    /// Document ID: base64url-encoded raw key.
+    /// Document ID: base64url of `keyspace \0 key` ([`doc_id`]).
     id: String,
     /// Partition key field.
     pk: String,
@@ -34,13 +82,66 @@ struct KvDoc {
     data: String,
 }
 
+/// A projection of a [`KvDoc`] to its id.
+#[derive(Debug, Deserialize)]
+struct IdOnly {
+    id: String,
+}
+
+/// The id of `key` in `keyspace`: `keyspace \0 key`, base64url. Keyspace
+/// names never hold a NUL, so no two (keyspace, key) pairs share an id.
+fn doc_id(keyspace: &str, key: &[u8]) -> String {
+    BASE64.encode(scoped(keyspace, key))
+}
+
+/// `keyspace \0 key`, the bytes [`doc_id`] encodes.
+fn scoped(keyspace: &str, key: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(keyspace.len() + 1 + key.len());
+    bytes.extend_from_slice(keyspace.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(key);
+    bytes
+}
+
+/// The id prefix every id starting with `prefix`'s bytes shares.
+///
+/// base64 turns each 3 bytes into 4 characters, but the character holding a
+/// group's last bits also depends on the bytes after it, so only whole
+/// 3-byte groups of the prefix encode the same way in every id that starts
+/// with it. The rest is left to the exact byte check after decoding.
+fn encoded_query_prefix(prefix: &[u8]) -> String {
+    BASE64.encode(&prefix[..prefix.len() / 3 * 3])
+}
+
+/// Refuse an item Cosmos DB would reject as too large.
+fn check_doc_size(doc: &KvDoc) -> Result<(), AppError> {
+    super::check_item_size(
+        "Cosmos DB",
+        doc.id.len() + doc.data.len() + DOC_OVERHEAD,
+        MAX_DOC_BYTES,
+    )
+}
+
+fn value_doc(id: String, value: &[u8]) -> KvDoc {
+    KvDoc {
+        id,
+        pk: PARTITION_VALUE.to_string(),
+        data: BASE64.encode(value),
+    }
+}
+
+fn decode(what: &str, encoded: &str) -> Result<Vec<u8>, AppError> {
+    BASE64
+        .decode(encoded)
+        .map_err(|e| AppError::Store(format!("cosmosdb decode {what}: {e}")))
+}
+
 // ---------------------------------------------------------------------------
 // CosmosDbBackend
 // ---------------------------------------------------------------------------
 
 pub struct CosmosDbBackend {
-    client: CosmosClient,
-    database: String,
+    container: ContainerClient,
 }
 
 /// Parse a Cosmos DB connection string into (endpoint, key).
@@ -74,6 +175,10 @@ impl CosmosDbBackend {
             .cosmosdb_database
             .clone()
             .unwrap_or_else(|| "webvh".to_string());
+        let container = config
+            .cosmosdb_container
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CONTAINER.to_string());
 
         let connection_string = config
             .cosmosdb_connection_string
@@ -82,7 +187,7 @@ impl CosmosDbBackend {
                 AppError::Config("store.cosmosdb_connection_string is required".into())
             })?;
 
-        info!(database, "opening cosmosdb store");
+        info!(database, container, "opening cosmosdb store");
 
         let (endpoint_str, account_key) = parse_connection_string(connection_string)?;
 
@@ -108,26 +213,181 @@ impl CosmosDbBackend {
             .await
             .map_err(|e| AppError::Store(format!("cosmosdb build client: {e}")))?;
 
-        Ok(Box::new(Self { client, database }))
+        Ok(Box::new(
+            Self::with_client(&client, &database, &container).await?,
+        ))
     }
+
+    /// The backend over `database`/`container`, creating either if missing
+    /// and copying in any keyspace still in its own container.
+    async fn with_client(
+        client: &CosmosClient,
+        database: &str,
+        container: &str,
+    ) -> Result<Self, AppError> {
+        let db = client.database_client(database);
+        let container = match db.container_client(container, None).await {
+            Ok(c) => c,
+            Err(e) if is_not_found(&e) => {
+                create_container(client, &db, database, container).await?;
+                db.container_client(container, None)
+                    .await
+                    .map_err(|e| AppError::Store(format!("cosmosdb container client: {e}")))?
+            }
+            Err(e) => return Err(AppError::Store(format!("cosmosdb container client: {e}"))),
+        };
+        let backend = Self { container };
+        backend.migrate(&db).await?;
+        Ok(backend)
+    }
+
+    /// Copy each keyspace an earlier release kept in a container of its own
+    /// into the shared container, once: a marker in [`LAYOUT_KEYSPACE`]
+    /// records each keyspace done (or found with no container of its own).
+    ///
+    /// A copied item never replaces one already in the shared container
+    /// (`create`, not `upsert`), so a replica that started on the new layout
+    /// first keeps what it wrote. Start one upgraded replica alone, so the
+    /// copy is done before any other writes.
+    async fn migrate(&self, db: &DatabaseClient) -> Result<(), AppError> {
+        for keyspace in ALL_KEYSPACES {
+            let marker = doc_id(LAYOUT_KEYSPACE, keyspace.as_bytes());
+            if self.read(&marker).await?.is_some() {
+                continue;
+            }
+            let copied = match db.container_client(*keyspace, None).await {
+                Ok(legacy) => self.copy_legacy(keyspace, &legacy).await?,
+                Err(e) if is_not_found(&e) => 0,
+                Err(e) => {
+                    return Err(AppError::Store(format!(
+                        "cosmosdb migrate {keyspace}: container client: {e}"
+                    )));
+                }
+            };
+            if copied > 0 {
+                info!(
+                    keyspace,
+                    copied, "cosmosdb: copied a keyspace from its own container"
+                );
+            }
+            self.container
+                .upsert_item(
+                    PARTITION_VALUE,
+                    &marker,
+                    value_doc(marker.clone(), b"migrated"),
+                    None,
+                )
+                .await
+                .map_err(|e| AppError::Store(format!("cosmosdb migrate marker: {e}")))?;
+        }
+        Ok(())
+    }
+
+    async fn copy_legacy(
+        &self,
+        keyspace: &str,
+        legacy: &ContainerClient,
+    ) -> Result<usize, AppError> {
+        let docs: Vec<KvDoc> = query(
+            legacy,
+            Query::from("SELECT * FROM c WHERE c.pk = @pk")
+                .with_parameter("@pk", PARTITION_VALUE)
+                .map_err(query_param)?,
+        )
+        .await?;
+        let mut copied = 0;
+        for doc in docs {
+            let key = decode("legacy key", &doc.id)?;
+            let id = doc_id(keyspace, &key);
+            let moved = KvDoc {
+                id: id.clone(),
+                pk: PARTITION_VALUE.to_string(),
+                data: doc.data,
+            };
+            match self
+                .container
+                .create_item(PARTITION_VALUE, &id, moved, None)
+                .await
+            {
+                Ok(_) => copied += 1,
+                Err(e) if e.status().is_conflict() => {}
+                Err(e) => return Err(AppError::Store(format!("cosmosdb migrate copy: {e}"))),
+            }
+        }
+        Ok(copied)
+    }
+
+    async fn read(&self, id: &str) -> Result<Option<KvDoc>, AppError> {
+        match self.container.read_item(PARTITION_VALUE, id, None).await {
+            Ok(resp) => resp
+                .into_model()
+                .map(Some)
+                .map_err(|e| AppError::Store(format!("cosmosdb read body: {e}"))),
+            Err(e) if is_not_found(&e) => Ok(None),
+            Err(e) => Err(AppError::Store(format!("cosmosdb read: {e}"))),
+        }
+    }
+}
+
+/// Create the database (if missing) and the container, partitioned on
+/// `/pk`. Someone else creating either meanwhile is fine.
+async fn create_container(
+    client: &CosmosClient,
+    db: &DatabaseClient,
+    database: &str,
+    container: &str,
+) -> Result<(), AppError> {
+    match client.create_database(database, None).await {
+        Ok(_) => info!(database, "cosmosdb database created"),
+        Err(e) if e.status().is_conflict() => {}
+        Err(e) => return Err(AppError::Store(format!("cosmosdb create database: {e}"))),
+    }
+    let properties = ContainerProperties::new(container.to_string(), "/pk".into());
+    match db.create_container(properties, None).await {
+        Ok(_) => {
+            info!(container, "cosmosdb container created");
+            Ok(())
+        }
+        Err(e) if e.status().is_conflict() => Ok(()),
+        Err(e) => Err(AppError::Store(format!("cosmosdb create container: {e}"))),
+    }
+}
+
+fn query_param(e: azure_data_cosmos::CosmosError) -> AppError {
+    AppError::Store(format!("cosmosdb query param: {e}"))
+}
+
+/// Run `query` in the shared partition and collect every result.
+async fn query<T: DeserializeOwned + Send + 'static>(
+    container: &ContainerClient,
+    query: Query,
+) -> Result<Vec<T>, AppError> {
+    let mut pager = container
+        .query_items::<T>(query, FeedScope::partition(PARTITION_VALUE), None)
+        .await
+        .map_err(|e| AppError::Store(format!("cosmosdb query: {e}")))?;
+    let mut out = Vec::new();
+    while let Some(item) = pager.next().await {
+        out.push(item.map_err(|e| AppError::Store(format!("cosmosdb query item: {e}")))?);
+    }
+    Ok(out)
 }
 
 impl StorageBackend for CosmosDbBackend {
     fn keyspace(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
+        CosmosDbKeyspace::valid_name(name)?;
         Ok((
             name.to_string(),
             Arc::new(CosmosDbKeyspace {
-                client: self.client.clone(),
-                database: self.database.clone(),
-                container_name: name.to_string(),
+                container: self.container.clone(),
+                keyspace: name.to_string(),
             }),
         ))
     }
 
     fn batch(&self) -> Box<dyn BatchOps> {
         Box::new(CosmosDbBatch {
-            client: self.client.clone(),
-            database: self.database.clone(),
+            container: self.container.clone(),
             ops: Vec::new(),
         })
     }
@@ -136,6 +396,11 @@ impl StorageBackend for CosmosDbBackend {
         // Cosmos DB is fully managed; no-op.
         Box::pin(async { Ok(()) })
     }
+
+    fn max_item_bytes(&self) -> Option<usize> {
+        // The value is stored base64-encoded: 4 characters for 3 bytes.
+        Some((MAX_DOC_BYTES - DOC_OVERHEAD) / 4 * 3)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -143,37 +408,71 @@ impl StorageBackend for CosmosDbBackend {
 // ---------------------------------------------------------------------------
 
 struct CosmosDbKeyspace {
-    client: CosmosClient,
-    database: String,
-    container_name: String,
-}
-
-fn encode_doc_id(key: &[u8]) -> String {
-    BASE64.encode(key)
+    container: ContainerClient,
+    keyspace: String,
 }
 
 impl CosmosDbKeyspace {
-    async fn container(&self) -> Result<azure_data_cosmos::clients::ContainerClient, AppError> {
-        self.client
-            .database_client(&self.database)
-            .container_client(&self.container_name, None)
-            .await
-            .map_err(|e| AppError::Store(format!("cosmosdb container client: {e}")))
+    /// A keyspace name is non-empty and holds no NUL, the byte that ends it
+    /// inside an id ([`doc_id`]).
+    fn valid_name(name: &str) -> Result<(), AppError> {
+        if name.is_empty() || name.contains('\0') {
+            return Err(AppError::Store(format!("invalid keyspace name {name:?}")));
+        }
+        Ok(())
+    }
+
+    fn id(&self, key: &[u8]) -> String {
+        doc_id(&self.keyspace, key)
+    }
+
+    /// The key an id of this keyspace stands for, or `None` for an id of
+    /// another keyspace (one sharing the query's encoded prefix).
+    fn key_of(&self, id: &str) -> Result<Option<Vec<u8>>, AppError> {
+        let bytes = decode("key", id)?;
+        let scope = scoped(&self.keyspace, b"");
+        Ok(bytes
+            .starts_with(&scope)
+            .then(|| bytes[scope.len()..].to_vec()))
+    }
+
+    /// The id-prefix query for `prefix`: `SELECT {select}` of every item
+    /// whose id may stand for a key starting with it.
+    fn prefix_query(&self, select: &str, prefix: &[u8], tail: &str) -> Result<Query, AppError> {
+        Query::from(format!(
+            "SELECT {select} FROM c WHERE c.pk = @pk AND STARTSWITH(c.id, @prefix){tail}"
+        ))
+        .with_parameter("@pk", PARTITION_VALUE)
+        .map_err(query_param)?
+        .with_parameter(
+            "@prefix",
+            encoded_query_prefix(&scoped(&self.keyspace, prefix)),
+        )
+        .map_err(query_param)
+    }
+
+    /// The rows of `docs` whose key starts with `prefix`, decoded.
+    fn rows(&self, docs: Vec<KvDoc>, prefix: &[u8]) -> Result<Vec<RawKvPair>, AppError> {
+        let mut rows = Vec::new();
+        for doc in docs {
+            if let Some(key) = self.key_of(&doc.id)?
+                && key.starts_with(prefix)
+            {
+                rows.push((key, decode("value", &doc.data)?));
+            }
+        }
+        Ok(rows)
     }
 }
 
 impl KeyspaceOps for CosmosDbKeyspace {
     fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async move {
-            let container = self.container().await?;
-            let doc_id = encode_doc_id(&key);
-            let doc = KvDoc {
-                id: doc_id.clone(),
-                pk: PARTITION_VALUE.to_string(),
-                data: BASE64.encode(&value),
-            };
-            container
-                .upsert_item(PARTITION_VALUE, &doc_id, doc, None)
+            let id = self.id(&key);
+            let doc = value_doc(id.clone(), &value);
+            check_doc_size(&doc)?;
+            self.container
+                .upsert_item(PARTITION_VALUE, &id, doc, None)
                 .await
                 .map_err(|e| AppError::Store(format!("cosmosdb upsert: {e}")))?;
             Ok(())
@@ -182,17 +481,13 @@ impl KeyspaceOps for CosmosDbKeyspace {
 
     fn get_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
         Box::pin(async move {
-            let container = self.container().await?;
-            let doc_id = encode_doc_id(&key);
-            match container.read_item(PARTITION_VALUE, &doc_id, None).await {
+            let id = self.id(&key);
+            match self.container.read_item(PARTITION_VALUE, &id, None).await {
                 Ok(resp) => {
                     let doc: KvDoc = resp
                         .into_model()
                         .map_err(|e| AppError::Store(format!("cosmosdb read body: {e}")))?;
-                    let bytes = BASE64
-                        .decode(&doc.data)
-                        .map_err(|e| AppError::Store(format!("cosmosdb decode: {e}")))?;
-                    Ok(Some(bytes))
+                    Ok(Some(decode("value", &doc.data)?))
                 }
                 Err(e) if is_not_found(&e) => Ok(None),
                 Err(e) => Err(AppError::Store(format!("cosmosdb read: {e}"))),
@@ -202,9 +497,8 @@ impl KeyspaceOps for CosmosDbKeyspace {
 
     fn remove(&self, key: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async move {
-            let container = self.container().await?;
-            let doc_id = encode_doc_id(&key);
-            match container.delete_item(PARTITION_VALUE, &doc_id, None).await {
+            let id = self.id(&key);
+            match self.container.delete_item(PARTITION_VALUE, &id, None).await {
                 Ok(_) => Ok(()),
                 Err(e) if is_not_found(&e) => Ok(()),
                 Err(e) => Err(AppError::Store(format!("cosmosdb delete: {e}"))),
@@ -214,9 +508,8 @@ impl KeyspaceOps for CosmosDbKeyspace {
 
     fn contains_key(&self, key: Vec<u8>) -> BoxFuture<'_, Result<bool, AppError>> {
         Box::pin(async move {
-            let container = self.container().await?;
-            let doc_id = encode_doc_id(&key);
-            match container.read_item(PARTITION_VALUE, &doc_id, None).await {
+            let id = self.id(&key);
+            match self.container.read_item(PARTITION_VALUE, &id, None).await {
                 Ok(_) => Ok(true),
                 Err(e) if is_not_found(&e) => Ok(false),
                 Err(e) => Err(AppError::Store(format!("cosmosdb read: {e}"))),
@@ -231,10 +524,10 @@ impl KeyspaceOps for CosmosDbKeyspace {
         // one delete succeeds and returns the value; the rest see 404 (it's
         // gone) or 412 (it changed; re-read) and never return it.
         Box::pin(async move {
-            let container = self.container().await?;
-            let doc_id = encode_doc_id(&key);
+            let container = &self.container;
+            let id = self.id(&key);
             for _ in 0..CONDITIONAL_WRITE_ATTEMPTS {
-                let resp = match container.read_item(PARTITION_VALUE, &doc_id, None).await {
+                let resp = match container.read_item(PARTITION_VALUE, &id, None).await {
                     Ok(resp) => resp,
                     Err(e) if is_not_found(&e) => return Ok(None),
                     Err(e) => return Err(AppError::Store(format!("cosmosdb read: {e}"))),
@@ -250,15 +543,10 @@ impl KeyspaceOps for CosmosDbKeyspace {
                 let options =
                     ItemWriteOptions::default().with_precondition(Precondition::if_match(etag));
                 match container
-                    .delete_item(PARTITION_VALUE, &doc_id, Some(options))
+                    .delete_item(PARTITION_VALUE, &id, Some(options))
                     .await
                 {
-                    Ok(_) => {
-                        let bytes = BASE64
-                            .decode(&doc.data)
-                            .map_err(|e| AppError::Store(format!("cosmosdb decode: {e}")))?;
-                        return Ok(Some(bytes));
-                    }
+                    Ok(_) => return Ok(Some(decode("value", &doc.data)?)),
                     Err(e) if is_not_found(&e) => return Ok(None),
                     Err(e) if e.status().is_precondition_failed() => continue,
                     Err(e) => return Err(AppError::Store(format!("cosmosdb delete: {e}"))),
@@ -270,22 +558,18 @@ impl KeyspaceOps for CosmosDbKeyspace {
 
     fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
         // Optimistic concurrency: create the counter (a create 409s if the
-        // item already exists), or replace it `If-Match` the ETag just read. A racing writer on another replica
-        // makes the write fail (409/412) and this re-reads, so no increment
-        // is ever lost.
+        // item already exists), or replace it `If-Match` the ETag just read.
+        // A racing writer on another replica makes the write fail (409/412)
+        // and this re-reads, so no increment is ever lost.
         Box::pin(async move {
-            let container = self.container().await?;
-            let doc_id = encode_doc_id(&key);
-            let counter_doc = |n: u64| KvDoc {
-                id: doc_id.clone(),
-                pk: PARTITION_VALUE.to_string(),
-                data: BASE64.encode(encode_counter(n)),
-            };
+            let container = &self.container;
+            let id = self.id(&key);
+            let counter_doc = |n: u64| value_doc(id.clone(), &encode_counter(n));
             for _ in 0..CONDITIONAL_WRITE_ATTEMPTS {
-                match container.read_item(PARTITION_VALUE, &doc_id, None).await {
+                match container.read_item(PARTITION_VALUE, &id, None).await {
                     Err(e) if is_not_found(&e) => {
                         match container
-                            .create_item(PARTITION_VALUE, &doc_id, counter_doc(1), None)
+                            .create_item(PARTITION_VALUE, &id, counter_doc(1), None)
                             .await
                         {
                             Ok(_) => return Ok(1),
@@ -311,12 +595,7 @@ impl KeyspaceOps for CosmosDbKeyspace {
                         let options = ItemWriteOptions::default()
                             .with_precondition(Precondition::if_match(etag));
                         match container
-                            .replace_item(
-                                PARTITION_VALUE,
-                                &doc_id,
-                                counter_doc(next),
-                                Some(options),
-                            )
+                            .replace_item(PARTITION_VALUE, &id, counter_doc(next), Some(options))
                             .await
                         {
                             Ok(_) => return Ok(next),
@@ -346,24 +625,18 @@ impl KeyspaceOps for CosmosDbKeyspace {
         // there first. Either refusal means the key no longer holds what the
         // caller expected.
         Box::pin(async move {
-            let container = self.container().await?;
-            let doc_id = encode_doc_id(&key);
-            let doc = KvDoc {
-                id: doc_id.clone(),
-                pk: PARTITION_VALUE.to_string(),
-                data: BASE64.encode(&new),
-            };
+            let container = &self.container;
+            let id = self.id(&key);
+            let doc = value_doc(id.clone(), &new);
+            check_doc_size(&doc)?;
             let Some(expected) = expected else {
-                return match container
-                    .create_item(PARTITION_VALUE, &doc_id, doc, None)
-                    .await
-                {
+                return match container.create_item(PARTITION_VALUE, &id, doc, None).await {
                     Ok(_) => Ok(true),
                     Err(e) if e.status().is_conflict() => Ok(false),
                     Err(e) => Err(AppError::Store(format!("cosmosdb create: {e}"))),
                 };
             };
-            let resp = match container.read_item(PARTITION_VALUE, &doc_id, None).await {
+            let resp = match container.read_item(PARTITION_VALUE, &id, None).await {
                 Ok(resp) => resp,
                 Err(e) if is_not_found(&e) => return Ok(false),
                 Err(e) => return Err(AppError::Store(format!("cosmosdb read: {e}"))),
@@ -376,16 +649,13 @@ impl KeyspaceOps for CosmosDbKeyspace {
             let current: KvDoc = resp
                 .into_model()
                 .map_err(|e| AppError::Store(format!("cosmosdb read body: {e}")))?;
-            let current = BASE64
-                .decode(&current.data)
-                .map_err(|e| AppError::Store(format!("cosmosdb decode: {e}")))?;
-            if current != expected {
+            if decode("value", &current.data)? != expected {
                 return Ok(false);
             }
             let options =
                 ItemWriteOptions::default().with_precondition(Precondition::if_match(etag));
             match container
-                .replace_item(PARTITION_VALUE, &doc_id, doc, Some(options))
+                .replace_item(PARTITION_VALUE, &id, doc, Some(options))
                 .await
             {
                 Ok(_) => Ok(true),
@@ -397,45 +667,69 @@ impl KeyspaceOps for CosmosDbKeyspace {
 
     fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
         Box::pin(async move {
-            let container = self.container().await?;
+            let docs: Vec<KvDoc> =
+                query(&self.container, self.prefix_query("*", &prefix, "")?).await?;
+            self.rows(docs, &prefix)
+        })
+    }
 
-            let query = if prefix.is_empty() {
-                azure_data_cosmos::Query::from("SELECT * FROM c WHERE c.pk = @pk")
-                    .with_parameter("@pk", PARTITION_VALUE)
-                    .map_err(|e| AppError::Store(format!("cosmosdb query param: {e}")))?
-            } else {
-                let prefix_encoded = encode_doc_id(&prefix);
-                azure_data_cosmos::Query::from(
-                    "SELECT * FROM c WHERE c.pk = @pk AND STARTSWITH(c.id, @prefix)",
-                )
-                .with_parameter("@pk", PARTITION_VALUE)
-                .map_err(|e| AppError::Store(format!("cosmosdb query param: {e}")))?
-                .with_parameter("@prefix", &prefix_encoded)
-                .map_err(|e| AppError::Store(format!("cosmosdb query param: {e}")))?
-            };
+    /// One `SELECT TOP` page in id order, resumed after the cursor (the id
+    /// of the last item the previous page evaluated). Ids are base64, whose
+    /// order is not key order, so pages are not `ordered`; and an item of
+    /// another keyspace sharing the encoded prefix takes a place in a page,
+    /// so a page may come back short or empty while more follow.
+    fn prefix_page_raw(
+        &self,
+        prefix: Vec<u8>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Option<PrefixPage>, AppError>> {
+        Box::pin(async move {
+            let limit = limit.clamp(1, 10_000);
+            let after = cursor
+                .map(|c| {
+                    String::from_utf8(c)
+                        .map_err(|_| AppError::Store("cosmosdb page: malformed cursor".into()))
+                })
+                .transpose()?;
+            let mut q = self.prefix_query(
+                &format!("TOP {limit} *"),
+                &prefix,
+                if after.is_some() {
+                    " AND c.id > @after ORDER BY c.id"
+                } else {
+                    " ORDER BY c.id"
+                },
+            )?;
+            if let Some(after) = &after {
+                q = q.with_parameter("@after", after).map_err(query_param)?;
+            }
+            let docs: Vec<KvDoc> = query(&self.container, q).await?;
+            let next = (docs.len() == limit)
+                .then(|| docs.last().map(|d| d.id.clone().into_bytes()))
+                .flatten();
+            Ok(Some(PrefixPage {
+                rows: self.rows(docs, &prefix)?,
+                next,
+                ordered: false,
+            }))
+        })
+    }
 
-            let mut results = Vec::new();
-            let mut pager = container
-                .query_items::<KvDoc>(query, FeedScope::partition(PARTITION_VALUE), None)
-                .await
-                .map_err(|e| AppError::Store(format!("cosmosdb query: {e}")))?;
-
-            while let Some(item_result) = pager.next().await {
-                let doc: KvDoc = item_result
-                    .map_err(|e| AppError::Store(format!("cosmosdb query item: {e}")))?;
-                let key_bytes = BASE64
-                    .decode(&doc.id)
-                    .map_err(|e| AppError::Store(format!("cosmosdb decode key: {e}")))?;
-                // Verify prefix match on raw bytes
-                if key_bytes.starts_with(&prefix) {
-                    let val_bytes = BASE64
-                        .decode(&doc.data)
-                        .map_err(|e| AppError::Store(format!("cosmosdb decode val: {e}")))?;
-                    results.push((key_bytes, val_bytes));
+    /// `SELECT c.id`: the keys without their values.
+    fn prefix_keys_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<Vec<u8>>, AppError>> {
+        Box::pin(async move {
+            let ids: Vec<IdOnly> =
+                query(&self.container, self.prefix_query("c.id", &prefix, "")?).await?;
+            let mut keys = Vec::new();
+            for IdOnly { id } in ids {
+                if let Some(key) = self.key_of(&id)?
+                    && key.starts_with(&prefix)
+                {
+                    keys.push(key);
                 }
             }
-
-            Ok(results)
+            Ok(keys)
         })
     }
 }
@@ -467,85 +761,405 @@ fn is_not_found(err: &azure_data_cosmos::CosmosError) -> bool {
 // ---------------------------------------------------------------------------
 
 enum CosmosDbBatchOp {
-    Insert {
-        container: String,
-        key: Vec<u8>,
-        value: Vec<u8>,
-    },
-    Remove {
-        container: String,
-        key: Vec<u8>,
-    },
+    Upsert(KvDoc),
+    Delete(String),
+}
+
+impl CosmosDbBatchOp {
+    fn id(&self) -> &str {
+        match self {
+            Self::Upsert(doc) => &doc.id,
+            Self::Delete(id) => id,
+        }
+    }
+
+    /// What this operation counts against [`MAX_BATCH_BYTES`].
+    fn size(&self) -> usize {
+        match self {
+            Self::Upsert(doc) => doc.id.len() + doc.data.len() + DOC_OVERHEAD,
+            Self::Delete(id) => id.len() + DOC_OVERHEAD,
+        }
+    }
 }
 
 struct CosmosDbBatch {
-    client: CosmosClient,
-    database: String,
+    container: ContainerClient,
     ops: Vec<CosmosDbBatchOp>,
 }
 
 impl BatchOps for CosmosDbBatch {
     fn insert_raw(&mut self, keyspace: &str, key: Vec<u8>, value: Vec<u8>) {
-        self.ops.push(CosmosDbBatchOp::Insert {
-            container: keyspace.to_string(),
-            key,
-            value,
-        });
+        self.ops.push(CosmosDbBatchOp::Upsert(value_doc(
+            doc_id(keyspace, &key),
+            &value,
+        )));
     }
 
     fn remove(&mut self, keyspace: &str, key: Vec<u8>) {
-        self.ops.push(CosmosDbBatchOp::Remove {
-            container: keyspace.to_string(),
-            key,
-        });
+        self.ops
+            .push(CosmosDbBatchOp::Delete(doc_id(keyspace, &key)));
     }
 
     fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>> {
         Box::pin(async move {
-            for op in &self.ops {
-                let container_name = match op {
-                    CosmosDbBatchOp::Insert { container, .. } => container,
-                    CosmosDbBatchOp::Remove { container, .. } => container,
-                };
-                let container_client = self
-                    .client
-                    .database_client(&self.database)
-                    .container_client(container_name, None)
-                    .await
-                    .map_err(|e| {
-                        AppError::Store(format!("cosmosdb batch container client: {e}"))
-                    })?;
+            let ops = prepare_ops(self.ops)?;
+            if ops.is_empty() {
+                return Ok(());
+            }
+            check_one_batch(&ops)?;
+            send_batch(&self.container, &ops).await
+        })
+    }
 
-                match op {
-                    CosmosDbBatchOp::Insert { key, value, .. } => {
-                        let doc_id = encode_doc_id(key);
-                        let doc = KvDoc {
-                            id: doc_id.clone(),
-                            pk: PARTITION_VALUE.to_string(),
-                            data: BASE64.encode(value),
-                        };
-                        container_client
-                            .upsert_item(PARTITION_VALUE, &doc_id, doc, None)
-                            .await
-                            .map_err(|e| AppError::Store(format!("cosmosdb batch upsert: {e}")))?;
-                    }
-                    CosmosDbBatchOp::Remove { key, .. } => {
-                        let doc_id = encode_doc_id(key);
-                        match container_client
-                            .delete_item(PARTITION_VALUE, &doc_id, None)
-                            .await
-                        {
-                            Ok(_) => {}
-                            Err(e) if is_not_found(&e) => {}
-                            Err(e) => {
-                                return Err(AppError::Store(format!("cosmosdb batch delete: {e}")));
-                            }
-                        }
+    fn commit_in_parts(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>> {
+        Box::pin(async move {
+            let ops = prepare_ops(self.ops)?;
+            for part in split_batches(&ops) {
+                send_batch(&self.container, part).await?;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Check every item fits, then keep only the last operation on each item:
+/// applied in order, the batch leaves each item as its last operation says,
+/// and Cosmos DB fails a delete of an item an earlier operation removed.
+fn prepare_ops(ops: Vec<CosmosDbBatchOp>) -> Result<Vec<CosmosDbBatchOp>, AppError> {
+    for op in &ops {
+        if let CosmosDbBatchOp::Upsert(doc) = op {
+            check_doc_size(doc)?;
+        }
+    }
+    let mut last = std::collections::HashMap::with_capacity(ops.len());
+    for (i, op) in ops.iter().enumerate() {
+        last.insert(op.id().to_owned(), i);
+    }
+    Ok(ops
+        .into_iter()
+        .enumerate()
+        .filter(|(i, op)| last.get(op.id()) == Some(i))
+        .map(|(_, op)| op)
+        .collect())
+}
+
+/// Refuse a batch over one transactional batch's bound, before anything is
+/// sent, rather than splitting it into batches that could land part-way.
+fn check_one_batch(ops: &[CosmosDbBatchOp]) -> Result<(), AppError> {
+    let bytes: usize = ops.iter().map(CosmosDbBatchOp::size).sum();
+    if ops.len() > MAX_BATCH_OPS || bytes > MAX_BATCH_BYTES {
+        warn!(
+            writes = ops.len(),
+            bytes, "batch refused: over one Cosmos DB transactional batch"
+        );
+        return Err(AppError::quota(
+            QuotaKind::Size,
+            format!(
+                "a change of {} writes ({bytes} bytes) is over the store's size \
+             limit for one atomic write: {MAX_BATCH_OPS} writes and \
+             {MAX_BATCH_BYTES} bytes",
+                ops.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Split operations into runs that each fit one transactional batch. Every
+/// item already fits on its own, so no run is empty.
+fn split_batches(ops: &[CosmosDbBatchOp]) -> Vec<&[CosmosDbBatchOp]> {
+    let mut parts = Vec::new();
+    let (mut start, mut bytes) = (0, 0);
+    for (i, op) in ops.iter().enumerate() {
+        let size = op.size();
+        if i > start && (i - start == MAX_BATCH_OPS || bytes + size > MAX_BATCH_BYTES) {
+            parts.push(&ops[start..i]);
+            (start, bytes) = (i, 0);
+        }
+        bytes += size;
+    }
+    if start < ops.len() {
+        parts.push(&ops[start..]);
+    }
+    parts
+}
+
+/// How a transactional batch ended.
+enum BatchOutcome {
+    Applied,
+    /// An item it deleted was not there: nothing was applied.
+    DeleteMissed,
+}
+
+/// Send `ops` as one transactional batch: applied whole or not at all.
+///
+/// A batch delete of a missing item fails the whole batch, where a single
+/// `remove` of a missing key succeeds; so the deletes are first narrowed to
+/// the items that exist. One deleted by someone else between that check and
+/// the batch fails it with nothing applied, and it is re-run.
+async fn send_batch(container: &ContainerClient, ops: &[CosmosDbBatchOp]) -> Result<(), AppError> {
+    for _ in 0..BATCH_ATTEMPTS {
+        let mut batch = TransactionalBatch::new(PARTITION_VALUE);
+        let mut count = 0;
+        for op in ops {
+            match op {
+                CosmosDbBatchOp::Upsert(doc) => {
+                    batch = batch
+                        .upsert_item(doc, None)
+                        .map_err(|e| AppError::Store(format!("cosmosdb batch upsert: {e}")))?;
+                    count += 1;
+                }
+                CosmosDbBatchOp::Delete(id) => {
+                    if exists(container, id).await? {
+                        batch = batch.delete_item(id.clone(), None);
+                        count += 1;
                     }
                 }
             }
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        match execute(container, batch).await? {
+            BatchOutcome::Applied => return Ok(()),
+            BatchOutcome::DeleteMissed => continue,
+        }
+    }
+    Err(AppError::Store(
+        "cosmosdb batch: items it deletes keep vanishing under it".into(),
+    ))
+}
 
-            Ok(())
-        })
+async fn exists(container: &ContainerClient, id: &str) -> Result<bool, AppError> {
+    match container.read_item(PARTITION_VALUE, id, None).await {
+        Ok(_) => Ok(true),
+        Err(e) if is_not_found(&e) => Ok(false),
+        Err(e) => Err(AppError::Store(format!("cosmosdb read: {e}"))),
+    }
+}
+
+async fn execute(
+    container: &ContainerClient,
+    batch: TransactionalBatch,
+) -> Result<BatchOutcome, AppError> {
+    let response = match container.execute_transactional_batch(batch, None).await {
+        Ok(response) => response,
+        Err(e) if is_not_found(&e) => return Ok(BatchOutcome::DeleteMissed),
+        Err(e) => return Err(AppError::Store(format!("cosmosdb batch: {e}"))),
+    };
+    let results = response
+        .into_model()
+        .map_err(|e| AppError::Store(format!("cosmosdb batch response: {e}")))?;
+    // A failed batch reports the operation that failed with its own status,
+    // and every other one with 424 (failed dependency).
+    match results
+        .results()
+        .iter()
+        .find(|r| !r.is_success() && r.status_code() != 424)
+    {
+        None if results.results().iter().all(|r| r.is_success()) => Ok(BatchOutcome::Applied),
+        Some(r) if r.status_code() == 404 => Ok(BatchOutcome::DeleteMissed),
+        Some(r) => Err(AppError::Store(format!(
+            "cosmosdb batch: an operation failed with {}",
+            r.status_code()
+        ))),
+        None => Err(AppError::Store("cosmosdb batch: not applied".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every byte pattern of length `len`, sampled: all values in the first
+    /// and last positions, a spread in between.
+    fn samples(len: usize) -> Vec<Vec<u8>> {
+        let edge: Vec<u8> = vec![
+            0x00, 0x01, 0x3f, 0x40, 0x41, 0x7f, 0x80, 0xbf, 0xc0, 0xfe, 0xff,
+        ];
+        let mut out = Vec::new();
+        for (i, a) in (0u8..=255).enumerate() {
+            let mut v = vec![b'k'; len];
+            v[0] = a;
+            if len > 1 {
+                v[len - 1] = edge[i % edge.len()];
+            }
+            out.push(v);
+        }
+        out
+    }
+
+    /// #342: an id-prefix query must find every key starting with the
+    /// prefix, whatever the prefix's length; the exact byte check after
+    /// decoding then drops the rest. Encoding the whole prefix found nothing
+    /// for most lengths (`did:` never matched `did:abc`).
+    #[test]
+    fn the_encoded_query_prefix_matches_every_key_with_the_byte_prefix() {
+        let keys: Vec<Vec<u8>> = (1..=14).flat_map(samples).collect();
+        for len in 1..=9 {
+            for key in keys.iter().filter(|k| k.len() >= len) {
+                let prefix = &key[..len];
+                let query = encoded_query_prefix(prefix);
+                assert!(
+                    BASE64.encode(key).starts_with(&query),
+                    "len {len}: {key:?} not found by {query:?}"
+                );
+            }
+        }
+        // The old encoding missed these.
+        assert!(
+            !BASE64
+                .encode(b"did:abc")
+                .starts_with(&BASE64.encode(b"did:"))
+        );
+        assert!(
+            BASE64
+                .encode(b"did:abc")
+                .starts_with(&encoded_query_prefix(b"did:"))
+        );
+        assert_eq!(encoded_query_prefix(b"di"), "");
+    }
+
+    #[test]
+    fn ids_keep_keyspaces_apart() {
+        // A keyspace name holding a NUL, the one way two ids could meet, is refused.
+        assert!(
+            CosmosDbKeyspace::valid_name("a\0b").is_err()
+                && CosmosDbKeyspace::valid_name("").is_err()
+        );
+        assert_ne!(doc_id("dids", b"x"), doc_id("did", b"sx"));
+        assert_eq!(
+            decode("id", &doc_id("dids", b"did:x")).unwrap(),
+            b"dids\0did:x"
+        );
+    }
+
+    #[test]
+    fn a_batch_keeps_each_items_last_operation_and_its_bound() {
+        let up = |id: &str| CosmosDbBatchOp::Upsert(value_doc(id.into(), b"v"));
+        let ops = prepare_ops(vec![
+            up("a"),
+            CosmosDbBatchOp::Delete("b".into()),
+            CosmosDbBatchOp::Delete("a".into()),
+            up("b"),
+        ])
+        .unwrap();
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(&ops[0], CosmosDbBatchOp::Delete(id) if id == "a"));
+        assert!(matches!(&ops[1], CosmosDbBatchOp::Upsert(doc) if doc.id == "b"));
+
+        let many: Vec<_> = (0..101).map(|i| up(&format!("k{i}"))).collect();
+        check_one_batch(&many[..100]).unwrap();
+        let err = check_one_batch(&many).unwrap_err();
+        assert!(matches!(err, AppError::QuotaExceeded { .. }), "{err:?}");
+        let lens: Vec<_> = split_batches(&many).iter().map(|p| p.len()).collect();
+        assert_eq!(lens, [100, 1]);
+    }
+
+    #[test]
+    fn an_item_over_2_mb_after_encoding_is_refused() {
+        let max = (MAX_DOC_BYTES - DOC_OVERHEAD) / 4 * 3;
+        let id = doc_id("dids", b"k");
+        check_doc_size(&value_doc(id.clone(), &vec![b'x'; max - 64])).unwrap();
+        let err = check_doc_size(&value_doc(id, &vec![b'x'; max + 1])).unwrap_err();
+        assert!(matches!(err, AppError::QuotaExceeded { .. }), "{err:?}");
+    }
+}
+
+/// The whole backend against the Cosmos DB SDK's in-memory emulator: the
+/// conformance suite, and the copy from per-keyspace containers.
+#[cfg(all(test, feature = "cosmosdb-emulator"))]
+mod emulator_tests {
+    use azure_core::http::Url;
+    use azure_data_cosmos::CosmosRuntimeBuilder;
+    use azure_data_cosmos_driver::in_memory_emulator::{
+        InMemoryEmulatorHttpClient, VirtualAccountConfig, VirtualRegion,
+    };
+
+    use super::*;
+    use crate::server::store::{Store, conformance};
+
+    const GATEWAY_URL: &str = "https://eastus.emulator.local";
+
+    async fn emulated_client() -> CosmosClient {
+        let config = VirtualAccountConfig::new(vec![VirtualRegion::new(
+            "East US",
+            Url::parse(GATEWAY_URL).unwrap(),
+        )])
+        .unwrap();
+        let emulator = Arc::new(InMemoryEmulatorHttpClient::new(config));
+        let account = AccountReference::with_authentication_key(
+            GATEWAY_URL.parse::<AccountEndpoint>().unwrap(),
+            azure_core::credentials::Secret::new("dGVzdGtleQ=="),
+        );
+        CosmosClient::builder()
+            .with_runtime(
+                CosmosRuntimeBuilder::from(emulator.runtime_builder())
+                    .build()
+                    .await
+                    .unwrap(),
+            )
+            .build(account, RoutingStrategy::ProximityTo(Region::EAST_US))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_suite() {
+        let client = emulated_client().await;
+        let backend = CosmosDbBackend::with_client(&client, "webvh", "kv")
+            .await
+            .unwrap();
+        let store = Store::from_backend(Box::new(backend));
+        conformance::run(&store, &conformance::namespace()).await;
+    }
+
+    /// A keyspace an earlier release kept in a container of its own is
+    /// copied into the shared container on open, and only once.
+    #[tokio::test]
+    async fn keyspaces_in_their_own_containers_are_copied_in_once() {
+        let client = emulated_client().await;
+        client.create_database("webvh", None).await.unwrap();
+        let db = client.database_client("webvh");
+        db.create_container(ContainerProperties::new("dids", "/pk".into()), None)
+            .await
+            .unwrap();
+        let legacy = db.container_client("dids", None).await.unwrap();
+        for (key, value) in [("did:a", "1"), ("did:b", "2")] {
+            let id = BASE64.encode(key);
+            legacy
+                .upsert_item(
+                    PARTITION_VALUE,
+                    &id,
+                    value_doc(id.clone(), value.as_bytes()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let backend = CosmosDbBackend::with_client(&client, "webvh", "kv")
+            .await
+            .unwrap();
+        let store = Store::from_backend(Box::new(backend));
+        let dids = store.keyspace("dids").unwrap();
+        let mut rows = dids.prefix_iter_raw("did:").await.unwrap();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (b"did:a".to_vec(), b"1".to_vec()),
+                (b"did:b".to_vec(), b"2".to_vec())
+            ]
+        );
+
+        // Marked done: a second open copies nothing back.
+        dids.remove("did:a").await.unwrap();
+        let again = CosmosDbBackend::with_client(&client, "webvh", "kv")
+            .await
+            .unwrap();
+        let store = Store::from_backend(Box::new(again));
+        let dids = store.keyspace("dids").unwrap();
+        assert_eq!(dids.get_raw("did:a").await.unwrap(), None);
+        assert_eq!(dids.get_raw("did:b").await.unwrap(), Some(b"2".to_vec()));
     }
 }

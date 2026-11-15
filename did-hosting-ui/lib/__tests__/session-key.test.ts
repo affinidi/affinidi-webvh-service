@@ -19,11 +19,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import {
-  generateSessionKeypair,
-  signEnvelope,
-  type SignableEnvelope,
-} from "../session-key";
+import { generateSessionKeypair, signEnvelope, type SignableEnvelope } from "../session-key";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -40,8 +36,8 @@ async function captureSessionKeypair(): Promise<{
   const spy = vi.spyOn(crypto.subtle, "generateKey");
   const result = await generateSessionKeypair();
   expect(spy).toHaveBeenCalledOnce();
-  const keypair = (await spy.mock.results[0].value) as CryptoKeyPair;
-  return { keypair, extractableArg: spy.mock.calls[0][1], result };
+  const keypair = (await spy.mock.results[0]!.value) as CryptoKeyPair;
+  return { keypair, extractableArg: spy.mock.calls[0]![1], result };
 }
 
 describe("generateSessionKeypair", () => {
@@ -51,12 +47,12 @@ describe("generateSessionKeypair", () => {
     expect(extractableArg).toBe(false);
     expect(keypair.privateKey.extractable).toBe(false);
 
-    await expect(
-      crypto.subtle.exportKey("pkcs8", keypair.privateKey),
-    ).rejects.toThrow(/not extractable/i);
-    await expect(
-      crypto.subtle.exportKey("jwk", keypair.privateKey),
-    ).rejects.toThrow(/not extractable/i);
+    await expect(crypto.subtle.exportKey("pkcs8", keypair.privateKey)).rejects.toThrow(
+      /not extractable/i,
+    );
+    await expect(crypto.subtle.exportKey("jwk", keypair.privateKey)).rejects.toThrow(
+      /not extractable/i,
+    );
   });
 
   it("still exports the raw public key, which is what the flag is not for", async () => {
@@ -67,9 +63,7 @@ describe("generateSessionKeypair", () => {
     // records, and the reason `false` costs nothing here.
     expect(keypair.publicKey.extractable).toBe(true);
 
-    const raw = new Uint8Array(
-      await crypto.subtle.exportKey("raw", keypair.publicKey),
-    );
+    const raw = new Uint8Array(await crypto.subtle.exportKey("raw", keypair.publicKey));
     expect(raw).toHaveLength(32);
     expect(result.pubkeyMultikey).toMatch(/^z6Mk/);
     expect(result.didKey).toBe(`did:key:${result.pubkeyMultikey}`);
@@ -79,7 +73,7 @@ describe("generateSessionKeypair", () => {
     // A non-extractable key is still a usable signing key; if this ever
     // regresses, the temptation is to "fix" it by making it extractable.
     await generateSessionKeypair();
-    const envelope: SignableEnvelope = { id: "urn:test", value: 1 };
+    const envelope: SignableEnvelope & { id: string; value: number } = { id: "urn:test", value: 1 };
     const proof = (await signEnvelope(envelope)).proof as Record<string, unknown>;
 
     expect(proof.cryptosuite).toBe("eddsa-jcs-2022");

@@ -530,8 +530,11 @@ pub fn reconcile_listener_protocols(
 /// - with TSP on, the listener persists its TSP relationships in `store`, so a
 ///   rebuild does not forget every peer.
 ///
-/// Returns the listener and the transports it carries; the caller starts the
-/// service with a TSP handler when `transports.tsp` is set.
+/// Returns the listener and the transports it carries. The caller starts the
+/// service with its TSP handler *always* installed (`start_with_tsp`), not only
+/// when `transports.tsp` is set: the listener's `protocols` gate TSP dispatch,
+/// and the service keeps one handler for its lifetime, so only a service that
+/// has one can pick up TSP when [`rebuild_own_listener`] turns it on later.
 pub async fn build_own_listener(
     listener_id: &str,
     identity: &ServiceIdentity,

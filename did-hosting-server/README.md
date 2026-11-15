@@ -295,9 +295,9 @@ external services.
 | ------------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------ |
 | Fjall (default, embedded) | `store-fjall`     | `store.data_dir`                                                                                             |
 | Redis                     | `store-redis`     | `store.redis_url`                                                                                            |
-| AWS DynamoDB              | `store-dynamodb`  | `store.dynamodb_table`, `store.dynamodb_region`                                                              |
+| AWS DynamoDB              | `store-dynamodb`  | `store.dynamodb_table_prefix`, `store.dynamodb_region`, `store.dynamodb_billing_mode`, `store.dynamodb_auto_create` |
 | Google Firestore          | `store-firestore` | `store.firestore_project`, `store.firestore_database`                                                        |
-| Azure Cosmos DB           | `store-cosmosdb`  | `store.cosmosdb_endpoint`, `store.cosmosdb_database`, `store.cosmosdb_container`, `store.cosmosdb_region`    |
+| Azure Cosmos DB           | `store-cosmosdb`  | `store.cosmosdb_connection_string`, `store.cosmosdb_database`, `store.cosmosdb_container`, `store.cosmosdb_region` |
 
 A DID's whole log is stored as one item, so a backend's item size limit is
 the largest log it can hold: about 400 KB on DynamoDB, and about 750 KB on

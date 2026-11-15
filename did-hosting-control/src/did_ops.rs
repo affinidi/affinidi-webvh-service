@@ -90,6 +90,36 @@ async fn check_did_host_safety(
     .await
 }
 
+/// Cross-check a caller's explicit domain against the host of the DID it is
+/// publishing (a DID's host IS its domain).
+///
+/// The VTA re-sends the domain it intends on `did/register` and on publish to
+/// catch a misconfigured caller before the log lands on the wrong tenant's
+/// slot, and documents a `did-management:unknown_domain` rejection when the
+/// two disagree (R3.6: a safety parameter the client sends must be enforced,
+/// never accepted and ignored). An absent or empty domain means "no explicit
+/// claim" and passes. Compared in the decoded form `extract_did_host`
+/// returns, case-insensitively, as a hostname is.
+fn ensure_requested_domain_matches_did(
+    request_domain: Option<&str>,
+    did_id: &str,
+) -> Result<(), AppError> {
+    let Some(requested) = request_domain.filter(|d| !d.is_empty()) else {
+        return Ok(());
+    };
+    let host = did_hosting_common::server::domain::extract_did_host(did_id)?;
+    if !requested.eq_ignore_ascii_case(&host) {
+        return Err(AppError::validation(
+            ValidationKind::UnknownDomain,
+            format!(
+                "did-management:unknown_domain — requested domain `{requested}` does \
+                 not match the DID's host `{host}`",
+            ),
+        ));
+    }
+    Ok(())
+}
+
 // Re-export for convenience
 pub use did_hosting_common::did_ops::{
     extract_did_id, extract_log_metadata, extract_service_types,
@@ -683,9 +713,17 @@ pub async fn register_did_atomic(
     // against that slot would be a tautology — the real binding is that
     // the key event log establishes the AID the identifier ends in, and
     // `verify_publication` has already enforced it.
+    //
+    // The same holds for the caller's explicit `domain`: a did:webs
+    // identifier is built *from* it, so it agrees by construction. A
+    // did:webvh identifier is not — it is read from the signed log — so the
+    // domain the caller says it is publishing into must be the DID's host,
+    // or the request is refused as `unknown_domain` before anything is
+    // written, exactly as `publish_did` refuses it.
     if publication.method != "webs" {
         did_ops::validate_did_id_matches_request(&did_id, path, server_base_url)
             .map_err(AppError::invalid)?;
+        ensure_requested_domain_matches_did(domain, &did_id)?;
     }
 
     // `path_guard`, acquired above, already covers this read: without it,
@@ -765,21 +803,29 @@ pub async fn register_did_atomic(
         // disagreed with its bytes would be served by the wrong
         // resolver.
         method: publication.method.to_string(),
-        // T13 migration fills `domain` for legacy records; a did:webs
-        // record must carry it from the start, because its identifier
-        // cannot be rebuilt without it.
+        // Every method's record carries its domain: the per-domain listing
+        // and UI filter key on it, and a did:webs record's identifier cannot
+        // be rebuilt without it. (This used to be written empty for webvh,
+        // which wiped the domain a reserved slot or an earlier publish had
+        // recorded every time its owner re-registered.)
         //
         // Taken from the DID rather than from the request parameter so
         // it lands in the same *decoded* form every other record uses
         // (`extract_did_host` percent-decodes `%3A` back to `:`). The
         // edge derives its copy the same way, so the two agree; storing
         // the raw parameter here would make the control plane and its
-        // edges disagree about the domain of the same DID.
-        domain: if publication.method == "webs" {
-            did_hosting_common::server::domain::extract_did_host(&did_id).unwrap_or_default()
-        } else {
-            String::new()
-        },
+        // edges disagree about the domain of the same DID. A DID whose
+        // host cannot be read keeps whatever the slot already recorded.
+        domain: did_hosting_common::server::domain::extract_did_host(&did_id)
+            .ok()
+            .filter(|h| !h.is_empty())
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|r| r.domain.clone())
+                    .filter(|d| !d.is_empty())
+            })
+            .unwrap_or_default(),
 
         services: publication.services(),
 
@@ -1018,19 +1064,8 @@ async fn prepare_republish(
     // wrong tenant's slot; without this check the parameter was silently
     // ignored and the advertised `did-management:unknown_domain` rejection did
     // not exist on the wire.
-    if let Some(requested) = request_domain.filter(|d| !d.is_empty())
-        && let Some(did_id) = did_id_val.as_deref()
-    {
-        let host = did_hosting_common::server::domain::extract_did_host(did_id)?;
-        if !requested.eq_ignore_ascii_case(&host) {
-            return Err(AppError::validation(
-                ValidationKind::UnknownDomain,
-                format!(
-                    "did-management:unknown_domain — requested domain `{requested}` does \
-                 not match the DID's host `{host}`",
-                ),
-            ));
-        }
+    if let Some(did_id) = did_id_val.as_deref() {
+        ensure_requested_domain_matches_did(request_domain, did_id)?;
     }
 
     record.updated_at = now_epoch();
@@ -4394,6 +4429,127 @@ mod tests_atomic {
             matches!(err, AppError::Validation { message: ref m, .. } if m.contains("unknown_domain")),
             "mismatched domain must be rejected as unknown_domain, got {err:?}"
         );
+    }
+
+    /// `did/register` enforces the caller's explicit domain exactly as publish
+    /// does (R3.6): a did:webvh log whose host is not the stated domain is
+    /// refused as `did-management:unknown_domain` before anything is written;
+    /// a matching (case-insensitive) or omitted domain registers.
+    #[tokio::test]
+    async fn register_cross_checks_explicit_domain_against_did_host() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "register-domain-xcheck";
+        let did_log = build_test_did_log("scid-reg-domain", "control.test", path).await;
+
+        // Mismatched domain → rejected, and the slot stays empty.
+        let err = register_did_atomic(
+            &owner_auth(owner),
+            &state,
+            path,
+            &did_log,
+            false,
+            Some("evil.example"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Validation { message: ref m, .. } if m.contains("unknown_domain")),
+            "mismatched domain must be rejected as unknown_domain, got {err:?}"
+        );
+        let record: Option<DidRecord> = state.dids_ks.get(did_key(path)).await.unwrap();
+        assert!(record.is_none(), "a refused register must write nothing");
+        assert!(
+            state
+                .dids_ks
+                .get_raw(content_log_key(path))
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused register must not store the log"
+        );
+
+        // Matching domain (any case) → registers.
+        register_did_atomic(
+            &owner_auth(owner),
+            &state,
+            path,
+            &did_log,
+            false,
+            Some("Control.Test"),
+        )
+        .await
+        .expect("matching domain registers");
+
+        // Omitted domain → unchanged behaviour: registers.
+        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
+            .await
+            .expect("omitted domain still registers");
+
+        // And a mismatch on a re-register of the now-owned slot is refused too.
+        let err = register_did_atomic(
+            &owner_auth(owner),
+            &state,
+            path,
+            &did_log,
+            false,
+            Some("evil.example"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Validation { message: ref m, .. } if m.contains("unknown_domain")),
+            "mismatched domain on re-register must be rejected, got {err:?}"
+        );
+    }
+
+    /// A webvh record registered through `did/register` carries its domain
+    /// (the DID's host), and a re-register keeps it rather than wiping it to
+    /// `""` — the per-domain listing keys on it.
+    #[tokio::test]
+    async fn register_records_and_keeps_the_webvh_domain() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner";
+        let path = "register-keeps-domain";
+        let did_log = build_test_did_log("scid-keep-domain", "control.test", path).await;
+
+        let first = register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.domain, "control.test",
+            "fresh register records the domain"
+        );
+
+        let again = register_did_atomic(
+            &owner_auth(owner),
+            &state,
+            path,
+            &did_log,
+            false,
+            Some("control.test"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.domain, "control.test", "re-register keeps the domain");
+
+        let stored: DidRecord = state.dids_ks.get(did_key(path)).await.unwrap().unwrap();
+        assert_eq!(
+            stored.domain, "control.test",
+            "the stored record keeps it too"
+        );
+        assert_eq!(stored.version_count, 2);
+
+        // A slot reserved with a domain, then registered into, keeps it.
+        let reserved = "register-reserved-domain";
+        create_did(&owner_auth(owner), &state, Some(reserved), false, None)
+            .await
+            .unwrap();
+        let log = build_test_did_log("scid-reserved-domain", "control.test", reserved).await;
+        let rec = register_did_atomic(&owner_auth(owner), &state, reserved, &log, false, None)
+            .await
+            .unwrap();
+        assert_eq!(rec.domain, "control.test");
     }
 
     /// Failed publishes (auth denied, validation error, missing slot) must

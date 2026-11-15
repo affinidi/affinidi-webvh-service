@@ -5,7 +5,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { api, resetServiceInfo, type RevokePasskeyStartResponse } from "../api";
+import { resetServiceInfo, type RevokePasskeyStartResponse } from "../api";
 import { completeRevocation, startRevocation, RevocationError } from "../revoke-flow";
 import { generateSessionKeypair } from "../session-key";
 import {
@@ -31,7 +31,7 @@ const UV_OPTIONS: RevokePasskeyStartResponse["uvOptions"] = {
 const ASSERTION = {
   id: "b2xk",
   rawId: "b2xk",
-  type: "public-key",
+  type: "public-key" as const,
   response: { authenticatorData: "YQ", clientDataJSON: "Yw", signature: "cw" },
 };
 

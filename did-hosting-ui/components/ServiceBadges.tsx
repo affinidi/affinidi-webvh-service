@@ -35,10 +35,7 @@ export const SERVICE_TYPE_DIDCOMM = "DIDCommMessaging";
  * would be more confusing). Handled the same way the resolver's implicit
  * `#whois` / `#files` services are: known, but not shown.
  */
-const HIDDEN_SERVICE_TYPES = new Set<string>([
-  SERVICE_TYPE_HOSTING,
-  SERVICE_TYPE_HOSTING_LEGACY,
-]);
+const HIDDEN_SERVICE_TYPES = new Set<string>([SERVICE_TYPE_HOSTING, SERVICE_TYPE_HOSTING_LEGACY]);
 
 export type BadgeKind = "tsp" | "didcomm" | "other";
 
@@ -83,23 +80,18 @@ export function badgeKinds(serviceTypes: string[]): BadgeKind[] {
 
 /** The raw type strings that folded into the `other` badge, for the tooltip. */
 function otherTypes(serviceTypes: string[]): string[] {
-  return serviceTypes.filter(
-    (t) => !HIDDEN_SERVICE_TYPES.has(t) && kindOf(t) === "other",
-  );
+  return serviceTypes.filter((t) => !HIDDEN_SERVICE_TYPES.has(t) && kindOf(t) === "other");
 }
 
-export function ServiceBadge({
-  kind,
-  title,
-}: {
-  kind: BadgeKind;
-  title?: string;
-}) {
+export function ServiceBadge({ kind, title }: { kind: BadgeKind; title?: string }) {
   const { bg, fg } = BADGE_COLORS[kind];
   return (
     <View style={[styles.badge, { backgroundColor: bg }]}>
       {/* `title` renders as a native tooltip on react-native-web. */}
-      <Text style={[styles.badgeText, { color: fg }]} {...({ title } as any)}>
+      <Text
+        style={[styles.badgeText, { color: fg }]}
+        {...(title ? ({ title } as Record<string, string>) : {})}
+      >
         {BADGE_LABELS[kind]}
       </Text>
     </View>
@@ -124,9 +116,7 @@ export function ServiceBadges({
 }) {
   if (!services) return null;
   if (services.length === 0) {
-    return emptyLabel ? (
-      <Text style={styles.emptyText}>{emptyLabel}</Text>
-    ) : null;
+    return emptyLabel ? <Text style={styles.emptyText}>{emptyLabel}</Text> : null;
   }
 
   const kinds = badgeKinds(services);
@@ -135,11 +125,7 @@ export function ServiceBadges({
   return (
     <View style={styles.row}>
       {kinds.map((k) => (
-        <ServiceBadge
-          key={k}
-          kind={k}
-          title={k === "other" ? others.join(", ") : undefined}
-        />
+        <ServiceBadge key={k} kind={k} title={k === "other" ? others.join(", ") : undefined} />
       ))}
     </View>
   );
