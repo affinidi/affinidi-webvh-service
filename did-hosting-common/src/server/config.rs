@@ -1957,51 +1957,7 @@ pub fn apply_env_overrides(
     }
 
     // Store
-    let store_data_dir_var = format!("{prefix}_STORE_DATA_DIR");
-    if let Ok(data_dir) = std::env::var(&store_data_dir_var) {
-        store.data_dir = PathBuf::from(data_dir);
-    }
-    env_opt!(&format!("{prefix}_STORE_REDIS_URL"), store.redis_url);
-    env_opt!(
-        &format!("{prefix}_STORE_DYNAMODB_TABLE_PREFIX"),
-        store.dynamodb_table_prefix
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_DYNAMODB_REGION"),
-        store.dynamodb_region
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_DYNAMODB_BILLING_MODE"),
-        store.dynamodb_billing_mode
-    );
-    let auto_create_var = format!("{prefix}_STORE_DYNAMODB_AUTO_CREATE");
-    if let Ok(v) = std::env::var(&auto_create_var) {
-        store.dynamodb_auto_create = Some(parse_env_bool(&auto_create_var, &v)?);
-    }
-    env_opt!(
-        &format!("{prefix}_STORE_FIRESTORE_PROJECT"),
-        store.firestore_project
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_FIRESTORE_DATABASE"),
-        store.firestore_database
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_COSMOSDB_CONNECTION_STRING"),
-        store.cosmosdb_connection_string
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_COSMOSDB_DATABASE"),
-        store.cosmosdb_database
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_COSMOSDB_CONTAINER"),
-        store.cosmosdb_container
-    );
-    env_opt!(
-        &format!("{prefix}_STORE_COSMOSDB_REGION"),
-        store.cosmosdb_region
-    );
+    apply_store_env_overrides(&format!("{prefix}_STORE"), store)?;
 
     // Auth
     env_parse!(
@@ -2138,6 +2094,62 @@ pub fn apply_env_overrides(
         secrets.k8s_secret_key
     );
 
+    Ok(())
+}
+
+/// Apply the `{prefix}_*` store overrides (`_DATA_DIR`, `_REDIS_URL`,
+/// `_DYNAMODB_TABLE_PREFIX`, …) to one [`StoreConfig`].
+///
+/// [`apply_env_overrides`] calls it with `{PREFIX}_STORE`; a binary with a
+/// second store calls it once more with that store's own prefix (the daemon's
+/// `[witness_store]` reads `DAEMON_WITNESS_STORE_*`).
+pub fn apply_store_env_overrides(prefix: &str, store: &mut StoreConfig) -> Result<(), AppError> {
+    macro_rules! env_opt {
+        ($var:expr, $field:expr) => {
+            if let Ok(v) = std::env::var($var) {
+                $field = Some(v);
+            }
+        };
+    }
+    let store_data_dir_var = format!("{prefix}_DATA_DIR");
+    if let Ok(data_dir) = std::env::var(&store_data_dir_var) {
+        store.data_dir = PathBuf::from(data_dir);
+    }
+    env_opt!(&format!("{prefix}_REDIS_URL"), store.redis_url);
+    env_opt!(
+        &format!("{prefix}_DYNAMODB_TABLE_PREFIX"),
+        store.dynamodb_table_prefix
+    );
+    env_opt!(&format!("{prefix}_DYNAMODB_REGION"), store.dynamodb_region);
+    env_opt!(
+        &format!("{prefix}_DYNAMODB_BILLING_MODE"),
+        store.dynamodb_billing_mode
+    );
+    let auto_create_var = format!("{prefix}_DYNAMODB_AUTO_CREATE");
+    if let Ok(v) = std::env::var(&auto_create_var) {
+        store.dynamodb_auto_create = Some(parse_env_bool(&auto_create_var, &v)?);
+    }
+    env_opt!(
+        &format!("{prefix}_FIRESTORE_PROJECT"),
+        store.firestore_project
+    );
+    env_opt!(
+        &format!("{prefix}_FIRESTORE_DATABASE"),
+        store.firestore_database
+    );
+    env_opt!(
+        &format!("{prefix}_COSMOSDB_CONNECTION_STRING"),
+        store.cosmosdb_connection_string
+    );
+    env_opt!(
+        &format!("{prefix}_COSMOSDB_DATABASE"),
+        store.cosmosdb_database
+    );
+    env_opt!(
+        &format!("{prefix}_COSMOSDB_CONTAINER"),
+        store.cosmosdb_container
+    );
+    env_opt!(&format!("{prefix}_COSMOSDB_REGION"), store.cosmosdb_region);
     Ok(())
 }
 

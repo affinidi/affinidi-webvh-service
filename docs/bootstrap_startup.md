@@ -608,6 +608,9 @@ backends you'll use — they each pull a sizable cloud SDK.
 | `<PREFIX>_STORE_COSMOSDB_CONTAINER` | Cosmos DB container holding every keyspace (default `kv`, partitioned on `/pk`, created if missing) |
 | `<PREFIX>_STORE_COSMOSDB_REGION` | Azure region (display form `"West US 2"` or normalised `"westus2"`; defaults to `eastus`) |
 
+The daemon's second store, `[witness_store]`, takes the same variables
+under `DAEMON_WITNESS_STORE_` (for example `DAEMON_WITNESS_STORE_REDIS_URL`).
+
 Storage backends are mutually exclusive — exactly one of `store-fjall`,
 `store-redis`, `store-dynamodb`, `store-firestore`, `store-cosmosdb`
 must be enabled at build time.

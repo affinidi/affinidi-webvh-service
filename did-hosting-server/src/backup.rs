@@ -1,8 +1,13 @@
 use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::store::{RawKvPair, Store};
+#[cfg(test)]
 use base64::Engine;
+#[cfg(test)]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
+use did_hosting_common::server::backup::{
+    BATCH_SIZE, KvEntry, decode_entry, encode_pairs, restore_keyspace, write_pairs,
+};
 use did_hosting_common::server::store::{
     KS_ASSIGNMENTS, KS_DIDS, KS_DOMAINS, KS_META, KS_PENDING_PURGES, KS_REGISTRY, KS_STATS,
     KS_TIMESERIES, KS_WITNESSES,
@@ -62,22 +67,6 @@ struct BackupKeyspaces {
     witnesses: Vec<KvEntry>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct KvEntry {
-    key: String,
-    value: String,
-}
-
-fn encode_pairs(pairs: Vec<RawKvPair>) -> Vec<KvEntry> {
-    pairs
-        .into_iter()
-        .map(|(k, v)| KvEntry {
-            key: BASE64.encode(&k),
-            value: BASE64.encode(&v),
-        })
-        .collect()
-}
-
 pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<(), AppError> {
     let config = AppConfig::load(config_path)?;
 
@@ -129,7 +118,10 @@ pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<
     if output == "-" {
         println!("{json}");
     } else {
-        std::fs::write(&output, &json).map_err(AppError::Io)?;
+        did_hosting_common::server::backup::write_private_file(
+            std::path::Path::new(&output),
+            json.as_bytes(),
+        )?;
     }
 
     let total = backup.keyspaces.dids.len()
@@ -318,50 +310,6 @@ pub async fn run_restore(config_path: Option<PathBuf>, input: String) -> Result<
     Ok(())
 }
 
-/// Entries written per restore batch.
-const BATCH_SIZE: usize = 1000;
-
-fn decode_entry(entry: &KvEntry) -> Result<RawKvPair, AppError> {
-    let key = BASE64
-        .decode(&entry.key)
-        .map_err(|e| AppError::Config(format!("invalid base64url key: {e}")))?;
-    let value = BASE64
-        .decode(&entry.value)
-        .map_err(|e| AppError::Config(format!("invalid base64url value: {e}")))?;
-    Ok((key, value))
-}
-
-async fn restore_keyspace(
-    store: &Store,
-    ks: &crate::store::KeyspaceHandle,
-    entries: &[KvEntry],
-) -> Result<usize, AppError> {
-    let pairs = entries
-        .iter()
-        .map(decode_entry)
-        .collect::<Result<Vec<_>, _>>()?;
-    write_pairs(store, ks, pairs).await
-}
-
-async fn write_pairs(
-    store: &Store,
-    ks: &crate::store::KeyspaceHandle,
-    pairs: Vec<RawKvPair>,
-) -> Result<usize, AppError> {
-    let count = pairs.len();
-    for chunk in pairs.chunks(BATCH_SIZE) {
-        let mut batch = store.batch();
-        for (key, value) in chunk {
-            batch.insert_raw(ks, key.clone(), value.clone());
-        }
-        // A restore is a bulk load that is safe to re-run, and a chunk of
-        // 1,000 entries can be over one DynamoDB transaction, so it need
-        // not land atomically.
-        batch.commit_in_parts().await?;
-    }
-    Ok(count)
-}
-
 /// A DID log a restore puts back, checked by
 /// [`crate::control_register::verify_history`].
 struct RestoredLog {
@@ -373,7 +321,7 @@ struct RestoredLog {
 }
 
 /// What a restore writes to the `dids` keyspace.
-struct DidsRestore {
+pub struct DidsRestore {
     /// Every entry to write as it is: all of the backup's, less the
     /// high-water marks this store already holds further.
     pairs: Vec<RawKvPair>,
@@ -400,7 +348,7 @@ struct DidsRestore {
 /// A backup's high-water mark is written only where this store holds none for
 /// that DID or it extends the one held; one this store already holds further
 /// is kept. Any failure refuses the whole restore.
-async fn plan_dids_restore(
+pub async fn plan_dids_restore(
     ks: &crate::store::KeyspaceHandle,
     entries: &[KvEntry],
 ) -> Result<DidsRestore, AppError> {
@@ -571,7 +519,7 @@ async fn plan_dids_restore(
 
 /// Write a [`plan_dids_restore`] plan: its entries, then the high-water marks
 /// of the logs it restored.
-async fn restore_dids(
+pub async fn restore_dids(
     store: &Store,
     ks: &crate::store::KeyspaceHandle,
     plan: DidsRestore,
