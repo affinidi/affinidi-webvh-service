@@ -93,10 +93,7 @@ export function validateScopeDraft(draft: ScopeDraft): string | null {
   if (draft.kind === "allowed_with_default" && !draft.default) {
     return "Pick a default domain";
   }
-  if (
-    draft.kind === "allowed_with_default" &&
-    !draft.domains.includes(draft.default)
-  ) {
+  if (draft.kind === "allowed_with_default" && !draft.domains.includes(draft.default)) {
     return "Default must be one of the selected domains";
   }
   return null;

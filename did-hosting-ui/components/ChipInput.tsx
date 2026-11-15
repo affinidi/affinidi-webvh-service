@@ -1,13 +1,25 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+
 import { colors, fonts, radii } from "../lib/theme";
 
+/**
+ * A list of values edited as chips (web only).
+ *
+ * Every control is a real `<button>`, so it is focusable and answers Enter
+ * and Space: each chip's remove button is named for the value it removes, and
+ * each suggestion is a button that adds itself. Enter in the text box adds
+ * what was typed; Escape closes the suggestions.
+ */
 export function ChipInput({
+  label,
   values,
   onChange,
   suggestions,
   placeholder,
   readOnly,
 }: {
+  /** What the list is ("Watchers") — names the text box and the group. */
+  label: string;
   values: string[];
   onChange: (v: string[]) => void;
   suggestions?: string[];
@@ -19,9 +31,7 @@ export function ChipInput({
   const wrapperRef = useRef<HTMLDivElement>(null);
 
   const filtered = (suggestions ?? []).filter(
-    (s) =>
-      !values.includes(s) &&
-      s.toLowerCase().includes(input.toLowerCase()),
+    (s) => !values.includes(s) && s.toLowerCase().includes(input.toLowerCase()),
   );
 
   const addValue = (v: string) => {
@@ -37,19 +47,23 @@ export function ChipInput({
     onChange(values.filter((x) => x !== v));
   };
 
-  // Close dropdown on outside click
+  // Close the suggestions on an outside click, or when focus leaves.
   useEffect(() => {
-    const handler = (e: MouseEvent) => {
+    const handler = (e: MouseEvent | FocusEvent) => {
       if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
         setShowDropdown(false);
       }
     };
     document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
+    document.addEventListener("focusin", handler);
+    return () => {
+      document.removeEventListener("mousedown", handler);
+      document.removeEventListener("focusin", handler);
+    };
   }, []);
 
   return (
-    <div ref={wrapperRef} style={{ position: "relative" }}>
+    <div ref={wrapperRef} role="group" aria-label={label} style={{ position: "relative" }}>
       <div
         style={{
           display: "flex",
@@ -87,18 +101,20 @@ export function ChipInput({
             </span>
             {!readOnly && (
               <button
+                type="button"
+                aria-label={`Remove ${v}`}
                 onClick={() => removeValue(v)}
                 style={{
                   background: "none",
                   border: "none",
-                  color: colors.textTertiary,
+                  color: colors.textSecondary,
                   cursor: "pointer",
                   fontSize: 14,
-                  padding: 0,
+                  padding: "0 2px",
                   lineHeight: 1,
                 }}
               >
-                x
+                ×
               </button>
             )}
           </span>
@@ -106,6 +122,7 @@ export function ChipInput({
         {!readOnly && (
           <input
             type="text"
+            aria-label={`Add to ${label}`}
             value={input}
             onChange={(e) => {
               setInput(e.target.value);
@@ -116,6 +133,8 @@ export function ChipInput({
               if (e.key === "Enter") {
                 e.preventDefault();
                 addValue(input);
+              } else if (e.key === "Escape") {
+                setShowDropdown(false);
               }
             }}
             placeholder={values.length === 0 ? placeholder : ""}
@@ -124,7 +143,6 @@ export function ChipInput({
               minWidth: 120,
               background: "none",
               border: "none",
-              outline: "none",
               color: colors.textPrimary,
               fontFamily: fonts.mono,
               fontSize: 12,
@@ -146,6 +164,8 @@ export function ChipInput({
       </div>
       {showDropdown && filtered.length > 0 && !readOnly && (
         <div
+          aria-label={`Suggestions for ${label}`}
+          role="group"
           style={{
             position: "absolute",
             top: "100%",
@@ -161,10 +181,20 @@ export function ChipInput({
           }}
         >
           {filtered.map((s) => (
-            <div
+            <button
+              type="button"
               key={s}
+              aria-label={`Add ${s}`}
               onClick={() => addValue(s)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") setShowDropdown(false);
+              }}
               style={{
+                display: "block",
+                width: "100%",
+                textAlign: "left",
+                background: "none",
+                border: "none",
                 padding: "6px 10px",
                 fontSize: 12,
                 fontFamily: fonts.mono,
@@ -176,16 +206,20 @@ export function ChipInput({
                 whiteSpace: "nowrap",
               }}
               onMouseEnter={(e) => {
-                (e.target as HTMLDivElement).style.backgroundColor =
-                  colors.bgTertiary;
+                e.currentTarget.style.backgroundColor = colors.bgTertiary;
               }}
               onMouseLeave={(e) => {
-                (e.target as HTMLDivElement).style.backgroundColor =
-                  "transparent";
+                e.currentTarget.style.backgroundColor = "transparent";
+              }}
+              onFocus={(e) => {
+                e.currentTarget.style.backgroundColor = colors.bgTertiary;
+              }}
+              onBlur={(e) => {
+                e.currentTarget.style.backgroundColor = "transparent";
               }}
             >
               {s}
-            </div>
+            </button>
           ))}
         </div>
       )}

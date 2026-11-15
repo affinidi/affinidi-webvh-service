@@ -1,24 +1,18 @@
-import { useEffect, useState, useCallback } from "react";
-import {
-  View,
-  Text,
-  StyleSheet,
-  Pressable,
-  ActivityIndicator,
-  ScrollView,
-} from "react-native";
+import { View, Text, StyleSheet, ActivityIndicator } from "react-native";
 import { useApi } from "./ApiProvider";
-import {
-  ServiceBadges,
-  SERVICE_TYPE_DIDCOMM,
-  SERVICE_TYPE_TSP,
-} from "./ServiceBadges";
+import { ServiceBadges, SERVICE_TYPE_DIDCOMM, SERVICE_TYPE_TSP } from "./ServiceBadges";
 import { ControlLink } from "./ControlLink";
 import { AgentNameChips } from "./AgentNameChips";
+import { Button } from "./Button";
+import { Heading } from "./Heading";
 import { colors, fonts, radii, spacing } from "../lib/theme";
-import type { ServiceOverview, ServiceInfo } from "../lib/api";
+import type { ServiceInfo } from "../lib/api";
+import { buildServiceOverview } from "../lib/api/service";
+import { errorMessage } from "../lib/errors";
+import { useTrustTaskQuery } from "../lib/query";
+import { QK } from "../lib/query-keys";
+import { formatRelative } from "../lib/time";
 import { useAgentNames } from "../lib/use-agent-names";
-import { startPolling } from "../lib/poll";
 
 const STATUS_COLORS: Record<string, string> = {
   active: colors.teal,
@@ -32,23 +26,11 @@ const TYPE_LABELS: Record<string, string> = {
   watcher: "Watcher",
 };
 
-function timeAgo(epoch: number | null): string {
-  if (!epoch) return "never";
-  const secs = Math.floor(Date.now() / 1000) - epoch;
-  if (secs < 5) return "just now";
-  if (secs < 60) return `${secs}s ago`;
-  if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
-  if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
-  return `${Math.floor(secs / 86400)}d ago`;
-}
-
+/** Decoration only: the badge it sits in spells the status out, so the
+ *  colour is never the only signal. */
 function StatusDot({ status }: { status: string }) {
   const color = STATUS_COLORS[status] ?? colors.textTertiary;
-  return (
-    <View
-      style={[styles.dot, { backgroundColor: color }]}
-    />
-  );
+  return <View aria-hidden style={[styles.dot, { backgroundColor: color }]} />;
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -66,9 +48,7 @@ function StatusBadge({ status }: { status: string }) {
 function TypeBadge({ type }: { type: string }) {
   return (
     <View style={styles.typeBadge}>
-      <Text style={styles.typeBadgeText}>
-        {TYPE_LABELS[type] ?? type}
-      </Text>
+      <Text style={styles.typeBadgeText}>{TYPE_LABELS[type] ?? type}</Text>
     </View>
   );
 }
@@ -111,9 +91,7 @@ function TransportRow({
             mismatch && styles.flagMismatch,
           ]}
         >
-          <Text style={styles.flagText}>
-            {advertised ? "advertised" : "not advertised"}
-          </Text>
+          <Text style={styles.flagText}>{advertised ? "advertised" : "not advertised"}</Text>
         </View>
       )}
     </View>
@@ -121,11 +99,7 @@ function TransportRow({
 }
 
 /** The human-readable consequence of an enabled/advertised mismatch. */
-function mismatchWarning(
-  label: string,
-  enabled: boolean,
-  advertised: boolean,
-): string | null {
+function mismatchWarning(label: string, enabled: boolean, advertised: boolean): string | null {
   if (enabled && !advertised) {
     return `${label} is enabled but the control plane's DID document has no ${label} service — peers cannot discover this transport.`;
   }
@@ -135,19 +109,9 @@ function mismatchWarning(
   return null;
 }
 
-function ServiceCard({
-  service,
-  agentNames,
-}: {
-  service: ServiceInfo;
-  agentNames: string[];
-}) {
+function ServiceCard({ service, agentNames }: { service: ServiceInfo; agentNames: string[] }) {
   const did = service.did;
-  const shortDid = did
-    ? did.length > 40
-      ? `${did.slice(0, 20)}...${did.slice(-12)}`
-      : did
-    : null;
+  const shortDid = did ? (did.length > 40 ? `${did.slice(0, 20)}...${did.slice(-12)}` : did) : null;
 
   return (
     <View style={styles.serviceCard}>
@@ -156,17 +120,19 @@ function ServiceCard({
           <TypeBadge type={service.serviceType} />
           <StatusBadge status={service.status} />
         </View>
-        {service.label && (
-          <Text style={styles.serviceLabel}>{service.label}</Text>
-        )}
+        {service.label && <Text style={styles.serviceLabel}>{service.label}</Text>}
       </View>
 
-      <Text style={styles.serviceUrl} numberOfLines={1}>{service.url}</Text>
+      <Text style={styles.serviceUrl} numberOfLines={1}>
+        {service.url}
+      </Text>
 
       {/* The DID is truncated for width, so the full value goes to the chips
           via `didId` — they need the authority, not the ellipsis. */}
       {shortDid && (
-        <Text style={styles.serviceDid} numberOfLines={1}>{shortDid}</Text>
+        <Text style={styles.serviceDid} numberOfLines={1}>
+          {shortDid}
+        </Text>
       )}
       {agentNames.length > 0 && (
         <View style={styles.serviceNamesRow}>
@@ -187,13 +153,9 @@ function ServiceCard({
       />
 
       <View style={styles.serviceMetaRow}>
-        <Text style={styles.metaText}>
-          Registered {timeAgo(service.registeredAt)}
-        </Text>
+        <Text style={styles.metaText}>Registered {formatRelative(service.registeredAt)}</Text>
         <Text style={styles.metaSep}>{"\u00B7"}</Text>
-        <Text style={styles.metaText}>
-          Health check {timeAgo(service.lastHealthCheck)}
-        </Text>
+        <Text style={styles.metaText}>Health check {formatRelative(service.lastHealthCheck)}</Text>
       </View>
     </View>
   );
@@ -214,9 +176,9 @@ function EmptyState({ isDaemon }: { isDaemon: boolean }) {
         <Text style={styles.emptyIcon}>{"\u2713"}</Text>
         <Text style={styles.emptyTitle}>Self-contained daemon</Text>
         <Text style={styles.emptyHint}>
-          Server, witness, and watcher run in this process — there are
-          no remote instances to register. Registering one is supported but
-          unusual; use a standalone control plane to manage remote services.
+          Server, witness, and watcher run in this process — there are no remote instances to
+          register. Registering one is supported but unusual; use a standalone control plane to
+          manage remote services.
         </Text>
       </View>
     );
@@ -226,9 +188,8 @@ function EmptyState({ isDaemon }: { isDaemon: boolean }) {
       <Text style={styles.emptyIcon}>{"\u26A1"}</Text>
       <Text style={styles.emptyTitle}>No services connected</Text>
       <Text style={styles.emptyHint}>
-        Start a webvh-server or webvh-witness with a control_url pointing
-        to this control plane, or add instances in config.toml under
-        [registry.instances].
+        Start a webvh-server or webvh-witness with a control_url pointing to this control plane, or
+        add instances in config.toml under [registry.instances].
       </Text>
     </View>
   );
@@ -239,33 +200,39 @@ function EmptyState({ isDaemon }: { isDaemon: boolean }) {
  *   either way; this only changes how an empty registry is explained and
  *   suppresses the service-count tiles, which are always zero there.
  */
-export function ServiceOverviewPanel({
-  isDaemon = false,
-}: {
-  isDaemon?: boolean;
-}) {
+export function ServiceOverviewPanel({ isDaemon = false }: { isDaemon?: boolean }) {
   const api = useApi();
-  const [data, setData] = useState<ServiceOverview | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  // `background`: a timer tick rather than the operator, so it must not keep
-  // the session alive (see `lib/poll.ts`).
-  const refresh = useCallback((background = false) => {
-    api
-      .getServicesOverview({ background })
-      .then((d) => {
-        setData(d);
-        setError(null);
-      })
-      .catch((e) => setError(e.message))
-      .finally(() => setLoading(false));
-  }, [api]);
-
-  useEffect(() => {
-    refresh();
-    return startPolling(({ background }) => refresh(background), 5000);
-  }, [refresh]);
+  // Three reads, each shared with the rest of the dashboard and settings
+  // (`lib/query-keys.ts`), polled every 5s while the page is visible. A
+  // tick is sent as a background request, so it does not keep the session
+  // alive (see `lib/poll.ts`).
+  const POLL = { refetchInterval: 5000 };
+  const config = useTrustTaskQuery(
+    QK.serverConfig,
+    ({ background }) => api.getConfig({ background }),
+    POLL,
+  );
+  const registry = useTrustTaskQuery(
+    QK.registry,
+    ({ background }) => api.listRegistry({ background }),
+    POLL,
+  );
+  const stats = useTrustTaskQuery(
+    QK.serverStats,
+    ({ background }) => api.getServerStats({ background }),
+    POLL,
+  );
+  const data =
+    config.data && registry.data && stats.data
+      ? buildServiceOverview(config.data, registry.data, stats.data)
+      : null;
+  const loading = config.loading || registry.loading || stats.loading;
+  const error = config.error ?? registry.error ?? stats.error;
+  const refresh = () => {
+    void config.refetch();
+    void registry.refetch();
+    void stats.refetch();
+  };
 
   // Above the early returns, so the hook order stays fixed. The panel polls
   // every 5s; the lookup only re-fires when the set of DIDs actually changes.
@@ -287,10 +254,10 @@ export function ServiceOverviewPanel({
   if (error && !data) {
     return (
       <View style={styles.errorBox}>
-        <Text style={styles.errorText}>{error}</Text>
-        <Pressable style={styles.retryButton} onPress={() => refresh()}>
-          <Text style={styles.retryText}>Retry</Text>
-        </Pressable>
+        <Text role="alert" style={styles.errorText}>
+          {errorMessage(error)}
+        </Text>
+        <Button label="Retry" onPress={refresh} />
       </View>
     );
   }
@@ -327,13 +294,13 @@ export function ServiceOverviewPanel({
       {/* Control plane header card */}
       <View style={styles.controlCard}>
         <View style={styles.controlHeader}>
-          <Text style={styles.controlTitle}>Control Plane</Text>
+          <Heading level={3} style={styles.controlTitle}>
+            Control Plane
+          </Heading>
           <Text style={styles.versionBadge}>v{control.version}</Text>
         </View>
         <View style={styles.controlMeta}>
-          {control.publicUrl && (
-            <Text style={styles.controlUrl}>{control.publicUrl}</Text>
-          )}
+          {control.publicUrl && <Text style={styles.controlUrl}>{control.publicUrl}</Text>}
         </View>
 
         {/* Transports: config-enabled vs DID-document-advertised. */}
@@ -343,11 +310,7 @@ export function ServiceOverviewPanel({
             enabled={control.didcommEnabled}
             advertised={advertisedDidcomm}
           />
-          <TransportRow
-            label="TSP"
-            enabled={control.tspEnabled}
-            advertised={advertisedTsp}
-          />
+          <TransportRow label="TSP" enabled={control.tspEnabled} advertised={advertisedTsp} />
           {transportWarnings.map((w) => (
             <View key={w} style={styles.transportWarnBanner}>
               <Text style={styles.transportWarnIcon}>{"⚠"}</Text>
@@ -371,9 +334,8 @@ export function ServiceOverviewPanel({
             <View style={styles.methodsEmptyBanner}>
               <Text style={styles.methodsEmptyIcon}>{"⚠"}</Text>
               <Text style={styles.methodsEmptyText}>
-                No DID methods compiled in — every DID op will fail.
-                Rebuild with at least one of the {"`method-*`"} cargo
-                features (e.g. {"`--features method-webvh,method-web`"}).
+                No DID methods compiled in — every DID op will fail. Rebuild with at least one of
+                the {"`method-*`"} cargo features (e.g. {"`--features method-webvh,method-web`"}).
               </Text>
             </View>
           ) : (
@@ -429,15 +391,11 @@ export function ServiceOverviewPanel({
           <Text style={styles.summaryLabel}>Total DIDs</Text>
         </View>
         <View style={styles.summaryCard}>
-          <Text style={styles.summaryValue}>
-            {aggregate.totalResolves.toLocaleString()}
-          </Text>
+          <Text style={styles.summaryValue}>{aggregate.totalResolves.toLocaleString()}</Text>
           <Text style={styles.summaryLabel}>Resolves</Text>
         </View>
         <View style={styles.summaryCard}>
-          <Text style={styles.summaryValue}>
-            {aggregate.totalUpdates.toLocaleString()}
-          </Text>
+          <Text style={styles.summaryValue}>{aggregate.totalUpdates.toLocaleString()}</Text>
           <Text style={styles.summaryLabel}>Updates</Text>
         </View>
       </View>
@@ -448,25 +406,13 @@ export function ServiceOverviewPanel({
       ) : (
         <>
           {servers.length > 0 && (
-            <ServiceGroup
-              label="Servers"
-              services={servers}
-              agentNames={agentNames}
-            />
+            <ServiceGroup label="Servers" services={servers} agentNames={agentNames} />
           )}
           {witnesses.length > 0 && (
-            <ServiceGroup
-              label="Witnesses"
-              services={witnesses}
-              agentNames={agentNames}
-            />
+            <ServiceGroup label="Witnesses" services={witnesses} agentNames={agentNames} />
           )}
           {watchers.length > 0 && (
-            <ServiceGroup
-              label="Watchers"
-              services={watchers}
-              agentNames={agentNames}
-            />
+            <ServiceGroup label="Watchers" services={watchers} agentNames={agentNames} />
           )}
         </>
       )}
@@ -485,16 +431,11 @@ function ServiceGroup({
 }) {
   return (
     <View style={styles.group}>
-      <Text style={styles.groupTitle}>
-        {label}{" "}
-        <Text style={styles.groupCount}>({services.length})</Text>
-      </Text>
+      <Heading level={3} style={styles.groupTitle}>
+        {label} <Text style={styles.groupCount}>({services.length})</Text>
+      </Heading>
       {services.map((s) => (
-        <ServiceCard
-          key={s.instanceId}
-          service={s}
-          agentNames={agentNames[s.did ?? ""] ?? []}
-        />
+        <ServiceCard key={s.instanceId} service={s} agentNames={agentNames[s.did ?? ""] ?? []} />
       ))}
     </View>
   );
@@ -518,18 +459,6 @@ const styles = StyleSheet.create({
     color: colors.error,
     fontSize: 14,
     marginBottom: spacing.md,
-  },
-  retryButton: {
-    borderColor: colors.accent,
-    borderWidth: 1,
-    borderRadius: radii.sm,
-    paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.sm,
-  },
-  retryText: {
-    fontFamily: fonts.semibold,
-    color: colors.accent,
-    fontSize: 13,
   },
 
   // Control plane card

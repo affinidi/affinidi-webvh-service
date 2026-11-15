@@ -18,20 +18,14 @@
  * asynchronous and will reflect on a refresh.
  */
 
-import { useCallback, useEffect, useState } from "react";
-import {
-  ActivityIndicator,
-  FlatList,
-  Modal,
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Text,
-  View,
-} from "react-native";
-import { Link } from "expo-router";
+import { useCallback, useState } from "react";
+import { ActivityIndicator, FlatList, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
+import { Button } from "../../components/Button";
+import { Dialog } from "../../components/Dialog";
+import { Heading } from "../../components/Heading";
+import { RequireAuth } from "../../components/RequireAuth";
 import { useDomains } from "../../components/DomainProvider";
 import { ServiceBadges } from "../../components/ServiceBadges";
 import { ControlLink } from "../../components/ControlLink";
@@ -39,17 +33,38 @@ import { AgentNameChips } from "../../components/AgentNameChips";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showAlert, showConfirm } from "../../lib/alert";
 import { useAgentNames } from "../../lib/use-agent-names";
+import { errorMessage } from "../../lib/errors";
+import { invalidateQueries, useTrustTaskQuery } from "../../lib/query";
 
 import type { ServiceInstance } from "../../lib/api";
 
+/** The registry, as this screen reads it. A domain assignment changes it. */
+const REGISTRY_KEY = ["registry", "list"] as const;
+
 export default function ServersScreen() {
-  const { isAuthenticated, role } = useAuth();
+  return (
+    <RequireAuth purpose="manage servers">
+      <ServersBody />
+    </RequireAuth>
+  );
+}
+
+function ServersBody() {
+  const { role } = useAuth();
   const api = useApi();
   const { domains } = useDomains();
 
-  const [instances, setInstances] = useState<ServiceInstance[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const isAdmin = role === "admin";
+  const {
+    data,
+    loading,
+    error: loadError,
+    refetch,
+  } = useTrustTaskQuery([...REGISTRY_KEY], ({ background }) => api.listRegistry({ background }), {
+    enabled: isAdmin,
+  });
+  const instances = data ?? [];
+  const error = loadError ? errorMessage(loadError, "failed to load registry") : null;
   const [busy, setBusy] = useState<string | null>(null);
   const [pickerFor, setPickerFor] = useState<ServiceInstance | null>(null);
 
@@ -57,26 +72,7 @@ export default function ServersScreen() {
   // recorded DIDs changes rather than on every render.
   const agentNames = useAgentNames(instances.map((i) => i.did));
 
-  const refresh = useCallback(async () => {
-    if (!isAuthenticated) {
-      setLoading(false);
-      return;
-    }
-    setLoading(true);
-    try {
-      const list = await api.listRegistry();
-      setInstances(list);
-      setError(null);
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "failed to load registry");
-    } finally {
-      setLoading(false);
-    }
-  }, [api, isAuthenticated]);
-
-  useEffect(() => {
-    refresh();
-  }, [refresh]);
+  const refresh = useCallback(() => invalidateQueries(["registry"]), []);
 
   const handleAssign = useCallback(
     async (instance: ServiceInstance, domain: string) => {
@@ -91,7 +87,7 @@ export default function ServersScreen() {
         );
         await refresh();
       } catch (e: unknown) {
-        showAlert("Assign failed", e instanceof Error ? e.message : String(e));
+        showAlert("Assign failed", errorMessage(e));
       } finally {
         setBusy(null);
       }
@@ -113,10 +109,7 @@ export default function ServersScreen() {
             await api.unassignDomainFromServer(instance.instanceId, domain);
             await refresh();
           } catch (e: unknown) {
-            showAlert(
-              "Unassign failed",
-              e instanceof Error ? e.message : String(e),
-            );
+            showAlert("Unassign failed", errorMessage(e));
           } finally {
             setBusy(null);
           }
@@ -143,10 +136,7 @@ export default function ServersScreen() {
               `Purge of ${domain} on ${instance.label ?? instance.instanceId} queued. The server's ack is asynchronous.`,
             );
           } catch (e: unknown) {
-            showAlert(
-              "Purge failed",
-              e instanceof Error ? e.message : String(e),
-            );
+            showAlert("Purge failed", errorMessage(e));
           } finally {
             setBusy(null);
           }
@@ -156,24 +146,10 @@ export default function ServersScreen() {
     [api],
   );
 
-  if (!isAuthenticated) {
+  if (!isAdmin) {
     return (
       <View style={styles.containerCenter}>
-        <Text style={styles.hint}>Please log in to manage servers.</Text>
-        <Link href="/login" asChild>
-          <Pressable style={styles.buttonPrimary}>
-            <Text style={styles.buttonPrimaryText}>Login</Text>
-          </Pressable>
-        </Link>
-      </View>
-    );
-  }
-  if (role !== "admin") {
-    return (
-      <View style={styles.containerCenter}>
-        <Text style={styles.hint}>
-          Server administration is restricted to Admin accounts.
-        </Text>
+        <Text style={styles.hint}>Server administration is restricted to Admin accounts.</Text>
       </View>
     );
   }
@@ -182,30 +158,32 @@ export default function ServersScreen() {
     <View style={styles.container}>
       <View style={styles.header}>
         <View style={{ flex: 1 }}>
-          <Text style={styles.title}>Servers</Text>
+          <Heading style={styles.title}>Servers</Heading>
           <Text style={styles.subtitle}>
-            Registered hosting instances and the domains they serve.
-            Assign / unassign drives the daemon's domain-assignment Trust
-            Task; unassign queues a grace-window purge.
+            Registered hosting instances and the domains they serve. Assign / unassign drives the
+            daemon&apos;s domain-assignment Trust Task; unassign queues a grace-window purge.
           </Text>
         </View>
-        <Pressable
-          accessibilityRole="button"
-          style={styles.buttonSecondary}
-          onPress={refresh}
-        >
-          <Text style={styles.buttonSecondaryText}>Refresh</Text>
-        </Pressable>
+        <Button label="Refresh" variant="secondary" onPress={() => void refetch()} />
       </View>
 
-      {error && <Text style={styles.errorText}>{error}</Text>}
+      {error && (
+        <Text role="alert" style={styles.errorText}>
+          {error}
+        </Text>
+      )}
 
       {loading ? (
-        <ActivityIndicator color={colors.accent} size="large" style={styles.spinner} />
+        <ActivityIndicator
+          color={colors.accent}
+          size="large"
+          aria-label="Loading servers"
+          style={styles.spinner}
+        />
       ) : instances.length === 0 ? (
         <Text style={styles.hint}>
-          No servers registered yet. Servers register themselves on startup
-          via DIDComm; check the daemon log if you expected to see one here.
+          No servers registered yet. Servers register themselves on startup via DIDComm; check the
+          daemon log if you expected to see one here.
         </Text>
       ) : (
         <FlatList
@@ -229,9 +207,7 @@ export default function ServersScreen() {
         visible={pickerFor !== null}
         instance={pickerFor}
         availableDomains={
-          pickerFor
-            ? domains.filter((d) => !pickerFor.servedDomains.includes(d.name))
-            : []
+          pickerFor ? domains.filter((d) => !pickerFor.servedDomains.includes(d.name)) : []
         }
         onPick={(domain) => pickerFor && handleAssign(pickerFor, domain)}
         onClose={() => setPickerFor(null)}
@@ -269,24 +245,15 @@ function ServerCard({
       <View style={styles.cardHeader}>
         <View style={{ flex: 1 }}>
           <View style={styles.nameRow}>
-            <Text style={styles.cardName}>
+            <Heading level={2} style={styles.cardName}>
               {instance.label ?? "(unlabeled)"}
-            </Text>
-            <View
-              style={[styles.statusBadge, { backgroundColor: colors.bgTertiary }]}
-            >
-              <View
-                style={[
-                  styles.healthDot,
-                  { backgroundColor: healthColor },
-                ]}
-              />
-              <Text style={styles.statusBadgeText}>{instance.status}</Text>
+            </Heading>
+            <View style={[styles.statusBadge, { backgroundColor: colors.bgTertiary }]}>
+              <View aria-hidden style={[styles.healthDot, { backgroundColor: healthColor }]} />
+              <Text style={styles.statusBadgeText}>Status: {instance.status}</Text>
             </View>
             <View style={styles.statusBadge}>
-              <Text style={styles.statusBadgeText}>
-                {instance.serviceType}
-              </Text>
+              <Text style={styles.statusBadgeText}>{instance.serviceType}</Text>
             </View>
           </View>
           <Text style={styles.cardSubline} numberOfLines={1}>
@@ -311,9 +278,7 @@ function ServerCard({
                 emptyLabel="no services in DID document"
               />
             ) : (
-              <Text style={styles.servicesUnknown}>
-                DID not resolved yet
-              </Text>
+              <Text style={styles.servicesUnknown}>DID not resolved yet</Text>
             )}
           </View>
           <ControlLink
@@ -330,20 +295,18 @@ function ServerCard({
             ))}
           </View>
         </View>
-        <Pressable
-          accessibilityRole="button"
+        <Button
+          label="+ Assign domain"
+          accessibilityLabel={`Assign a domain to ${instance.label ?? instance.instanceId}`}
           onPress={onAssign}
-          style={styles.buttonPrimary}
-        >
-          <Text style={styles.buttonPrimaryText}>+ Assign domain</Text>
-        </Pressable>
+        />
       </View>
 
       <View style={styles.divider} />
 
       {instance.servedDomains.length === 0 ? (
         <Text style={styles.emptyDomains}>
-          No domains assigned yet. Use "+ Assign domain" to begin hosting.
+          No domains assigned yet. Use “+ Assign domain” to begin hosting.
         </Text>
       ) : (
         <View style={{ gap: spacing.sm }}>
@@ -354,32 +317,22 @@ function ServerCard({
               <View key={d} style={styles.domainRow}>
                 <Text style={styles.domainRowName}>{d}</Text>
                 <View style={styles.domainRowActions}>
-                  <Pressable
-                    accessibilityRole="button"
+                  <Button
+                    label="Unassign"
+                    accessibilityLabel={`Unassign ${d}`}
+                    variant="secondary"
+                    busy={isBusy}
+                    busyLabel="…"
                     onPress={() => onUnassign(d)}
-                    disabled={isBusy}
-                    style={[
-                      styles.buttonSecondary,
-                      isBusy && styles.buttonDisabled,
-                    ]}
-                  >
-                    <Text style={styles.buttonSecondaryText}>
-                      {isBusy ? "…" : "Unassign"}
-                    </Text>
-                  </Pressable>
-                  <Pressable
-                    accessibilityRole="button"
+                  />
+                  <Button
+                    label="Purge now"
+                    accessibilityLabel={`Purge ${d} now`}
+                    variant="danger"
+                    busy={isBusy}
+                    busyLabel="…"
                     onPress={() => onPurge(d)}
-                    disabled={isBusy}
-                    style={[
-                      styles.buttonDanger,
-                      isBusy && styles.buttonDisabled,
-                    ]}
-                  >
-                    <Text style={styles.buttonDangerText}>
-                      {isBusy ? "…" : "Purge now"}
-                    </Text>
-                  </Pressable>
+                  />
                 </View>
               </View>
             );
@@ -404,56 +357,44 @@ function DomainPicker({
   onClose: () => void;
 }) {
   return (
-    <Modal
+    <Dialog
       visible={visible}
-      transparent
-      animationType="fade"
-      onRequestClose={onClose}
+      title={`Assign domain to ${instance?.label ?? "this server"}`}
+      onClose={onClose}
+      style={styles.popover}
     >
-      <Pressable style={styles.overlay} onPress={onClose}>
-        <Pressable
-          style={styles.popover}
-          onPress={(e) => e.stopPropagation()}
-          accessibilityLabel="Pick a domain to assign"
-        >
-          <Text style={styles.popoverTitle}>
-            Assign domain to {instance?.label ?? "this server"}
-          </Text>
-          {availableDomains.length === 0 ? (
-            <Text style={styles.hint}>
-              No unassigned domains available. Create a new one on the
-              Domains page, or unassign it from another server first.
-            </Text>
-          ) : (
-            <ScrollView style={{ marginTop: spacing.sm }}>
-              {availableDomains.map((d) => (
-                <Pressable
-                  key={d.name}
-                  accessibilityRole="button"
-                  onPress={() => onPick(d.name)}
-                  style={({ pressed }) => [
-                    styles.pickerOption,
-                    pressed && styles.pickerOptionPressed,
-                    d.status === "disabled" && styles.buttonDisabled,
-                  ]}
-                  disabled={d.status === "disabled"}
-                >
-                  <Text style={styles.pickerOptionName}>{d.name}</Text>
-                  {!!d.label && (
-                    <Text style={styles.pickerOptionLabel}>{d.label}</Text>
-                  )}
-                  {d.status === "disabled" && (
-                    <Text style={styles.pickerOptionDisabledHint}>
-                      Disabled — re-enable on Domains page first
-                    </Text>
-                  )}
-                </Pressable>
-              ))}
-            </ScrollView>
-          )}
-        </Pressable>
-      </Pressable>
-    </Modal>
+      {availableDomains.length === 0 ? (
+        <Text style={styles.hint}>
+          No unassigned domains available. Create a new one on the Domains page, or unassign it from
+          another server first.
+        </Text>
+      ) : (
+        <ScrollView style={{ marginTop: spacing.sm }}>
+          {availableDomains.map((d) => (
+            <Button
+              key={d.name}
+              variant="ghost"
+              accessibilityLabel={
+                d.status === "disabled" ? `${d.name}, disabled` : `Assign ${d.name}`
+              }
+              disabled={d.status === "disabled"}
+              onPress={() => onPick(d.name)}
+              style={styles.pickerOption}
+            >
+              <View>
+                <Text style={styles.pickerOptionName}>{d.name}</Text>
+                {!!d.label && <Text style={styles.pickerOptionLabel}>{d.label}</Text>}
+                {d.status === "disabled" && (
+                  <Text style={styles.pickerOptionDisabledHint}>
+                    Disabled — re-enable on Domains page first
+                  </Text>
+                )}
+              </View>
+            </Button>
+          ))}
+        </ScrollView>
+      )}
+    </Dialog>
   );
 }
 
@@ -482,6 +423,7 @@ const styles = StyleSheet.create({
     fontSize: 24,
     fontFamily: fonts.bold,
     color: colors.textPrimary,
+    marginBottom: 0,
   },
   subtitle: {
     marginTop: 4,
@@ -525,6 +467,7 @@ const styles = StyleSheet.create({
     fontFamily: fonts.semibold,
     fontSize: 16,
     color: colors.textPrimary,
+    marginBottom: 0,
   },
   cardNamesRow: {
     marginTop: spacing.xs,
@@ -626,52 +569,6 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: spacing.sm,
   },
-  buttonPrimary: {
-    backgroundColor: colors.accent,
-    borderRadius: radii.md,
-    paddingVertical: 8,
-    paddingHorizontal: spacing.md,
-    alignItems: "center",
-  },
-  buttonPrimaryText: {
-    color: colors.textOnAccent,
-    fontFamily: fonts.semibold,
-    fontSize: 13,
-  },
-  buttonSecondary: {
-    backgroundColor: "transparent",
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingVertical: 6,
-    paddingHorizontal: spacing.md,
-  },
-  buttonSecondaryText: {
-    color: colors.textSecondary,
-    fontFamily: fonts.semibold,
-    fontSize: 12,
-  },
-  buttonDanger: {
-    backgroundColor: "transparent",
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.error,
-    paddingVertical: 6,
-    paddingHorizontal: spacing.md,
-  },
-  buttonDangerText: {
-    color: colors.error,
-    fontFamily: fonts.semibold,
-    fontSize: 12,
-  },
-  buttonDisabled: { opacity: 0.5 },
-  overlay: {
-    flex: 1,
-    backgroundColor: colors.overlay,
-    alignItems: "center",
-    justifyContent: "center",
-    padding: spacing.lg,
-  },
   popover: {
     width: "100%",
     maxWidth: 480,
@@ -682,18 +579,13 @@ const styles = StyleSheet.create({
     borderColor: colors.border,
     padding: spacing.lg,
   },
-  popoverTitle: {
-    fontFamily: fonts.semibold,
-    fontSize: 14,
-    color: colors.textPrimary,
-  },
   pickerOption: {
     paddingVertical: spacing.md,
+    justifyContent: "flex-start",
     paddingHorizontal: spacing.md,
     borderRadius: radii.md,
     marginBottom: spacing.xs,
   },
-  pickerOptionPressed: { backgroundColor: colors.bgTertiary },
   pickerOptionName: {
     fontFamily: fonts.mono,
     fontSize: 14,

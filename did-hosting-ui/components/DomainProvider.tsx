@@ -1,6 +1,6 @@
 /**
- * Domain context — fetches the caller-scoped domain list once on
- * mount + tracks the active "current domain" selection.
+ * Domain context — reads the caller-scoped domain list (cached, see
+ * `lib/query.ts`) + tracks the active "current domain" selection.
  *
  * Design (v0.7):
  * - Admins send `domain/list` and see every configured domain.
@@ -26,6 +26,8 @@ import {
 import { useApi } from "./ApiProvider";
 import { useAuth } from "./AuthProvider";
 import type { DomainEntry } from "../lib/api";
+import { errorMessage } from "../lib/errors";
+import { useTrustTaskQuery } from "../lib/query";
 
 const STORAGE_KEY = "didhosting_current_domain";
 
@@ -72,46 +74,35 @@ function writeStoredDomain(name: string | null): void {
   }
 }
 
+/** The query key the domain list is cached under. A domain mutation
+ *  invalidates the `["domains"]` prefix. */
+export const DOMAINS_KEY = ["domains"] as const;
+
 export function DomainProvider({ children }: { children: ReactNode }) {
   const api = useApi();
   const { isAuthenticated, role } = useAuth();
-  const [domains, setDomains] = useState<DomainEntry[]>([]);
-  const [defaultDomain, setDefaultDomain] = useState<string | null>(null);
-  const [currentDomain, setCurrentDomainState] = useState<string | null>(() =>
-    readStoredDomain(),
+  const [currentDomain, setCurrentDomainState] = useState<string | null>(() => readStoredDomain());
+
+  // Admin → full list; Owner / Service → scoped subset. The role is in the
+  // key, so a different session's list is never read from the cache.
+  const query = useTrustTaskQuery(
+    [...DOMAINS_KEY, role === "admin" ? "all" : "mine"],
+    () => (role === "admin" ? api.listDomains() : api.listMyDomains()),
+    { enabled: isAuthenticated },
   );
-  const [loaded, setLoaded] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const refresh = useCallback(async () => {
-    if (!isAuthenticated) {
-      setDomains([]);
-      setDefaultDomain(null);
-      setLoaded(false);
-      return;
-    }
-    try {
-      // Admin → full list; Owner / Service → scoped subset.
-      const fetcher =
-        role === "admin" ? api.listDomains : api.listMyDomains;
-      const resp = await fetcher();
-      const sorted = [...resp.domains].sort((a, b) =>
-        a.name.localeCompare(b.name),
-      );
-      setDomains(sorted);
-      setDefaultDomain(resp.default);
-      setError(null);
-      setLoaded(true);
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "failed to load domains";
-      setError(msg);
-      setLoaded(true);
-    }
-  }, [api, isAuthenticated, role]);
-
-  useEffect(() => {
-    refresh();
-  }, [refresh]);
+  const resp = isAuthenticated ? query.data : undefined;
+  // Sorted once per answer, so the array is stable between renders and the
+  // fallback effect below does not re-run for nothing.
+  const domains = useMemo<DomainEntry[]>(
+    () => (resp ? [...resp.domains].sort((a, b) => a.name.localeCompare(b.name)) : []),
+    [resp],
+  );
+  const defaultDomain = resp?.default ?? null;
+  const loaded = isAuthenticated && !query.loading && (resp !== undefined || query.error != null);
+  const error =
+    isAuthenticated && query.error ? errorMessage(query.error, "failed to load domains") : null;
+  const { refetch } = query;
+  const refresh = useCallback(() => refetch(), [refetch]);
 
   // After the list loads, validate the stored selection still
   // exists in the current set. If the user pinned a domain that's
@@ -147,20 +138,10 @@ export function DomainProvider({ children }: { children: ReactNode }) {
       defaultDomain,
       refresh,
     }),
-    [
-      domains,
-      currentDomain,
-      setCurrentDomain,
-      loaded,
-      error,
-      defaultDomain,
-      refresh,
-    ],
+    [domains, currentDomain, setCurrentDomain, loaded, error, defaultDomain, refresh],
   );
 
-  return (
-    <DomainContext.Provider value={value}>{children}</DomainContext.Provider>
-  );
+  return <DomainContext.Provider value={value}>{children}</DomainContext.Provider>;
 }
 
 export function useDomains(): DomainContextValue {

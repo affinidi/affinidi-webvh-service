@@ -30,6 +30,7 @@ import type {
   DomainBranding,
   DomainEntry,
   DomainQuota,
+  DidDocumentState,
   DomainScope,
   IdentityGeneration,
   InviteListItem,
@@ -37,6 +38,7 @@ import type {
   LogMetadata,
   PasskeyCredential,
   ServerStats,
+  WebvhParameters,
   ServiceInstance,
   TimeRange,
   TimeSeriesPoint,
@@ -48,10 +50,23 @@ export const WEBVH_EXT = "vnd.affinidi.webvh";
 
 type Ext = Record<string, unknown> | undefined;
 
+/** A JSON object (not an array, not null). */
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+/** Strings only, from an unchecked list. */
+function strings(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+}
+
+const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+const num = (v: unknown): number | null => (typeof v === "number" ? v : null);
+
 /** This host's extension object off a wire record, or `{}`. */
-function webvhExt(ext: Ext): Record<string, any> {
+function webvhExt(ext: Ext): Record<string, unknown> {
   const v = ext?.[WEBVH_EXT];
-  return v && typeof v === "object" ? (v as Record<string, any>) : {};
+  return isRecord(v) ? v : {};
 }
 
 /** RFC 3339 → epoch seconds. `null` for absent or unreadable. */
@@ -95,8 +110,8 @@ export function logEntriesFromWire(resp: DidLogResponse): LogEntryInfo[] {
   return resp.entries.map((e) => ({
     versionId: e.versionId ?? null,
     versionTime: e.versionTime ?? null,
-    state: (e.state as Record<string, any>) ?? null,
-    parameters: (e.parameters as Record<string, any> | undefined) ?? null,
+    state: isRecord(e.state) ? (e.state as DidDocumentState) : null,
+    parameters: isRecord(e.parameters) ? (e.parameters as WebvhParameters) : null,
   }));
 }
 
@@ -109,17 +124,14 @@ export function logEntriesFromWire(resp: DidLogResponse): LogEntryInfo[] {
  */
 export function logMetadataFromEntries(entries: LogEntryInfo[]): LogMetadata | null {
   if (entries.length === 0) return null;
-  const effective: Record<string, any> = {};
+  const effective: WebvhParameters = {};
   for (const e of entries) {
     if (e.parameters) Object.assign(effective, e.parameters);
   }
   const latest = entries[entries.length - 1]!;
-  const witness =
-    effective.witness && typeof effective.witness === "object" ? effective.witness : null;
+  const witness = isRecord(effective.witness) ? effective.witness : null;
   const witnessList: unknown[] = Array.isArray(witness?.witnesses) ? witness.witnesses : [];
-  const watcherUrls: string[] = Array.isArray(effective.watchers)
-    ? effective.watchers.filter((w: unknown): w is string => typeof w === "string")
-    : [];
+  const watcherUrls = strings(effective.watchers);
   return {
     logEntryCount: entries.length,
     latestVersionId: latest.versionId,
@@ -144,17 +156,17 @@ export function logMetadataFromEntries(entries: LogEntryInfo[]): LogMetadata | n
 
 /** The host's `DomainBranding` / `DomainQuota` are its storage structs,
  *  serialised snake_case inside the extension. */
-function brandingFromWire(b: any): DomainBranding | null {
-  if (!b || typeof b !== "object") return null;
+function brandingFromWire(b: unknown): DomainBranding | null {
+  if (!isRecord(b)) return null;
   return {
-    logoUrl: b.logo_url ?? null,
-    primaryColor: b.primary_color ?? null,
-    displayName: b.display_name ?? null,
+    logoUrl: str(b.logo_url),
+    primaryColor: str(b.primary_color),
+    displayName: str(b.display_name),
   };
 }
-function quotaFromWire(q: any): DomainQuota | null {
-  if (!q || typeof q !== "object") return null;
-  return { maxDids: q.max_dids ?? null, maxBytes: q.max_bytes ?? null };
+function quotaFromWire(q: unknown): DomainQuota | null {
+  if (!isRecord(q)) return null;
+  return { maxDids: num(q.max_dids), maxBytes: num(q.max_bytes) };
 }
 
 /** The shared `DomainEntry` schema is open (`additionalProperties`), so the
@@ -171,8 +183,8 @@ export function domainFromWire(wire: object): DomainEntry {
     createdAt: epochSeconds(raw.createdAt as string) ?? 0,
     defaultDomain: raw.defaultDomain === true,
     branding: brandingFromWire(host.branding),
-    witnesses: Array.isArray(host.witnesses) ? host.witnesses : null,
-    watchers: Array.isArray(host.watchers) ? host.watchers : null,
+    witnesses: Array.isArray(host.witnesses) ? strings(host.witnesses) : null,
+    watchers: Array.isArray(host.watchers) ? strings(host.watchers) : null,
     quota: quotaFromWire(host.quota),
     wellKnownEnabled: host.wellKnownEnabled === true,
     disabledAt: epochSeconds(raw.disabledAt as string | undefined),
@@ -314,12 +326,7 @@ type WireRole = "admin" | "owner" | "service" | "metricsReader";
  *  promote a read-only credential on save; folding it into any other role
  *  would mislabel the row. `undefined` for a value this client predates. */
 function knownRole(r: string | undefined): WireRole | undefined {
-  return r === "admin" ||
-    r === "owner" ||
-    r === "service" ||
-    r === "metricsReader"
-    ? r
-    : undefined;
+  return r === "admin" || r === "owner" || r === "service" || r === "metricsReader" ? r : undefined;
 }
 
 /** Invite roles. The server refuses `metricsReader` on invites, so it only
@@ -374,7 +381,7 @@ export function passkeyCredentialFromWire(c: WireCredentialSummary): PasskeyCred
  *  wire carries webvh fields under `ext["vnd.affinidi.webvh"]`. */
 export function aclEntryFromWire(spec: WireAclEntry): AclEntry {
   const webvh = webvhExt(spec.ext as Ext);
-  const quota: any = webvh.quota ?? {};
+  const quota = isRecord(webvh.quota) ? webvh.quota : {};
   return {
     did: spec.subject,
     role: aclRole(spec.role),
@@ -435,5 +442,7 @@ export function actNarrowing(current: ActScope, next: ActScope): ActScope | null
   const keep = new Set(next.scope === "contexts" ? next.contexts : []);
   const kept = current.contexts.filter((c) => keep.has(c));
   if (kept.length === current.contexts.length) return null;
-  return kept.length === 0 ? { scope: "none" } : { scope: "contexts", contexts: kept as [string, ...string[]] };
+  return kept.length === 0
+    ? { scope: "none" }
+    : { scope: "contexts", contexts: kept as [string, ...string[]] };
 }

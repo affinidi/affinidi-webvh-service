@@ -35,12 +35,8 @@ describe("aclEntryFromWire role mapping", () => {
   });
 
   it("keeps admin and service", () => {
-    expect(aclEntryFromWire({ ...base, role: "admin" } as never).role).toBe(
-      "admin",
-    );
-    expect(aclEntryFromWire({ ...base, role: "service" } as never).role).toBe(
-      "service",
-    );
+    expect(aclEntryFromWire({ ...base, role: "admin" } as never).role).toBe("admin");
+    expect(aclEntryFromWire({ ...base, role: "service" } as never).role).toBe("service");
   });
 
   it("falls back to owner for an unknown role", () => {
@@ -61,14 +57,12 @@ describe("inviteFromWire role mapping", () => {
     // stale/forged row must be shown as itself — not silently promoted to owner
     // nor mislabelled — so an unchanged save is refused server-side, never a
     // silent rewrite. Mirrors `aclRole` for ACL entries.
-    expect(
-      inviteFromWire({ ...invite, role: "metricsReader" } as never).role,
-    ).toBe("metricsReader");
+    expect(inviteFromWire({ ...invite, role: "metricsReader" } as never).role).toBe(
+      "metricsReader",
+    );
   });
 
   it("never promotes a genuinely unknown role to owner — falls back to service", () => {
-    expect(inviteFromWire({ ...invite, role: "superuser" } as never).role).toBe(
-      "service",
-    );
+    expect(inviteFromWire({ ...invite, role: "superuser" } as never).role).toBe("service");
   });
 });
