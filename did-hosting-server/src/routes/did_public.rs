@@ -59,6 +59,7 @@ use crate::server::AppState;
     params(("mnemonic" = String, Path, description = "Slot path; the published did:webvh resolves at <base>/{mnemonic}/did.jsonl")),
     responses(
         (status = 200, description = "did:webvh log (JSONL) or did:web document for the slot", content_type = "application/jsonl+json"),
+        (status = 304, description = "The `If-None-Match` tag is current"),
         (status = 404, description = "No DID hosted at this path"),
         (status = 405, description = "A method other than GET or HEAD"),
         (status = 429, description = "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`", content_type = "application/json"),
