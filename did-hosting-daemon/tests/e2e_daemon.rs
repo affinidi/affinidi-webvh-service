@@ -775,6 +775,26 @@ async fn documented_daemon_routes_are_served() {
         reqwest::StatusCode::NOT_FOUND
     );
 
+    // It reads the daemon's one store, so it serves the daemon's own root
+    // log — the hosting service's record, not a `WatcherRecord`, which once
+    // failed this request with a 500.
+    let resp = http
+        .get(url("/watcher/.well-known/did.jsonl"))
+        .send()
+        .await
+        .expect("GET the watcher's root log");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let watcher_root = resp.text().await.expect("root log body");
+    let root = http
+        .get(url("/.well-known/did.jsonl"))
+        .send()
+        .await
+        .expect("GET the root log")
+        .text()
+        .await
+        .expect("root log body");
+    assert_eq!(watcher_root, root);
+
     // The did:web route is the resolver's, not the console's fallback,
     // whatever it makes of a loopback root DID.
     let resp = http

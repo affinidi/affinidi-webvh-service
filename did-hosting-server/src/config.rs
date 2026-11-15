@@ -422,6 +422,43 @@ mod tests {
         assert!(AppConfig::load(Some(path)).is_err());
     }
 
+    /// A malformed `trusted_proxy_cidrs` entry or `rotation_grace_period`
+    /// stops the load, naming the key and the value, instead of being
+    /// dropped (the CIDR) or read as an hour (the grace period).
+    #[test]
+    fn a_bad_proxy_cidr_or_grace_period_is_refused_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        std::fs::write(
+            &path,
+            "[server]\ntrusted_proxy_cidrs = [\"10.0.0.0/8\", \"10.0.0.0/40\"]\n",
+        )
+        .unwrap();
+        let err = AppConfig::load(Some(path.clone())).unwrap_err().to_string();
+        assert!(err.contains("trusted_proxy_cidrs"), "{err}");
+        assert!(err.contains("10.0.0.0/40"), "{err}");
+
+        std::fs::write(
+            &path,
+            "[identity]\nrotation_grace_period = \"1 fortnight\"\n",
+        )
+        .unwrap();
+        let err = AppConfig::load(Some(path.clone())).unwrap_err().to_string();
+        assert!(err.contains("rotation_grace_period"), "{err}");
+        assert!(err.contains("1 fortnight"), "{err}");
+
+        std::fs::write(
+            &path,
+            "[server]\ntrusted_proxy_cidrs = [\"10.0.0.0/8\"]\n\
+             [identity]\nrotation_grace_period = \"15m\"\n",
+        )
+        .unwrap();
+        let config = AppConfig::load(Some(path)).expect("valid values load");
+        assert_eq!(config.server.trusted_proxy_cidrs.len(), 1);
+        assert_eq!(config.identity.rotation_grace_secs(), 15 * 60);
+    }
+
     /// The documented `DID_HOSTING_` names reach the shared settings, the
     /// legacy `WEBVH_` names still work, and the documented name wins.
     #[test]

@@ -34,7 +34,6 @@
 //! the resolved domain.
 
 use std::net::IpAddr;
-use std::str::FromStr;
 
 use ipnetwork::IpNetwork;
 use tracing::{debug, warn};
@@ -176,24 +175,10 @@ pub fn parse_forwarded_host(header: &str) -> Option<&str> {
     None
 }
 
-/// Parse a list of CIDR strings (the `trusted_proxy_cidrs` config
-/// field). Returns the parsed CIDRs and a list of any strings that
-/// failed to parse (so the caller can warn-log them but still boot).
-pub fn parse_trusted_cidrs(input: &[String]) -> (Vec<IpNetwork>, Vec<String>) {
-    let mut ok = Vec::with_capacity(input.len());
-    let mut bad = Vec::new();
-    for s in input {
-        match IpNetwork::from_str(s) {
-            Ok(net) => ok.push(net),
-            Err(_) => bad.push(s.clone()),
-        }
-    }
-    (ok, bad)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     fn cidr(s: &str) -> IpNetwork {
         IpNetwork::from_str(s).expect("valid cidr")
@@ -380,21 +365,6 @@ mod tests {
             parse_forwarded_host(r#"host="[2001:db8::1]:8080""#),
             Some("[2001:db8::1]:8080")
         );
-    }
-
-    // ---- CIDR list parser ----
-
-    #[test]
-    fn parse_trusted_cidrs_separates_good_and_bad() {
-        let inputs = vec![
-            "10.0.0.0/8".to_string(),
-            "garbage".to_string(),
-            "2001:db8::/32".to_string(),
-            "192.168.1.300/24".to_string(), // invalid octet
-        ];
-        let (ok, bad) = parse_trusted_cidrs(&inputs);
-        assert_eq!(ok.len(), 2);
-        assert_eq!(bad, vec!["garbage", "192.168.1.300/24"]);
     }
 
     // ---- end-to-end smoke ----

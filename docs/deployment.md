@@ -73,7 +73,7 @@ edge and the daemon warn at startup when only one is set.
 | Key | Question it answers | Headers it trusts | Read by | Bad entry |
 | --- | --- | --- | --- | --- |
 | `trusted_proxies` | Who is the **client**? (per-address rate limits, connection caps, GeoIP for wallet sign-in) | `X-Forwarded-For` | every binary | refused at load |
-| `trusted_proxy_cidrs` | Which **host** does the request address? (which hosting domain, and so which DIDs, a resolution sees) | `Forwarded` (RFC 7239), `X-Forwarded-Host` | the edge, and the daemon's resolution | logged and ignored |
+| `trusted_proxy_cidrs` | Which **host** does the request address? (which hosting domain, and so which DIDs, a resolution sees) | `Forwarded` (RFC 7239), `X-Forwarded-Host` | the edge, and the daemon's resolution | refused at load |
 
 Both take addresses or CIDR ranges. List only ranges from which nothing
 but the proxy can reach the service: any other peer in the list can name

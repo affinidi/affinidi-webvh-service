@@ -31,7 +31,7 @@ pub mod store;
 pub mod types;
 pub mod wire;
 
-pub use detect::{HostHeaders, parse_forwarded_host, parse_trusted_cidrs, resolve_request_host};
+pub use detect::{HostHeaders, parse_forwarded_host, resolve_request_host};
 pub use normalize::normalize_domain_name;
 pub use safety::{
     ResolutionDomains, assert_acl_allows_host, assert_did_host_allowed,

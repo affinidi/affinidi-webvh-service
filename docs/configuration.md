@@ -74,7 +74,7 @@ Below, `<P>` stands for a binary's env prefix.
 | `port` | per binary (table above) | `<P>_SERVER_PORT` | Bind port. |
 | `trusted_proxies` | `[]` | `<P>_SERVER_TRUSTED_PROXIES` (comma-separated; empty clears) | Addresses or CIDR ranges whose `X-Forwarded-For` is trusted for the **client address** (rate limits, connection caps, GeoIP). A bad entry, or a range covering every address (`0.0.0.0/0`), is refused at load. These peers are also exempt from the per-address connection cap. |
 | `client_ipv6_prefix` | `64` | — | Prefix length an IPv6 client is counted by in every per-address limit (1–128). |
-| `trusted_proxy_cidrs` | `[]` | — | CIDR ranges whose `Forwarded` / `X-Forwarded-Host` is trusted for the **request host** (which hosting domain a resolution addresses). Read by the edge and the daemon's resolution. Unparseable entries are logged and ignored. See [deployment.md](deployment.md#two-proxy-lists). |
+| `trusted_proxy_cidrs` | `[]` | — | Addresses or CIDR ranges whose `Forwarded` / `X-Forwarded-Host` is trusted for the **request host** (which hosting domain a resolution addresses). Read by the edge and the daemon's resolution. A bad entry, or a range covering every address, is refused at load, naming the key and the entry. See [deployment.md](deployment.md#two-proxy-lists). |
 
 ### `[server.resolve_cache]` — `ResolveCacheConfig`
 
@@ -239,7 +239,7 @@ stops the service, naming the key.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `mode` | `vta` | `vta`: a VTA provisions the node's keys. `self-managed`: the node mints its own keys and self-hosts its `did:webvh` (daemon only; env `DID_HOSTING_IDENTITY_MODE` on the daemon). |
-| `rotation_grace_period` | `"1h"` | How long a superseded identity generation stays usable after a rotation; `"0"` retires at once (for a compromised key). A value that does not parse is logged and treated as `1h`. |
+| `rotation_grace_period` | `"1h"` | How long a superseded identity generation stays usable after a rotation; `"0"` retires at once (for a compromised key). A value that does not parse is refused at load, naming the key. |
 
 See [identity-rotation-design.md](identity-rotation-design.md).
 

@@ -2461,32 +2461,27 @@ mod tests {
         assert!(secret_matches_document(&unrelated, None));
     }
 
+    /// The grace period is read from the parsed config; a typo never reaches
+    /// here (it is refused at load — see
+    /// `config::tests::rotation_grace_period_is_parsed_at_load`).
     #[test]
-    fn the_grace_period_parses_and_a_typo_fails_safe() {
-        use crate::server::config::IdentityConfig;
+    fn the_grace_period_is_read_from_the_parsed_config() {
+        use crate::server::config::{GracePeriod, IdentityConfig};
 
         let cfg = IdentityConfig::default();
         assert_eq!(cfg.rotation_grace_secs(), 3600, "default is 1h");
 
         let cfg = IdentityConfig {
-            rotation_grace_period: "30m".into(),
+            rotation_grace_period: GracePeriod::parse("30m").unwrap(),
             ..Default::default()
         };
         assert_eq!(cfg.rotation_grace_secs(), 1800);
 
         let cfg = IdentityConfig {
-            rotation_grace_period: "0".into(),
+            rotation_grace_period: GracePeriod::parse("0").unwrap(),
             ..Default::default()
         };
         assert_eq!(cfg.rotation_grace_secs(), 0, "0 retires immediately");
-
-        // A typo must not take the boot down, and must fail *long* — keeping
-        // the old key honoured — rather than short.
-        let cfg = IdentityConfig {
-            rotation_grace_period: "1 fortnight".into(),
-            ..Default::default()
-        };
-        assert_eq!(cfg.rotation_grace_secs(), 3600);
     }
 
     #[cfg(feature = "store-fjall")]
