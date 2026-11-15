@@ -94,7 +94,7 @@ async fn make_state_with(server: ServerConfig) -> (AppState, tempfile::TempDir) 
                 did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
             ),
         ),
-        sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+        sync_locks: Default::default(),
         replay_cache: std::sync::Arc::new(did_hosting_common::server::replay::ReplayCache::new()),
     };
     (state, dir)
@@ -1026,4 +1026,64 @@ async fn resolve_rate_limit_refuses_one_address_past_the_limit() {
         StatusCode::TOO_MANY_REQUESTS,
         "the Trust Task listener is not counted against resolution"
     );
+}
+
+/// Resolution answers with a strong ETag, `304` to a matching
+/// `If-None-Match` (weakly compared, lists and `*` included), and compresses
+/// for a client that accepts it — weakening the tag on the encoded form,
+/// which still revalidates.
+#[tokio::test]
+async fn resolution_has_etags_conditional_gets_and_compression() {
+    let (state, _dir) = make_state().await;
+    let did_id = "did:webvh:test:server.example.com:alice";
+    let body = format!(
+        "{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\",\"pad\":\"{}\"}}}}",
+        "x".repeat(4096)
+    );
+    seed_did(&state, "alice", did_id, &body).await;
+    let app = did_hosting_server::routes::router(1024 * 1024).with_state(state);
+    let get = |headers: &[(&str, &str)]| {
+        let mut request = Request::builder().uri("/alice/did.jsonl");
+        for (k, v) in headers {
+            request = request.header(*k, *v);
+        }
+        app.clone().oneshot(request.body(Body::empty()).unwrap())
+    };
+
+    let response = get(&[]).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let tag = response.headers()["etag"].to_str().unwrap().to_string();
+    assert!(tag.starts_with('"'), "strong: {tag}");
+
+    for inm in [
+        tag.clone(),
+        format!("W/{tag}"),
+        format!("\"other\", {tag}"),
+        "*".to_string(),
+    ] {
+        let response = get(&[("if-none-match", &inm)]).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED, "{inm}");
+        assert_eq!(response.headers()["etag"].to_str().unwrap(), tag);
+        assert!(response.headers().contains_key("cache-control"));
+    }
+    let response = get(&[("if-none-match", "\"stale\"")]).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = get(&[("accept-encoding", "gzip")]).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-encoding"], "gzip");
+    let weak = response.headers()["etag"].to_str().unwrap().to_string();
+    assert_eq!(weak, format!("W/{tag}"));
+    let compressed = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert!(
+        compressed.len() < body.len() / 4,
+        "{} bytes",
+        compressed.len()
+    );
+    let response = get(&[("accept-encoding", "gzip"), ("if-none-match", &weak)])
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
 }

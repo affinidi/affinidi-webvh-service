@@ -71,6 +71,9 @@ pub async fn serve_public(State(state): State<AppState>, request: Request) -> Re
         return refused;
     }
     let (parts, _) = request.into_parts();
+    // The request host, `If-None-Match` and the slot's record are read once
+    // here and shared by every dispatcher below.
+    let lookup = super::resolve_shared::Lookup::new(&state, &parts);
 
     // Order matters when methods share suffixes; today they don't, but
     // the iteration is encoded explicitly anyway so the priority is
@@ -78,7 +81,7 @@ pub async fn serve_public(State(state): State<AppState>, request: Request) -> Re
 
     #[cfg(feature = "method-webvh")]
     {
-        if let Some(response) = resolve_webvh::dispatch(&state, &parts).await {
+        if let Some(response) = resolve_webvh::dispatch(&lookup, &parts).await {
             return response;
         }
     }
@@ -87,14 +90,14 @@ pub async fn serve_public(State(state): State<AppState>, request: Request) -> Re
     // tell whether the slot behind it is a did:webs record.
     #[cfg(feature = "method-webs")]
     {
-        if let Some(response) = resolve_webs::dispatch(&state, &parts).await {
+        if let Some(response) = resolve_webs::dispatch(&lookup, &parts).await {
             return response;
         }
     }
 
     #[cfg(feature = "method-web")]
     {
-        if let Some(response) = resolve_web::dispatch(&state, &parts).await {
+        if let Some(response) = resolve_web::dispatch(&lookup, &parts).await {
             return response;
         }
     }
@@ -102,8 +105,8 @@ pub async fn serve_public(State(state): State<AppState>, request: Request) -> Re
     // Silence the unused-binding warning when no method features are
     // on. The build with both features off is rejected at the crate
     // level by `compile_error!` in `lib.rs` (added below).
-    let _ = state;
-    let _ = parts;
+    let _ = &lookup;
+    let _ = &parts;
 
     StatusCode::NOT_FOUND.into_response()
 }
