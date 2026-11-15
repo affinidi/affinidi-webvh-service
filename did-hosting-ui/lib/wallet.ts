@@ -63,7 +63,7 @@ export interface ProxyVaultEntry {
   contextId: string;
   secretKind: string;
   principalDid?: string;
-  targets: Array<{ kind: string; [k: string]: unknown }>;
+  targets: { kind: string; [k: string]: unknown }[];
   lastUsedAt?: string;
 }
 interface VaultListWireResult {
@@ -74,7 +74,7 @@ interface ProxyLoginWireResult {
   sessionBlob: {
     sessionId: string;
     expiresAt: string;
-    headers?: Array<{ name: string; value: string }>;
+    headers?: { name: string; value: string }[];
     cookies?: unknown[];
     bindOrigin?: string;
   };
@@ -88,9 +88,7 @@ interface VtaWalletProvider {
    *  The caller sets `recipient` (audience) on the envelope before calling;
    *  the wallet adds an `eddsa-jcs-2022` Data Integrity proof and returns the
    *  envelope. Server verifies by resolving the did:peer. */
-  signTrustTask?(
-    params: VtaWalletSignTrustTaskParams,
-  ): Promise<VtaWalletSignTrustTaskResult>;
+  signTrustTask?(params: VtaWalletSignTrustTaskParams): Promise<VtaWalletSignTrustTaskResult>;
   /** Propose a Trust Task for the user's VTA to execute.
    *
    *  The generic relay. We supply a type URI and a payload and nothing else:
@@ -249,9 +247,7 @@ export async function resolveProxyEntry(): Promise<{
   bound: boolean;
 }> {
   if (!isWalletProxyAvailable()) {
-    throw new Error(
-      "VTI Wallet doesn't expose proxy-login APIs (extension may be out of date).",
-    );
+    throw new Error("VTI Wallet doesn't expose proxy-login APIs (extension may be out of date).");
   }
   const rpDid = await getRpDid();
   const profile = await window.vtaWallet!.walletProfile!({
@@ -305,9 +301,7 @@ function extractBearer(headerValue: string): string | null {
  */
 export async function listProxyCandidates(): Promise<ProxyVaultEntry[]> {
   if (!isWalletProxyAvailable()) {
-    throw new Error(
-      "VTI Wallet doesn't expose proxy-login APIs (extension may be out of date).",
-    );
+    throw new Error("VTI Wallet doesn't expose proxy-login APIs (extension may be out of date).");
   }
   const rpDid = await getRpDid();
   const wire = await window.vtaWallet!.vaultList!({
@@ -323,13 +317,9 @@ export async function listProxyCandidates(): Promise<ProxyVaultEntry[]> {
  * sign-in with a trigger link (`oob-sign-in.ts`); kept, behind "Using an
  * older wallet?", until a removal date is set.
  */
-export async function loginWithWalletProxy(
-  entry: ProxyVaultEntry,
-): Promise<VtaWalletLoginResult> {
+export async function loginWithWalletProxy(entry: ProxyVaultEntry): Promise<VtaWalletLoginResult> {
   if (!isWalletProxyAvailable()) {
-    throw new Error(
-      "VTI Wallet doesn't expose proxy-login APIs (extension may be out of date).",
-    );
+    throw new Error("VTI Wallet doesn't expose proxy-login APIs (extension may be out of date).");
   }
   if (!entry.principalDid) {
     throw new Error(
@@ -375,9 +365,7 @@ export async function loginWithWalletProxy(
     nonce: chJson.challenge,
     target: { kind: "did", did: rpDid },
   });
-  const authHeader = pl.sessionBlob.headers?.find(
-    (h) => h.name.toLowerCase() === "authorization",
-  );
+  const authHeader = pl.sessionBlob.headers?.find((h) => h.name.toLowerCase() === "authorization");
   const idTokenCompact = authHeader ? extractBearer(authHeader.value) : null;
   if (!idTokenCompact) {
     throw new Error(
@@ -394,12 +382,11 @@ export async function loginWithWalletProxy(
   //            issues access tokens for a session bound to that same fresh
   //            key, so the session's calls are signed without a wallet
   //            prompt each.
-  const tokenResp = await authenticateIdTokenBindingSessionKey(apiBase, {
+  const tokenResp = await authenticateIdTokenBindingSessionKey({
     idToken: idTokenCompact,
     sessionId: chJson.sessionId,
     challenge: chJson.challenge,
     principalDid: entry.principalDid,
-    rpDid,
   });
 
   return {
@@ -431,13 +418,11 @@ export function isWalletTaskRelayAvailable(): boolean {
 // unrecognised, so there is no class, no planner and no consent request — the
 // request simply fails as an unknown method, which looks like a transport
 // problem rather than the typo it is.
-export const WEBVH_DIDS_UPDATE_1_0 =
-  "https://trusttasks.org/spec/vta/webvh/dids/update/1.0";
+export const WEBVH_DIDS_UPDATE_1_0 = "https://trusttasks.org/spec/vta/webvh/dids/update/1.0";
 
 /** 1.1 adds `scidAlsoKnownAs`: list or remove the log's did:scid alias, with
  *  the agent deriving the DID URL and editing `alsoKnownAs` itself. */
-export const WEBVH_DIDS_UPDATE_1_1 =
-  "https://trusttasks.org/spec/vta/webvh/dids/update/1.1";
+export const WEBVH_DIDS_UPDATE_1_1 = "https://trusttasks.org/spec/vta/webvh/dids/update/1.1";
 
 /** Park / resume an agent name. Same `vta/webvh/...` dispatch discipline as
  *  {@link WEBVH_DIDS_UPDATE_1_0}. */

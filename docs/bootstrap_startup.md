@@ -597,12 +597,15 @@ backends you'll use — they each pull a sizable cloud SDK.
 |----------|-------------|
 | `<PREFIX>_STORE_DATA_DIR` | Fjall on-disk path (default backend) |
 | `<PREFIX>_STORE_REDIS_URL` | Redis connection URL |
-| `<PREFIX>_STORE_DYNAMODB_TABLE_PREFIX` | DynamoDB table-name prefix |
+| `<PREFIX>_STORE_DYNAMODB_TABLE_PREFIX` | DynamoDB table name prefix (one table per keyspace, `<prefix>_<keyspace>`) |
 | `<PREFIX>_STORE_DYNAMODB_REGION` | AWS region for DynamoDB |
+| `<PREFIX>_STORE_DYNAMODB_BILLING_MODE` | Billing for tables the service creates: `pay_per_request` (default) or `provisioned:<read>:<write>` |
+| `<PREFIX>_STORE_DYNAMODB_AUTO_CREATE` | `false` to refuse, rather than create, a missing table (pre-provisioned tables, no `dynamodb:CreateTable`) |
 | `<PREFIX>_STORE_FIRESTORE_PROJECT` | GCP project ID for Firestore |
 | `<PREFIX>_STORE_FIRESTORE_DATABASE` | Firestore database id |
-| `<PREFIX>_STORE_COSMOSDB_CONNECTION_STRING` | Cosmos DB connection string |
+| `<PREFIX>_STORE_COSMOSDB_CONNECTION_STRING` | Cosmos DB `AccountEndpoint=...;AccountKey=...` |
 | `<PREFIX>_STORE_COSMOSDB_DATABASE` | Cosmos DB database name |
+| `<PREFIX>_STORE_COSMOSDB_CONTAINER` | Cosmos DB container holding every keyspace (default `kv`, partitioned on `/pk`, created if missing) |
 | `<PREFIX>_STORE_COSMOSDB_REGION` | Azure region (display form `"West US 2"` or normalised `"westus2"`; defaults to `eastus`) |
 
 The daemon's second store, `[witness_store]`, takes the same variables

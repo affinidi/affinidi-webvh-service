@@ -126,10 +126,9 @@ pub const KS_TSP_RELATIONSHIPS: &str = "tsp_relationships";
 /// [`crate::server::scid_floors`].
 pub const KS_SCID_FLOORS: &str = "scid_floors";
 
-/// Every keyspace above. A backup declares, for each of these, whether it
-/// carries it or why not (the daemon's `backup` module tests that it does),
-/// and the test below fails when a `KS_*` constant is added here but not to
-/// this list.
+/// Every keyspace this workspace opens, so a backend can prepare (or
+/// migrate) each one at startup without waiting for its first use. A new
+/// `KS_*` constant belongs here too.
 pub const ALL_KEYSPACES: &[&str] = &[
     KS_DIDS,
     KS_ACL,

@@ -42,7 +42,6 @@
 // ---------------------------------------------------------------------------
 
 let sessionKeypair: CryptoKeyPair | null = null;
-let sessionPubkeyMultikey: string | null = null;
 let sessionDidKey: string | null = null;
 
 /** Cached promise of an in-flight IDB restore; coalesces concurrent
@@ -88,38 +87,29 @@ export async function generateSessionKeypair(): Promise<{
   // `crypto.subtle.sign(...)` and cannot be read out. Structured clone
   // carries a non-extractable key into IndexedDB with the flag intact,
   // so persistence does not reopen the hole.
-  const keypair = (await crypto.subtle.generateKey(
-    { name: "Ed25519" },
-    false,
-    ["sign", "verify"],
-  )) as CryptoKeyPair;
+  const keypair = (await crypto.subtle.generateKey({ name: "Ed25519" }, false, [
+    "sign",
+    "verify",
+  ])) as CryptoKeyPair;
 
-  const rawPub = new Uint8Array(
-    await crypto.subtle.exportKey("raw", keypair.publicKey),
-  );
+  const rawPub = new Uint8Array(await crypto.subtle.exportKey("raw", keypair.publicKey));
   if (rawPub.length !== 32) {
-    throw new Error(
-      `unexpected Ed25519 public key length: ${rawPub.length} bytes (expected 32)`,
-    );
+    throw new Error(`unexpected Ed25519 public key length: ${rawPub.length} bytes (expected 32)`);
   }
 
   const multikey = ed25519Multikey(rawPub);
   const didKey = `did:key:${multikey}`;
 
   sessionKeypair = keypair;
-  sessionPubkeyMultikey = multikey;
   sessionDidKey = didKey;
 
   // Persist for reload survival. Best-effort: if IDB is unavailable
   // (private browsing, file: origin, embedded webview), the in-memory
   // copy keeps working for this tab session, but the user has to log
   // in again after a reload.
-  await idbPut(KEYPAIR_KEY, { keypair, pubkeyMultikey: multikey, didKey }).catch(
-    (e) => {
-      // eslint-disable-next-line no-console
-      console.warn("session-key: IDB persist failed", e);
-    },
-  );
+  await idbPut(KEYPAIR_KEY, { keypair, pubkeyMultikey: multikey, didKey }).catch((e) => {
+    console.warn("session-key: IDB persist failed", e);
+  });
 
   return { pubkeyMultikey: multikey, didKey };
 }
@@ -162,11 +152,9 @@ export async function restoreSessionKeypair(): Promise<void> {
       const persisted = await idbGet<PersistedKeypair>(KEYPAIR_KEY);
       if (persisted) {
         sessionKeypair = persisted.keypair;
-        sessionPubkeyMultikey = persisted.pubkeyMultikey;
         sessionDidKey = persisted.didKey;
       }
     } catch (e) {
-      // eslint-disable-next-line no-console
       console.warn("session-key: IDB restore failed", e);
     } finally {
       restoreInFlight = null;
@@ -183,7 +171,6 @@ export async function restoreSessionKeypair(): Promise<void> {
 export function clearSessionKeypair(): void {
   forgetSessionKeypair();
   void idbDelete(KEYPAIR_KEY).catch((e) => {
-    // eslint-disable-next-line no-console
     console.warn("session-key: IDB clear failed", e);
   });
 }
@@ -192,7 +179,6 @@ export function clearSessionKeypair(): void {
  *  signed out, which has already deleted the stored copy. */
 export function forgetSessionKeypair(): void {
   sessionKeypair = null;
-  sessionPubkeyMultikey = null;
   sessionDidKey = null;
 }
 
@@ -213,7 +199,6 @@ const CREATED_BACKDATE_MS = 5_000;
 
 /** Subset of the trust-task envelope shape relevant to signing. */
 export type SignableEnvelope = {
-  [key: string]: unknown;
   proof?: unknown;
 };
 
@@ -228,9 +213,7 @@ export type SignableEnvelope = {
  * where `unsignedDoc` is the envelope minus `proof` and `proofConfig`
  * is the proof minus `proofValue`.
  */
-export async function signEnvelope<T extends SignableEnvelope>(
-  envelope: T,
-): Promise<T> {
+export async function signEnvelope<T extends SignableEnvelope>(envelope: T): Promise<T> {
   // Lazy-restore from IndexedDB so a page reload after login still
   // produces a working keypair without an explicit boot-time call.
   if (sessionKeypair === null) {
@@ -265,8 +248,7 @@ export async function signEnvelope<T extends SignableEnvelope>(
   };
 
   // Hash the proof config and the doc (envelope minus proof).
-  const docCopy: SignableEnvelope = { ...envelope };
-  delete docCopy.proof;
+  const { proof: _unsigned, ...docCopy } = envelope;
   const proofConfigHash = await sha256(jcsCanonicalize(proofConfig));
   const docHash = await sha256(jcsCanonicalize(docCopy));
 
@@ -274,16 +256,10 @@ export async function signEnvelope<T extends SignableEnvelope>(
   const toSign = new Uint8Array(proofConfigHash.length + docHash.length);
   toSign.set(proofConfigHash, 0);
   toSign.set(docHash, proofConfigHash.length);
-  const sigBuf = await crypto.subtle.sign(
-    { name: "Ed25519" },
-    sessionKeypair.privateKey,
-    toSign,
-  );
+  const sigBuf = await crypto.subtle.sign({ name: "Ed25519" }, sessionKeypair.privateKey, toSign);
   const sig = new Uint8Array(sigBuf);
   if (sig.length !== 64) {
-    throw new Error(
-      `unexpected Ed25519 signature length: ${sig.length} bytes (expected 64)`,
-    );
+    throw new Error(`unexpected Ed25519 signature length: ${sig.length} bytes (expected 64)`);
   }
 
   // The W3C Data Integrity spec encodes Ed25519 proofValue as
@@ -297,8 +273,7 @@ export async function signEnvelope<T extends SignableEnvelope>(
 // Helpers — base58btc, multikey, JCS, SHA-256
 // ---------------------------------------------------------------------------
 
-const B58_ALPHABET =
-  "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 /**
  * Encode raw bytes as base58btc. Standard Bitcoin alphabet (no `0`,
@@ -312,9 +287,9 @@ function base58btcEncode(bytes: Uint8Array): string {
   // Convert from base-256 to base-58 by repeated division.
   const digits: number[] = [];
   for (let i = 0; i < bytes.length; i++) {
-    let carry = bytes[i];
+    let carry = bytes[i]!;
     for (let j = 0; j < digits.length; j++) {
-      carry += digits[j] << 8;
+      carry += digits[j]! << 8;
       digits[j] = carry % 58;
       carry = (carry / 58) | 0;
     }
@@ -326,7 +301,7 @@ function base58btcEncode(bytes: Uint8Array): string {
 
   let result = "";
   for (let i = 0; i < zeros; i++) result += B58_ALPHABET[0];
-  for (let i = digits.length - 1; i >= 0; i--) result += B58_ALPHABET[digits[i]];
+  for (let i = digits.length - 1; i >= 0; i--) result += B58_ALPHABET[digits[i]!];
   return result;
 }
 
@@ -337,9 +312,7 @@ function base58btcEncode(bytes: Uint8Array): string {
  */
 function ed25519Multikey(rawPubKey: Uint8Array): string {
   if (rawPubKey.length !== 32) {
-    throw new Error(
-      `Ed25519 multikey expects 32-byte pubkey, got ${rawPubKey.length}`,
-    );
+    throw new Error(`Ed25519 multikey expects 32-byte pubkey, got ${rawPubKey.length}`);
   }
   const prefixed = new Uint8Array(34);
   prefixed[0] = 0xed;
@@ -463,8 +436,7 @@ function openDb(): Promise<IDBDatabase | null> {
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error ?? new Error("indexedDB.open failed"));
-    req.onblocked = () =>
-      reject(new Error("indexedDB.open blocked by an older connection"));
+    req.onblocked = () => reject(new Error("indexedDB.open blocked by an older connection"));
   });
 }
 

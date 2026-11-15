@@ -107,14 +107,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = StoreConfig {
             data_dir: dir.path().to_path_buf(),
-            redis_url: None,
-            dynamodb_table_prefix: None,
-            dynamodb_region: None,
-            firestore_project: None,
-            firestore_database: None,
-            cosmosdb_connection_string: None,
-            cosmosdb_database: None,
-            cosmosdb_region: None,
+            ..StoreConfig::default()
         };
         // Leak the tempdir so the path stays valid for the duration of
         // the test process. Acceptable in tests; fjall holds an internal

@@ -41,10 +41,7 @@ export interface RequestOptions extends RequestInit {
   background?: boolean;
 }
 
-export async function request<T>(
-  path: string,
-  options: RequestOptions = {},
-): Promise<T> {
+export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   // Renew ahead of expiry, so an operator who is using the console is not
   // signed out mid-task. Skipped for the renewal call itself, which would
   // otherwise recurse.

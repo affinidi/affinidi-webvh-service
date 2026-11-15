@@ -1,26 +1,23 @@
-import { useEffect, useRef, useState, useCallback } from "react";
-import {
-  View,
-  Text,
-  TextInput,
-  StyleSheet,
-  Pressable,
-  FlatList,
-  ScrollView,
-  ActivityIndicator,
-} from "react-native";
+import { useEffect, useRef, useState } from "react";
+import { View, Text, StyleSheet, FlatList, ScrollView, ActivityIndicator } from "react-native";
 import { Link, useLocalSearchParams, useRouter } from "expo-router";
-import * as Clipboard from "expo-clipboard";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { useDomains } from "../../components/DomainProvider";
-import {
-  AgentNameChips,
-  servedNames,
-} from "../../components/AgentNameChips";
+import { AgentNameChips, servedNames } from "../../components/AgentNameChips";
+import { Button } from "../../components/Button";
+import { CopyButton } from "../../components/CopyButton";
+import { Field } from "../../components/Field";
+import { Heading } from "../../components/Heading";
+import { RequireAuth } from "../../components/RequireAuth";
+import { SegmentedControl } from "../../components/SegmentedControl";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
+import { webAria } from "../../lib/a11y";
 import { showAlert } from "../../lib/alert";
-import type { DidRecord } from "../../lib/api";
+import { errorMessage } from "../../lib/errors";
+import { plural } from "../../lib/plural";
+import { invalidateQueries, useTrustTaskQuery } from "../../lib/query";
+import { formatDate } from "../../lib/time";
 import { matchesDomain } from "../../lib/domain";
 import { DidQrButton } from "../../components/DidQrButton";
 import { TableRow } from "../../components/TableRow";
@@ -61,20 +58,32 @@ const COLUMNS: {
 
 type PathStatus = null | "checking" | "available" | "taken" | "error";
 
+/** Every list of DIDs is read under this prefix; a write that changes one
+ *  invalidates them all. */
+const DIDS_KEY = ["dids"] as const;
+
 export default function DidList() {
+  return (
+    <RequireAuth purpose="manage DIDs">
+      <DidListBody />
+    </RequireAuth>
+  );
+}
+
+function DidListBody() {
   const api = useApi();
-  const { isAuthenticated, role, did: myDid } = useAuth();
+  const { role, did: myDid } = useAuth();
   const router = useRouter();
   const { owner } = useLocalSearchParams<{ owner?: string }>();
+  const { domains, currentDomain, defaultDomain, loaded: domainsLoaded } = useDomains();
   const {
-    domains,
-    currentDomain,
-    defaultDomain,
-    loaded: domainsLoaded,
-  } = useDomains();
-  const [dids, setDids] = useState<DidRecord[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+    data,
+    loading,
+    error: loadError,
+  } = useTrustTaskQuery([...DIDS_KEY, "list", owner ?? null], () => api.listDids(owner));
+  const dids = data ?? [];
+  const error = loadError ? errorMessage(loadError, "Failed to load DIDs") : null;
+  const refresh = () => void invalidateQueries([...DIDS_KEY]);
   const [creating, setCreating] = useState(false);
 
   const [creatingRoot, setCreatingRoot] = useState(false);
@@ -82,7 +91,6 @@ export default function DidList() {
   const [showAccept, setShowAccept] = useState(false);
   const [acceptPath, setAcceptPath] = useState("");
   const [accepting, setAccepting] = useState(false);
-  const [copiedDid, setCopiedDid] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState<DidSort>({ key: "mnemonic", dir: "asc" });
 
@@ -96,26 +104,6 @@ export default function DidList() {
   const [createDomain, setCreateDomain] = useState<string | null>(
     currentDomain ?? defaultDomain ?? null,
   );
-
-  const refresh = useCallback(() => {
-    if (!isAuthenticated) {
-      setLoading(false);
-      return;
-    }
-    setLoading(true);
-    api
-      .listDids(owner)
-      .then((data) => {
-        setDids(data);
-        setError(null);
-      })
-      .catch((e) => setError(e.message))
-      .finally(() => setLoading(false));
-  }, [api, isAuthenticated, owner]);
-
-  useEffect(() => {
-    refresh();
-  }, [refresh]);
 
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -139,9 +127,7 @@ export default function DidList() {
     debounceRef.current = setTimeout(() => {
       api
         .checkName(trimmed, createDomain ?? undefined)
-        .then((result) =>
-          setPathStatus(result.available ? "available" : "taken"),
-        )
+        .then((result) => setPathStatus(result.available ? "available" : "taken"))
         .catch(() => setPathStatus("error"));
     }, 400);
 
@@ -151,6 +137,7 @@ export default function DidList() {
   }, [customPath, api, createDomain]);
 
   const handleCreate = async () => {
+    if (creating) return;
     setCreating(true);
     try {
       const path = customPath.trim() || undefined;
@@ -158,8 +145,7 @@ export default function DidList() {
       resetForm();
       refresh();
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Failed to create DID";
-      showAlert("Error", msg);
+      showAlert("Error", errorMessage(e, "Failed to create DID"));
     } finally {
       setCreating(false);
     }
@@ -167,7 +153,7 @@ export default function DidList() {
 
   const handleAccept = async () => {
     const path = acceptPath.trim();
-    if (!path || !myDid) return;
+    if (!path || !myDid || accepting) return;
     setAccepting(true);
     try {
       await api.acceptDidTransfer(path, myDid);
@@ -176,25 +162,11 @@ export default function DidList() {
       refresh();
       showAlert("Success", `"${path}" is now yours`);
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Failed to accept the DID";
-      showAlert("Error", msg);
+      showAlert("Error", errorMessage(e, "Failed to accept the DID"));
     } finally {
       setAccepting(false);
     }
   };
-
-  if (!isAuthenticated) {
-    return (
-      <View style={styles.containerCenter}>
-        <Text style={styles.hint}>Please log in to manage DIDs.</Text>
-        <Link href="/login" asChild>
-          <Pressable style={styles.buttonPrimary}>
-            <Text style={styles.buttonPrimaryText}>Login</Text>
-          </Pressable>
-        </Link>
-      </View>
-    );
-  }
 
   const handleCreateRootDid = async () => {
     setCreatingRoot(true);
@@ -202,32 +174,14 @@ export default function DidList() {
       await api.createDid(".well-known");
       refresh();
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Failed to create root DID";
-      showAlert("Error", msg);
+      showAlert("Error", errorMessage(e, "Failed to create root DID"));
     } finally {
       setCreatingRoot(false);
     }
   };
 
   const showRootDidButton =
-    role === "admin" &&
-    !dids.some((d) => d.mnemonic === ".well-known") &&
-    !loading;
-
-  const handleCopyDid = async (didId: string) => {
-    await Clipboard.setStringAsync(didId);
-    setCopiedDid(didId);
-    setTimeout(() => setCopiedDid(null), 2000);
-  };
-
-  const formatDate = (ts: number) =>
-    new Date(ts * 1000).toLocaleDateString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+    role === "admin" && !dids.some((d) => d.mnemonic === ".well-known") && !loading;
 
   // Filter the list to the current domain when the switcher has one
   // pinned. "All domains" (currentDomain === null, admin-only) shows
@@ -246,12 +200,9 @@ export default function DidList() {
   const hiddenNoDomainCount =
     currentDomain === null
       ? 0
-      : dids.filter((d) => !d.domain && !matchesDomain(d, currentDomain))
-          .length;
+      : dids.filter((d) => !d.domain && !matchesDomain(d, currentDomain)).length;
   const visibleDids =
-    currentDomain === null
-      ? dids
-      : dids.filter((d) => matchesDomain(d, currentDomain));
+    currentDomain === null ? dids : dids.filter((d) => matchesDomain(d, currentDomain));
   const rows = sortDids(
     visibleDids.filter((d) => matchesSearch(d, search)),
     sort,
@@ -260,10 +211,8 @@ export default function DidList() {
   // A badge on every row says nothing. Show the method only when the list
   // mixes methods (otherwise the DID's own prefix says it), and mark owners
   // only when the list mixes them.
-  const showMethod =
-    new Set(visibleDids.map((d) => d.method ?? "")).size > 1;
-  const markOwners =
-    showOwnerInfo && visibleDids.some((d) => d.owner !== myDid);
+  const showMethod = new Set(visibleDids.map((d) => d.method ?? "")).size > 1;
+  const markOwners = showOwnerInfo && visibleDids.some((d) => d.owner !== myDid);
   // Sized from the domain's DIDs, not the search results, so the columns
   // hold still while typing.
   const nameWidth = nameColumnWidth(
@@ -279,11 +228,7 @@ export default function DidList() {
   );
   const didWidth = didTextWidth(visibleDids.map((d) => d.didId));
   const columnWidth = (key: DidSortKey, fixed?: number) =>
-    key === "mnemonic"
-      ? nameWidth
-      : key === "didId"
-        ? didWidth + DID_ACTIONS_WIDTH
-        : fixed!;
+    key === "mnemonic" ? nameWidth : key === "didId" ? didWidth + DID_ACTIONS_WIDTH : fixed!;
   /** A column's width. The name fits its longest name; the others are
    *  minimums that share any spare width equally. */
   const columnStyle = (key: DidSortKey, fixed?: number) => ({
@@ -293,9 +238,7 @@ export default function DidList() {
   });
   // Below the columns' sum the table scrolls sideways instead of squeezing.
   const tableMinWidth =
-    COLUMNS.reduce((w, c) => w + columnWidth(c.key, c.width), 0) +
-    2 * spacing.sm +
-    3;
+    COLUMNS.reduce((w, c) => w + columnWidth(c.key, c.width), 0) + 2 * spacing.sm + 3;
 
   return (
     <View style={styles.container}>
@@ -304,116 +247,93 @@ export default function DidList() {
           <Text style={styles.ownerBannerText} numberOfLines={1}>
             DIDs owned by {owner}
           </Text>
-          <Pressable
-            style={styles.buttonSecondary}
-            onPress={() => router.replace("/dids")}
-          >
-            <Text style={styles.buttonSecondaryText}>Your DIDs</Text>
-          </Pressable>
+          <Button label="Your DIDs" variant="secondary" onPress={() => router.replace("/dids")} />
         </View>
       )}
 
       <View style={styles.header}>
         <View style={{ flex: 1 }}>
-          <Text style={styles.title}>
+          <Heading style={styles.title}>
             {owner ? "Owner DIDs" : role === "admin" ? "All DIDs" : "Your DIDs"}
-          </Text>
+          </Heading>
           {currentDomain !== null && (
             <Text style={styles.filterCaption}>
               Filtered to {currentDomain}
               {hiddenNoDomainCount > 0
-                ? ` · ${hiddenNoDomainCount} unassigned DID${
-                    hiddenNoDomainCount === 1 ? "" : "s"
-                  } hidden`
+                ? ` · ${plural(hiddenNoDomainCount, "unassigned DID", "unassigned DIDs")} hidden`
                 : ""}
             </Text>
           )}
         </View>
         <View style={styles.headerActions}>
           {showRootDidButton && (
-            <Pressable
-              style={[styles.buttonSecondary, creatingRoot && styles.disabled]}
+            <Button
+              label="Create Root DID"
+              variant="secondary"
+              busy={creatingRoot}
+              busyLabel="Creating..."
               onPress={handleCreateRootDid}
-              disabled={creatingRoot}
-            >
-              <Text style={styles.buttonSecondaryText}>
-                {creatingRoot ? "Creating..." : "Create Root DID"}
-              </Text>
-            </Pressable>
+            />
           )}
           {!showAccept && myDid && (
-            <Pressable
-              style={styles.buttonSecondary}
-              onPress={() => setShowAccept(true)}
-            >
-              <Text style={styles.buttonSecondaryText}>Accept a DID</Text>
-            </Pressable>
+            <Button label="Accept a DID" variant="secondary" onPress={() => setShowAccept(true)} />
           )}
-          {!showForm && (
-            <Pressable
-              style={styles.buttonPrimary}
-              onPress={() => setShowForm(true)}
-            >
-              <Text style={styles.buttonPrimaryText}>+ New DID</Text>
-            </Pressable>
-          )}
+          {!showForm && <Button label="+ New DID" onPress={() => setShowForm(true)} />}
         </View>
       </View>
 
       {showAccept && (
         <View style={styles.formCard}>
-          <TextInput
-            style={styles.input}
+          <Field
+            label="Path of the DID offered to you"
+            hideLabel
+            inputStyle={styles.input}
             placeholder="path of the DID offered to you"
-            placeholderTextColor={colors.textTertiary}
             value={acceptPath}
             onChangeText={setAcceptPath}
+            onSubmit={handleAccept}
             autoCapitalize="none"
             autoCorrect={false}
-            accessibilityLabel="Path of the DID offered to you"
+            style={styles.fieldTight}
           />
           <Text style={styles.validationHint}>
-            Another owner offered you a DID. Enter its path to take ownership;
-            the offer lapses after 72 hours.
+            Another owner offered you a DID. Enter its path to take ownership; the offer lapses
+            after 72 hours.
           </Text>
           <View style={styles.formActions}>
-            <Pressable
-              style={[
-                styles.buttonPrimary,
-                (!acceptPath.trim() || accepting) && styles.disabled,
-              ]}
+            <Button
+              label="Accept"
+              busy={accepting}
+              busyLabel="Accepting..."
+              disabled={!acceptPath.trim()}
               onPress={handleAccept}
-              disabled={!acceptPath.trim() || accepting}
-            >
-              <Text style={styles.buttonPrimaryText}>
-                {accepting ? "Accepting..." : "Accept"}
-              </Text>
-            </Pressable>
-            <Pressable
-              style={styles.buttonSecondary}
+            />
+            <Button
+              label="Cancel"
+              variant="secondary"
+              disabled={accepting}
               onPress={() => {
                 setShowAccept(false);
                 setAcceptPath("");
               }}
-              disabled={accepting}
-            >
-              <Text style={styles.buttonSecondaryText}>Cancel</Text>
-            </Pressable>
+            />
           </View>
         </View>
       )}
 
       {showForm && (
         <View style={styles.formCard}>
-          <TextInput
-            style={styles.input}
+          <Field
+            label="DID path or mnemonic"
+            hideLabel
+            inputStyle={styles.input}
             placeholder="custom-name or path/to/name (optional)"
-            placeholderTextColor={colors.textTertiary}
             value={customPath}
             onChangeText={setCustomPath}
+            onSubmit={handleCreate}
             autoCapitalize="none"
             autoCorrect={false}
-            accessibilityLabel="DID path or mnemonic"
+            style={styles.fieldTight}
           />
           <Text style={styles.validationHint}>
             Segments: 2–63 chars, lowercase letters, digits, and hyphens.
@@ -424,81 +344,53 @@ export default function DidList() {
           {domainsLoaded && domains.length > 0 && (
             <View style={styles.domainPickerWrap}>
               <Text style={styles.formLabel}>Host on domain</Text>
-              <View style={styles.domainPickerRow}>
-                {domains.map((d) => (
-                  <Pressable
-                    key={d.name}
-                    accessibilityRole="button"
-                    accessibilityState={{ selected: createDomain === d.name }}
-                    onPress={() => setCreateDomain(d.name)}
-                    disabled={d.status === "disabled"}
-                    style={[
-                      styles.domainPickerOption,
-                      createDomain === d.name && styles.domainPickerOptionActive,
-                      d.status === "disabled" && styles.disabled,
-                    ]}
-                  >
-                    <Text
-                      style={[
-                        styles.domainPickerOptionText,
-                        createDomain === d.name && styles.domainPickerOptionTextActive,
-                      ]}
-                    >
-                      {d.name}
-                      {defaultDomain === d.name ? " · default" : ""}
-                    </Text>
-                  </Pressable>
-                ))}
-              </View>
+              <SegmentedControl
+                label="Host on domain"
+                value={createDomain}
+                onChange={setCreateDomain}
+                options={domains.map((d) => ({
+                  value: d.name,
+                  label: `${d.name}${defaultDomain === d.name ? " · default" : ""}`,
+                  disabled: d.status === "disabled",
+                }))}
+                style={styles.domainPickerRow}
+              />
               <Text style={styles.validationHint}>
-                The selected domain becomes the DID's host. Omit (rare) to let the
-                daemon pick your ACL default.
+                The selected domain becomes the DID&apos;s host. Omit (rare) to let the daemon pick
+                your ACL default.
               </Text>
             </View>
           )}
 
-          {pathStatus === "checking" && (
-            <Text style={styles.statusChecking}>Checking availability...</Text>
-          )}
-          {pathStatus === "available" && (
-            <Text style={styles.statusAvailable}>Available</Text>
-          )}
-          {pathStatus === "taken" && (
-            <Text style={styles.statusTaken}>Already taken</Text>
-          )}
-          {pathStatus === "error" && (
-            <Text style={styles.statusTaken}>
-              Could not check availability
-            </Text>
-          )}
+          <View aria-live="polite">
+            {pathStatus === "checking" && (
+              <Text style={styles.statusChecking}>Checking availability...</Text>
+            )}
+            {pathStatus === "available" && <Text style={styles.statusAvailable}>✓ Available</Text>}
+            {pathStatus === "taken" && <Text style={styles.statusTaken}>✗ Already taken</Text>}
+            {pathStatus === "error" && (
+              <Text style={styles.statusTaken}>Could not check availability</Text>
+            )}
+          </View>
 
           <View style={styles.formActions}>
-            <Pressable
-              style={[styles.buttonPrimary, creating && styles.disabled]}
-              onPress={handleCreate}
-              disabled={creating}
-            >
-              <Text style={styles.buttonPrimaryText}>
-                {creating ? "Creating..." : "Create"}
-              </Text>
-            </Pressable>
-            <Pressable
-              style={styles.buttonSecondary}
-              onPress={resetForm}
-              disabled={creating}
-            >
-              <Text style={styles.buttonSecondaryText}>Cancel</Text>
-            </Pressable>
+            <Button label="Create" busy={creating} busyLabel="Creating..." onPress={handleCreate} />
+            <Button label="Cancel" variant="secondary" disabled={creating} onPress={resetForm} />
           </View>
         </View>
       )}
 
-      {error && <Text style={styles.errorText}>{error}</Text>}
+      {error && (
+        <Text role="alert" style={styles.errorText}>
+          {error}
+        </Text>
+      )}
 
       {loading ? (
         <ActivityIndicator
           color={colors.accent}
           size="large"
+          aria-label="Loading DIDs"
           style={{ marginTop: spacing.xxl }}
         />
       ) : visibleDids.length === 0 ? (
@@ -510,33 +402,39 @@ export default function DidList() {
       ) : (
         <>
           <View style={styles.searchRow}>
-            <TextInput
-              style={styles.searchInput}
+            <Field
+              label="Search DIDs"
+              hideLabel
+              style={styles.searchField}
+              inputStyle={styles.searchInput}
               placeholder="Search by name, DID, method or domain"
-              placeholderTextColor={colors.textTertiary}
               value={search}
               onChangeText={setSearch}
               autoCapitalize="none"
               autoCorrect={false}
-              accessibilityLabel="Search DIDs"
             />
-            <Text style={styles.countText}>
+            <Text style={styles.countText} aria-live="polite">
               {rows.length === visibleDids.length
-                ? `${visibleDids.length.toLocaleString()} DID${visibleDids.length === 1 ? "" : "s"}`
+                ? plural(visibleDids.length, "DID", "DIDs")
                 : `${rows.length.toLocaleString()} of ${visibleDids.length.toLocaleString()}`}
             </Text>
           </View>
           <ScrollView horizontal contentContainerStyle={styles.tableScroll}>
-            <View style={[styles.table, { minWidth: tableMinWidth }]}>
-              <View style={styles.headRow} accessibilityRole="header">
+            <View
+              role="table"
+              aria-label="DIDs"
+              style={[styles.table, { minWidth: tableMinWidth }]}
+            >
+              <View style={styles.headRow} role="row">
                 {COLUMNS.map((c) => {
                   const active = sort.key === c.key;
                   return (
-                    <Pressable
+                    <View
                       key={c.key}
-                      accessibilityRole="button"
-                      accessibilityLabel={`Sort by ${c.label}`}
-                      onPress={() => setSort(nextSort(sort, c.key))}
+                      role="columnheader"
+                      {...webAria({
+                        sort: active ? (sort.dir === "asc" ? "ascending" : "descending") : "none",
+                      })}
                       style={[
                         styles.cell,
                         columnStyle(c.key, c.width),
@@ -544,14 +442,22 @@ export default function DidList() {
                         c.gapAfter && styles.cellGapAfter,
                       ]}
                     >
-                      <Text
-                        style={[styles.headText, active && styles.headTextActive]}
-                        numberOfLines={1}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        accessibilityLabel={`Sort by ${c.label}`}
+                        onPress={() => setSort(nextSort(sort, c.key))}
+                        style={styles.headButton}
                       >
-                        {c.label}
-                        {active ? (sort.dir === "asc" ? " ▲" : " ▼") : ""}
-                      </Text>
-                    </Pressable>
+                        <Text
+                          style={[styles.headText, active && styles.headTextActive]}
+                          numberOfLines={1}
+                        >
+                          {c.label}
+                          {active ? (sort.dir === "asc" ? " ▲" : " ▼") : ""}
+                        </Text>
+                      </Button>
+                    </View>
                   );
                 })}
               </View>
@@ -564,131 +470,122 @@ export default function DidList() {
                   renderItem={({ item, index }) => {
                     const isOwn = item.owner === myDid;
                     const names = servedNames(item.agentNames);
+                    // The row is not itself a link: the name is, and the copy
+                    // and QR buttons sit beside it rather than inside it.
                     return (
-                      <Link href={`/dids/${item.mnemonic}`} asChild>
-                        <TableRow
-                          hoverStyle={styles.rowHover}
-                          // Flattened: Link's Slot merges a child's style by
-                          // object spread, which breaks an array (see TableRow).
-                          style={StyleSheet.flatten([
-                            styles.row,
-                            index % 2 === 1 && styles.rowAlt,
-                            markOwners &&
-                              (isOwn ? styles.rowOwn : styles.rowOther),
-                          ])}
-                        >
-                          <View style={[styles.cell, columnStyle("mnemonic")]}>
-                            <View style={styles.nameRow}>
-                              <Text style={styles.mnemonic} numberOfLines={1}>
-                                {item.mnemonic}
-                              </Text>
-                              {showMethod && item.method && (
-                                <View style={styles.methodBadge}>
-                                  <Text style={styles.methodBadgeText}>
-                                    did:{item.method}
-                                  </Text>
-                                </View>
-                              )}
-                              {markOwners && isOwn && (
-                                <View style={styles.youBadge}>
-                                  <Text style={styles.youBadgeText}>You</Text>
-                                </View>
-                              )}
-                              {item.disabled && (
-                                <View style={styles.disabledBadge}>
-                                  <Text style={styles.disabledBadgeText}>Suspended</Text>
-                                </View>
-                              )}
+                      <TableRow
+                        hoverStyle={styles.rowHover}
+                        style={[
+                          styles.row,
+                          index % 2 === 1 && styles.rowAlt,
+                          markOwners && (isOwn ? styles.rowOwn : styles.rowOther),
+                        ]}
+                      >
+                        <View role="cell" style={[styles.cell, columnStyle("mnemonic")]}>
+                          <View style={styles.nameRow}>
+                            <Link href={`/dids/${item.mnemonic}`} style={styles.mnemonic}>
+                              {item.mnemonic}
+                            </Link>
+                            {showMethod && item.method && (
+                              <View style={styles.methodBadge}>
+                                <Text style={styles.methodBadgeText}>did:{item.method}</Text>
+                              </View>
+                            )}
+                            {markOwners && isOwn && (
+                              <View style={styles.youBadge}>
+                                <Text style={styles.youBadgeText}>You</Text>
+                              </View>
+                            )}
+                            {item.disabled && (
+                              <View style={styles.disabledBadge}>
+                                <Text style={styles.disabledBadgeText}>Suspended</Text>
+                              </View>
+                            )}
+                          </View>
+                          {currentDomain === null && item.domain && (
+                            <Text style={styles.subText} numberOfLines={1}>
+                              {item.domain}
+                            </Text>
+                          )}
+                          {/* Served agent names, under the name: an alias
+                              for the DID, as on the detail page. */}
+                          {names.length > 0 && (
+                            <View style={styles.agentNamesRow}>
+                              <AgentNameChips
+                                names={names}
+                                domain={item.domain}
+                                didId={item.didId}
+                                size="sm"
+                                showHost={false}
+                              />
                             </View>
-                            {currentDomain === null && item.domain && (
-                              <Text style={styles.subText} numberOfLines={1}>
-                                {item.domain}
-                              </Text>
-                            )}
-                            {/* Served agent names, under the name: an alias
-                                for the DID, as on the detail page. */}
-                            {names.length > 0 && (
-                              <View style={styles.agentNamesRow}>
-                                <AgentNameChips
-                                  names={names}
-                                  domain={item.domain}
-                                  didId={item.didId}
-                                  size="sm"
-                                  showHost={false}
-                                />
-                              </View>
-                            )}
-                            {markOwners && !isOwn && (
-                              <Text style={styles.subText} numberOfLines={1}>
-                                Owner: {item.owner}
-                              </Text>
-                            )}
-                          </View>
-                          <View style={[styles.cell, columnStyle("didId")]}>
-                            {item.versionCount === 0 ? (
-                              <Text style={styles.statusPending}>Pending upload</Text>
-                            ) : item.didId ? (
-                              <View style={styles.didIdRow}>
-                                <Text
-                                  style={[styles.didText, { width: didWidth }]}
-                                  numberOfLines={1}
-                                  accessibilityLabel={item.didId}
-                                  // Full DID on hover (web).
-                                  {...({ title: item.didId } as any)}
-                                >
-                                  {compactDid(item.didId)}
-                                </Text>
-                                <Pressable
-                                  accessibilityRole="button"
-                                  accessibilityLabel="Copy DID"
-                                  style={styles.copyButton}
-                                  onPress={(e: any) => {
-                                    e?.preventDefault?.();
-                                    e?.stopPropagation?.();
-                                    handleCopyDid(item.didId!);
-                                  }}
-                                >
-                                  <Text style={styles.copyButtonText}>
-                                    {copiedDid === item.didId ? "Copied!" : "Copy"}
-                                  </Text>
-                                </Pressable>
-                                <DidQrButton did={item.didId} label={item.mnemonic} />
-                              </View>
-                            ) : (
-                              <Text style={styles.subText}>Uploaded</Text>
-                            )}
-                          </View>
-                          <View
-                            style={[
-                              styles.cell,
-                              styles.cellRight,
-                              styles.cellGapAfter,
-                              columnStyle("versions", 100),
-                            ]}
-                          >
-                            <Text style={styles.numText}>
-                              {item.versionCount.toLocaleString()}
+                          )}
+                          {markOwners && !isOwn && (
+                            <Text style={styles.subText} numberOfLines={1}>
+                              Owner: {item.owner}
                             </Text>
-                          </View>
-                          <View style={[styles.cell, columnStyle("created", 150)]}>
-                            <Text style={styles.dateText}>{formatDate(item.createdAt)}</Text>
-                          </View>
-                          <View style={[styles.cell, columnStyle("updated", 150)]}>
-                            {/* One version has never been updated: a dash
-                                lets the DIDs that have changed stand out. */}
-                            {item.versionCount <= 1 ? (
-                              <Text style={styles.dateTextMuted}>—</Text>
-                            ) : (
-                              <Text style={styles.dateText}>{formatDate(item.updatedAt)}</Text>
-                            )}
-                          </View>
-                          <View style={[styles.cell, styles.cellRight, columnStyle("resolves", 100)]}>
-                            <Text style={styles.numText}>
-                              {item.totalResolves.toLocaleString()}
+                          )}
+                        </View>
+                        <View role="cell" style={[styles.cell, columnStyle("didId")]}>
+                          {item.versionCount === 0 ? (
+                            <Text style={styles.statusPending}>Pending upload</Text>
+                          ) : item.didId ? (
+                            <View style={styles.didIdRow}>
+                              <Text
+                                style={[styles.didText, { width: didWidth }]}
+                                numberOfLines={1}
+                                aria-label={item.didId}
+                                // Full DID on hover (web).
+                                {...titleAttr(item.didId)}
+                              >
+                                {compactDid(item.didId)}
+                              </Text>
+                              <CopyButton
+                                value={item.didId}
+                                accessibilityLabel={`Copy DID of ${item.mnemonic}`}
+                              />
+                              <DidQrButton did={item.didId} label={item.mnemonic} />
+                            </View>
+                          ) : (
+                            <Text style={styles.subText}>Uploaded</Text>
+                          )}
+                        </View>
+                        <View
+                          role="cell"
+                          style={[
+                            styles.cell,
+                            styles.cellRight,
+                            styles.cellGapAfter,
+                            columnStyle("versions", 100),
+                          ]}
+                        >
+                          <Text style={styles.numText}>{item.versionCount.toLocaleString()}</Text>
+                        </View>
+                        <View role="cell" style={[styles.cell, columnStyle("created", 150)]}>
+                          <Text style={styles.dateText}>
+                            {formatDate(item.createdAt, { withTime: true })}
+                          </Text>
+                        </View>
+                        <View role="cell" style={[styles.cell, columnStyle("updated", 150)]}>
+                          {/* One version has never been updated: a dash
+                              lets the DIDs that have changed stand out. */}
+                          {item.versionCount <= 1 ? (
+                            <Text style={styles.dateTextMuted} aria-label="Never updated">
+                              —
                             </Text>
-                          </View>
-                        </TableRow>
-                      </Link>
+                          ) : (
+                            <Text style={styles.dateText}>
+                              {formatDate(item.updatedAt, { withTime: true })}
+                            </Text>
+                          )}
+                        </View>
+                        <View
+                          role="cell"
+                          style={[styles.cell, styles.cellRight, columnStyle("resolves", 100)]}
+                        >
+                          <Text style={styles.numText}>{item.totalResolves.toLocaleString()}</Text>
+                        </View>
+                      </TableRow>
                     );
                   }}
                 />
@@ -701,18 +598,17 @@ export default function DidList() {
   );
 }
 
+/** The DOM `title` attribute (a hover tooltip on web), which React Native's
+ *  `Text` types do not list. */
+function titleAttr(title: string): Record<string, never> {
+  return { title } as unknown as Record<string, never>;
+}
+
 const styles = StyleSheet.create({
   container: {
     flex: 1,
     padding: spacing.xl,
     backgroundColor: colors.bgPrimary,
-  },
-  containerCenter: {
-    flex: 1,
-    padding: spacing.xl,
-    backgroundColor: colors.bgPrimary,
-    alignItems: "center",
-    justifyContent: "center",
   },
   header: {
     flexDirection: "row",
@@ -731,6 +627,7 @@ const styles = StyleSheet.create({
     fontSize: 22,
     fontFamily: fonts.bold,
     color: colors.textPrimary,
+    marginBottom: 0,
   },
   formCard: {
     backgroundColor: colors.bgSecondary,
@@ -783,9 +680,20 @@ const styles = StyleSheet.create({
     gap: spacing.md,
     marginBottom: spacing.md,
   },
-  searchInput: {
+  searchField: {
     flex: 1,
     maxWidth: 520,
+    marginBottom: 0,
+  },
+  fieldTight: {
+    marginBottom: 0,
+  },
+  headButton: {
+    paddingHorizontal: 0,
+    paddingVertical: 0,
+    justifyContent: "flex-start",
+  },
+  searchInput: {
     backgroundColor: colors.bgSecondary,
     borderRadius: radii.md,
     borderWidth: 1,
@@ -937,17 +845,6 @@ const styles = StyleSheet.create({
   agentNamesRow: {
     marginTop: 4,
   },
-  copyButton: {
-    backgroundColor: colors.bgTertiary,
-    borderRadius: radii.sm,
-    paddingVertical: 2,
-    paddingHorizontal: spacing.sm,
-  },
-  copyButtonText: {
-    fontSize: 11,
-    fontFamily: fonts.medium,
-    color: colors.textSecondary,
-  },
   ownerBanner: {
     flexDirection: "row",
     alignItems: "center",
@@ -979,35 +876,6 @@ const styles = StyleSheet.create({
     color: colors.error,
     marginBottom: spacing.md,
   },
-  buttonPrimary: {
-    backgroundColor: colors.accent,
-    borderRadius: radii.md,
-    paddingVertical: 12,
-    paddingHorizontal: spacing.xl,
-    alignItems: "center",
-  },
-  buttonSecondary: {
-    backgroundColor: "transparent",
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingVertical: 12,
-    paddingHorizontal: spacing.xl,
-    alignItems: "center",
-  },
-  disabled: {
-    opacity: 0.5,
-  },
-  buttonPrimaryText: {
-    color: colors.textOnAccent,
-    fontSize: 14,
-    fontFamily: fonts.semibold,
-  },
-  buttonSecondaryText: {
-    color: colors.textSecondary,
-    fontSize: 14,
-    fontFamily: fonts.semibold,
-  },
   filterCaption: {
     marginTop: 4,
     fontSize: 12,
@@ -1031,26 +899,6 @@ const styles = StyleSheet.create({
     flexWrap: "wrap",
     gap: spacing.xs,
     marginTop: 4,
-  },
-  domainPickerOption: {
-    paddingVertical: 6,
-    paddingHorizontal: spacing.md,
-    borderRadius: radii.full,
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: colors.bgTertiary,
-  },
-  domainPickerOptionActive: {
-    borderColor: colors.accent,
-    backgroundColor: colors.accent,
-  },
-  domainPickerOptionText: {
-    fontFamily: fonts.medium,
-    fontSize: 12,
-    color: colors.textSecondary,
-  },
-  domainPickerOptionTextActive: {
-    color: colors.textOnAccent,
   },
   methodBadge: {
     backgroundColor: colors.tealMuted,

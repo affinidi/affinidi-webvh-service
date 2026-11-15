@@ -37,12 +37,13 @@
  * one renders and copies as `webvh.storm.ws/@` on its own. Do not filter empty
  * strings out of `names` on the assumption they are placeholders.
  */
-import { useState } from "react";
-import { View, Text, StyleSheet, Pressable } from "react-native";
-import * as Clipboard from "expo-clipboard";
-import { colors, fonts, radii, spacing } from "../lib/theme";
-import { extractDidHost } from "../lib/domain";
+import { useEffect, useRef, type ComponentRef, type ReactNode } from "react";
+import { StyleSheet, Text, View } from "react-native";
+
 import type { AgentNameEntry } from "../lib/api";
+import { extractDidHost } from "../lib/domain";
+import { colors, fonts, radii, spacing } from "../lib/theme";
+import { CopyButton } from "./CopyButton";
 
 /**
  * The hosting domain a name is scoped to.
@@ -77,6 +78,27 @@ export function servedNames(entries?: AgentNameEntry[]): string[] {
   return (entries ?? []).filter((e) => e.enabled).map((e) => e.name);
 }
 
+/**
+ * Keep a click inside from following an enclosing link.
+ *
+ * Chips sit inside a pressable row on the DID list; without this a copy would
+ * also navigate into the DID. The copy button's own press handler stops the
+ * event reaching the row's React handler, but not the anchor's native default
+ * action — so a native listener here, below the anchor, cancels that. A no-op
+ * off the web.
+ */
+function NoNavigate({ children }: { children: ReactNode }) {
+  const ref = useRef<ComponentRef<typeof View>>(null);
+  useEffect(() => {
+    const node = ref.current as unknown as Partial<HTMLElement> | null;
+    if (!node || typeof node.addEventListener !== "function") return;
+    const cancel = (e: Event) => e.preventDefault();
+    node.addEventListener("click", cancel);
+    return () => node.removeEventListener?.("click", cancel);
+  }, []);
+  return <View ref={ref}>{children}</View>;
+}
+
 export function AgentNameChips({
   names,
   domain,
@@ -94,19 +116,11 @@ export function AgentNameChips({
    *  copied value is always the full `host/@name`. */
   showHost?: boolean;
 }) {
-  const [copied, setCopied] = useState<string | null>(null);
-
   const host = agentNameHost(domain, didId);
   const served = names ?? [];
   // No served names is the common case. Render nothing rather than an empty
   // label, so those rows look exactly as they did before agent names existed.
   if (served.length === 0 || !host) return null;
-
-  const handleCopy = async (value: string) => {
-    await Clipboard.setStringAsync(value);
-    setCopied(value);
-    setTimeout(() => setCopied(null), 2000);
-  };
 
   const small = size === "sm";
 
@@ -115,35 +129,21 @@ export function AgentNameChips({
       {served.map((name) => {
         const full = formatAgentName(host, name);
         return (
-          <View
-            key={name}
-            style={[styles.chip, small ? styles.chipSm : styles.chipMd]}
-          >
-            <Text
-              style={[styles.chipText, small && styles.chipTextSm]}
-              numberOfLines={1}
-            >
+          <View key={name} style={[styles.chip, small ? styles.chipSm : styles.chipMd]}>
+            <Text style={[styles.chipText, small && styles.chipTextSm]} numberOfLines={1}>
               {/* The `@` carries the meaning; give it the accent so the eye
                   finds the handle without reading the domain first. */}
               {showHost && <Text style={styles.chipHost}>{host}/</Text>}
               <Text style={styles.chipAt}>@</Text>
               {name}
             </Text>
-            <Pressable
-              style={styles.copyButton}
-              accessibilityLabel={`Copy agent name ${full}`}
-              onPress={(e) => {
-                // Chips sit inside a pressable card on the list view; without
-                // this the copy would also navigate into the DID.
-                e.preventDefault();
-                e.stopPropagation?.();
-                void handleCopy(full);
-              }}
-            >
-              <Text style={styles.copyButtonText}>
-                {copied === full ? "Copied" : "Copy"}
-              </Text>
-            </Pressable>
+            <NoNavigate>
+              <CopyButton
+                value={full}
+                accessibilityLabel={`Copy agent name ${full}`}
+                style={styles.copyButton}
+              />
+            </NoNavigate>
           </View>
         );
       })}
@@ -192,14 +192,7 @@ const styles = StyleSheet.create({
     color: colors.teal,
   },
   copyButton: {
-    backgroundColor: colors.bgTertiary,
-    borderRadius: radii.sm,
     paddingVertical: 1,
     paddingHorizontal: spacing.sm,
-  },
-  copyButtonText: {
-    fontSize: 10,
-    fontFamily: fonts.medium,
-    color: colors.textSecondary,
   },
 });

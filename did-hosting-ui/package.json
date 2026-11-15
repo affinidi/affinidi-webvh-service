@@ -9,6 +9,9 @@
     "web": "expo start --web",
     "build:web": "expo export --platform web --output-dir ../did-hosting-control/ui-dist",
     "typecheck": "tsc --noEmit",
+    "lint": "eslint . --max-warnings 0",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "gen:tasks": "trust-tasks-gen-ts --lock ../did-hosting-common/trust-tasks.lock --out lib/trust-tasks",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -36,7 +39,16 @@
   "devDependencies": {
     "@openvtc/trust-tasks": "^0.28.1",
     "@openvtc/trust-tasks-gen": "^0.1.1",
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/react": "^16.3.3",
     "@types/react": "~19.3.0",
+    "@types/react-dom": "~19.3.0",
+    "eslint": "^9.39.5",
+    "eslint-config-expo": "~58.0.4",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-jsx-a11y": "^6.10.2",
+    "jsdom": "^26.1.0",
+    "prettier": "^3.10.1",
     "typescript": "~7.0.2",
     "vitest": "^5.0.0"
   },
@@ -48,7 +60,10 @@
     "ws": "^8.20.1",
     "shell-quote": "^1.8.4",
     "@babel/core": "^7.29.6",
-    "glob": "^14.0.2"
+    "glob": "^14.0.2",
+    "eslint-config-expo": {
+      "typescript": "~6.0.3"
+    }
   },
   "engines": {
     "node": ">=24.3.0"

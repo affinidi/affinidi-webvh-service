@@ -35,6 +35,7 @@ use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 use affinidi_messaging_test_mediator::TestMediator;
+use affinidi_tdk::secrets_resolver::secrets::Secret;
 use did_hosting_common::tasks::did_management::{did, domain};
 use did_hosting_common::tasks::webvh::witness::publish::v0_1 as witness_publish;
 use serde_json::json;
@@ -71,6 +72,9 @@ struct Topology {
     shutdown: CancellationToken,
     control: did_hosting_control::server::AppState,
     control_did: String,
+    /// The control plane's signing and key-agreement secrets, kept so a test
+    /// can stand up a successor identity for the same DID.
+    control_secrets: (Secret, Secret),
     control_https_url: String,
     edge: did_hosting_server::server::AppState,
     edge_did: String,
@@ -95,6 +99,16 @@ async fn reserve_port() -> (String, tokio::net::TcpListener) {
 
 impl Topology {
     async fn build() -> Self {
+        Self::build_with(ProtocolSet {
+            didcomm: true,
+            tsp: true,
+        })
+        .await
+    }
+
+    /// [`Self::build`], with the control plane's identity (and its
+    /// `features.tsp`) carrying `control_protocols`.
+    async fn build_with(control_protocols: ProtocolSet) -> Self {
         // `local_direct_delivery(true, false)`: the admin RPC client's TSP
         // leg (`AdminClient::call`'s `Via::Tsp` branch) is a **Direct** send
         // (`DIDCommService::send_tsp`, via `tsp_ensure_relationship`), which
@@ -131,13 +145,10 @@ impl Topology {
             support::mint_mediator_peer(&mediator).await;
         let control_identity = ServiceIdentity::for_didcomm_test(
             &control_did,
-            control_signing,
-            control_ka,
+            control_signing.clone(),
+            control_ka.clone(),
             mediator.did(),
-            ProtocolSet {
-                didcomm: true,
-                tsp: true,
-            },
+            control_protocols,
         )
         .await
         .expect("control identity");
@@ -153,7 +164,7 @@ impl Topology {
         let control_config = did_hosting_control::config::AppConfig {
             features: FeaturesConfig {
                 didcomm: true,
-                tsp: true,
+                tsp: control_protocols.tsp,
                 ..FeaturesConfig::default()
             },
             server_did: Some(control_did.clone()),
@@ -505,6 +516,7 @@ impl Topology {
             shutdown,
             control,
             control_did,
+            control_secrets: (control_signing, control_ka),
             control_https_url,
             edge,
             edge_did,
@@ -773,4 +785,84 @@ async fn distributed_lifecycle_over_didcomm() {
 #[tokio::test]
 async fn distributed_lifecycle_over_tsp() {
     run_lifecycle(Via::Tsp).await;
+}
+
+/// A control plane that boots with TSP off — its identity is DIDComm-only and
+/// its DID document advertises no `TSPTransport`, so its listener carries
+/// DIDComm alone — gains TSP when an identity change rebuilds the listener
+/// with it on (`rebuild_own_listener`), with no restart: an admin's request
+/// over TSP after the rebuild is dispatched and answered. This is the shape of
+/// a rotation to a document that starts advertising `TSPTransport`; a service
+/// started without a TSP handler could never dispatch it.
+#[tokio::test]
+async fn control_dispatches_tsp_after_a_rebuild_turns_it_on() {
+    let topo = Topology::build_with(ProtocolSet {
+        didcomm: true,
+        tsp: false,
+    })
+    .await;
+    let svc = topo
+        .control
+        .didcomm_service
+        .get()
+        .expect("control messaging service")
+        .clone();
+
+    // DIDComm works on the listener the control plane booted with.
+    let reply = topo
+        .admin
+        .call(
+            Via::Didcomm,
+            &topo.control_did,
+            &topo.control_https_url,
+            domain::create::v0_1::Payload::TYPE_URI,
+            json!({ "name": EDGE_HOST, "setAsDefault": false }),
+        )
+        .await;
+    ok(&reply, domain::create::v0_1::Payload::TYPE_URI);
+
+    // The identity now carries TSP — what a rotation to a TSP-advertising
+    // document yields — and the listener is rebuilt on it, as
+    // `identity_rotation::rebuild_listener` does.
+    let (signing, ka) = topo.control_secrets.clone();
+    let rotated = ServiceIdentity::for_didcomm_test(
+        &topo.control_did,
+        signing,
+        ka,
+        topo.mediator.did(),
+        ProtocolSet {
+            didcomm: true,
+            tsp: true,
+        },
+    )
+    .await
+    .expect("rotated control identity");
+    let transports = did_hosting_common::server::didcomm_profile::rebuild_own_listener(
+        &svc,
+        "control",
+        &rotated,
+        topo.mediator.did(),
+        &topo.control.store,
+    )
+    .await
+    .expect("rebuild the control listener");
+    assert!(transports.tsp, "the rebuilt listener carries TSP");
+    svc.wait_connected("control", CONNECT_TIMEOUT)
+        .await
+        .expect("rebuilt control listener reconnects");
+
+    // A TSP request is now dispatched and answered.
+    let reply = topo
+        .admin
+        .call(
+            Via::Tsp,
+            &topo.control_did,
+            &topo.control_https_url,
+            domain::list::v0_1::Payload::TYPE_URI,
+            json!({}),
+        )
+        .await;
+    ok(&reply, domain::list::v0_1::Payload::TYPE_URI);
+
+    topo.teardown().await;
 }

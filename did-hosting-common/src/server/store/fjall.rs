@@ -257,6 +257,22 @@ impl KeyspaceOps for FjallKeyspace {
         })
     }
 
+    fn prefix_keys_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<Vec<u8>>, AppError>> {
+        let (db, ks) = (self.db.clone(), self.keyspace.clone());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || -> Result<Vec<Vec<u8>>, AppError> {
+                let mut keys = Vec::new();
+                for guard in db.snapshot().prefix(&ks, &prefix) {
+                    let key = guard.key().map_err(|e| AppError::Store(e.to_string()))?;
+                    keys.push(key.to_vec());
+                }
+                Ok(keys)
+            })
+            .await
+            .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
+        })
+    }
+
     fn prefix_page_raw(
         &self,
         prefix: Vec<u8>,
@@ -474,6 +490,14 @@ mod tests {
         (store, dir)
     }
 
+    /// The shared `KeyspaceOps` contract every backend runs
+    /// ([`super::super::conformance`]); the tests below are fjall's own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_suite() {
+        let (store, _dir) = temp_store().await;
+        conformance::run(&store, &conformance::namespace()).await;
+    }
+
     #[tokio::test]
     async fn a_write_is_tracked_even_when_it_fails_and_a_read_is_not() {
         let (store, _dir) = temp_store().await;
@@ -500,71 +524,6 @@ mod tests {
         })
         .await;
         assert!(wrote, "a batch commit is a write");
-    }
-
-    #[tokio::test]
-    async fn insert_and_get_roundtrip() {
-        let (store, _dir) = temp_store().await;
-        let ks = store.keyspace("test").unwrap();
-        ks.insert("key1", &"hello").await.unwrap();
-        let val: Option<String> = ks.get("key1").await.unwrap();
-        assert_eq!(val, Some("hello".to_string()));
-    }
-
-    /// Two concurrent `take_raw` calls on the same key must observe exactly
-    /// one `Some(_)` and one `None`. This is the contract refresh-token
-    /// rotation depends on.
-    #[tokio::test]
-    async fn take_raw_atomic_serialises_concurrent_claims() {
-        let (store, _dir) = temp_store().await;
-        let ks = store.keyspace("test").unwrap();
-        ks.insert_raw(b"refresh:abc".to_vec(), b"session-X".to_vec())
-            .await
-            .unwrap();
-
-        let ks_a = ks.clone();
-        let ks_b = ks.clone();
-        let (a, b) = tokio::join!(
-            tokio::spawn(async move { ks_a.take_raw(b"refresh:abc".to_vec()).await.unwrap() }),
-            tokio::spawn(async move { ks_b.take_raw(b"refresh:abc".to_vec()).await.unwrap() }),
-        );
-        let a = a.unwrap();
-        let b = b.unwrap();
-
-        // Exactly one winner: one observed Some, the other None.
-        let winners = [a.is_some(), b.is_some()].iter().filter(|x| **x).count();
-        assert_eq!(winners, 1, "exactly one concurrent take_raw must win");
-
-        // Key is gone from the store.
-        assert!(ks.get_raw(b"refresh:abc".to_vec()).await.unwrap().is_none());
-    }
-
-    /// Many concurrent `incr_raw` calls on the same key must each observe a
-    /// distinct, correctly-ordered value — never the same next value twice.
-    /// This is the contract the passkey invite wrong-code lockout depends on.
-    #[tokio::test]
-    async fn incr_raw_serialises_concurrent_callers() {
-        let (store, _dir) = temp_store().await;
-        let ks = store.keyspace("test").unwrap();
-
-        const N: u64 = 20;
-        let mut handles = Vec::new();
-        for _ in 0..N {
-            let ks = ks.clone();
-            handles.push(tokio::spawn(async move {
-                ks.incr_raw(b"counter:x".to_vec()).await.unwrap()
-            }));
-        }
-        let mut results: Vec<u64> = Vec::new();
-        for h in handles {
-            results.push(h.await.unwrap());
-        }
-        results.sort_unstable();
-        assert_eq!(
-            results,
-            (1..=N).collect::<Vec<_>>(),
-            "lost or duplicate increment"
-        );
     }
 
     /// The serialisation must hold across *separately obtained* handles —
@@ -594,55 +553,6 @@ mod tests {
             (1..=N).collect::<Vec<_>>(),
             "lost or duplicate increment across handles"
         );
-    }
-
-    /// `compare_and_swap_raw` writes only over the value it expects, and of
-    /// many callers swapping from the same value through separately
-    /// obtained handles exactly one wins.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn compare_and_swap_raw_writes_once_per_expected_value() {
-        let (store, _dir) = temp_store().await;
-        let ks = store.keyspace("test").unwrap();
-
-        // Absent: only a swap from `None` writes.
-        assert!(
-            !ks.compare_and_swap_raw("mark", Some(b"a".to_vec()), b"b".to_vec())
-                .await
-                .unwrap()
-        );
-        assert!(ks.get_raw("mark").await.unwrap().is_none());
-        assert!(
-            ks.compare_and_swap_raw("mark", None, b"a".to_vec())
-                .await
-                .unwrap()
-        );
-        assert!(
-            !ks.compare_and_swap_raw("mark", None, b"z".to_vec())
-                .await
-                .unwrap()
-        );
-        assert_eq!(ks.get_raw("mark").await.unwrap(), Some(b"a".to_vec()));
-
-        const RACERS: usize = 32;
-        let mut handles = Vec::new();
-        for n in 0..RACERS {
-            let store = store.clone();
-            handles.push(tokio::spawn(async move {
-                let ks = store.keyspace("test").unwrap();
-                ks.compare_and_swap_raw("mark", Some(b"a".to_vec()), format!("b{n}"))
-                    .await
-                    .unwrap()
-            }));
-        }
-        let mut winners = 0;
-        for h in handles {
-            if h.await.unwrap() {
-                winners += 1;
-            }
-        }
-        assert_eq!(winners, 1, "exactly one swap from the same value may win");
-        let held = ks.get_raw("mark").await.unwrap().unwrap();
-        assert!(held.starts_with(b"b"), "{held:?}");
     }
 
     /// `take_raw` across separately obtained handles: exactly one winner
@@ -759,42 +669,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_missing_returns_none() {
-        let (store, _dir) = temp_store().await;
-        let ks = store.keyspace("test").unwrap();
-        let val: Option<String> = ks.get("nonexistent").await.unwrap();
-        assert_eq!(val, None);
-    }
-
-    #[tokio::test]
-    async fn remove_deletes_key() {
-        let (store, _dir) = temp_store().await;
-        let ks = store.keyspace("test").unwrap();
-        ks.insert("key1", &"hello").await.unwrap();
-        ks.remove("key1").await.unwrap();
-        let val: Option<String> = ks.get("key1").await.unwrap();
-        assert_eq!(val, None);
-    }
-
-    #[tokio::test]
-    async fn contains_key_true_false() {
-        let (store, _dir) = temp_store().await;
-        let ks = store.keyspace("test").unwrap();
-        assert!(!ks.contains_key("key1").await.unwrap());
-        ks.insert("key1", &"hello").await.unwrap();
-        assert!(ks.contains_key("key1").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn insert_raw_and_get_raw_roundtrip() {
-        let (store, _dir) = temp_store().await;
-        let ks = store.keyspace("test").unwrap();
-        ks.insert_raw("raw1", b"raw-value".to_vec()).await.unwrap();
-        let val = ks.get_raw("raw1").await.unwrap();
-        assert_eq!(val, Some(b"raw-value".to_vec()));
-    }
-
-    #[tokio::test]
     async fn prefix_page_raw_walks_a_prefix_in_key_order() {
         let (store, _dir) = temp_store().await;
         let ks = store.keyspace("test").unwrap();
@@ -823,23 +697,6 @@ mod tests {
         let exact = ks.prefix_page_raw("p:", None, 3).await.unwrap().unwrap();
         assert_eq!(keys(&exact), ["p:1", "p:2", "p:3"]);
         assert_eq!(exact.next, None);
-    }
-
-    #[tokio::test]
-    async fn prefix_iter_raw_filters_correctly() {
-        let (store, _dir) = temp_store().await;
-        let ks = store.keyspace("test").unwrap();
-        ks.insert_raw("prefix:a", b"1".to_vec()).await.unwrap();
-        ks.insert_raw("prefix:b", b"2".to_vec()).await.unwrap();
-        ks.insert_raw("other:c", b"3".to_vec()).await.unwrap();
-        let results = ks.prefix_iter_raw("prefix:").await.unwrap();
-        assert_eq!(results.len(), 2);
-        let keys: Vec<String> = results
-            .iter()
-            .map(|(k, _)| String::from_utf8(k.clone()).unwrap())
-            .collect();
-        assert!(keys.contains(&"prefix:a".to_string()));
-        assert!(keys.contains(&"prefix:b".to_string()));
     }
 
     // =======================================================================

@@ -1,12 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import {
-  View,
-  Text,
-  StyleSheet,
-  Pressable,
-  ActivityIndicator,
-  ScrollView,
-} from "react-native";
+import { useMemo } from "react";
+import { View, Text, StyleSheet, ActivityIndicator, ScrollView } from "react-native";
 import { Link, Redirect } from "expo-router";
 import { useAuth } from "../components/AuthProvider";
 import { useApi } from "../components/ApiProvider";
@@ -15,34 +8,52 @@ import { AffinidiLogo } from "../components/AffinidiLogo";
 import { UsageChart } from "../components/UsageChart";
 import { ServiceOverviewPanel } from "../components/ServiceOverview";
 import { colors, fonts, radii, spacing } from "../lib/theme";
-import type {
-  AclEntry,
-  ControlPlaneConfig,
-  DidRecord,
-  HealthResponse,
-  ServerStats,
-} from "../lib/api";
+import { ACL_KEY } from "../components/acl/keys";
+import { Button } from "../components/Button";
+import { Heading } from "../components/Heading";
+import { errorMessage } from "../lib/errors";
+import { plural } from "../lib/plural";
+import { useTrustTaskQuery } from "../lib/query";
+import { QK } from "../lib/query-keys";
 import { matchesDomain } from "../lib/domain";
 
 export default function Dashboard() {
   const { isAuthenticated, restored, role } = useAuth();
   const api = useApi();
   const { currentDomain, domains } = useDomains();
-  const [health, setHealth] = useState<HealthResponse | null>(null);
-  const [serverStats, setServerStats] = useState<ServerStats | null>(null);
-  const [config, setConfig] = useState<ControlPlaneConfig | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [aclEntries, setAclEntries] = useState<AclEntry[] | null>(null);
+  const isAdmin = role === "admin";
+  // `server/config` and the server-wide `stats/get` are both admin-only on
+  // the backend (config carries operator topology). Skipped for non-admins —
+  // `config` only drives the daemon/standalone label, and the usage chart /
+  // aggregate section is hidden whenever `serverStats` is absent. A failure
+  // leaves them absent, as before. The keys are shared with the service
+  // overview and settings, so the page asks for each once.
+  const health = useTrustTaskQuery(QK.health, () => api.health());
+  const { data: config } = useTrustTaskQuery(
+    QK.serverConfig,
+    ({ background }) => api.getConfig({ background }),
+    { enabled: isAuthenticated && isAdmin },
+  );
+  const { data: serverStats } = useTrustTaskQuery(
+    QK.serverStats,
+    ({ background }) => api.getServerStats({ background }),
+    { enabled: isAuthenticated && isAdmin },
+  );
+  const { data: acl } = useTrustTaskQuery(ACL_KEY, () => api.listAcl(), {
+    enabled: isAuthenticated && isAdmin,
+  });
+  const aclEntries = acl?.entries ?? null;
   // Per-domain stats are derived from the DID list. We only fetch it
   // when a specific domain is pinned — "All domains" reads the cheap
   // server-wide aggregate from `stats/get` instead.
-  const [dids, setDids] = useState<DidRecord[] | null>(null);
+  const { data: dids } = useTrustTaskQuery(QK.allDids, () => api.listDids(), {
+    enabled: isAuthenticated && currentDomain !== null,
+  });
 
   const isDaemon = config?.deploymentMode === "daemon";
-  const isAdmin = role === "admin";
 
   const domainStats = useMemo(() => {
-    if (currentDomain === null || dids === null) return null;
+    if (currentDomain === null || !dids) return null;
     // Legacy slots pre-M-01 (and the historical bug where create
     // dropped the `domain` field) carry an empty `domain`. The shared
     // matchesDomain helper in lib/domain.ts falls back to the
@@ -55,10 +66,7 @@ export default function Dashboard() {
       // versionCount is the length of the current log chain; subtract 1
       // to approximate "updates beyond initial creation". DIDs that
       // haven't uploaded a log yet (versionCount === 0) contribute 0.
-      totalUpdates: scoped.reduce(
-        (s, d) => s + Math.max(0, d.versionCount - 1),
-        0,
-      ),
+      totalUpdates: scoped.reduce((s, d) => s + Math.max(0, d.versionCount - 1), 0),
     };
   }, [currentDomain, dids]);
 
@@ -69,64 +77,9 @@ export default function Dashboard() {
   // returns the full set for admins.
   const allScopedOwnerCount = useMemo(() => {
     if (!aclEntries) return 0;
-    return aclEntries.filter(
-      (e) =>
-        e.role === "owner" && (!e.domains || e.domains.kind === "all"),
-    ).length;
+    return aclEntries.filter((e) => e.role === "owner" && (!e.domains || e.domains.kind === "all"))
+      .length;
   }, [aclEntries]);
-
-  useEffect(() => {
-    api
-      .health()
-      .then(setHealth)
-      .catch((e) => setError(e.message));
-  }, [api]);
-
-  useEffect(() => {
-    // `server/config` and the server-wide `stats/get` are both admin-only on
-    // the backend (config carries operator topology). Skip them for non-admins — `config` only drives
-    // the daemon/standalone label, and the usage chart / aggregate section is
-    // hidden whenever `serverStats` is null.
-    if (!isAuthenticated || !isAdmin) return;
-    api
-      .getConfig()
-      .then(setConfig)
-      .catch(() => {});
-    api
-      .getServerStats()
-      .then(setServerStats)
-      .catch(() => {});
-  }, [isAuthenticated, isAdmin, api]);
-
-  useEffect(() => {
-    if (!isAuthenticated || !isAdmin) return;
-    api
-      .listAcl()
-      .then((res) => setAclEntries(res.entries))
-      .catch(() => setAclEntries(null));
-  }, [api, isAuthenticated, isAdmin]);
-
-  // When a domain is pinned, pull the DID list so we can derive
-  // per-domain stat cards. "All domains" doesn't need this — the
-  // server-wide aggregate from `stats/get` is shown instead.
-  useEffect(() => {
-    if (!isAuthenticated || currentDomain === null) {
-      setDids(null);
-      return;
-    }
-    let cancelled = false;
-    api
-      .listDids()
-      .then((res) => {
-        if (!cancelled) setDids(res);
-      })
-      .catch(() => {
-        if (!cancelled) setDids(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [api, isAuthenticated, currentDomain]);
 
   // Signed out: straight to the login page, which shows the sign-in code at
   // once. Until the saved session has been looked for, show the mark rather
@@ -142,52 +95,45 @@ export default function Dashboard() {
   }
 
   return (
-    <ScrollView
-      style={styles.scroll}
-      contentContainerStyle={styles.scrollContent}
-    >
+    <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent}>
       <View style={styles.header}>
         <AffinidiLogo size={48} />
-        <Text style={styles.subtitle}>Decentralized Identity Hosting</Text>
+        <Heading style={styles.subtitle}>Decentralized Identity Hosting</Heading>
         <Text style={styles.domainCaption}>
-          {currentDomain
-            ? `Active domain: ${currentDomain}`
-            : "Showing all domains"}
+          {currentDomain ? `Active domain: ${currentDomain}` : "Showing all domains"}
         </Text>
       </View>
 
       {isAdmin && allScopedOwnerCount > 0 && (
         <View style={styles.migrationBanner}>
           <Text style={styles.migrationTitle}>
-            {allScopedOwnerCount} owner
-            {allScopedOwnerCount === 1 ? "" : "s"} on unrestricted scope
+            {plural(allScopedOwnerCount, "owner", "owners")} on unrestricted scope
           </Text>
           <Text style={styles.migrationBody}>
-            These ACL entries still use the legacy "All domains" scope. Open
-            Access Control to narrow each owner to specific domains and set a
-            default.
+            These ACL entries still use the legacy “All domains” scope. Open Access Control to
+            narrow each owner to specific domains and set a default.
           </Text>
           <Link href="/acl" asChild>
-            <Pressable style={styles.migrationButton}>
-              <Text style={styles.migrationButtonText}>Review owners</Text>
-            </Pressable>
+            <Button label="Review owners" style={styles.migrationButton} />
           </Link>
         </View>
       )}
 
-      {error ? (
+      {health.error && !health.data ? (
         <View style={[styles.card, styles.errorCard]}>
-          <Text style={styles.errorText}>Server unreachable: {error}</Text>
+          <Text role="alert" style={styles.errorText}>
+            Server unreachable: {errorMessage(health.error)}
+          </Text>
         </View>
-      ) : health ? (
+      ) : health.data ? (
         <View style={styles.statusRow}>
           <View style={styles.card}>
             <Text style={styles.cardLabel}>Status</Text>
-            <Text style={styles.statusOk}>{health.status}</Text>
+            <Text style={styles.statusOk}>{health.data.status}</Text>
           </View>
           <View style={styles.card}>
             <Text style={styles.cardLabel}>Version</Text>
-            <Text style={styles.cardValue}>{health.version}</Text>
+            <Text style={styles.cardValue}>{health.data.version}</Text>
           </View>
           {isDaemon && (
             <View style={styles.card}>
@@ -210,17 +156,13 @@ export default function Dashboard() {
                 <Text style={styles.cardValue}>{domains.length.toLocaleString()}</Text>
               </View>
               <View style={styles.card}>
-                <Text style={styles.cardLabel}>
-                  {domainStats ? "Resolves" : "Total Resolves"}
-                </Text>
+                <Text style={styles.cardLabel}>{domainStats ? "Resolves" : "Total Resolves"}</Text>
                 <Text style={styles.cardValue}>
                   {(domainStats?.totalResolves ?? serverStats.totalResolves).toLocaleString()}
                 </Text>
               </View>
               <View style={styles.card}>
-                <Text style={styles.cardLabel}>
-                  {domainStats ? "Updates" : "Total Updates"}
-                </Text>
+                <Text style={styles.cardLabel}>{domainStats ? "Updates" : "Total Updates"}</Text>
                 <Text style={styles.cardValue}>
                   {(domainStats?.totalUpdates ?? serverStats.totalUpdates).toLocaleString()}
                 </Text>
@@ -240,9 +182,9 @@ export default function Dashboard() {
           so rendering this for anyone else just yields a 403 error box. */}
       {isAdmin && (
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>
+          <Heading level={2} style={styles.sectionTitle}>
             {isDaemon ? "Control Plane" : "Service Topology"}
-          </Text>
+          </Heading>
           <ServiceOverviewPanel isDaemon={isDaemon} />
         </View>
       )}
@@ -381,14 +323,8 @@ const styles = StyleSheet.create({
   },
   migrationButton: {
     alignSelf: "flex-start",
-    backgroundColor: colors.teal,
     paddingHorizontal: spacing.lg,
     paddingVertical: 8,
     borderRadius: radii.sm,
-  },
-  migrationButtonText: {
-    fontSize: 13,
-    fontFamily: fonts.semibold,
-    color: colors.bgPrimary,
   },
 });

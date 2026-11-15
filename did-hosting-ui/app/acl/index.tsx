@@ -1,534 +1,59 @@
-import { useEffect, useMemo, useState, useCallback, memo } from "react";
-import {
-  View,
-  Text,
-  TextInput,
-  StyleSheet,
-  Pressable,
-  FlatList,
-  ActivityIndicator,
-} from "react-native";
-import { Link } from "expo-router";
-import * as Clipboard from "expo-clipboard";
+import { useCallback, useMemo, useState } from "react";
+import { ActivityIndicator, FlatList, StyleSheet, Text, View } from "react-native";
+
 import { useApi } from "../../components/ApiProvider";
-import { useAuth } from "../../components/AuthProvider";
 import { useDomains } from "../../components/DomainProvider";
-import { PasskeysCard } from "../../components/PasskeysCard";
-import { colors, fonts, radii, spacing } from "../../lib/theme";
+import { Heading } from "../../components/Heading";
+import { RequireAuth } from "../../components/RequireAuth";
+import { AclEntryRow, type EditState } from "../../components/acl/AclEntryRow";
+import { AddEntryForm } from "../../components/acl/AddEntryForm";
+import { InviteCard } from "../../components/acl/InviteCard";
+import { ACL_KEY, INVITES_KEY } from "../../components/acl/keys";
+import { PendingInvites } from "../../components/acl/PendingInvites";
 import {
-  formatBytes,
-  parseMbToBytes,
-  bytesToMb,
-  parseOptionalInt,
-} from "../../lib/format";
-import { showAlert, showConfirm } from "../../lib/alert";
-import type {
-  AclEntry,
-  CreateInviteResponse,
-  DidRecord,
-  InvitePurpose,
-  InviteListItem,
-} from "../../lib/api";
-import {
-  DEFAULT_SCOPE_DRAFT,
   aclEntryToDraft,
-  defaultScopeForRole,
   draftToScope,
   validateScopeDraft,
   type ScopeDraft,
-  type ScopeKind,
 } from "../../lib/acl-scope";
-
-interface EditState {
-  did: string;
-  role: "admin" | "owner" | "service" | "metricsReader";
-  label: string;
-  maxTotalSize: string;
-  maxDidCount: string;
-  scope: ScopeDraft;
-}
-
-const formatDate = (ts: number) =>
-  new Date(ts * 1000).toLocaleDateString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-  });
+import { showAlert, showConfirm } from "../../lib/alert";
+import type { AclEntry, DidRecord, InviteListItem, Role } from "../../lib/api";
+import { errorMessage } from "../../lib/errors";
+import { bytesToMb, parseMbToBytes, parseOptionalInt } from "../../lib/format";
+import { plural } from "../../lib/plural";
+import { invalidateQueries, useTrustTaskQuery } from "../../lib/query";
+import { colors, fonts, spacing } from "../../lib/theme";
 
 const keyExtractor = (item: AclEntry) => item.did;
-
-/** Human-readable role label. The wire value `metricsReader` is a single
- *  lowercase token, so naive capitalisation renders "Metricsreader"; spell it
- *  "Metrics Reader" and capitalise the rest. */
-const roleLabel = (r: string): string =>
-  r === "metricsReader" ? "Metrics Reader" : r.charAt(0).toUpperCase() + r.slice(1);
-
-/** Renders the current scope of an ACL entry as a compact read-only
- * cluster of chips. "All domains" collapses to a single chip; otherwise
- * each allowed domain renders as a chip, with the default marked by a
- * leading star. Used in the row read view (not the editor). */
-function ScopeBadges({ entry }: { entry: AclEntry }) {
-  const scope = entry.domains;
-  if (!scope || scope.kind === "all") {
-    return (
-      <View style={styles.scopeChip}>
-        <Text style={styles.scopeChipText}>All domains</Text>
-      </View>
-    );
-  }
-  const def = scope.kind === "allowed_with_default" ? scope.default : null;
-  return (
-    <View style={styles.scopeChipRow}>
-      {scope.domains.map((d) => {
-        const isDefault = d === def;
-        return (
-          <View
-            key={d}
-            style={[styles.scopeChip, isDefault && styles.scopeChipDefault]}
-          >
-            <Text
-              style={[
-                styles.scopeChipText,
-                isDefault && styles.scopeChipTextDefault,
-              ]}
-              numberOfLines={1}
-            >
-              {isDefault ? `★ ${d}` : d}
-            </Text>
-          </View>
-        );
-      })}
-    </View>
-  );
-}
-
-/** Inline editor for a `DomainScope` draft. Three modes:
- * - All domains: no further input
- * - Specific domains: multi-select chips
- * - Specific + default: multi-select chips + single-select default
- *
- * `availableDomains` is sourced from `useDomains()` so the chip list
- * always reflects the live catalog (filtered by ACL scope for non-admins,
- * but Access Control is admin-only so this is the full set).
- */
-function ScopeEditor({
-  draft,
-  availableDomains,
-  onChange,
-}: {
-  draft: ScopeDraft;
-  availableDomains: { name: string; disabled: boolean }[];
-  onChange: (next: ScopeDraft) => void;
-}) {
-  const toggleDomain = (name: string) => {
-    const has = draft.domains.includes(name);
-    const next = has
-      ? draft.domains.filter((d) => d !== name)
-      : [...draft.domains, name];
-    let nextDefault = draft.default;
-    if (draft.kind === "allowed_with_default" && !next.includes(nextDefault)) {
-      nextDefault = next[0] ?? "";
-    }
-    onChange({ ...draft, domains: next, default: nextDefault });
-  };
-
-  const setKind = (kind: ScopeKind) => {
-    if (kind === "all") {
-      onChange({ kind, domains: [], default: "" });
-      return;
-    }
-    if (kind === "allowed") {
-      onChange({ ...draft, kind, default: "" });
-      return;
-    }
-    // allowed_with_default — auto-pick the first selected as default if
-    // the user hasn't chosen one yet.
-    const def =
-      draft.default && draft.domains.includes(draft.default)
-        ? draft.default
-        : draft.domains[0] ?? "";
-    onChange({ ...draft, kind, default: def });
-  };
-
-  return (
-    <View style={styles.scopeEditor}>
-      <Text style={styles.editFieldLabel}>Domain scope</Text>
-      <View style={styles.scopeKindRow}>
-        {(
-          [
-            { v: "all", label: "All" },
-            { v: "allowed", label: "Specific" },
-            { v: "allowed_with_default", label: "Specific + default" },
-          ] as const
-        ).map((opt) => (
-          <Pressable
-            key={opt.v}
-            style={[
-              styles.scopeKindButton,
-              draft.kind === opt.v && styles.scopeKindButtonActive,
-            ]}
-            onPress={() => setKind(opt.v)}
-          >
-            <Text
-              style={[
-                styles.scopeKindText,
-                draft.kind === opt.v && styles.scopeKindTextActive,
-              ]}
-            >
-              {opt.label}
-            </Text>
-          </Pressable>
-        ))}
-      </View>
-
-      {draft.kind !== "all" && (
-        <View>
-          <Text style={styles.scopeHint}>
-            {draft.kind === "allowed"
-              ? "Owner can create DIDs on any of the selected domains."
-              : "Owner can create on any selected domain; new DIDs default to the starred one."}
-          </Text>
-          {availableDomains.length === 0 ? (
-            <Text style={styles.scopeEmpty}>
-              No domains configured yet — create one on the Domains page.
-            </Text>
-          ) : (
-            <View style={styles.scopeDomainsWrap}>
-              {availableDomains.map((d) => {
-                const selected = draft.domains.includes(d.name);
-                const isDefault =
-                  draft.kind === "allowed_with_default" &&
-                  draft.default === d.name;
-                return (
-                  <Pressable
-                    key={d.name}
-                    style={[
-                      styles.scopeDomain,
-                      selected && styles.scopeDomainSelected,
-                      isDefault && styles.scopeDomainDefault,
-                      d.disabled && styles.scopeDomainDisabled,
-                    ]}
-                    onPress={() => toggleDomain(d.name)}
-                  >
-                    <Text
-                      style={[
-                        styles.scopeDomainText,
-                        selected && styles.scopeDomainTextSelected,
-                      ]}
-                    >
-                      {isDefault ? `★ ${d.name}` : d.name}
-                      {d.disabled ? "  (disabled)" : ""}
-                    </Text>
-                  </Pressable>
-                );
-              })}
-            </View>
-          )}
-          {draft.kind === "allowed_with_default" && draft.domains.length > 1 && (
-            <View>
-              <Text style={styles.editFieldLabel}>Default domain</Text>
-              <View style={styles.scopeDomainsWrap}>
-                {draft.domains.map((name) => {
-                  const active = draft.default === name;
-                  return (
-                    <Pressable
-                      key={name}
-                      style={[
-                        styles.scopeDefaultButton,
-                        active && styles.scopeDefaultButtonActive,
-                      ]}
-                      onPress={() => onChange({ ...draft, default: name })}
-                    >
-                      <Text
-                        style={[
-                          styles.scopeDefaultText,
-                          active && styles.scopeDefaultTextActive,
-                        ]}
-                      >
-                        {active ? `★ ${name}` : name}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-              </View>
-            </View>
-          )}
-        </View>
-      )}
-    </View>
-  );
-}
-
-const AclEntryRow = memo(function AclEntryRow({
-  item,
-  editing,
-  saving,
-  availableDomains,
-  onStartEdit,
-  onCancelEdit,
-  onSave,
-  onDelete,
-  onChangeRole,
-  onChangeLabel,
-  onChangeMaxTotalSize,
-  onChangeMaxDidCount,
-  onChangeScope,
-  passkeysExpanded,
-  onTogglePasskeys,
-}: {
-  item: AclEntry;
-  editing: EditState | null;
-  saving: boolean;
-  availableDomains: { name: string; disabled: boolean }[];
-  onStartEdit: (entry: AclEntry) => void;
-  onCancelEdit: () => void;
-  onSave: (did: string) => void;
-  onDelete: (did: string) => void;
-  onChangeRole: (v: "admin" | "owner" | "service" | "metricsReader") => void;
-  onChangeLabel: (v: string) => void;
-  onChangeMaxTotalSize: (v: string) => void;
-  onChangeMaxDidCount: (v: string) => void;
-  onChangeScope: (next: ScopeDraft) => void;
-  passkeysExpanded: boolean;
-  onTogglePasskeys: (did: string) => void;
-}) {
-  const isEditing = editing?.did === item.did;
-  const scopeError = isEditing && editing ? validateScopeDraft(editing.scope) : null;
-
-  return (
-    <View>
-    <View style={styles.entryCard}>
-      <View style={styles.entryInfo}>
-        <Link href={`/dids?owner=${encodeURIComponent(item.did)}`}>
-          <Text style={styles.entryDid}>{item.did}</Text>
-        </Link>
-        <View style={styles.entryMeta}>
-          <View
-            style={[
-              styles.roleBadge,
-              item.role === "admin" && styles.adminBadge,
-              item.role === "service" && styles.serviceBadge,
-            ]}
-          >
-            <Text style={styles.roleBadgeText}>{item.role}</Text>
-          </View>
-          {!isEditing && item.label && (
-            <Text style={styles.entryLabel}>{item.label}</Text>
-          )}
-          <Text style={styles.entryDate}>
-            {formatDate(item.created_at)}
-          </Text>
-        </View>
-
-        {isEditing ? (
-          <View style={styles.editFields}>
-            <View style={styles.roleRow}>
-              {(["owner", "admin", "service", "metricsReader"] as const).map(
-                (r) => (
-                <Pressable
-                  key={r}
-                  style={[
-                    styles.roleButton,
-                    editing.role === r && styles.roleActive,
-                  ]}
-                  onPress={() => onChangeRole(r)}
-                >
-                  <Text
-                    style={[
-                      styles.roleText,
-                      editing.role === r && styles.roleTextActive,
-                    ]}
-                  >
-                    {roleLabel(r)}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
-            <TextInput
-              style={styles.editInput}
-              placeholder="Label"
-              placeholderTextColor={colors.textTertiary}
-              value={editing.label}
-              onChangeText={onChangeLabel}
-            />
-            <View style={styles.editRow}>
-              <View style={styles.editFieldHalf}>
-                <Text style={styles.editFieldLabel}>Max size (MB)</Text>
-                <TextInput
-                  style={styles.editInput}
-                  placeholder="Default"
-                  placeholderTextColor={colors.textTertiary}
-                  value={editing.maxTotalSize}
-                  onChangeText={onChangeMaxTotalSize}
-                  keyboardType="numeric"
-                />
-              </View>
-              <View style={styles.editFieldHalf}>
-                <Text style={styles.editFieldLabel}>Max DIDs</Text>
-                <TextInput
-                  style={styles.editInput}
-                  placeholder="Default"
-                  placeholderTextColor={colors.textTertiary}
-                  value={editing.maxDidCount}
-                  onChangeText={onChangeMaxDidCount}
-                  keyboardType="numeric"
-                />
-              </View>
-            </View>
-            {editing && (
-              <ScopeEditor
-                draft={editing.scope}
-                availableDomains={availableDomains}
-                onChange={onChangeScope}
-              />
-            )}
-            {scopeError && (
-              <Text style={styles.scopeError}>{scopeError}</Text>
-            )}
-            <View style={styles.editActions}>
-              <Pressable
-                style={[
-                  styles.saveButton,
-                  (saving || !!scopeError) && styles.disabled,
-                ]}
-                onPress={() => onSave(item.did)}
-                disabled={saving || !!scopeError}
-              >
-                <Text style={styles.saveText}>
-                  {saving ? "Saving..." : "Save"}
-                </Text>
-              </Pressable>
-              <Pressable style={styles.cancelButton} onPress={onCancelEdit}>
-                <Text style={styles.cancelText}>Cancel</Text>
-              </Pressable>
-            </View>
-          </View>
-        ) : (
-          <View>
-            <View style={styles.quotaRow}>
-              <Text style={styles.quotaText}>
-                Max Size:{" "}
-                {item.max_total_size != null
-                  ? formatBytes(item.max_total_size)
-                  : "Default"}
-              </Text>
-              <Text style={styles.quotaText}>
-                Max DIDs:{" "}
-                {item.max_did_count != null
-                  ? item.max_did_count.toLocaleString()
-                  : "Default"}
-              </Text>
-            </View>
-            <View style={styles.scopeReadRow}>
-              <Text style={styles.scopeReadLabel}>Domains:</Text>
-              <ScopeBadges entry={item} />
-            </View>
-          </View>
-        )}
-      </View>
-
-      {!isEditing && (
-        <View style={styles.entryActions}>
-          <Pressable
-            style={styles.editButton}
-            onPress={() => onStartEdit(item)}
-          >
-            <Text style={styles.editText}>Edit</Text>
-          </Pressable>
-          <Pressable
-            style={styles.editButton}
-            onPress={() => onTogglePasskeys(item.did)}
-          >
-            <Text style={styles.editText}>
-              {passkeysExpanded ? "Hide passkeys" : "Passkeys"}
-            </Text>
-          </Pressable>
-          <Pressable
-            style={styles.deleteButton}
-            onPress={() => onDelete(item.did)}
-          >
-            <Text style={styles.deleteText}>Remove</Text>
-          </Pressable>
-        </View>
-      )}
-    </View>
-      {passkeysExpanded && (
-        <View style={styles.passkeysPanel}>
-          <PasskeysCard subject={item.did} purpose="session" title="Sign-in passkeys" />
-          <PasskeysCard subject={item.did} purpose="stepUp" title="Step-up passkeys" />
-        </View>
-      )}
-    </View>
-  );
-});
+const NO_INVITES: InviteListItem[] = [];
 
 export default function AclManagement() {
-  const api = useApi();
-  const { isAuthenticated } = useAuth();
-  const { domains: domainCatalog, defaultDomain } = useDomains();
+  return (
+    <RequireAuth purpose="manage access control">
+      <AclScreen />
+    </RequireAuth>
+  );
+}
 
-  // Trimmed view of `domainCatalog` for ScopeEditor — name + disabled flag,
-  // sorted alphabetically. Disabled domains stay visible so admins can
-  // still see what's selected, but the chip is greyed out.
+function AclScreen() {
+  const api = useApi();
+  const { domains: domainCatalog } = useDomains();
+
+  // Trimmed view of `domainCatalog` for ScopeEditor — name + disabled flag.
+  // Disabled domains stay visible so admins can still see what's selected,
+  // but the button is greyed out.
   const availableDomains = useMemo(
-    () =>
-      domainCatalog.map((d) => ({
-        name: d.name,
-        disabled: d.status === "disabled",
-      })),
+    () => domainCatalog.map((d) => ({ name: d.name, disabled: d.status === "disabled" })),
     [domainCatalog],
   );
 
-  const [entries, setEntries] = useState<AclEntry[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  // New entry form
-  const [newDid, setNewDid] = useState("");
-  const [newRole, setNewRole] = useState<
-    "admin" | "owner" | "service" | "metricsReader"
-  >("owner");
-  const [newLabel, setNewLabel] = useState("");
-  const [newMaxTotalSize, setNewMaxTotalSize] = useState("");
-  const [newMaxDidCount, setNewMaxDidCount] = useState("");
-  const [newScope, setNewScope] = useState<ScopeDraft>(DEFAULT_SCOPE_DRAFT);
-  // Whether the operator has touched the scope editor for the entry being
-  // built — once true, the effect below stops overwriting `newScope`.
-  const [newScopeTouched, setNewScopeTouched] = useState(false);
-  const [creating, setCreating] = useState(false);
-
-  // See `defaultScopeForRole`. Runs only while the operator hasn't picked a
-  // scope themselves, and only for the "Add Entry" form — editing an
-  // existing entry's role never rewrites its scope, matching the removed
-  // route's `PUT` behaviour, which had no such default either.
-  useEffect(() => {
-    if (newScopeTouched) return;
-    setNewScope(defaultScopeForRole(newRole, defaultDomain));
-  }, [newRole, defaultDomain, newScopeTouched]);
-
-  const handleNewScopeChange = useCallback((next: ScopeDraft) => {
-    setNewScopeTouched(true);
-    setNewScope(next);
-  }, []);
-
-  // Invite form
-  const [inviteDid, setInviteDid] = useState("");
-  const [inviteRole, setInviteRole] =
-    useState<"admin" | "owner" | "service">("owner");
-  const [inviting, setInviting] = useState(false);
-  const [invitePurpose, setInvitePurpose] = useState<InvitePurpose>("session");
-  const [invite, setInvite] = useState<CreateInviteResponse | null>(null);
-  const [inviteCopied, setInviteCopied] = useState<"link" | "code" | null>(null);
-
-  // Pending invites (from server)
-  const [pendingInvites, setPendingInvites] = useState<InviteListItem[]>([]);
-  const [editingInvite, setEditingInvite] = useState<
-    {
-      inviteId: string;
-      role: "admin" | "owner" | "service" | "metricsReader";
-    } | null
-  >(null);
-  const [invitesBusyId, setInvitesBusyId] = useState<string | null>(null);
+  const acl = useTrustTaskQuery(ACL_KEY, () => api.listAcl());
+  // Invite failures are non-fatal — the admin can still see the ACL list if
+  // invites are broken for any reason.
+  const invites = useTrustTaskQuery(INVITES_KEY, () =>
+    api.listInvites().catch(() => ({ invites: NO_INVITES })),
+  );
+  const entries = acl.data?.entries ?? [];
 
   // Inline edit state
   const [editing, setEditing] = useState<EditState | null>(null);
@@ -546,136 +71,6 @@ export default function AclManagement() {
     });
   }, []);
 
-  const refresh = useCallback(() => {
-    if (!isAuthenticated) {
-      setLoading(false);
-      return;
-    }
-    setLoading(true);
-    // Fetch entries + pending invites in parallel. Invite failures are
-    // non-fatal — the admin can still see the ACL list if invites are
-    // broken for any reason.
-    Promise.all([
-      api.listAcl(),
-      api.listInvites().catch(() => ({ invites: [] as InviteListItem[] })),
-    ])
-      .then(([aclData, inviteData]) => {
-        setEntries(aclData.entries);
-        setPendingInvites(inviteData.invites);
-        setError(null);
-      })
-      .catch((e) => setError(e.message))
-      .finally(() => setLoading(false));
-  }, [api, isAuthenticated]);
-
-  useEffect(() => {
-    refresh();
-  }, [refresh]);
-
-  const handleInvite = async () => {
-    if (!inviteDid.trim()) return;
-    setInviting(true);
-    try {
-      const resp = await api.createInvite(inviteDid.trim(), inviteRole, invitePurpose);
-      setInvite(resp);
-      setInviteCopied(null);
-      // Pull in the newly-created invite for the pending list too.
-      refresh();
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Failed to create invite";
-      showAlert("Error", msg);
-    } finally {
-      setInviting(false);
-    }
-  };
-
-  const handleRevokeInvite = useCallback(
-    (inviteId: string) => {
-      showConfirm("Revoke invite", "Revoke this enrollment invite?", async () => {
-        setInvitesBusyId(inviteId);
-        try {
-          await api.revokeInvite(inviteId);
-          refresh();
-        } catch (e: unknown) {
-          const msg = e instanceof Error ? e.message : "Failed to revoke";
-          showAlert("Error", msg);
-        } finally {
-          setInvitesBusyId((prev) => (prev === inviteId ? null : prev));
-        }
-      });
-    },
-    [api, refresh],
-  );
-
-  const startEditInviteRole = useCallback(
-    (item: InviteListItem) =>
-      setEditingInvite({ inviteId: item.inviteId, role: item.role }),
-    [],
-  );
-
-  const cancelEditInviteRole = useCallback(() => setEditingInvite(null), []);
-
-  const handleSaveInviteRole = useCallback(async () => {
-    if (!editingInvite) return;
-    setInvitesBusyId(editingInvite.inviteId);
-    try {
-      await api.updateInvite(editingInvite.inviteId, {
-        role: editingInvite.role,
-      });
-      setEditingInvite(null);
-      refresh();
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Failed to update invite";
-      showAlert("Error", msg);
-    } finally {
-      setInvitesBusyId((prev) =>
-        prev === editingInvite.inviteId ? null : prev,
-      );
-    }
-  }, [api, editingInvite, refresh]);
-
-  const handleCopyInvite = async (what: "link" | "code") => {
-    if (!invite) return;
-    await Clipboard.setStringAsync(what === "link" ? invite.inviteUrl : invite.claimCode);
-    setInviteCopied(what);
-    setTimeout(() => setInviteCopied(null), 2000);
-  };
-
-  const handleClearInvite = () => {
-    setInvite(null);
-    setInviteDid("");
-  };
-
-  const handleCreate = async () => {
-    if (!newDid.trim()) return;
-    const scopeErr = validateScopeDraft(newScope);
-    if (scopeErr) {
-      showAlert("Invalid scope", scopeErr);
-      return;
-    }
-    setCreating(true);
-    try {
-      await api.createAcl(newDid.trim(), newRole, {
-        label: newLabel.trim() || undefined,
-        maxTotalSize: parseMbToBytes(newMaxTotalSize) ?? undefined,
-        maxDidCount: parseOptionalInt(newMaxDidCount) ?? undefined,
-        domains: draftToScope(newScope),
-      });
-      setNewDid("");
-      setNewLabel("");
-      setNewMaxTotalSize("");
-      setNewMaxDidCount("");
-      setNewScopeTouched(false);
-      refresh();
-    } catch (e: unknown) {
-      const msg =
-        e instanceof Error ? e.message : "Failed to create ACL entry";
-      showAlert("Error", msg);
-    } finally {
-      setCreating(false);
-    }
-  };
-
   const handleDelete = useCallback(
     (did: string) => {
       const doDelete = async (deleteDids: boolean, dids: DidRecord[]) => {
@@ -686,10 +81,9 @@ export default function AclManagement() {
             }
           }
           await api.deleteAcl(did);
-          refresh();
+          await invalidateQueries(ACL_KEY, ["dids"]);
         } catch (e: unknown) {
-          const msg = e instanceof Error ? e.message : "Failed to delete";
-          showAlert("Error", msg);
+          showAlert("Error", errorMessage(e, "Failed to delete"));
         }
       };
 
@@ -698,30 +92,27 @@ export default function AclManagement() {
         .listDids(did)
         .then((dids) => {
           if (dids.length === 0) {
-            showConfirm(
-              "Remove Access",
-              `Remove access for ${did}?`,
-              () => doDelete(false, []),
-            );
+            showConfirm("Remove Access", `Remove access for ${did}?`, () => doDelete(false, []));
           } else {
+            const owned = plural(dids.length, "DID", "DIDs");
             showConfirm(
               "Delete DIDs",
-              `This account owns ${dids.length} DID(s). Delete them too?`,
+              `This account owns ${owned}. Delete them too?`,
               () => doDelete(true, dids),
               () => {
                 // User declined deleting DIDs — confirm removing access only
                 showConfirm(
                   "Remove Access Only",
-                  `Remove access for ${did}? (${dids.length} DID(s) will be kept)`,
+                  `Remove access for ${did}? (${owned} will be kept)`,
                   () => doDelete(false, []),
                 );
               },
             );
           }
         })
-        .catch((e) => {
+        .catch((e: unknown) => {
           // Can't fetch DIDs — fall back to simple confirmation
-          const msg = e instanceof Error ? e.message : "";
+          const msg = errorMessage(e, "");
           showConfirm(
             "Remove Access",
             `Remove access for ${did}?${msg ? `\n(Could not check owned DIDs: ${msg})` : ""}`,
@@ -729,7 +120,7 @@ export default function AclManagement() {
           );
         });
     },
-    [api, refresh],
+    [api],
   );
 
   const startEditing = useCallback((entry: AclEntry) => {
@@ -737,21 +128,16 @@ export default function AclManagement() {
       did: entry.did,
       role: entry.role,
       label: entry.label ?? "",
-      maxTotalSize:
-        entry.max_total_size != null ? bytesToMb(entry.max_total_size) : "",
-      maxDidCount:
-        entry.max_did_count != null ? entry.max_did_count.toString() : "",
+      maxTotalSize: entry.max_total_size != null ? bytesToMb(entry.max_total_size) : "",
+      maxDidCount: entry.max_did_count != null ? entry.max_did_count.toString() : "",
       scope: aclEntryToDraft(entry),
     });
   }, []);
 
-  const cancelEditing = useCallback(() => {
-    setEditing(null);
-  }, []);
+  const cancelEditing = useCallback(() => setEditing(null), []);
 
   const onChangeRole = useCallback(
-    (v: "admin" | "owner" | "service" | "metricsReader") =>
-      setEditing((prev) => (prev ? { ...prev, role: v } : prev)),
+    (v: Role) => setEditing((prev) => (prev ? { ...prev, role: v } : prev)),
     [],
   );
   const onChangeLabel = useCallback(
@@ -759,23 +145,20 @@ export default function AclManagement() {
     [],
   );
   const onChangeMaxTotalSize = useCallback(
-    (v: string) =>
-      setEditing((prev) => (prev ? { ...prev, maxTotalSize: v } : prev)),
+    (v: string) => setEditing((prev) => (prev ? { ...prev, maxTotalSize: v } : prev)),
     [],
   );
   const onChangeMaxDidCount = useCallback(
-    (v: string) =>
-      setEditing((prev) => (prev ? { ...prev, maxDidCount: v } : prev)),
+    (v: string) => setEditing((prev) => (prev ? { ...prev, maxDidCount: v } : prev)),
     [],
   );
   const onChangeScope = useCallback(
-    (next: ScopeDraft) =>
-      setEditing((prev) => (prev ? { ...prev, scope: next } : prev)),
+    (next: ScopeDraft) => setEditing((prev) => (prev ? { ...prev, scope: next } : prev)),
     [],
   );
 
   const handleSave = useCallback(
-    async (did: string) => {
+    async (loaded: AclEntry) => {
       if (!editing) return;
       const scopeErr = validateScopeDraft(editing.scope);
       if (scopeErr) {
@@ -784,39 +167,30 @@ export default function AclManagement() {
       }
       setSaving(true);
       try {
-        await api.updateAcl(did, {
-          role: editing.role,
-          label: editing.label.trim() || null,
-          maxTotalSize: parseMbToBytes(editing.maxTotalSize),
-          maxDidCount: parseOptionalInt(editing.maxDidCount),
-          domains: draftToScope(editing.scope),
-        });
+        // Diffed against the entry as loaded: an unchanged save sends nothing.
+        await api.updateAcl(
+          loaded.did,
+          {
+            role: editing.role,
+            label: editing.label.trim() || null,
+            maxTotalSize: parseMbToBytes(editing.maxTotalSize),
+            maxDidCount: parseOptionalInt(editing.maxDidCount),
+            domains: draftToScope(editing.scope),
+          },
+          loaded,
+        );
         setEditing(null);
-        refresh();
+        await invalidateQueries(ACL_KEY);
       } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : "Failed to update";
-        showAlert("Error", msg);
+        showAlert("Error", errorMessage(e, "Failed to update"));
+        // A multi-step update may have half-applied; show the entry as it is.
+        void invalidateQueries(ACL_KEY);
       } finally {
         setSaving(false);
       }
     },
-    [api, editing, refresh],
+    [api, editing],
   );
-
-  if (!isAuthenticated) {
-    return (
-      <View style={styles.containerCenter}>
-        <Text style={styles.hint}>
-          Please log in to manage access control.
-        </Text>
-        <Link href="/login" asChild>
-          <Pressable style={styles.buttonPrimary}>
-            <Text style={styles.buttonPrimaryText}>Login</Text>
-          </Pressable>
-        </Link>
-      </View>
-    );
-  }
 
   const renderEntry = ({ item }: { item: AclEntry }) => (
     <AclEntryRow
@@ -838,344 +212,17 @@ export default function AclManagement() {
     />
   );
 
-  const formatExpiry = (ts: number) => {
-    const now = Math.floor(Date.now() / 1000);
-    const mins = Math.max(0, Math.round((ts - now) / 60));
-    if (mins < 60) return `${mins} min`;
-    const hrs = Math.floor(mins / 60);
-    const rem = mins % 60;
-    return rem === 0 ? `${hrs}h` : `${hrs}h ${rem}m`;
-  };
-
   const header = (
     <View>
-      <Text style={styles.title}>Access Control</Text>
-
-      {/* Invite by link */}
-      <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Invite by Link</Text>
-        <Text style={styles.inviteHelp}>
-          Generate an enrollment link and a claim code. Send them over two
-          different channels — the link by email, say, and the code by chat or
-          phone: either alone redeems nothing. The invitee opens the link,
-          types the code and registers a passkey. A sign-in invite adds them to
-          the ACL with the selected role; a step-up invite enrols a passkey
-          that only confirms sensitive actions and never signs in.
+      <Heading level={1}>Access Control</Heading>
+      <InviteCard />
+      <PendingInvites invites={invites.data?.invites ?? NO_INVITES} />
+      <AddEntryForm availableDomains={availableDomains} />
+      {acl.error != null && (
+        <Text role="alert" style={styles.errorText}>
+          {errorMessage(acl.error, "Failed to load the access control list")}
         </Text>
-        {invite ? (
-          <View>
-            <Text style={styles.editFieldLabel}>Enrollment URL</Text>
-            <View style={styles.inviteUrlBlock}>
-              <Text style={styles.inviteUrlText} selectable numberOfLines={2}>
-                {invite.inviteUrl}
-              </Text>
-            </View>
-            <Text style={styles.editFieldLabel}>Claim code (send separately)</Text>
-            <View style={styles.inviteUrlBlock}>
-              <Text style={styles.inviteUrlText} selectable>
-                {invite.claimCode}
-              </Text>
-            </View>
-            <Text style={styles.inviteExpiry}>
-              {invite.purpose === "stepUp" ? "Step-up passkey. " : ""}
-              Expires in {formatExpiry(invite.expiresAt)}. Shown once: neither
-              the link nor the code can be displayed again.
-            </Text>
-            <View style={styles.editActions}>
-              <Pressable style={styles.saveButton} onPress={() => handleCopyInvite("link")}>
-                <Text style={styles.saveText}>
-                  {inviteCopied === "link" ? "Copied" : "Copy Link"}
-                </Text>
-              </Pressable>
-              <Pressable style={styles.saveButton} onPress={() => handleCopyInvite("code")}>
-                <Text style={styles.saveText}>
-                  {inviteCopied === "code" ? "Copied" : "Copy Code"}
-                </Text>
-              </Pressable>
-              <Pressable
-                style={styles.cancelButton}
-                onPress={handleClearInvite}
-              >
-                <Text style={styles.cancelText}>New Invite</Text>
-              </Pressable>
-            </View>
-          </View>
-        ) : (
-          <View>
-            <TextInput
-              style={styles.input}
-              placeholder="did:web:example.com"
-              placeholderTextColor={colors.textTertiary}
-              value={inviteDid}
-              onChangeText={setInviteDid}
-              autoCapitalize="none"
-              autoCorrect={false}
-            />
-            <View style={styles.roleRow}>
-              {([
-                ["session", "Sign-in"],
-                ["stepUp", "Step-up only"],
-              ] as const).map(([p, text]) => (
-                <Pressable
-                  key={p}
-                  style={[
-                    styles.roleButton,
-                    invitePurpose === p && styles.roleActive,
-                  ]}
-                  onPress={() => setInvitePurpose(p)}
-                >
-                  <Text
-                    style={[
-                      styles.roleText,
-                      invitePurpose === p && styles.roleTextActive,
-                    ]}
-                  >
-                    {text}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
-            {invitePurpose === "session" && (
-            <View style={styles.roleRow}>
-              {(["owner", "admin", "service"] as const).map((r) => (
-                <Pressable
-                  key={r}
-                  style={[
-                    styles.roleButton,
-                    inviteRole === r && styles.roleActive,
-                  ]}
-                  onPress={() => setInviteRole(r)}
-                >
-                  <Text
-                    style={[
-                      styles.roleText,
-                      inviteRole === r && styles.roleTextActive,
-                    ]}
-                  >
-                    {roleLabel(r)}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
-            )}
-            <Pressable
-              style={[
-                styles.buttonPrimary,
-                (!inviteDid.trim() || inviting) && styles.disabled,
-              ]}
-              onPress={handleInvite}
-              disabled={!inviteDid.trim() || inviting}
-            >
-              <Text style={styles.buttonPrimaryText}>
-                {inviting ? "Generating..." : "Generate Invite"}
-              </Text>
-            </Pressable>
-          </View>
-        )}
-      </View>
-
-      {/* Pending invites — only shown when there are any */}
-      {pendingInvites.length > 0 && (
-        <View style={styles.card}>
-          <Text style={styles.sectionTitle}>
-            Pending Invites ({pendingInvites.length})
-          </Text>
-          {pendingInvites.map((inv) => {
-            const isEditing = editingInvite?.inviteId === inv.inviteId;
-            const busy = invitesBusyId === inv.inviteId;
-            return (
-              <View key={inv.inviteId} style={styles.pendingInviteRow}>
-                <View style={styles.pendingInviteInfo}>
-                  <Text style={styles.entryDid} numberOfLines={1}>
-                    {inv.did}
-                  </Text>
-                  <View style={styles.entryMeta}>
-                    <View
-                      style={[
-                        styles.roleBadge,
-                        inv.role === "admin" && styles.adminBadge,
-                        inv.role === "service" && styles.serviceBadge,
-                      ]}
-                    >
-                      <Text style={styles.roleBadgeText}>
-                        {inv.purpose === "stepUp" ? "step-up" : inv.role}
-                      </Text>
-                    </View>
-                    <Text style={styles.entryDate}>
-                      {inv.expired
-                        ? "expired"
-                        : `expires in ${formatExpiry(inv.expiresAt)}`}
-                    </Text>
-                  </View>
-                  {isEditing && (
-                    <View style={styles.editFields}>
-                      <View style={styles.roleRow}>
-                        {(["owner", "admin", "service"] as const).map((r) => (
-                          <Pressable
-                            key={r}
-                            style={[
-                              styles.roleButton,
-                              editingInvite.role === r && styles.roleActive,
-                            ]}
-                            onPress={() =>
-                              setEditingInvite({
-                                inviteId: inv.inviteId,
-                                role: r,
-                              })
-                            }
-                          >
-                            <Text
-                              style={[
-                                styles.roleText,
-                                editingInvite.role === r &&
-                                  styles.roleTextActive,
-                              ]}
-                            >
-                              {roleLabel(r)}
-                            </Text>
-                          </Pressable>
-                        ))}
-                      </View>
-                      <View style={styles.editActions}>
-                        <Pressable
-                          style={[styles.saveButton, busy && styles.disabled]}
-                          onPress={handleSaveInviteRole}
-                          disabled={busy}
-                        >
-                          <Text style={styles.saveText}>
-                            {busy ? "Saving..." : "Save role"}
-                          </Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.cancelButton}
-                          onPress={cancelEditInviteRole}
-                        >
-                          <Text style={styles.cancelText}>Cancel</Text>
-                        </Pressable>
-                      </View>
-                    </View>
-                  )}
-                </View>
-                {!isEditing && (
-                  <View style={styles.entryActions}>
-                    {inv.purpose === "session" && (
-                      <Pressable
-                        style={styles.editButton}
-                        onPress={() => startEditInviteRole(inv)}
-                      >
-                        <Text style={styles.editText}>Role</Text>
-                      </Pressable>
-                    )}
-                    <Pressable
-                      style={[styles.deleteButton, busy && styles.disabled]}
-                      onPress={() => handleRevokeInvite(inv.inviteId)}
-                      disabled={busy}
-                    >
-                      <Text style={styles.deleteText}>Revoke</Text>
-                    </Pressable>
-                  </View>
-                )}
-              </View>
-            );
-          })}
-        </View>
       )}
-
-      {/* Add new entry */}
-      <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Add Entry</Text>
-        <TextInput
-          style={styles.input}
-          placeholder="did:web:example.com  or  example.com/@alice"
-          placeholderTextColor={colors.textTertiary}
-          value={newDid}
-          onChangeText={setNewDid}
-          autoCapitalize="none"
-          autoCorrect={false}
-        />
-        {/* Names are resolved once, when the entry is created; the entry is
-            stored against the DID. Said plainly here because otherwise an
-            operator could reasonably assume access follows the name, and be
-            surprised either way — that it does not move when the name does,
-            or that it might. */}
-        <Text style={styles.hintSmall}>
-          A DID, or an agent name hosted here — the name is resolved now and the
-          entry is stored against the DID it points at today.
-        </Text>
-        <View style={styles.roleRow}>
-          {(["owner", "admin", "service", "metricsReader"] as const).map((r) => (
-            <Pressable
-              key={r}
-              style={[
-                styles.roleButton,
-                newRole === r && styles.roleActive,
-              ]}
-              onPress={() => setNewRole(r)}
-            >
-              <Text
-                style={[
-                  styles.roleText,
-                  newRole === r && styles.roleTextActive,
-                ]}
-              >
-                {roleLabel(r)}
-              </Text>
-            </Pressable>
-          ))}
-        </View>
-        <TextInput
-          style={styles.input}
-          placeholder="Label (optional)"
-          placeholderTextColor={colors.textTertiary}
-          value={newLabel}
-          onChangeText={setNewLabel}
-        />
-        <View style={styles.quotaInputRow}>
-          <View style={styles.quotaInputHalf}>
-            <TextInput
-              style={styles.input}
-              placeholder="Max total size (MB)"
-              placeholderTextColor={colors.textTertiary}
-              value={newMaxTotalSize}
-              onChangeText={setNewMaxTotalSize}
-              keyboardType="numeric"
-            />
-          </View>
-          <View style={styles.quotaInputHalf}>
-            <TextInput
-              style={styles.input}
-              placeholder="Max DID count"
-              placeholderTextColor={colors.textTertiary}
-              value={newMaxDidCount}
-              onChangeText={setNewMaxDidCount}
-              keyboardType="numeric"
-            />
-          </View>
-        </View>
-        <Text style={styles.quotaHint}>
-          Leave blank to use server default
-        </Text>
-        <ScopeEditor
-          draft={newScope}
-          availableDomains={availableDomains}
-          onChange={handleNewScopeChange}
-        />
-        <Pressable
-          style={[
-            styles.buttonPrimary,
-            (!newDid.trim() || creating || !!validateScopeDraft(newScope)) &&
-              styles.disabled,
-          ]}
-          onPress={handleCreate}
-          disabled={!newDid.trim() || creating || !!validateScopeDraft(newScope)}
-        >
-          <Text style={styles.buttonPrimaryText}>
-            {creating ? "Adding..." : "Add Entry"}
-          </Text>
-        </Pressable>
-      </View>
-
-      {error && <Text style={styles.errorText}>{error}</Text>}
     </View>
   );
 
@@ -1192,11 +239,12 @@ export default function AclManagement() {
       ListHeaderComponent={header}
       renderItem={renderEntry}
       ListEmptyComponent={
-        loading ? (
+        acl.loading ? (
           <ActivityIndicator
             color={colors.accent}
             size="large"
-            style={{ marginTop: spacing.xl }}
+            style={styles.spinner}
+            aria-label="Loading"
           />
         ) : (
           <Text style={styles.hint}>No ACL entries configured.</Text>
@@ -1223,101 +271,8 @@ const styles = StyleSheet.create({
   entrySeparator: {
     height: spacing.sm,
   },
-  containerCenter: {
-    flex: 1,
-    padding: spacing.xl,
-    backgroundColor: colors.bgPrimary,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  title: {
-    fontSize: 22,
-    fontFamily: fonts.bold,
-    color: colors.textPrimary,
-    marginBottom: spacing.xl,
-  },
-  card: {
-    backgroundColor: colors.bgSecondary,
-    borderRadius: radii.lg,
-    borderWidth: 1,
-    borderColor: colors.border,
-    padding: spacing.xl,
-    marginBottom: spacing.xl,
-  },
-  sectionTitle: {
-    fontSize: 16,
-    fontFamily: fonts.semibold,
-    color: colors.textPrimary,
-    marginBottom: spacing.md,
-  },
-  input: {
-    backgroundColor: colors.bgPrimary,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: radii.sm,
-    padding: spacing.md,
-    color: colors.textPrimary,
-    fontFamily: fonts.regular,
-    fontSize: 14,
-    marginBottom: spacing.md,
-  },
-  roleRow: {
-    flexDirection: "row",
-    gap: spacing.sm,
-    marginBottom: spacing.md,
-  },
-  roleButton: {
-    flex: 1,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: radii.sm,
-    paddingVertical: 10,
-    alignItems: "center",
-  },
-  roleActive: {
-    borderColor: colors.accent,
-    backgroundColor: "rgba(59, 113, 255, 0.12)",
-  },
-  roleText: {
-    fontFamily: fonts.semibold,
-    color: colors.textTertiary,
-  },
-  roleTextActive: {
-    color: colors.accent,
-  },
-  quotaInputRow: {
-    flexDirection: "row",
-    gap: spacing.sm,
-  },
-  quotaInputHalf: {
-    flex: 1,
-  },
-  quotaHint: {
-    fontSize: 12,
-    fontFamily: fonts.regular,
-    color: colors.textTertiary,
-    marginBottom: spacing.md,
-  },
-  buttonPrimary: {
-    backgroundColor: colors.accent,
-    borderRadius: radii.md,
-    paddingVertical: 12,
-    alignItems: "center",
-  },
-  disabled: {
-    opacity: 0.5,
-  },
-  buttonPrimaryText: {
-    color: colors.textOnAccent,
-    fontSize: 14,
-    fontFamily: fonts.semibold,
-  },
-  hintSmall: {
-    fontSize: 12,
-    fontFamily: fonts.regular,
-    color: colors.textTertiary,
-    marginTop: spacing.xs,
-    lineHeight: 16,
+  spinner: {
+    marginTop: spacing.xl,
   },
   hint: {
     fontSize: 14,
@@ -1331,338 +286,5 @@ const styles = StyleSheet.create({
     fontFamily: fonts.medium,
     color: colors.error,
     marginBottom: spacing.md,
-  },
-  entryCard: {
-    backgroundColor: colors.bgSecondary,
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.border,
-    padding: 14,
-    flexDirection: "row",
-    alignItems: "flex-start",
-    justifyContent: "space-between",
-    gap: spacing.md,
-  },
-  entryInfo: {
-    flex: 1,
-    minWidth: 0,
-  },
-  entryDid: {
-    fontSize: 13,
-    fontFamily: fonts.mono,
-    color: colors.textPrimary,
-    marginBottom: spacing.xs,
-    // Long did:peer values have no whitespace; allow mid-token wrapping
-    // so the card doesn't blow past its container on web.
-    wordBreak: "break-all",
-  } as any,
-  entryMeta: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: spacing.sm,
-  },
-  roleBadge: {
-    backgroundColor: colors.tealMuted,
-    borderRadius: 4,
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-  },
-  adminBadge: {
-    backgroundColor: "rgba(59, 113, 255, 0.15)",
-  },
-  serviceBadge: {
-    backgroundColor: "rgba(168, 85, 247, 0.15)",
-  },
-  roleBadgeText: {
-    fontSize: 11,
-    fontFamily: fonts.bold,
-    color: colors.textPrimary,
-    textTransform: "uppercase",
-  },
-  entryLabel: {
-    fontSize: 13,
-    fontFamily: fonts.regular,
-    color: colors.textSecondary,
-  },
-  entryDate: {
-    fontSize: 12,
-    fontFamily: fonts.regular,
-    color: colors.textTertiary,
-  },
-  quotaRow: {
-    flexDirection: "row",
-    gap: spacing.md,
-    marginTop: spacing.xs,
-  },
-  quotaText: {
-    fontSize: 12,
-    fontFamily: fonts.regular,
-    color: colors.textTertiary,
-  },
-  entryActions: {
-    gap: spacing.xs,
-  },
-  passkeysPanel: {
-    marginTop: spacing.md,
-    gap: spacing.sm,
-  },
-  editButton: {
-    borderColor: colors.accent,
-    borderWidth: 1,
-    borderRadius: radii.sm,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    alignItems: "center",
-  },
-  editText: {
-    color: colors.accent,
-    fontSize: 12,
-    fontFamily: fonts.semibold,
-  },
-  deleteButton: {
-    borderColor: colors.error,
-    borderWidth: 1,
-    borderRadius: radii.sm,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    alignItems: "center",
-  },
-  deleteText: {
-    color: colors.error,
-    fontSize: 12,
-    fontFamily: fonts.semibold,
-  },
-  editFields: {
-    marginTop: spacing.sm,
-  },
-  editInput: {
-    backgroundColor: colors.bgPrimary,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: radii.sm,
-    padding: spacing.sm,
-    color: colors.textPrimary,
-    fontFamily: fonts.regular,
-    fontSize: 13,
-    marginBottom: spacing.sm,
-  },
-  editRow: {
-    flexDirection: "row",
-    gap: spacing.sm,
-  },
-  editFieldHalf: {
-    flex: 1,
-  },
-  editFieldLabel: {
-    fontSize: 11,
-    fontFamily: fonts.medium,
-    color: colors.textTertiary,
-    marginBottom: 4,
-  },
-  editActions: {
-    flexDirection: "row",
-    gap: spacing.sm,
-    marginTop: spacing.xs,
-  },
-  saveButton: {
-    backgroundColor: colors.accent,
-    borderRadius: radii.sm,
-    paddingHorizontal: 14,
-    paddingVertical: 6,
-    alignItems: "center",
-  },
-  saveText: {
-    color: colors.textOnAccent,
-    fontSize: 12,
-    fontFamily: fonts.semibold,
-  },
-  cancelButton: {
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: radii.sm,
-    paddingHorizontal: 14,
-    paddingVertical: 6,
-    alignItems: "center",
-  },
-  cancelText: {
-    color: colors.textSecondary,
-    fontSize: 12,
-    fontFamily: fonts.semibold,
-  },
-  inviteHelp: {
-    fontSize: 13,
-    fontFamily: fonts.regular,
-    color: colors.textSecondary,
-    lineHeight: 19,
-    marginBottom: spacing.md,
-  },
-  pendingInviteRow: {
-    flexDirection: "row",
-    alignItems: "flex-start",
-    justifyContent: "space-between",
-    gap: spacing.md,
-    paddingVertical: spacing.sm,
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
-  },
-  pendingInviteInfo: {
-    flex: 1,
-    minWidth: 0,
-  },
-  inviteUrlBlock: {
-    backgroundColor: colors.bgPrimary,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: radii.sm,
-    padding: spacing.md,
-    marginTop: 4,
-    marginBottom: spacing.sm,
-  },
-  inviteUrlText: {
-    fontSize: 13,
-    fontFamily: fonts.mono,
-    color: colors.teal,
-  },
-  inviteExpiry: {
-    fontSize: 12,
-    fontFamily: fonts.regular,
-    color: colors.textTertiary,
-    marginBottom: spacing.sm,
-  },
-
-  // Domain scope editor + read view
-  scopeEditor: {
-    marginTop: spacing.sm,
-    marginBottom: spacing.sm,
-  },
-  scopeKindRow: {
-    flexDirection: "row",
-    gap: spacing.sm,
-    marginBottom: spacing.sm,
-  },
-  scopeKindButton: {
-    flex: 1,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: radii.sm,
-    paddingVertical: 8,
-    alignItems: "center",
-  },
-  scopeKindButtonActive: {
-    borderColor: colors.accent,
-    backgroundColor: "rgba(59, 113, 255, 0.12)",
-  },
-  scopeKindText: {
-    fontSize: 12,
-    fontFamily: fonts.semibold,
-    color: colors.textTertiary,
-  },
-  scopeKindTextActive: {
-    color: colors.accent,
-  },
-  scopeHint: {
-    fontSize: 12,
-    fontFamily: fonts.regular,
-    color: colors.textTertiary,
-    marginBottom: spacing.sm,
-  },
-  scopeEmpty: {
-    fontSize: 12,
-    fontFamily: fonts.medium,
-    color: colors.textSecondary,
-    fontStyle: "italic",
-    marginBottom: spacing.sm,
-  },
-  scopeDomainsWrap: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: spacing.xs,
-    marginBottom: spacing.sm,
-  },
-  scopeDomain: {
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: 999,
-    paddingHorizontal: spacing.md,
-    paddingVertical: 4,
-  },
-  scopeDomainSelected: {
-    borderColor: colors.accent,
-    backgroundColor: "rgba(59, 113, 255, 0.18)",
-  },
-  scopeDomainDefault: {
-    borderColor: colors.teal,
-    backgroundColor: "rgba(31, 229, 205, 0.18)",
-  },
-  scopeDomainDisabled: {
-    opacity: 0.5,
-  },
-  scopeDomainText: {
-    fontSize: 12,
-    fontFamily: fonts.medium,
-    color: colors.textSecondary,
-  },
-  scopeDomainTextSelected: {
-    color: colors.textPrimary,
-  },
-  scopeDefaultButton: {
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: radii.sm,
-    paddingHorizontal: spacing.md,
-    paddingVertical: 4,
-  },
-  scopeDefaultButtonActive: {
-    borderColor: colors.teal,
-    backgroundColor: "rgba(31, 229, 205, 0.18)",
-  },
-  scopeDefaultText: {
-    fontSize: 12,
-    fontFamily: fonts.semibold,
-    color: colors.textTertiary,
-  },
-  scopeDefaultTextActive: {
-    color: colors.teal,
-  },
-  scopeError: {
-    fontSize: 12,
-    fontFamily: fonts.medium,
-    color: colors.error,
-    marginBottom: spacing.sm,
-  },
-  scopeReadRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: spacing.sm,
-    flexWrap: "wrap",
-    marginTop: spacing.xs,
-  },
-  scopeReadLabel: {
-    fontSize: 12,
-    fontFamily: fonts.medium,
-    color: colors.textTertiary,
-  },
-  scopeChipRow: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: spacing.xs,
-    flex: 1,
-  },
-  scopeChip: {
-    backgroundColor: colors.bgTertiary,
-    borderRadius: 999,
-    paddingHorizontal: spacing.sm,
-    paddingVertical: 2,
-  },
-  scopeChipDefault: {
-    backgroundColor: "rgba(31, 229, 205, 0.18)",
-  },
-  scopeChipText: {
-    fontSize: 11,
-    fontFamily: fonts.medium,
-    color: colors.textSecondary,
-  },
-  scopeChipTextDefault: {
-    color: colors.teal,
   },
 });

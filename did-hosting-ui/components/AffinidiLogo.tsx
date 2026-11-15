@@ -40,13 +40,12 @@ export function AffinidiLogo({
   return (
     <View style={styles.container}>
       <View style={{ width, height, overflow: "hidden" }}>
-        {/* eslint-disable-next-line react-native/no-inline-styles */}
         <img
           src={encoded}
           width={width}
           height={height}
           alt="Affinidi"
-          style={{ display: "block" } as any}
+          style={{ display: "block" }}
         />
       </View>
     </View>

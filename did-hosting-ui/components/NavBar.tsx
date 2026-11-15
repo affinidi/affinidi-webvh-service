@@ -18,14 +18,16 @@
  */
 
 import { View, Text, StyleSheet, Pressable, ScrollView } from "react-native";
-import { Link, usePathname } from "expo-router";
+import { Link, usePathname, type Href } from "expo-router";
 import { useAuth } from "./AuthProvider";
 import { AffinidiLogo } from "./AffinidiLogo";
+import { Button } from "./Button";
 import { DomainSwitcher } from "./DomainSwitcher";
+import { webAria } from "../lib/a11y";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 
 type NavItem = {
-  href: string;
+  href: Href & string;
   label: string;
   /** When true, hidden from non-admin roles. */
   adminOnly?: boolean;
@@ -46,19 +48,13 @@ export function NavBar() {
 
   if (!isAuthenticated) return null;
 
-  const items = NAV_ITEMS.filter(
-    (item) => !item.adminOnly || role === "admin",
-  );
+  const items = NAV_ITEMS.filter((item) => !item.adminOnly || role === "admin");
 
   return (
     <View style={styles.bar}>
       <View style={styles.inner}>
         <Link href="/" asChild>
-          <Pressable
-            style={styles.logoArea}
-            accessibilityRole="link"
-            accessibilityLabel="did-hosting home"
-          >
+          <Pressable style={styles.logoArea} role="link" aria-label="did-hosting home">
             <AffinidiLogo size={22} showWordmark={false} />
           </Pressable>
         </Link>
@@ -67,12 +63,11 @@ export function NavBar() {
           horizontal
           showsHorizontalScrollIndicator={false}
           contentContainerStyle={styles.links}
+          role="navigation"
+          aria-label="Main"
         >
           {items.map((item) => {
-            const active =
-              item.href === "/"
-                ? pathname === "/"
-                : pathname.startsWith(item.href);
+            const active = item.href === "/" ? pathname === "/" : pathname.startsWith(item.href);
             // Pre-flatten the style arrays. `<Link asChild>` clones the
             // Pressable + forwards its props; with Expo SDK 54 / React 19 /
             // react-native-web 0.21, an array `style` prop survives the
@@ -89,10 +84,11 @@ export function NavBar() {
               active && styles.linkTextActive,
             ]);
             return (
-              <Link key={item.href} href={item.href as any} asChild>
+              <Link key={item.href} href={item.href} asChild>
                 <Pressable
-                  accessibilityRole="link"
-                  accessibilityState={{ selected: active }}
+                  role="link"
+                  aria-label={item.label}
+                  {...webAria(active ? { current: "page" } : {})}
                   style={buttonStyle}
                 >
                   <Text style={textStyle}>{item.label}</Text>
@@ -106,14 +102,13 @@ export function NavBar() {
 
         <View style={styles.rightCluster}>
           <DomainSwitcher />
-          <Pressable
-            style={styles.logoutButton}
-            onPress={logout}
-            accessibilityRole="button"
+          <Button
+            label="Logout"
             accessibilityLabel="Log out"
-          >
-            <Text style={styles.logoutText}>Logout</Text>
-          </Pressable>
+            variant="secondary"
+            size="sm"
+            onPress={logout}
+          />
         </View>
       </View>
     </View>
@@ -167,15 +162,5 @@ const styles = StyleSheet.create({
   },
   linkTextActive: {
     color: colors.textPrimary,
-  },
-  logoutButton: {
-    paddingVertical: 6,
-    paddingHorizontal: spacing.md,
-    borderRadius: radii.sm,
-  },
-  logoutText: {
-    fontSize: 13,
-    fontFamily: fonts.medium,
-    color: colors.error,
   },
 });

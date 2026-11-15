@@ -78,19 +78,23 @@ export const T = {
   didDelete: `${DM}did/delete/0.1` as const satisfies typeof DidDelete.TYPE_URI,
   didChangeOwner: `${DM}did/change-owner/0.1` as const satisfies typeof DidChangeOwner.TYPE_URI,
   didRollback: `${DM}did/rollback/0.1` as const satisfies typeof DidRollback.TYPE_URI,
-  witnessPublish: `${TT}webvh/witness/publish/0.1` as const satisfies typeof WitnessPublish.TYPE_URI,
+  witnessPublish:
+    `${TT}webvh/witness/publish/0.1` as const satisfies typeof WitnessPublish.TYPE_URI,
   agentNameCheck: `${DM}agent-name/check/0.1` as const satisfies typeof AgentNameCheck.TYPE_URI,
-  agentNameResolve: `${DM}agent-name/resolve/0.1` as const satisfies typeof AgentNameResolve.TYPE_URI,
+  agentNameResolve:
+    `${DM}agent-name/resolve/0.1` as const satisfies typeof AgentNameResolve.TYPE_URI,
   domainList: `${DM}domain/list/0.1` as const satisfies typeof DomainList.TYPE_URI,
   meDomains: `${DM}me/domains/0.1` as const satisfies typeof MeDomains.TYPE_URI,
   domainCreate: `${DM}domain/create/0.1` as const satisfies typeof DomainCreate.TYPE_URI,
   domainSetState: `${DM}domain/set-state/0.1` as const satisfies typeof DomainSetState.TYPE_URI,
-  domainSetDefault: `${DM}domain/set-default/0.1` as const satisfies typeof DomainSetDefault.TYPE_URI,
+  domainSetDefault:
+    `${DM}domain/set-default/0.1` as const satisfies typeof DomainSetDefault.TYPE_URI,
   domainPurge: `${DM}domain/purge/0.1` as const satisfies typeof DomainPurge.TYPE_URI,
   domainAssign: `${DM}domain/assign/0.1` as const satisfies typeof DomainAssign.TYPE_URI,
   domainUnassign: `${DM}domain/unassign/0.1` as const satisfies typeof DomainUnassign.TYPE_URI,
   registryList: `${DM}registry/list/0.2` as const satisfies typeof RegistryList.TYPE_URI,
-  registryPurgeDomain: `${DM}registry/purge-domain/0.1` as const satisfies typeof RegistryPurgeDomain.TYPE_URI,
+  registryPurgeDomain:
+    `${DM}registry/purge-domain/0.1` as const satisfies typeof RegistryPurgeDomain.TYPE_URI,
   statsGet: `${DM}stats/get/0.1` as const satisfies typeof StatsGet.TYPE_URI,
   statsTimeseries: `${DM}stats/timeseries/0.2` as const satisfies typeof StatsTimeseries.TYPE_URI,
   serverConfig: `${DM}server/config/0.1` as const satisfies typeof ServerConfig.TYPE_URI,
@@ -99,20 +103,30 @@ export const T = {
   loginStart: `${TT}auth/passkey/login/start/0.2` as const satisfies typeof LoginStart.TYPE_URI,
   loginFinish: `${TT}auth/passkey/login/finish/0.2` as const satisfies typeof LoginFinish.TYPE_URI,
   invite: `${TT}auth/passkey/enroll/invite/0.3` as const satisfies typeof Invite.TYPE_URI,
-  redeemStart: `${TT}auth/passkey/enroll/redeem/start/0.1` as const satisfies typeof RedeemStart.TYPE_URI,
-  redeemFinish: `${TT}auth/passkey/enroll/redeem/finish/0.1` as const satisfies typeof RedeemFinish.TYPE_URI,
-  inviteList: `${TT}auth/passkey/enroll/invite/list/0.1` as const satisfies typeof InviteList.TYPE_URI,
-  inviteUpdate: `${TT}auth/passkey/enroll/invite/update/0.1` as const satisfies typeof InviteUpdate.TYPE_URI,
-  inviteRevoke: `${TT}auth/passkey/enroll/invite/revoke/0.1` as const satisfies typeof InviteRevoke.TYPE_URI,
+  redeemStart:
+    `${TT}auth/passkey/enroll/redeem/start/0.1` as const satisfies typeof RedeemStart.TYPE_URI,
+  redeemFinish:
+    `${TT}auth/passkey/enroll/redeem/finish/0.1` as const satisfies typeof RedeemFinish.TYPE_URI,
+  inviteList:
+    `${TT}auth/passkey/enroll/invite/list/0.1` as const satisfies typeof InviteList.TYPE_URI,
+  inviteUpdate:
+    `${TT}auth/passkey/enroll/invite/update/0.1` as const satisfies typeof InviteUpdate.TYPE_URI,
+  inviteRevoke:
+    `${TT}auth/passkey/enroll/invite/revoke/0.1` as const satisfies typeof InviteRevoke.TYPE_URI,
   passkeyList: `${TT}auth/passkey/list/0.1` as const satisfies typeof PasskeyList.TYPE_URI,
-  passkeyAdminList: `${TT}auth/passkey/admin-list/0.1` as const satisfies typeof PasskeyAdminList.TYPE_URI,
-  passkeyRevokeStart: `${TT}auth/passkey/revoke/start/0.2` as const satisfies typeof PasskeyRevokeStart.TYPE_URI,
-  passkeyRevokeFinish: `${TT}auth/passkey/revoke/finish/0.2` as const satisfies typeof PasskeyRevokeFinish.TYPE_URI,
+  passkeyAdminList:
+    `${TT}auth/passkey/admin-list/0.1` as const satisfies typeof PasskeyAdminList.TYPE_URI,
+  passkeyRevokeStart:
+    `${TT}auth/passkey/revoke/start/0.2` as const satisfies typeof PasskeyRevokeStart.TYPE_URI,
+  passkeyRevokeFinish:
+    `${TT}auth/passkey/revoke/finish/0.2` as const satisfies typeof PasskeyRevokeFinish.TYPE_URI,
   aclList: `${TT}acl/list/0.3` as const satisfies typeof AclList.TYPE_URI,
   revokeSession: `${TT}auth/revoke-session/0.2` as const satisfies typeof RevokeSession.TYPE_URI,
   stepUpStart: `${TT}auth/step-up/start/0.2` as const satisfies typeof StepUpStart.TYPE_URI,
-  stepUpApproveRequest: `${TT}auth/step-up/approve-request/0.5` as const satisfies typeof StepUpApproveRequest.TYPE_URI,
-  stepUpApproveResponse: `${TT}auth/step-up/approve-response/0.7` as const satisfies typeof StepUpApprove.TYPE_URI,
+  stepUpApproveRequest:
+    `${TT}auth/step-up/approve-request/0.5` as const satisfies typeof StepUpApproveRequest.TYPE_URI,
+  stepUpApproveResponse:
+    `${TT}auth/step-up/approve-response/0.7` as const satisfies typeof StepUpApprove.TYPE_URI,
   aclShow: `${TT}acl/show/0.2` as const satisfies typeof AclShow.TYPE_URI,
   aclGrant: `${TT}acl/grant/0.2` as const satisfies typeof AclGrant.TYPE_URI,
   aclRevoke: `${TT}acl/revoke/0.2` as const satisfies typeof AclRevoke.TYPE_URI,
