@@ -14,7 +14,7 @@ rust-version.workspace = true
 
 [features]
 default = ["keyring", "store-fjall", "ui", "did-methods"]
-ui = ["did-hosting-control/ui"]
+ui = ["did-hosting-control/ui", "dep:tower"]
 # NOTE: passkey/WebAuthn is always compiled in — it arrives unconditionally
 # through the `did-hosting-control` dependency (which enables
 # `did-hosting-common/passkey` and links `webauthn-rs` non-optionally), and
@@ -135,6 +135,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 toml = "1.0"
 tower-http = { version = "0.7", features = ["trace"] }
+tower = { version = "0.5", features = ["util"], optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 vta-sdk = { workspace = true }

@@ -1149,20 +1149,45 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // Combined fallback: try DID public serving first, then the SPA UI.
     combined = match server_state {
-        Some(ref state) => combined.fallback(
-            {
+        Some(ref state) => {
+            // DID resolution and the console's pages are charged to the
+            // public resolution rate limit…
+            let limited = {
                 let state = state.clone();
                 move |request: axum::extract::Request| {
                     let state = state.clone();
                     async move { daemon_fallback(state, request).await }
                 }
             }
-            .layer(resolve_limit.layer()),
-        ),
+            .layer(resolve_limit.layer());
+            // …but a file of the console's bundle is not: it is served from
+            // memory, touches no store, and a page load fetches dozens of
+            // them. No DID artifact shares a name with one (the bundle holds
+            // `_expo/static/…`, `assets/…` and the like), so resolution never
+            // takes this path.
+            #[cfg(feature = "ui")]
+            let ui = did_hosting_control::frontend::static_service();
+            combined.fallback(move |request: axum::extract::Request| {
+                let limited = limited.clone();
+                #[cfg(feature = "ui")]
+                let ui = ui.clone();
+                async move {
+                    #[cfg(feature = "ui")]
+                    if did_hosting_control::frontend::is_embedded_asset(request.uri().path()) {
+                        use tower::ServiceExt;
+                        return match ui.oneshot(request).await {
+                            Ok(response) => axum::response::IntoResponse::into_response(response),
+                            Err(never) => match never {},
+                        };
+                    }
+                    axum::handler::Handler::call(limited, request, ()).await
+                }
+            })
+        }
         None => {
             #[cfg(feature = "ui")]
             {
-                combined.fallback(did_hosting_control::frontend::static_handler)
+                combined.fallback_service(did_hosting_control::frontend::static_service())
             }
             #[cfg(not(feature = "ui"))]
             {
@@ -1910,6 +1935,7 @@ async fn daemon_fallback(
     // routing); the full Request is consumed by serve_public to read
     // ConnectInfo + headers for resolve-side host detection.
     let uri = request.uri().clone();
+    let headers = request.headers().clone();
     let did_resp =
         did_hosting_server::routes::did_public::serve_public(axum::extract::State(state), request)
             .await;
@@ -1920,12 +1946,12 @@ async fn daemon_fallback(
 
     #[cfg(feature = "ui")]
     {
-        did_hosting_control::frontend::static_handler(uri).await
+        did_hosting_control::frontend::serve(&uri, &headers)
     }
 
     #[cfg(not(feature = "ui"))]
     {
-        let _ = uri;
+        let _ = (uri, headers);
         StatusCode::NOT_FOUND.into_response()
     }
 }
