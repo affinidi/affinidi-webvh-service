@@ -1,13 +1,9 @@
 use std::sync::{Arc, OnceLock};
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
-use affinidi_messaging_didcomm_service::{
-    DIDCommService, DIDCommServiceConfig, ListenerConfig, Protocols, RestartPolicy, RetryConfig,
-};
+use affinidi_messaging_didcomm_service::{DIDCommService, DIDCommServiceConfig};
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
-use did_hosting_common::server::didcomm_profile::{
-    advertised_protocols, build_tdk_profile_for_identity, reconcile_listener_protocols,
-};
+use did_hosting_common::server::didcomm_profile::build_own_listener;
 use did_hosting_common::server::identity::{self, ServiceIdentity};
 use did_hosting_common::server::init;
 use did_hosting_common::server::path_locks::PathLocks;
@@ -236,8 +232,10 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         warn!("failed to establish the service identity from its DID document: {e}");
     }
 
+    // Start the mediator messaging service when *either* transport is enabled —
+    // a TSP-only witness (didcomm off, tsp on) still needs its listener.
     let didcomm_shutdown = CancellationToken::new();
-    if state.config.features.didcomm {
+    if state.config.features.didcomm || state.config.features.tsp {
         match start_didcomm_service(&state, didcomm_shutdown.clone()).await {
             Ok(Some(svc)) => {
                 let _ = state.didcomm_service.set(svc);
@@ -339,40 +337,19 @@ async fn start_didcomm_service(
         }
     };
 
-    // Carries the key material of every live generation, keyed on the kids the
-    // DID document actually resolved to — the same kids the secrets resolver
-    // was seeded with.
-    let profile = build_tdk_profile_for_identity("witness", identity, Some(&mediator_did)).await?;
-
     // DIDComm and/or TSP ride the same mediator socket. The listener carries
     // every transport the witness's own DID document advertises, whatever the
-    // config flags say — the document is how peers reach it.
-    let advertised = advertised_protocols(&identity.did, Some(&identity.did_resolver)).await;
-    let transports = reconcile_listener_protocols(identity.protocols(), advertised, &identity.did);
+    // config flags say — the document is how peers reach it. Built by the same
+    // function the identity rebuild uses, so a rotation cannot come back with a
+    // different listener.
+    let (listener, transports) = build_own_listener(
+        crate::identity_rotation::LISTENER_ID,
+        identity,
+        &mediator_did,
+        &state.store,
+    )
+    .await?;
     let tsp_enabled = transports.tsp;
-    let protocols = match (transports.didcomm, transports.tsp) {
-        (true, true) => Protocols::BOTH,
-        (false, true) => Protocols::TSP_ONLY,
-        _ => Protocols::DIDCOMM_ONLY,
-    };
-
-    let mut listener = ListenerConfig {
-        id: "witness".into(),
-        profile,
-        restart_policy: RestartPolicy::Always {
-            backoff: RetryConfig::default(),
-        },
-        auto_delete: true,
-        protocols,
-        ..Default::default()
-    };
-    if tsp_enabled {
-        listener.relationship_store = Some(
-            did_hosting_common::server::tsp_relationship_store::build_relationship_store(
-                &state.store,
-            )?,
-        );
-    }
 
     let router = messaging::build_witness_router(state.clone())
         .map_err(|e| AppError::Internal(format!("failed to build DIDComm router: {e}")))?;

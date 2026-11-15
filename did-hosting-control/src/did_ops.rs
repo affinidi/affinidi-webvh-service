@@ -51,8 +51,9 @@ fn invalidate_cached_content(state: &AppState, mnemonic: &str) {
     }
 }
 
-/// Pulled out as a helper so `register_did_atomic` and `publish_did`
-/// can share the call without duplicating the ACL lookup.
+/// Pulled out as a helper so `register_did_atomic` and
+/// [`prepare_republish`] can share the call without duplicating the ACL
+/// lookup.
 async fn check_did_host_safety(
     state: &AppState,
     auth: &AuthClaims,
@@ -417,7 +418,7 @@ pub async fn create_did(
     use crate::auth::session::now_epoch;
 
     // Every branch returns holding the slot's per-path write lock — the same
-    // one `register_did_atomic` and `publish_did` take — so the availability
+    // one `register_did_atomic` and the agent-name ops take — so the availability
     // check (or the force-replace read) and the commit below are one step.
     // Without it, two creates of one free path both saw it free and both
     // committed: the later silently replaced the earlier caller's slot and
@@ -480,7 +481,7 @@ pub async fn create_did(
         domain: domain.unwrap_or("").to_string(),
 
         // An empty slot — no log, so no document to read services from.
-        // `publish_did` fills this on first upload.
+        // `register_did_atomic` fills this on first upload.
         services: None,
         agent_names: Vec::new(),
     };
@@ -540,8 +541,8 @@ pub async fn create_did(
 
 /// Atomic claim-and-publish for a DID at a known path.
 ///
-/// Solves the resolvability gap in the two-step
-/// `request_uri` → `publish_did` flow: between those two calls a
+/// Solves the resolvability gap in the retired two-step
+/// `request_uri` → `did/publish` flow: between those two calls a
 /// previously-resolvable slot is empty, so any in-flight resolver hits
 /// 404. This op writes the new mnemonic record + log content + owner
 /// index in a single batch, so a resolver's GET returns either the old
@@ -621,7 +622,7 @@ pub async fn register_did_atomic(
     // lost-update race but not this one, since `verify_publication` had
     // already run — and had already decided which entries need a proof —
     // before the lock was ever taken.
-    let _path_guard = state.path_locks.guard(path).await;
+    let path_guard = state.path_locks.guard(path).await;
 
     // The slot's currently stored log and witness proofs, if any — a
     // fresh registration has neither, a re-register of an existing slot
@@ -686,7 +687,7 @@ pub async fn register_did_atomic(
             .map_err(AppError::Validation)?;
     }
 
-    // `_path_guard`, acquired above, already covers this read: without it,
+    // `path_guard`, acquired above, already covers this read: without it,
     // two concurrent fresh-slot calls could both observe `existing == None`,
     // both build records, and both commit — fjall batches are atomic
     // per-commit but not conditional, so the second would silently
@@ -728,7 +729,7 @@ pub async fn register_did_atomic(
     // `max_did_count`; the published log counts against `max_total_size`
     // (old size 0 for a fresh slot, else the slot's current content_size).
     // Both helpers are admin-exempt and no-op when the ACL sets no cap.
-    let _quota_guard = owner_quota_guard(state, &auth.did).await;
+    let quota_guard = owner_quota_guard(state, &auth.did).await;
     if existing.is_none() {
         check_did_count_limit(auth, state).await?;
     }
@@ -819,7 +820,7 @@ pub async fn register_did_atomic(
     // submitted document may claim.
     let reg_domain =
         did_hosting_common::server::domain::extract_did_host(&did_id).unwrap_or_default();
-    let (claimed, released, _name_locks) = reconcile_agent_names(
+    let (claimed, released, name_locks) = reconcile_agent_names(
         state,
         &mut new_record,
         path,
@@ -864,14 +865,21 @@ pub async fn register_did_atomic(
         batch.remove(&state.dids_ks, agent_name_key(&reg_domain, name));
     }
     batch.commit().await?;
+    // Released before the identity check below, which can reach the network
+    // when this is the service's own DID; nothing after this point reads or
+    // writes the slot or its names.
+    drop(name_locks);
+    drop(path_guard);
     invalidate_cached_content(state, path);
+    drop(quota_guard);
     if existing.is_none() {
         state.stats_collector.increment_total_dids();
     }
 
-    // Same rationale as `publish_did`: the atomic register path commits
-    // a new log entry, so it must advance the update counters when the
-    // control plane is authoritative for stats.
+    // A new log entry was committed, so advance the update counters — the
+    // control plane is authoritative for stats (standalone or daemon mode);
+    // without this, updates would only surface via stats-sync from a remote
+    // edge and sit at zero in self-hosted deployments.
     state.stats_collector.record_update(path);
 
     info!(
@@ -881,6 +889,20 @@ pub async fn register_did_atomic(
         owner_changed,
         "DID atomically registered on control plane"
     );
+
+    // If the DID just published was the service's *own*, its keys or services
+    // may have changed: re-resolve and rotate the identity now rather than at
+    // the next backstop reload. This is the live publish path (`did/register`),
+    // so without it a rotation of our own DID would go unnoticed for up to
+    // `DEFAULT_RELOAD_INTERVAL`, with the served document advertising keys the
+    // listener has not loaded.
+    //
+    // Safe to call on every register: it compares mnemonics first (no network),
+    // and a publish of our own DID that didn't change the identity resolves the
+    // document once and no-ops. It deliberately does not fail the register — the
+    // log entry is committed and correct either way, and a rotation that can't
+    // proceed logs loudly rather than rolling back a valid publish.
+    crate::identity_rotation::on_did_published(state, path).await;
 
     // The record as written. Answer from it rather than reading it back: on an
     // eventually consistent store that read can miss the write, and the caller
@@ -901,8 +923,8 @@ fn validate_slot_path_shape(mnemonic: &str) -> Result<(), AppError> {
 /// Shared front-half of a new-version publish: authorize the caller, verify
 /// the submitted log's cryptographic proofs, run the host/domain safety
 /// checks, and advance the loaded record's version/size/did_id/services/domain
-/// fields — the work `publish_did` and every agent-name operation do
-/// identically before they commit.
+/// fields — the work every agent-name operation (and the test-only
+/// `publish_did`) does identically before it commits.
 ///
 /// Returns the prepared, **uncommitted** record, the DID's resolved hosting
 /// domain (the authority an agent name is scoped to), and the verified
@@ -1283,7 +1305,18 @@ async fn agent_name_held_by_other(
     Ok(record.is_some_and(|r| r.agent_names.iter().any(|e| e.name == name)))
 }
 
-pub async fn publish_did(
+/// Publish a new version of an existing slot through [`prepare_republish`] —
+/// **test-only**.
+///
+/// The `did/publish` task this served has been retired; the only live publish
+/// path is `did/register` → [`register_did_atomic`], which carries the
+/// agent-name reconcile and the identity-rotation hook. This remains so tests
+/// can drive [`prepare_republish`] — the front half the agent-name verbs share
+/// — on its own (its `?domain=` cross-check and `record.domain` backfill).
+/// Never give it a production caller: a reconcile or a hook added here would
+/// not run in production.
+#[cfg(test)]
+pub(crate) async fn publish_did(
     auth: &AuthClaims,
     state: &AppState,
     mnemonic: &str,
@@ -1600,7 +1633,7 @@ async fn apply_agent_name_op(
         IndexWrite::Keep => {}
     }
     batch.commit().await?;
-    // As in `publish_did`: not held across the identity check below.
+    // As in `register_did_atomic`: not held across the identity check below.
     drop(name_locks);
     drop(slot_guard);
     invalidate_cached_content(state, mnemonic);
@@ -1617,7 +1650,7 @@ async fn apply_agent_name_op(
         "agent name updated on control plane"
     );
 
-    // Same rationale as `publish_did`: a new document version was committed,
+    // Same rationale as `register_did_atomic`: a new document version was committed,
     // so if it was the service's own DID, re-resolve and rotate if needed.
     crate::identity_rotation::on_did_published(state, mnemonic).await;
 
@@ -4603,10 +4636,10 @@ mod tests_atomic {
         assert_eq!(stored_services(&state, "slot").await, None);
     }
 
-    /// `publish_did` caches the document's services, in document order
+    /// `register_did_atomic` caches the document's services, in document order
     /// (TSP before DIDComm, matching the VTA templates).
     #[tokio::test]
-    async fn publish_did_caches_advertised_services() {
+    async fn register_caches_advertised_services() {
         let (state, _dir) = test_state().await;
         let owner = "did:example:owner";
         let path = "with-transports";
@@ -4621,7 +4654,7 @@ mod tests_atomic {
             "precondition: no document yet"
         );
 
-        publish_did(&owner_auth(owner), &state, path, &did_log, None)
+        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
             .await
             .unwrap();
 
@@ -4637,7 +4670,7 @@ mod tests_atomic {
     /// A document with no services caches as `Some(vec![])` — we read it and
     /// it advertises nothing — which is distinct from the `None` above.
     #[tokio::test]
-    async fn publish_did_caches_empty_services_for_bare_document() {
+    async fn register_caches_empty_services_for_bare_document() {
         let (state, _dir) = test_state().await;
         let owner = "did:example:owner";
         let path = "bare";
@@ -4646,7 +4679,7 @@ mod tests_atomic {
         create_did(&owner_auth(owner), &state, Some(path), false, None)
             .await
             .unwrap();
-        publish_did(&owner_auth(owner), &state, path, &did_log, None)
+        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
             .await
             .unwrap();
 
@@ -4657,7 +4690,7 @@ mod tests_atomic {
     /// server that stops advertising TSP must lose the badge — a
     /// fill-if-empty implementation would keep showing the stale one.
     #[tokio::test]
-    async fn publish_did_retracts_a_dropped_service() {
+    async fn register_retracts_a_dropped_service() {
         let (state, _dir) = test_state().await;
         let owner = "did:example:owner";
         let path = "drops-tsp";
@@ -4667,7 +4700,7 @@ mod tests_atomic {
             .unwrap();
 
         let both = build_test_did_log_with_transports("control.test", path, true, true).await;
-        publish_did(&owner_auth(owner), &state, path, &both, None)
+        register_did_atomic(&owner_auth(owner), &state, path, &both, false, None)
             .await
             .unwrap();
         assert!(
@@ -4681,7 +4714,7 @@ mod tests_atomic {
         // Re-publish a document that advertises DIDComm only.
         let didcomm_only =
             build_test_did_log_with_transports("control.test", path, false, true).await;
-        publish_did(&owner_auth(owner), &state, path, &didcomm_only, None)
+        register_did_atomic(&owner_auth(owner), &state, path, &didcomm_only, false, None)
             .await
             .unwrap();
 
@@ -4697,7 +4730,7 @@ mod tests_atomic {
     /// path for a record the sweep deferred (unparseable log) or one written
     /// before the sweep ran.
     #[tokio::test]
-    async fn publish_did_backfills_services_on_legacy_record() {
+    async fn register_backfills_services_on_legacy_record() {
         let (state, _dir) = test_state().await;
         let owner = "did:example:owner";
         let path = "legacy";
@@ -4711,7 +4744,7 @@ mod tests_atomic {
         rec.services = None;
         state.dids_ks.insert(did_key(path), &rec).await.unwrap();
 
-        publish_did(&owner_auth(owner), &state, path, &did_log, None)
+        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
             .await
             .unwrap();
 
@@ -4733,7 +4766,7 @@ mod tests_atomic {
         create_did(&owner_auth(owner), &state, Some(path), false, None)
             .await
             .unwrap();
-        publish_did(&owner_auth(owner), &state, path, &did_log, None)
+        register_did_atomic(&owner_auth(owner), &state, path, &did_log, false, None)
             .await
             .unwrap();
 
@@ -4930,7 +4963,7 @@ mod tests_atomic {
         let owner = "did:example:a";
         register_owned(&state, owner, "slot-a").await;
         let named = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
-        publish_did(&owner_auth(owner), &state, "slot-a", &named, None)
+        register_did_atomic(&owner_auth(owner), &state, "slot-a", &named, false, None)
             .await
             .expect("bind alice");
         let plain = build_test_did_log_with_names("control.test", "slot-a", &[]).await;
@@ -4997,7 +5030,7 @@ mod tests_atomic {
         register_owned(&state, owner_a, "slot-a").await;
         register_owned(&state, owner_b, "slot-b").await;
         let held = build_test_did_log_with_names("control.test", "slot-b", &["alice"]).await;
-        publish_did(&owner_auth(owner_b), &state, "slot-b", &held, None)
+        register_did_atomic(&owner_auth(owner_b), &state, "slot-b", &held, false, None)
             .await
             .expect("B binds alice");
 
@@ -5576,7 +5609,7 @@ mod tests_atomic {
 
         // Simulate the UI bind: publish a version that claims @alice.
         let bind = build_test_did_log_with_names("control.test", path, &["alice"]).await;
-        publish_did(&owner_auth(owner), &state, path, &bind, None)
+        register_did_atomic(&owner_auth(owner), &state, path, &bind, false, None)
             .await
             .expect("publish");
         let rec = get_record(&state, path).await;
@@ -5616,11 +5649,11 @@ mod tests_atomic {
         register_owned(&state, owner, path).await;
 
         let bind = build_test_did_log_with_names("control.test", path, &["alice"]).await;
-        publish_did(&owner_auth(owner), &state, path, &bind, None)
+        register_did_atomic(&owner_auth(owner), &state, path, &bind, false, None)
             .await
             .unwrap();
         let drop = build_test_did_log_with_names("control.test", path, &[]).await;
-        publish_did(&owner_auth(owner), &state, path, &drop, None)
+        register_did_atomic(&owner_auth(owner), &state, path, &drop, false, None)
             .await
             .unwrap();
 
@@ -5640,7 +5673,7 @@ mod tests_atomic {
         register_owned(&state, owner, path).await;
 
         let bind = build_test_did_log_with_names("control.test", path, &["alice"]).await;
-        publish_did(&owner_auth(owner), &state, path, &bind, None)
+        register_did_atomic(&owner_auth(owner), &state, path, &bind, false, None)
             .await
             .unwrap();
         let park = build_test_did_log_with_names("control.test", path, &[]).await;
@@ -5650,7 +5683,7 @@ mod tests_atomic {
 
         // Some later, unrelated publish (still not claiming alice).
         let other = build_test_did_log_with_names("control.test", path, &[]).await;
-        publish_did(&owner_auth(owner), &state, path, &other, None)
+        register_did_atomic(&owner_auth(owner), &state, path, &other, false, None)
             .await
             .unwrap();
 
@@ -5689,7 +5722,7 @@ mod tests_atomic {
         let before = get_record(&state, path).await.version_count;
 
         let log = build_test_did_log_with_names("control.test", path, &["admin"]).await;
-        let err = publish_did(&owner_auth(owner), &state, path, &log, None)
+        let err = register_did_atomic(&owner_auth(owner), &state, path, &log, false, None)
             .await
             .unwrap_err();
         assert!(
@@ -5779,7 +5812,7 @@ mod tests_atomic {
         let before = get_record(&state, path).await.version_count;
 
         let log = build_test_did_log_with_names("control.test", path, &[""]).await;
-        let err = publish_did(&owner_auth(owner), &state, path, &log, None)
+        let err = register_did_atomic(&owner_auth(owner), &state, path, &log, false, None)
             .await
             .unwrap_err();
         assert!(
@@ -5815,7 +5848,7 @@ mod tests_atomic {
             .expect("admin registers the root DID");
 
         let log = build_test_did_log_with_names("control.test", ".well-known", &[""]).await;
-        publish_did(&admin_auth(admin), &state, ".well-known", &log, None)
+        register_did_atomic(&admin_auth(admin), &state, ".well-known", &log, false, None)
             .await
             .expect("the root DID may claim its domain's community name");
 
@@ -5824,6 +5857,81 @@ mod tests_atomic {
             Some(".well-known"),
             "the community name should index to the root slot"
         );
+    }
+
+    /// `did/register` is the only live publish path, so a register of the
+    /// control plane's *own* DID must reach the identity reload at once — not
+    /// wait up to `DEFAULT_RELOAD_INTERVAL` for the backstop while the served
+    /// document advertises keys the listener has not loaded. A register of
+    /// any other DID must not.
+    #[tokio::test]
+    async fn registering_our_own_did_triggers_the_identity_reload() {
+        use crate::identity_rotation::OWN_DID_RELOADS;
+
+        let (state, _dir) = test_state().await;
+        // `test_state`'s server DID is pathless, so ours is the root slot.
+        assert_eq!(
+            did_hosting_common::server::identity::mnemonic_from_did(
+                state.config.server_did.as_deref().unwrap()
+            )
+            .as_deref(),
+            Some(".well-known")
+        );
+        let admin = "did:example:admin";
+        OWN_DID_RELOADS.with(|n| n.set(0));
+
+        // Someone else's DID: no reload.
+        let other = build_test_did_log("scid", "control.test", "tenant-slot").await;
+        register_did_atomic(
+            &admin_auth(admin),
+            &state,
+            "tenant-slot",
+            &other,
+            false,
+            None,
+        )
+        .await
+        .expect("register a tenant DID");
+        assert_eq!(OWN_DID_RELOADS.with(|n| n.get()), 0);
+
+        // Ours: first registration, then a republish — each reloads.
+        let ours = build_test_did_log("scid", "control.test", ".well-known").await;
+        register_did_atomic(
+            &admin_auth(admin),
+            &state,
+            ".well-known",
+            &ours,
+            false,
+            None,
+        )
+        .await
+        .expect("register our own DID");
+        assert_eq!(OWN_DID_RELOADS.with(|n| n.get()), 1);
+        register_did_atomic(
+            &admin_auth(admin),
+            &state,
+            ".well-known",
+            &ours,
+            false,
+            None,
+        )
+        .await
+        .expect("republish our own DID");
+        assert_eq!(OWN_DID_RELOADS.with(|n| n.get()), 2);
+
+        // A refused register commits nothing and so reloads nothing.
+        let err = register_did_atomic(
+            &owner_auth("did:example:tenant"),
+            &state,
+            ".well-known",
+            &ours,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)), "{err:?}");
+        assert_eq!(OWN_DID_RELOADS.with(|n| n.get()), 2);
     }
 
     /// The hijack. Layer-1 cannot catch this one: after the overwrite the
@@ -5839,13 +5947,13 @@ mod tests_atomic {
         register_owned(&state, owner_b, "slot-b").await;
 
         let log_a = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
-        publish_did(&owner_auth(owner_a), &state, "slot-a", &log_a, None)
+        register_did_atomic(&owner_auth(owner_a), &state, "slot-a", &log_a, false, None)
             .await
             .expect("owner A binds alice");
 
         // B publishes a document claiming A's name.
         let log_b = build_test_did_log_with_names("control.test", "slot-b", &["alice"]).await;
-        let err = publish_did(&owner_auth(owner_b), &state, "slot-b", &log_b, None)
+        let err = register_did_atomic(&owner_auth(owner_b), &state, "slot-b", &log_b, false, None)
             .await
             .unwrap_err();
         assert!(
@@ -5879,7 +5987,7 @@ mod tests_atomic {
 
         // The control: the holder re-publishing its own name is not a
         // collision, it is a refresh.
-        publish_did(&owner_auth(owner_a), &state, "slot-a", &log_a, None)
+        register_did_atomic(&owner_auth(owner_a), &state, "slot-a", &log_a, false, None)
             .await
             .expect("re-publishing one's own name must still work");
     }
@@ -5896,7 +6004,7 @@ mod tests_atomic {
         register_owned(&state, owner_b, "slot-b").await;
 
         let bind = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
-        publish_did(&owner_auth(owner_a), &state, "slot-a", &bind, None)
+        register_did_atomic(&owner_auth(owner_a), &state, "slot-a", &bind, false, None)
             .await
             .unwrap();
         let park = build_test_did_log_with_names("control.test", "slot-a", &[]).await;
@@ -5905,7 +6013,7 @@ mod tests_atomic {
             .expect("park");
 
         let log_b = build_test_did_log_with_names("control.test", "slot-b", &["alice"]).await;
-        let err = publish_did(&owner_auth(owner_b), &state, "slot-b", &log_b, None)
+        let err = register_did_atomic(&owner_auth(owner_b), &state, "slot-b", &log_b, false, None)
             .await
             .unwrap_err();
         assert!(
@@ -5931,7 +6039,7 @@ mod tests_atomic {
         let owner_b = "did:example:b";
         register_owned(&state, owner_a, "slot-a").await;
         let bind = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
-        publish_did(&owner_auth(owner_a), &state, "slot-a", &bind, None)
+        register_did_atomic(&owner_auth(owner_a), &state, "slot-a", &bind, false, None)
             .await
             .unwrap();
 
@@ -5990,7 +6098,7 @@ mod tests_atomic {
 
         // "Bob" is a well-formed agent-name URI but not a valid name here.
         let log = build_test_did_log_with_names("control.test", path, &["Bob", "alice"]).await;
-        publish_did(&owner_auth(owner), &state, path, &log, None)
+        register_did_atomic(&owner_auth(owner), &state, path, &log, false, None)
             .await
             .expect("an unserveable entry must not fail the publish");
 
@@ -6023,7 +6131,7 @@ mod tests_atomic {
 
         // A holds alice legitimately.
         let bind = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
-        publish_did(&owner_auth(owner_a), &state, "slot-a", &bind, None)
+        register_did_atomic(&owner_auth(owner_a), &state, "slot-a", &bind, false, None)
             .await
             .unwrap();
 
@@ -6044,7 +6152,7 @@ mod tests_atomic {
         // B publishes without claiming alice: its own stale entry goes, but the
         // index belongs to A and must survive.
         let drop = build_test_did_log_with_names("control.test", "slot-b", &[]).await;
-        publish_did(&owner_auth(owner_b), &state, "slot-b", &drop, None)
+        register_did_atomic(&owner_auth(owner_b), &state, "slot-b", &drop, false, None)
             .await
             .unwrap();
 
@@ -6102,10 +6210,11 @@ mod tests_atomic {
                     );
                     (a.map(drop), b.map(drop))
                 } else {
-                    tokio::join!(
-                        publish_did(&auth_a, &state, "slot-a", &log_a, None),
-                        publish_did(&auth_b, &state, "slot-b", &log_b, None),
-                    )
+                    let (a, b) = tokio::join!(
+                        register_did_atomic(&auth_a, &state, "slot-a", &log_a, false, None),
+                        register_did_atomic(&auth_b, &state, "slot-b", &log_b, false, None),
+                    );
+                    (a.map(drop), b.map(drop))
                 };
             let winner = match (&result_a, &result_b) {
                 (Ok(_), Err(AppError::AgentName(AgentNameError::Taken))) => "slot-a",
@@ -6180,7 +6289,7 @@ mod tests_atomic {
         register_owned(&state, owner_b, "slot-b").await;
 
         let bind = build_test_did_log_with_names("control.test", "slot-a", &["alice", "bob"]).await;
-        publish_did(&owner_auth(owner_a), &state, "slot-a", &bind, None)
+        register_did_atomic(&owner_auth(owner_a), &state, "slot-a", &bind, false, None)
             .await
             .unwrap();
         let park = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
@@ -6268,7 +6377,7 @@ mod tests_atomic {
                 .available
         );
         let claim = build_test_did_log_with_names("control.test", "slot-a", &["alice"]).await;
-        publish_did(&owner_auth(owner), &state, "slot-a", &claim, None)
+        register_did_atomic(&owner_auth(owner), &state, "slot-a", &claim, false, None)
             .await
             .expect("a leftover entry does not block the claim");
         assert_eq!(

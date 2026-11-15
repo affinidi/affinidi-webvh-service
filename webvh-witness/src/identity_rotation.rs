@@ -12,10 +12,8 @@
 
 use std::time::Duration;
 
-use affinidi_messaging_didcomm_service::{
-    DIDCommService, ListenerConfig, Protocols, RestartPolicy, RetryConfig,
-};
-use did_hosting_common::server::didcomm_profile::build_tdk_profile_for_identity;
+use affinidi_messaging_didcomm_service::DIDCommService;
+use did_hosting_common::server::didcomm_profile::rebuild_own_listener;
 use did_hosting_common::server::identity::{
     self, DEFAULT_RELOAD_INTERVAL, DEFAULT_SWEEP_INTERVAL, IdentityGeneration, ReloadOutcome,
 };
@@ -29,8 +27,9 @@ use crate::messaging;
 use crate::secret_store::create_secret_store;
 use crate::server::AppState;
 
-/// Must match the listener id `server::start_didcomm_service` registers.
-const LISTENER_ID: &str = "witness";
+/// The listener id the witness registers its DID under, at boot
+/// (`server::start_didcomm_service`) and on every rebuild.
+pub(crate) const LISTENER_ID: &str = "witness";
 
 /// How long the expiry sweep waits between passes (local, cheap).
 pub const SWEEP_INTERVAL: Duration = DEFAULT_SWEEP_INTERVAL;
@@ -51,11 +50,11 @@ pub async fn reload_now(state: &AppState) -> Result<(), AppError> {
         &state.store,
         secret_store.as_ref(),
         state.config.mediator_did.as_deref(),
-        // The witness carries no TSP listener of its own — TSP rides the
-        // control plane's mediator socket.
+        // The same set the witness loads its identity with at boot: it runs its
+        // own TSP listener (`WitnessTspHandler`) when `features.tsp` is on.
         identity::ProtocolSet {
             didcomm: state.config.features.didcomm,
-            tsp: false,
+            tsp: state.config.features.tsp,
         },
         state.config.identity.rotation_grace_secs(),
     )
@@ -133,11 +132,10 @@ pub async fn reload_now(state: &AppState) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Rebuild the DIDComm listener against the current live set.
-///
-/// Necessary because the framework re-seeds its secrets resolver from
-/// `ListenerConfig.profile.secrets()` on every reconnect — a secret that is not
-/// in the profile vector vanishes the moment the socket drops.
+/// Rebuild the DIDComm listener against the current live set — through the
+/// same builder boot uses ([`rebuild_own_listener`]), so the rebuilt listener
+/// keeps the transports our DID document advertises and its persistent TSP
+/// relationship store.
 async fn rebuild_listener(state: &AppState) -> Result<(), AppError> {
     let Some(svc) = state.didcomm_service.get() else {
         debug!("no messaging service running — nothing to rebuild");
@@ -150,36 +148,7 @@ async fn rebuild_listener(state: &AppState) -> Result<(), AppError> {
         return Ok(());
     };
 
-    let profile =
-        build_tdk_profile_for_identity(LISTENER_ID, identity, Some(&mediator_did)).await?;
-
-    let transports = identity.protocols();
-    let protocols = match (transports.didcomm, transports.tsp) {
-        (true, true) => Protocols::BOTH,
-        (false, true) => Protocols::TSP_ONLY,
-        _ => Protocols::DIDCOMM_ONLY,
-    };
-
-    // Remove-then-add: the mediator allows one connection per DID, and the
-    // framework rejects a second listener for a DID it already holds.
-    if let Err(e) = svc.remove_listener(LISTENER_ID).await {
-        warn!("failed to remove the old listener: {e}");
-    }
-
-    svc.add_listener(ListenerConfig {
-        id: LISTENER_ID.into(),
-        profile,
-        restart_policy: RestartPolicy::Always {
-            backoff: RetryConfig::default(),
-        },
-        auto_delete: true,
-        protocols,
-        ..Default::default()
-    })
-    .await
-    .map_err(|e| AppError::Internal(format!("failed to restart the DIDComm listener: {e}")))?;
-
-    info!("DIDComm listener rebuilt on the new identity");
+    rebuild_own_listener(svc, LISTENER_ID, identity, &mediator_did, &state.store).await?;
     Ok(())
 }
 
