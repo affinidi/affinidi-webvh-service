@@ -56,18 +56,20 @@ pub async fn cleanup_empty_dids(
                 .is_some_and(|d| now.saturating_sub(d) > SOFT_DELETE_RETENTION)
     };
 
-    let raw = dids_ks.prefix_iter_raw("did:").await?;
+    // The candidates, from a page of records at a time.
+    let mut candidates = Vec::new();
+    let mut pages = crate::paging::PageWalk::new(dids_ks, "did:", crate::paging::DID_PAGE_ROWS);
+    while let Some(rows) = pages.next_page().await? {
+        candidates.extend(
+            rows.into_iter()
+                .filter_map(|(_, value)| serde_json::from_slice::<DidRecord>(&value).ok())
+                .filter(|r| should_remove(r))
+                .map(|r| r.mnemonic),
+        );
+    }
     let mut removed = Vec::new();
 
-    for (_key, value) in raw {
-        let Ok(snapshot) = serde_json::from_slice::<DidRecord>(&value) else {
-            continue;
-        };
-        if !should_remove(&snapshot) {
-            continue;
-        }
-        let mnemonic = snapshot.mnemonic;
-
+    for mnemonic in candidates {
         let _guard = match locks {
             Some(locks) => Some(locks.guard(&mnemonic).await),
             None => None,

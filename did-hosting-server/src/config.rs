@@ -139,6 +139,28 @@ pub struct LimitsConfig {
     /// Default per-account maximum number of DIDs. Default: 20.
     #[serde(default = "default_max_did_count")]
     pub default_max_did_count: u64,
+    /// The most bytes of DID content the resolution cache holds. Default:
+    /// 256 MiB. Past it, the oldest entries are dropped.
+    #[serde(default = "default_content_cache_bytes")]
+    pub content_cache_bytes: usize,
+    /// Worker threads of the HTTP (resolution) runtime. Default: one per
+    /// available core.
+    #[serde(default)]
+    pub http_worker_threads: Option<usize>,
+}
+
+fn default_content_cache_bytes() -> usize {
+    crate::cache::DEFAULT_CONTENT_CACHE_BYTES
+}
+
+impl LimitsConfig {
+    /// The HTTP runtime's worker threads: `http_worker_threads`, else one
+    /// per available core (at least one).
+    pub fn http_workers(&self) -> usize {
+        self.http_worker_threads
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+    }
 }
 
 fn default_upload_body_limit() -> usize {
@@ -159,6 +181,8 @@ impl Default for LimitsConfig {
             upload_body_limit: default_upload_body_limit(),
             default_max_total_size: default_max_total_size(),
             default_max_did_count: default_max_did_count(),
+            content_cache_bytes: default_content_cache_bytes(),
+            http_worker_threads: None,
         }
     }
 }

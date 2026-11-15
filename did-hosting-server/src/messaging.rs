@@ -857,17 +857,19 @@ async fn apply_sync_entry(
         ));
     }
 
-    // Serialised: `apply_single_update` reads what this slot (and this DID's
-    // identity) currently holds, checks the new log extends it, and only then
-    // writes. Two updates for the same slot running at once could each pass
-    // that check against the same pre-write state and leave a fork applied —
-    // the same race #232 closed for the watcher's `apply_sync`.
-    let _guard = state.sync_lock.lock().await;
+    // Serialised per slot and per DID inside: `apply_single_update` reads
+    // what this slot (and this DID's identity) currently holds, checks the new
+    // log extends it, and only then writes, under `sync_locks`. Two updates
+    // for the same slot running at once could otherwise each pass that check
+    // against the same pre-write state and leave a fork applied — the race
+    // #232 closed for the watcher's `apply_sync`. The chain is verified
+    // before either lock is taken.
     let status = apply_single_update(
         &state.dids_ks,
         &state.store,
         update,
-        &state.did_cache,
+        &state.resolution_caches(),
+        &state.sync_locks,
         state.config.public_url.as_deref(),
     )
     .await
@@ -918,7 +920,10 @@ async fn do_sync_delete(
     // slot's record and then removes it, which the same race as
     // `apply_single_update`'s read-check-write can corrupt if it interleaves
     // with a concurrent update to the same slot.
-    let _guard = state.sync_lock.lock().await;
+    let _guard = state
+        .sync_locks
+        .guard(&crate::control_register::slot_lock_key(mnemonic))
+        .await;
     let record: Option<did_ops::DidRecord> = state
         .dids_ks
         .get(did_ops::did_key(mnemonic))
@@ -944,7 +949,7 @@ async fn do_sync_delete(
             );
         }
         batch.commit().await.map_err(OpError::from)?;
-        state.did_cache.invalidate_did(mnemonic);
+        state.resolution_caches().forget_did(mnemonic);
         info!(did = %control.did, mnemonic = %mnemonic, "deleted DID via sync from control plane");
         "deleted"
     } else {
@@ -1014,6 +1019,7 @@ async fn do_domain_assign(
         record_assignment_cancelling_purge(&state.store, &domain, &control.did, now)
             .await
             .map_err(OpError::from)?;
+    state.resolution_caches().forget_domains();
 
     // A re-assign within the grace window cancels the pending purge. Logged so
     // an operator can answer "did my data survive the unassign / re-assign
@@ -1083,6 +1089,7 @@ async fn do_domain_unassign(
     )
     .await
     .map_err(OpError::from)?;
+    state.resolution_caches().forget_domains();
 
     let purge_at = match outcome {
         UnassignOutcome::Removed(_) => {
@@ -1152,6 +1159,8 @@ async fn do_domain_purge(
     let report = purge_domain_dids(&state.store, &domain, "admin-immediate")
         .await
         .map_err(OpError::from)?;
+    // Whatever was deleted, even if some slots failed.
+    state.resolution_caches().clear();
     // Uncount what was deleted even if some slots failed and the op is retried.
     if let Some(collector) = state.stats_collector.as_ref() {
         collector.subtract_total_dids(report.deleted);
@@ -1162,8 +1171,6 @@ async fn do_domain_purge(
             report.failed
         )));
     }
-    state.did_cache.clear();
-
     // The immediate purge supersedes any scheduled one.
     pending_purge::cancel(&state.store, &domain)
         .await
@@ -1232,6 +1239,7 @@ async fn do_domain_upsert(
     let (existed, _) = apply_replicated_domain(&state.store, &entry, &control.did)
         .await
         .map_err(OpError::from)?;
+    state.resolution_caches().forget_domains();
 
     info!(
         did = %control.did,

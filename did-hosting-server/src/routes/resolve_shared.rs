@@ -13,10 +13,13 @@ use std::sync::Arc;
 
 use axum::extract::ConnectInfo;
 use axum::http::request::Parts;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use did_hosting_common::server::domain::{
     HostHeaders, assert_resolution_allowed, resolve_request_host,
 };
 
+use crate::cache::{CachedContent, if_none_match_hits};
 use crate::did_ops::{self, DidRecord};
 use crate::error::AppError;
 use crate::server::AppState;
@@ -94,4 +97,94 @@ pub(super) fn extract_request_host(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip());
     resolve_request_host(&h, peer_ip, trusted_cidrs).map(|s| s.to_string())
+}
+
+/// One resolve request, read once: its host and `If-None-Match`, and the
+/// record of the slot it names, fetched at most once however many method
+/// dispatchers look at it (`did.json` is tried as did:webs, then did:web).
+pub struct Lookup<'a> {
+    pub(super) state: &'a AppState,
+    host: Option<String>,
+    if_none_match: Option<String>,
+    record: tokio::sync::OnceCell<(String, Option<Arc<DidRecord>>)>,
+}
+
+impl<'a> Lookup<'a> {
+    pub fn new(state: &'a AppState, parts: &Parts) -> Self {
+        Self {
+            state,
+            host: extract_request_host(parts, &state.trusted_proxy_cidrs),
+            if_none_match: parts
+                .headers
+                .get(header::IF_NONE_MATCH)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            record: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    pub(super) fn host(&self) -> Option<&str> {
+        self.host.as_deref()
+    }
+
+    /// `mnemonic`'s gate record ([`gate_record`]), read once per request.
+    pub(super) async fn record(&self, mnemonic: &str) -> Result<Option<Arc<DidRecord>>, AppError> {
+        if let Some((held, record)) = self.record.get() {
+            if held == mnemonic {
+                return Ok(record.clone());
+            }
+            return gate_record(self.state, mnemonic).await;
+        }
+        let (held, record) = self
+            .record
+            .get_or_try_init(|| async {
+                Ok::<_, AppError>((
+                    mnemonic.to_string(),
+                    gate_record(self.state, mnemonic).await?,
+                ))
+            })
+            .await?;
+        if held == mnemonic {
+            Ok(record.clone())
+        } else {
+            gate_record(self.state, mnemonic).await
+        }
+    }
+}
+
+/// The response for resolved content: `304 Not Modified` when the request's
+/// `If-None-Match` names its tag, else the bytes. Both carry the strong
+/// `ETag` and the `[server.resolve_cache]` `Cache-Control` — explicit, so the
+/// global `no-store` middleware leaves it, letting CDNs and browsers
+/// revalidate hot DIDs instead of refetching them.
+pub(super) fn content_response(
+    lookup: &Lookup<'_>,
+    content_type: &str,
+    content: &CachedContent,
+) -> Response {
+    let cache_control = lookup.state.config.server.resolve_cache.header_value();
+    let not_modified = lookup
+        .if_none_match
+        .as_deref()
+        .is_some_and(|h| if_none_match_hits(h, &content.etag));
+    if not_modified {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, content.etag.to_string()),
+                (header::CACHE_CONTROL, cache_control),
+            ],
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type.to_string()),
+            (header::ETAG, content.etag.to_string()),
+            (header::CACHE_CONTROL, cache_control),
+        ],
+        content.bytes.clone(),
+    )
+        .into_response()
 }
