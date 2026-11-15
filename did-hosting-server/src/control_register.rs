@@ -381,15 +381,11 @@ async fn verify_update(
             &update.log_content,
             update.witness_content.as_deref(),
         )
-        .map_err(AppError::Validation)?,
+        .map_err(AppError::invalid)?,
+        // Verified below, with the document it derives.
         #[cfg(feature = "method-webs")]
-        _ => {}
-        #[cfg(not(feature = "method-webs"))]
-        _ => {
-            return Err(AppError::Validation(format!(
-                "this server cannot verify {synced_method} logs"
-            )));
-        }
+        "webs" => {}
+        other => return Err(cannot_verify(other)),
     }
 
     #[cfg(feature = "method-webs")]
@@ -399,7 +395,7 @@ async fn verify_update(
             update.log_content.as_bytes(),
             None,
         )
-        .map_err(|e| AppError::Validation(e.to_string()))?;
+        .map_err(|e| AppError::invalid(e.to_string()))?;
         Some(
             serde_json::from_slice::<serde_json::Value>(&derived)
                 .map_err(|e| AppError::Internal(e.to_string()))?,
@@ -440,7 +436,7 @@ pub(crate) async fn verify_history(
     log_content: &str,
     method: &str,
 ) -> Result<String, crate::error::AppError> {
-    use crate::error::AppError;
+    use crate::error::{AppError, ValidationKind};
 
     let held = dids_ks
         .get_raw(content_log_key(mnemonic))
@@ -455,17 +451,20 @@ pub(crate) async fn verify_history(
         .chain(slot_mark.as_ref().map(|m| m.method.as_str()))
     {
         if held_method != method {
-            return Err(AppError::Validation(format!(
-                "slot {mnemonic} holds a {held_method} DID; refusing to replace it with a {method} log"
-            )));
+            return Err(AppError::validation(
+                ValidationKind::HistoryRewrite,
+                format!(
+                    "slot {mnemonic} holds a {held_method} DID; refusing to replace it with a {method} log"
+                ),
+            ));
         }
     }
 
     let identity = match method {
-        "webvh" => webvh_scid(did_id).ok_or_else(|| {
-            AppError::Validation(format!("{did_id} is not a did:webvh identifier"))
-        })?,
-        _ => did_id.to_string(),
+        "webvh" => webvh_scid(did_id)
+            .ok_or_else(|| AppError::invalid(format!("{did_id} is not a did:webvh identifier")))?,
+        "webs" => did_id.to_string(),
+        other => return Err(cannot_verify(other)),
     };
 
     // Every history of this same DID the edge has served.
@@ -496,24 +495,42 @@ pub(crate) fn verify_extends(
     previous: &str,
     next: &str,
 ) -> Result<(), crate::error::AppError> {
-    use crate::error::AppError;
+    use crate::error::{AppError, ValidationKind};
+    use did_hosting_common::did_ops::LogExtendError;
+    #[cfg(feature = "method-webs")]
+    use did_hosting_common::method::MethodError;
     match method {
-        "webvh" => did_hosting_common::did_ops::verify_log_extends(Some(previous), next)
-            .map_err(AppError::Validation),
+        "webvh" => {
+            did_hosting_common::did_ops::verify_log_extends(Some(previous), next).map_err(|e| {
+                let kind = match e {
+                    LogExtendError::Deactivated => ValidationKind::Deactivated,
+                    LogExtendError::HistoryRewrite { .. } => ValidationKind::HistoryRewrite,
+                };
+                AppError::validation(kind, e.to_string())
+            })
+        }
         #[cfg(feature = "method-webs")]
         "webs" => did_hosting_common::method::webs::Webs::verify_continuation(
             did_id,
             previous.as_bytes(),
             next.as_bytes(),
         )
-        .map_err(|e| AppError::Validation(e.to_string())),
-        _ => {
+        .map_err(|e| match e {
+            MethodError::HistoryRewrite(_) => {
+                AppError::validation(ValidationKind::HistoryRewrite, e.to_string())
+            }
+            e => AppError::invalid(e.to_string()),
+        }),
+        other => {
             let _ = did_id;
-            Err(AppError::Validation(format!(
-                "this server cannot verify {method} logs"
-            )))
+            Err(cannot_verify(other))
         }
     }
+}
+
+/// The refusal for a log of a method this edge does not host from a sync.
+fn cannot_verify(method: &str) -> crate::error::AppError {
+    crate::error::AppError::invalid(format!("this server cannot verify {method} logs"))
 }
 
 /// For a restore: what to do with a high-water log `incoming` for `identity`
@@ -547,7 +564,7 @@ pub(crate) async fn high_water_to_restore(
         return Ok(true);
     }
     verify_extends(method, identity, incoming, &held).map_err(|_| {
-        crate::error::AppError::Validation(format!(
+        crate::error::AppError::invalid(format!(
             "the backup's history for {identity} diverges from the one this store has served"
         ))
     })?;
@@ -609,7 +626,7 @@ async fn verify_binding(
         match did_hosting_common::did_ops::extract_did_id(&update.log_content) {
             Some(id) if id == update.did_id => {}
             other => {
-                return Err(AppError::Validation(format!(
+                return Err(AppError::invalid(format!(
                     "sync update names {} but its log establishes {}",
                     update.did_id,
                     other.as_deref().unwrap_or("no DID")
@@ -626,8 +643,8 @@ async fn verify_binding(
         bases.push(format!("https://{}", entry.domain));
     }
     if bases.is_empty() {
-        return Err(AppError::Validation(
-            "this server has no public URL or assigned domain to bind synced DIDs to".into(),
+        return Err(AppError::invalid(
+            "this server has no public URL or assigned domain to bind synced DIDs to",
         ));
     }
 
@@ -642,7 +659,7 @@ async fn verify_binding(
         }),
         // did:webs:{host}:{path…}:{aid} — the slot is the path including the
         // AID, so the identifier must end in exactly that.
-        _ => {
+        "webs" => {
             let host = extract_did_host(&update.did_id).unwrap_or_default();
             let suffix = format!(":{}", update.mnemonic.replace('/', ":"));
             update.did_id.ends_with(&suffix)
@@ -656,9 +673,10 @@ async fn verify_binding(
                     })
                 })
         }
+        other => return Err(cannot_verify(other)),
     };
     if !bound {
-        return Err(AppError::Validation(format!(
+        return Err(AppError::invalid(format!(
             "{} does not resolve at slot {} on a host this server serves",
             update.did_id, update.mnemonic
         )));
@@ -693,8 +711,21 @@ pub async fn apply_single_update(
     // method that actually verified the content: `resolve_webs` will only
     // answer for a record tagged `webs`, so a did:webs log landing here as
     // `webvh` would be stored and then served by nobody.
+    // Only a method whose history this edge checks is accepted: a `did:web`
+    // document (or anything not recognisably a DID log) is refused rather
+    // than stored unchecked under a tag no resolver here serves.
     let synced_method =
-        did_hosting_common::method::detect_method(update.log_content.as_bytes()).unwrap_or("webvh");
+        match did_hosting_common::method::detect_method(update.log_content.as_bytes()) {
+            Some("webvh") => "webvh",
+            #[cfg(feature = "method-webs")]
+            Some("webs") => "webs",
+            Some(other) => return Err(cannot_verify(other)),
+            None => {
+                return Err(crate::error::AppError::invalid(
+                    "the synced log is not a DID log of any method this server hosts",
+                ));
+            }
+        };
 
     // The edge verifies what it is asked to serve itself, rather than trusting
     // the control plane to have done so: a compromised or buggy control plane

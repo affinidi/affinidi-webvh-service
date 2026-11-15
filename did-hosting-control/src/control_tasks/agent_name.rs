@@ -14,8 +14,9 @@ use crate::server_push;
 fn did_log(did_data: &serde_json::Value) -> Result<String, TaskError> {
     match did_data {
         serde_json::Value::String(s) => Ok(s.clone()),
-        _ => Err(AppError::Validation(
-            "[log] didData must be the slot's signed did.jsonl, as a string".into(),
+        _ => Err(AppError::validation(
+            did_hosting_common::server::error::ValidationKind::InvalidLog,
+            "didData must be the slot's signed did.jsonl, as a string",
         )
         .into()),
     }
@@ -36,7 +37,7 @@ pub(crate) async fn update(
         // `#[non_exhaustive]`: a state a later schema adds is not one this
         // host knows how to apply.
         _ => {
-            return Err(AppError::Validation("unsupported agent-name state".into()).into());
+            return Err(AppError::invalid("unsupported agent-name state").into());
         }
     };
     let record = did_ops::update_agent_name(
@@ -130,7 +131,7 @@ pub(crate) async fn check(
     let result = did_ops::check_agent_name(state, &domain, &p.name)
         .await
         .map_err(|e| match e {
-            AppError::Validation(message) => {
+            AppError::Validation { message, .. } => {
                 TaskError::Declared(check::v0_1::error_codes::INVALID_NAME, message)
             }
             other => other.into(),

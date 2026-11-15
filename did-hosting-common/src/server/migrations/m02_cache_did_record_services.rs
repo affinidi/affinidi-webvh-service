@@ -29,7 +29,7 @@
 //! Records with no log content (an empty slot from `create_did`, i.e.
 //! `version_count == 0`) are left at `None` and counted as `skipped_no_log`.
 //! That is the correct terminal state for them: there is no document, and
-//! `publish_did` will fill the cache on first upload.
+//! `register_did_atomic` will fill the cache on first upload.
 //!
 //! ## Who runs it
 //!
@@ -45,7 +45,7 @@
 //!   unattended because it writes nothing but `services`, a field read only
 //!   by the UI.
 //!
-//! `publish_did` additionally self-heals a `None` it encounters, so a record
+//! Every publish additionally self-heals a `None` it encounters, so a record
 //! this sweep deferred (unparseable log) still converges on its next publish.
 //! A run that deferred records reports [`MigrationOutcome::Deferred`], so the
 //! migration stays pending and the next runner invocation retries them.
@@ -77,7 +77,7 @@ pub struct M02Counters {
     /// Records that already carried `Some(_)`. Skipped.
     pub already_cached: u64,
     /// Records with no log content — empty slots awaiting a first publish.
-    /// Left at `None`; `publish_did` fills them.
+    /// Left at `None`; `register_did_atomic` fills them.
     pub skipped_no_log: u64,
     /// Records whose log content was present but unparseable as JSONL with
     /// a `state`. Left at `None` and counted for follow-up; the migration
@@ -292,7 +292,7 @@ mod tests {
         assert_eq!(load(&store, "b").await.services, Some(vec![]));
     }
 
-    /// An empty slot (no log content) stays `None` for `publish_did` to fill.
+    /// An empty slot (no log content) stays `None` for `register_did_atomic` to fill.
     #[tokio::test]
     async fn record_without_log_is_left_none() {
         let store = fjall_store().await;

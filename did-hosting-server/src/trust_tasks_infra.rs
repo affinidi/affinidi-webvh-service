@@ -17,7 +17,7 @@
 //! `DIDCommResponse` for the envelope). So a ping delivered over TSP is ponged
 //! over TSP without either side re-resolving anything.
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use did_hosting_common::didcomm_types::{MSG_HEALTH_PING, MSG_SERVER_REGISTER_ACK, MSG_STATS_ACK};
@@ -107,11 +107,12 @@ pub(crate) async fn do_health_ping(state: &AppState) -> Value {
         .map(|v| v.len() as u64)
         .unwrap_or(0);
 
-    json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION"),
-        "did_count": did_count,
+    serde_json::to_value(did_hosting_common::HealthPong {
+        status: "ok".into(),
+        version: Some(env!("CARGO_PKG_VERSION").into()),
+        did_count: Some(did_count),
     })
+    .expect("a health pong serialises")
 }
 
 /// Transport-agnostic core of the registration ack — informational only.

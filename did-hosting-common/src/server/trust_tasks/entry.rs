@@ -433,10 +433,17 @@ impl SpecAclEntry {
             DomainScope::All
         };
 
+        // The same shape every other ACL write surface enforces
+        // (`acl::validate_did_format`): trimmed, bounded by `MAX_DID_LEN` (the
+        // bound `check_acl` authorises under, so an entry granted here can
+        // authorise everywhere), no control characters. It returns the
+        // identity: a did:scid subject without the `src` locator a request may
+        // carry (VTI-KEY-160).
+        let did = crate::server::acl::validate_did_format(&self.subject)
+            .map_err(|e| EntryRefusal::Malformed(format!("subject: {}", e.user_message())))?;
+
         Ok(LocalAclEntry {
-            // Recorded under the identity: a did:scid subject without the
-            // `src` locator a request may carry (VTI-KEY-160).
-            did: crate::scid::identity(&self.subject),
+            did,
             role,
             label: self.label,
             created_at,
@@ -602,6 +609,27 @@ mod tests {
         v["role"] = json!("owner");
         let local = parse(v).into_local(0, false).unwrap();
         assert_eq!(local.domains, DomainScope::Allowed { domains: vec![] });
+    }
+
+    /// The subject is held to the same shape every other ACL write surface
+    /// enforces: bounded by the length `check_acl` authorises under, free of
+    /// control characters, and trimmed.
+    #[test]
+    fn the_subject_is_validated_as_every_acl_write_is() {
+        let with_subject = |subject: &str| {
+            let mut v = admin(json!({ "scope": "all" }));
+            v["subject"] = json!(subject);
+            parse(v).into_local(0, false)
+        };
+        let too_long = format!("did:web:{}", "a".repeat(crate::server::acl::MAX_DID_LEN));
+        for bad in [too_long.as_str(), "did:web:a\nb", "   "] {
+            assert!(
+                matches!(with_subject(bad), Err(EntryRefusal::Malformed(_))),
+                "{bad:?} must be refused"
+            );
+        }
+        let local = with_subject("  did:example:padded ").unwrap();
+        assert_eq!(local.did, "did:example:padded");
     }
 
     #[test]

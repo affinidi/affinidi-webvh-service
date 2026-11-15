@@ -67,18 +67,10 @@ async fn filtered_request_logging(
     meta: affinidi_messaging_didcomm::UnpackMetadata,
     next: Next,
 ) -> MiddlewareResult {
-    const QUIET: &[&str] = &[
-        MSG_HEALTH_PING,
-        MSG_HEALTH_PONG,
-        MSG_STATS_SYNC,
-        MSG_STATS_ACK,
-        MESSAGE_PICKUP_STATUS_TYPE,
-    ];
-
-    let msg_type = message.typ.clone();
+    let msg_type = logged_type(&message);
     let result = next.run(ctx, message, meta).await;
 
-    if !QUIET.iter().any(|t| msg_type == *t) {
+    if !is_quiet(&msg_type) {
         let status = match &result {
             Ok(Some(_)) => "ok(response)",
             Ok(None) => "ok(empty)",
@@ -88,6 +80,34 @@ async fn filtered_request_logging(
     }
 
     result
+}
+
+/// Message types the request log leaves out: the periodic health and stats
+/// exchanges, one or more per edge per minute.
+const QUIET_TYPES: &[&str] = &[
+    MSG_HEALTH_PING,
+    MSG_HEALTH_PONG,
+    MSG_STATS_SYNC,
+    MSG_STATS_ACK,
+    MESSAGE_PICKUP_STATUS_TYPE,
+];
+
+/// Whether `msg_type` (as [`logged_type`] reports it) is left out of the
+/// request log.
+fn is_quiet(msg_type: &str) -> bool {
+    QUIET_TYPES.contains(&msg_type)
+}
+
+/// The type a message is logged under: for a trust-task envelope, which
+/// every task now arrives in, the type of the document inside it; otherwise
+/// the message's own.
+fn logged_type(message: &Message) -> String {
+    if message.typ == trust_tasks_didcomm::ENVELOPE_TYPE
+        && let Some(inner) = message.body.get("type").and_then(Value::as_str)
+    {
+        return inner.to_string();
+    }
+    message.typ.clone()
 }
 // ---------------------------------------------------------------------------
 // DID operation dispatch
@@ -190,7 +210,9 @@ pub(crate) async fn do_stats_sync(
     state: &AppState,
     signer: &str,
     body: &Value,
-) -> Result<Value, InfraRejection> {
+) -> Result<did_hosting_common::StatsSyncAck, InfraRejection> {
+    use did_hosting_common::{StatsSyncAck, StatsSyncRequest, StatsSyncStatus};
+
     // Require Service role — matches REST `/api/control/stats` which is gated
     // on ServiceAuth. An Owner-role DID must not be able to write per-DID
     // stats deltas: doing so would let any tenant tamper with another
@@ -201,20 +223,14 @@ pub(crate) async fn do_stats_sync(
     })?;
     if !service {
         warn!(did = signer, "stats sync rejected: Service role required");
-        return Err(InfraRejection::new(
-            "e.p.stats.unauthorized",
-            "service role required",
-        ));
+        return Err(InfraRejection::not_authorised("service role required"));
     }
 
     // The body is typed and closed (R3.2): a member this service does not
     // read is refused rather than silently dropped.
-    let body: StatsSyncBody = serde_json::from_value(body.clone()).map_err(|e| {
+    let body: StatsSyncRequest = serde_json::from_value(body.clone()).map_err(|e| {
         warn!(did = signer, error = %e, "stats sync rejected: malformed payload");
-        InfraRejection::new(
-            "e.p.stats.malformed",
-            "not a stats-sync payload this service reads",
-        )
+        InfraRejection::malformed("not a stats-sync payload this service reads")
     })?;
 
     // Bind the payload to the transport-proven signer, as the REST handler
@@ -226,10 +242,10 @@ pub(crate) async fn do_stats_sync(
             did = signer,
             server_did, "stats sync rejected: server_did does not match signer"
         );
-        return Err(InfraRejection::new(
-            "e.p.stats.sender_mismatch",
-            "server_did does not match signer",
-        ));
+        return Err(InfraRejection::SenderMismatch {
+            claimed: server_did.to_string(),
+            signer: signer.to_string(),
+        });
     }
 
     let seq = body.seq;
@@ -237,7 +253,10 @@ pub(crate) async fn do_stats_sync(
     // Idempotency check
     if !accept_seq(server_did, seq) {
         debug!(server_did, seq, "stats sync: stale sequence");
-        return Ok(json!({ "status": "skipped", "reason": "stale_seq" }));
+        return Ok(StatsSyncAck {
+            status: StatsSyncStatus::Skipped,
+            reason: Some("stale_seq".into()),
+        });
     }
 
     let deltas = body.did_deltas.as_slice();
@@ -247,10 +266,10 @@ pub(crate) async fn do_stats_sync(
             count = deltas.len(),
             "stats sync rejected: too many deltas"
         );
-        return Err(InfraRejection::new(
-            "e.p.stats.too-large",
-            "too many deltas in one sync",
-        ));
+        return Err(InfraRejection::TooLarge {
+            message: "too many deltas in one sync".into(),
+            limit: did_hosting_common::server::stats_collector::MAX_STATS_SYNC_DELTAS,
+        });
     }
     let mut invalid = 0usize;
     let mut invalid_sample: Vec<String> = Vec::new();
@@ -311,35 +330,10 @@ pub(crate) async fn do_stats_sync(
         "stats sync accepted"
     );
 
-    Ok(json!({ "status": "accepted" }))
-}
-
-/// The `server/stats-sync` body an edge sends (`did-hosting-server`'s
-/// `stats::sync`), closed.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StatsSyncBody {
-    #[serde(default)]
-    server_did: Option<String>,
-    #[serde(default)]
-    seq: u64,
-    #[serde(default)]
-    did_deltas: Vec<StatsSyncDelta>,
-}
-
-/// One DID's counts in a [`StatsSyncBody`].
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StatsSyncDelta {
-    mnemonic: String,
-    #[serde(default)]
-    resolve_delta: u64,
-    #[serde(default)]
-    update_delta: u64,
-    #[serde(default)]
-    last_resolved_at: Option<u64>,
-    #[serde(default)]
-    last_updated_at: Option<u64>,
+    Ok(StatsSyncAck {
+        status: StatsSyncStatus::Accepted,
+        reason: None,
+    })
 }
 
 /// The largest resolve or update count one delta may carry: far above what
@@ -403,16 +397,17 @@ pub(crate) async fn do_health_pong(state: &AppState, signer: &str, body: &Value)
         }
     }
 
-    let status = body
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let version = body
-        .get("version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-
-    debug!(signer, status, version, "health pong received from server");
+    // Typed and closed (R3.2): a pong this service does not read in full
+    // marks nothing active.
+    let pong: did_hosting_common::HealthPong = match serde_json::from_value(body.clone()) {
+        Ok(pong) => pong,
+        Err(e) => {
+            warn!(did = signer, error = %e, "health pong ignored: not a pong this service reads");
+            return;
+        }
+    };
+    let version = pong.version.as_deref().unwrap_or("unknown");
+    debug!(signer, status = %pong.status, version, "health pong received from server");
 
     // Find the instance the signer registered and mark it active. Another
     // DID whose registry id collides with it is not that instance.
@@ -594,33 +589,89 @@ pub(crate) async fn do_domain_ack(state: &AppState, signer: &str, type_uri: &str
 // Server registration handler
 // ---------------------------------------------------------------------------
 
-/// A rejection an infrastructure core (registration, stats sync) can report;
-/// the trust-task route turns it into a framework `ErrorResponse`.
-pub(crate) struct InfraRejection {
-    pub code: &'static str,
-    pub comment: String,
-    /// The refusal to send, when it is not a permission or shape problem
-    /// (a failed lookup): see [`InfraRejection::lookup_failed`].
-    pub reason: Option<Box<trust_tasks_rs::RejectReason>>,
+/// Why an infrastructure core (registration, stats sync) refused a document.
+/// Each kind reaches the edge as its own standard code, so it can tell "not
+/// authorised" from "malformed" from "too large" without reading prose.
+#[derive(Debug)]
+pub(crate) enum InfraRejection {
+    /// The signer may not do this: it is not in the ACL, or not a Service
+    /// (`permissionDenied`).
+    NotAuthorised(String),
+    /// The payload is not one this service reads (`malformedRequest`).
+    Malformed(String),
+    /// The payload names a server other than the one that signed it
+    /// (`identityMismatch`).
+    SenderMismatch { claimed: String, signer: String },
+    /// The payload is over what one document may carry (`taskFailed`, with
+    /// `details.limit`).
+    TooLarge { message: String, limit: usize },
+    /// What the payload asks for is held by someone else (`taskFailed`).
+    Conflict(String),
+    /// Not about the document at all: a failure of this service, reported as
+    /// `unavailable` (retry) or `internalError`.
+    Failed(Box<trust_tasks_rs::RejectReason>),
 }
 
 impl InfraRejection {
-    fn new(code: &'static str, comment: impl Into<String>) -> Self {
-        Self {
-            code,
-            comment: comment.into(),
-            reason: None,
-        }
+    fn not_authorised(message: impl Into<String>) -> Self {
+        Self::NotAuthorised(message.into())
+    }
+
+    fn malformed(message: impl Into<String>) -> Self {
+        Self::Malformed(message.into())
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self::Conflict(message.into())
     }
 
     /// The sender's role could not be read (a throttled store, say). That is
     /// no answer about the sender, so it is not refused as unauthorised: it
     /// is told to retry, or that the failure was ours.
     fn lookup_failed(e: &crate::error::AppError) -> Self {
-        Self {
-            code: "e.p.lookup.failed",
-            comment: "the sender's role could not be read".into(),
-            reason: Some(Box::new(e.failure_reject_reason())),
+        Self::Failed(Box::new(e.failure_reject_reason()))
+    }
+
+    /// The refusal that goes on the wire.
+    pub(crate) fn reject_reason(&self) -> trust_tasks_rs::RejectReason {
+        use trust_tasks_rs::RejectReason;
+        match self {
+            Self::NotAuthorised(reason) => RejectReason::PermissionDenied {
+                reason: reason.clone(),
+            },
+            Self::Malformed(reason) => RejectReason::MalformedRequest {
+                reason: reason.clone(),
+            },
+            Self::SenderMismatch { claimed, signer } => {
+                RejectReason::IdentityMismatch(trust_tasks_rs::ConsistencyError::IssuerMismatch {
+                    in_band: claimed.clone(),
+                    transport: signer.clone(),
+                })
+            }
+            Self::TooLarge { message, limit } => RejectReason::TaskFailed {
+                reason: message.clone(),
+                details: Some(json!({ "limit": limit })),
+            },
+            Self::Conflict(reason) => RejectReason::TaskFailed {
+                reason: reason.clone(),
+                details: None,
+            },
+            Self::Failed(reason) => (**reason).clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for InfraRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAuthorised(m) => write!(f, "not authorised: {m}"),
+            Self::Malformed(m) => write!(f, "malformed: {m}"),
+            Self::SenderMismatch { claimed, signer } => {
+                write!(f, "payload names {claimed} but {signer} signed it")
+            }
+            Self::TooLarge { message, .. } => write!(f, "too large: {message}"),
+            Self::Conflict(m) => write!(f, "conflict: {m}"),
+            Self::Failed(reason) => write!(f, "failed: {reason}"),
         }
     }
 }
@@ -651,7 +702,10 @@ pub(crate) async fn do_server_register(
     state: &AppState,
     signer: &str,
     body: &Value,
-) -> Result<Value, InfraRejection> {
+) -> Result<
+    did_hosting_common::tasks::did_management::server::register::v0_2::Response,
+    InfraRejection,
+> {
     use crate::acl::check_acl;
     use crate::registry::{self, ServiceInstance, ServiceStatus, ServiceType};
 
@@ -670,8 +724,7 @@ pub(crate) async fn do_server_register(
                 role = %other,
                 "server registration rejected: Service role required"
             );
-            return Err(InfraRejection::new(
-                "e.p.registration.unauthorized",
+            return Err(InfraRejection::not_authorised(
                 "service role required to register as a server",
             ));
         }
@@ -684,8 +737,7 @@ pub(crate) async fn do_server_register(
                 did = signer,
                 "server registration rejected: DID not in ACL (requires pre-approval)"
             );
-            return Err(InfraRejection::new(
-                "e.p.registration.unauthorized",
+            return Err(InfraRejection::not_authorised(
                 "server DID must be pre-approved in the ACL before registering",
             ));
         }
@@ -694,10 +746,7 @@ pub(crate) async fn do_server_register(
     let payload: did_hosting_common::tasks::did_management::server::register::v0_2::Payload =
         serde_json::from_value(body.clone()).map_err(|e| {
             warn!(did = signer, error = %e, "server registration rejected: malformed payload");
-            InfraRejection::new(
-                "e.p.registration.malformed",
-                format!("not a server/register/0.2 payload: {e}"),
-            )
+            InfraRejection::malformed(format!("not a server/register/0.2 payload: {e}"))
         })?;
     // Use the signer DID as a stable instance ID (one registration per DID).
     let instance_id = registry::instance_id_for(signer);
@@ -706,10 +755,9 @@ pub(crate) async fn do_server_register(
             did = signer,
             "server registration rejected: did/instanceId do not name the signer"
         );
-        return Err(InfraRejection::new(
-            "e.p.registration.malformed",
-            format!("`did` must be the signer and `instanceId` must be `{instance_id}`"),
-        ));
+        return Err(InfraRejection::malformed(format!(
+            "`did` must be the signer and `instanceId` must be `{instance_id}`"
+        )));
     }
     // The registry id is not one-to-one with DIDs (`instance_id_for`): a
     // record under this id that another DID registered stays that DID's.
@@ -727,8 +775,7 @@ pub(crate) async fn do_server_register(
             did = signer,
             holder, instance_id, "server registration rejected: instance id held by another DID"
         );
-        return Err(InfraRejection::new(
-            "e.p.registration.conflict",
+        return Err(InfraRejection::conflict(
             "another server's registration holds this instance id",
         ));
     }
@@ -760,10 +807,7 @@ pub(crate) async fn do_server_register(
             requested = public_url,
             "server registration rejected: URL host not in registry.url_allowlist",
         );
-        return Err(InfraRejection::new(
-            "e.p.registration.unauthorized",
-            e.user_message(),
-        ));
+        return Err(InfraRejection::not_authorised(e.user_message()));
     }
 
     let label = payload.label.as_ref().map(|l| l.to_string());
@@ -897,14 +941,7 @@ pub(crate) async fn do_server_register(
         warn!(did = signer, error = %e, "server registration failed");
         // The store's own text stays in the log: it describes this service,
         // not the request.
-        return Err(InfraRejection {
-            code: "e.p.registration.internal-error",
-            comment: "the registration could not be stored".into(),
-            reason: e
-                .retry_after_secs()
-                .is_some()
-                .then(|| Box::new(e.failure_reject_reason())),
-        });
+        return Err(InfraRejection::Failed(Box::new(e.failure_reject_reason())));
     }
 
     info!(
@@ -942,11 +979,14 @@ pub(crate) async fn do_server_register(
     server_push::sync_all_dids_to_server(state, signer.to_string(), reported);
     server_push::sync_all_domains_to_server(state, signer.to_string());
 
-    Ok(json!({
-        "instanceId": instance_id,
-        "accepted": true,
-        "lastSeenAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-    }))
+    Ok(
+        did_hosting_common::tasks::did_management::server::register::v0_2::Response::builder()
+            .accepted(true)
+            .instance_id(instance_id)
+            .last_seen_at(chrono::SubsecRound::trunc_subsecs(chrono::Utc::now(), 0))
+            .try_into()
+            .expect("a register ack is well formed"),
+    )
 }
 
 /// Answer a message this router has no arm for with a problem-report, so the
@@ -964,6 +1004,13 @@ pub(crate) async fn do_server_register(
 /// Threading to `message.id` is load-bearing: callers demux replies by thread
 /// id, so an unthreaded problem-report is discarded and the caller waits out its
 /// timeout anyway — the bug would look unfixed.
+///
+/// The reply is the standard DIDComm `report-problem/2.0` message: the
+/// message it answers is a bare DIDComm message, not a Trust Task document,
+/// so neither a `trust-task-error` nor a Trust Task URI (this used to send
+/// `did-management/did/problem-report/0.1`, which no specification pins and
+/// no peer reads) is its answer. A VTA reads it as a problem report
+/// (`vta_sdk::didcomm_session`).
 ///
 /// Loop-safe: an inbound problem-report returns above, before we would reply,
 /// and `is_problem_report` matches the type we emit — so a peer that cannot
@@ -995,7 +1042,7 @@ async fn handle_fallback(
 /// the call site, where `message.id` lives.
 fn run_unsupported_task(msg_type: &str) -> (String, Value) {
     (
-        MSG_PROBLEM_REPORT.to_string(),
+        affinidi_messaging_didcomm_service::transport::PROBLEM_REPORT_TYPE.to_string(),
         json!({
             "code": "e.p.msg.unsupported-task",
             // The type is the whole diagnostic: a retired task, a typo, and a
@@ -1044,7 +1091,7 @@ async fn handle_trust_tasks_envelope(
     Extension(state): Extension<AppState>,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
     let sender = require_sender(&ctx)?;
-    info!(sender = sender, "inbound DIDComm: trust-tasks envelope");
+    debug!(sender = sender, "inbound DIDComm: trust-tasks envelope");
     match run_trust_tasks_envelope(&state, sender, &message).await? {
         Some((response_type, response_body)) => Ok(Some(
             DIDCommResponse::new(response_type, response_body).thid(message.id.clone()),
@@ -1057,10 +1104,12 @@ async fn handle_trust_tasks_envelope(
 /// an inbound trust-tasks envelope. Extracted from
 /// `handle_trust_tasks_envelope` so the dispatch + body-parse +
 /// repack logic is testable without an `ATM`-backed
-/// [`HandlerContext`]. Returns `None`
-/// for the SPEC.md §8.1 routing exception (identity-mismatch with no
-/// transport sender), which is unreachable on the dispatcher's
-/// `require_sender_did(true)` gate.
+/// [`HandlerContext`]. Returns `None` for a document that was itself an
+/// answer (a pong, an acknowledgement, a peer's error: [`RoutedReply::Terminal`],
+/// the normal end of an exchange), and for the SPEC.md §8.1 routing exception
+/// (identity-mismatch with no transport sender) — unreachable on the
+/// dispatcher's `require_sender_did(true)` gate, so only that one is logged as
+/// an invariant break.
 pub(crate) async fn run_trust_tasks_envelope(
     state: &AppState,
     sender: &str,
@@ -1136,7 +1185,7 @@ pub(crate) async fn run_trust_tasks_envelope(
     // `did-hosting/*/1.0` protocol, auth, infra, ACL + discovery, and the
     // legacy `MSG_*` bridge.
     let verifier = require_verifier(state)?;
-    match dispatch_trust_task_doc(
+    let reply = dispatch_trust_task_doc(
         state,
         sender,
         None,
@@ -1146,9 +1195,13 @@ pub(crate) async fn run_trust_tasks_envelope(
         verifier,
         large_doc_charge,
     )
-    .await?
-    .into_document()
-    {
+    .await?;
+    // A pong, an acknowledgement or a peer's error is answered by nothing:
+    // the exchange is over, and that is not worth a log line.
+    if reply.is_terminal() {
+        return Ok(None);
+    }
+    match reply.into_document() {
         Some(body) => Ok(Some((trust_tasks_didcomm::ENVELOPE_TYPE.to_string(), body))),
         None => {
             // SPEC §8.1 routing exception: identity-mismatch with no
@@ -1238,9 +1291,10 @@ pub(crate) enum RoutedReply {
     /// map, and the problem-report shape carries any error, so HTTPS answers
     /// `200` exactly as the other two transports answer with the document.
     Document(Value),
-    /// Nothing goes on the wire (SPEC §8.1: identity mismatch with no
-    /// transport-authenticated sender).
-    Suppressed,
+    /// Nothing goes on the wire because the document was itself an answer:
+    /// a health pong, a sync or domain acknowledgement, a peer's
+    /// `trust-task-error`. The normal end of an exchange, not a failure.
+    Terminal,
     /// A reply a bound-key row (`ProofRule::BoundKey`) produced whole: a
     /// success its task signed under its own specification's rule (wallet
     /// sign-in's step 1 and step 2 for `assertionMethod`, and a step 2 whose
@@ -1268,8 +1322,14 @@ impl RoutedReply {
                         .as_str()
                         .is_some_and(|t| t.contains("/trust-task-error/"))
             }
-            RoutedReply::Suppressed | RoutedReply::Sealed(_) => false,
+            RoutedReply::Terminal | RoutedReply::Sealed(_) => false,
         }
+    }
+
+    /// Whether the document was itself an answer, so nothing is sent back
+    /// ([`RoutedReply::Terminal`]).
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(self, RoutedReply::Terminal)
     }
 
     /// The reply document, for a transport with no status codes to carry.
@@ -1286,7 +1346,7 @@ impl RoutedReply {
                 DispatchOutcome::Suppressed => None,
             },
             RoutedReply::Document(value) => Some(value),
-            RoutedReply::Suppressed => None,
+            RoutedReply::Terminal => None,
             RoutedReply::Sealed(sealed) => sealed.into_document(),
         }
     }
@@ -1422,7 +1482,7 @@ async fn seal_reply(
                 Err(_) => RoutedReply::Document(value),
             }
         }
-        RoutedReply::Suppressed => RoutedReply::Suppressed,
+        RoutedReply::Terminal => RoutedReply::Terminal,
         sealed @ RoutedReply::Sealed(_) => sealed,
     }
 }
@@ -1545,7 +1605,7 @@ async fn route_trust_task_doc(
         {
             crate::trust_tasks_infra::acknowledge_outbox(state, &signer, &doc).await;
         }
-        return Ok(RoutedReply::Suppressed);
+        return Ok(RoutedReply::Terminal);
     }
 
     // ── The proof gate. Every document that asks this control plane to *do*
@@ -1882,7 +1942,7 @@ async fn route_trust_task_doc(
             return Ok(
                 match crate::trust_tasks_infra::dispatch(state, &principal, via, doc).await {
                     Some(value) => RoutedReply::Document(value),
-                    None => RoutedReply::Suppressed,
+                    None => RoutedReply::Terminal,
                 },
             );
         }
@@ -1986,6 +2046,15 @@ async fn route_trust_task_doc(
                     trust_tasks_rs::ProofPolicy::<TransportBoundVerifier>::AcceptUnverified,
                 )
             }
+            // The gate above verified every proof a signed document carries,
+            // so the framework handler is not asked to verify it again (a
+            // second canonicalisation, signature check and possibly a DID
+            // resolution per ACL task), exactly as the witness runs it. An
+            // unsigned document (discovery) has nothing to verify either way.
+            None if signed => (
+                None,
+                trust_tasks_rs::ProofPolicy::<TransportBoundVerifier>::AcceptUnverified,
+            ),
             None => (None, policy),
         };
         let removes_entry = removal;
@@ -2150,6 +2219,9 @@ pub(crate) fn proof_rule(type_uri: &str) -> ProofRule {
     if let Some(rule) = crate::control_tasks::proof_rule(type_uri) {
         return rule;
     }
+    if let Some(rule) = crate::trust_tasks_infra::proof_rule(type_uri) {
+        return rule;
+    }
     if type_uri == trust_tasks_rs::specs::trust_task_discovery::v0_3::Payload::TYPE_URI
         || crate::trust_tasks_auth::owns(type_uri)
         || type_uri.starts_with(OOB_FAMILY_PREFIX)
@@ -2245,6 +2317,15 @@ mod tests {
     use crate::server::AppState;
 
     use super::*;
+
+    use did_hosting_common::tasks::auth::authenticate::v0_3 as authenticate;
+    use did_hosting_common::tasks::did_management::did::{check_name, delete};
+    use trust_tasks_rs::Payload as _;
+
+    const AUTHENTICATE: &str = authenticate::Payload::TYPE_URI;
+    const CHECK_NAME: &str = check_name::v0_1::Payload::TYPE_URI;
+    const DELETE: &str = delete::v0_1::Payload::TYPE_URI;
+    const DELETE_RESPONSE: &str = delete::v0_1::Response::TYPE_URI;
 
     #[test]
     fn stats_sync_accepts_only_hosted_path_shapes() {
@@ -2439,7 +2520,10 @@ mod tests {
     #[test]
     fn unsupported_task_reply_names_the_type() {
         let (typ, body) = run_unsupported_task("https://example.org/spec/made-up/0.1");
-        assert_eq!(typ, MSG_PROBLEM_REPORT);
+        assert_eq!(
+            typ,
+            affinidi_messaging_didcomm_service::transport::PROBLEM_REPORT_TYPE
+        );
         assert_eq!(
             body.get("code").and_then(|v| v.as_str()),
             Some("e.p.msg.unsupported-task")
@@ -2482,12 +2566,16 @@ mod tests {
             "https://trusttasks.org/spec/did-management/agent-name/disable/0.1",
             // Bare-message forms of ops that now travel only as signed Trust
             // Task documents inside the envelope.
-            MSG_AUTHENTICATE,
-            MSG_DELETE,
+            AUTHENTICATE,
+            DELETE,
             MSG_SERVER_REGISTER,
         ] {
             let (typ, body) = run_unsupported_task(retired);
-            assert_eq!(typ, MSG_PROBLEM_REPORT, "{retired}");
+            assert_eq!(
+                typ,
+                affinidi_messaging_didcomm_service::transport::PROBLEM_REPORT_TYPE,
+                "{retired}"
+            );
             assert!(
                 body.get("comment")
                     .and_then(|v| v.as_str())
@@ -2534,24 +2622,27 @@ mod tests {
             panic!("stats sync must not succeed without its role");
         };
         assert!(matches!(
-            rej.reason.as_deref(),
-            Some(&trust_tasks_rs::RejectReason::Unavailable {
+            rej.reject_reason(),
+            trust_tasks_rs::RejectReason::Unavailable {
                 retry_after: Some(_)
-            })
+            }
         ));
         let Err(rej) = do_server_register(&throttled, edge, &json!({})).await else {
             panic!("registration must not succeed without its role");
         };
         assert!(matches!(
-            rej.reason.as_deref(),
-            Some(&trust_tasks_rs::RejectReason::Unavailable { .. })
+            rej.reject_reason(),
+            trust_tasks_rs::RejectReason::Unavailable { .. }
         ));
 
         let Err(rej) = do_stats_sync(&state, "did:example:stranger", &stats).await else {
             panic!("a stranger's stats sync must be refused");
         };
-        assert_eq!(rej.code, "e.p.stats.unauthorized");
-        assert!(rej.reason.is_none());
+        assert!(matches!(rej, InfraRejection::NotAuthorised(_)), "{rej}");
+        assert_eq!(
+            rej.reject_reason().code(),
+            trust_tasks_rs::StandardCode::PermissionDenied
+        );
     }
 
     /// A synced delta for a hosted path that predates the current path
@@ -2731,7 +2822,7 @@ mod tests {
 
         let doc = sign(
             request_doc(
-                MSG_DID_REQUEST,
+                CHECK_NAME,
                 Some(&admin),
                 json!({ "path": "bob", "reserve": false }),
             ),
@@ -2759,7 +2850,7 @@ mod tests {
         seed_role(&state, admin, Role::Admin).await;
         seed_did(&state, admin, "victim").await;
 
-        let doc = request_doc(MSG_DELETE, Some(admin), json!({ "mnemonic": "victim" }));
+        let doc = request_doc(DELETE, Some(admin), json!({ "mnemonic": "victim" }));
         let resp = dispatch_envelope(&state, admin, doc).await;
         assert_eq!(resp["payload"]["code"], "proofRequired", "{resp}");
         assert!(
@@ -2785,7 +2876,7 @@ mod tests {
         let (attacker, attacker_key) = crate::signing::test_util::did_key_signer(&[66u8; 32]);
 
         let doc = sign(
-            request_doc(MSG_DELETE, Some(&attacker), json!({ "mnemonic": "victim" })),
+            request_doc(DELETE, Some(&attacker), json!({ "mnemonic": "victim" })),
             &attacker_key,
         )
         .await;
@@ -2851,14 +2942,14 @@ mod tests {
         seed_did(&state, &admin, "replayed").await;
 
         let doc = sign(
-            request_doc(MSG_DELETE, Some(&admin), json!({ "mnemonic": "replayed" })),
+            request_doc(DELETE, Some(&admin), json!({ "mnemonic": "replayed" })),
             &admin_key,
         )
         .await;
 
         let first = dispatch_envelope(&state, &admin, doc.clone()).await;
         assert_eq!(
-            first["type"], MSG_DELETE_CONFIRM,
+            first["type"], DELETE_RESPONSE,
             "the first delivery must be handled, not rejected: {first}"
         );
 
@@ -2886,7 +2977,7 @@ mod tests {
         let (admin, admin_key) = crate::signing::test_util::did_key_signer(&[72u8; 32]);
         seed_role(&state, &admin, Role::Admin).await;
 
-        let mut doc = request_doc(MSG_DID_REQUEST, Some(&admin), json!({ "path": "bob" }));
+        let mut doc = request_doc(CHECK_NAME, Some(&admin), json!({ "path": "bob" }));
         doc["recipient"] = json!(control);
         let reply = dispatch_envelope(&state, &admin, sign(doc, &admin_key).await).await;
         let reply: trust_tasks_rs::TrustTask<Value> = serde_json::from_value(reply).unwrap();
@@ -2907,7 +2998,7 @@ mod tests {
         .expect("reply is signed by the control plane for the requester");
 
         // An error reply (unsigned request) stays unsigned.
-        let mut unsigned = request_doc(MSG_DID_REQUEST, Some(&admin), json!({ "path": "bob" }));
+        let mut unsigned = request_doc(CHECK_NAME, Some(&admin), json!({ "path": "bob" }));
         unsigned["recipient"] = json!(control);
         let err = dispatch_envelope(&state, &admin, unsigned).await;
         assert!(err["type"].as_str().unwrap().contains("/trust-task-error/"));
@@ -2990,7 +3081,7 @@ mod tests {
         let (state, _dir) = signing_state().await;
         let (stranger, key) = crate::signing::test_util::did_key_signer(&[83u8; 32]);
         let doc = sign(
-            request_doc(MSG_DID_REQUEST, Some(&stranger), json!({ "path": "alice" })),
+            request_doc(CHECK_NAME, Some(&stranger), json!({ "path": "alice" })),
             &key,
         )
         .await;
@@ -3012,7 +3103,7 @@ mod tests {
 
         let signed = sign(
             request_doc(
-                MSG_DID_REQUEST,
+                CHECK_NAME,
                 Some(&admin),
                 json!({ "path": "bob", "reserve": true }),
             ),
@@ -3679,7 +3770,7 @@ mod tests {
         let Err(rej) = do_server_register(&state, second, &register_payload(second)).await else {
             panic!("the colliding DID must not register over the first");
         };
-        assert_eq!(rej.code, "e.p.registration.conflict");
+        assert!(matches!(rej, InfraRejection::Conflict(_)), "{rej}");
 
         async fn held(state: &AppState, did: &str) -> crate::registry::ServiceInstance {
             crate::registry::get_instance(
@@ -3757,7 +3848,7 @@ mod tests {
         let Err(rej) = do_stats_sync(&state, edge, &extra).await else {
             panic!("an unknown member must refuse the sync");
         };
-        assert_eq!(rej.code, "e.p.stats.malformed");
+        assert!(matches!(rej, InfraRejection::Malformed(_)), "{rej}");
 
         let body = json!({
             "server_did": edge,
@@ -3799,6 +3890,219 @@ mod tests {
             domain_intents(&state, edge).await.unwrap()[0].op,
             DomainOp::Unassign,
             "a malformed ack settles nothing"
+        );
+    }
+
+    /// Each way a stats sync is refused reaches the edge as its own standard
+    /// code: not authorised, a foreign `server_did`, too many deltas and a
+    /// malformed body are told apart without reading the message (#366).
+    #[tokio::test]
+    async fn stats_sync_refusals_are_distinguishable_on_the_wire() {
+        use trust_tasks_rs::StandardCode;
+        let (state, _dir) = test_state().await;
+        let edge = "did:example:stats-codes-edge";
+        seed_role(&state, edge, Role::Service).await;
+        let code = |rej: InfraRejection| rej.reject_reason().code();
+
+        let body = json!({ "server_did": edge, "seq": 1, "did_deltas": [] });
+        let rej = do_stats_sync(&state, "did:example:nobody", &body)
+            .await
+            .unwrap_err();
+        assert_eq!(code(rej), StandardCode::PermissionDenied);
+
+        let foreign = json!({ "server_did": "did:example:other-edge", "seq": 2 });
+        let rej = do_stats_sync(&state, edge, &foreign).await.unwrap_err();
+        assert!(
+            matches!(rej, InfraRejection::SenderMismatch { .. }),
+            "{rej}"
+        );
+        assert_eq!(code(rej), StandardCode::IdentityMismatch);
+
+        let max = did_hosting_common::server::stats_collector::MAX_STATS_SYNC_DELTAS;
+        let deltas: Vec<Value> = (0..=max)
+            .map(|i| json!({ "mnemonic": format!("d{i}") }))
+            .collect();
+        let large = json!({ "server_did": edge, "seq": 3, "did_deltas": deltas });
+        let rej = do_stats_sync(&state, edge, &large).await.unwrap_err();
+        let reason = rej.reject_reason();
+        assert_eq!(reason.code(), StandardCode::TaskFailed);
+        assert!(
+            matches!(&reason, trust_tasks_rs::RejectReason::TaskFailed { details: Some(d), .. }
+                if d["limit"] == json!(max)),
+            "{reason:?}"
+        );
+
+        let rej = do_stats_sync(&state, edge, &json!({ "seq": "four" }))
+            .await
+            .unwrap_err();
+        assert_eq!(code(rej), StandardCode::MalformedRequest);
+    }
+
+    /// A stats sync is answered with the typed acknowledgement.
+    #[tokio::test]
+    async fn stats_sync_acks_are_typed() {
+        use did_hosting_common::{StatsSyncAck, StatsSyncStatus};
+        let (state, _dir) = test_state().await;
+        let edge = "did:example:stats-ack-edge";
+        seed_role(&state, edge, Role::Service).await;
+        let body = json!({ "server_did": edge, "seq": 5, "did_deltas": [] });
+        let ack = do_stats_sync(&state, edge, &body).await.unwrap();
+        assert_eq!(ack.status, StatsSyncStatus::Accepted);
+        let replayed = do_stats_sync(&state, edge, &body).await.unwrap();
+        assert_eq!(
+            replayed,
+            StatsSyncAck {
+                status: StatsSyncStatus::Skipped,
+                reason: Some("stale_seq".into()),
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&replayed).unwrap(),
+            json!({ "status": "skipped", "reason": "stale_seq" }),
+            "the wire shape an edge reads is unchanged"
+        );
+    }
+
+    /// The infrastructure tasks state their proof rule rather than taking
+    /// the dispatcher's default for an unknown Type URI.
+    #[test]
+    fn infrastructure_tasks_have_an_explicit_proof_rule() {
+        for uri in [
+            MSG_SERVER_REGISTER,
+            MSG_HEALTH_PONG,
+            MSG_STATS_SYNC,
+            MSG_SYNC_UPDATE_ACK,
+            MSG_SYNC_DELETE_ACK,
+            MSG_SYNC_BATCH_ACK,
+            MSG_REPLICA_DOMAIN_ASSIGN_ACK,
+            MSG_REPLICA_DOMAIN_UNASSIGN_ACK,
+            MSG_REPLICA_DOMAIN_PURGE_ACK,
+            MSG_REPLICA_DOMAIN_UPSERT_ACK,
+        ] {
+            assert_eq!(
+                crate::trust_tasks_infra::proof_rule(uri),
+                Some(ProofRule::Authentication),
+                "{uri}"
+            );
+            assert_eq!(proof_rule(uri), ProofRule::Authentication, "{uri}");
+        }
+        // A reply this control plane itself emits is not one it routes.
+        assert_eq!(
+            crate::trust_tasks_infra::proof_rule(MSG_SERVER_REGISTER_ACK),
+            None
+        );
+    }
+
+    /// A pong from a Service is the end of the exchange: dispatch reports it
+    /// as terminal (no reply, nothing logged as an invariant break), and the
+    /// instance is marked active (#359).
+    #[tokio::test]
+    async fn a_service_pong_is_terminal_not_suppressed() {
+        use crate::registry::ServiceStatus;
+        let (state, _dir) = signing_state().await;
+        let (edge, edge_key) = crate::signing::test_util::did_key_signer(&[43u8; 32]);
+        seed_service(&state, &edge).await;
+        let registered = sign(
+            request_doc(MSG_SERVER_REGISTER, Some(&edge), register_payload(&edge)),
+            &edge_key,
+        )
+        .await;
+        dispatch_envelope(&state, &edge, registered).await;
+
+        let pong = sign(
+            request_doc(
+                MSG_HEALTH_PONG,
+                Some(&edge),
+                json!({ "status": "ok", "version": "1.2.3", "did_count": 4 }),
+            ),
+            &edge_key,
+        )
+        .await;
+        let doc: trust_tasks_rs::TrustTask<Value> = serde_json::from_value(pong).unwrap();
+        let transport = trust_tasks_didcomm::DidcommHandler::new(CONTROL.to_string(), edge.clone());
+        let reply = dispatch_trust_task_doc(
+            &state,
+            &edge,
+            None,
+            None,
+            &transport,
+            doc,
+            require_verifier(&state).unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(reply.is_terminal(), "a pong is answered by nothing");
+
+        let instance = crate::registry::get_instance_for_did(&state.registry_ks, &edge)
+            .await
+            .unwrap()
+            .expect("registered");
+        assert_eq!(instance.status, ServiceStatus::Active);
+    }
+
+    /// A pong carrying a member this service does not read marks nothing.
+    #[tokio::test]
+    async fn a_pong_with_an_unknown_member_marks_nothing() {
+        use crate::registry::ServiceStatus;
+        let (state, _dir) = signing_state().await;
+        let (edge, edge_key) = crate::signing::test_util::did_key_signer(&[44u8; 32]);
+        seed_service(&state, &edge).await;
+        let registered = sign(
+            request_doc(MSG_SERVER_REGISTER, Some(&edge), register_payload(&edge)),
+            &edge_key,
+        )
+        .await;
+        dispatch_envelope(&state, &edge, registered).await;
+        let mut instance = crate::registry::get_instance_for_did(&state.registry_ks, &edge)
+            .await
+            .unwrap()
+            .unwrap();
+        instance.status = ServiceStatus::Unreachable;
+        crate::registry::register_instance(&state.registry_ks, &instance)
+            .await
+            .unwrap();
+
+        do_health_pong(&state, &edge, &json!({ "status": "ok", "load": 9 })).await;
+        let instance = crate::registry::get_instance_for_did(&state.registry_ks, &edge)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(instance.status, ServiceStatus::Unreachable);
+    }
+
+    /// The request log keys its quiet list on the document inside a
+    /// trust-task envelope, which is how every task now arrives (#359).
+    #[test]
+    fn the_quiet_list_reads_the_envelopes_inner_type() {
+        let pong = envelope(request_doc(MSG_HEALTH_PONG, None, json!({})));
+        assert_eq!(logged_type(&pong), MSG_HEALTH_PONG);
+        assert!(is_quiet(&logged_type(&pong)));
+
+        let stats = envelope(request_doc(MSG_STATS_SYNC, None, json!({})));
+        assert!(is_quiet(&logged_type(&stats)));
+
+        let delete = envelope(request_doc(DELETE, None, json!({})));
+        assert_eq!(logged_type(&delete), DELETE);
+        assert!(!is_quiet(&logged_type(&delete)));
+
+        let bare = Message::build(
+            "m".to_string(),
+            "https://example.org/bare".to_string(),
+            json!({}),
+        )
+        .finalize();
+        assert_eq!(logged_type(&bare), "https://example.org/bare");
+    }
+
+    /// A registration this control plane cannot store is reported as its own
+    /// failure, never as the edge being unauthorised.
+    #[test]
+    fn a_failed_store_is_not_reported_as_permission_denied() {
+        let rej = InfraRejection::lookup_failed(&crate::error::AppError::Internal("x".into()));
+        assert_eq!(
+            rej.reject_reason().code(),
+            trust_tasks_rs::StandardCode::InternalError
         );
     }
 }

@@ -146,7 +146,7 @@ pub async fn sign_witness_proof(
 ) -> Result<(String, DataIntegrityProof), AppError> {
     // Validate version_id format: <number>-<hash>
     if !is_valid_version_id(version_id) {
-        return Err(AppError::Validation(format!(
+        return Err(AppError::invalid(format!(
             "invalid version_id format: '{version_id}' (expected '<number>-<hash>')"
         )));
     }

@@ -678,11 +678,11 @@ fn map_app_error(e: &AppError, codes: &'static [DeclaredErrorCode]) -> Mapped {
             &["pathTaken", "nameTaken", "alreadyExists", "conflict"],
             StandardCode::TaskFailed,
         ),
-        AppError::Validation(message) => {
-            if message.contains("unknown_domain") {
-                return pick(&["unknownDomain"], StandardCode::MalformedRequest);
-            }
-            match e.validation_kind() {
+        AppError::Validation { kind, .. } => {
+            match kind {
+                ValidationKind::UnknownDomain => {
+                    pick(&["unknownDomain"], StandardCode::MalformedRequest)
+                }
                 ValidationKind::InvalidLog => pick(
                     &["invalidLog", "invalidDidData"],
                     StandardCode::MalformedRequest,
@@ -693,10 +693,14 @@ fn map_app_error(e: &AppError, codes: &'static [DeclaredErrorCode]) -> Mapped {
                 ValidationKind::InvalidWitness => {
                     pick(&["invalidWitness"], StandardCode::MalformedRequest)
                 }
-                ValidationKind::Other => Mapped::Standard(StandardCode::MalformedRequest),
+                // An edge-side history refusal; on a publish the same check
+                // is reported as an invalid log (`publication_error`).
+                ValidationKind::HistoryRewrite
+                | ValidationKind::Deactivated
+                | ValidationKind::Other => Mapped::Standard(StandardCode::MalformedRequest),
             }
         }
-        AppError::QuotaExceeded(_) => pick(&["quotaExceeded"], StandardCode::TaskFailed),
+        AppError::QuotaExceeded { .. } => pick(&["quotaExceeded"], StandardCode::TaskFailed),
         AppError::DomainDisabled { .. } => pick(&["domainDisabled"], StandardCode::TaskFailed),
         AppError::RateLimited { .. } => Mapped::Standard(StandardCode::Unavailable),
         AppError::AgentName(kind) => match kind {

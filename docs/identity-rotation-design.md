@@ -2,7 +2,7 @@
 
 ## Status
 
-**Built:** phases 1 and 2, wired into **all four binaries** — the generation
+**Built:** phases 1 and 2, wired into **every binary that has an identity** — the generation
 model, `KS_IDENTITY`, `load_identity` (replacing `init_didcomm_auth` and fixing
 the kid bug), the `AppState` lift of `DIDCommService` in server and witness, the
 daemon consolidation, retirement, the rotation trigger, the expiry sweep, and the
@@ -12,15 +12,29 @@ Triggers differ by what each service can observe:
 
 | Service | Publish hook | Sync-update hook | Periodic sweep |
 |---|---|---|---|
-| control | ✅ `did_ops::publish_did` | — | ✅ |
-| server | ✅ `did_ops::publish_did` | ✅ `MSG_SYNC_UPDATE` | ✅ |
+| control | ✅ `did_ops::register_did_atomic` (`did/register`) and the agent-name ops | — | ✅ |
+| server | — (no management routes) | ✅ `MSG_SYNC_UPDATE` | ✅ |
 | witness | — (hosts no DIDs) | — | ✅ **only trigger** |
+| watcher | — (its own DID is published elsewhere) | — | ✅ **only trigger** |
 | daemon | ✅ via control | — | ✅ in the unified storage task |
 
-The witness has no `dids` keyspace and no publish path — its own DID is published
-in another process — so the sweep is not a backstop there but its *only* way to
-notice a rotation. A rotation therefore reaches the witness within one sweep
-interval (60s) rather than immediately. In daemon mode the embedded server's and
+The witness has no `dids` keyspace and no publish path, and the watcher's own DID
+is likewise published by another process (it mirrors DIDs from its sources, but a
+mirrored path alone does not say the DID is its own) — so for both the sweep is
+not a backstop but their *only* way to notice a rotation. A rotation therefore
+reaches them within one reload interval (5 minutes) rather than immediately, and
+needs no restart.
+
+Every node builds its listener through one function,
+`didcomm_profile::build_own_listener`, both at boot and when an identity change
+rebuilds it (`rebuild_own_listener`): the live generations' key material, the
+transports reconciled against what the node's own DID document advertises, and
+the persistent TSP relationship store. A rebuild therefore cannot come back with
+fewer transports, or with an in-memory relationship store, than the node booted
+with. Old-mediator drains are resumed after the listener starts on every node; on
+the control plane and the daemon that step is
+`did_hosting_control::server::post_listener_startup`, shared so neither can miss
+it. In daemon mode the embedded server's and
 witness's rotation paths are **inert by construction**: neither starts a DIDComm
 listener, so their `didcomm_service` slot is never filled and `rebuild_listener`
 no-ops. The daemon's control plane owns the identity. Nothing is conditionally
@@ -449,10 +463,9 @@ generation 0 by resolving the current `server_did`, exactly as
 
 Called from:
 
-- `publish_did` (`did-hosting-control/src/did_ops.rs:513`) and the server's
-  `publish_did` / `apply_single_update`, gated on `mnemonic == our_mnemonic`
-  (`mnemonic_from_did` already exists at `did-hosting-server/src/server.rs:679`;
-  no publish path checks this today).
+- The control plane's `register_did_atomic` (the `did/register` task) and its
+  agent-name ops, and the server's `apply_single_update`, gated on
+  `mnemonic == our_mnemonic` (`identity::mnemonic_from_did`).
 - A **periodic backstop** in the storage task, to catch out-of-band updates.
 
 Debounced behind the identity mutex; concurrent calls coalesce.

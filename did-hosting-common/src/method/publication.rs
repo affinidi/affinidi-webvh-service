@@ -1,6 +1,6 @@
 //! Verifying an incoming publication, whatever method it belongs to.
 //!
-//! The control plane's write path — `register_did_atomic`, `publish_did` —
+//! The control plane's write path — `register_did_atomic`, the agent-name ops —
 //! is almost entirely method-agnostic. Ownership, takeover, ACL, domain
 //! safety, the agent-name registry and the atomic batch write are the
 //! same work regardless of what kind of DID is being published. What is
@@ -190,7 +190,7 @@ fn verify_webvh(
             && scid(text).as_deref() == Some(held.as_str())
         {
             crate::did_ops::verify_log_extends(Some(&existing), text)
-                .map_err(MethodError::Validation)?;
+                .map_err(|e| MethodError::Validation(e.to_string()))?;
         }
     }
 

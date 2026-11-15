@@ -112,3 +112,59 @@ async fn the_high_water_log_outlives_a_delete() {
         .await
         .expect("the same log syncs again");
 }
+
+/// A fork of a `did:webs` log is refused as a history rewrite, carried as the
+/// error's kind, so the edge answers `historyRewrite` rather than
+/// `invalidLog` without reading the message (#367).
+#[tokio::test]
+async fn a_webs_fork_is_a_history_rewrite() {
+    use did_hosting_common::server::error::ValidationKind;
+    let (_dir, store, ks) = store().await;
+    sync(&store, &ks, &fixture("ixn-ixn.keri.cesr"))
+        .await
+        .expect("first sync");
+    let cache = ContentCache::new(Duration::from_secs(60));
+    let err = apply_single_update(
+        &ks,
+        &store,
+        &update(&fixture("other-ixn.keri.cesr")),
+        &cache,
+        Some(PUBLIC_URL),
+    )
+    .await
+    .expect_err("a fork");
+    assert_eq!(
+        err.validation_kind(),
+        ValidationKind::HistoryRewrite,
+        "{err}"
+    );
+}
+
+/// Only a method whose history the edge checks is synced: a `did:web`
+/// document is refused rather than stored unchecked under a tag no resolver
+/// here serves (#367).
+#[cfg(feature = "method-web")]
+#[tokio::test]
+async fn a_did_web_document_is_not_synced() {
+    let (_dir, store, ks) = store().await;
+    let cache = ContentCache::new(Duration::from_secs(60));
+    let document = r#"{"id":"did:web:example.com:alice"}"#;
+    let update = DidSyncUpdate {
+        mnemonic: "alice".into(),
+        did_id: "did:web:example.com:alice".into(),
+        log_content: document.into(),
+        witness_content: None,
+        version_count: 1,
+        disabled: false,
+    };
+    let err = apply_single_update(&ks, &store, &update, &cache, Some(PUBLIC_URL))
+        .await
+        .expect_err("a did:web document is not synced");
+    assert!(err.to_string().contains("cannot verify web"), "{err}");
+    assert!(
+        ks.get_raw(content_log_key("alice"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

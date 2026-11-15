@@ -364,7 +364,7 @@ impl From<crate::error::AppError> for OpError {
             // Over capacity (a throttled store): this server can apply it
             // later, so the control plane keeps it queued.
             | AppError::RateLimited { .. } => OpError::Transient(e.to_string()),
-            AppError::QuotaExceeded(_) => OpError::Failed(e.to_string()),
+            AppError::QuotaExceeded { .. } => OpError::Failed(e.to_string()),
             other => OpError::Refused(other.to_string()),
         }
     }
@@ -883,19 +883,17 @@ async fn apply_sync_entry(
 
 /// Classify a failed sync apply under the codes `sync/update/0.2` declares.
 fn sync_refusal(e: crate::error::AppError) -> OpError {
-    use crate::error::AppError;
+    use crate::error::{AppError, ValidationKind};
     match e {
-        AppError::Validation(message) => {
-            let code = if message.contains("deactivated") {
-                sync_update::error_codes::DEACTIVATED
-            } else if message.contains("not an extension")
-                || message.contains("rollback")
-                || message.contains("high-water")
-                || message.contains("refusing to replace")
-            {
-                sync_update::error_codes::HISTORY_REWRITE
-            } else {
-                sync_update::error_codes::INVALID_LOG
+        AppError::Validation { kind, message } => {
+            let code = match kind {
+                ValidationKind::Deactivated => sync_update::error_codes::DEACTIVATED,
+                ValidationKind::HistoryRewrite => sync_update::error_codes::HISTORY_REWRITE,
+                ValidationKind::InvalidLog
+                | ValidationKind::InvalidPath
+                | ValidationKind::InvalidWitness
+                | ValidationKind::UnknownDomain
+                | ValidationKind::Other => sync_update::error_codes::INVALID_LOG,
             };
             OpError::Declared(code, message)
         }
@@ -1403,7 +1401,7 @@ mod tests {
     #[test]
     fn refusals_are_final() {
         for err in [
-            OpError::from(AppError::Validation("not an extension".into())),
+            OpError::from(AppError::invalid("not an extension")),
             OpError::from("missing 'mnemonic'"),
         ] {
             assert!(matches!(err, OpError::Refused(_)), "{err:?}");
@@ -1415,12 +1413,39 @@ mod tests {
     /// `taskFailed`, non-retryable, so the control plane stops re-sending it.
     #[test]
     fn a_store_size_refusal_is_final_and_not_an_invalid_log() {
-        let err = OpError::from(AppError::QuotaExceeded(
-            "item size 431916 bytes is over the store's per-item limit of 409600 bytes".into(),
+        let err = OpError::from(AppError::quota(
+            did_hosting_common::server::error::QuotaKind::Size,
+            "item size 431916 bytes is over the store's per-item limit of 409600 bytes",
         ));
         assert!(matches!(err, OpError::Failed(_)), "{err:?}");
         let payload = payload_of(err);
         assert_eq!(payload["code"], "taskFailed");
         assert_eq!(payload["retryable"], false);
+    }
+
+    /// A sync refusal's code comes from the kind the check carried, never
+    /// from its wording: reworded messages keep their codes, and a message
+    /// that happens to mention "deactivated" is not a deactivation (#367).
+    #[test]
+    fn a_sync_refusal_is_classified_by_its_kind() {
+        use crate::error::ValidationKind;
+        let code_of = |e: AppError| match sync_refusal(e) {
+            OpError::Declared(code, _) => code.code,
+            other => panic!("expected a declared code, got {other:?}"),
+        };
+        assert_eq!(
+            code_of(AppError::validation(ValidationKind::Deactivated, "x")),
+            sync_update::error_codes::DEACTIVATED.code
+        );
+        assert_eq!(
+            code_of(AppError::validation(ValidationKind::HistoryRewrite, "x")),
+            sync_update::error_codes::HISTORY_REWRITE.code
+        );
+        assert_eq!(
+            code_of(AppError::invalid(
+                "a deactivated rollback that is not an extension of the high-water mark"
+            )),
+            sync_update::error_codes::INVALID_LOG.code
+        );
     }
 }

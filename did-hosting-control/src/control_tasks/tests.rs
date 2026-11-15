@@ -3644,8 +3644,9 @@ async fn a_document_refused_as_unavailable_after_a_write_is_not_run_again() {
 #[test]
 fn a_store_size_refusal_is_a_task_failure_naming_the_limit() {
     use did_hosting_common::server::error::AppError;
-    let payload = super::TaskError::App(AppError::QuotaExceeded(
-        "item size 431916 bytes is over the store's per-item limit of 409600 bytes".into(),
+    let payload = super::TaskError::App(AppError::quota(
+        did_hosting_common::server::error::QuotaKind::Size,
+        "item size 431916 bytes is over the store's per-item limit of 409600 bytes",
     ))
     .payload(&[]);
     let payload = serde_json::to_value(payload).expect("serialise the error payload");

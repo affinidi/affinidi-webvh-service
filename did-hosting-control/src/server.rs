@@ -2,15 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
-use affinidi_messaging_didcomm_service::{
-    DIDCommService, DIDCommServiceConfig, ListenerConfig, Protocols, RestartPolicy, RetryConfig,
-};
+use affinidi_messaging_didcomm_service::{DIDCommService, DIDCommServiceConfig};
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use did_hosting_common::server::auth::extractor::AuthState;
-use did_hosting_common::server::didcomm_profile::{
-    advertised_protocols, build_tdk_profile_for_identity, reconcile_listener_protocols,
-    wait_for_did_resolution,
-};
+use did_hosting_common::server::didcomm_profile::{build_own_listener, wait_for_did_resolution};
 use did_hosting_common::server::identity::{self, ServiceIdentity};
 use did_hosting_common::server::init;
 use did_hosting_common::server::store::{
@@ -575,13 +570,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         }
     }
 
-    // 3b. Reconnect to any mediator we rotated *away* from but whose grace
-    // period has not elapsed. Peers holding a stale DID document are still
-    // delivering there, and a restart part-way through the window must not
-    // abandon that queue — which is exactly why the retiring generation (and its
-    // old mediator) is persisted. No-op in the common case: a key rotation on the
-    // same mediator strands nothing.
-    crate::identity_rotation::resume_mediator_drains(&state);
+    // 3b. Everything that has to follow the listener — shared with the daemon.
+    post_listener_startup(&state);
 
     // 4. Spawn DIDComm health check task (runs on main tokio runtime)
     let health_shutdown = CancellationToken::new();
@@ -742,6 +732,22 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 // DIDComm service startup (inbound)
 // ---------------------------------------------------------------------------
 
+/// Startup work that must run once the messaging listener is up (or has been
+/// skipped because no transport is enabled).
+///
+/// Shared by the standalone control plane's [`run`] and the daemon's
+/// `run_daemon`, so a step added here cannot be missed by one of them.
+///
+/// - Reconnect to any mediator we rotated *away* from but whose grace period
+///   has not elapsed. Peers holding a stale DID document are still delivering
+///   there, and a restart part-way through the window must not abandon that
+///   queue — which is exactly why the retiring generation (and its old
+///   mediator) is persisted. No-op in the common case: a key rotation on the
+///   same mediator strands nothing.
+pub fn post_listener_startup(state: &AppState) {
+    crate::identity_rotation::resume_mediator_drains(state);
+}
+
 pub async fn start_didcomm_service(
     state: &AppState,
     shutdown: CancellationToken,
@@ -776,13 +782,6 @@ pub async fn start_didcomm_service(
     // "No Mediator is configured for this Profile" later).
     wait_for_did_resolution(&mediator_did, "mediator", &identity.did_resolver, &shutdown).await?;
 
-    // Carries the key material of every live generation, keyed on the kids the
-    // DID document actually resolved to — the same kids the secrets resolver
-    // was seeded with.
-    let profile = build_tdk_profile_for_identity("control", identity, Some(&mediator_did)).await?;
-
-    info!("TDK profile built, configuring DIDComm listener");
-
     // Transport selection — DIDComm and/or TSP ride the same mediator
     // socket. Inbound TSP frames are routed to the `WebvhTspHandler` when
     // TSP is on. The four combinations map to the framework's `Protocols`;
@@ -798,38 +797,26 @@ pub async fn start_didcomm_service(
     // is authoritative for how peers reach us, so the listener must carry every
     // transport it advertises or silently drop (and ack) inbound frames on the
     // ones it doesn't.
-    let advertised = advertised_protocols(&identity.did, Some(&identity.did_resolver)).await;
-    let transports = reconcile_listener_protocols(identity.protocols(), advertised, &identity.did);
+    //
+    // The profile carries the key material of every live generation, keyed on
+    // the kids the DID document actually resolved to. With TSP on the listener
+    // persists the control plane's TSP relationships (Rev 3 §7.2.2) across
+    // restarts, so it keeps its half of each edge relationship and does not
+    // need to re-invite: an edge re-invites on its own connect, and this side
+    // answers (`WebvhTspHandler::handle_control`). In daemon mode this is the
+    // only listener, so it covers the daemon too.
+    //
+    // Built by the same function the identity rebuild uses, so a rotation
+    // cannot come back with a different listener.
+    let (listener, transports) = build_own_listener(
+        crate::identity_rotation::LISTENER_ID,
+        identity,
+        &mediator_did,
+        &state.store,
+    )
+    .await?;
     let tsp_enabled = transports.tsp;
-    let protocols = match (transports.didcomm, transports.tsp) {
-        (true, true) => Protocols::BOTH,
-        (false, true) => Protocols::TSP_ONLY,
-        _ => Protocols::DIDCOMM_ONLY,
-    };
-
-    let mut listener = ListenerConfig {
-        id: "control".into(),
-        profile,
-        restart_policy: RestartPolicy::Always {
-            backoff: RetryConfig::default(),
-        },
-        auto_delete: true,
-        protocols,
-        ..Default::default()
-    };
-    // Persist the control plane's TSP relationships (Rev 3 §7.2.2) across
-    // restarts, so it keeps its half of each edge relationship and does not need
-    // to re-invite: an edge re-invites on its own connect, and this side answers
-    // (`WebvhTspHandler::handle_control`). Without persistence a control restart
-    // would drop every edge until each re-handshakes. Only meaningful when TSP is
-    // on. In daemon mode this is the only listener, so it covers the daemon too.
-    if tsp_enabled {
-        listener.relationship_store = Some(
-            did_hosting_common::server::tsp_relationship_store::build_relationship_store(
-                &state.store,
-            )?,
-        );
-    }
+    info!("TDK profile built, DIDComm listener configured");
 
     let router = messaging::build_control_router(state.clone())
         .map_err(|e| AppError::Internal(format!("failed to build DIDComm router: {e}")))?;
@@ -881,7 +868,7 @@ pub async fn start_didcomm_service(
 ///
 /// Failure is non-fatal. The daemon exits when its migrations fail, but missing
 /// badges are cosmetic and must not stop the control plane from starting —
-/// `publish_did` self-heals each record on its next publish regardless.
+/// `register_did_atomic` self-heals each record on its next publish regardless.
 pub async fn backfill_service_badges(store: &Store) {
     use did_hosting_common::server::migrations::{M02CacheDidRecordServices, MigrationRunner};
 

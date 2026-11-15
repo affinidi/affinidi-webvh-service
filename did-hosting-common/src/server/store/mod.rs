@@ -87,10 +87,10 @@ fn check_item_size(backend: &str, size: usize, limit: usize) -> Result<(), AppEr
             limit,
             "write refused: item over the store's per-item limit"
         );
-        // `AppError::quota_kind` keys on the word "size".
-        return Err(AppError::QuotaExceeded(format!(
-            "item size {size} bytes is over the store's per-item limit of {limit} bytes"
-        )));
+        return Err(AppError::quota(
+            crate::server::error::QuotaKind::Size,
+            format!("item size {size} bytes is over the store's per-item limit of {limit} bytes"),
+        ));
     }
     Ok(())
 }
