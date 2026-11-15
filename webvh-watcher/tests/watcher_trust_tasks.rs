@@ -1010,3 +1010,195 @@ async fn a_source_with_domains_syncs_only_dids_on_them() {
     .expect("answered");
     assert_eq!(answered(&reply, MSG_SYNC_UPDATE)["status"], "applied");
 }
+
+// ---------------------------------------------------------------------------
+// The high-water mark, and resolution
+// ---------------------------------------------------------------------------
+
+fn scid_of(did: &str) -> String {
+    did.strip_prefix("did:webvh:")
+        .unwrap()
+        .split(':')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+async fn apply(state: &AppState, body: Value) -> String {
+    let s = source();
+    let reply = deliver(
+        state,
+        Via::Https,
+        &s.0,
+        signed(MSG_SYNC_UPDATE, &s, body).await,
+    )
+    .await
+    .expect("answered");
+    answered(&reply, MSG_SYNC_UPDATE)["status"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The mark is a few fields, not a second copy of the log; a full-log row an
+/// earlier release stored is rewritten compact and keeps refusing rollbacks.
+#[tokio::test]
+async fn the_high_water_mark_is_compact_and_legacy_rows_migrate() {
+    let (state, _dir) = watcher_state().await;
+    let (did, log) = did_log("erin", 2).await;
+    assert_eq!(
+        apply(&state, update_body("erin", &did, &log)).await,
+        "applied"
+    );
+    let raw = state
+        .dids_ks
+        .get_raw(watcher_ops::high_water_key(&scid_of(&did)))
+        .await
+        .unwrap()
+        .expect("a mark is kept");
+    let mark: watcher_ops::HighWaterMark = serde_json::from_slice(&raw).expect("compact form");
+    assert_eq!(mark, watcher_ops::HighWaterMark::of(&log));
+    assert_eq!(mark.entries, 2);
+    assert!(mark.deactivated);
+    assert!(raw.len() < log.len(), "smaller than the log it marks");
+
+    // A legacy row: the full log, under another DID's SCID.
+    let (did_f, log_f) = did_log("frank", 2).await;
+    let key = watcher_ops::high_water_key(&scid_of(&did_f));
+    state
+        .dids_ks
+        .insert_raw(key.clone(), log_f.as_bytes().to_vec())
+        .await
+        .unwrap();
+    // Read as its mark before the migration…
+    let (_, one) = did_log("frank", 1).await;
+    assert_eq!(
+        update_refusal(&state, update_body("frank", &did_f, &one)).await,
+        "webvh/sync/update:historyRewrite"
+    );
+    // …and rewritten by it, once.
+    assert_eq!(
+        watcher_ops::migrate_high_water_marks(&state.dids_ks)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        watcher_ops::migrate_high_water_marks(&state.dids_ks)
+            .await
+            .unwrap(),
+        0
+    );
+    let migrated: watcher_ops::HighWaterMark =
+        serde_json::from_slice(&state.dids_ks.get_raw(key).await.unwrap().unwrap()).unwrap();
+    assert_eq!(migrated, watcher_ops::HighWaterMark::of(&log_f));
+    assert_eq!(
+        update_refusal(&state, update_body("frank", &did_f, &one)).await,
+        "webvh/sync/update:historyRewrite"
+    );
+    // The full log itself still extends the mark.
+    assert_eq!(
+        apply(&state, update_body("frank", &did_f, &log_f)).await,
+        "applied"
+    );
+}
+
+/// A mark admits exactly the logs that extend the one it marks.
+#[tokio::test]
+async fn a_mark_admits_only_extensions() {
+    let (_, one) = did_log("gina", 1).await;
+    let (_, two) = did_log("gina", 2).await;
+    let mark = watcher_ops::HighWaterMark::of(&one);
+    assert!(mark.admits(&one).is_ok(), "the same log");
+    assert!(mark.admits(&two).is_ok(), "an extension");
+    assert!(
+        mark.admits(&format!("{one}\n")).is_ok(),
+        "blank lines are not entries"
+    );
+    let forked = one.replacen("origin.example.com", "fork.example.com", 1);
+    assert!(mark.admits(&forked).is_err(), "a fork");
+    let deactivated = watcher_ops::HighWaterMark::of(&two);
+    assert!(deactivated.admits(&one).is_err(), "a rollback");
+    assert!(deactivated.admits(&two).is_ok());
+}
+
+async fn get(
+    state: &AppState,
+    path: &str,
+    if_none_match: Option<&str>,
+) -> axum::response::Response {
+    use tower::ServiceExt;
+    let mut request = axum::http::Request::get(path);
+    if let Some(tag) = if_none_match {
+        request = request.header("if-none-match", tag);
+    }
+    webvh_watcher::routes::router_public_only()
+        .with_state(state.clone())
+        .oneshot(request.body(axum::body::Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+/// A mirrored log carries a strong ETag and answers a matching
+/// `If-None-Match` with 304; a disabled slot is hidden from the in-memory
+/// set, loaded at boot and kept current by every sync.
+#[tokio::test]
+async fn resolution_answers_conditional_requests_and_hides_disabled_slots() {
+    use http_body_util::BodyExt;
+    let (state, _dir) = watcher_state().await;
+    let (did, log) = did_log("hana", 1).await;
+    assert_eq!(
+        apply(&state, update_body("hana", &did, &log)).await,
+        "applied"
+    );
+    state.prepare_mirror().await.unwrap();
+
+    let ok = get(&state, "/hana/did.jsonl", None).await;
+    assert_eq!(ok.status(), 200);
+    let etag = ok.headers()["etag"].to_str().unwrap().to_string();
+    assert!(
+        etag.starts_with('"') && etag.ends_with('"'),
+        "strong: {etag}"
+    );
+    let body = ok.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body, log.as_bytes());
+
+    let not_modified = get(&state, "/hana/did.jsonl", Some(&etag)).await;
+    assert_eq!(not_modified.status(), 304);
+    assert_eq!(not_modified.headers()["etag"], etag.as_str());
+    assert!(
+        not_modified
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+    let other = get(&state, "/hana/did.jsonl", Some("\"other\"")).await;
+    assert_eq!(other.status(), 200);
+
+    // Disabled, then enabled again, through syncs.
+    let mut body = update_body("hana", &did, &log);
+    body["disabled"] = json!(true);
+    assert_eq!(apply(&state, body).await, "applied");
+    assert_eq!(get(&state, "/hana/did.jsonl", None).await.status(), 404);
+    assert_eq!(
+        apply(&state, update_body("hana", &did, &log)).await,
+        "applied"
+    );
+    assert_eq!(get(&state, "/hana/did.jsonl", None).await.status(), 200);
+
+    // A disabled slot already stored is hidden by a freshly loaded set.
+    let mut body = update_body("hana", &did, &log);
+    body["disabled"] = json!(true);
+    assert_eq!(apply(&state, body).await, "applied");
+    let restarted = AppState::new(
+        state.store.clone(),
+        (*state.config).clone(),
+        state.identity.clone(),
+    )
+    .unwrap();
+    restarted.prepare_mirror().await.unwrap();
+    assert_eq!(get(&restarted, "/hana/did.jsonl", None).await.status(), 404);
+}

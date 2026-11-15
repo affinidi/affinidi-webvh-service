@@ -319,11 +319,9 @@ async fn sync_update_task(
         u.version_count.get(),
         u.disabled,
     );
-    let _guard = state.sync_lock.lock().await;
-    let status =
-        watcher_ops::apply_sync(&state.store, &state.dids_ks, &state.config.sync, source, &e)
-            .await
-            .map_err(refusal_payload)?;
+    let status = watcher_ops::apply_sync(state.mirror(), source, &e)
+        .await
+        .map_err(refusal_payload)?;
     info!(source, mnemonic = %e.mnemonic, ?status, "sync update applied");
     reply::<sync_update::Response>(json!({ "mnemonic": e.mnemonic, "status": status_str(status) }))
 }
@@ -337,7 +335,6 @@ async fn sync_batch_task(
     doc: &TrustTask<Value>,
 ) -> Result<Value, ErrorPayload> {
     let b: sync_batch::Payload = payload(doc)?;
-    let _guard = state.sync_lock.lock().await;
     let mut results = Vec::with_capacity(b.updates.len());
     let mut transient: Option<String> = None;
     for u in b.updates {
@@ -349,9 +346,7 @@ async fn sync_batch_task(
             u.version_count.get(),
             u.disabled,
         );
-        match watcher_ops::apply_sync(&state.store, &state.dids_ks, &state.config.sync, source, &e)
-            .await
-        {
+        match watcher_ops::apply_sync(state.mirror(), source, &e).await {
             Ok(status) => {
                 results.push(json!({ "mnemonic": e.mnemonic, "status": status_str(status) }))
             }
@@ -390,16 +385,9 @@ async fn sync_delete_task(
             reason: format!("mnemonic: {e}"),
         })
     })?;
-    let _guard = state.sync_lock.lock().await;
-    let held = watcher_ops::delete_record(
-        &state.store,
-        &state.dids_ks,
-        &state.config.sync,
-        mnemonic,
-        source,
-    )
-    .await
-    .map_err(internal)?;
+    let held = watcher_ops::delete_record(state.mirror(), mnemonic, source)
+        .await
+        .map_err(internal)?;
     info!(source, mnemonic, held, "sync delete applied");
     reply::<sync_delete::Response>(json!({
         "mnemonic": mnemonic,
