@@ -891,8 +891,7 @@ pub async fn resend_domain_intents_for(
     for intent in intents {
         let ops: &[&str] = match intent.op {
             DomainOp::Assign
-                if intent.acked
-                    && served.is_some_and(|s| s.contains(&intent.domain)) =>
+                if intent.acked && served.is_some_and(|s| s.contains(&intent.domain)) =>
             {
                 continue;
             }
