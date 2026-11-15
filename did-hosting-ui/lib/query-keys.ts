@@ -12,6 +12,6 @@ export const QK = {
   /** `registry/list` — the service overview and the servers screen. */
   registry: ["registry"] as const,
   identityGenerations: ["identity", "generations"] as const,
-  /** Every DID the session can see (`did/list` with no owner filter). */
-  allDids: ["dids", "all"] as const,
+  /** One domain's `stats/get` totals — the dashboard's pinned-domain cards. */
+  domainStats: (domain: string | null) => ["stats", "domain", domain] as const,
 };

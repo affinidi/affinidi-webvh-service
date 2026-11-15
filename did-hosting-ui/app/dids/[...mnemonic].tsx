@@ -15,7 +15,7 @@ import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { useDomains } from "../../components/DomainProvider";
 import { RequireAuth } from "../../components/RequireAuth";
-import { UsageChart } from "../../components/UsageChart";
+import { LazyUsageChart } from "../../components/LazyUsageChart";
 import { AgentNamesCard } from "../../components/did/AgentNamesCard";
 import { ConsentPanel } from "../../components/did/ConsentPanel";
 import { DangerZone } from "../../components/did/DangerZone";
@@ -81,13 +81,10 @@ function DidDetailScreen() {
     ({ background }) => api.getDid(mnemonic, { background }),
     { enabled },
   );
-  const logQuery = useTrustTaskQuery(
-    [...key, "log"],
-    ({ background }) => api.getDidLog(mnemonic, { background }),
-    { enabled },
-  );
   const didDetail = detailQuery.data ?? null;
-  const logEntries = logQuery.data ?? NO_ENTRIES;
+  // `getDid` already read the log for its summary; its entries are the
+  // log shown here, so the page reads `did/log` once per load.
+  const logEntries = didDetail?.entries ?? NO_ENTRIES;
 
   const reload = useCallback(() => void invalidateQueries(key), [key]);
 
@@ -162,7 +159,9 @@ function DidDetailScreen() {
     // dispatched to this tab.
     readLog: () => api.getDidLog(mnemonic, { background: true }),
     onMovedOn: (entries) => {
-      setQueryData([...key, "log"], entries);
+      setQueryData<DidDetailResponse | undefined>([...key, "detail"], (prev) =>
+        prev ? { ...prev, entries } : prev,
+      );
       // Background reads, like the watch that noticed: no operator did this.
       void api
         .getDid(mnemonic, { background: true })
@@ -383,7 +382,7 @@ function DidDetailScreen() {
 
         {didDetail?.log && <DidDetailsCard detail={didDetail} />}
 
-        <UsageChart mnemonic={mnemonic} />
+        <LazyUsageChart mnemonic={mnemonic} />
 
         {logEntries.length > 0 && (
           <DidDocumentCard
