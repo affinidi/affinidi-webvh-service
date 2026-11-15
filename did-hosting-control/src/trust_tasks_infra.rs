@@ -77,20 +77,23 @@ use crate::server::AppState;
 /// route back into ourselves. The sync and domain `#response` acks are the
 /// other way round — edges emit them, we receive them.
 pub fn owns(type_uri: &str) -> bool {
-    matches!(
-        type_uri,
-        MSG_SERVER_REGISTER
-            | MSG_HEALTH_PONG
-            | MSG_STATS_SYNC
-            | MSG_SYNC_UPDATE_ACK
-            | MSG_SYNC_BATCH_ACK
-            | MSG_SYNC_DELETE_ACK
-            | MSG_REPLICA_DOMAIN_ASSIGN_ACK
-            | MSG_REPLICA_DOMAIN_UNASSIGN_ACK
-            | MSG_REPLICA_DOMAIN_PURGE_ACK
-            | MSG_REPLICA_DOMAIN_UPSERT_ACK
-    )
+    INFRA_TASK_URIS.contains(&type_uri)
 }
+
+/// Every Type URI [`owns`] claims, in one list the Trust Task catalogue
+/// (`docs/trust-tasks.md`) is generated from.
+pub const INFRA_TASK_URIS: &[&str] = &[
+    MSG_SERVER_REGISTER,
+    MSG_HEALTH_PONG,
+    MSG_STATS_SYNC,
+    MSG_SYNC_UPDATE_ACK,
+    MSG_SYNC_BATCH_ACK,
+    MSG_SYNC_DELETE_ACK,
+    MSG_REPLICA_DOMAIN_ASSIGN_ACK,
+    MSG_REPLICA_DOMAIN_UNASSIGN_ACK,
+    MSG_REPLICA_DOMAIN_PURGE_ACK,
+    MSG_REPLICA_DOMAIN_UPSERT_ACK,
+];
 
 /// What an infrastructure task's proof must be: every one is an operational
 /// message an edge (or a configured watcher, for its acknowledgements) signs

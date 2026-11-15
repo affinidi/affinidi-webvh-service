@@ -1,18 +1,21 @@
 # Affinidi DID Hosting Server
 
-The DID Hosting Server is a read-only DID hosting edge node for
-[WebVH](https://www.w3.org/TR/did-web-vh/) DIDs. It serves DID
-documents publicly and is fed by its
+The DID Hosting Server is a read-only DID hosting **edge** for
+[WebVH](https://www.w3.org/TR/did-web-vh/) (and `did:web` / `did:webs`)
+DIDs. It serves DID documents publicly and is fed by its
 [control plane](../did-hosting-control/) with signed Trust Tasks —
 `webvh/sync/*` and `did-management/replica/domain/*` — over TSP,
-DIDComm or HTTPS (`POST /api/trust-tasks`).
+DIDComm or HTTPS (`POST /api/trust-tasks`), whichever the edge's DID document
+advertises.
 
 All DID lifecycle management (create, publish, delete) is handled
 by the control plane. The edge has no management API, no sessions and
 no ACL: the only party it takes directives from is its configured
 `control_did`, established from each document's proof. It does not
-start without one. For a single-host deployment, use the
-[daemon](../did-hosting-daemon/) instead.
+start without one. An edge is a cache: it can be wiped and rebuilt from its
+control plane. For a single-host deployment, use the
+[daemon](../did-hosting-daemon/) instead. See
+[docs/architecture.md](../docs/architecture.md) for how the pieces fit.
 
 > **IMPORTANT:**
 > did-hosting-service crates are provided "as is" without any
@@ -24,79 +27,40 @@ start without one. For a single-host deployment, use the
 
 ## Getting Started
 
-This guide walks you through building the server, obtaining
-credentials from your Affinidi Trust Context (VTA), and running
-the interactive setup wizard.
-
 ### Prerequisites
 
-- Rust 1.94.0+ (2024 Edition)
-- A VTA credential (base64url string) for the server's VTA context
+- Rust: the workspace MSRV is `rust-version` in the root
+  [`Cargo.toml`](../Cargo.toml) (2024 edition).
+- A VTA context for the edge's own DID, and the DID of the control plane
+  that will drive it.
 
-### 1. Clone and build
+### 1. Build
 
 ```bash
-git clone https://github.com/affinidi/did-hosting-service.git
-cd did-hosting-service
+git clone https://github.com/affinidi/affinidi-webvh-service.git
+cd affinidi-webvh-service
 cargo build --locked -p did-hosting-server --release
 ```
 
-The binary is produced at `target/release/did-hosting-server`.
+The binary is produced at `target/release/did-hosting-server`. Or install
+it with `cargo install did-hosting-server --locked` (`--locked` installs the
+dependency versions this release was tested against).
 
-Alternatively, you can install the server directly with Cargo:
-
-```bash
-cargo install did-hosting-server --locked
-```
-
-`--locked` installs the exact dependency versions this release was built
-and tested against. Without it, Cargo ignores the published lockfile and
-re-resolves to the newest semver-compatible versions of every dependency,
-which can pull in an upstream release that has not been tested against
-this one.
-
-### 2. Run the setup wizard
+### 2. Run setup
 
 ```bash
-did-hosting-server setup
-```
-
-For CI / scripted deployments, drop the wizard prompts and use a
-declarative recipe:
-
-```bash
-# Online (after `setup --setup-key-out` enrolment of an ephemeral did:key):
+did-hosting-server setup                                   # interactive
 did-hosting-server setup --from examples/did-hosting-server-build.toml \
-                   --setup-key-file setup.key
-
-# Air-gapped (both phases non-interactive):
-did-hosting-server setup --from recipe.toml   # phase 1: writes bootstrap-request.json
-# (operator ferries to VTA admin, gets sealed bundle back)
-did-hosting-server setup --from recipe.toml   # phase 2 (vta_mode = "offline-complete"
-                                        # + bundle_path + expect_digest set)
+                         --setup-key-file setup.key        # non-interactive
 ```
 
-See [docs/bootstrap_startup.md](../docs/bootstrap_startup.md#non-interactive-setup-recipe-driven)
-for the recipe schema, env-var overlay, exit codes, and reprovision
-safety.
-
-The wizard walks you through all required configuration:
-
-- **VTA credential** — authenticates with the server's VTA
-  context and creates the root DID automatically
-- **Features** — enable DIDComm messaging and/or REST API
-- **Public URL** — the externally reachable URL of this server
-- **Control plane** — URL and DID of the did-hosting-control service
-- **Host / port** — listen address (default: `0.0.0.0:8530`)
-- **Log level / format** — logging configuration
-- **Data directory** — persistent storage path
-- **Secrets backend** — where to store private key material
-  (OS keyring, AWS Secrets Manager, or GCP Secret Manager)
-- **Admin bootstrap** — enter an existing DID or generate a
-  new `did:key` identity
-
-The wizard writes `config.toml` (without any key material) and
-stores the server's private keys in the chosen secrets backend.
+The wizard asks how to reach the VTA (online, or the two air-gapped
+phases), provisions the edge's own `did:webvh` from its public URL, and asks
+for the **control plane's DID** (required), the listen address (default
+`0.0.0.0:8530`), logging, the data directory and the secrets backend. It
+writes `config.toml` (no key material) and stores the keys in the secrets
+backend. Recipes, the air-gapped flow and exit codes are in
+[docs/bootstrap_startup.md](../docs/bootstrap_startup.md#non-interactive-setup-recipe-driven).
 
 ### 3. Start the server
 
@@ -104,84 +68,42 @@ stores the server's private keys in the chosen secrets backend.
 did-hosting-server --config config.toml
 ```
 
-On startup the server loads secrets from the configured backend.
-If no secrets are found it exits with an error directing you to
-run `did-hosting-server setup` first.
+The edge registers itself with its control plane: it sends a signed
+`server/register` on startup over its mediator connection, and the control plane's administrator assigns
+it domains (see [bootstrap_startup.md](../docs/bootstrap_startup.md)).
 
 ## Configuration
 
-The server is configured via a TOML file. By default it looks
-for `config.toml` in the current directory. You can specify a
-different path with the `--config` flag or the
-`DID_HOSTING_CONFIG_PATH` environment variable.
-
-### Example `config.toml`
+Every key and environment variable is listed in
+[docs/configuration.md](../docs/configuration.md). The env prefix is
+`DID_HOSTING_` (the deprecated `WEBVH_` names are still read; the
+`DID_HOSTING_` name wins). A minimal edge:
 
 ```toml
-# Server DID identity (required: the control plane addresses and verifies it)
-server_did = "did:webvh:webvh.example.com"
-mediator_did = "did:webvh:mediator.example.com"
-public_url = "https://webvh.example.com"
-# The control plane that drives this edge (required)
-control_did = "did:webvh:control.example.com"
+server_did = "did:webvh:<scid>:edge1.example.com"   # written by setup
+mediator_did = "did:webvh:mediator.example.com"     # omit for HTTP-only
+public_url = "https://edge1.example.com"
+control_did = "did:webvh:<scid>:control.example.com"  # required
 
 [features]
 didcomm = true
-# agent_names = true   # serve GET /@alice -> 302 to the DID. On by default;
-                       # set false to leave the /@… namespace unserved.
+tsp = true
 
 [server]
-host = "0.0.0.0"    # Bind address
-port = 8530          # Bind port
-# trusted_proxies = ["10.0.0.0/20"]  # load balancer addresses or subnets: read X-Forwarded-For
-# client_ipv6_prefix = 64            # per-address limits count an IPv6 client by this network (1-128)
-
-[server.resolve_cache]                      # Cache-Control on DID resolution
-max_age_secs = 300                          # max-age; 0 sends no-cache (default 300)
-# shared_max_age_secs = 3600                # s-maxage for CDNs/proxies only
-# stale_while_revalidate_secs = 60          # serve stale while refetching
-
-# [server.resolve_rate_limit]               # Per-client limit on resolution (off by default)
-# max_per_window = 500                      # requests per address per window; then 429
-# window_secs = 10                          # refill window (default 10, at most 3600)
-
-[log]
-level = "info"       # trace, debug, info, warn, error
-format = "text"      # text or json
+host = "0.0.0.0"
+port = 8530
+# Behind a reverse proxy, list it in both (see docs/deployment.md):
+# trusted_proxies = ["10.0.0.0/20"]
+# trusted_proxy_cidrs = ["10.0.0.0/20"]
 
 [store]
-data_dir = "data/did-hosting-server"   # Persistent data directory (fjall)
-
-[auth]
-cleanup_ttl_minutes = 60                    # Empty DID cleanup (minutes)
+data_dir = "data/did-hosting-server"
 
 [secrets]
-keyring_service = "webvh"                   # OS keyring service name (default backend)
-# aws_secret_name = "did-hosting-server-secrets"  # Use AWS Secrets Manager instead
-# aws_region = "us-east-1"
-# gcp_project = "my-project"               # Use GCP Secret Manager instead
-# gcp_secret_name = "did-hosting-server-secrets"
-# vault_addr = "https://vault.example.com:8200"    # Use HashiCorp Vault instead
-# vault_secret_path = "webvh/server-secrets"       # KV v2 path (mount defaults to "secret")
-# vault_auth_method = "kubernetes"                 # kubernetes (default) | token | approle
-# vault_k8s_role = "did-hosting-server"            # Vault role, for kubernetes auth
-# k8s_secret_name = "did-hosting-server-secrets"   # Use a native Kubernetes Secret instead
-# k8s_namespace = "webvh"                          # optional; defaults to the pod's namespace
-
-[limits]
-upload_body_limit = 102400                  # Max Trust Task body over HTTPS (floor 1 MiB)
-
-[replication]
-staleness_bound_secs = 300                  # /api/health answers 503 past this (default 5 min)
-reconcile_interval_secs = 60                # How often to reconcile with the control plane
+keyring_service = "webvh"
 ```
 
-Private keys (signing, key agreement, JWT signing) are **not**
-stored in the config file. They are managed by the secrets
-backend selected during `did-hosting-server setup`. See
-[Secrets Backends](#secrets-backends) below.
-
-#### Replication staleness bound
+### Replication
 
 The control plane delivers every change through its durable outbox and
 retries until the edge acknowledges it. As the backstop, the edge
@@ -219,200 +141,6 @@ has been unreachable the whole time. A load balancer or supervisor relying
 solely on `/api/health` to detect a genuinely stuck edge should also watch
 for repeated restarts, not just probe failures.
 
-#### Limits
-
-- **`upload_body_limit`** — Maximum body of a `POST /api/trust-tasks`
-  request. Never below 1 MiB, so the control plane's largest
-  `sync/batch` always fits.
-
-Per-account quotas are the control plane's concern: an edge serves
-whatever its control plane has accepted.
-
-### Secrets Backends
-
-Private key material is stored outside the config file in a
-pluggable secrets backend. The backend is selected at compile
-time via feature flags and at runtime via config/env vars.
-
-| Backend              | Feature flag    | Config fields                                                                  |
-| -------------------- | --------------- | ------------------------------------------------------------------------------ |
-| OS Keyring (default) | `keyring`       | `secrets.keyring_service`                                                      |
-| AWS Secrets Manager  | `aws-secrets`   | `secrets.aws_secret_name`, `secrets.aws_region`                                |
-| GCP Secret Manager   | `gcp-secrets`   | `secrets.gcp_project`, `secrets.gcp_secret_name`                               |
-| Azure Key Vault      | `azure-secrets` | `secrets.azure_vault_url`, `secrets.azure_secret_name`                         |
-| HashiCorp Vault      | `vault-secrets` | `secrets.vault_addr`, `secrets.vault_secret_path`, `secrets.vault_auth_method` (`kubernetes`/`token`/`approle`) |
-| Kubernetes Secret    | `k8s-secrets`   | `secrets.k8s_secret_name`, `secrets.k8s_namespace`                             |
-| Plaintext (tests)    | *(always)*      | `secrets.backend = "plaintext"` + `secrets.confirm_plaintext = true` — **tests only**, keys in a clear-text file beside the config |
-
-Every backend is the published [`vti-secrets`](https://crates.io/crates/vti-secrets)
-crate, shared with the VTA and VTC. The OS keyring is the default. A host
-where it cannot be opened (a headless Linux box with no Secret Service) is
-refused at setup with the list of secure backends above: nothing falls back
-to plaintext. Set `secrets.backend` to name the backend explicitly.
-
-The server stores its key material as a JSON-serialized record
-in the backend:
-
-- **signing_key** — Ed25519 private key for server DID signing
-- **key_agreement_key** — X25519 private key for DIDComm
-  encryption
-- **jwt_signing_key** — Ed25519 private key for JWT token
-  signing
-- **vta_credential** — VTA credential for re-authentication
-  (optional)
-
-Keys are stored in multibase format (Base58BTC with multicodec
-type prefix), which is self-describing and can be directly
-loaded as `Secret` objects.
-
-To compile with a non-default backend:
-
-```bash
-# AWS Secrets Manager
-cargo build --locked -p did-hosting-server --release --features aws-secrets
-
-# GCP Secret Manager
-cargo build --locked -p did-hosting-server --release --features gcp-secrets
-
-# HashiCorp Vault (Kubernetes / token / AppRole auth)
-cargo build --locked -p did-hosting-server --release --features vault-secrets
-
-# Native Kubernetes Secret
-cargo build --locked -p did-hosting-server --release --features k8s-secrets
-
-# Multiple backends
-cargo build --locked -p did-hosting-server --release --features "keyring,aws-secrets"
-```
-
-### Storage Backends
-
-The storage layer is pluggable — exactly one backend must be
-selected at compile time via feature flags. The default backend
-is **fjall**, an embedded key-value store that requires no
-external services.
-
-| Backend                   | Feature flag      | Config fields                                                                                                |
-| ------------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------ |
-| Fjall (default, embedded) | `store-fjall`     | `store.data_dir`                                                                                             |
-| Redis                     | `store-redis`     | `store.redis_url`                                                                                            |
-| AWS DynamoDB              | `store-dynamodb`  | `store.dynamodb_table_prefix`, `store.dynamodb_region`, `store.dynamodb_billing_mode`, `store.dynamodb_auto_create` |
-| Google Firestore          | `store-firestore` | `store.firestore_project`, `store.firestore_database`                                                        |
-| Azure Cosmos DB           | `store-cosmosdb`  | `store.cosmosdb_connection_string`, `store.cosmosdb_database`, `store.cosmosdb_container`, `store.cosmosdb_region` |
-
-A DID's whole log is stored as one item, so a backend's item size limit is
-the largest log it can hold: about 400 KB on DynamoDB, and about 750 KB on
-Firestore (1 MiB, with the log stored base64-encoded). The other backends hold
-any log `did/register` accepts (1 MiB). An update that would take a log past
-the limit is refused with the size in its message, and the DID keeps its last
-version; with 2.3 KB entries, a DynamoDB-backed DID takes about 170 updates.
-A DID at its limit takes no further entry, a deactivation or key rotation
-included. An edge whose store holds less than its control plane's refuses
-the larger logs and keeps serving the versions it had (the control plane logs
-a warning), so give edges a store whose limit is at least the control
-plane's.
-
-A change that spans several items (a DID's record, log, witness file and
-agent names) is written atomically. On DynamoDB that is one transaction,
-which takes at most 100 writes and 4 MB, so a single change over either is
-refused with nothing written rather than split. Only a DID with close to 100
-agent names, or with a log and witness file together near 4 MB, comes near
-it. On Firestore it is one commit, of at most 500 writes and about 10 MB.
-`backup restore` is a bulk load and is split across as many transactions as
-it needs.
-
-To build with a non-default storage backend:
-
-```bash
-cargo build --locked -p did-hosting-server --release \
-  --no-default-features --features "keyring,store-redis"
-```
-
-> **Note:** Enabling more than one `store-*` feature or zero
-> `store-*` features will produce a compile error (enforced by
-> `did-hosting-server/build.rs`).
-
-### DID method features
-
-The public DID-resolution routes (`GET /{mnemonic}/did.jsonl`,
-`GET /{mnemonic}/did.json`, the `.well-known` variants) are gated
-at compile time by **method features**. At least one must be
-enabled for any DID to be resolvable.
-
-| Feature        | What it enables                                       |
-| -------------- | ----------------------------------------------------- |
-| `method-webvh` | did:webvh resolution (`/did.jsonl`, `/did-witness.json`) |
-| `method-web`   | did:web resolution (`/did.json`)                      |
-
-Both ship in the default feature set, so the most common builds
-need no special handling:
-
-```bash
-cargo build --locked -p did-hosting-server --release
-cargo install did-hosting-server --locked
-```
-
-> **Heads-up if you build with `--no-default-features`:** the
-> method gates come off too. A build that drops `method-webvh`
-> will compile, start, load DIDs from the store, and then 404
-> every `/{mnemonic}/did.jsonl` request with an **empty response
-> body** (the per-method dispatcher in
-> `did_public::serve_public` is `#[cfg]`-gated out). If you go
-> minimal, opt the methods back in explicitly:
->
-> ```bash
-> cargo build --locked -p did-hosting-server --release \
->   --no-default-features \
->   --features "keyring,store-fjall,method-webvh,method-web"
-> ```
-
-### Environment Variable Overrides
-
-Every config field can be overridden via environment variables
-with the `DID_HOSTING_` prefix. Before 0.10.1 the shared settings below
-(`FEATURES_*`, `SERVER_*`, `LOG_*`, `STORE_*`, `AUTH_*`, `SECRETS_*`,
-`CLEANUP_TTL_MINUTES`) were read only under `WEBVH_`. Those names still
-work but are deprecated, and the `DID_HOSTING_` name wins when both are set.
-
-| Variable                              | Description                        |
-| ------------------------------------- | ---------------------------------- |
-| `DID_HOSTING_CONFIG_PATH`                   | Path to config file                |
-| `DID_HOSTING_SERVER_DID`                    | Server DID identifier              |
-| `DID_HOSTING_PUBLIC_URL`                    | Public URL of the server           |
-| `DID_HOSTING_MEDIATOR_DID`                  | Mediator DID identifier            |
-| `DID_HOSTING_FEATURES_DIDCOMM`             | Enable DIDComm (`1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off`; anything else is refused) |
-| `DID_HOSTING_SERVER_HOST`                   | Bind host                          |
-| `DID_HOSTING_SERVER_PORT`                   | Bind port                          |
-| `DID_HOSTING_LOG_LEVEL`                     | Log level                          |
-| `DID_HOSTING_LOG_FORMAT`                    | Log format (`text` / `json`)       |
-| `DID_HOSTING_STORE_DATA_DIR`               | Data directory path (fjall)        |
-| `DID_HOSTING_AUTH_ACCESS_EXPIRY`            | Access token expiry (sec)          |
-| `DID_HOSTING_AUTH_REFRESH_EXPIRY`           | Refresh token expiry (sec)         |
-| `DID_HOSTING_AUTH_CHALLENGE_TTL`            | Auth challenge TTL (sec)           |
-| `DID_HOSTING_AUTH_SESSION_CLEANUP_INTERVAL` | Session cleanup interval (sec)     |
-| `DID_HOSTING_CLEANUP_TTL_MINUTES`          | Empty DID cleanup TTL (min)        |
-| `DID_HOSTING_SECRETS_KEYRING_SERVICE`       | Keyring service name               |
-| `DID_HOSTING_SECRETS_AWS_SECRET_NAME`       | AWS Secrets Manager secret name    |
-| `DID_HOSTING_SECRETS_AWS_REGION`            | AWS region                         |
-| `DID_HOSTING_SECRETS_GCP_PROJECT`           | GCP project ID                     |
-| `DID_HOSTING_SECRETS_GCP_SECRET_NAME`       | GCP Secret Manager secret name     |
-| `DID_HOSTING_LIMITS_UPLOAD_BODY_LIMIT`      | Max upload body size (bytes)       |
-| `DID_HOSTING_LIMITS_DEFAULT_MAX_TOTAL_SIZE` | Per-account total DID size (bytes) |
-| `DID_HOSTING_LIMITS_DEFAULT_MAX_DID_COUNT`  | Per-account max DID count          |
-| `DID_HOSTING_SERVER_RESOLVE_CACHE_MAX_AGE_SECS` | Resolve `max-age` (0 = `no-cache`) |
-| `DID_HOSTING_SERVER_RESOLVE_CACHE_SHARED_MAX_AGE_SECS` | Resolve `s-maxage` (empty clears) |
-| `DID_HOSTING_SERVER_RESOLVE_CACHE_STALE_WHILE_REVALIDATE_SECS` | Resolve `stale-while-revalidate` (empty clears) |
-| `DID_HOSTING_REPLAY_MAX_ENTRIES`            | Replay cache records, all signers (default 1,000,000, about 32 MB) |
-| `DID_HOSTING_REPLAY_MAX_ENTRIES_PER_SIGNER` | Replay cache records per signer (default 250,000, about 600 signed requests a second) |
-| `DID_HOSTING_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW` | Resolution requests per client address per window (empty clears: no limit) |
-| `DID_HOSTING_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS` | Resolution rate-limit window (default 10; empty restores it) |
-| `DID_HOSTING_SERVER_TRUSTED_PROXIES` | Comma-separated proxy addresses or CIDR ranges whose `X-Forwarded-For` is trusted (empty clears) |
-
-The replay settings live in `[replay]` (`max_entries`,
-`max_entries_per_signer`). Every sync document is signed by the control plane, so the per-signer
-bound caps how fast this edge follows DID changes (about 600 a second at
-the default). The deprecated `WEBVH_REPLAY_*` names are still read. The control plane's README explains the
-bounds ("Replay cache bounds").
-
 ### Resolution rate limit
 
 Resolution is public and unauthenticated, and each request reads the store.
@@ -448,100 +176,136 @@ When sizing `max_per_window`:
   flood from that many addresses (or IPv6 /64s) also delays new clients. A
   CDN or web application firewall is the defence against that.
 
-## Building
+## Secrets backends
 
-### Default (with OS keyring)
+Private key material (the edge's signing and key-agreement keys) is kept
+outside the config file, in the backend `[secrets]` names. The OS keyring is
+the default; the others are build features:
+
+| Backend | Feature | Config fields |
+| --- | --- | --- |
+| OS keyring (default) | `keyring` | `keyring_service` |
+| AWS Secrets Manager | `aws-secrets` | `aws_secret_name`, `aws_region` |
+| GCP Secret Manager | `gcp-secrets` | `gcp_project`, `gcp_secret_name` |
+| Azure Key Vault | `azure-secrets` | `azure_vault_url`, `azure_secret_name` |
+| HashiCorp Vault | `vault-secrets` | `vault_addr`, `vault_secret_path`, `vault_auth_method` |
+| Kubernetes Secret | `k8s-secrets` | `k8s_secret_name`, `k8s_namespace` |
+| Plaintext (tests only) | always | `backend = "plaintext"` + `confirm_plaintext = true` |
+
+Every backend is the published [`vti-secrets`](https://crates.io/crates/vti-secrets)
+crate, shared with the VTA and VTC. A host where the keyring cannot be
+opened is refused at setup: nothing falls back to plaintext.
 
 ```bash
-cargo build --locked -p did-hosting-server --release
+cargo build --locked -p did-hosting-server --release --features vault-secrets
 ```
 
-This builds with the `keyring` and `store-fjall` features
-enabled by default.
+## Storage backends
 
-## CLI Commands
+The storage layer is pluggable — exactly one backend must be
+selected at compile time via feature flags. The default backend
+is **fjall**, an embedded key-value store that requires no
+external services.
+
+| Backend                   | Feature flag      | Config fields                                                                                                |
+| ------------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------ |
+| Fjall (default, embedded) | `store-fjall`     | `store.data_dir`                                                                                             |
+| Redis                     | `store-redis`     | `store.redis_url`                                                                                            |
+| AWS DynamoDB              | `store-dynamodb`  | `store.dynamodb_table_prefix`, `store.dynamodb_region`, `store.dynamodb_billing_mode`, `store.dynamodb_auto_create` |
+| Google Firestore          | `store-firestore` | `store.firestore_project`, `store.firestore_database`                                                        |
+| Azure Cosmos DB           | `store-cosmosdb`  | `store.cosmosdb_connection_string`, `store.cosmosdb_database`, `store.cosmosdb_container`, `store.cosmosdb_region` |
+
+A DID's whole log is stored as one item, so a backend's item size limit is
+the largest log it can hold: about 400 KB on DynamoDB, and about 750 KB on
+Firestore (1 MiB, with the log stored base64-encoded). The other backends hold
+any log `did/register` accepts (1 MiB). An update that would take a log past
+the limit is refused with the size in its message, and the DID keeps its last
+version; with 2.3 KB entries, a DynamoDB-backed DID takes about 170 updates.
+A DID at its limit takes no further entry, a deactivation or key rotation
+included. An edge whose store holds less than its control plane's refuses
+the larger logs and keeps serving the versions it had (the control plane logs
+a warning), so give edges a store whose limit is at least the control
+plane's.
+
+A change that spans several items (a DID's record, log, witness file and
+agent names) is written atomically. On DynamoDB that is one transaction,
+which takes at most 100 writes and 4 MB, so a single change over either is
+refused with nothing written rather than split. Only a DID with close to 100
+agent names, or with a log and witness file together near 4 MB, comes near
+it. On Firestore it is one commit, of at most 500 writes and about 10 MB.
+`backup restore` is a bulk load and is split across as many transactions as
+it needs.
+
+## DID method features
+
+| Feature | Default | Serves |
+| --- | --- | --- |
+| `method-webvh` | on | `did.jsonl`, `did-witness.json` |
+| `method-web` | on | `did.json` (a `did:web` record, or the `did:web` form of a `did:webvh`) |
+| `method-webs` | off | `keri.cesr`, and `did.json` for `did:webs` records (pulls the KERI stack; see [did-webs-hosting.md](../docs/did-webs-hosting.md)) |
+
+A build with `--no-default-features` drops the method features too, and an
+edge with no method compiled in 404s every resolution. Opt them back in:
+
+```bash
+cargo build --locked -p did-hosting-server --release \
+  --no-default-features --features "keyring,store-fjall,method-webvh,method-web"
+```
+
+## HTTP endpoints
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/api/health` | Liveness probe; `503` when the edge's own DID is not served locally or it is past the staleness bound |
+| `POST` | `/api/trust-tasks` | The HTTPS binding of the edge's Trust Task listener (its control plane only) |
+| `GET` | `/{mnemonic}/did.jsonl`, `/.well-known/did.jsonl` | `did:webvh` log |
+| `GET` | `/{mnemonic}/did-witness.json`, `/.well-known/did-witness.json` | `did:webvh` witness proofs |
+| `GET` | `/{mnemonic}/did.json`, `/.well-known/did.json` | `did:web` document (`method-web`; `did:webs` with `method-webs`) |
+| `GET` | `/{mnemonic}/keri.cesr` | `did:webs` key event log (`method-webs`) |
+| `GET` | `/@`, `/@{name}`, `/@{name}/{context}` | Agent-name redirect (`302` to the DID); `404` when unbound or `features.agent_names` is off |
+
+[`docs/openapi.json`](../docs/openapi.json) is generated from these handlers
+(a test keeps it current). There is no management API, and no metrics scrape
+endpoint: the control plane reads an edge's metrics with the signed
+`server/metrics` Trust Task (see [docs/metrics.md](../docs/metrics.md)).
+
+## CLI commands
 
 Every subcommand, with its full `--help`, is in
-[`docs/cli-reference.md`](../docs/cli-reference.md), generated from the CLI
-(a test keeps it current). Below is a summary. `health` exits non-zero when a
-check fails (`--strict`: also when one warns).
+[`docs/cli-reference.md`](../docs/cli-reference.md). `health` exits non-zero
+when a check fails (`--strict`: also when one warns).
 
 ```
 did-hosting-server                      # Run server (default)
-did-hosting-server setup                # Interactive config wizard
-did-hosting-server setup --from <recipe.toml>  # Non-interactive — see below
-did-hosting-server uninstall            # Teardown: clear secrets + remove config
-did-hosting-server health               # Run health check diagnostics
-did-hosting-server list-dids            # List all DIDs in the store
-did-hosting-server remove-did           # Remove a DID from the store
-did-hosting-server dump-did             # Dump DID log for a path
-did-hosting-server load-did             # Load a DID at an arbitrary path
-did-hosting-server bootstrap-did        # Bootstrap a DID (defaults to .well-known)
-did-hosting-server recreate-did         # Recreate a DID at a given path
-did-hosting-server recover-did          # Recover a soft-deleted DID
-did-hosting-server import-secrets       # Import secrets from VTA bundle or keys
-did-hosting-server backup               # Export data to backup file
-did-hosting-server restore              # Restore data from backup file
+did-hosting-server setup                # Interactive or --from <recipe> setup
+did-hosting-server uninstall            # Clear managed secrets + remove config
+did-hosting-server health [--strict]    # Diagnostics
+did-hosting-server identity-list        # This node's identity generations
+did-hosting-server list-dids | dump-did | load-did | remove-did | recover-did
+did-hosting-server bootstrap-did | recreate-did
+did-hosting-server backup | restore
+did-hosting-server export-sealed | import-sealed | import-secrets
 ```
 
-### Backup & Restore
+### Backup and restore
 
 ```bash
-# Backup to default file (did-hosting-backup.json)
-did-hosting-server backup
-
-# Backup to a specific file
 did-hosting-server backup --output /path/to/backup.json
-
-# Restore data and config.toml
 did-hosting-server restore --input /path/to/backup.json
 ```
 
-A restore checks the whole backup before it writes anything, `config.toml`
-included. Each restored log must verify, match its record, and extend both the
-backup's own high-water mark and what the store already holds for that DID,
-including the mark it keeps after a delete. Otherwise the restore is refused
-and nothing is written.
+The backup (format version 3) is one JSON document holding the effective
+configuration and the edge's keyspaces: `dids`, `stats`, `domains`,
+`assignments`, `pending_purges`, `registry`, `timeseries`, `meta` and
+`witnesses`. It holds no ACL and no sessions (an edge has neither) and no
+private keys (those live in the secrets backend). A restore checks the whole
+backup before writing anything: each log must verify, match its record and
+extend what the store already holds. Re-running an interrupted restore is
+safe. Since an edge is a cache, rebuilding it from its control plane
+(register it again on an empty store) is usually simpler than restoring it;
+see [docs/backup-and-upgrade.md](../docs/backup-and-upgrade.md).
 
-- To start from a backup's state, restore into an empty data directory. That
-  works for any consistent backup. A backup whose own log is behind its own
-  high-water mark (a store an earlier version's `load-did` wrote an older log
-  into) is refused even then, with a message that says so.
-- The data goes into the store the backup's config names, after the same
-  environment overrides the service applies (`DID_HOSTING_STORE_DATA_DIR`
-  among them). If the running service uses a different data directory, set
-  that variable, or move the data afterwards.
-- If a restore is interrupted, run it again. Re-running is safe.
-
-`load-did` follows the same rule, and also verifies the log's chain and
-witness proofs.
-
-The backup file is a single JSON document containing:
-
-- **config** — the effective server configuration at backup time
-- **dids** — all DID documents and logs
-- **acl** — access control entries
-- **stats** — DID resolution statistics
-
-Ephemeral data (active sessions, refresh tokens, auth
-challenges) is excluded. All keys and values are base64url
-encoded.
-
-## HTTP Endpoints
-
-| Method | Path                            | Description     |
-| ------ | ------------------------------- | --------------- |
-| `GET`  | `/api/health`                   | Liveness probe; 503 past the staleness bound |
-| `POST` | `/api/trust-tasks`              | Trust Task listener (HTTPS binding) |
-| `GET`  | `/{mnemonic}/did.jsonl`         | Resolve DID log |
-| `GET`  | `/{mnemonic}/did-witness.json`  | Resolve witness |
-| `GET`  | `/.well-known/did.jsonl`        | Root DID log    |
-| `GET`  | `/.well-known/did-witness.json` | Root witness    |
-
-There is no management API. DIDs, domains and their state reach the
-edge only as Trust Tasks signed by its control plane.
-
-## Performance Testing
+## Performance testing
 
 The `perf_test` example is an interactive TUI benchmarking tool
 for load-testing a running DID Hosting server. It sends concurrent DID
@@ -613,25 +377,12 @@ If you face any issues or have suggestions, please don't
 hesitate to contact us using
 [this link](https://share.hsforms.com/1i-4HKZRXSsmENzXtPdIG4g8oa2v).
 
-### Reporting technical issues
-
-If you have a technical issue with the Affinidi DID Hosting Service
-codebase, you can also create an issue directly in GitHub.
-
-1. Ensure the bug was not already reported by searching on
-   GitHub under
-   [Issues](https://github.com/affinidi/did-hosting-service/issues).
-
-2. If you're unable to find an open issue addressing the
-   problem,
-   [open a new one](https://github.com/affinidi/did-hosting-service/issues/new).
-   Be sure to include a **title and clear description**, as
-   much relevant information as possible, and a **code sample**
-   or an **executable test case** demonstrating the expected
-   behaviour that is not occurring.
+If you have a technical issue with the codebase, search the
+[issues](https://github.com/affinidi/affinidi-webvh-service/issues) and, if
+it is not there,
+[open a new one](https://github.com/affinidi/affinidi-webvh-service/issues/new)
+with a clear description and, ideally, a failing test.
 
 ## Contributing
 
-Want to contribute? Head over to our
-[CONTRIBUTING](https://github.com/affinidi/did-hosting-service/blob/main/CONTRIBUTING.md)
-guidelines.
+See [CONTRIBUTING.md](../CONTRIBUTING.md).

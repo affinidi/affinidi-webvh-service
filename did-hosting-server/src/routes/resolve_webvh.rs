@@ -150,6 +150,16 @@ pub async fn serve_root_did_log(
 }
 
 /// `GET /.well-known/did-witness.json` — root-DID witness.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/.well-known/did-witness.json",
+    tag = "resolve",
+    responses(
+        (status = 200, description = "Root DID's did:webvh witness proofs", content_type = "application/json"),
+        (status = 404, description = "No root DID, or no witness file, hosted on this domain"),
+        (status = 429, description = "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`", content_type = "application/json"),
+    ),
+))]
 pub async fn serve_root_witness(
     State(state): State<AppState>,
     request: Request,

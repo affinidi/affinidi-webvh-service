@@ -20,21 +20,28 @@ registry, and supports passkey (WebAuthn) sign-in.
 
 ### Prerequisites
 
-- Rust 1.94.0+ (2024 Edition)
-- Node.js 20+ (only if building with the management UI)
+- Rust: the workspace MSRV is `rust-version` in the root
+  [`Cargo.toml`](../Cargo.toml) (2024 edition).
+- Node.js: `engines.node` in
+  [`did-hosting-ui/package.json`](../did-hosting-ui/package.json)
+  (currently >= 24.3). The default build needs it: `ui` is a default
+  feature, and the build script runs `npm` to bundle the console when
+  `../did-hosting-ui` is present and the bundle is stale.
 
 ### 1. Build
 
 ```bash
-# Without UI
+# Default: with the embedded management UI (needs Node.js)
 cargo build --locked -p did-hosting-control --release
 
-# With embedded management UI
-cd did-hosting-ui && npm install && npm run build:web && cd ..
-cargo build --locked -p did-hosting-control --release --features ui
+# Without the UI (no Node.js needed)
+cargo build --locked -p did-hosting-control --release \
+  --no-default-features --features keyring,store-fjall
 ```
 
-The binary is produced at `target/release/did-hosting-control`.
+The binary is produced at `target/release/did-hosting-control`. A crate
+installed from crates.io (`cargo install did-hosting-control --locked`)
+carries a pre-built UI bundle and never runs Node.
 
 ### 2. Run the setup wizard
 
@@ -50,16 +57,11 @@ recipe handles online VTA flow (with `--setup-key-file`), the
 air-gapped `offline-prepare` / `offline-complete` pair, env-var
 overlays, and reprovision safety.
 
-The interactive wizard configures:
-
-- **Configuration file path** — where to write `config.toml`
-- **Server DID identity** — for DIDComm authentication
-- **Public URL** — for passkey (WebAuthn) RP origin
-- **Host / port** — listen address (default: `0.0.0.0:8532`)
-- **Log level / format** — logging configuration
-- **Data directory** — persistent storage path
-- **Secrets backend** — where to store private key material
-- **Admin bootstrap** — create an initial admin ACL entry
+The interactive wizard asks how to reach the VTA (online, or the two
+air-gapped phases), provisions the control plane's own `did:webvh` (hosting
+URL and path, messaging transport), then the public URL (the passkey
+origin), listen address (default `0.0.0.0:8532`), logging, data directory,
+secrets backend, and an initial admin ACL entry.
 
 ### 3. Start the control plane
 
@@ -67,15 +69,16 @@ The interactive wizard configures:
 did-hosting-control --config config.toml
 ```
 
-If built with `--features ui`, browse to
-`http://localhost:8532/` to access the management UI.
+With the default `ui` feature, browse to `http://localhost:8532/` for the
+management console (put TLS in front for anything but local use; see
+[docs/deployment.md](../docs/deployment.md)).
 
 ## Configuration
 
-The control plane is configured via a TOML file. By default it
-looks for `config.toml` in the current directory. You can specify
-a different path with the `--config` flag or the
-`CONTROL_CONFIG_PATH` environment variable.
+Every key and environment variable (prefix `CONTROL_`) is listed in
+[docs/configuration.md](../docs/configuration.md). The file is
+`config.toml` in the working directory unless `--config` or
+`CONTROL_CONFIG_PATH` names another; unknown keys are refused at load.
 
 ### Example `config.toml`
 
@@ -103,7 +106,7 @@ data_dir = "data/did-hosting-control"
 [auth]
 access_token_expiry = 900
 refresh_token_expiry = 86400
-challenge_ttl = 300
+challenge_ttl = 30
 passkey_enrollment_ttl = 86400
 # Longest a passkey invite's claim-code check waits for a free hashing slot
 # before it is answered `unavailable` with a retry time (milliseconds).
@@ -176,32 +179,11 @@ case-insensitive, and **exact** — `example.com` does not match
 - **Non-empty:** only listed hosts may be registered. If a backend is on an
   internal IP literal (e.g. `10.0.0.5`), list that literal exactly.
 
-### Environment Variable Overrides
+### Environment variable overrides
 
-Environment variables use the `CONTROL_` prefix:
-
-| Variable                                   | Description                  |
-| ------------------------------------------ | ---------------------------- |
-| `CONTROL_CONFIG_PATH`                      | Path to config file          |
-| `CONTROL_SERVER_DID`                       | Control plane DID            |
-| `CONTROL_MEDIATOR_DID`                     | Mediator DID                 |
-| `CONTROL_PUBLIC_URL`                       | Public URL (passkey origin)  |
-| `CONTROL_SERVER_HOST`                      | Bind host                    |
-| `CONTROL_SERVER_PORT`                      | Bind port                    |
-| `CONTROL_LOG_LEVEL`                        | Log level                    |
-| `CONTROL_SERVER_TRUSTED_PROXIES`           | Comma-separated proxy addresses or CIDR ranges whose `X-Forwarded-For` is trusted |
-| `CONTROL_REGISTRY_HEALTH_CHECK_INTERVAL`   | Health check interval (sec)  |
-| `CONTROL_REPLAY_MAX_ENTRIES`               | Replay cache records, all signers (default 1,000,000, about 32 MB) |
-| `CONTROL_REPLAY_MAX_ENTRIES_PER_SIGNER`    | Replay cache records per signer (default 250,000, about 600 signed requests a second) |
-| `CONTROL_GEOIP_DATABASE`                   | Local GeoIP `.mmdb` file for wallet sign-in locations (empty clears) |
-| `CONTROL_STATS_FLUSH_MAX_ROWS_PER_SECOND`  | Statistics rows the periodic flush writes a second, at most (default 20) |
-| `CONTROL_STATS_MODE`                       | Which DIDs keep 5-minute statistics: `auto` (busy ones, default), `fine` (all), `coarse` (none) |
-| `CONTROL_STATS_PROMOTE_PER_HOUR`           | Resolves in an hour that promote a DID to 5-minute statistics (default 60) |
-| `CONTROL_STATS_DEMOTE_PER_HOUR`            | Hourly resolves (last hour and day's average) below which it is demoted (default 20) |
-| `CONTROL_STATS_MAX_FINE_DIDS`              | Most DIDs promoted automatically (default 1,000) |
-
-The replay settings live in `[replay]` (`max_entries`,
-`max_entries_per_signer`); see "Replay cache bounds" below.
+Every setting above has a `CONTROL_`-prefixed variable (`CONTROL_SERVER_PORT`,
+`CONTROL_STORE_REDIS_URL`, `CONTROL_REPLAY_MAX_ENTRIES`, …); the full list is
+in [docs/configuration.md](../docs/configuration.md).
 
 ### Statistics flush budget
 
@@ -241,17 +223,22 @@ check fails (`--strict`: also when one warns).
 
 ```
 did-hosting-control                                    # Run control plane (default)
-did-hosting-control setup                              # Interactive config wizard
-did-hosting-control add-acl --did <DID> [--role admin|owner] [--label <name>]  # Add ACL entry
-did-hosting-control list-acl                           # List ACL entries
-did-hosting-control remove-acl --did <DID>             # Remove an ACL entry
+did-hosting-control setup                              # Interactive or --from <recipe> setup
+did-hosting-control add-acl --did <DID> [--role admin|owner|service|metricsReader]  # Add ACL entry (offline)
+did-hosting-control list-acl | remove-acl --did <DID>  # (offline)
 did-hosting-control invite --did <DID>                 # Create a passkey enrolment invite
 did-hosting-control health [--strict]                  # Health check (non-zero exit on failure)
 did-hosting-control uninstall                          # Teardown: clear secrets + remove config
-did-hosting-control stats-show --path <m>              # A DID's statistics tier (offline)
-did-hosting-control stats-set --path <m> --resolution auto|fine|coarse|off  # (offline)
-did-hosting-control stats-purge-legacy                 # Delete migrated legacy statistics now (offline)
+did-hosting-control stats-show | stats-set | stats-purge-legacy  # Statistics tiers (offline)
+did-hosting-control identity-list | identity-rotate-keys | identity-scid-alias | identity-retire-now
+did-hosting-control tsp-relationship-list | tsp-relationship-reset | tsp-relationship-delete
+did-hosting-control fetch-metrics --key <key.json>     # Read counters over the signed server/metrics task
 ```
+
+Everything an operator does to a running control plane beyond these is a
+Trust Task: through the console, or signed from the command line as
+[docs/sending-trust-tasks.md](../docs/sending-trust-tasks.md) describes. The
+catalogue of tasks is [docs/trust-tasks.md](../docs/trust-tasks.md).
 
 ## Features
 
@@ -274,10 +261,8 @@ The UI provides:
 
 Passkey/WebAuthn support is always compiled into the control plane.
 It is activated at runtime when a `public_url` is configured: the
-control plane then supports WebAuthn passkey enrollment and login,
-providing browser-based passwordless authentication alongside DIDComm
-challenge-response auth. Without a `public_url`, WebAuthn is not
-initialised and authentication falls back to DID challenge-response.
+control plane then supports passkey enrolment and login alongside wallet
+and DID sign-in. Without a `public_url`, WebAuthn is not initialised.
 
 ### Replay cache bounds
 
@@ -369,19 +354,16 @@ The control plane has no REST management API. Its HTTP surface is:
 | ------ | ---- | ----------- |
 | `POST` | `/api/trust-tasks` | The HTTPS binding of the Trust Task listener: the same dispatch TSP and DIDComm reach. Every management operation arrives here, authorised on the document's own proof. |
 | `GET` | `/api/health` | Unauthenticated liveness probe |
-| `POST` | `/api/auth/challenge` | Browser sign-in, step 1: a challenge for a SIOPv2 `id_token` |
-| `POST` | `/api/auth/` | Browser sign-in, step 2: redeem a SIOPv2 `id_token` minted by the holder's VTA |
-| `POST` | `/api/auth/refresh` | Renew a console session: its refresh token, plus a proof from the browser's bound session key |
-| `GET` | `/*` | The management UI (`ui` feature), for any path outside `/api` |
+| `GET` | `/api/sign-in/readiness` | Whether this service's DID lists the services wallet sign-in needs (read by the login page) |
+| `POST` | `/api/auth/challenge` | Mint a sign-in challenge nonce, for a browser that holds no key to sign a Trust Task with yet. The same challenge is the `auth/challenge/0.1` Trust Task. |
+| `GET` | `/*` | The management UI (`ui` feature), for any other path |
 
-The three `/api/auth/*` routes are the one sign-in with no Trust Task form:
-`auth/authenticate/0.3` carries no `id_token`, and a browser session does not
-hold the subject key a Trust Task `auth/refresh` must be signed with. A peer
-that signs its own documents signs in with `auth/challenge/0.1` and
-`auth/authenticate/0.3` on `POST /api/trust-tasks`.
-
-Operational metrics are the admin-only `did-management/server/metrics/0.1`
-Trust Task; there is no Prometheus scrape endpoint.
+Signing in completes over Trust Tasks on `POST /api/trust-tasks`:
+`auth/authenticate/0.3`, and `auth/refresh/0.2` to renew a console session.
+Operational metrics are the `did-management/server/metrics/0.1` Trust Task
+(see [docs/metrics.md](../docs/metrics.md)); there is no Prometheus scrape
+endpoint. Every task the control plane serves, with its proof rule, is in
+[docs/trust-tasks.md](../docs/trust-tasks.md).
 
 ### Passkeys
 
@@ -447,11 +429,11 @@ codebase, you can also create an issue directly in GitHub.
 
 1. Ensure the bug was not already reported by searching on
    GitHub under
-   [Issues](https://github.com/affinidi/did-hosting-service/issues).
+   [Issues](https://github.com/affinidi/affinidi-webvh-service/issues).
 
 2. If you're unable to find an open issue addressing the
    problem,
-   [open a new one](https://github.com/affinidi/did-hosting-service/issues/new).
+   [open a new one](https://github.com/affinidi/affinidi-webvh-service/issues/new).
    Be sure to include a **title and clear description**, as
    much relevant information as possible, and a **code sample**
    or an **executable test case** demonstrating the expected
@@ -460,5 +442,4 @@ codebase, you can also create an issue directly in GitHub.
 ## Contributing
 
 Want to contribute? Head over to our
-[CONTRIBUTING](https://github.com/affinidi/did-hosting-service/blob/main/CONTRIBUTING.md)
-guidelines.
+[CONTRIBUTING](../CONTRIBUTING.md) guidelines.

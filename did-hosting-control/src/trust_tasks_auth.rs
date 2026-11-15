@@ -132,6 +132,15 @@ fn build_auth_dispatcher() -> Dispatcher<TypedAuth> {
 /// this claims and the set it can actually narrow cannot drift apart — the
 /// failure mode being a URI `owns` accepts and `dispatch` then warns about as
 /// unowned, which is a silent 500 dressed as a routing bug.
+/// Every Type URI [`owns`] claims (for the generated Trust Task catalogue).
+pub fn task_uris() -> Vec<String> {
+    build_auth_dispatcher()
+        .registered_uris()
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
 pub fn owns(type_uri: &str) -> bool {
     build_auth_dispatcher()
         .registered_uris()

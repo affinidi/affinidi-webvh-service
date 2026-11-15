@@ -1,6 +1,13 @@
 # Changelog — webvh-witness
 
-See the [workspace CHANGELOG](../CHANGELOG.md) for cross-crate release notes.
+> **This file stops at 0.6.0.** Every later release of `webvh-witness` —
+> all crates in this workspace share one version — is recorded only in the
+> [workspace CHANGELOG](../CHANGELOG.md). The entries below are historical:
+> the REST `sign_proof` and `/api/didcomm` endpoints and JWT roles they <!-- retired-name-ok -->
+> describe are gone. The witness now has no REST management API; every
+> operation is a signed Trust Task (`webvh/witness/*`, `acl/*`) on
+> `POST /api/trust-tasks`, TSP or DIDComm — see the
+> [README](README.md#trust-tasks).
 
 ## 0.6.0 (2026-05-05)
 

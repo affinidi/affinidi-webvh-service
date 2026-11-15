@@ -49,8 +49,9 @@ store-firestore = ["dep:firestore", "dep:futures", "did-hosting-common/store-fir
 store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures", "did-hosting-common/store-cosmosdb"]
 # Generate an OpenAPI 3.1 spec for the HTTP upload/resolve API (issue #47).
 # Off by default — only the `openapi_snapshot` test and a doc-gen build need it.
-# Requires method-webvh (the well-known resolve path is documented).
-openapi = ["dep:utoipa", "method-webvh"]
+# Requires method-webvh and method-web (both methods' resolve paths are
+# documented).
+openapi = ["dep:utoipa", "method-webvh", "method-web"]
 
 [lib]
 name = "did_hosting_server"

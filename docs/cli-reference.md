@@ -1,5 +1,7 @@
 # CLI reference
 
+> **Status:** current — generated from each binary's clap definition.
+
 <!-- Generated from each binary's clap definition. Do not edit by hand: run
      `UPDATE_CLI_REFERENCE=1 cargo test -p <crate> --bin <binary> cli_reference`
      (see did-hosting-common/src/cli_reference.rs). -->
@@ -279,7 +281,7 @@ Stop honouring a superseded identity generation immediately.
 
 The offline kill switch, for a compromised key. Messages still addressed to that generation's key-agreement key will no longer decrypt.
 
-The service must be stopped (the store is exclusively locked). For a LIVE service use the control plane's `POST /api/identity/generations/{id}/retire` or the UI button, which drops the key from the running process immediately.
+The service must be stopped (the store is exclusively locked). For a LIVE service use the control plane's `identity/retire/0.1` Trust Task (`send-trust-task`, see docs/sending-trust-tasks.md) or the UI button, which drops the key from the running process immediately.
 
 Usage: did-hosting-server identity-retire-now [OPTIONS] --generation <GENERATION>
 
@@ -767,6 +769,7 @@ Commands:
   export-sealed            Export this control plane's DID + signing/KA keys as an HPKE-sealed migration bundle. See `did-hosting-server export-sealed` for full semantics; the receiver opens with `import-sealed`
   import-sealed            Open a sealed `DidSecrets` migration bundle and import the contained keys as this control plane's identity. Inverse of `export-sealed` on the sending side
   vta-open                 Open a sealed VTA bootstrap response (primitive — prefer `setup-offline-complete` for a full wizard-driven finish)
+  send-trust-task          Send one signed Trust Task to the running control plane and print the response payload as JSON
   fetch-metrics            Scrape this service's counters over the authenticated `server/metrics/0.1` Trust Task and print them as JSON
   help                     Print this message or the help of the given subcommand(s)
 
@@ -1106,7 +1109,7 @@ Stop honouring a superseded identity generation immediately.
 
 The offline kill switch, for a compromised key. Messages still addressed to that generation's key-agreement key will no longer decrypt.
 
-The service must be stopped (the store is exclusively locked). For a LIVE service use the control plane's `POST /api/identity/generations/{id}/retire` or the UI button, which drops the key from the running process immediately.
+The service must be stopped (the store is exclusively locked). For a LIVE service use the control plane's `identity/retire/0.1` Trust Task (`send-trust-task`, see docs/sending-trust-tasks.md) or the UI button, which drops the key from the running process immediately.
 
 Usage: did-hosting-control identity-retire-now [OPTIONS] --generation <GENERATION>
 
@@ -1369,6 +1372,38 @@ Options:
           Print help (see a summary with '-h')
 ```
 
+### `did-hosting-control send-trust-task`
+
+```text
+Send one signed Trust Task to the running control plane and print the response payload as JSON.
+
+Every management operation is a Trust Task (docs/trust-tasks.md lists them). Signs the request with the `--key` did:key, POSTs it to the running control plane's `POST /api/trust-tasks`, verifies the reply is the service's own signed response, and prints its payload. The key is authorised like any other client: by its proof and its ACL entry (add it with `add-acl`). A refusal is reported as an error with its code.
+
+Usage: did-hosting-control send-trust-task [OPTIONS] --key <KEY> --type <TYPE>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --key <KEY>
+          Path to the signer's did:key JSON file — same format `setup --setup-key-out` writes
+
+      --type <TYPE>
+          The task: a full Type URI, or `<slug>/<version>` such as `identity/list/0.1` or `did-management/registry/list/0.2`
+
+      --payload <PAYLOAD>
+          The request payload as JSON (default `{}`)
+
+      --payload-file <PAYLOAD_FILE>
+          Read the request payload from a JSON file
+
+      --url <URL>
+          Base URL of the running control plane. Defaults to `http://<server.host>:<server.port>` from config (a wildcard bind is dialled as loopback)
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
 ### `did-hosting-control fetch-metrics`
 
 ```text
@@ -1413,6 +1448,7 @@ Commands:
   stats-show                 Show a DID's statistics resolution, recorded tier and totals (offline; stop the service first)
   stats-set                  Set a DID's statistics resolution (offline; stop the service first): `auto` (by traffic), `fine` (always 5-minute detail), `coarse` (never promoted) or `off` (totals only). Applied at the next start
   stats-purge-legacy         Finish the move to tiered statistics and delete the legacy time-series rows now, instead of 30 days after the migration (offline; stop the service first). An older version rolled back to afterwards has no time-series history
+  send-trust-task            Send one signed Trust Task to the running daemon and print the response payload as JSON
   fetch-metrics              Read the service's own counters via the authenticated `server/metrics/0.1` Trust Task and print them as JSON
   identity-list              List the service's own identity generations (key material still honoured)
   tsp-relationship-list      List this service's established TSP relationships (offline; stop the service first)
@@ -1697,6 +1733,38 @@ Options:
           Print help
 ```
 
+### `did-hosting-daemon send-trust-task`
+
+```text
+Send one signed Trust Task to the running daemon and print the response payload as JSON.
+
+Every management operation is a Trust Task (docs/trust-tasks.md lists them). Signs the request with the `--key` did:key, POSTs it to the running daemon's `POST /api/trust-tasks`, verifies the reply is the service's own signed response, and prints its payload. The key is authorised like any other client: by its proof and its ACL entry (add it with `add-acl`). A refusal is reported as an error with its code.
+
+Usage: did-hosting-daemon send-trust-task [OPTIONS] --key <KEY> --type <TYPE>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --key <KEY>
+          Path to the signer's did:key JSON file — same format `setup --setup-key-out` writes
+
+      --type <TYPE>
+          The task: a full Type URI, or `<slug>/<version>` such as `identity/list/0.1` or `did-management/registry/list/0.2`
+
+      --payload <PAYLOAD>
+          The request payload as JSON (default `{}`)
+
+      --payload-file <PAYLOAD_FILE>
+          Read the request payload from a JSON file
+
+      --url <URL>
+          Base URL of the running daemon. Defaults to `http://<server.host>:<server.port>` from config (a wildcard bind is dialled as loopback)
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
 ### `did-hosting-daemon fetch-metrics`
 
 ```text
@@ -1871,7 +1939,7 @@ Stop honouring a superseded identity generation immediately.
 
 The offline kill switch, for a compromised key. Messages still addressed to that generation's key-agreement key will no longer decrypt.
 
-The service must be stopped (the store is exclusively locked). For a LIVE service use the control plane's `POST /api/identity/generations/{id}/retire` or the UI button, which drops the key from the running process immediately.
+The service must be stopped (the store is exclusively locked). For a LIVE service use the control plane's `identity/retire/0.1` Trust Task (`send-trust-task`, see docs/sending-trust-tasks.md) or the UI button, which drops the key from the running process immediately.
 
 Usage: did-hosting-daemon identity-retire-now [OPTIONS] --generation <GENERATION>
 
