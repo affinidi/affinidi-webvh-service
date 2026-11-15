@@ -6,6 +6,7 @@ import { formatDate } from "../../lib/time";
 import { Card } from "../Card";
 import { Heading } from "../Heading";
 import { didStyles } from "./styles";
+import { Term, type GlossaryKey } from "../Term";
 
 /** Resolve and update counts for this DID. */
 export function DidStatsCard({
@@ -65,22 +66,34 @@ export function DidDetailsCard({ detail }: { detail: DidDetailResponse }) {
         {method && <Detail label="Method" value={method} mono />}
         {detail.domain && <Detail label="Domain" value={detail.domain} mono />}
         <Detail label="Log Entries" value={log.logEntryCount.toLocaleString()} />
-        {log.ttl != null && <Detail label="TTL" value={`${log.ttl}s`} />}
+        {log.ttl != null && <Detail label="Cache time (TTL)" value={`${log.ttl}s`} />}
       </View>
 
       <Heading level={3} style={styles.optionsTitle}>
         Options
       </Heading>
       <View style={styles.grid}>
-        <Option label="Portable" value={log.portable ? "Yes" : "No"} on={log.portable} />
-        <Option label="Pre-rotation" value={log.preRotation ? "Yes" : "No"} on={log.preRotation} />
+        <Option
+          label="Portable"
+          term="portable"
+          value={log.portable ? "Yes" : "No"}
+          on={log.portable}
+        />
+        <Option
+          label="Pre-rotation"
+          term="preRotation"
+          value={log.preRotation ? "Yes" : "No"}
+          on={log.preRotation}
+        />
         <Option
           label="Witnesses"
+          term="witness"
           value={log.witnesses ? `${log.witnessThreshold}/${log.witnessCount}` : "None"}
           on={log.witnesses}
         />
         <Option
           label="Watchers"
+          term="watcher"
           value={log.watchers ? String(log.watcherCount) : "None"}
           on={log.watchers}
         />
@@ -110,18 +123,25 @@ function Option({
   value,
   on,
   alarm,
+  term,
 }: {
   label: string;
   value: string;
   on: boolean;
   alarm?: boolean;
+  /** Explained with a "?" when set. */
+  term?: GlossaryKey;
 }) {
   return (
     <View style={styles.option}>
       <Text style={[styles.optionValue, alarm ? styles.alarm : on ? styles.on : styles.off]}>
         {value}
       </Text>
-      <Text style={styles.label}>{label}</Text>
+      {term ? (
+        <Term term={term} label={label} style={styles.label} />
+      ) : (
+        <Text style={styles.label}>{label}</Text>
+      )}
     </View>
   );
 }

@@ -3,12 +3,11 @@ import { useApi } from "./ApiProvider";
 import { ServiceBadges, SERVICE_TYPE_DIDCOMM, SERVICE_TYPE_TSP } from "./ServiceBadges";
 import { ControlLink } from "./ControlLink";
 import { AgentNameChips } from "./AgentNameChips";
-import { Button } from "./Button";
 import { Heading } from "./Heading";
+import { ErrorWithRetry, StaleMarker } from "./QueryState";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 import type { ServiceInfo } from "../lib/api";
 import { buildServiceOverview } from "../lib/api/service";
-import { errorMessage } from "../lib/errors";
 import { useTrustTaskQuery } from "../lib/query";
 import { QK } from "../lib/query-keys";
 import { formatRelative } from "../lib/time";
@@ -174,11 +173,11 @@ function EmptyState({ isDaemon }: { isDaemon: boolean }) {
     return (
       <View style={styles.emptyCard}>
         <Text style={styles.emptyIcon}>{"\u2713"}</Text>
-        <Text style={styles.emptyTitle}>Self-contained daemon</Text>
+        <Text style={styles.emptyTitle}>Self-contained deployment</Text>
         <Text style={styles.emptyHint}>
-          Server, witness, and watcher run in this process — there are no remote instances to
-          register. Registering one is supported but unusual; use a standalone control plane to
-          manage remote services.
+          did-hosting-daemon runs the server, witness and watcher in this process — there are no
+          remote instances to register. Registering one is supported but unusual; use a standalone
+          control plane to manage remote services.
         </Text>
       </View>
     );
@@ -188,8 +187,8 @@ function EmptyState({ isDaemon }: { isDaemon: boolean }) {
       <Text style={styles.emptyIcon}>{"\u26A1"}</Text>
       <Text style={styles.emptyTitle}>No services connected</Text>
       <Text style={styles.emptyHint}>
-        Start a webvh-server or webvh-witness with a control_url pointing to this control plane, or
-        add instances in config.toml under [registry.instances].
+        Start a did-hosting-server or webvh-witness configured with this control plane&apos;s
+        address, or list instances in config.toml under [registry.instances].
       </Text>
     </View>
   );
@@ -200,6 +199,13 @@ function EmptyState({ isDaemon }: { isDaemon: boolean }) {
  *   either way; this only changes how an empty registry is explained and
  *   suppresses the service-count tiles, which are always zero there.
  */
+/** The oldest of the reads' update times — what the panel as a whole is
+ *  "as of". */
+function oldestUpdate(...times: (number | null)[]): number | null {
+  const known = times.filter((t): t is number => t !== null);
+  return known.length === times.length ? Math.min(...known) : null;
+}
+
 export function ServiceOverviewPanel({ isDaemon = false }: { isDaemon?: boolean }) {
   const api = useApi();
   // Three reads, each shared with the rest of the dashboard and settings
@@ -252,14 +258,7 @@ export function ServiceOverviewPanel({ isDaemon = false }: { isDaemon?: boolean 
   }
 
   if (error && !data) {
-    return (
-      <View style={styles.errorBox}>
-        <Text role="alert" style={styles.errorText}>
-          {errorMessage(error)}
-        </Text>
-        <Button label="Retry" onPress={refresh} />
-      </View>
-    );
+    return <ErrorWithRetry error={error} what="the service overview" onRetry={refresh} />;
   }
 
   if (!data) return null;
@@ -291,6 +290,13 @@ export function ServiceOverviewPanel({ isDaemon = false }: { isDaemon?: boolean 
 
   return (
     <View style={styles.container}>
+      {/* Polled: once data is shown, a failing poll must not pass stale
+          numbers off as live. */}
+      <StaleMarker
+        updatedAt={oldestUpdate(config.updatedAt, registry.updatedAt, stats.updatedAt)}
+        error={error}
+        onRetry={refresh}
+      />
       {/* Control plane header card */}
       <View style={styles.controlCard}>
         <View style={styles.controlHeader}>

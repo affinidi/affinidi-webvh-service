@@ -1,5 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { View, Text, StyleSheet, FlatList, ScrollView, ActivityIndicator } from "react-native";
+import {
+  View,
+  Text,
+  StyleSheet,
+  FlatList,
+  ScrollView,
+  ActivityIndicator,
+  useWindowDimensions,
+} from "react-native";
 import { Link, useLocalSearchParams, useRouter } from "expo-router";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
@@ -13,7 +21,10 @@ import { RequireAuth } from "../../components/RequireAuth";
 import { SegmentedControl } from "../../components/SegmentedControl";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { webAria } from "../../lib/a11y";
-import { showAlert } from "../../lib/alert";
+import { confirm, notify } from "../../lib/feedback";
+import { didPathError } from "../../lib/validation";
+import { ErrorWithRetry } from "../../components/QueryState";
+import { DidCards } from "../../components/DidCards";
 import { errorMessage } from "../../lib/errors";
 import { plural } from "../../lib/plural";
 import { invalidateQueries, useTrustTaskQuery } from "../../lib/query";
@@ -80,9 +91,12 @@ function DidListBody() {
     data,
     loading,
     error: loadError,
+    refetch,
   } = useTrustTaskQuery([...DIDS_KEY, "list", owner ?? null], () => api.listDids(owner));
   const dids = data ?? [];
-  const error = loadError ? errorMessage(loadError, "Failed to load DIDs") : null;
+  const { width } = useWindowDimensions();
+  // Under this width the table would scroll sideways; rows become cards.
+  const narrow = width > 0 && width < 700;
   const refresh = () => void invalidateQueries([...DIDS_KEY]);
   const [creating, setCreating] = useState(false);
 
@@ -113,12 +127,19 @@ function DidListBody() {
     setPathStatus(null);
   };
 
+  // Checked here first with the server's own path grammar, so a path the
+  // server would refuse is said at once and never sent.
+  const pathError = didPathError(customPath.trim());
+  const trimmedPath = customPath.trim();
+  // An empty path asks for a random name; anything else must be free.
+  const canCreate = !creating && !pathError && (trimmedPath === "" || pathStatus === "available");
+
   // Debounced availability check as user types
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
 
     const trimmed = customPath.trim();
-    if (trimmed.length < 2) {
+    if (trimmed.length < 2 || didPathError(trimmed)) {
       setPathStatus(null);
       return;
     }
@@ -137,15 +158,20 @@ function DidListBody() {
   }, [customPath, api, createDomain]);
 
   const handleCreate = async () => {
-    if (creating) return;
+    if (!canCreate) return;
     setCreating(true);
     try {
       const path = customPath.trim() || undefined;
-      await api.createDid(path, createDomain ?? undefined);
+      const created = await api.createDid(path, createDomain ?? undefined);
       resetForm();
       refresh();
+      notify(
+        "success",
+        `Reserved “${created.mnemonic}”`,
+        `Next: have the DID's agent sign its first did.jsonl and publish it here${created.didUrl ? ` (${created.didUrl})` : ""} — or open the DID and upload the file. Until then it shows as “Pending upload”.`,
+      );
     } catch (e: unknown) {
-      showAlert("Error", errorMessage(e, "Failed to create DID"));
+      notify("error", "Could not create the DID", errorMessage(e, "Failed to create DID"));
     } finally {
       setCreating(false);
     }
@@ -160,28 +186,56 @@ function DidListBody() {
       setAcceptPath("");
       setShowAccept(false);
       refresh();
-      showAlert("Success", `"${path}" is now yours`);
+      notify("success", "DID accepted", `"${path}" is now yours.`);
     } catch (e: unknown) {
-      showAlert("Error", errorMessage(e, "Failed to accept the DID"));
+      notify("error", "Could not accept the DID", errorMessage(e, "Failed to accept the DID"));
     } finally {
       setAccepting(false);
     }
   };
 
+  // The root DID belongs to one domain: the one the switcher is on, else the
+  // default.
+  const rootDomain = currentDomain ?? defaultDomain ?? null;
   const handleCreateRootDid = async () => {
+    if (!rootDomain) return;
+    const ok = await confirm({
+      title: `Reserve the root DID for ${rootDomain}?`,
+      body:
+        `The root DID stands for the domain itself: it resolves at ` +
+        `https://${rootDomain}/.well-known/did.jsonl, and it is the only DID that can hold ` +
+        `the community name ${rootDomain}/@. This reserves the slot; its agent then ` +
+        `publishes the signed did.jsonl, as for any other DID.`,
+      confirmLabel: "Reserve root DID",
+      destructive: false,
+    });
+    if (!ok) return;
     setCreatingRoot(true);
     try {
-      await api.createDid(".well-known");
+      await api.createDid(".well-known", rootDomain);
       refresh();
+      notify(
+        "success",
+        `Root DID reserved for ${rootDomain}`,
+        "Next: have its agent publish the signed did.jsonl, or open it and upload the file.",
+      );
     } catch (e: unknown) {
-      showAlert("Error", errorMessage(e, "Failed to create root DID"));
+      notify(
+        "error",
+        "Could not create the root DID",
+        errorMessage(e, "Failed to create root DID"),
+      );
     } finally {
       setCreatingRoot(false);
     }
   };
 
   const showRootDidButton =
-    role === "admin" && !dids.some((d) => d.mnemonic === ".well-known") && !loading;
+    role === "admin" &&
+    !!rootDomain &&
+    !loading &&
+    !loadError &&
+    !dids.some((d) => d.mnemonic === ".well-known" && matchesDomain(d, rootDomain));
 
   // Filter the list to the current domain when the switcher has one
   // pinned. "All domains" (currentDomain === null, admin-only) shows
@@ -268,7 +322,7 @@ function DidListBody() {
         <View style={styles.headerActions}>
           {showRootDidButton && (
             <Button
-              label="Create Root DID"
+              label={`Create root DID for ${rootDomain}`}
               variant="secondary"
               busy={creatingRoot}
               busyLabel="Creating..."
@@ -324,13 +378,14 @@ function DidListBody() {
       {showForm && (
         <View style={styles.formCard}>
           <Field
-            label="DID path or mnemonic"
+            label="DID path (optional)"
             hideLabel
             inputStyle={styles.input}
             placeholder="custom-name or path/to/name (optional)"
             value={customPath}
             onChangeText={setCustomPath}
             onSubmit={handleCreate}
+            error={trimmedPath ? pathError : null}
             autoCapitalize="none"
             autoCorrect={false}
             style={styles.fieldTight}
@@ -338,7 +393,7 @@ function DidListBody() {
           <Text style={styles.validationHint}>
             Segments: 2–63 chars, lowercase letters, digits, and hyphens.
             {"\n"}Use / for folders (e.g. people/staff/glenn).
-            {"\n"}Leave blank for a random mnemonic.
+            {"\n"}Leave blank for a random name.
           </Text>
 
           {domainsLoaded && domains.length > 0 && (
@@ -356,8 +411,8 @@ function DidListBody() {
                 style={styles.domainPickerRow}
               />
               <Text style={styles.validationHint}>
-                The selected domain becomes the DID&apos;s host. Omit (rare) to let the daemon pick
-                your ACL default.
+                The selected domain becomes the DID&apos;s host. With none selected, the control
+                plane uses your default domain.
               </Text>
             </View>
           )}
@@ -374,19 +429,21 @@ function DidListBody() {
           </View>
 
           <View style={styles.formActions}>
-            <Button label="Create" busy={creating} busyLabel="Creating..." onPress={handleCreate} />
+            <Button
+              label="Create"
+              busy={creating}
+              busyLabel="Creating..."
+              disabled={!canCreate}
+              onPress={handleCreate}
+            />
             <Button label="Cancel" variant="secondary" disabled={creating} onPress={resetForm} />
           </View>
         </View>
       )}
 
-      {error && (
-        <Text role="alert" style={styles.errorText}>
-          {error}
-        </Text>
-      )}
-
-      {loading ? (
+      {loadError != null && !data ? (
+        <ErrorWithRetry error={loadError} what="the DIDs" onRetry={() => void refetch()} />
+      ) : loading ? (
         <ActivityIndicator
           color={colors.accent}
           size="large"
@@ -419,179 +476,197 @@ function DidListBody() {
                 : `${rows.length.toLocaleString()} of ${visibleDids.length.toLocaleString()}`}
             </Text>
           </View>
-          <ScrollView horizontal contentContainerStyle={styles.tableScroll}>
-            <View
-              role="table"
-              aria-label="DIDs"
-              style={[styles.table, { minWidth: tableMinWidth }]}
-            >
-              <View style={styles.headRow} role="row">
-                {COLUMNS.map((c) => {
-                  const active = sort.key === c.key;
-                  return (
-                    <View
-                      key={c.key}
-                      role="columnheader"
-                      {...webAria({
-                        sort: active ? (sort.dir === "asc" ? "ascending" : "descending") : "none",
-                      })}
-                      style={[
-                        styles.cell,
-                        columnStyle(c.key, c.width),
-                        c.align === "right" && styles.cellRight,
-                        c.gapAfter && styles.cellGapAfter,
-                      ]}
-                    >
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        accessibilityLabel={`Sort by ${c.label}`}
-                        onPress={() => setSort(nextSort(sort, c.key))}
-                        style={styles.headButton}
-                      >
-                        <Text
-                          style={[styles.headText, active && styles.headTextActive]}
-                          numberOfLines={1}
-                        >
-                          {c.label}
-                          {active ? (sort.dir === "asc" ? " ▲" : " ▼") : ""}
-                        </Text>
-                      </Button>
-                    </View>
-                  );
-                })}
-              </View>
-              {rows.length === 0 ? (
-                <Text style={styles.hint}>No DIDs match “{search.trim()}”.</Text>
-              ) : (
-                <FlatList
-                  data={rows}
-                  keyExtractor={(item) => item.mnemonic}
-                  renderItem={({ item, index }) => {
-                    const isOwn = item.owner === myDid;
-                    const names = servedNames(item.agentNames);
-                    // The row is not itself a link: the name is, and the copy
-                    // and QR buttons sit beside it rather than inside it.
+          {narrow ? (
+            <DidCards
+              rows={rows}
+              search={search}
+              myDid={myDid}
+              markOwners={markOwners}
+              showMethod={showMethod}
+              showDomain={currentDomain === null}
+            />
+          ) : (
+            <ScrollView horizontal contentContainerStyle={styles.tableScroll}>
+              <View
+                role="table"
+                aria-label="DIDs"
+                style={[styles.table, { minWidth: tableMinWidth }]}
+              >
+                <View style={styles.headRow} role="row">
+                  {COLUMNS.map((c) => {
+                    const active = sort.key === c.key;
                     return (
-                      <TableRow
-                        hoverStyle={styles.rowHover}
+                      <View
+                        key={c.key}
+                        role="columnheader"
+                        {...webAria({
+                          sort: active ? (sort.dir === "asc" ? "ascending" : "descending") : "none",
+                        })}
                         style={[
-                          styles.row,
-                          index % 2 === 1 && styles.rowAlt,
-                          markOwners && (isOwn ? styles.rowOwn : styles.rowOther),
+                          styles.cell,
+                          columnStyle(c.key, c.width),
+                          c.align === "right" && styles.cellRight,
+                          c.gapAfter && styles.cellGapAfter,
                         ]}
                       >
-                        <View role="cell" style={[styles.cell, columnStyle("mnemonic")]}>
-                          <View style={styles.nameRow}>
-                            <Link href={`/dids/${item.mnemonic}`} style={styles.mnemonic}>
-                              {item.mnemonic}
-                            </Link>
-                            {showMethod && item.method && (
-                              <View style={styles.methodBadge}>
-                                <Text style={styles.methodBadgeText}>did:{item.method}</Text>
-                              </View>
-                            )}
-                            {markOwners && isOwn && (
-                              <View style={styles.youBadge}>
-                                <Text style={styles.youBadgeText}>You</Text>
-                              </View>
-                            )}
-                            {item.disabled && (
-                              <View style={styles.disabledBadge}>
-                                <Text style={styles.disabledBadgeText}>Suspended</Text>
-                              </View>
-                            )}
-                          </View>
-                          {currentDomain === null && item.domain && (
-                            <Text style={styles.subText} numberOfLines={1}>
-                              {item.domain}
-                            </Text>
-                          )}
-                          {/* Served agent names, under the name: an alias
-                              for the DID, as on the detail page. */}
-                          {names.length > 0 && (
-                            <View style={styles.agentNamesRow}>
-                              <AgentNameChips
-                                names={names}
-                                domain={item.domain}
-                                didId={item.didId}
-                                size="sm"
-                                showHost={false}
-                              />
-                            </View>
-                          )}
-                          {markOwners && !isOwn && (
-                            <Text style={styles.subText} numberOfLines={1}>
-                              Owner: {item.owner}
-                            </Text>
-                          )}
-                        </View>
-                        <View role="cell" style={[styles.cell, columnStyle("didId")]}>
-                          {item.versionCount === 0 ? (
-                            <Text style={styles.statusPending}>Pending upload</Text>
-                          ) : item.didId ? (
-                            <View style={styles.didIdRow}>
-                              <Text
-                                style={[styles.didText, { width: didWidth }]}
-                                numberOfLines={1}
-                                aria-label={item.didId}
-                                // Full DID on hover (web).
-                                {...titleAttr(item.didId)}
-                              >
-                                {compactDid(item.didId)}
-                              </Text>
-                              <CopyButton
-                                value={item.didId}
-                                accessibilityLabel={`Copy DID of ${item.mnemonic}`}
-                              />
-                              <DidQrButton did={item.didId} label={item.mnemonic} />
-                            </View>
-                          ) : (
-                            <Text style={styles.subText}>Uploaded</Text>
-                          )}
-                        </View>
-                        <View
-                          role="cell"
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          accessibilityLabel={`Sort by ${c.label}`}
+                          onPress={() => setSort(nextSort(sort, c.key))}
+                          style={styles.headButton}
+                        >
+                          <Text
+                            style={[styles.headText, active && styles.headTextActive]}
+                            numberOfLines={1}
+                          >
+                            {c.label}
+                            {active ? (sort.dir === "asc" ? " ▲" : " ▼") : ""}
+                          </Text>
+                        </Button>
+                      </View>
+                    );
+                  })}
+                </View>
+                {rows.length === 0 ? (
+                  <Text style={styles.hint}>No DIDs match “{search.trim()}”.</Text>
+                ) : (
+                  <FlatList
+                    data={rows}
+                    keyExtractor={(item) => item.mnemonic}
+                    renderItem={({ item, index }) => {
+                      const isOwn = item.owner === myDid;
+                      const names = servedNames(item.agentNames);
+                      // The row is not itself a link: the name is, and the copy
+                      // and QR buttons sit beside it rather than inside it.
+                      return (
+                        <TableRow
+                          hoverStyle={styles.rowHover}
                           style={[
-                            styles.cell,
-                            styles.cellRight,
-                            styles.cellGapAfter,
-                            columnStyle("versions", 100),
+                            styles.row,
+                            index % 2 === 1 && styles.rowAlt,
+                            markOwners && (isOwn ? styles.rowOwn : styles.rowOther),
                           ]}
                         >
-                          <Text style={styles.numText}>{item.versionCount.toLocaleString()}</Text>
-                        </View>
-                        <View role="cell" style={[styles.cell, columnStyle("created", 150)]}>
-                          <Text style={styles.dateText}>
-                            {formatDate(item.createdAt, { withTime: true })}
-                          </Text>
-                        </View>
-                        <View role="cell" style={[styles.cell, columnStyle("updated", 150)]}>
-                          {/* One version has never been updated: a dash
-                              lets the DIDs that have changed stand out. */}
-                          {item.versionCount <= 1 ? (
-                            <Text style={styles.dateTextMuted} aria-label="Never updated">
-                              —
-                            </Text>
-                          ) : (
+                          <View role="cell" style={[styles.cell, columnStyle("mnemonic")]}>
+                            <View style={styles.nameRow}>
+                              <Link href={`/dids/${item.mnemonic}`} style={styles.mnemonic}>
+                                {item.mnemonic}
+                              </Link>
+                              {showMethod && item.method && (
+                                <View style={styles.methodBadge}>
+                                  <Text style={styles.methodBadgeText}>did:{item.method}</Text>
+                                </View>
+                              )}
+                              {markOwners && isOwn && (
+                                <View style={styles.youBadge}>
+                                  <Text style={styles.youBadgeText}>You</Text>
+                                </View>
+                              )}
+                              {item.disabled && (
+                                <View style={styles.disabledBadge}>
+                                  <Text style={styles.disabledBadgeText}>Suspended</Text>
+                                </View>
+                              )}
+                            </View>
+                            {currentDomain === null && item.domain && (
+                              <Text style={styles.subText} numberOfLines={1}>
+                                {item.domain}
+                              </Text>
+                            )}
+                            {/* Served agent names, under the name: an alias
+                              for the DID, as on the detail page. */}
+                            {names.length > 0 && (
+                              <View style={styles.agentNamesRow}>
+                                <AgentNameChips
+                                  names={names}
+                                  domain={item.domain}
+                                  didId={item.didId}
+                                  size="sm"
+                                  showHost={false}
+                                />
+                              </View>
+                            )}
+                            {markOwners && !isOwn && (
+                              <Text style={styles.subText} numberOfLines={1}>
+                                Owner: {item.owner}
+                              </Text>
+                            )}
+                          </View>
+                          <View role="cell" style={[styles.cell, columnStyle("didId")]}>
+                            {item.versionCount === 0 ? (
+                              <Text
+                                style={styles.statusPending}
+                                {...titleAttr("Reserved — waiting for its first signed did.jsonl")}
+                              >
+                                Pending upload
+                              </Text>
+                            ) : item.didId ? (
+                              <View style={styles.didIdRow}>
+                                <Text
+                                  style={[styles.didText, { width: didWidth }]}
+                                  numberOfLines={1}
+                                  aria-label={item.didId}
+                                  // Full DID on hover (web).
+                                  {...titleAttr(item.didId)}
+                                >
+                                  {compactDid(item.didId)}
+                                </Text>
+                                <CopyButton
+                                  value={item.didId}
+                                  accessibilityLabel={`Copy DID of ${item.mnemonic}`}
+                                />
+                                <DidQrButton did={item.didId} label={item.mnemonic} />
+                              </View>
+                            ) : (
+                              <Text style={styles.subText}>Uploaded</Text>
+                            )}
+                          </View>
+                          <View
+                            role="cell"
+                            style={[
+                              styles.cell,
+                              styles.cellRight,
+                              styles.cellGapAfter,
+                              columnStyle("versions", 100),
+                            ]}
+                          >
+                            <Text style={styles.numText}>{item.versionCount.toLocaleString()}</Text>
+                          </View>
+                          <View role="cell" style={[styles.cell, columnStyle("created", 150)]}>
                             <Text style={styles.dateText}>
-                              {formatDate(item.updatedAt, { withTime: true })}
+                              {formatDate(item.createdAt, { withTime: true })}
                             </Text>
-                          )}
-                        </View>
-                        <View
-                          role="cell"
-                          style={[styles.cell, styles.cellRight, columnStyle("resolves", 100)]}
-                        >
-                          <Text style={styles.numText}>{item.totalResolves.toLocaleString()}</Text>
-                        </View>
-                      </TableRow>
-                    );
-                  }}
-                />
-              )}
-            </View>
-          </ScrollView>
+                          </View>
+                          <View role="cell" style={[styles.cell, columnStyle("updated", 150)]}>
+                            {/* One version has never been updated: a dash
+                              lets the DIDs that have changed stand out. */}
+                            {item.versionCount <= 1 ? (
+                              <Text style={styles.dateTextMuted} aria-label="Never updated">
+                                —
+                              </Text>
+                            ) : (
+                              <Text style={styles.dateText}>
+                                {formatDate(item.updatedAt, { withTime: true })}
+                              </Text>
+                            )}
+                          </View>
+                          <View
+                            role="cell"
+                            style={[styles.cell, styles.cellRight, columnStyle("resolves", 100)]}
+                          >
+                            <Text style={styles.numText}>
+                              {item.totalResolves.toLocaleString()}
+                            </Text>
+                          </View>
+                        </TableRow>
+                      );
+                    }}
+                  />
+                )}
+              </View>
+            </ScrollView>
+          )}
         </>
       )}
     </View>

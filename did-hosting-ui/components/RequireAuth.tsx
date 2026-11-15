@@ -1,32 +1,29 @@
 import type { ReactNode } from "react";
-import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, StyleSheet, View } from "react-native";
 
-import { colors, fonts, spacing } from "../lib/theme";
+import { colors, spacing } from "../lib/theme";
 import { useAuth } from "./AuthProvider";
 
 export interface RequireAuthProps {
-  /** What the signed-out reader is told: "Please log in to {purpose}." */
+  /** What the page is for — its loading indicator's name. */
   purpose: string;
   children: ReactNode;
 }
 
 /**
- * Render `children` only for a signed-in session.
+ * Render `children` only while there is a session — or while one has just
+ * expired, so the page and anything typed into it stay put under the
+ * "session expired" prompt (`AuthGate`).
  *
- * While the saved session is still being looked for, a spinner — so a reload
- * does not flash "Please log in" before the session is restored. Signed out,
- * one line saying what signing in would show.
+ * Signed out, the route guard is already on its way to the sign-in page;
+ * until it gets there this shows a spinner, never a "please log in" stub.
  */
 export function RequireAuth({ purpose, children }: RequireAuthProps) {
-  const { isAuthenticated, restored } = useAuth();
-  if (isAuthenticated) return <>{children}</>;
+  const { isAuthenticated, sessionExpired } = useAuth();
+  if (isAuthenticated || sessionExpired) return <>{children}</>;
   return (
     <View style={styles.container}>
-      {restored ? (
-        <Text style={styles.hint}>Please log in to {purpose}.</Text>
-      ) : (
-        <ActivityIndicator color={colors.accent} size="large" aria-label="Loading" />
-      )}
+      <ActivityIndicator color={colors.accent} size="large" aria-label={`Loading — ${purpose}`} />
     </View>
   );
 }
@@ -38,10 +35,5 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     backgroundColor: colors.bgPrimary,
-  },
-  hint: {
-    fontSize: 15,
-    fontFamily: fonts.regular,
-    color: colors.textSecondary,
   },
 });
