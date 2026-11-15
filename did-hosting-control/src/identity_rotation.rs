@@ -18,10 +18,8 @@
 
 use std::time::Duration;
 
-use affinidi_messaging_didcomm_service::{
-    DIDCommService, ListenerConfig, Protocols, RestartPolicy, RetryConfig,
-};
-use did_hosting_common::server::didcomm_profile::build_tdk_profile_for_identity;
+use affinidi_messaging_didcomm_service::DIDCommService;
+use did_hosting_common::server::didcomm_profile::rebuild_own_listener;
 use did_hosting_common::server::identity::{
     self, DEFAULT_RELOAD_INTERVAL, DEFAULT_SWEEP_INTERVAL, IdentityGeneration, ReloadOutcome,
     mnemonic_from_did,
@@ -39,7 +37,16 @@ use crate::server::AppState;
 /// The listener id the control plane registers its DID under. Must match
 /// `server::start_didcomm_service`, or the rebuild would add a second listener
 /// for the same DID and the framework would reject it as a duplicate.
-const LISTENER_ID: &str = "control";
+pub(crate) const LISTENER_ID: &str = "control";
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`on_did_published`] recognised our own DID on this
+    /// thread — lets a test assert a publish path reaches the reload without
+    /// standing up a resolvable identity. Thread-local because `#[tokio::test]`
+    /// runs on a current-thread runtime and tests run in parallel.
+    pub(crate) static OWN_DID_RELOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Called after any DID is published. Rotates the service identity if the DID
 /// that changed was our own.
@@ -58,6 +65,9 @@ pub async fn on_did_published(state: &AppState, mnemonic: &str) {
     if ours != mnemonic {
         return;
     }
+
+    #[cfg(test)]
+    OWN_DID_RELOADS.with(|n| n.set(n.get() + 1));
 
     info!(
         mnemonic,
@@ -196,45 +206,11 @@ async fn rebuild_listener(state: &AppState) -> Result<(), AppError> {
         return Ok(());
     };
 
-    let profile =
-        build_tdk_profile_for_identity(LISTENER_ID, identity, Some(&mediator_did)).await?;
-
-    // Union across live generations: a generation retiring out of DIDComm while
-    // the current identity is TSP-only still has peers delivering DIDComm to it
-    // until it expires.
-    let transports = identity.protocols();
-    let protocols = match (transports.didcomm, transports.tsp) {
-        (true, true) => Protocols::BOTH,
-        (false, true) => Protocols::TSP_ONLY,
-        _ => Protocols::DIDCOMM_ONLY,
-    };
-
-    // Remove-then-add, not add-then-remove: the mediator allows exactly one
-    // connection per DID, and the framework rejects a second listener for a DID
-    // it already holds. There is a brief window with no listener; inbound
-    // messages queue at the mediator and are delivered on reconnect.
-    if let Err(e) = svc.remove_listener(LISTENER_ID).await {
-        warn!("failed to remove the old listener: {e}");
-    }
-
-    svc.add_listener(ListenerConfig {
-        id: LISTENER_ID.into(),
-        profile,
-        restart_policy: RestartPolicy::Always {
-            backoff: RetryConfig::default(),
-        },
-        auto_delete: true,
-        protocols,
-        ..Default::default()
-    })
-    .await
-    .map_err(|e| AppError::Internal(format!("failed to restart the DIDComm listener: {e}")))?;
-
-    info!(
-        didcomm = transports.didcomm,
-        tsp = transports.tsp,
-        "DIDComm listener rebuilt on the new identity"
-    );
+    // The same builder boot uses: union across live generations (a generation
+    // retiring out of DIDComm while the current identity is TSP-only still has
+    // peers delivering DIDComm to it until it expires), reconciled against what
+    // our DID document advertises, with the persistent TSP relationship store.
+    rebuild_own_listener(svc, LISTENER_ID, identity, &mediator_did, &state.store).await?;
     Ok(())
 }
 

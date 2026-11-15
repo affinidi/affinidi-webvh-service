@@ -111,8 +111,8 @@ pub(crate) async fn revoke_session(
 ) -> Result<revoke_session::v0_2::Response, TaskError> {
     let caller = cx.caller()?.to_string();
     if p.all.is_some() || p.subject.is_some() {
-        return Err(AppError::Validation(
-            "this relying party revokes one session, named by sessionId".into(),
+        return Err(AppError::invalid(
+            "this relying party revokes one session, named by sessionId",
         )
         .into());
     }
@@ -120,7 +120,7 @@ pub(crate) async fn revoke_session(
         .session_id
         .as_ref()
         .map(|s| s.to_string())
-        .ok_or_else(|| AppError::Validation("sessionId is required".into()))?;
+        .ok_or_else(|| AppError::invalid("sessionId is required"))?;
     let revoked = |count: u32| typed(json!({ "revokedCount": count }), "revoke-session response");
 
     // Signed by the bearer session's bound key: that session only.
@@ -191,7 +191,7 @@ pub(crate) async fn step_up_start(
         .map(|t| t.to_string())
         .unwrap_or_else(|| STEP_UP_ACR.to_string());
     if target != STEP_UP_ACR && target != "aal1" {
-        return Err(AppError::Validation(format!(
+        return Err(AppError::invalid(format!(
             "this relying party offers step-up to {STEP_UP_ACR} only"
         ))
         .into());
@@ -476,7 +476,7 @@ pub(crate) async fn approve_response(
             return typed(json!({ "status": "recorded" }), "approve-response response");
         }
         PayloadDecision::Approved => {}
-        _ => return Err(AppError::Validation("unsupported decision".into()).into()),
+        _ => return Err(AppError::invalid("unsupported decision").into()),
     }
     // Once this subject holds a step-up passkey, only a webauthn assertion
     // from it may grant step-up: a wallet/VTA-signed `didSigned` decision

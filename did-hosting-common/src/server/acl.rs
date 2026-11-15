@@ -66,7 +66,7 @@ impl std::str::FromStr for Role {
             "owner" => Ok(Role::Owner),
             "service" => Ok(Role::Service),
             "metricsReader" => Ok(Role::MetricsReader),
-            _ => Err(AppError::Validation(format!("unknown role: {s}"))),
+            _ => Err(AppError::invalid(format!("unknown role: {s}"))),
         }
     }
 }
@@ -116,8 +116,9 @@ fn acl_key(did: &str) -> String {
 /// Maximum DID-string length we accept anywhere a DID is written by a
 /// caller — ACL entries, ownership transfers, etc. 2048 fits a
 /// `did:peer:2.*` with multiple inline keys (typical 600–1500 bytes)
-/// plus headroom; tighter bounds are enforced elsewhere where needed
-/// (e.g. `check_acl`'s 512-byte cap on the hot auth path).
+/// plus headroom. The one bound for every DID this service stores or looks
+/// up: `check_acl` and an auth challenge use it too, so an entry an
+/// administrator can create is one that can authorise.
 pub const MAX_DID_LEN: usize = 2048;
 
 /// Validate a DID-string supplied by an admin/owner before it lands in
@@ -136,21 +137,19 @@ pub const MAX_DID_LEN: usize = 2048;
 pub fn validate_did_format(did: &str) -> Result<String, AppError> {
     let trimmed = did.trim();
     if trimmed.is_empty() {
-        return Err(AppError::Validation("DID must not be empty".into()));
+        return Err(AppError::invalid("DID must not be empty"));
     }
     if trimmed.len() > MAX_DID_LEN {
-        return Err(AppError::Validation(format!(
+        return Err(AppError::invalid(format!(
             "DID exceeds maximum length of {MAX_DID_LEN} characters"
         )));
     }
     if !trimmed.starts_with("did:") {
-        return Err(AppError::Validation(
-            "DID must start with 'did:' scheme".into(),
-        ));
+        return Err(AppError::invalid("DID must start with 'did:' scheme"));
     }
     if trimmed.chars().any(|c| c.is_ascii_control()) {
-        return Err(AppError::Validation(
-            "DID must not contain ASCII control characters".into(),
+        return Err(AppError::invalid(
+            "DID must not contain ASCII control characters",
         ));
     }
     Ok(crate::scid::identity(trimmed))
@@ -271,15 +270,15 @@ pub async fn seed_provisioning_vta_acl(
 /// a failed lookup (a throttled store) says nothing about the caller, and
 /// refusing it as "not in the ACL" reads as a revoked grant.
 pub fn is_acl_refusal(e: &AppError) -> bool {
-    matches!(e, AppError::Forbidden(_) | AppError::Validation(_))
+    matches!(e, AppError::Forbidden(_) | AppError::Validation { .. })
 }
 
 /// Check whether a DID is in the ACL and return its role.
 ///
 /// Returns `Forbidden` if the DID is not found.
 pub async fn check_acl(acl: &KeyspaceHandle, did: &str) -> Result<Role, AppError> {
-    if did.len() > 512 {
-        return Err(AppError::Validation("DID exceeds maximum length".into()));
+    if did.len() > MAX_DID_LEN {
+        return Err(AppError::invalid("DID exceeds maximum length"));
     }
     match get_acl_entry(acl, did).await? {
         Some(entry) => {
@@ -506,7 +505,7 @@ mod tests {
     #[test]
     fn validate_did_format_rejects_missing_did_prefix() {
         let err = validate_did_format("example.com").unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)));
+        assert!(matches!(err, AppError::Validation { .. }));
     }
 
     #[test]

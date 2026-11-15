@@ -41,10 +41,19 @@
 //! `crate::messaging::dispatch_trust_task_doc`'s proof gate, so `signer` is
 //! the DID whose key signed it — not a transport's report. Registration, stats
 //! sync, health pongs and domain acks then require that DID to hold the
-//! `Service` role in the ACL; sync acks are only logged. These ops don't run
-//! the typed §7.2 pipeline because upstream has no typed payload specs for
-//! them; the proof gate supplies what that pipeline would (issuer binding,
-//! audience, freshness, replay).
+//! `Service` role in the ACL; sync acks are only logged. Their proof rule is
+//! stated here ([`proof_rule`]: `authentication`), not left to the
+//! dispatcher's default for an unknown Type URI, and the proof gate supplies
+//! what the typed §7.2 pipeline would (issuer binding, audience, freshness,
+//! replay).
+//!
+//! Payloads are typed and closed: registration and the replica acks by their
+//! generated types; stats sync and the health pong by this workspace's own
+//! (`did_hosting_common::{StatsSyncRequest, StatsSyncAck, HealthPong}`),
+//! because the shapes on the wire predate the `server/stats-sync/0.1` and
+//! `server/health/0.1` specifications the lock pins. Conforming them is #449.
+//! A refusal is a `messaging::InfraRejection`, each kind its own standard
+//! code on the wire.
 
 use serde_json::Value;
 use tracing::warn;
@@ -56,6 +65,7 @@ use did_hosting_common::didcomm_types::{
     MSG_SYNC_DELETE_ACK, MSG_SYNC_UPDATE_ACK,
 };
 use did_hosting_common::server::didcomm_profile::ObservedTransport;
+use did_hosting_common::server::trust_tasks::ProofRule;
 
 use crate::registry;
 use crate::server::AppState;
@@ -80,6 +90,15 @@ pub fn owns(type_uri: &str) -> bool {
             | MSG_REPLICA_DOMAIN_PURGE_ACK
             | MSG_REPLICA_DOMAIN_UPSERT_ACK
     )
+}
+
+/// What an infrastructure task's proof must be: every one is an operational
+/// message an edge (or a configured watcher, for its acknowledgements) signs
+/// for `authentication`, by a signer the ACL lists. Stated here rather than
+/// left to the dispatcher's default for a Type URI it does not know, so a
+/// change to that default cannot loosen these.
+pub fn proof_rule(type_uri: &str) -> Option<ProofRule> {
+    owns(type_uri).then_some(ProofRule::Authentication)
 }
 
 /// Handle an infrastructure trust task signed by `sender` (the proven issuer).
@@ -125,31 +144,14 @@ async fn dispatch_inner(
             let reply_id = uuid::Uuid::new_v4().to_string();
             match crate::messaging::do_server_register(state, sender, &doc.payload).await {
                 Ok(ack) => {
+                    let ack = serde_json::to_value(ack).expect("a register ack serialises");
                     let resp = doc.respond_with(reply_id, ack);
                     debug_assert_eq!(resp.type_uri.to_string(), MSG_SERVER_REGISTER_ACK);
                     Some(serde_json::to_value(&resp).expect("ack document serialises"))
                 }
                 Err(rej) => {
-                    // A payload that is not `server/register/0.2` is malformed,
-                    // not forbidden: the caller is told which, and can fix it.
-                    let reason = if let Some(reason) = rej.reason.as_deref().cloned() {
-                        reason
-                    } else if rej.code == "e.p.registration.malformed" {
-                        trust_tasks_rs::RejectReason::MalformedRequest {
-                            reason: rej.comment.clone(),
-                        }
-                    } else {
-                        trust_tasks_rs::RejectReason::PermissionDenied {
-                            reason: rej.comment.clone(),
-                        }
-                    };
-                    let err = doc.reject_with(reply_id, reason);
-                    warn!(
-                        sender,
-                        code = rej.code,
-                        comment = %rej.comment,
-                        "server registration rejected (trust task)"
-                    );
+                    warn!(sender, refusal = %rej, "server registration rejected (trust task)");
+                    let err = doc.reject_with(reply_id, rej.reject_reason());
                     Some(serde_json::to_value(&err).expect("error document serialises"))
                 }
             }
@@ -158,17 +160,13 @@ async fn dispatch_inner(
             let reply_id = uuid::Uuid::new_v4().to_string();
             match crate::messaging::do_stats_sync(state, sender, &doc.payload).await {
                 Ok(ack) => {
+                    let ack = serde_json::to_value(ack).expect("a stats ack serialises");
                     let resp = doc.respond_with(reply_id, ack);
                     debug_assert_eq!(resp.type_uri.to_string(), MSG_STATS_ACK);
                     Some(serde_json::to_value(&resp).expect("ack document serialises"))
                 }
                 Err(rej) => {
-                    let reason = rej.reason.as_deref().cloned().unwrap_or_else(|| {
-                        trust_tasks_rs::RejectReason::PermissionDenied {
-                            reason: rej.comment.clone(),
-                        }
-                    });
-                    let err = doc.reject_with(reply_id, reason);
+                    let err = doc.reject_with(reply_id, rej.reject_reason());
                     Some(serde_json::to_value(&err).expect("error document serialises"))
                 }
             }

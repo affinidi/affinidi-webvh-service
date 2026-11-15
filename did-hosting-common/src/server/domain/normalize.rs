@@ -31,20 +31,20 @@ const MAX_LEN: usize = 253;
 ///   (which equals `input`).
 /// - If `input` parses cleanly but isn't canonical (uppercase, IDN
 ///   pre-punycode, trailing slash, etc.), returns
-///   `Err(AppError::Validation(...))` with the canonical form in the
+///   `Err(AppError::invalid(...))` with the canonical form in the
 ///   message so the caller can retry.
 /// - If `input` is unparseable (control chars, garbage), returns
-///   `Err(AppError::Validation(...))` with a generic "malformed" reason.
+///   `Err(AppError::invalid(...))` with a generic "malformed" reason.
 ///
 /// IP-literal hosts (`127.0.0.1`, `[::1]`) are rejected — a domain
 /// must be a DNS name. Loopback IPs are honoured at the request-host
 /// level by the trusted-proxy logic in T19, not here.
 pub fn normalize_domain_name(input: &str) -> Result<String, AppError> {
     if input.is_empty() {
-        return Err(AppError::Validation("domain name must not be empty".into()));
+        return Err(AppError::invalid("domain name must not be empty"));
     }
     if input.len() > MAX_LEN {
-        return Err(AppError::Validation(format!(
+        return Err(AppError::invalid(format!(
             "domain name exceeds {MAX_LEN} chars"
         )));
     }
@@ -52,13 +52,13 @@ pub fn normalize_domain_name(input: &str) -> Result<String, AppError> {
     // and these slip in). Reject before any further processing so the
     // error names the issue clearly.
     if input.trim() != input {
-        return Err(AppError::Validation(
-            "domain name must not have leading or trailing whitespace".into(),
+        return Err(AppError::invalid(
+            "domain name must not have leading or trailing whitespace",
         ));
     }
     if input.starts_with('/') || input.ends_with('/') {
-        return Err(AppError::Validation(
-            "domain name must not start or end with '/'".into(),
+        return Err(AppError::invalid(
+            "domain name must not start or end with '/'",
         ));
     }
 
@@ -77,7 +77,7 @@ pub fn normalize_domain_name(input: &str) -> Result<String, AppError> {
     };
 
     if canonical != input {
-        return Err(AppError::Validation(format!(
+        return Err(AppError::invalid(format!(
             "domain name not in canonical form — use '{canonical}'"
         )));
     }
@@ -102,7 +102,7 @@ pub fn normalize_domain_name(input: &str) -> Result<String, AppError> {
 fn normalize_host(host: &str) -> Result<String, AppError> {
     let (host_part, port) = split_host_port(host)?;
     let parsed = url::Host::parse(host_part)
-        .map_err(|e| AppError::Validation(format!("malformed host '{host_part}': {e}")))?;
+        .map_err(|e| AppError::invalid(format!("malformed host '{host_part}': {e}")))?;
     let canonical_host = match parsed {
         url::Host::Domain(s) => {
             // url::Host::parse lowercases and IDNA-encodes; double-check
@@ -111,14 +111,14 @@ fn normalize_host(host: &str) -> Result<String, AppError> {
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
             {
-                return Err(AppError::Validation(format!(
+                return Err(AppError::invalid(format!(
                     "host '{s}' contains characters outside LDH + '.'"
                 )));
             }
             s
         }
         url::Host::Ipv4(_) | url::Host::Ipv6(_) => {
-            return Err(AppError::Validation(format!(
+            return Err(AppError::invalid(format!(
                 "host '{host_part}' is an IP literal — domain names must be DNS hostnames"
             )));
         }
@@ -140,17 +140,17 @@ fn split_host_port(host: &str) -> Result<(&str, Option<u16>), AppError> {
         return Ok((host, None));
     };
     if h.is_empty() || p.is_empty() {
-        return Err(AppError::Validation(format!(
+        return Err(AppError::invalid(format!(
             "malformed host '{host}': empty host or port around ':'"
         )));
     }
     let n: u16 = p.parse().map_err(|_| {
-        AppError::Validation(format!(
+        AppError::invalid(format!(
             "host port '{p}' must be a number between 1 and 65535"
         ))
     })?;
     if n == 0 {
-        return Err(AppError::Validation("host port must not be 0".into()));
+        return Err(AppError::invalid("host port must not be 0"));
     }
     Ok((h, Some(n)))
 }
@@ -162,18 +162,16 @@ fn split_host_port(host: &str) -> Result<(&str, Option<u16>), AppError> {
 /// percent-encoding, leading/trailing slashes, empty segments.
 fn normalize_path(path: &str) -> Result<String, AppError> {
     if path.is_empty() {
-        return Err(AppError::Validation(
-            "path-prefix after '/' must not be empty".into(),
-        ));
+        return Err(AppError::invalid("path-prefix after '/' must not be empty"));
     }
     if path.starts_with('/') || path.ends_with('/') {
-        return Err(AppError::Validation(
-            "path-prefix must not have leading or trailing '/'".into(),
+        return Err(AppError::invalid(
+            "path-prefix must not have leading or trailing '/'",
         ));
     }
     if path.contains("//") {
-        return Err(AppError::Validation(
-            "path-prefix must not contain empty segments ('//')".into(),
+        return Err(AppError::invalid(
+            "path-prefix must not contain empty segments ('//')",
         ));
     }
     for c in path.chars() {
@@ -184,7 +182,7 @@ fn normalize_path(path: &str) -> Result<String, AppError> {
             || c == '.'
             || c == '/';
         if !ok {
-            return Err(AppError::Validation(format!(
+            return Err(AppError::invalid(format!(
                 "path-prefix contains invalid character {c:?} — \
                  allowed: lowercase alphanumeric, '-', '_', '.', '/'"
             )));
@@ -333,7 +331,7 @@ mod tests {
             // (url::Host::parse) the host-malformed path may trigger.
             // Either is acceptable; just confirm rejection.
             let _ = s;
-            assert!(matches!(err, AppError::Validation(_)));
+            assert!(matches!(err, AppError::Validation { .. }));
         }
     }
 
@@ -402,25 +400,25 @@ mod tests {
     #[test]
     fn rejects_zero_port() {
         let err = normalize_domain_name("example.com:0").expect_err("port 0 must reject");
-        assert!(matches!(err, AppError::Validation(_)));
+        assert!(matches!(err, AppError::Validation { .. }));
     }
 
     #[test]
     fn rejects_overflow_port() {
         // 65536 doesn't fit in u16.
         let err = normalize_domain_name("example.com:65536").expect_err("overflow must reject");
-        assert!(matches!(err, AppError::Validation(_)));
+        assert!(matches!(err, AppError::Validation { .. }));
     }
 
     #[test]
     fn rejects_non_numeric_port() {
         let err = normalize_domain_name("example.com:http").expect_err("non-numeric must reject");
-        assert!(matches!(err, AppError::Validation(_)));
+        assert!(matches!(err, AppError::Validation { .. }));
     }
 
     #[test]
     fn rejects_empty_port_after_colon() {
         let err = normalize_domain_name("example.com:").expect_err("empty port must reject");
-        assert!(matches!(err, AppError::Validation(_)));
+        assert!(matches!(err, AppError::Validation { .. }));
     }
 }

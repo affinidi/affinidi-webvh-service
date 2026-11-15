@@ -298,7 +298,7 @@ pub async fn import_own_did(
     jsonl: &str,
 ) -> Result<OwnDidImport, AppError> {
     let minted = extract_did_id(jsonl)
-        .ok_or_else(|| AppError::Validation("could not extract DID id from did.jsonl".into()))?;
+        .ok_or_else(|| AppError::invalid("could not extract DID id from did.jsonl"))?;
 
     if let Some(existing) = dids_ks.get::<DidRecord>(did_key(mnemonic)).await? {
         return Ok(if existing.did_id.as_deref() == Some(minted.as_str()) {
@@ -446,25 +446,24 @@ async fn check_import(
     validate_did_jsonl(jsonl)?;
 
     let did_id = extract_did_id(jsonl)
-        .ok_or_else(|| AppError::Validation("could not extract DID id from did.jsonl".into()))?;
+        .ok_or_else(|| AppError::invalid("could not extract DID id from did.jsonl"))?;
 
     // Extract SCID from the DID id (did:webvh:<scid>:host:...)
     let scid = did_id
         .strip_prefix("did:webvh:")
         .and_then(|rest| rest.split(':').next())
-        .ok_or_else(|| AppError::Validation("could not extract SCID from DID id".into()))?
+        .ok_or_else(|| AppError::invalid("could not extract SCID from DID id"))?
         .to_string();
 
     // Validate witness content is valid JSON if provided
     if let Some(witness) = witness_content {
-        serde_json::from_str::<serde_json::Value>(witness).map_err(|e| {
-            AppError::Validation(format!("did-witness.json must be valid JSON: {e}"))
-        })?;
+        serde_json::from_str::<serde_json::Value>(witness)
+            .map_err(|e| AppError::invalid(format!("did-witness.json must be valid JSON: {e}")))?;
     }
 
     // The chain (entry hashes, proofs, key rotation) and, for a witnessed
     // DID, the witness proofs.
-    verify_did_log_and_witness_proofs(jsonl, witness_content).map_err(AppError::Validation)?;
+    verify_did_log_and_witness_proofs(jsonl, witness_content).map_err(AppError::invalid)?;
     let identity = verify_history(dids_ks, mnemonic, &did_id, jsonl, "webvh").await?;
     Ok(CheckedImport {
         did_id,
@@ -821,7 +820,7 @@ mod local_history_tests {
         let err = import_did_at_path(&store, &ks, "alice", &logs[0], None)
             .await
             .expect_err("an older version is refused");
-        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        assert!(matches!(err, AppError::Validation { .. }), "{err:?}");
         assert!(
             ks.get::<DidRecord>(did_key("alice"))
                 .await
@@ -842,7 +841,7 @@ mod local_history_tests {
         let err = import_did_at_path(&store, &ks, "elsewhere", &logs[0], None)
             .await
             .expect_err("an older version under another slot is refused");
-        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        assert!(matches!(err, AppError::Validation { .. }), "{err:?}");
     }
 
     /// A log whose chain does not verify is refused, not only one that does
@@ -864,7 +863,7 @@ mod local_history_tests {
         let err = import_did_at_path(&store, &ks, "bob", &edited, None)
             .await
             .expect_err("an edited log is refused");
-        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        assert!(matches!(err, AppError::Validation { .. }), "{err:?}");
         assert!(ks.get::<DidRecord>(did_key("bob")).await.unwrap().is_none());
     }
 

@@ -514,6 +514,123 @@ pub fn reconcile_listener_protocols(
     config.union(advertised)
 }
 
+/// Build the main listener a node runs for its *own* DID.
+///
+/// The one function every node (server, control, witness, watcher) uses both at
+/// boot and when it rebuilds the listener after an identity change, so the two
+/// cannot drift. A rebuild that skipped any of these steps would come back
+/// different from the listener the node booted with:
+///
+/// - the profile carries every live generation's key material
+///   ([`build_tdk_profile_for_identity`]);
+/// - the transports are the live generations' union **reconciled against what
+///   our own DID document advertises** ([`reconcile_listener_protocols`]) —
+///   otherwise frames on an advertised transport the listener does not carry
+///   are dropped and acked;
+/// - with TSP on, the listener persists its TSP relationships in `store`, so a
+///   rebuild does not forget every peer.
+///
+/// Returns the listener and the transports it carries; the caller starts the
+/// service with a TSP handler when `transports.tsp` is set.
+pub async fn build_own_listener(
+    listener_id: &str,
+    identity: &ServiceIdentity,
+    mediator_did: &str,
+    store: &crate::server::store::Store,
+) -> Result<
+    (
+        affinidi_messaging_didcomm_service::ListenerConfig,
+        crate::server::identity::ProtocolSet,
+    ),
+    AppError,
+> {
+    let profile = build_tdk_profile_for_identity(listener_id, identity, Some(mediator_did)).await?;
+    let advertised = advertised_protocols(&identity.did, Some(&identity.did_resolver)).await;
+    let transports = reconcile_listener_protocols(identity.protocols(), advertised, &identity.did);
+    let listener = own_listener_config(listener_id, profile, transports, store)?;
+    Ok((listener, transports))
+}
+
+/// Rebuild a running node's own listener against its current live identity.
+///
+/// Necessary after any identity change because the framework re-seeds its
+/// secrets resolver from `ListenerConfig.profile.secrets()` on every reconnect —
+/// a secret that is not in the profile vector vanishes the moment the socket
+/// drops. The new listener comes from [`build_own_listener`], exactly as at
+/// boot.
+///
+/// Remove-then-add, not add-then-remove: the mediator allows exactly one
+/// connection per DID, and the framework rejects a second listener for a DID it
+/// already holds. There is a brief window with no listener; inbound messages
+/// queue at the mediator and are delivered on reconnect.
+///
+/// Returns the transports the rebuilt listener carries.
+pub async fn rebuild_own_listener(
+    svc: &affinidi_messaging_didcomm_service::DIDCommService,
+    listener_id: &str,
+    identity: &ServiceIdentity,
+    mediator_did: &str,
+    store: &crate::server::store::Store,
+) -> Result<crate::server::identity::ProtocolSet, AppError> {
+    let (listener, transports) =
+        build_own_listener(listener_id, identity, mediator_did, store).await?;
+
+    if let Err(e) = svc.remove_listener(listener_id).await {
+        warn!("failed to remove the old listener: {e}");
+    }
+    svc.add_listener(listener)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to restart the DIDComm listener: {e}")))?;
+
+    info!(
+        didcomm = transports.didcomm,
+        tsp = transports.tsp,
+        "DIDComm listener rebuilt on the new identity"
+    );
+    Ok(transports)
+}
+
+/// The listener config [`build_own_listener`] assembles, once the profile and
+/// the reconciled transports are known. Split out so the shape is testable
+/// without resolving a DID.
+fn own_listener_config(
+    listener_id: &str,
+    profile: TDKProfile,
+    transports: crate::server::identity::ProtocolSet,
+    store: &crate::server::store::Store,
+) -> Result<affinidi_messaging_didcomm_service::ListenerConfig, AppError> {
+    use affinidi_messaging_didcomm_service::{
+        ListenerConfig, Protocols, RestartPolicy, RetryConfig,
+    };
+
+    // "Neither flag set but a mediator is configured" defaults to DIDComm-only
+    // for back-compat.
+    let protocols = match (transports.didcomm, transports.tsp) {
+        (true, true) => Protocols::BOTH,
+        (false, true) => Protocols::TSP_ONLY,
+        _ => Protocols::DIDCOMM_ONLY,
+    };
+    let mut listener = ListenerConfig {
+        id: listener_id.into(),
+        profile,
+        restart_policy: RestartPolicy::Always {
+            backoff: RetryConfig::default(),
+        },
+        auto_delete: true,
+        protocols,
+        ..Default::default()
+    };
+    // Persist this listener's TSP relationships (Rev 3 §7.2.2) across restarts
+    // and rebuilds. The default store is in-memory, so without this every
+    // peer's relationship is forgotten and its application traffic silently
+    // dropped until a re-handshake. See docs/tsp-transport.md.
+    if transports.tsp {
+        listener.relationship_store =
+            Some(crate::server::tsp_relationship_store::build_relationship_store(store)?);
+    }
+    Ok(listener)
+}
+
 /// Wait until a DID resolves, retrying with exponential backoff.
 ///
 /// Used at DIDComm startup to block until the mediator DID document is
@@ -809,5 +926,41 @@ mod tests {
     fn reconcile_falls_back_to_config_when_document_unresolvable() {
         let cfg = pset(true, false);
         assert_eq!(reconcile_listener_protocols(cfg, None, "did:x"), cfg);
+    }
+
+    /// The listener boot and every identity rebuild share: the reconciled
+    /// transports map onto the framework's protocols, and a TSP listener always
+    /// carries the persistent relationship store (a rebuild that dropped it
+    /// would forget every TSP peer).
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn own_listener_config_carries_the_transports_and_tsp_relationship_store() {
+        use affinidi_messaging_didcomm_service::Protocols;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = crate::server::store::Store::open(&crate::server::config::StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        })
+        .await
+        .expect("open store");
+        let profile = || TDKProfile::new("node", "did:example:node", Some(CFG_MED), vec![]);
+
+        for (transports, protocols, persists) in [
+            (pset(true, true), Protocols::BOTH, true),
+            (pset(false, true), Protocols::TSP_ONLY, true),
+            (pset(true, false), Protocols::DIDCOMM_ONLY, false),
+            (pset(false, false), Protocols::DIDCOMM_ONLY, false),
+        ] {
+            let listener =
+                own_listener_config("node", profile(), transports, &store).expect("listener");
+            assert_eq!(listener.id, "node");
+            assert_eq!(listener.protocols, protocols, "{transports:?}");
+            assert_eq!(
+                listener.relationship_store.is_some(),
+                persists,
+                "{transports:?}: a TSP listener must persist its relationships"
+            );
+        }
     }
 }

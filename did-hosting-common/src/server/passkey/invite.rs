@@ -379,9 +379,7 @@ pub async fn issue(
     hash_wait: std::time::Duration,
 ) -> Result<IssuedInvite, AppError> {
     if req.purpose == Purpose::StepUp && req.role.is_some() {
-        return Err(AppError::Validation(
-            "a step-up invite confers no role".into(),
-        ));
+        return Err(AppError::invalid("a step-up invite confers no role"));
     }
     let token = generate_token();
     let claim_code = generate_claim_code();

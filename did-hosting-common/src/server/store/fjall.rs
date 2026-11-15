@@ -114,7 +114,10 @@ impl FjallBackend {
             "opening fjall store"
         );
 
-        let db = builder.open().map_err(|e| AppError::Store(e.to_string()))?;
+        let db = builder.open().map_err(|e| match e {
+            fjall::Error::Locked => AppError::StoreLocked(e.to_string()),
+            e => AppError::Store(e.to_string()),
+        })?;
         // fjall 3.1 never flushes keyspaces below 64 MiB each and ignores
         // its write-buffer limit, so without this every write stays in
         // memory for the life of the process (see [`super::flusher`]).

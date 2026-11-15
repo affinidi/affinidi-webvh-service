@@ -463,7 +463,10 @@ mod tests {
 
         match outcome {
             DispatchOutcome::Rejected(e) => {
-                assert!(serde_json::to_string(&e).unwrap().contains("not a DID"));
+                // Refused while translating the entry, as every ACL write
+                // validates its subject (`acl::validate_did_format`).
+                let body = serde_json::to_string(&e).unwrap();
+                assert!(body.contains("subject") && body.contains("did:"), "{body}");
             }
             other => panic!("expected Rejected, got {other:?}"),
         }
