@@ -288,20 +288,10 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
 
     // 15. Admin ACL bootstrap
     eprintln!();
-    eprintln!("  The Access Control List (ACL) determines who can authenticate");
-    eprintln!("  with this service. Without at least one admin entry, all");
-    eprintln!("  authenticated API calls will be rejected.");
-    eprintln!();
-    eprintln!("  For the control plane, the did-hosting-server's DID must be added");
-    eprintln!("  as an admin so it can register itself on startup. You can do");
-    eprintln!("  this now if you know the server DID, or later with:");
-    eprintln!("    did-hosting-control add-acl --did <server-did> --role admin");
-    eprintln!();
-    eprintln!("  You may also want an operator admin (your own DID or a");
-    eprintln!("  generated did:key) for manual management.");
+    eprint!("{ACL_BOOTSTRAP_GUIDANCE}");
     eprintln!();
     let admin_options = &[
-        "Enter an existing DID (e.g. server DID or operator DID)",
+        "Enter an existing operator DID",
         "Generate a new did:key identity for the operator",
         "Skip (add later with did-hosting-control add-acl)",
     ];
@@ -367,6 +357,21 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
 
     Ok(())
 }
+
+/// What the wizard tells the operator before its admin ACL step. The entry it
+/// adds is an operator's (`admin`); an edge registers only with the `service`
+/// role (`server/register` refuses any other), so it is granted separately.
+const ACL_BOOTSTRAP_GUIDANCE: &str = "  \
+The Access Control List (ACL) determines who can authenticate with this
+  service. Without at least one admin entry, all authenticated calls are
+  rejected. This step adds an operator admin: your own DID, or a generated
+  did:key.
+
+  Each did-hosting-server (edge) needs its own entry with the `service`
+  role so it can register itself on startup; an `admin` entry is refused.
+  Once you know an edge's DID, grant it with:
+    did-hosting-control add-acl --did <edge-did> --role service
+";
 
 /// Choice of VTA reachability for the unified `setup` wizard.
 enum VtaMode {
@@ -719,11 +724,10 @@ pub async fn run_setup_offline_prepare(
     // operator can save a generated private key immediately). The
     // `complete` step won't re-prompt.
     eprintln!();
-    eprintln!("  Admin ACL entry — the control plane rejects authenticated calls");
-    eprintln!("  until at least one admin DID is enrolled.");
+    eprint!("{ACL_BOOTSTRAP_GUIDANCE}");
     eprintln!();
     let admin_options = &[
-        "Enter an existing DID (e.g. server DID or operator DID)",
+        "Enter an existing operator DID",
         "Generate a new did:key identity for the operator",
         "Skip (add later with did-hosting-control add-acl)",
     ];
@@ -1038,6 +1042,26 @@ fn cleanup_offline_artifacts(state_path: &Path) {
         eprintln!(
             "  Warning: failed to remove state file {}: {e}",
             state_path.display()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wizard grants an edge the role `server/register` requires
+    /// (`service`), never `admin`, which registration refuses.
+    #[test]
+    fn acl_guidance_grants_edges_the_service_role() {
+        let grant = format!("add-acl --did <edge-did> --role {}", Role::Service);
+        assert!(
+            ACL_BOOTSTRAP_GUIDANCE.contains(&grant),
+            "{ACL_BOOTSTRAP_GUIDANCE}"
+        );
+        assert!(
+            !ACL_BOOTSTRAP_GUIDANCE.contains("--role admin"),
+            "{ACL_BOOTSTRAP_GUIDANCE}"
         );
     }
 }

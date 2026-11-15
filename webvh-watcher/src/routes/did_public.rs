@@ -7,7 +7,7 @@ use tracing::debug;
 
 use crate::error::AppError;
 use crate::server::AppState;
-use crate::watcher_ops::{self, WatcherRecord};
+use crate::watcher_ops;
 
 /// A strong entity tag for `content`: its SHA-256, quoted.
 fn entity_tag(content: &[u8]) -> String {
@@ -30,6 +30,21 @@ fn none_match(headers: &HeaderMap, etag: &str) -> bool {
         .any(|tag| tag == "*" || tag.trim_start_matches("W/") == etag)
 }
 
+/// The members of a slot record resolution reads: whether it may be served.
+///
+/// Deliberately not [`WatcherRecord`](watcher_ops::WatcherRecord). The daemon's embedded watcher reads
+/// the daemon's one store, whose slot rows are the hosting service's
+/// `DidRecord`s (no `source_did`, an optional `did_id`), and decoding one as
+/// a `WatcherRecord` failed every resolution of a hosted DID with a `500`.
+/// Both shapes carry `disabled`; a `DidRecord` may also be soft-deleted.
+#[derive(serde::Deserialize)]
+struct SlotState {
+    #[serde(default)]
+    disabled: bool,
+    #[serde(default)]
+    deleted_at: Option<u64>,
+}
+
 /// Serve stored content for a mnemonic, from one store read when the
 /// disabled slots are tracked in memory.
 async fn serve_content(
@@ -45,9 +60,9 @@ async fn serve_content(
         Some(disabled) => disabled,
         None => state
             .dids_ks
-            .get::<WatcherRecord>(watcher_ops::did_key(mnemonic))
+            .get::<SlotState>(watcher_ops::did_key(mnemonic))
             .await?
-            .is_some_and(|r| r.disabled),
+            .is_some_and(|s| s.disabled || s.deleted_at.is_some()),
     };
     if disabled {
         return Err(not_found());
@@ -166,4 +181,90 @@ pub async fn serve_public(
 
     // No matching DID path — return 404
     StatusCode::NOT_FOUND.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use did_hosting_common::server::config::StoreConfig;
+    use did_hosting_common::server::store::Store;
+    use tower::ServiceExt;
+
+    async fn state() -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store_config = StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        };
+        let store = Store::open(&store_config).await.unwrap();
+        let config = crate::config::AppConfig {
+            store: store_config,
+            ..crate::config::AppConfig::default()
+        };
+        (AppState::new(store, config, None).unwrap(), dir)
+    }
+
+    async fn get(state: &AppState, path: &str) -> StatusCode {
+        crate::routes::router_public_only()
+            .with_state(state.clone())
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// A hosting service's `DidRecord` row, as the daemon's one store holds
+    /// it: no `source_did`, so it is not a `WatcherRecord`.
+    fn did_record(mnemonic: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut record = serde_json::json!({
+            "owner": "did:key:z6MkOwner",
+            "mnemonic": mnemonic,
+            "created_at": 1,
+            "updated_at": 1,
+            "version_count": 1,
+            "did_id": null,
+            "method": "webvh",
+            "domain": "example.com",
+        });
+        record
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        record
+    }
+
+    /// The daemon's embedded watcher shares the daemon's store: a slot the
+    /// hosting service holds is served (or refused) by its `DidRecord`, not
+    /// answered `500` for not being a `WatcherRecord`.
+    #[tokio::test]
+    async fn a_hosting_service_record_is_served_by_its_state() {
+        let (state, _dir) = state().await;
+        let ks = &state.dids_ks;
+        for (mnemonic, extra) in [
+            (".well-known", serde_json::json!({})),
+            ("alice", serde_json::json!({})),
+            ("off", serde_json::json!({ "disabled": true })),
+            ("gone", serde_json::json!({ "deleted_at": 5 })),
+        ] {
+            ks.insert(watcher_ops::did_key(mnemonic), &did_record(mnemonic, extra))
+                .await
+                .unwrap();
+            ks.insert_raw(watcher_ops::content_log_key(mnemonic), b"{}\n".to_vec())
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(get(&state, "/.well-known/did.jsonl").await, StatusCode::OK);
+        assert_eq!(get(&state, "/alice/did.jsonl").await, StatusCode::OK);
+        assert_eq!(get(&state, "/off/did.jsonl").await, StatusCode::NOT_FOUND);
+        assert_eq!(get(&state, "/gone/did.jsonl").await, StatusCode::NOT_FOUND);
+        assert_eq!(get(&state, "/ghost/did.jsonl").await, StatusCode::NOT_FOUND);
+        // No witness content is held for the root: 404, not 500.
+        assert_eq!(
+            get(&state, "/.well-known/did-witness.json").await,
+            StatusCode::NOT_FOUND
+        );
+    }
 }
