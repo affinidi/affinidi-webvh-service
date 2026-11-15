@@ -59,28 +59,123 @@ pub fn prompt_long_value(prompt: &str, allow_empty: bool) -> dialoguer::Result<S
     }
 }
 
-/// Prompt for a public URL.
-///
-/// `prompt_text` lets the caller phrase the question for its binary
-/// (e.g. "Server URL", "DID hosting URL"). The trailing slash is
-/// stripped before returning so downstream code can `format!("{}/path")`
-/// without double-slashing.
-pub fn prompt_public_url(prompt_text: &str) -> dialoguer::Result<String> {
-    let url = prompt_long_value(prompt_text, false)?;
-    Ok(url.trim_end_matches('/').to_string())
+/// [`prompt_long_value`], re-prompting with the reason until `check` accepts
+/// the value. With `allow_empty`, an empty submission returns `""` without
+/// being checked. At end of input an unacceptable value is an error rather
+/// than a silent acceptance.
+pub fn prompt_long_validated(
+    prompt: &str,
+    allow_empty: bool,
+    check: impl Fn(&str) -> Result<String, String>,
+) -> dialoguer::Result<String> {
+    loop {
+        let value = prompt_long_value(prompt, allow_empty)?;
+        if value.is_empty() && allow_empty {
+            return Ok(value);
+        }
+        match check(&value) {
+            Ok(accepted) => return Ok(accepted),
+            Err(reason) if value.is_empty() => {
+                // EOF with nothing read: nothing more will come.
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, reason).into());
+            }
+            Err(reason) => eprintln!("  {reason}"),
+        }
+    }
 }
 
-/// Prompt for the bind / listen host. Default is almost always `0.0.0.0`
-/// (any interface); pass that in to keep the call site's intent visible.
+/// Accept an absolute `http`/`https` URL with a host, returned without its
+/// trailing slash so downstream code can `format!("{}/path")` without
+/// double-slashing.
+pub fn validate_url(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let url = url::Url::parse(value).map_err(|e| {
+        format!("`{value}` is not a URL ({e}); enter it with its scheme, e.g. https://example.com")
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!(
+            "`{value}` uses `{}`; the URL must start with https:// (or http://)",
+            url.scheme()
+        ));
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err(format!("`{value}` has no host"));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(format!("`{value}` must not carry a query or fragment"));
+    }
+    Ok(value.trim_end_matches('/').to_string())
+}
+
+/// Accept a DID: `did:<method>:<method-specific-id>`, the method lowercase
+/// letters and digits, no whitespace anywhere.
+pub fn validate_did(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let shape = || {
+        format!("`{value}` is not a DID; expected did:<method>:<id>, e.g. did:webvh:…:example.com")
+    };
+    if value.chars().any(char::is_whitespace) {
+        return Err(format!("`{value}` contains whitespace; a DID has none"));
+    }
+    let rest = value.strip_prefix("did:").ok_or_else(shape)?;
+    let (method, id) = rest.split_once(':').ok_or_else(shape)?;
+    if method.is_empty()
+        || !method
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        || id.is_empty()
+    {
+        return Err(shape());
+    }
+    Ok(value.to_string())
+}
+
+/// Accept a listen address: an IPv4 or IPv6 address (`0.0.0.0`, `127.0.0.1`,
+/// `::`), not a hostname.
+pub fn validate_listen_host(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    value
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.to_string())
+        .map_err(|_| {
+            format!(
+                "`{value}` is not an IP address; enter one, e.g. 0.0.0.0 (every interface) \
+                 or 127.0.0.1"
+            )
+        })
+}
+
+/// Prompt for an `http`/`https` URL (see [`validate_url`]), re-prompting
+/// with the reason until one parses.
+///
+/// `prompt_text` lets the caller phrase the question for its binary
+/// (e.g. "Server URL", "DID hosting URL"). With `allow_empty`, an empty
+/// answer returns `""` (a "leave empty to skip" prompt).
+pub fn prompt_url(prompt_text: &str, allow_empty: bool) -> dialoguer::Result<String> {
+    prompt_long_validated(prompt_text, allow_empty, validate_url)
+}
+
+/// Prompt for a DID (see [`validate_did`]), re-prompting with the reason
+/// until one has the `did:<method>:` shape. With `allow_empty`, an empty
+/// answer returns `""`.
+pub fn prompt_did(prompt_text: &str, allow_empty: bool) -> dialoguer::Result<String> {
+    prompt_long_validated(prompt_text, allow_empty, validate_did)
+}
+
+/// Prompt for the bind / listen host, an IP address. Default is almost
+/// always `0.0.0.0` (any interface); pass that in to keep the call site's
+/// intent visible.
 pub fn prompt_listen_host(default: &str) -> dialoguer::Result<String> {
-    Input::new()
+    let host: String = Input::new()
         .with_prompt("Listen host")
         .default(default.to_string())
-        .interact_text()
+        .validate_with(|v: &String| validate_listen_host(v).map(|_| ()))
+        .interact_text()?;
+    Ok(validate_listen_host(&host).unwrap_or(host))
 }
 
 /// Prompt for the bind / listen port. Default differs per binary
-/// (server=8530, daemon=8534, witness=8102, …); pass the binary's choice.
+/// (server=8530, daemon=8534, witness=8531, …); pass the binary's choice.
 pub fn prompt_listen_port(default: u16) -> dialoguer::Result<u16> {
     Input::new()
         .with_prompt("Listen port")
@@ -124,4 +219,58 @@ pub fn prompt_transport_selection() -> dialoguer::Result<TransportSelection> {
         2 => TransportSelection::Tsp,
         _ => TransportSelection::Both,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urls_need_an_http_scheme_and_a_host() {
+        assert_eq!(
+            validate_url(" https://server1.example.com/ ").unwrap(),
+            "https://server1.example.com"
+        );
+        assert_eq!(
+            validate_url("http://localhost:8530/dids/a").unwrap(),
+            "http://localhost:8530/dids/a"
+        );
+        for bad in [
+            "server1.example.com",
+            "ftp://example.com",
+            "https://",
+            "https://example.com/?x=1",
+            "not a url",
+        ] {
+            assert!(validate_url(bad).is_err(), "{bad} accepted");
+        }
+    }
+
+    #[test]
+    fn dids_need_the_did_method_shape() {
+        assert_eq!(
+            validate_did("did:webvh:abc:example.com").unwrap(),
+            "did:webvh:abc:example.com"
+        );
+        assert!(validate_did("did:key:z6Mk").is_ok());
+        for bad in [
+            "webvh:abc",
+            "did:",
+            "did:webvh",
+            "did:webvh:",
+            "did:WebVH:abc",
+            "did:webvh:abc example.com",
+            "https://example.com",
+        ] {
+            assert!(validate_did(bad).is_err(), "{bad} accepted");
+        }
+    }
+
+    #[test]
+    fn listen_hosts_are_ip_addresses() {
+        assert_eq!(validate_listen_host("0.0.0.0").unwrap(), "0.0.0.0");
+        assert_eq!(validate_listen_host(" :: ").unwrap(), "::");
+        assert!(validate_listen_host("localhost").is_err());
+        assert!(validate_listen_host("example.com").is_err());
+    }
 }

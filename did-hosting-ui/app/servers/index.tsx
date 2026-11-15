@@ -31,7 +31,8 @@ import { ServiceBadges } from "../../components/ServiceBadges";
 import { ControlLink } from "../../components/ControlLink";
 import { AgentNameChips } from "../../components/AgentNameChips";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
-import { showAlert, showConfirm } from "../../lib/alert";
+import { confirm, notify } from "../../lib/feedback";
+import { ErrorWithRetry, StaleMarker } from "../../components/QueryState";
 import { useAgentNames } from "../../lib/use-agent-names";
 import { errorMessage } from "../../lib/errors";
 import { invalidateQueries, useTrustTaskQuery } from "../../lib/query";
@@ -60,11 +61,11 @@ function ServersBody() {
     loading,
     error: loadError,
     refetch,
+    updatedAt,
   } = useTrustTaskQuery([...REGISTRY_KEY], ({ background }) => api.listRegistry({ background }), {
     enabled: isAdmin,
   });
   const instances = data ?? [];
-  const error = loadError ? errorMessage(loadError, "failed to load registry") : null;
   const [busy, setBusy] = useState<string | null>(null);
   const [pickerFor, setPickerFor] = useState<ServiceInstance | null>(null);
 
@@ -81,13 +82,14 @@ function ServersBody() {
       setPickerFor(null);
       try {
         await api.assignDomainToServer(instance.instanceId, domain);
-        showAlert(
-          "Assignment queued",
-          `${instance.label ?? instance.instanceId} will host ${domain} once the DIDComm push acks.`,
+        notify(
+          "success",
+          "Assignment sent",
+          `${instance.label ?? instance.instanceId} will start hosting ${domain} once it confirms. Refresh to see when it has.`,
         );
         await refresh();
       } catch (e: unknown) {
-        showAlert("Assign failed", errorMessage(e));
+        notify("error", "Could not assign the domain", errorMessage(e));
       } finally {
         setBusy(null);
       }
@@ -96,52 +98,60 @@ function ServersBody() {
   );
 
   const handleUnassign = useCallback(
-    (instance: ServiceInstance, domain: string) => {
-      showConfirm(
-        `Unassign ${domain} from this server?`,
-        "DIDs hosted under this domain will be scheduled for purge after the " +
-          "configured grace window (default 2h). Re-assigning within the grace cancels " +
-          "the purge.",
-        async () => {
-          const key = `${instance.instanceId}:${domain}`;
-          setBusy(key);
-          try {
-            await api.unassignDomainFromServer(instance.instanceId, domain);
-            await refresh();
-          } catch (e: unknown) {
-            showAlert("Unassign failed", errorMessage(e));
-          } finally {
-            setBusy(null);
-          }
-        },
-      );
+    async (instance: ServiceInstance, domain: string) => {
+      const name = instance.label ?? instance.instanceId;
+      const ok = await confirm({
+        title: `Stop hosting ${domain} on ${name}?`,
+        body:
+          `${name} stops serving ${domain}, and deletes its copies of the domain's DIDs after ` +
+          `the server's grace period (2 hours unless configured otherwise). Assigning the ` +
+          `domain back before then cancels the deletion. The DIDs stay on the control plane.`,
+        confirmLabel: "Unassign domain",
+      });
+      if (!ok) return;
+      const key = `${instance.instanceId}:${domain}`;
+      setBusy(key);
+      try {
+        await api.unassignDomainFromServer(instance.instanceId, domain);
+        await refresh();
+        notify("success", "Unassignment sent", `${name} will stop hosting ${domain}.`);
+      } catch (e: unknown) {
+        notify("error", "Could not unassign the domain", errorMessage(e));
+      } finally {
+        setBusy(null);
+      }
     },
     [api, refresh],
   );
 
   const handlePurge = useCallback(
-    (instance: ServiceInstance, domain: string) => {
-      showConfirm(
-        `Purge ${domain} on this server NOW?`,
-        "This bypasses the grace period and deletes every DID hosted under " +
-          `${domain} on ${instance.label ?? instance.instanceId} immediately. ` +
-          "The action is audit-logged with reason=admin-immediate and cannot be undone.",
-        async () => {
-          const key = `${instance.instanceId}:${domain}`;
-          setBusy(key);
-          try {
-            await api.purgeDomainOnServer(instance.instanceId, domain);
-            showAlert(
-              "Purge dispatched",
-              `Purge of ${domain} on ${instance.label ?? instance.instanceId} queued. The server's ack is asynchronous.`,
-            );
-          } catch (e: unknown) {
-            showAlert("Purge failed", errorMessage(e));
-          } finally {
-            setBusy(null);
-          }
-        },
-      );
+    async (instance: ServiceInstance, domain: string) => {
+      const name = instance.label ?? instance.instanceId;
+      const ok = await confirm({
+        title: `Purge ${domain} on ${name} now?`,
+        body:
+          `${name} deletes its copies of every DID hosted on ${domain} immediately, without ` +
+          `waiting for the grace period. The control plane still holds the DIDs, so ` +
+          `assigning the domain again re-publishes them. The purge is recorded in the ` +
+          `audit log as an administrator's immediate purge.`,
+        confirmLabel: "Purge now",
+        typeToConfirm: domain,
+      });
+      if (!ok) return;
+      const key = `${instance.instanceId}:${domain}`;
+      setBusy(key);
+      try {
+        await api.purgeDomainOnServer(instance.instanceId, domain);
+        notify(
+          "success",
+          "Purge sent",
+          `${name} has been told to purge ${domain}. It confirms on its own; refresh to see the result.`,
+        );
+      } catch (e: unknown) {
+        notify("error", "Could not purge the domain", errorMessage(e));
+      } finally {
+        setBusy(null);
+      }
     },
     [api],
   );
@@ -160,20 +170,20 @@ function ServersBody() {
         <View style={{ flex: 1 }}>
           <Heading style={styles.title}>Servers</Heading>
           <Text style={styles.subtitle}>
-            Registered hosting instances and the domains they serve. Assign / unassign drives the
-            daemon&apos;s domain-assignment Trust Task; unassign queues a grace-window purge.
+            Hosting servers registered with this control plane, and the domains each one serves.
+            Unassigning a domain deletes the server&apos;s copies of its DIDs after a grace period.
           </Text>
         </View>
         <Button label="Refresh" variant="secondary" onPress={() => void refetch()} />
       </View>
 
-      {error && (
-        <Text role="alert" style={styles.errorText}>
-          {error}
-        </Text>
+      {loadError != null && !data ? (
+        <ErrorWithRetry error={loadError} what="the servers" onRetry={() => void refetch()} />
+      ) : (
+        <StaleMarker updatedAt={updatedAt} error={loadError} onRetry={() => void refetch()} />
       )}
 
-      {loading ? (
+      {loadError != null && !data ? null : loading ? (
         <ActivityIndicator
           color={colors.accent}
           size="large"
@@ -182,8 +192,9 @@ function ServersBody() {
         />
       ) : instances.length === 0 ? (
         <Text style={styles.hint}>
-          No servers registered yet. Servers register themselves on startup via DIDComm; check the
-          daemon log if you expected to see one here.
+          No servers registered yet. A hosting server registers itself with the control plane when
+          it starts; if you expected one here, check that server&apos;s log and its control plane
+          address.
         </Text>
       ) : (
         <FlatList

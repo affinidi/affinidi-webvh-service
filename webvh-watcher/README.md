@@ -187,6 +187,11 @@ rather than to the proxy.
 
 ## CLI Commands
 
+Every subcommand, with its full `--help`, is in
+[`docs/cli-reference.md`](../docs/cli-reference.md), generated from the CLI
+(a test keeps it current). Below is a summary. `health` exits non-zero when a
+check fails (`--strict`: also when one warns).
+
 ```
 webvh-watcher                                  # Run watcher (default)
 webvh-watcher setup                            # Interactive online VTA setup

@@ -419,11 +419,10 @@ async fn run_online_provision(
     eprintln!();
     eprintln!("  Authenticating to the VTA.");
     eprintln!();
-    let vta_did =
-        setup_prompts::prompt_long_value("VTA DID (e.g. did:webvh:vta.example.com)", false)?;
+    let vta_did = setup_prompts::prompt_did("VTA DID (e.g. did:webvh:vta.example.com)", false)?;
     let context_id: String = Input::new()
         .with_prompt("Context ID")
-        .default("webvh".to_string())
+        .default("did-hosting".to_string())
         .interact_text()?;
 
     let setup_key = match preloaded_setup_key {
@@ -529,7 +528,7 @@ async fn run_online_provision(
     eprintln!("  serves the daemon's DID document at <public-url>/<did-path>/did.jsonl.");
     eprintln!();
     let entered_url =
-        setup_prompts::prompt_long_value("Public URL (e.g. https://webvh.example.com)", false)?;
+        setup_prompts::prompt_url("Public URL (e.g. https://webvh.example.com)", false)?;
     let (public_url, default_did_path) = split_origin_and_did_path(&entered_url);
 
     // Discover-first webvh publication choice: serverless (self-host) vs a
@@ -902,7 +901,7 @@ async fn run_self_managed_setup(
     eprintln!("  hosts its own DID document at <public-url>/<did-path>/did.jsonl.");
     eprintln!();
     let entered_url =
-        setup_prompts::prompt_long_value("Public URL (e.g. https://webvh.example.com)", false)?;
+        setup_prompts::prompt_url("Public URL (e.g. https://webvh.example.com)", false)?;
     let (public_url, default_did_path) = split_origin_and_did_path(&entered_url);
     warn_if_insecure_public_url(&public_url);
     let did_path = prompt_did_path(&default_did_path)?;
@@ -997,7 +996,8 @@ async fn run_self_managed_setup(
     // did:scid alias unless DAEMON_HOSTING_SCID_ALSO_KNOWN_AS says otherwise;
     // the written config records the same choice.
     let scid_also_known_as =
-        did_hosting_common::server::config::scid_also_known_as_from_env("DAEMON", true);
+        did_hosting_common::server::config::scid_also_known_as_from_env("DAEMON", true)
+            .map_err(|e| e.to_string())?;
     let host_encoded = did_hosting_common::did::encode_host(&public_url)
         .map_err(|e| format!("failed to encode host from public URL: {e}"))?;
     let doc = build_did_document(
@@ -1254,7 +1254,7 @@ pub async fn run_setup_offline_prepare(
     // and folded into the hosting URL embedded in the bootstrap request, so
     // the VTA-minted DID and the phase-2 local import agree on the path.
     let entered_url =
-        setup_prompts::prompt_long_value("Public URL (e.g. https://webvh.example.com)", false)?;
+        setup_prompts::prompt_url("Public URL (e.g. https://webvh.example.com)", false)?;
     let (public_url, default_did_path) = split_origin_and_did_path(&entered_url);
     let did_path = prompt_did_path(&default_did_path)?;
 
@@ -1265,7 +1265,7 @@ pub async fn run_setup_offline_prepare(
     eprintln!();
     let context_id: String = Input::new()
         .with_prompt("VTA context ID")
-        .default("webvh".to_string())
+        .default("did-hosting".to_string())
         .interact_text()?;
 
     eprintln!();
@@ -1537,7 +1537,7 @@ pub async fn run_setup_offline_complete(
 // ---------------------------------------------------------------------------
 
 /// Prompt for which services are enabled and derive the matching
-/// `FeaturesConfig`. Control always implies `rest_api=true`; a mediator
+/// `FeaturesConfig`. Control always implies `http_listener=true`; a mediator
 /// is handled separately downstream and drives `didcomm`.
 fn prompt_enable_and_features() -> Result<(EnableConfig, FeaturesConfig), Box<dyn std::error::Error>>
 {
@@ -1564,7 +1564,7 @@ fn prompt_enable_and_features() -> Result<(EnableConfig, FeaturesConfig), Box<dy
         // If control is on, REST is on (admin UI depends on it). If only
         // the server is enabled, REST is still useful for health / stats
         // endpoints, so default it on.
-        rest_api: enable.control || enable.server,
+        http_listener: enable.control || enable.server,
         // The caller flips this to true once a mediator has been chosen.
         didcomm: false,
         ..Default::default()
@@ -1590,7 +1590,7 @@ fn prompt_admin_choice() -> Result<AdminChoice, Box<dyn std::error::Error>> {
         .interact()?;
     Ok(match admin_idx {
         0 => {
-            let did: String = Input::new().with_prompt("Admin DID").interact_text()?;
+            let did: String = setup_prompts::prompt_did("Admin DID", false)?;
             AdminChoice::Did(did)
         }
         1 => {
@@ -1632,7 +1632,7 @@ fn prompt_did_path(default: &str) -> Result<String, Box<dyn std::error::Error>> 
 /// Confirm-then-Input and made the wizard look like it asked for the
 /// mediator twice.
 fn prompt_mediator_did() -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let did = setup_prompts::prompt_long_value("Mediator DID (leave empty to skip)", true)?;
+    let did = setup_prompts::prompt_did("Mediator DID (leave empty to skip)", true)?;
     let trimmed = did.trim();
     Ok(if trimmed.is_empty() {
         None
@@ -1686,7 +1686,13 @@ async fn finalize_daemon_setup(
                 did_id
             }
             OwnDidImport::HeldByAnother { existing, minted } => {
-                return Err(stale_own_did_message(did_path, existing.as_deref(), &minted).into());
+                return Err(stale_own_did_message(
+                    "did-hosting-daemon",
+                    did_path,
+                    existing.as_deref(),
+                    &minted,
+                )
+                .into());
             }
         };
         did_hosting_server::setup::update_server_did_in_config(

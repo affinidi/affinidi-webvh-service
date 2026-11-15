@@ -2,7 +2,7 @@ import { useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 
 import type { CreateInviteResponse, InvitePurpose } from "../../lib/api";
-import { showAlert } from "../../lib/alert";
+import { notify } from "../../lib/feedback";
 import { errorMessage } from "../../lib/errors";
 import { invalidateQueries } from "../../lib/query";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
@@ -15,6 +15,7 @@ import { Field } from "../Field";
 import { SegmentedControl } from "../SegmentedControl";
 import { INVITES_KEY } from "./keys";
 import { INVITE_ROLES, type InviteRole } from "./roles";
+import { Term } from "../Term";
 
 const PURPOSES = [
   { value: "session", label: "Sign-in" },
@@ -41,7 +42,7 @@ export function InviteCard() {
       // Pull in the newly-created invite for the pending list too.
       void invalidateQueries(INVITES_KEY);
     } catch (e: unknown) {
-      showAlert("Error", errorMessage(e, "Failed to create invite"));
+      notify("error", "Could not create the invite", errorMessage(e, "Failed to create invite"));
     } finally {
       setInviting(false);
     }
@@ -61,9 +62,10 @@ export function InviteCard() {
         ACL with the selected role; a step-up invite enrols a passkey that only confirms sensitive
         actions and never signs in.
       </Text>
+      <Term term="stepUp" label="What is a step-up passkey?" style={styles.help} />
       {invite ? (
         <View>
-          <Text style={styles.fieldLabel}>Enrollment URL</Text>
+          <Text style={styles.fieldLabel}>Enrolment link</Text>
           <View style={styles.valueBlock}>
             <Text style={styles.valueText} selectable numberOfLines={2}>
               {invite.inviteUrl}

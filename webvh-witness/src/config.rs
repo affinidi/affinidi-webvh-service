@@ -9,6 +9,7 @@ pub use did_hosting_common::server::config::{
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
     pub features: FeaturesConfig,
@@ -120,5 +121,42 @@ impl AppConfig {
         env_opt!("WITNESS_VTA_CONTEXT_ID", config.vta.context_id);
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the setup wizard and recipe write (a serialised `AppConfig`)
+    /// loads back under the strict parser, with the default port 8531;
+    /// misspelt keys are refused and the former `rest_api` name still loads.
+    #[test]
+    fn a_written_config_loads_and_typos_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config: AppConfig = toml::from_str("").unwrap();
+        assert_eq!(config.server.port, 8531);
+        config.server_did = Some("did:webvh:abc:witness.example.com".into());
+        config.features.http_listener = true;
+        std::fs::write(&path, toml::to_string_pretty(&config).unwrap()).unwrap();
+        let loaded = AppConfig::load(Some(path.clone())).expect("written config loads");
+        assert!(loaded.features.http_listener);
+
+        std::fs::write(&path, "[features]\nrest_api = true\n").unwrap();
+        assert!(
+            AppConfig::load(Some(path.clone()))
+                .unwrap()
+                .features
+                .http_listener
+        );
+
+        for bad in [
+            "sever_did = \"did:example:x\"\n",
+            "[store]\ndatadir = \"x\"\n",
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(AppConfig::load(Some(path.clone())).is_err(), "{bad}");
+        }
     }
 }

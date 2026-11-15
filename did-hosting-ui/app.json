@@ -3,19 +3,10 @@
     "name": "DID Hosting Manager",
     "slug": "webvh-ui",
     "version": "1.0.0",
-    "orientation": "portrait",
+    "platforms": ["web"],
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "dark",
     "scheme": "webvh",
-    "ios": {
-      "supportsTablet": true
-    },
-    "android": {
-      "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#ffffff"
-      }
-    },
     "web": {
       "favicon": "./assets/favicon.png",
       "bundler": "metro",
@@ -29,7 +20,7 @@
         {
           "image": "./assets/splash-icon.png",
           "resizeMode": "contain",
-          "backgroundColor": "#ffffff"
+          "backgroundColor": "#040823"
         }
       ],
       "expo-status-bar"

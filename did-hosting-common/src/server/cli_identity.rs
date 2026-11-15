@@ -56,20 +56,20 @@ pub async fn run_list_generations(store_config: &StoreConfig) -> CliResult {
     let now = crate::server::auth::session::now_epoch();
     let current_id = generations.first().map(|g| g.id);
 
-    eprintln!();
+    println!();
     for g in &generations {
         let is_current = Some(g.id) == current_id;
-        eprintln!(
+        println!(
             "  Generation {}{}",
             g.id,
             if is_current { "  (current)" } else { "" }
         );
-        eprintln!("    key agreement : {}", g.ka_kid);
-        eprintln!("    signing       : {}", g.signing_kid);
+        println!("    key agreement : {}", g.ka_kid);
+        println!("    signing       : {}", g.signing_kid);
         if let Some(ref m) = g.mediator_did {
-            eprintln!("    mediator      : {m}");
+            println!("    mediator      : {m}");
         }
-        eprintln!(
+        println!(
             "    transports    : {}",
             match (g.protocols.didcomm, g.protocols.tsp) {
                 (true, true) => "DIDComm + TSP",
@@ -81,16 +81,16 @@ pub async fn run_list_generations(store_config: &StoreConfig) -> CliResult {
         match g.expires_at {
             Some(expires) => {
                 let remaining = expires.saturating_sub(now);
-                eprintln!(
+                println!(
                     "    retired       : still honoured for {}m {}s",
                     remaining / 60,
                     remaining % 60
                 );
             }
             None if is_current => {}
-            None => eprintln!("    retired       : no expiry recorded"),
+            None => println!("    retired       : no expiry recorded"),
         }
-        eprintln!();
+        println!();
     }
 
     if generations.len() > 1 {

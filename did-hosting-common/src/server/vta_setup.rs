@@ -90,11 +90,10 @@ fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Resolve the mediator DID from the VTA's DID document.
 ///
 /// Looks for a `DIDCommMessaging` service endpoint in the VTA DID document
-/// that contains a DID URI (the mediator). Returns `None` if no mediator
-/// is configured, if DID resolution fails, or if resolution times out.
-pub async fn resolve_vta_mediator(vta_did: &str) -> Option<String> {
-    eprintln!("  Checking VTA for mediator configuration...");
-
+/// that contains a DID URI (the mediator). `Ok(None)`: the document names
+/// no mediator. `Err`: the VTA DID could not be resolved (or resolution
+/// timed out) — a different answer, which the wizard reports as such.
+pub async fn resolve_vta_mediator(vta_did: &str) -> Result<Option<String>, String> {
     // Use a timeout — DID resolution may hang if the network is unreachable
     match tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -102,8 +101,31 @@ pub async fn resolve_vta_mediator(vta_did: &str) -> Option<String> {
     )
     .await
     {
-        Ok(Ok(mediator)) => mediator,
-        Ok(Err(_)) | Err(_) => None,
+        Ok(Ok(mediator)) => Ok(mediator),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("timed out after 10s".to_string()),
+    }
+}
+
+/// The wizards' mediator discovery: [`resolve_vta_mediator`], telling the
+/// operator which of "no mediator advertised" and "could not resolve the VTA
+/// DID" happened, so a resolution failure is not mistaken for a VTA without
+/// a mediator. Returns the mediator to offer, if any.
+pub async fn discover_vta_mediator(vta_did: &str) -> Option<String> {
+    eprintln!("  Checking VTA for mediator configuration...");
+    match resolve_vta_mediator(vta_did).await {
+        Ok(Some(mediator)) => Some(mediator),
+        Ok(None) => {
+            eprintln!("  The VTA's DID document advertises no mediator.");
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "  Could not resolve the VTA DID ({e}), so its mediator cannot be offered. \
+                 Check the VTA DID and network access, or enter a mediator DID by hand."
+            );
+            None
+        }
     }
 }
 

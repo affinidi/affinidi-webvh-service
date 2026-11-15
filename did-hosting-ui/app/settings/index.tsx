@@ -9,7 +9,8 @@ import { RequireAuth } from "../../components/RequireAuth";
 import { ServiceBadges } from "../../components/ServiceBadges";
 import { AgentNameChips } from "../../components/AgentNameChips";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
-import { showConfirm } from "../../lib/alert";
+import { confirm, notify } from "../../lib/feedback";
+import { ErrorWithRetry } from "../../components/QueryState";
 import { errorMessage } from "../../lib/errors";
 import { useTrustTaskMutation, useTrustTaskQuery } from "../../lib/query";
 import { QK } from "../../lib/query-keys";
@@ -104,6 +105,7 @@ function Settings() {
     data: config,
     loading,
     error,
+    refetch,
   } = useTrustTaskQuery(QK.serverConfig, ({ background }) => api.getConfig({ background }), {
     enabled: isAdmin,
   });
@@ -113,17 +115,14 @@ function Settings() {
   // set of DIDs actually changes, not on every render.
   const agentNames = useAgentNames([config?.controlDid, config?.mediatorDid, config?.vtaDid]);
 
-  // A deployment with no DID configured has no generations. That is not an
-  // error worth showing — the panel simply doesn't render.
-  const { data: generations = [] } = useTrustTaskQuery(
+  // A deployment with no DID configured answers with no generations, and
+  // the panel simply doesn't render. A failed read is said, with a retry.
+  const generationsQuery = useTrustTaskQuery(
     QK.identityGenerations,
-    () =>
-      api.listIdentityGenerations().then(
-        (d) => d.generations,
-        (): IdentityGeneration[] => [],
-      ),
+    () => api.listIdentityGenerations().then((d) => d.generations),
     { enabled: isAdmin },
   );
+  const generations: IdentityGeneration[] = generationsQuery.data ?? [];
   const retire = useTrustTaskMutation((id: number) => api.retireIdentityGeneration(id), {
     invalidates: [QK.identityGenerations],
   });
@@ -138,24 +137,26 @@ function Settings() {
    * ability to reach it until their cache expires. That breakage is the point
    * when a key is compromised, but it is not something to trigger by accident.
    */
-  const retireGeneration = (g: IdentityGeneration) => {
-    showConfirm(
-      `Retire generation ${g.id}?`,
-      `This stops honouring generation ${g.id} immediately, ahead of its grace period.\n\n` +
+  const retireGeneration = async (g: IdentityGeneration) => {
+    const ok = await confirm({
+      title: `Retire generation ${g.id}?`,
+      body:
+        `This stops honouring generation ${g.id} immediately, ahead of its grace period.\n\n` +
         `Messages still encrypted to its key-agreement key will no longer decrypt, and peers ` +
         `whose cached DID document still names that key will be unable to reach this service ` +
         `until their cache expires.\n\n` +
         `Do this if the key is compromised. Otherwise, let the grace period run out.`,
-      () => {
-        setRetiring(g.id);
-        retire
-          .mutate(g.id)
-          .catch(() => {
-            // Shown below from `retire.error`.
-          })
-          .finally(() => setRetiring(null));
-      },
-    );
+      confirmLabel: `Retire generation ${g.id}`,
+    });
+    if (!ok) return;
+    setRetiring(g.id);
+    retire
+      .mutate(g.id)
+      .then(() => notify("success", `Generation ${g.id} retired`))
+      .catch(() => {
+        // Shown below from `retire.error`.
+      })
+      .finally(() => setRetiring(null));
   };
   const identityError = retire.error
     ? errorMessage(retire.error, "Failed to retire generation")
@@ -186,9 +187,11 @@ function Settings() {
   if (error && !config) {
     return (
       <View style={styles.containerCenter}>
-        <Text role="alert" style={styles.errorText}>
-          {errorMessage(error)}
-        </Text>
+        <ErrorWithRetry
+          error={error}
+          what="the control plane settings"
+          onRetry={() => void refetch()}
+        />
       </View>
     );
   }
@@ -219,6 +222,14 @@ function Settings() {
         <Row label="Control Plane URL" value={config.publicUrl ?? "Not configured"} />
         {config.didHostingUrl && <Row label="DID Hosting URL" value={config.didHostingUrl} />}
       </View>
+
+      {generationsQuery.error != null && !generationsQuery.data && (
+        <ErrorWithRetry
+          error={generationsQuery.error}
+          what="the key generations"
+          onRetry={() => void generationsQuery.refetch()}
+        />
+      )}
 
       {/* Key generations. Only rendered when there is more than one — a
           service that has never rotated has nothing to say here, and a

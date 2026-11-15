@@ -3,28 +3,23 @@
 use std::error::Error;
 use std::path::PathBuf;
 
-use did_hosting_common::server::health;
+use did_hosting_common::server::health::{self, HealthReport};
 
 use crate::config::AppConfig;
 
-pub async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
+/// Run every check and return what they found. A config that does not load
+/// is an error: nothing else can be checked without it.
+pub async fn run_health(config_path: Option<PathBuf>) -> Result<HealthReport, Box<dyn Error>> {
+    let mut report = HealthReport::new();
     health::header("webvh-witness", env!("CARGO_PKG_VERSION"));
 
     // ── Configuration ──────────────────────────────────────────────
-    let config = match AppConfig::load(config_path) {
-        Ok(c) => {
-            health::section("Configuration");
-            health::check_config_loaded(&c.config_path);
-            health::check_value("server_did", &c.server_did);
-            health::check_value("mediator_did", &c.mediator_did);
-            Some(c)
-        }
-        Err(e) => {
-            health::section("Configuration");
-            health::fail(&format!("Config load failed: {e}"));
-            None
-        }
-    };
+    health::section("Configuration");
+    let config = AppConfig::load(config_path)
+        .map_err(|e| -> Box<dyn Error> { format!("config load failed: {e}").into() })?;
+    health::check_config_loaded(&config.config_path);
+    health::check_value("server_did", &config.server_did);
+    health::check_value("mediator_did", &config.mediator_did);
 
     // ── Compile Features ───────────────────────────────────────────
     health::section("Compile Features");
@@ -37,33 +32,24 @@ pub async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn Erro
     health::print_feature("aws-secrets", cfg!(feature = "aws-secrets"));
     health::print_feature("gcp-secrets", cfg!(feature = "gcp-secrets"));
 
-    let config = match config {
-        Some(c) => c,
-        None => {
-            eprintln!();
-            return Ok(());
-        }
-    };
-
     // ── Secrets ────────────────────────────────────────────────────
     health::section("Secrets");
-    health::check_secrets(&config.secrets, &config.config_path).await;
+    health::check_secrets(&mut report, &config.secrets, &config.config_path).await;
 
     // ── Store ──────────────────────────────────────────────────────
     health::section("Store");
-    health::check_store(&config.store).await;
+    health::check_store(&mut report, &config.store).await;
 
     // ── DID Resolution ─────────────────────────────────────────────
     if let Some(ref did) = config.server_did {
         health::section("DID Resolution");
-        health::check_did_resolution("Server DID resolves", did).await;
+        health::check_did_resolution(&mut report, "Server DID resolves", did).await;
     }
 
     if let Some(ref did) = config.mediator_did {
         health::section("Mediator DID Resolution");
-        health::check_did_resolution("Mediator DID resolves", did).await;
+        health::check_did_resolution(&mut report, "Mediator DID resolves", did).await;
     }
 
-    eprintln!();
-    Ok(())
+    Ok(report)
 }

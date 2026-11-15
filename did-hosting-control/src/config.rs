@@ -9,6 +9,7 @@ pub use did_hosting_common::server::config::{
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
     pub features: FeaturesConfig,
@@ -255,6 +256,7 @@ impl GeoIpConfig {
 
 /// Trust Tasks framework runtime knobs.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrustTasksConfig {
     /// Retained only so an existing config that sets it still parses.
     ///
@@ -300,6 +302,7 @@ fn default_store() -> StoreConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegistryConfig {
     #[serde(default)]
     pub instances: Vec<InstanceConfig>,
@@ -334,6 +337,7 @@ pub struct RegistryConfig {
 
 /// One watcher: the URL DID logs name it by, and its DID.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WatcherPeer {
     pub url: String,
     pub did: String,
@@ -355,9 +359,10 @@ fn default_health_check_interval() -> u64 {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InstanceConfig {
     pub label: Option<String>,
-    pub service_type: String,
+    pub service_type: crate::registry::ServiceType,
     pub url: String,
 }
 
@@ -405,7 +410,7 @@ impl AppConfig {
         did_hosting_common::server::config::apply_hosting_env_overrides(
             "CONTROL",
             &mut config.hosting,
-        );
+        )?;
         // CONTROL_REPLAY_* — anti-replay cache bounds. Also validates `[replay]`.
         config.replay.apply_env_overrides("CONTROL")?;
         // CONTROL_GEOIP_DATABASE — the local sign-in location database.
@@ -459,6 +464,59 @@ impl AppConfig {
         }
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+
+    /// What the setup wizard and recipe write (a serialised `AppConfig`)
+    /// loads back under the strict parser, with a registry instance's
+    /// `service_type` read as the enum; a misspelt key or an unknown service
+    /// type is refused.
+    #[test]
+    fn a_written_config_loads_and_typos_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config: AppConfig = toml::from_str("").unwrap();
+        config.server_did = Some("did:webvh:abc:control.example.com".into());
+        config.public_url = Some("https://control.example.com".into());
+        config.features.http_listener = true;
+        config.features.didcomm = true;
+        config.registry.instances.push(InstanceConfig {
+            label: Some("edge".into()),
+            service_type: crate::registry::ServiceType::Server,
+            url: "https://edge.example.com".into(),
+        });
+        std::fs::write(&path, toml::to_string_pretty(&config).unwrap()).unwrap();
+        let loaded = AppConfig::load(Some(path.clone())).expect("written config loads");
+        assert!(loaded.features.http_listener);
+        assert_eq!(
+            loaded.registry.instances[0].service_type,
+            crate::registry::ServiceType::Server
+        );
+        assert_eq!(loaded.hosting.disable_purge_grace.as_secs(), 30 * 86_400);
+
+        // A config written before the rename still loads.
+        std::fs::write(&path, "[features]\nrest_api = true\n").unwrap();
+        assert!(
+            AppConfig::load(Some(path.clone()))
+                .unwrap()
+                .features
+                .http_listener
+        );
+
+        for bad in [
+            "[registry]\nhealth_check_intreval = 5\n",
+            "[[registry.instances]]\nservice_type = \"edge\"\nurl = \"https://e.example.com\"\n",
+            "[trust_tasks]\nenforce = true\n",
+            "[hosting]\ndisable_purge_grace = \"1w\"\n",
+            "did_hosting_ur = \"https://x.example.com\"\n",
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(AppConfig::load(Some(path.clone())).is_err(), "{bad}");
+        }
     }
 }
 

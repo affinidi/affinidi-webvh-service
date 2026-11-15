@@ -98,7 +98,10 @@ pub async fn run_wizard(
     }
 
     // 2. Feature selection
-    let feature_items = &["DIDComm Messaging", "REST API"];
+    let feature_items = &[
+        "DIDComm Messaging",
+        "HTTP listener (Trust Tasks over HTTPS, health)",
+    ];
     let selected = MultiSelect::new()
         .with_prompt("Which features do you want to enable? (Space to toggle, Enter to confirm)")
         .items(feature_items)
@@ -106,7 +109,7 @@ pub async fn run_wizard(
         .interact()?;
 
     let enable_didcomm = selected.contains(&0);
-    let enable_rest_api = selected.contains(&1);
+    let enable_http_listener = selected.contains(&1);
 
     // 3. VTA online provision: prompt for VTA DID + context + mediator,
     //    mint ephemeral did:key, print PNM `contexts create` command,
@@ -124,7 +127,7 @@ pub async fn run_wizard(
     eprintln!("  The witness DID will be hosted on your did-hosting-server.");
     eprintln!();
     let did_hosting_url =
-        setup_prompts::prompt_long_value("DID hosting URL (e.g. https://did.example.com)", false)?;
+        setup_prompts::prompt_url("DID hosting URL (e.g. https://did.example.com)", false)?;
     let _did_hosting_url = did_hosting_url.trim_end_matches('/').to_string();
 
     // 5. DID path
@@ -156,7 +159,11 @@ pub async fn run_wizard(
 
     // 9. Host / Port
     let host = setup_prompts::prompt_listen_host("0.0.0.0")?;
-    let port = setup_prompts::prompt_listen_port(8102)?;
+    let port = setup_prompts::prompt_listen_port(
+        did_hosting_common::server::setup_recipe::SetupRecipe::default_port(
+            did_hosting_common::server::setup_recipe::ServiceKind::Witness,
+        ),
+    )?;
 
     // 10. Log level / format
     let log_levels = ["info", "debug", "warn", "error", "trace"];
@@ -191,7 +198,7 @@ pub async fn run_wizard(
         features: FeaturesConfig {
             didcomm: enable_didcomm,
             tsp: enable_didcomm,
-            rest_api: enable_rest_api,
+            http_listener: enable_http_listener,
             ..Default::default()
         },
         server_did: Some(outcome.integration_did.clone()),
@@ -267,7 +274,7 @@ pub async fn run_wizard(
 
     if admin_idx <= 1 {
         let admin_did = if admin_idx == 0 {
-            let did: String = Input::new().with_prompt("Admin DID").interact_text()?;
+            let did: String = setup_prompts::prompt_did("Admin DID", false)?;
             did
         } else {
             let (did, sk) = vta_setup::generate_admin_did_key();
@@ -401,11 +408,10 @@ async fn run_online_provision(
     eprintln!();
     eprintln!("  Authenticating to the VTA.");
     eprintln!();
-    let vta_did =
-        setup_prompts::prompt_long_value("VTA DID (e.g. did:webvh:vta.example.com)", false)?;
+    let vta_did = setup_prompts::prompt_did("VTA DID (e.g. did:webvh:vta.example.com)", false)?;
     let context_id: String = Input::new()
         .with_prompt("Context ID")
-        .default("webvh".to_string())
+        .default("did-hosting".to_string())
         .interact_text()?;
 
     // The did-hosting-server template needs a MEDIATOR_DID up-front (it
@@ -415,7 +421,7 @@ async fn run_online_provision(
     eprintln!("  The mediator DID is embedded in the witness's DID document");
     eprintln!("  and reused at runtime for outbound DIDComm.");
     eprintln!();
-    let vta_mediator = vta_setup::resolve_vta_mediator(&vta_did).await;
+    let vta_mediator = vta_setup::discover_vta_mediator(&vta_did).await;
     let mut mediator_options: Vec<String> = Vec::new();
     if let Some(ref did) = vta_mediator {
         mediator_options.push(format!("Use VTA's mediator ({did})"));
@@ -431,7 +437,7 @@ async fn run_online_provision(
             .clone()
             .expect("Use VTA option only present when discovered")
     } else {
-        setup_prompts::prompt_long_value("Mediator DID", false)?
+        setup_prompts::prompt_did("Mediator DID", false)?
     };
 
     let setup_key = match preloaded_setup_key {
@@ -502,7 +508,7 @@ async fn run_online_provision(
 //
 // Same two-step pattern as `did-hosting-control setup-offline-prepare/complete`
 // and `did-hosting-server setup-offline-*`, adapted to witness's config:
-// feature toggles (didcomm / rest_api), admin ACL with optional label, and
+// feature toggles (didcomm / http_listener), admin ACL with optional label, and
 // "import this DID on the server" next-step text.
 // ---------------------------------------------------------------------------
 
@@ -517,7 +523,7 @@ enum AdminChoice {
 struct PendingWitnessSetupState {
     config_output: PathBuf,
     enable_didcomm: bool,
-    enable_rest_api: bool,
+    enable_http_listener: bool,
     did_hosting_url: String,
     did_path: String,
     mediator_did: Option<String>,
@@ -572,17 +578,20 @@ pub async fn run_setup_offline_prepare(
     }
 
     // Feature selection (mirrors online wizard)
-    let feature_items = &["DIDComm Messaging", "REST API"];
+    let feature_items = &[
+        "DIDComm Messaging",
+        "HTTP listener (Trust Tasks over HTTPS, health)",
+    ];
     let selected = MultiSelect::new()
         .with_prompt("Which features do you want to enable? (Space to toggle, Enter to confirm)")
         .items(feature_items)
         .defaults(&[true, true])
         .interact()?;
     let enable_didcomm = selected.contains(&0);
-    let enable_rest_api = selected.contains(&1);
+    let enable_http_listener = selected.contains(&1);
 
     let did_hosting_url =
-        setup_prompts::prompt_long_value("DID hosting URL (e.g. https://did.example.com)", false)?;
+        setup_prompts::prompt_url("DID hosting URL (e.g. https://did.example.com)", false)?;
     let did_hosting_url = did_hosting_url.trim_end_matches('/').to_string();
 
     let did_path: String = Input::new()
@@ -597,7 +606,7 @@ pub async fn run_setup_offline_prepare(
     eprintln!();
     let context_id: String = Input::new()
         .with_prompt("VTA context ID")
-        .default("webvh".to_string())
+        .default("did-hosting".to_string())
         .interact_text()?;
 
     eprintln!();
@@ -605,8 +614,7 @@ pub async fn run_setup_offline_prepare(
     eprintln!("  In the offline flow we can't auto-discover the VTA's mediator,");
     eprintln!("  so enter the mediator DID manually or skip.");
     eprintln!();
-    let mediator_raw =
-        setup_prompts::prompt_long_value("Mediator DID (leave empty to skip)", true)?;
+    let mediator_raw = setup_prompts::prompt_did("Mediator DID (leave empty to skip)", true)?;
     let mediator_did = if mediator_raw.trim().is_empty() {
         None
     } else {
@@ -620,7 +628,11 @@ pub async fn run_setup_offline_prepare(
     let did_log_output = PathBuf::from(did_log_output);
 
     let host = setup_prompts::prompt_listen_host("0.0.0.0")?;
-    let port = setup_prompts::prompt_listen_port(8102)?;
+    let port = setup_prompts::prompt_listen_port(
+        did_hosting_common::server::setup_recipe::SetupRecipe::default_port(
+            did_hosting_common::server::setup_recipe::ServiceKind::Witness,
+        ),
+    )?;
 
     let log_levels = ["info", "debug", "warn", "error", "trace"];
     let log_level_idx = Select::new()
@@ -663,7 +675,7 @@ pub async fn run_setup_offline_prepare(
 
     let admin = match admin_idx {
         0 => {
-            let did: String = Input::new().with_prompt("Admin DID").interact_text()?;
+            let did: String = setup_prompts::prompt_did("Admin DID", false)?;
             let admin_label: String = Input::new()
                 .with_prompt("Label (optional)")
                 .default(String::new())
@@ -706,7 +718,7 @@ pub async fn run_setup_offline_prepare(
     let state = PendingWitnessSetupState {
         config_output: config_output.clone(),
         enable_didcomm,
-        enable_rest_api,
+        enable_http_listener,
         did_hosting_url,
         did_path,
         mediator_did,
@@ -818,7 +830,7 @@ pub async fn run_setup_offline_complete(
         features: FeaturesConfig {
             didcomm: state.enable_didcomm,
             tsp: state.enable_didcomm,
-            rest_api: state.enable_rest_api,
+            http_listener: state.enable_http_listener,
             ..Default::default()
         },
         server_did: Some(result.did.clone()),

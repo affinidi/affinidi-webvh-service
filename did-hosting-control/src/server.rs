@@ -202,7 +202,7 @@ impl AppState {
     /// requests on *any* transport, not on the REST thread's: invite
     /// redemption and the large-document budget are charged over DIDComm and
     /// TSP too, so a sweep tied to the REST runtime would stop (or never
-    /// start) when the REST API is off. The sweep only touches the limiters'
+    /// start) when the HTTP listener is off. The sweep only touches the limiters'
     /// shared maps, so which runtime runs it does not matter otherwise.
     pub fn spawn_rate_limit_gc(&self, shutdown: &CancellationToken) {
         self.ip_rate_limiter.spawn_gc(shutdown.clone());
@@ -282,15 +282,18 @@ pub async fn open_geoip(
 
 pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
     // Validate that at least one management interface is enabled
-    if !config.features.rest_api && !config.features.didcomm && !config.features.tsp {
+    if !config.features.http_listener && !config.features.didcomm && !config.features.tsp {
         return Err(AppError::Config(
-            "at least one of 'rest_api', 'didcomm', or 'tsp' must be enabled in [features]".into(),
+            "at least one of 'http_listener', 'didcomm', or 'tsp' must be enabled in [features]"
+                .into(),
         ));
     }
 
     #[cfg(feature = "ui")]
-    if !config.features.rest_api {
-        warn!("UI feature is compiled in but rest_api is disabled — UI will not be accessible");
+    if !config.features.http_listener {
+        warn!(
+            "UI feature is compiled in but http_listener is disabled — UI will not be accessible"
+        );
     }
 
     // Open keyspace handles
@@ -343,7 +346,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     });
 
     // Bind TCP listener on the main thread
-    let std_listener = if config.features.rest_api {
+    let std_listener = if config.features.http_listener {
         let addr = format!("{}:{}", config.server.host, config.server.port);
         let listener = std::net::TcpListener::bind(&addr).map_err(AppError::Io)?;
         listener.set_nonblocking(true).map_err(AppError::Io)?;
@@ -458,15 +461,15 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 
     // Sweep idle clients out of the rate limiters on this runtime, not the
     // REST thread's: invite redemption is charged over DIDComm and TSP too,
-    // so the sweep runs whether or not the REST API is on.
+    // so the sweep runs whether or not the HTTP listener is on.
     let rate_limit_gc = CancellationToken::new();
     state.spawn_rate_limit_gc(&rate_limit_gc);
 
     // Log startup configuration
     info!("--- enabled services ---");
     info!(
-        "  REST API : {}",
-        if state.config.features.rest_api {
+        "  HTTP listener : {}",
+        if state.config.features.http_listener {
             "enabled"
         } else {
             "disabled"
@@ -894,15 +897,7 @@ pub async fn backfill_service_badges(store: &Store) {
 /// Seed the registry with statically configured instances.
 pub async fn seed_registry(state: &AppState) {
     for instance_config in &state.config.registry.instances {
-        let service_type = match instance_config.service_type.as_str() {
-            "server" => registry::ServiceType::Server,
-            "witness" => registry::ServiceType::Witness,
-            "watcher" => registry::ServiceType::Watcher,
-            other => {
-                warn!(service_type = %other, "unknown service type in registry config, skipping");
-                continue;
-            }
-        };
+        let service_type = instance_config.service_type.clone();
 
         let instance_id = uuid::Uuid::new_v4().to_string();
         let instance = registry::ServiceInstance {

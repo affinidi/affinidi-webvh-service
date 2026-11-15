@@ -9,6 +9,7 @@ pub use did_hosting_common::server::config::{
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
     pub features: FeaturesConfig,
@@ -81,6 +82,7 @@ pub struct AppConfig {
 /// `/api/health` probe answers `503`, so a load balancer drains it instead of
 /// letting it serve state that may be out of date.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplicationConfig {
     /// The longest an edge may go without a clean reconcile and still report
     /// healthy. Default 300 (5 minutes).
@@ -129,6 +131,7 @@ impl ReplicationConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
     /// Maximum body size (bytes) for did.jsonl / witness uploads. Default: 100KB.
     #[serde(default = "default_upload_body_limit")]
@@ -165,6 +168,7 @@ impl Default for LimitsConfig {
 
 /// Stats collection and sync configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StatsConfig {
     /// How often (seconds) to flush in-memory counters to storage. Default: 5.
     #[serde(default = "default_stats_flush_interval")]
@@ -241,10 +245,12 @@ impl AppConfig {
         // _MAX_JOURNAL) — shared, unprefixed names; see
         // `did_hosting_common::server::config::apply_fjall_env_overrides`.
         did_hosting_common::server::config::apply_fjall_env_overrides(&mut config.fjall)?;
-        did_hosting_common::server::config::apply_hosting_env_overrides(
-            "WEBVH",
-            &mut config.hosting,
-        );
+        for prefix in ["WEBVH", "DID_HOSTING"] {
+            did_hosting_common::server::config::apply_hosting_env_overrides(
+                prefix,
+                &mut config.hosting,
+            )?;
+        }
 
         // Server identity (did-hosting-server specific env vars)
         macro_rules! env_opt {
@@ -359,6 +365,38 @@ impl AppConfig {
 #[allow(unsafe_code)]
 mod tests {
     use super::*;
+
+    /// What the setup wizard and recipe write (a serialised `AppConfig`)
+    /// loads back under the strict parser; a misspelt key does not.
+    #[test]
+    fn a_written_config_loads_and_an_unknown_key_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config: AppConfig = toml::from_str("").unwrap();
+        config.server_did = Some("did:webvh:abc:server.example.com".into());
+        config.public_url = Some("https://server.example.com".into());
+        config.control_did = Some("did:webvh:def:control.example.com".into());
+        config.mediator_did = Some("did:webvh:ghi:mediator.example.com".into());
+        config.features.didcomm = true;
+        config.features.tsp = true;
+        config.hosting.unassigned_purge_grace =
+            did_hosting_common::server::config::GracePeriod::parse("45m").unwrap();
+        config.store.dynamodb_billing_mode = Some("provisioned".into());
+        config.store.dynamodb_auto_create = Some(false);
+        config.store.cosmosdb_container = Some("kv2".into());
+        std::fs::write(&path, toml::to_string_pretty(&config).unwrap()).unwrap();
+        let loaded = AppConfig::load(Some(path.clone())).expect("written config loads");
+        assert_eq!(loaded.hosting.unassigned_purge_grace.as_secs(), 45 * 60);
+        assert!(loaded.features.didcomm && loaded.features.tsp);
+        assert_eq!(loaded.store.dynamodb_auto_create, Some(false));
+        assert_eq!(loaded.store.cosmosdb_container.as_deref(), Some("kv2"));
+
+        std::fs::write(&path, "[limits]\nupload_body_limt = 5\n").unwrap();
+        let err = AppConfig::load(Some(path.clone())).unwrap_err().to_string();
+        assert!(err.contains("upload_body_limt"), "{err}");
+        std::fs::write(&path, "contol_did = \"did:example:x\"\n").unwrap();
+        assert!(AppConfig::load(Some(path)).is_err());
+    }
 
     /// The documented `DID_HOSTING_` names reach the shared settings, the
     /// legacy `WEBVH_` names still work, and the documented name wins.

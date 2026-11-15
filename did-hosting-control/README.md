@@ -85,7 +85,10 @@ mediator_did = "did:webvh:mediator.example.com"
 public_url = "https://control.example.com"
 
 [features]
-rest_api = true
+# Run the HTTP listener: the management UI, POST /api/trust-tasks and
+# /api/health. (Formerly `rest_api`, still accepted.) At least one of
+# http_listener, didcomm and tsp must be on.
+http_listener = true
 
 [server]
 host = "0.0.0.0"
@@ -231,13 +234,22 @@ overrides it. Legacy statistics are migrated automatically at startup. See
 
 ## CLI Commands
 
+Every subcommand, with its full `--help`, is in
+[`docs/cli-reference.md`](../docs/cli-reference.md), generated from the CLI
+(a test keeps it current). Below is a summary. `health` exits non-zero when a
+check fails (`--strict`: also when one warns).
+
 ```
 did-hosting-control                                    # Run control plane (default)
 did-hosting-control setup                              # Interactive config wizard
 did-hosting-control add-acl --did <DID> [--role admin|owner] [--label <name>]  # Add ACL entry
 did-hosting-control list-acl                           # List ACL entries
-did-hosting-control stats-show --mnemonic <m>          # A DID's statistics tier (offline)
-did-hosting-control stats-set --mnemonic <m> --resolution auto|fine|coarse|off  # (offline)
+did-hosting-control remove-acl --did <DID>             # Remove an ACL entry
+did-hosting-control invite --did <DID>                 # Create a passkey enrolment invite
+did-hosting-control health [--strict]                  # Health check (non-zero exit on failure)
+did-hosting-control uninstall                          # Teardown: clear secrets + remove config
+did-hosting-control stats-show --path <m>              # A DID's statistics tier (offline)
+did-hosting-control stats-set --path <m> --resolution auto|fine|coarse|off  # (offline)
 did-hosting-control stats-purge-legacy                 # Delete migrated legacy statistics now (offline)
 ```
 
