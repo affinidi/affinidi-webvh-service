@@ -408,7 +408,7 @@ pub async fn take_session(
 /// Returns the number of sessions demoted.
 ///
 /// Walks only `subject`'s own sessions, via the `session-did:{subject}:`
-/// index (see [`session_did_key`]) — not a full `session:` table scan.
+/// index (see `session_did_key`) — not a full `session:` table scan.
 pub async fn demote_non_passkey_step_up_sessions(
     sessions: &KeyspaceHandle,
     subject: &str,

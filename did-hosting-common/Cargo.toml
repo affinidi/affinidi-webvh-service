@@ -13,6 +13,9 @@ publish.workspace = true
 rust-version.workspace = true
 build = "build.rs"
 
+[lints]
+workspace = true
+
 [features]
 default = ["method-webvh", "method-web"]
 
@@ -135,10 +138,10 @@ vta-sdk = { workspace = true }
 # and 0.11.30 the move to vta-sdk 0.20. An unlocked build against an
 # earlier line will not compile.
 vti-common = { version = "0.51", default-features = false }
-async-trait = "0.1"
+async-trait = { workspace = true }
 
 # server-core dependencies (optional)
-axum = { version = "0.8", optional = true }
+axum = { workspace = true, optional = true }
 axum-extra = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }
@@ -147,10 +150,10 @@ chrono = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
-tower-http = { version = "0.7", features = ["trace", "cors"], optional = true }
+tower-http = { workspace = true, features = ["trace", "cors"], optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 hex = { version = "0.4", optional = true }
-toml = "1.0"
+toml = { workspace = true }
 
 # Trust Tasks framework — see workspace Cargo.toml for the version pin.
 # Gated behind `server-core` because the dispatcher only runs on the
@@ -240,7 +243,7 @@ base64 = { workspace = true }
 trust-tasks-build = { workspace = true, optional = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 # Deletes the keyring round-trip test's entry; the store itself is `vti-secrets`'.
 keyring-core = "1"
 tokio = { workspace = true }
@@ -248,15 +251,15 @@ tokio = { workspace = true }
 # (`examples/gen_corpus.rs`).
 chrono = { workspace = true }
 # Trust-Tasks router unit tests use `oneshot()` + raw body collection.
-tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
+tower = { workspace = true, features = ["util"] }
+http-body-util = { workspace = true }
 # Test-only stub `ProofVerifier` impls (`AlwaysOkVerifier`,
 # `AlwaysErrVerifier`, `PanickingVerifier`) use the
 # `#[async_trait::async_trait]` macro to match the trait's
 # `async fn verify<P>(...)` shape. Prod code uses `ProofPolicy`
 # variants that don't carry a custom verifier impl, so the dep is
 # test-only.
-async-trait = "0.1"
+async-trait = { workspace = true }
 # `verifier::tests` sign real `eddsa-jcs-2022` Data Integrity proofs with a
 # generated ed25519 `did:key` to exercise the bind-when-present /
 # signature-only-when-absent paths end-to-end.

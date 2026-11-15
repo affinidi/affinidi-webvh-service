@@ -59,7 +59,7 @@ pub struct DidRecord {
     /// enabled-at-compile-time methods (`webvh`, `web`); the daemon
     /// rejects any other value on the write path. Legacy records
     /// (pre-T13 migration) default to `"webvh"` via the `#[serde(default)]`
-    /// fallback in [`Self::default_method`].
+    /// fallback in `Self::default_method`.
     #[serde(default = "default_method")]
     pub method: String,
 

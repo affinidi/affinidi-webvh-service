@@ -99,7 +99,7 @@ pub struct OutboxEntry {
     /// Number of delivery attempts so far.
     pub attempts: u32,
     /// Earliest unix-seconds at which the worker should retry. Set
-    /// after a failed attempt by [`compute_backoff`].
+    /// after a failed attempt by `compute_backoff`.
     pub next_attempt_at: u64,
     /// Last error string, for operator-visible diagnostics. Truncated
     /// to ~200 chars to keep keyspace rows small.

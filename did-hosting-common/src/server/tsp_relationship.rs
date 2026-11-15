@@ -9,7 +9,7 @@
 //! VID it holds no relationship with. A relationship is admitted the moment the
 //! receiver *records* an inbound relationship-forming invite, which the
 //! messaging-service framework does before it calls
-//! [`TspHandler::handle_control`]. What the framework does **not** do is answer
+//! `TspHandler::handle_control`. What the framework does **not** do is answer
 //! it: completing the handshake — sending the accept that moves the peer from
 //! `InviteReceived` back to `Bidirectional` and restores *our own* ability to
 //! send (`can_send()` is `Bidirectional`-only) — is the application's job. This

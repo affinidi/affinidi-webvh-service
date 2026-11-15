@@ -4,7 +4,7 @@
 //! These are the control↔server ops that used to exist only as legacy `MSG_*`
 //! DIDComm messages, which made them DIDComm-only and therefore invisible to a
 //! TSP-only server. As trust-task documents they route through the same
-//! [`crate::messaging::dispatch_trust_task_doc`] entry that TSP, the DIDComm
+//! `crate::messaging::dispatch_trust_task_doc` entry that TSP, the DIDComm
 //! envelope, and HTTPS all share — so the binding is chosen from the peer's DID
 //! document rather than hard-coded.
 //!
@@ -38,7 +38,7 @@
 //! ## Authorisation
 //!
 //! Every document reaching [`dispatch`] has already passed
-//! [`crate::messaging::dispatch_trust_task_doc`]'s proof gate, so `signer` is
+//! `crate::messaging::dispatch_trust_task_doc`'s proof gate, so `signer` is
 //! the DID whose key signed it — not a transport's report. Registration, stats
 //! sync, health pongs and domain acks then require that DID to hold the
 //! `Service` role in the ACL; sync acks are only logged. These ops don't run

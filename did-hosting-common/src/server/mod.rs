@@ -42,25 +42,25 @@ pub mod setup_recipe;
 pub mod stats_collector;
 pub mod stats_tiers;
 pub mod store;
-/// New trust-tasks framework integration (SPEC.md 0.1). Gated behind
-/// `server-core` because the dispatcher only runs on the server side;
-/// the client crate (no trust-tasks admin surface yet) doesn't compile
-/// it in.
+// New trust-tasks framework integration (SPEC.md 0.1). Gated behind
+// `server-core` because the dispatcher only runs on the server side;
+// the client crate (no trust-tasks admin surface yet) doesn't compile
+// it in.
 #[cfg(feature = "server-core")]
 pub mod trust_tasks;
-/// The Trust Tasks TSP binding envelope: reading whichever dialect a frame
-/// arrives in and answering in the same one. Shared so the control plane and
-/// the edge server cannot drift apart on the wire.
+// The Trust Tasks TSP binding envelope: reading whichever dialect a frame
+// arrives in and answering in the same one. Shared so the control plane and
+// the edge server cannot drift apart on the wire.
 #[cfg(feature = "server-core")]
 pub mod tsp_binding;
-/// Inbound TSP relationship answering arm (Rev 3 §7.2.2). Gated behind
-/// `server-core` because it names the messaging-service `HandlerContext` and
-/// the TSP control-message types, which only the server-side listeners use.
+// Inbound TSP relationship answering arm (Rev 3 §7.2.2). Gated behind
+// `server-core` because it names the messaging-service `HandlerContext` and
+// the TSP control-message types, which only the server-side listeners use.
 #[cfg(feature = "server-core")]
 pub mod tsp_relationship;
-/// Durable TSP relationship store (Rev 3 §7.2.2 persistence). Gated behind
-/// `server-core` because it names the messaging SDK's relationship-store types
-/// and webvh's storage keyspaces, both server-only.
+// Durable TSP relationship store (Rev 3 §7.2.2 persistence). Gated behind
+// `server-core` because it names the messaging SDK's relationship-store types
+// and webvh's storage keyspaces, both server-only.
 #[cfg(feature = "server-core")]
 pub mod tsp_relationship_store;
 pub mod vta_setup;

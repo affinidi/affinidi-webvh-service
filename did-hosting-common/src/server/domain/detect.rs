@@ -145,7 +145,7 @@ fn first_xff_value(header: &str) -> Option<&str> {
 /// Supports:
 /// - Multiple forwarded-element groups (comma-separated). Honours
 ///   the **first** group's `host=` (same rationale as
-///   [`first_xff_value`]).
+///   `first_xff_value`).
 /// - Quoted (`host="example.com"`) and unquoted (`host=example.com`)
 ///   parameter values.
 /// - Case-insensitive parameter names (`Host=`, `HOST=`).

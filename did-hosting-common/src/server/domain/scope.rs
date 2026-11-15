@@ -7,15 +7,15 @@
 //!
 //! ## Variants
 //!
-//! - [`Self::All`] — no per-domain restriction. The default for `Admin`
+//! - [`DomainScope::All`] — no per-domain restriction. The default for `Admin`
 //!   and `Service` ACL roles (where role-based access already
 //!   constrains the surface). Pre-rollout `Owner` entries that exist
 //!   in stores at upgrade time also deserialize as `All` for
 //!   backwards-compat — see the migration banner + ACL-lockdown tool
 //!   in T22 / T42.
-//! - [`Self::Allowed`] — explicit whitelist of allowed domain names.
+//! - [`DomainScope::Allowed`] — explicit whitelist of allowed domain names.
 //!   No implicit default; a missing `domain` on the wire is rejected.
-//! - [`Self::AllowedWithDefault`] — whitelist plus an explicit default
+//! - [`DomainScope::AllowedWithDefault`] — whitelist plus an explicit default
 //!   used when the caller omits `domain`. **The new default for
 //!   freshly-created `Owner` entries** in T22.
 //!

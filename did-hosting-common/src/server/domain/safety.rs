@@ -6,10 +6,10 @@
 //! 1. Parse the DID identifier embedded in the caller's payload (the
 //!    `state.id` from the latest jsonl entry, or the `id` from a
 //!    did:web doc — surfaced through [`super::super::super::method::DidMethod`]).
-//! 2. Verify the parsed host is an [`DomainStatus::Active`] domain in
+//! 2. Verify the parsed host is an [`DomainStatus::Active`](crate::server::domain::DomainStatus::Active) domain in
 //!    the `KS_DOMAINS` keyspace. Missing or disabled → `400`
 //!    (`AppError::Validation`).
-//! 3. Verify the caller's ACL [`DomainScope`] permits that host.
+//! 3. Verify the caller's ACL [`DomainScope`](crate::server::domain::DomainScope) permits that host.
 //!    Not-allowed → `403` (`AppError::Forbidden`).
 //!
 //! The two error codes are distinct so the UI can render different
@@ -45,7 +45,7 @@ pub async fn assert_host_is_active_domain(store: &Store, host: &str) -> Result<(
     Ok(())
 }
 
-/// Verify that the caller's ACL [`DomainScope`] permits operating on
+/// Verify that the caller's ACL [`DomainScope`](crate::server::domain::DomainScope) permits operating on
 /// `host`. Admin and Service roles short-circuit per spec §3.
 ///
 /// Returns `Err(AppError::Forbidden)` if the ACL scope doesn't allow
@@ -65,7 +65,7 @@ pub fn assert_acl_allows_host(acl_entry: &AclEntry, host: &str) -> Result<(), Ap
 }
 
 /// Parse a DID identifier and extract its host segment via the
-/// [`DidMethod`] dispatcher.
+/// [`DidMethod`](crate::method::DidMethod) dispatcher.
 ///
 /// The host segment of a did:webvh / did:web identifier percent-encodes
 /// reserved characters — notably the port colon: `localhost:8534`

@@ -174,7 +174,7 @@ pub fn siop_id_token_claimed_issuer(id_token: &str) -> Option<String> {
 ///    `iss == sub`.
 /// 3. Resolve the authentication key for `iss`. The `kid` is honoured
 ///    for the verification-method lookup (resolved via
-///    [`resolve_verifying_key`], which also requires the key to be listed
+///    `resolve_verifying_key`, which also requires the key to be listed
 ///    under `authentication`), and the resolved
 ///    key's base DID must equal `iss`. Works for any DID method the
 ///    resolver supports — `did:key` (in-tree) and `did:webvh` (DID

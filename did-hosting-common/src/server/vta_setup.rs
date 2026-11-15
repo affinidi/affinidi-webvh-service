@@ -615,7 +615,7 @@ pub struct WebvhRemoteTarget<'a> {
     pub path: Option<&'a str>,
 }
 
-/// Build the canonical [`ProvisionAsk`] for a webvh service's own DID.
+/// Build the canonical `ProvisionAsk` for a webvh service's own DID.
 ///
 /// This is the one place template selection, path-folding, and
 /// `WEBVH_*`/`MEDIATOR_DID`/`URL` variable wiring happen. Both the online
@@ -704,7 +704,7 @@ pub fn build_webvh_provision_ask(
 /// Write an offline bootstrap request and return the in-memory ephemeral seed.
 ///
 /// The target DID is described entirely by `ask` — the *same*
-/// [`ProvisionAsk`] the online flow would send. Build it with
+/// `ProvisionAsk` the online flow would send. Build it with
 /// [`build_webvh_provision_ask`] so template selection, path-folding, and
 /// variable bindings live in one place and the online/offline paths can't
 /// drift apart. The ask's `context` becomes the VP's `contextHint` (so the

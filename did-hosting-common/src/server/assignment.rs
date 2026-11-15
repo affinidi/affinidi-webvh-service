@@ -10,7 +10,7 @@
 //!
 //! - **Key**: `assignments:<domain>` — one entry per assigned domain.
 //!   The keyspace const `KS_ASSIGNMENTS` carries the prefix; per-
-//!   record keys are built via [`assignment_key`].
+//!   record keys are built via `assignment_key`.
 //! - **Value**: [`AssignmentEntry`] — JSON-serialised.
 //!
 //! ## Idempotency semantics

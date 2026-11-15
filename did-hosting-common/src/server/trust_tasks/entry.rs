@@ -1,4 +1,4 @@
-//! Bidirectional translation between our local [`AclEntry`] storage
+//! Bidirectional translation between our local [`AclEntry`](crate::server::acl::AclEntry) storage
 //! shape and the Trust Tasks AclEntry 0.2 wire shape
 //! (`acl/_shared/0.2/acl-entry.schema.json`), used by every `acl/*` task
 //! this service serves.
@@ -242,7 +242,7 @@ pub fn domains_for_act(act: &AuthorityScope, default: Option<&str>) -> DomainSco
 }
 
 impl SpecAclEntry {
-    /// Project a local [`AclEntry`] onto the AclEntry 0.2 wire shape.
+    /// Project a local [`AclEntry`](crate::server::acl::AclEntry) onto the AclEntry 0.2 wire shape.
     ///
     /// `created_at` is converted from epoch seconds to RFC3339; `0` — the
     /// legacy "no timestamp" sentinel some pre-v0.7 entries carry — surfaces

@@ -203,7 +203,7 @@ const MAX_TRACKED_ADDRESSES: usize = 10_000;
 const MAX_COST: u64 = LARGE_DOCUMENT_BUDGET_PER_WINDOW + 1;
 
 /// How long a raised per-document cost takes to halve with no further
-/// unverified claim from its address. The highest cost ([`MAX_COST`]) is back
+/// unverified claim from its address. The highest cost (`MAX_COST`) is back
 /// to 1 within two half-lives, so an address that once sent unverifiable
 /// large documents — or shares an egress address with one that did — is held
 /// to the raised cost for under an hour, not until the process restarts.
@@ -293,7 +293,7 @@ impl LargeDocumentBudget {
 
     /// Sweep addresses whose allowance has refilled out of the budget's
     /// memory every minute until `shutdown` fires. Penalties are not swept
-    /// here: they decay, and [`Self::penalize`] drops the decayed ones when
+    /// here: they decay, and `Self::penalize` drops the decayed ones when
     /// the table is full. Must run on a Tokio runtime.
     pub fn spawn_gc(&self, shutdown: &tokio_util::sync::CancellationToken) {
         self.per_address.spawn_gc(shutdown.clone());
@@ -540,7 +540,7 @@ pub async fn check_for_known_issuer(
 /// on any verification failure. A `verified_issuer` that is not the identity
 /// the charge was granted against — including a failure, which proves none at
 /// all — doubles the address's cost for its next large document
-/// ([`LargeDocumentBudget::penalize`]). A charge that verified to its claimed
+/// (`LargeDocumentBudget::penalize`). A charge that verified to its claimed
 /// issuer costs nothing extra, and halves any raised cost the address holds.
 ///
 /// The two are compared as identities ([`crate::scid::identity`]): a

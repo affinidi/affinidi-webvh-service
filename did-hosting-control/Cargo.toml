@@ -26,6 +26,9 @@ include = [
   "README.md",
 ]
 
+[lints]
+workspace = true
+
 [features]
 default = ["keyring", "store-fjall", "ui"]
 metrics = ["did-hosting-common/metrics"]
@@ -97,7 +100,7 @@ did-hosting-common = { version = "0.12", path = "../did-hosting-common", feature
 # the workspace `vta-sdk = "0.38"` — see the lockstep note in
 # did-hosting-common/Cargo.toml.
 vti-common = { version = "0.51", default-features = false }
-async-trait = "0.1"
+async-trait = { workspace = true }
 # Local `.mmdb` GeoIP reader (`crate::geoip`) — never a third-party call.
 maxminddb = { workspace = true }
 # `[[geoip.networks]]` ranges; the same crate and line `did-hosting-common`
@@ -139,7 +142,7 @@ tokio-util = { workspace = true }
 affinidi-did-resolver-cache-sdk = "0.8.43"
 # Egress address-class guard for the registry URL validation (SSRF default-deny).
 affinidi-net-guard = "0.1"
-axum = "0.8"
+axum = { workspace = true }
 axum-extra = { workspace = true }
 clap = { workspace = true }
 dialoguer = { workspace = true }
@@ -160,9 +163,9 @@ serde_json_canonicalizer = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-toml = "1.0"
+toml = { workspace = true }
 vta-sdk = { workspace = true }
-tower-http = { version = "0.7", features = ["trace"] }
+tower-http = { workspace = true, features = ["trace"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
@@ -187,7 +190,7 @@ azure_identity = { version = "1.0", optional = true }
 # Enabled by the `test-support` feature so the in-process `TestServer` fixture
 # can open a temporary fjall store. Optional + non-default: a production build
 # never pulls it in.
-tempfile = { version = "3", optional = true }
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true
@@ -200,8 +203,8 @@ affinidi-keri = "0.4"
 # can check any reply against the schema its type names
 # (`trust_tasks_rs::validate`) without depending on that staying true.
 trust-tasks-rs = { workspace = true, features = ["validate"] }
-tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
+tower = { workspace = true, features = ["util"] }
+http-body-util = { workspace = true }
 base64 = { workspace = true }
 # A software authenticator for the passkey enrolment tests (P-256 keys and
 # ECDSA signatures for real attestations and assertions). The same `openssl`
