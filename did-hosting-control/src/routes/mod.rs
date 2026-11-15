@@ -73,7 +73,7 @@ pub fn router() -> Router<AppState> {
 
     #[cfg(feature = "ui")]
     {
-        r = r.fallback(crate::frontend::static_handler);
+        r = r.fallback_service(crate::frontend::static_service());
     }
 
     r

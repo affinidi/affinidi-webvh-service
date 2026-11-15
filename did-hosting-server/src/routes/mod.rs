@@ -120,7 +120,32 @@ pub fn router_public_only() -> Router<AppState> {
 pub fn router_public_only_with_resolve_limit(
     resolve_limit: Arc<ResolveRateLimiter>,
 ) -> Router<AppState> {
-    router_public_only().layer(resolve_limit.layer())
+    with_compression(router_public_only()).layer(resolve_limit.layer())
+}
+
+/// Compress resolution responses (gzip or brotli, as the client accepts):
+/// DID logs are JSON lines that shrink several-fold. A compressed response is
+/// a different representation of the same content, so its `ETag` is marked
+/// weak (`W/`); `If-None-Match` compares weakly, so revalidation still hits.
+pub fn with_compression(router: Router<AppState>) -> Router<AppState> {
+    router
+        .layer(tower_http::compression::CompressionLayer::new())
+        .layer(axum::middleware::map_response(weaken_encoded_etag))
+}
+
+async fn weaken_encoded_etag(mut response: axum::response::Response) -> axum::response::Response {
+    use axum::http::{HeaderValue, header};
+    if response.headers().contains_key(header::CONTENT_ENCODING)
+        && let Some(tag) = response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+        && !tag.starts_with("W/")
+        && let Ok(weak) = HeaderValue::from_str(&format!("W/{tag}"))
+    {
+        response.headers_mut().insert(header::ETAG, weak);
+    }
+    response
 }
 
 /// The edge's full router, with the DID-serving fallback and no resolution
@@ -144,8 +169,7 @@ pub fn router_with_resolve_limit(
     // No Prometheus `/metrics`: an edge's metrics are read by its control
     // plane as `did-management/server/metrics/0.1`, authenticated like any
     // other directive.
-    router_public_only()
-        .fallback(did_public::serve_public)
+    with_compression(router_public_only().fallback(did_public::serve_public))
         .layer(resolve_limit.layer())
         .merge(trust_task_listener(body_limit))
 }

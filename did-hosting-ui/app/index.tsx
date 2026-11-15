@@ -5,7 +5,7 @@ import { useAuth } from "../components/AuthProvider";
 import { useApi } from "../components/ApiProvider";
 import { useDomains } from "../components/DomainProvider";
 import { AffinidiLogo } from "../components/AffinidiLogo";
-import { UsageChart } from "../components/UsageChart";
+import { LazyUsageChart } from "../components/LazyUsageChart";
 import { ServiceOverviewPanel } from "../components/ServiceOverview";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 import { ACL_KEY } from "../components/acl/keys";
@@ -67,24 +67,32 @@ function DashboardBody() {
     enabled: isAuthenticated && isAdmin,
   });
   const aclEntries = aclQuery.data?.entries ?? null;
-  // Per-domain stats are derived from the DID list. An admin reads it only
-  // when a specific domain is pinned — "All domains" reads the cheap
-  // server-wide aggregate from `stats/get` instead. An owner has no
-  // aggregate to read, so for them the list (their own DIDs) is the source.
+  // An admin's pinned-domain totals: one `stats/get` for that domain, however
+  // many DIDs it holds. "All domains" reads the server-wide aggregate instead.
+  // Under the `stats` prefix, so whatever refreshes the stats refreshes it.
+  const domainStatsQuery = useTrustTaskQuery(
+    QK.domainStats(currentDomain),
+    ({ background }) => api.getDomainStats(currentDomain ?? "", { background }),
+    { enabled: isAuthenticated && isAdmin && currentDomain !== null },
+  );
+  // An owner has no aggregate to read: their own DIDs (bounded by their
+  // quota) are the source of their per-domain cards.
   const didsQuery = useTrustTaskQuery(QK.allDids, () => api.listDids(), {
-    enabled: isAuthenticated && (!isAdmin || currentDomain !== null),
+    enabled: isAuthenticated && !isAdmin,
   });
   const dids = didsQuery.data;
 
   const isDaemon = config?.deploymentMode === "daemon";
 
   const domainStats = useMemo(() => {
-    if (currentDomain === null || !dids) return null;
+    if (currentDomain === null) return null;
+    if (isAdmin) return domainStatsQuery.data ?? null;
+    if (!dids) return null;
     // Legacy slots carry an empty `domain`; the shared matchesDomain helper
     // falls back to the DID's host segment so the per-domain numbers don't
     // read as zero before publish-time backfill tags them.
     return domainTotals(dids.filter((d) => matchesDomain(d, currentDomain)));
-  }, [currentDomain, dids]);
+  }, [currentDomain, isAdmin, domainStatsQuery.data, dids]);
 
   // An owner's DIDs, one card per domain they host on.
   const ownerDomains = useMemo(() => {
@@ -197,7 +205,9 @@ function DashboardBody() {
           than leaving the cards they feed silently missing. */}
       {[
         { q: statsQuery, what: "the statistics" },
-        { q: didsQuery, what: isAdmin ? "the DIDs on this domain" : "your DIDs" },
+        isAdmin
+          ? { q: domainStatsQuery, what: "the statistics for this domain" }
+          : { q: didsQuery, what: "your DIDs" },
         { q: aclQuery, what: "the access list" },
       ]
         .filter(({ q }) => q.error != null && q.data === undefined)
@@ -270,7 +280,7 @@ function DashboardBody() {
       {/* Usage chart */}
       {serverStats && (
         <View style={styles.section}>
-          <UsageChart />
+          <LazyUsageChart />
         </View>
       )}
     </ScrollView>

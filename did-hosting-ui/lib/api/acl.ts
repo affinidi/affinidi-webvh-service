@@ -138,7 +138,12 @@ export const aclApi = {
       throw new ApiError(400, `'${trimmed}' is not a valid agent name`);
     }
     const served = `${parsed.domain}/@${parsed.name}`;
-    const dids = await didsApi.listDids();
+    // The one slot holding the name, from the name index — not every DID.
+    const { records: dids } = await didsApi.listDidPage({
+      domain: parsed.domain,
+      agentName: parsed.name,
+      limit: 1,
+    });
     const hasDidId = (d: DidRecord): d is DidRecord & { didId: string } => d.didId !== null;
     const candidates = dids.filter(
       (d): d is DidRecord & { didId: string } =>

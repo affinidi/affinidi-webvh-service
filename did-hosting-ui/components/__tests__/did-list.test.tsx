@@ -8,7 +8,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { DidRecord } from "../../lib/api";
+import type { DidListPage, DidListQuery, DidRecord } from "../../lib/api";
 import { clearQueryCache } from "../../lib/query";
 
 vi.mock("expo-router", () => ({
@@ -20,20 +20,21 @@ vi.mock("expo-router", () => ({
 }));
 vi.mock("expo-clipboard", () => ({ setStringAsync: vi.fn(async () => true) }));
 
+let currentDomain: string | null = null;
 let auth = { isAuthenticated: true, restored: true, role: "owner", did: "did:example:me" };
 vi.mock("../AuthProvider", () => ({ useAuth: () => auth }));
 vi.mock("../DomainProvider", () => ({
   useDomains: () => ({
     domains: [],
-    currentDomain: null,
+    currentDomain,
     defaultDomain: null,
     loaded: true,
   }),
 }));
 
-const listDids = vi.fn<(owner?: string) => Promise<DidRecord[]>>();
+const listDidPage = vi.fn<(q?: DidListQuery) => Promise<DidListPage>>();
 vi.mock("../ApiProvider", () => ({
-  useApi: () => ({ listDids, checkName: vi.fn(), createDid: vi.fn() }),
+  useApi: () => ({ listDidPage, checkName: vi.fn(), createDid: vi.fn() }),
 }));
 
 // Fork-independent: the chips have their own tests.
@@ -61,6 +62,7 @@ function did(mnemonic: string, over: Partial<DidRecord> = {}): DidRecord {
 
 beforeEach(() => {
   clearQueryCache();
+  currentDomain = null;
   auth = { isAuthenticated: true, restored: true, role: "owner", did: "did:example:me" };
 });
 afterEach(() => {
@@ -74,17 +76,17 @@ describe("DID list", () => {
     render(<DidList />);
     expect(screen.getByLabelText("Loading — manage DIDs")).toBeTruthy();
     expect(screen.queryByText(/Please log in/)).toBeNull();
-    expect(listDids).not.toHaveBeenCalled();
+    expect(listDidPage).not.toHaveBeenCalled();
   });
 
   it("shows a failed load as an error with Retry, not as an empty list", async () => {
-    listDids.mockRejectedValueOnce(new Error("control plane down"));
+    listDidPage.mockRejectedValueOnce(new Error("control plane down"));
     await act(async () => {
       render(<DidList />);
     });
     expect(screen.getByRole("alert").textContent).toMatch(/Could not load the DIDs/);
     expect(screen.queryByText(/No DIDs yet/)).toBeNull();
-    listDids.mockResolvedValue([did("alice")]);
+    listDidPage.mockResolvedValue({ records: [did("alice")] });
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Retry loading the DIDs" }));
     });
@@ -92,14 +94,14 @@ describe("DID list", () => {
   });
 
   it("shows a spinner while the list loads", () => {
-    listDids.mockReturnValue(new Promise(() => {}));
+    listDidPage.mockReturnValue(new Promise(() => {}));
     render(<DidList />);
     expect(screen.getByLabelText("Loading DIDs")).toBeTruthy();
     expect(screen.getByRole("heading", { level: 1, name: "Your DIDs" })).toBeTruthy();
   });
 
   it("says so when there are no DIDs", async () => {
-    listDids.mockResolvedValue([]);
+    listDidPage.mockResolvedValue({ records: [] });
     await act(async () => {
       render(<DidList />);
     });
@@ -107,7 +109,7 @@ describe("DID list", () => {
   });
 
   it("lists DIDs with a pluralised count, a link per name and actions beside it", async () => {
-    listDids.mockResolvedValue([did("alice"), did("bob")]);
+    listDidPage.mockResolvedValue({ records: [did("alice"), did("bob")] });
     await act(async () => {
       render(<DidList />);
     });
@@ -127,10 +129,63 @@ describe("DID list", () => {
   });
 
   it("uses the singular for one DID", async () => {
-    listDids.mockResolvedValue([did("solo")]);
+    listDidPage.mockResolvedValue({ records: [did("solo")] });
     await act(async () => {
       render(<DidList />);
     });
     expect(screen.getByText("1 DID")).toBeTruthy();
+  });
+
+  it("asks the server for one page of the pinned domain, and the next only on demand", async () => {
+    currentDomain = "example.com";
+    listDidPage.mockImplementation(async (q) =>
+      q?.cursor === "c1"
+        ? { records: [did("carol")] }
+        : { records: [did("alice"), did("bob")], nextCursor: "c1" },
+    );
+    await act(async () => {
+      render(<DidList />);
+    });
+    expect(listDidPage).toHaveBeenCalledTimes(1);
+    expect(listDidPage.mock.calls[0]![0]).toEqual({ domain: "example.com", limit: 50 });
+    expect(screen.getByText(/2 DIDs shown · more available/)).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    });
+    expect(listDidPage).toHaveBeenCalledTimes(2);
+    expect(listDidPage.mock.calls[1]![0]).toEqual({
+      domain: "example.com",
+      limit: 50,
+      cursor: "c1",
+    });
+    expect(screen.getByText("3 DIDs")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
+  });
+
+  it("sends the search to the server once typing pauses, starting paging over", async () => {
+    vi.useFakeTimers();
+    try {
+      listDidPage.mockImplementation(async (q) =>
+        q?.search ? { records: [did("alice")] } : { records: [did("alice"), did("bob")] },
+      );
+      await act(async () => {
+        render(<DidList />);
+      });
+      const box = screen.getByRole("textbox", { name: "Search DIDs" });
+      await act(async () => {
+        fireEvent.change(box, { target: { value: " ali" } });
+      });
+      // Not yet: the search waits for typing to pause.
+      expect(listDidPage).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(400);
+      });
+      expect(listDidPage).toHaveBeenCalledTimes(2);
+      expect(listDidPage.mock.calls[1]![0]).toEqual({ search: "ali", limit: 50 });
+      expect(screen.getByText("1 DID")).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

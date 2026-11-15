@@ -23,6 +23,7 @@ import {
   statsFromWire,
   timeRangeToWire,
   timeseriesFromWire,
+  WEBVH_EXT,
 } from "../wire";
 import { withStepUp } from "./auth";
 import { T } from "./tasks";
@@ -123,6 +124,18 @@ export const serviceApi = {
 
   getServerStats: async (opts: ReadOptions = {}): Promise<ServerStats> =>
     statsFromWire(await trustTask<StatsGet.Payload, StatsGet.Response>(T.statsGet, {}, opts)),
+
+  /** One domain's totals (`stats/get` with the webvh `domain` extension):
+   *  every slot on it for an admin, the caller's own for anyone else. One
+   *  request, however many DIDs the domain holds. */
+  getDomainStats: async (domain: string, opts: ReadOptions = {}): Promise<ServerStats> =>
+    statsFromWire(
+      await trustTask<StatsGet.Payload, StatsGet.Response>(
+        T.statsGet,
+        { ext: { [WEBVH_EXT]: { domain } } },
+        opts,
+      ),
+    ),
 
   getServerTimeseries: async (
     range: TimeRange = "24h",

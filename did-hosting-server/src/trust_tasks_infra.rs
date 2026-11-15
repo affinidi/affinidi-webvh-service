@@ -100,12 +100,12 @@ pub async fn dispatch(
 ///
 /// Shared by every transport's trust-task dispatch.
 pub(crate) async fn do_health_ping(state: &AppState) -> Value {
-    let did_count = state
-        .dids_ks
-        .prefix_iter_raw("did:")
-        .await
-        .map(|v| v.len() as u64)
-        .unwrap_or(0);
+    // The collector's count: seeded at boot and recounted hourly from the
+    // keys, so a ping (every few minutes, per edge) reads nothing.
+    let did_count = match state.stats_collector.as_ref() {
+        Some(collector) => collector.get_aggregate().total_dids,
+        None => state.dids_ks.prefix_count("did:").await.unwrap_or(0) as u64,
+    };
 
     serde_json::to_value(did_hosting_common::HealthPong {
         status: "ok".into(),
