@@ -116,7 +116,7 @@ pub async fn purge_domain_dids_locked(
         if record.domain.is_empty() {
             warn!(
                 mnemonic = %record.mnemonic,
-                "DidRecord has no domain field — skipping. Run M-01 migration for full coverage."
+                "DidRecord has no domain field — skipping. M-01 stays pending and tags it on the next start once a default domain is set."
             );
             skipped_no_domain += 1;
             continue;
