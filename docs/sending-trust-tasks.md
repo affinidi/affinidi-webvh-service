@@ -100,6 +100,17 @@ did-hosting-control send-trust-task --key admin-key.json \
   --payload '{"domain": "dids.example.com", "owner": "did:key:z6Mk…", "limit": 100}'
 ```
 
+`did/list` pages: pass the reply's `nextCursor` back as `cursor` while one is
+present. Its `vnd.affinidi.webvh` extension adds `search` (matched without
+case against the mnemonic, the DID and its agent names) and `agentName` (with
+`domain`); a searched page may come back short, or empty, with a
+`nextCursor`:
+
+```bash
+did-hosting-control send-trust-task --key admin-key.json --type did/list/0.2 \
+  --payload '{"ext": {"vnd.affinidi.webvh": {"search": "alice"}}}'
+```
+
 The output is JSON, so `jq` works on it:
 
 ```bash

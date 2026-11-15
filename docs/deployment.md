@@ -50,6 +50,12 @@ leaves the host.
   proxy should not strip them. Resolution responses set their own
   `Cache-Control` (`[server.resolve_cache]`) and allow any origin (CORS) so
   browser resolvers can read them; everything else is `no-store`.
+- Edges and watchers answer resolution with an `ETag` and honour
+  `If-None-Match` (`304 Not Modified`), and compress responses (gzip or
+  brotli) for clients that accept it; the console's assets are compressed
+  and cacheable too. A proxy may pass these through or cache on them, but
+  must not rewrite the body of an uncompressed response it then forwards
+  with the original strong `ETag`.
 - Allow request bodies of at least **1 MiB** on `POST /api/trust-tasks`
   (edge and watcher; a control plane's `did/register` can be as large), and
   do not buffer responses indefinitely.

@@ -287,9 +287,12 @@ without a clean reconcile, `/api/health` answers `503`.
 | --- | --- | --- | --- |
 | `upload_body_limit` | `102400` | `DID_HOSTING_LIMITS_UPLOAD_BODY_LIMIT` | Largest `POST /api/trust-tasks` body; never below 1 MiB in effect. |
 | `default_max_total_size`, `default_max_did_count` | `1048576`, `20` | `DID_HOSTING_LIMITS_DEFAULT_MAX_TOTAL_SIZE`, `…_DEFAULT_MAX_DID_COUNT` | Accepted for compatibility; nothing on the edge reads them (quotas are the control plane's concern). |
+| `content_cache_bytes` | `268435456` (256 MiB) | — | The most resolved DID content held in memory (served with a strong `ETag`; past the limit the oldest entries are dropped). |
+| `http_worker_threads` | one per available core | — | Worker threads of the edge's HTTP (resolution) runtime. |
 
-The daemon accepts a `[limits]` table too; its embedded edge mounts no
-listener, so it has no effect there.
+The daemon accepts a `[limits]` table too. Its embedded edge mounts no
+listener of its own, so only `content_cache_bytes` (the resolution cache)
+has an effect there.
 
 ### `[stats]` — `StatsConfig` (edge)
 
