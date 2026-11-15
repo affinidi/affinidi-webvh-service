@@ -32,6 +32,14 @@ cargo test --workspace
 python3 scripts/check-docs.py        # docs status lines + retired names
 ```
 
+CI (`.github/workflows/ci.yml`) also runs, among others: `cargo doc
+--no-deps --workspace` with `RUSTDOCFLAGS=-D warnings` (a broken intra-doc
+link fails the build), `cargo package --workspace` (the published tarballs
+build), the MSRV build, per-store and per-method builds, `cargo deny`, the
+fuzz lockfile check (`fuzz/Cargo.lock` must match; refresh it after a
+dependency-requirement bump), and the `docs` job below. The workspace denies
+`unsafe_code`.
+
 Server-side modules of `did-hosting-common` compile only with a store
 backend: `cargo test -p did-hosting-common --features store-fjall`.
 

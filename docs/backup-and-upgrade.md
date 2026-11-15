@@ -132,6 +132,7 @@ changes the store format, a minor release may. Before a minor upgrade:
 | Tiered statistics | Automatic: legacy `ts:` rows are folded into the new rows a flush at a time, and deleted after 30 days (`stats-purge-legacy` deletes them at once). |
 | Daemon backup format | Take a fresh `did-hosting-daemon backup` after upgrading. |
 | Refresh tokens stored hashed | Existing sessions keep working. |
+| **Breaking:** stats sync and health pings follow their pinned specs (#469) | **Upgrade the control plane before its edges.** A 0.12 control plane still reads a 0.11 edge's sync and pong (until 0.13); a 0.11 control plane refuses a 0.12 edge's, so its stats go uncounted and it ages to `Unreachable`. |
 | DID record indexes (`m03_index_did_records`) | Automatic: the control plane and daemon build the per-domain index and per-owner `usage:` rows at first boot; a control plane that cannot run the migration does not start. **Upgrade control-plane replicas that share a store together**: an old replica writes records without updating these rows. |
 
 ### Older upgrades

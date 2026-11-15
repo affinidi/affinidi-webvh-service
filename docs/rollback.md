@@ -78,6 +78,8 @@ restore the store from a backup taken on 0.11:
 | **Refresh tokens stored as SHA-256 digests.** | 0.11 cannot redeem a session issued by 0.12: users sign in again. |
 | **Daemon backup format.** `did-hosting-daemon backup` writes a daemon document (both stores and the config verbatim). | 0.11's `did-hosting-daemon restore` cannot read it. Keep a backup taken by 0.11 for a 0.11 restore. |
 | **Strict config parsing.** | Nothing to undo; a 0.12 config without new keys loads on 0.11. |
+| **Stats-sync and health payloads** follow the pinned specs (#469). | Roll the **edges back first**, then the control plane: a 0.11 control plane refuses a 0.12 edge's sync and pong, while a 0.12 control plane still reads a 0.11 edge's. |
+| **DID record indexes** (`domain:` index and `usage:` rows, migration `m03_index_did_records`). | 0.11 ignores them but writes records without updating them. Before upgrading again, delete the `migration:applied:m03_index_did_records` row in the `meta` keyspace so 0.12 rebuilds them (the sweep is idempotent). Never run 0.11 and 0.12 control-plane replicas against one store. |
 | **Outbox reference rows.** Queued rows are re-keyed when the 0.12 worker starts. | 0.11 does not understand the new rows. Let the outbox drain before rolling back (`did_hosting_replication_pending` at 0 for every target, in the admin gauges of `server/metrics/0.1`); anything left is re-derived on each edge's next registration. |
 
 Restore with the backup tool of the release you are going back to, into an
