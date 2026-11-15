@@ -25,6 +25,7 @@ import {
 } from "./session";
 import {
   generateSessionKeypair,
+  getSessionDidKey,
   hasSessionKeypair,
   restoreSessionKeypair,
   signEnvelope,
@@ -394,6 +395,11 @@ export type Signer =
    *  finish, which binds the new session to the key that signs it. A fresh
    *  key pair is generated for it. */
   | "fresh-session-key"
+  /** The session key this browser already holds, as its own `did:key`
+   *  issuer — renewing a session (`auth/refresh`), and a proxied wallet
+   *  login whose payload names the key it binds (the caller generated it
+   *  first, so the payload could say so). */
+  | "session-key"
   /** No proof and no issuer — only for a task whose proof rule is optional
    *  and that authorises nothing (opening a passkey login ceremony). */
   | "none";
@@ -417,7 +423,18 @@ async function sign(
   if (signer === "fresh-session-key") {
     const { didKey } = await generateSessionKeypair();
     doc.issuer = didKey;
-    await signEnvelope(doc as unknown as Record<string, unknown>);
+    await signEnvelope(doc);
+    return doc;
+  }
+  if (signer === "session-key") {
+    // After a reload the key is only in IndexedDB.
+    if (!hasSessionKeypair()) await restoreSessionKeypair();
+    const didKey = getSessionDidKey();
+    if (!hasSessionKeypair() || !didKey) {
+      throw new ApiError(401, "This browser no longer holds the session key — sign in again.");
+    }
+    doc.issuer = didKey;
+    await signEnvelope(doc);
     return doc;
   }
 
@@ -465,7 +482,7 @@ async function sign(
       "This browser no longer holds the session key — sign in again.",
     );
   }
-  await signEnvelope(doc as unknown as Record<string, unknown>);
+  await signEnvelope(doc);
   return doc;
 }
 

@@ -79,7 +79,7 @@ describe("generateSessionKeypair", () => {
     // A non-extractable key is still a usable signing key; if this ever
     // regresses, the temptation is to "fix" it by making it extractable.
     await generateSessionKeypair();
-    const envelope: SignableEnvelope = { id: "urn:test", value: 1 };
+    const envelope: SignableEnvelope & { id: string; value: number } = { id: "urn:test", value: 1 };
     const proof = (await signEnvelope(envelope)).proof as Record<string, unknown>;
 
     expect(proof.cryptosuite).toBe("eddsa-jcs-2022");

@@ -42,7 +42,6 @@
 // ---------------------------------------------------------------------------
 
 let sessionKeypair: CryptoKeyPair | null = null;
-let sessionPubkeyMultikey: string | null = null;
 let sessionDidKey: string | null = null;
 
 /** Cached promise of an in-flight IDB restore; coalesces concurrent
@@ -107,7 +106,6 @@ export async function generateSessionKeypair(): Promise<{
   const didKey = `did:key:${multikey}`;
 
   sessionKeypair = keypair;
-  sessionPubkeyMultikey = multikey;
   sessionDidKey = didKey;
 
   // Persist for reload survival. Best-effort: if IDB is unavailable
@@ -162,7 +160,6 @@ export async function restoreSessionKeypair(): Promise<void> {
       const persisted = await idbGet<PersistedKeypair>(KEYPAIR_KEY);
       if (persisted) {
         sessionKeypair = persisted.keypair;
-        sessionPubkeyMultikey = persisted.pubkeyMultikey;
         sessionDidKey = persisted.didKey;
       }
     } catch (e) {
@@ -192,7 +189,6 @@ export function clearSessionKeypair(): void {
  *  signed out, which has already deleted the stored copy. */
 export function forgetSessionKeypair(): void {
   sessionKeypair = null;
-  sessionPubkeyMultikey = null;
   sessionDidKey = null;
 }
 
@@ -213,7 +209,6 @@ const CREATED_BACKDATE_MS = 5_000;
 
 /** Subset of the trust-task envelope shape relevant to signing. */
 export type SignableEnvelope = {
-  [key: string]: unknown;
   proof?: unknown;
 };
 
@@ -265,8 +260,7 @@ export async function signEnvelope<T extends SignableEnvelope>(
   };
 
   // Hash the proof config and the doc (envelope minus proof).
-  const docCopy: SignableEnvelope = { ...envelope };
-  delete docCopy.proof;
+  const { proof: _unsigned, ...docCopy } = envelope;
   const proofConfigHash = await sha256(jcsCanonicalize(proofConfig));
   const docHash = await sha256(jcsCanonicalize(docCopy));
 

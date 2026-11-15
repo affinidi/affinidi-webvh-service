@@ -394,12 +394,11 @@ export async function loginWithWalletProxy(
   //            issues access tokens for a session bound to that same fresh
   //            key, so the session's calls are signed without a wallet
   //            prompt each.
-  const tokenResp = await authenticateIdTokenBindingSessionKey(apiBase, {
+  const tokenResp = await authenticateIdTokenBindingSessionKey({
     idToken: idTokenCompact,
     sessionId: chJson.sessionId,
     challenge: chJson.challenge,
     principalDid: entry.principalDid,
-    rpDid,
   });
 
   return {

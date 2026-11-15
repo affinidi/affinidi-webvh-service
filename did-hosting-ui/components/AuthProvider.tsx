@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useCallback, useEffect } from "react";
 import {
   api,
+  decodeJwtPayload,
   getToken,
   listenForSignOut,
   restoreSession,
@@ -21,16 +22,10 @@ interface AuthState {
 
 /** Decode the JWT payload (no verification) to extract claims. */
 function decodeJwtClaims(token: string): { role: "admin" | "owner" | null; did: string | null } {
-  try {
-    const payload = token.split(".")[1];
-    if (!payload) return { role: null, did: null };
-    const json = JSON.parse(atob(payload));
-    const role = json.role === "admin" || json.role === "owner" ? json.role : null;
-    const did = typeof json.sub === "string" ? json.sub : null;
-    return { role, did };
-  } catch {
-    return { role: null, did: null };
-  }
+  const claims = decodeJwtPayload(token);
+  const role = claims?.role === "admin" || claims?.role === "owner" ? claims.role : null;
+  const did = typeof claims?.sub === "string" ? claims.sub : null;
+  return { role, did };
 }
 
 const AuthContext = createContext<AuthState>({

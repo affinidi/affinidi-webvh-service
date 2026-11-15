@@ -265,7 +265,7 @@ export interface StarterKeys {
 
 const sessionKeys: StarterKeys = {
   generate: () => generateSessionKeypair(),
-  sign: (doc) => signEnvelope(doc as never),
+  sign: (doc) => signEnvelope(doc),
   clear: () => clearSessionKeypair(),
 };
 

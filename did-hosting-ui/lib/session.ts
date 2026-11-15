@@ -32,11 +32,13 @@
 import {
   clearSessionKeypair,
   forgetSessionKeypair,
-  getSessionDidKey,
   hasSessionKeypair,
   restoreSessionKeypair,
-  signEnvelope,
 } from "./session-key";
+import type {
+  Payload as RefreshPayload,
+  Response as RefreshResponse,
+} from "./trust-tasks/auth/refresh/0.2/payload";
 // `trust-task.ts` imports `clearToken`/`getSessionSubjectDid` from this
 // module, so a static top-level import back the other way is a genuine
 // cycle, not one that "resolves fine": `trust-task.ts` declares `class
@@ -237,16 +239,37 @@ export function resetSessionCacheForTests(): void {
 
 const REFRESH_TASK_URI = "https://trusttasks.org/spec/auth/refresh/0.2";
 
-/** Seconds since the epoch at which `token` expires, or null if unreadable. */
-function tokenExpiry(token: string): number | null {
+/**
+ * A JWT's payload claims, read without verification — the one decoder the
+ * console has (see the module doc for why reading unverified is fine here).
+ *
+ * The payload is base64url: `-` and `_` in place of `+` and `/`, and no `=`
+ * padding. Plain `atob` refuses those, so they are mapped back and the
+ * padding restored first; the bytes are then decoded as UTF-8, so a claim
+ * with non-ASCII text survives. `null` for anything that is not a JWT with a
+ * JSON-object payload.
+ */
+export function decodeJwtPayload(token: string | null | undefined): Record<string, unknown> | null {
+  const payload = token?.split(".")[1];
+  if (!payload) return null;
   try {
-    const payload = token.split(".")[1];
-    if (!payload) return null;
-    const exp = JSON.parse(atob(payload)).exp;
-    return typeof exp === "number" ? exp : null;
+    const b64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+    const claims: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    return claims !== null && typeof claims === "object" && !Array.isArray(claims)
+      ? (claims as Record<string, unknown>)
+      : null;
   } catch {
     return null;
   }
+}
+
+/** Seconds since the epoch at which `token` expires, or null if unreadable. */
+function tokenExpiry(token: string): number | null {
+  const exp = decodeJwtPayload(token)?.exp;
+  return typeof exp === "number" ? exp : null;
 }
 
 /** Renew when the access token has this long or less to live. */
@@ -351,33 +374,24 @@ async function refreshWithSessionKey(refresh: string): Promise<void> {
     throw new Error("This browser no longer holds the session key — sign in again.");
   }
 
-  const { TRUST_TASKS_PATH, getServiceInfo } = await import("./trust-task");
-  const { serviceDid } = await getServiceInfo();
-  let envelope: Record<string, unknown> = {
-    type: REFRESH_TASK_URI,
-    id: crypto.randomUUID(),
-    recipient: serviceDid,
-    issuedAt: new Date().toISOString(),
-    // The auth family verifies a proof bound to its own `issuer` — the
-    // session key signs as *itself*, not as a delegate for the
-    // session's subject (unlike an ordinary authenticated call; see
-    // `trust-task.ts`'s `"session"` signer). Mirrors the session-key
-    // binding `auth/authenticate/0.2`/`0.3` established at login.
-    issuer: getSessionDidKey(),
-    payload: { refreshToken: refresh },
-  };
-  envelope = await signEnvelope(envelope);
-  const res = await fetch(TRUST_TASKS_PATH, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(envelope),
-  });
-  if (!res.ok) {
-    throw new Error(`auth/refresh was refused (${res.status})`);
-  }
-  const body = await res.json();
-  const nextAccess = body?.payload?.tokens?.accessToken;
-  const nextRefresh = body?.payload?.tokens?.refreshToken;
+  // Through the one Trust Task client, so the reply is checked like every
+  // other: the service's signed answer to this request, addressed back to
+  // the session key that asked. The auth family verifies a proof bound to
+  // its own `issuer` — the session key signs as *itself*
+  // (`"session-key"`), not as a delegate for the session's subject (unlike
+  // an ordinary authenticated call; see `trust-task.ts`'s `"session"`
+  // signer). Mirrors the session-key binding `auth/authenticate/0.2`/`0.3`
+  // established at login. No bearer: the refresh token in the payload is
+  // the credential, and `request()` must not try to renew from inside a
+  // renewal.
+  const { trustTask } = await import("./trust-task");
+  const reply = await trustTask<RefreshPayload, RefreshResponse>(
+    REFRESH_TASK_URI,
+    { refreshToken: refresh },
+    { signer: "session-key", anonymous: true },
+  );
+  const nextAccess = reply?.tokens?.accessToken;
+  const nextRefresh = reply?.tokens?.refreshToken;
   if (typeof nextAccess !== "string" || nextAccess === "") {
     throw new Error("auth/refresh answered without an access token");
   }
@@ -418,17 +432,7 @@ export function clearToken(): void {
 
 /** The access token's claims, read without verification. See the module doc. */
 function tokenClaims(): Record<string, unknown> | null {
-  const token = getToken();
-  const payload = token?.split(".")[1];
-  if (!payload) return null;
-  try {
-    const b64 = payload.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
-    const claims = JSON.parse(atob(padded));
-    return claims && typeof claims === "object" ? claims : null;
-  } catch {
-    return null;
-  }
+  return decodeJwtPayload(getToken());
 }
 
 /**
