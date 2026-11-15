@@ -26,7 +26,8 @@ import { Platform, StyleSheet, Text, View } from "react-native";
 
 import { Button } from "./Button";
 
-import { api, setAuthMethod, setRefreshToken, setToken } from "../lib/api";
+import { setAuthMethod, setRefreshToken, setToken } from "../lib/api";
+import { useApi } from "./ApiProvider";
 import { getApiBase } from "../lib/api-base";
 import {
   configuredLinkHost,
@@ -72,6 +73,7 @@ export function WalletSignIn({
    *  so the page can fall back to its other login methods. */
   onUnavailable?: () => void;
 }) {
+  const api = useApi();
   const [state, setState] = useState<SignInState>({ status: "idle" });
   // State, not a ref: creating the controller must re-render, or the
   // buttons that need it stay disabled.

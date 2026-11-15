@@ -10,7 +10,8 @@ import { Dialog } from "../components/Dialog";
 import { Field } from "../components/Field";
 import { Heading } from "../components/Heading";
 import { WalletSignIn } from "../components/WalletSignIn";
-import { api, setAuthMethod, setRefreshToken } from "../lib/api";
+import { setAuthMethod, setRefreshToken } from "../lib/api";
+import { useApi } from "../components/ApiProvider";
 import { errorMessage } from "../lib/errors";
 import { getPasskeyCredential } from "../lib/passkey";
 import { fetchSignInReadiness, notSetUpNote, offersWalletSignIn } from "../lib/sign-in-readiness";
@@ -27,6 +28,7 @@ import {
 
 export default function Login() {
   const { isAuthenticated, login } = useAuth();
+  const api = useApi();
   const router = useRouter();
   const [passkeyLoading, setPasskeyLoading] = useState(false);
   const [passkeyError, setPasskeyError] = useState<string | null>(null);
@@ -103,7 +105,7 @@ export default function Login() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [api]);
 
   const handlePasskeyLogin = async () => {
     if (passkeyLoading) return;
