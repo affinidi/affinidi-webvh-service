@@ -20,6 +20,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ApiError,
+  T,
   TrustTaskRejection,
   api,
   resetServiceInfo,
@@ -105,6 +106,26 @@ describe("retryDelayMs — SPEC §8.4 decision table", () => {
       expect(retryDelayMs(type, { code: "internalError", retryable: true }, NOW))
         .toBeNull();
     }
+  });
+
+  it("takes the retry-safe set from the console's task table", () => {
+    // Built from `T`, so the set follows a version bump instead of keeping
+    // the old Type URI and silently dropping the task out of auto-retry.
+    for (const type of [T.didList, T.didInfo, T.serverInfo, T.inviteList]) {
+      expect(retryDelayMs(type, { code: "internalError", retryable: true }, NOW))
+        .toBe(500);
+    }
+    // A version the console does not send is not in it.
+    expect(
+      retryDelayMs(
+        "https://trusttasks.org/spec/did-management/did/list/0.1",
+        { code: "internalError", retryable: true },
+        NOW,
+      ),
+    ).toBeNull();
+    // Nor is a mutation that is not a no-op on re-issue.
+    expect(retryDelayMs(T.didDelete, { code: "internalError", retryable: true }, NOW))
+      .toBeNull();
   });
 
   it("ignores unknown codes even when flagged retryable", () => {

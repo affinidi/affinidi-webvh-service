@@ -34,8 +34,9 @@ pub(crate) async fn check_name(
     // means something as an auto-assign reservation.
     if !p.reserve {
         let path = path.ok_or_else(|| {
-            AppError::Validation(
-                "[path] check-name without `reserve: true` requires a `path` to probe".into(),
+            AppError::validation(
+                did_hosting_common::server::error::ValidationKind::InvalidPath,
+                "check-name without `reserve: true` requires a `path` to probe",
             )
         })?;
         let probe = did_ops::check_name(state, path).await?;
@@ -61,9 +62,11 @@ pub(crate) async fn check_name(
     ) {
         Ok(d) => Some(d),
         Err(e) if p.domain.is_some() => {
-            return Err(
-                AppError::Validation(format!("did-management:unknown_domain — {e}")).into(),
-            );
+            return Err(AppError::validation(
+                did_hosting_common::server::error::ValidationKind::UnknownDomain,
+                format!("did-management:unknown_domain — {e}"),
+            )
+            .into());
         }
         Err(_) => None,
     };
@@ -113,15 +116,14 @@ pub(crate) async fn register(
         "webs" => {}
         #[cfg(not(feature = "method-webs"))]
         "webs" => {
-            return Err(AppError::Validation(
+            return Err(AppError::invalid(
                 "this host does not host did:webs: it was built without the `method-webs` \
-                 feature"
-                    .into(),
+                 feature",
             )
             .into());
         }
         other => {
-            return Err(AppError::Validation(format!(
+            return Err(AppError::invalid(format!(
                 "this host registers webvh and did:webs over this task; received method = \
                  '{other}'"
             ))
@@ -129,7 +131,10 @@ pub(crate) async fn register(
         }
     }
     let did_log = std::str::from_utf8(&payload).map_err(|e| {
-        AppError::Validation(format!("[log] {method} didData is not valid UTF-8: {e}"))
+        AppError::validation(
+            did_hosting_common::server::error::ValidationKind::InvalidLog,
+            format!("{method} didData is not valid UTF-8: {e}"),
+        )
     })?;
 
     // One self-registration per domain at a time, from the count to the
@@ -183,8 +188,8 @@ pub(crate) fn register_method_and_data(
         "didData": serde_json::to_value(&p.did_data)?,
         "force": p.force,
     }))
-    .map_err(|e| AppError::Validation(format!("invalid register payload: {e}")))?;
-    req.resolve().map_err(AppError::Validation)
+    .map_err(|e| AppError::invalid(format!("invalid register payload: {e}")))?;
+    req.resolve().map_err(AppError::invalid)
 }
 
 /// `did/info/0.1`.
@@ -648,7 +653,7 @@ pub(crate) async fn set_state(
     let disabled = match p.state {
         set_state::v0_1::PayloadState::Active => false,
         set_state::v0_1::PayloadState::Suspended => true,
-        _ => return Err(AppError::Validation("unsupported DID state".into()).into()),
+        _ => return Err(AppError::invalid("unsupported DID state").into()),
     };
     let record = did_ops::set_did_disabled(&auth, state, &p.mnemonic, disabled).await?;
     server_push::notify_servers_did(state, p.mnemonic.to_string());
@@ -671,7 +676,9 @@ pub(crate) async fn rollback(
         did_ops::rollback_did_to(&auth, state, &p.mnemonic, Some(p.target_version.get()))
             .await
             .map_err(|e| match e {
-                AppError::Validation(message) if message.starts_with("invalid target version") => {
+                AppError::Validation { message, .. }
+                    if message.starts_with("invalid target version") =>
+                {
                     TaskError::Declared(
                         rollback::v0_1::error_codes::INVALID_TARGET_VERSION,
                         message,

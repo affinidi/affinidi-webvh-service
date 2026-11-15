@@ -100,7 +100,7 @@ Elsewhere the same `service[].type` values render as badges — `Hosting`
   the others, and switching them on wholesale would fill `domain` from the
   system-default tier as a side effect. The sweep is idempotent and
   marker-gated: one pass over the DID logs on the first boot after upgrade,
-  nothing thereafter. `publish_did` self-heals anything the sweep deferred.
+  nothing thereafter. `register_did_atomic` self-heals anything the sweep deferred.
 - **Servers list** — read from `ServiceInstance.advertised_services`,
   resolved from each instance's DID document at registration and refreshed
   by the registry health-check loop.

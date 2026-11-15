@@ -78,7 +78,7 @@ pub async fn create_domain(store: &Store, entry: &DomainEntry) -> Result<(), App
         // This branch is unreachable because `normalize_domain_name`
         // would have returned `Err` for non-canonical input — but
         // guarding here documents the invariant for future readers.
-        return Err(AppError::Validation(format!(
+        return Err(AppError::invalid(format!(
             "domain name not in canonical form — use '{canonical}'"
         )));
     }
@@ -129,7 +129,7 @@ pub async fn update_domain(
 ) -> Result<(), AppError> {
     let canonical = normalize_domain_name(name)?;
     if new_entry.name != canonical {
-        return Err(AppError::Validation(format!(
+        return Err(AppError::invalid(format!(
             "cannot rename domain ('{}' → '{}') — domain names are immutable",
             canonical, new_entry.name
         )));
@@ -232,7 +232,7 @@ pub async fn apply_replicated_domain(
 ) -> Result<(bool, Option<pending_purge::PendingPurge>), AppError> {
     let canonical = normalize_domain_name(&entry.name)?;
     if canonical != entry.name {
-        return Err(AppError::Validation(format!(
+        return Err(AppError::invalid(format!(
             "domain name not in canonical form — use '{canonical}'"
         )));
     }
@@ -402,7 +402,7 @@ mod tests {
         let err = create_domain(&store, &e)
             .await
             .expect_err("non-canonical must reject");
-        assert!(matches!(err, AppError::Validation(_)));
+        assert!(matches!(err, AppError::Validation { .. }));
     }
 
     #[tokio::test]
@@ -429,7 +429,7 @@ mod tests {
         let err = update_domain(&store, "a.example", &renamed)
             .await
             .expect_err("rename must reject");
-        assert!(matches!(err, AppError::Validation(_)));
+        assert!(matches!(err, AppError::Validation { .. }));
         assert!(err.to_string().contains("immutable"));
     }
 

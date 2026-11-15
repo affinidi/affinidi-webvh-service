@@ -566,7 +566,7 @@ async fn plan_dids_restore(
             rollbacks.join("\n    ")
         ));
     }
-    Err(AppError::Validation(message))
+    Err(AppError::invalid(message))
 }
 
 /// Write a [`plan_dids_restore`] plan: its entries, then the high-water marks
@@ -670,7 +670,8 @@ mod history_tests {
             .await
             .unwrap();
         let before = ks.iter_all().await.unwrap();
-        let Err(AppError::Validation(message)) = plan_dids_restore(&ks, &backup).await else {
+        let Err(AppError::Validation { message, .. }) = plan_dids_restore(&ks, &backup).await
+        else {
             panic!("an older backup must be refused");
         };
         assert!(message.contains("alice"), "{message}");
@@ -707,7 +708,7 @@ mod history_tests {
 
     fn refusal(result: Result<DidsRestore, AppError>) -> String {
         match result {
-            Err(AppError::Validation(message)) => message,
+            Err(AppError::Validation { message, .. }) => message,
             Err(other) => panic!("expected a refusal, got {other:?}"),
             Ok(_) => panic!("expected a refusal, the restore was planned"),
         }
@@ -855,7 +856,7 @@ mod history_tests {
         )
         .await
         .expect_err("an older backup is refused");
-        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        assert!(matches!(err, AppError::Validation { .. }), "{err:?}");
         assert!(!config_file.exists(), "config.toml was not written");
     }
 

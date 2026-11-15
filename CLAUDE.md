@@ -115,8 +115,8 @@ index), owner and domain assignments. Everything else is downstream of it.
 
 - **The agent (VTA) is an external publisher *into* the control plane.** It
   holds the DID's update key and produces signed `did.jsonl` versions, but it
-  publishes them *to* the control plane (`publish_did`, `register_did_atomic`,
-  the agent-name ops). It is a source of *documents*, not of record — the
+  publishes them *to* the control plane (`register_did_atomic` — the
+  `did/register` task — and the agent-name ops). It is a source of *documents*, not of record — the
   control plane decides what is stored and served.
 
 - **Hosting servers (edges) are lossy and ephemeral — treat them as caches.**
@@ -128,8 +128,8 @@ index), owner and domain assignments. Everything else is downstream of it.
 
 **The load-bearing consequence:** every control-plane write must keep the
 authoritative state correct *by itself* — you cannot lean on an edge to hold or
-repair it. Concretely, `publish_did`/`register_did_atomic` **reconcile the
-agent-name registry against the published document** (`reconcile_agent_names`):
+repair it. Concretely, `register_did_atomic` (`did/register`, the only live publish
+path) **reconciles the agent-name registry against the published document** (`reconcile_agent_names`):
 a name the signed document claims via `alsoKnownAs` is registered `enabled` with
 its index; a previously-served name the document drops is released; a **parked**
 (`enabled: false`) name is preserved even though it's absent from the document
@@ -142,8 +142,8 @@ cannot serve a name the document doesn't claim (Layer-1), but the control plane'
 reconciled registry — not the edge — is the truth.
 
 **Reconciling is not trusting.** Deriving the registry from `alsoKnownAs` says
-what a document *claims*, never that the claim is allowed. So both reconcile
-sites apply the same preconditions the explicit `set` verb does — reserved names
+what a document *claims*, never that the claim is allowed. So the reconcile
+applies the same preconditions the explicit `set` verb does — reserved names
 refused, a name held by another DID refused, all under `path_locks.guard` for
 the DID *and* a per-name lock (`did_ops::lock_agent_names`; the DID's lock
 first, then the names in sorted order) — and the invariant to preserve when

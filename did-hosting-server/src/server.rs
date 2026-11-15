@@ -2,20 +2,14 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
-use affinidi_messaging_didcomm_service::{
-    DIDCommService, DIDCommServiceConfig, ListenerConfig, ListenerEvent, Protocols, RestartPolicy,
-    RetryConfig,
-};
+use affinidi_messaging_didcomm_service::{DIDCommService, DIDCommServiceConfig, ListenerEvent};
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use axum::routing::get;
 use did_hosting_common::server::domain::parse_trusted_cidrs;
 use did_hosting_common::server::store::KS_DIDS;
 use ipnetwork::IpNetwork;
 
-use did_hosting_common::server::didcomm_profile::{
-    advertised_protocols, build_tdk_profile_for_identity, reconcile_listener_protocols,
-    wait_for_did_resolution,
-};
+use did_hosting_common::server::didcomm_profile::{build_own_listener, wait_for_did_resolution};
 use did_hosting_common::server::identity::{self, ServiceIdentity};
 use did_hosting_common::server::init;
 use tokio_util::sync::CancellationToken;
@@ -678,11 +672,6 @@ pub async fn start_didcomm_service(
     // "No Mediator is configured for this Profile" later).
     wait_for_did_resolution(&mediator_did, "mediator", &identity.did_resolver, &shutdown).await?;
 
-    // Carries the key material of every live generation, keyed on the kids the
-    // DID document actually resolved to — the same kids the secrets resolver
-    // was seeded with.
-    let profile = build_tdk_profile_for_identity("server", identity, Some(&mediator_did)).await?;
-
     // Transport selection — DIDComm and/or TSP ride the same mediator
     // socket. Inbound TSP frames (sync/domain pushes from the control
     // plane's outbox) are routed to the `ServerTspHandler` when TSP is on.
@@ -699,38 +688,19 @@ pub async fn start_didcomm_service(
     // disables a transport its DID still advertises (e.g. `features.tsp = false`
     // while the DID carries `TSPTransport`, since `did-host-didcomm` advertises
     // both) silently drops — and acks — every inbound frame on that transport.
-    let advertised = advertised_protocols(&identity.did, Some(&identity.did_resolver)).await;
-    let transports = reconcile_listener_protocols(identity.protocols(), advertised, &identity.did);
-    let didcomm_enabled = transports.didcomm;
+    //
+    // The profile carries the key material of every live generation, and with
+    // TSP on the listener persists its relationships (Rev 3 §7.2.2) so a restart
+    // does not forget every peer. Built by the same function the identity
+    // rebuild uses, so a rotation cannot come back with a different listener.
+    let (listener, transports) = build_own_listener(
+        crate::identity_rotation::LISTENER_ID,
+        identity,
+        &mediator_did,
+        &state.store,
+    )
+    .await?;
     let tsp_enabled = transports.tsp;
-    let protocols = match (didcomm_enabled, tsp_enabled) {
-        (true, true) => Protocols::BOTH,
-        (false, true) => Protocols::TSP_ONLY,
-        _ => Protocols::DIDCOMM_ONLY,
-    };
-
-    let mut listener = ListenerConfig {
-        id: "server".into(),
-        profile,
-        restart_policy: RestartPolicy::Always {
-            backoff: RetryConfig::default(),
-        },
-        auto_delete: true,
-        protocols,
-        ..Default::default()
-    };
-    // Persist this listener's TSP relationships (Rev 3 §7.2.2) across restarts.
-    // The default store is in-memory, so without this a restart forgets every
-    // peer and then silently drops each peer's application traffic — the peers
-    // still hold the relationship the restarted node forgot — until a
-    // re-handshake. Only meaningful when TSP is on. See docs/tsp-transport.md.
-    if tsp_enabled {
-        listener.relationship_store = Some(
-            did_hosting_common::server::tsp_relationship_store::build_relationship_store(
-                &state.store,
-            )?,
-        );
-    }
 
     let router = messaging::build_server_router(state.clone())
         .map_err(|e| AppError::Internal(format!("failed to build DIDComm router: {e}")))?;

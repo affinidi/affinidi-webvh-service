@@ -35,6 +35,7 @@
  */
 
 import { clearSessionKeypair, generateSessionKeypair, signEnvelope } from "./session-key";
+import { T } from "./task-types";
 
 export interface VtaWalletLoginParams {
   rpDid: string;
@@ -94,7 +95,7 @@ export interface IdTokenAuthResponse {
   };
 }
 
-const AUTH_AUTHENTICATE_V0_3 = "https://trusttasks.org/spec/auth/authenticate/0.3";
+const AUTH_AUTHENTICATE_V0_3 = T.authenticate;
 
 /**
  * Wrap a proxy login's `id_token` as an `auth/authenticate/0.3` proxied

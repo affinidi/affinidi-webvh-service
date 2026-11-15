@@ -1312,6 +1312,12 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         info!("DIDComm disabled in config");
     }
 
+    // 4b'. Post-listener startup shared with the standalone control plane —
+    // notably resuming any old-mediator drain a previous process left running.
+    if let Some(ref state) = control_state {
+        did_hosting_control::server::post_listener_startup(state);
+    }
+
     // 4c. Durable outbox worker. Drains the control-side outbound
     // queue per-target; idle until DIDComm is up, then delivers
     // every queued mutation. Spawned regardless of whether DIDComm

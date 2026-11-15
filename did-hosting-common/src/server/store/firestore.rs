@@ -590,13 +590,15 @@ fn check_one_commit(ops: &[FirestoreBatchOp]) -> Result<(), AppError> {
             bytes,
             "batch refused: over one Firestore commit"
         );
-        // `AppError::quota_kind` keys on the word "size".
-        return Err(AppError::QuotaExceeded(format!(
-            "a change of {} writes ({bytes} bytes) is over the store's size \
+        return Err(AppError::quota(
+            crate::server::error::QuotaKind::Size,
+            format!(
+                "a change of {} writes ({bytes} bytes) is over the store's size \
              limit for one atomic write: {MAX_COMMIT_WRITES} writes and \
              {MAX_COMMIT_BYTES} bytes",
-            ops.len()
-        )));
+                ops.len()
+            ),
+        ));
     }
     Ok(())
 }
@@ -679,7 +681,7 @@ mod tests {
     fn document_over_1_mib_after_encoding_is_refused_as_a_size_quota() {
         check_document_size("dids", &doc(700 * 1024)).unwrap();
         let err = check_document_size("dids", &doc(800 * 1024)).unwrap_err();
-        let AppError::QuotaExceeded(message) = &err else {
+        let AppError::QuotaExceeded { message, .. } = &err else {
             panic!("expected a size quota, got {err:?}");
         };
         assert!(
@@ -755,7 +757,7 @@ mod tests {
         let ops: Vec<_> = (0..501).map(|i| insert(i, 10)).collect();
         check_one_commit(&ops[..500]).unwrap();
         let err = check_one_commit(&ops).unwrap_err();
-        assert!(matches!(err, AppError::QuotaExceeded(_)), "{err:?}");
+        assert!(matches!(err, AppError::QuotaExceeded { .. }), "{err:?}");
         assert_eq!(err.quota_kind(), crate::server::error::QuotaKind::Size);
     }
 
@@ -766,7 +768,7 @@ mod tests {
         let ops: Vec<_> = (0..14).map(|i| insert(i, 700 * 1024)).collect();
         check_documents(&ops).unwrap();
         let err = check_one_commit(&ops).unwrap_err();
-        assert!(matches!(err, AppError::QuotaExceeded(_)), "{err:?}");
+        assert!(matches!(err, AppError::QuotaExceeded { .. }), "{err:?}");
     }
 
     /// `commit_in_parts` splits on both bounds, keeping every write once and
