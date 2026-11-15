@@ -45,7 +45,7 @@ The interactive wizard walks you through configuration:
 - **Features** — enable DIDComm messaging and/or REST API
 - **DID hosting** — URL and path where did-hosting-server will host
   the witness DID
-- **Host / port** — listen address (default: `0.0.0.0:8102`)
+- **Host / port** — listen address (default: `0.0.0.0:8531`)
 - **Log level / format** — logging configuration
 - **Data directory** — persistent storage path
 - **Secrets backend** — where to store private key material
@@ -73,7 +73,9 @@ mediator_did = "did:webvh:mediator.example.com"
 
 [features]
 didcomm = true
-rest_api = true
+# Run the HTTP listener (POST /api/trust-tasks, /api/health). Formerly
+# `rest_api`, still accepted.
+http_listener = true
 
 [server]
 host = "0.0.0.0"
@@ -141,6 +143,11 @@ proxy in `server.trusted_proxies` so per-address limits apply to clients
 rather than to the proxy.
 
 ## CLI Commands
+
+Every subcommand, with its full `--help`, is in
+[`docs/cli-reference.md`](../docs/cli-reference.md), generated from the CLI
+(a test keeps it current). Below is a summary. `health` exits non-zero when a
+check fails (`--strict`: also when one warns).
 
 ```
 webvh-witness                                  # Run witness (default)

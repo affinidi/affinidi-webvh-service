@@ -1039,18 +1039,9 @@ async fn do_domain_assign(
 }
 
 /// This server's unassignment grace, from `hosting.unassigned_purge_grace`.
+/// Parsed at config load, so there is nothing left to fall back from.
 fn unassign_grace_seconds(state: &AppState) -> u64 {
-    use did_hosting_common::server::pending_purge::parse_grace_string;
-    // A misconfigured value falls back to 2h with a warning, so an unassign
-    // still schedules a purge rather than failing outright.
-    parse_grace_string(&state.config.hosting.unassigned_purge_grace).unwrap_or_else(|e| {
-        warn!(
-            error = %e,
-            config = %state.config.hosting.unassigned_purge_grace,
-            "unassigned_purge_grace unparseable; defaulting to 2h"
-        );
-        2 * 60 * 60
-    })
+    state.config.hosting.unassigned_purge_grace.as_secs()
 }
 
 /// `replica/domain/unassign/0.1`: remove the assignment and schedule the

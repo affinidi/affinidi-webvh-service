@@ -59,7 +59,7 @@ public_url = "https://daemon.example.com"
 [vta]
 # Required for vta_mode = "online" (omit for self-managed):
 did = "did:webvh:vta.example.com"
-context_id = "webvh"
+context_id = "did-hosting"
 
 # vta_mode = "offline-prepare" requires this:
 # request_path  = "bootstrap-request.json"

@@ -37,15 +37,21 @@ enum Command {
         #[arg(long)]
         setup_key_file: Option<PathBuf>,
         /// Context id for `--setup-key-out`'s PNM command.
-        #[arg(long, default_value = "webvh", requires = "setup_key_out")]
+        #[arg(long, default_value = "did-hosting", requires = "setup_key_out")]
         context: String,
         /// Allow overwriting an existing config.toml. The previous file
         /// is moved to config.toml.bak.
         #[arg(long)]
         force_reprovision: bool,
     },
-    /// Run health check diagnostics
-    Health,
+    /// Run health check diagnostics. Exits non-zero when a check fails (or,
+    /// with --strict, warns), so it can gate a deploy or a container probe.
+    Health {
+        /// Also exit non-zero when a check only warned (a store held by the
+        /// running service, plaintext secrets, a non-2xx reachability probe).
+        #[arg(long)]
+        strict: bool,
+    },
 }
 
 #[tokio::main]
@@ -74,11 +80,12 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::Health) => {
-            if let Err(e) = health::run_health(cli.config).await {
-                eprintln!("Health check error: {e}");
-                std::process::exit(1);
-            }
+        Some(Command::Health { strict }) => {
+            let code = did_hosting_common::server::health::finish(
+                health::run_health(cli.config).await,
+                strict,
+            );
+            std::process::exit(code);
         }
         None => run_watcher(cli.config).await,
     }
@@ -145,4 +152,9 @@ fn print_banner() {
 "#,
         version = env!("CARGO_PKG_VERSION"),
     );
+}
+
+#[cfg(test)]
+mod cli_reference_tests {
+    did_hosting_common::cli_reference_test!(super::Cli, "webvh-watcher");
 }

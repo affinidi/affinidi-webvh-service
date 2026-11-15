@@ -206,7 +206,7 @@ pub async fn apply_recipe(
         features: FeaturesConfig {
             didcomm,
             tsp,
-            rest_api: true,
+            http_listener: true,
             ..Default::default()
         },
         server_did: Some(control_did.clone()),

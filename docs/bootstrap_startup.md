@@ -302,7 +302,7 @@ setup, cloud credentials come from the environment.
 ```bash
 # Run setup with no prompts. For online VTA mode, phase 1 still mints
 # the ephemeral did:key separately; the recipe drives phase 2.
-did-hosting-server setup --setup-key-out setup.key --context webvh
+did-hosting-server setup --setup-key-out setup.key --context did-hosting
 # (operator enrols the printed did:key at the VTA)
 did-hosting-server setup --from examples/did-hosting-server-build.toml \
                    --setup-key-file setup.key
