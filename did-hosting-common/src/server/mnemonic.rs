@@ -281,7 +281,7 @@ pub fn validate_agent_name(name: &str) -> Result<(), AppError> {
 /// That rule is structural rather than role-based, and deliberately so. The
 /// community name is the domain's own identity — the strongest phishing
 /// primitive the host has, one step beyond the `@support` / `@security` names
-/// [`RESERVED_AGENT_NAMES`] already withholds. An admin-only gate would still
+/// `RESERVED_AGENT_NAMES` already withholds. An admin-only gate would still
 /// let an operator bind it to a tenant's DID by mistake; tying it to the
 /// `.well-known` slot means the only DID that can ever answer for
 /// `{domain}/@` is the one already serving as `{domain}`'s root, which is

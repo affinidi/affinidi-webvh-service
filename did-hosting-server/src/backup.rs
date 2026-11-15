@@ -342,7 +342,7 @@ pub struct DidsRestore {
 /// - verify: its chain and witness proofs (webvh), or its key event log and
 ///   the AID the slot's identifier names (webs);
 /// - extend what this store holds for its DID and slot, and the high-water
-///   marks it keeps ([`crate::control_register::verify_history`]);
+///   marks it keeps (`crate::control_register::verify_history`);
 /// - extend the backup's own high-water mark for its DID.
 ///
 /// A backup's high-water mark is written only where this store holds none for

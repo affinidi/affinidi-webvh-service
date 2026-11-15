@@ -29,7 +29,7 @@ use super::trust_tasks::{HostPolicy, TransportBoundVerifier, metrics_request_typ
 /// returned to a `MetricsReader`, so we never request them.
 ///
 /// `url` overrides the endpoint; when absent the base is derived from
-/// `default_host` / `default_port` via [`loopback_base_url`] (a wildcard bind is
+/// `default_host` / `default_port` via `loopback_base_url` (a wildcard bind is
 /// dialled as loopback).
 pub async fn fetch_metrics(
     server_did: &str,

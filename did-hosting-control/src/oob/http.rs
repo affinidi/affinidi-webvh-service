@@ -4,14 +4,14 @@
 //!
 //! The six tasks a starter or wallet sends (`request`, `claim`, `prove`,
 //! `respond`, `redeem`, `cancel`) are `bound_key` rows of
-//! [`crate::control_tasks`], reached through `POST /api/trust-tasks` and the
+//! `crate::control_tasks`, reached through `POST /api/trust-tasks` and the
 //! same router and gate as every other task (`messaging::
 //! route_trust_task_doc`). Their rule is `ProofRule::BoundKey(KEY_PURPOSES)`.
 //! In order:
 //!
 //! 1. The gate serves them over HTTPS only, and ignores any bearer session
 //!    sent with one: nothing in the family is authorised by it.
-//! 2. [`admit`], before any proof work: a size limit on the document
+//! 2. `admit`, before any proof work: a size limit on the document
 //!    ([`MAX_OOB_DOCUMENT_BYTES`], under the route's own body limit);
 //!    per-address rate limits on every `auth/oob/*` document; `request` only
 //!    from the portal's origin (base design 12 item 10: exactly one `Origin`
@@ -20,10 +20,10 @@
 //!    hosts, or a too-broad `trusted_proxies`) still meet a ceiling.
 //! 3. The gate's proof check: an Ed25519 `did:key` issuer, a proof by exactly
 //!    that key for one of [`KEY_PURPOSES`], verified locally with no DID
-//!    resolution (`verify_bound_key`). A refusal is rendered by [`refuse`] in
+//!    resolution (`verify_bound_key`). A refusal is rendered by `refuse` in
 //!    the family's error shape. No ACL pre-filter (`K_a` and `K_b` are never
 //!    in the ACL) and no shared replay cache (see `ProofRule::BoundKey`).
-//! 4. [`exchange`] hands the document to the state machine
+//! 4. `exchange` hands the document to the state machine
 //!    ([`super::service`]), which checks on every document the envelope
 //!    (`type`, `id` of at most 128 bytes, in-band `issuer`, `recipient` = this
 //!    service, fresh `issuedAt`, `expiresAt`), the key again, the
@@ -71,7 +71,7 @@ use crate::messaging::HttpsFacts;
 use crate::server::AppState;
 
 /// The `ext` namespace of the redeem response that carries this service's
-/// bearer tokens (see [`create_session`] for why).
+/// bearer tokens (see `create_session` for why).
 pub const SESSION_EXT_NAMESPACE: &str = "com.affinidi.did-hosting";
 
 /// The largest `auth/oob/*` document accepted. `prove` and `respond` carry one

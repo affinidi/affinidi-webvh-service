@@ -130,7 +130,7 @@ pub struct OfflinePreparedInfo {
     /// us to write.
     pub request_path: PathBuf,
     /// Ephemeral X25519-derivable private seed. Treat as secret. The
-    /// caller MUST persist this via [`SecretStore::set_bootstrap_seed`]
+    /// caller MUST persist this via `SecretStore::set_bootstrap_seed`
     /// before returning, otherwise phase 2 cannot open the sealed
     /// response.
     pub seed: [u8; 32],

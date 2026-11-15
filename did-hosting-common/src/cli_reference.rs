@@ -1,6 +1,6 @@
 //! `docs/cli-reference.md`, generated from each binary's clap definition.
 //!
-//! Every binary carries a test made by [`cli_reference_test!`]: it renders
+//! Every binary carries a test made by [`cli_reference_test!`](crate::cli_reference_test!): it renders
 //! the binary's `--help` and every subcommand's long help, and fails when the
 //! binary's section of `docs/cli-reference.md` differs — so the reference
 //! cannot drift from the CLI, and the test doubles as a `--help` snapshot.

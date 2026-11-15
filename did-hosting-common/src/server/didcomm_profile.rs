@@ -425,7 +425,7 @@ fn decide_binding(
     None
 }
 
-/// The messaging transports a DID document advertises, as a [`ProtocolSet`].
+/// The messaging transports a DID document advertises, as a [`ProtocolSet`](crate::server::identity::ProtocolSet).
 ///
 /// Resolves `did` and maps its services: a `TSPTransport` service ⇒ `tsp`, a
 /// `DIDCommMessaging` service ⇒ `didcomm`. Returns `None` when the document
@@ -695,7 +695,7 @@ pub async fn wait_for_did_resolution(
 
 /// Build a `TDKProfile` from an already-loaded [`ServiceIdentity`].
 ///
-/// Differs from [`build_tdk_profile`] in two ways that matter.
+/// Differs from `build_tdk_profile` in two ways that matter.
 ///
 /// The kids are **not** re-resolved — they come from the identity's generation
 /// records. That is what keeps the listener's profile and the secrets resolver

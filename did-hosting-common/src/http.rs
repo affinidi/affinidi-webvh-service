@@ -31,7 +31,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// For URLs this node's operator chose (a configured control plane, witness
 /// or hosting URL). A URL taken from a peer's DID document goes through
-/// [`peer_endpoint_client`] instead.
+/// `peer_endpoint_client` instead.
 ///
 /// Redirects are refused (`Policy::none()`) so a compromised or misconfigured
 /// endpoint cannot 3xx-bounce the request — and any `Authorization` header on

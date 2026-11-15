@@ -1463,10 +1463,10 @@ Options:
           Path to the configuration file
 
       --setup-key-out <SETUP_KEY_OUT>
-          Phase 1: mint an ephemeral did:key, persist to <path>, and print the `pnm contexts create` command + exit
+          Phase 1: mint an ephemeral did:key, persist to `<path>`, and print the `pnm contexts create` command + exit
 
       --setup-key-file <SETUP_KEY_FILE>
-          Phase 2: reuse the setup DID persisted at <path>; skip the interactive "Has the context been created?" confirmation
+          Phase 2: reuse the setup DID persisted at `<path>`; skip the interactive "Has the context been created?" confirmation
 
       --context <CONTEXT>
           Context id for phase 1's PNM command. Defaults to `did-hosting`

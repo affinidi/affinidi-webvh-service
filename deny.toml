@@ -45,7 +45,107 @@ ignore = [
 #   RUSTSEC-2026-0258 (h2 0.3.27), RUSTSEC-2026-0346, -0349 (rustls 0.21.12).
 
 [bans]
-multiple-versions = "allow"
+# Duplicate versions warn rather than fail: every duplicate below is pulled by
+# an upstream we do not control, so a hard ban would only make the job red
+# until those upstreams move. The skip list names the *older* copy of each one
+# known today, so a new duplicate (or a third copy of one of these) still shows
+# up as a warning in the `cargo deny` job log. When a dependency update drops a
+# duplicate, cargo-deny reports its skip entry as unused — delete it then.
+#
+# None of these is dedupable from this workspace (checked with
+# `cargo tree -i <crate>@<ver>` and `cargo update --dry-run`): every older copy
+# is reached only through a third-party crate's own requirement.
+multiple-versions = "warn"
+skip = [
+  # RustCrypto's 2024-25 release generation (digest 0.10 -> 0.11, signature 2
+  # -> 3, elliptic-curve 0.13 -> 0.14, ed25519-dalek 2 -> 3, ...). We and the
+  # Affinidi stack are on the new generation; jsonwebtoken (both majors),
+  # webauthn-rs, the KERI stack (argon2 0.5) and the cloud SDKs
+  # are still on the old one.
+  "aead@0.5.2",
+  "aes@0.8.4",
+  "argon2@0.5.3",
+  "base16ct@0.2.0",
+  "blake2@0.10.6",
+  "block-buffer@0.10.4",
+  "block-padding@0.3.3",
+  "cbc@0.1.2",
+  "cipher@0.4.4",
+  "const-oid@0.9.6",
+  "cpufeatures@0.2.17",
+  "crypto-bigint@0.5.5",
+  "crypto-common@0.1.7",
+  "curve25519-dalek@4.1.3",
+  "der@0.7.10",
+  "digest@0.10.7",
+  "ecdsa@0.16.9",
+  "ed25519@2.2.3",
+  "ed25519-dalek@2.2.0",
+  "elliptic-curve@0.13.8",
+  "ff@0.13.1",
+  "fiat-crypto@0.2.9",
+  "group@0.13.0",
+  "hkdf@0.12.4",
+  "hmac@0.12.1",
+  "inout@0.1.4",
+  "num-bigint@0.4.8",
+  "p256@0.13.2",
+  "p384@0.13.1",
+  "password-hash@0.5.0",
+  "pem-rfc7468@0.7.0",
+  "pkcs8@0.10.2",
+  "poly1305@0.8.0",
+  "primeorder@0.13.6",
+  "rfc6979@0.4.0",
+  "salsa20@0.10.2",
+  "sec1@0.7.3",
+  "sha1@0.10.7",
+  "sha2@0.10.9",
+  "signature@2.2.0",
+  "spki@0.7.3",
+  "universal-hash@0.5.1",
+  # rand 0.8 / 0.9 / 0.10 and their cores: the same generational split.
+  "getrandom@0.2.17",
+  "getrandom@0.3.4",
+  "r-efi@5.3.0",
+  "rand@0.8.8",
+  "rand@0.9.5",
+  "rand_chacha@0.3.1",
+  "rand_core@0.6.4",
+  "rand_core@0.9.5",
+  # base64: 0.21 under webauthn-rs, 0.22 under `headers` / jsonwebtoken (see
+  # the note on `base64` in Cargo.toml).
+  "base64@0.21.7",
+  "base64@0.22.1",
+  # jsonwebtoken 10 is ours, 11 arrives with vti-common / the mediator /
+  # google-cloud-auth (see the note on `jsonwebtoken` in Cargo.toml).
+  "jsonwebtoken@10.4.0",
+  # tower-http 0.6 via reqwest 0.13 and kube-client; we are on 0.7.
+  "tower-http@0.6.11",
+  # tokio-tungstenite / tungstenite 0.29 via axum 0.8's `ws`; the messaging
+  # SDK is on 0.30.
+  "tokio-tungstenite@0.29.0",
+  "tungstenite@0.29.0",
+  # serde_json_canonicalizer 0.3 via affinidi-data-integrity 0.8.
+  "serde_json_canonicalizer@0.3.2",
+  # thiserror 1 via asn1-rs / x509-parser (webauthn-rs) and vaultrs.
+  "thiserror@1.0.69",
+  "thiserror-impl@1.0.69",
+  # Proc-macro and std-adjacent generations pulled by assorted upstreams.
+  "convert_case@0.10.0",
+  "core-foundation@0.9.4",
+  "darling@0.20.11",
+  "darling_core@0.20.11",
+  "darling_macro@0.20.11",
+  "hashbrown@0.14.5",
+  "hashbrown@0.16.1",
+  "syn@1.0.109",
+  "syn@2.0.119",
+  "synstructure@0.12.6",
+  "synstructure@0.13.2",
+  # untrusted 0.7 via aws-lc-rs; ring is on 0.9.
+  "untrusted@0.7.1",
+]
 
 [licenses]
 # We want really high confidence when inferring licenses from text
