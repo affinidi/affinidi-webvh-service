@@ -191,28 +191,60 @@ jobs:
         # each one needs its own job. `method-webvh,method-web` are included so
         # the method-dependent unit tests (domain::safety host extraction) run.
         #
-        # Only the embedded fjall backend runs the unit suite (`run_tests:
-        # true`). The generic handler/ACL tests assume an isolated, empty store
-        # per test (fjall gives each a fresh temp dir); a single shared redis or
-        # a cloud emulator cross-contaminates parallel tests, so those backends
-        # are build-only here. Real backend integration tests would need
-        # per-test isolation (FLUSHDB / unique key prefixes) — out of scope.
+        # Only the embedded fjall backend runs the whole unit suite
+        # (`run_tests: true`): the generic handler/ACL tests assume an
+        # isolated, empty store per test (fjall gives each a fresh temp dir).
+        #
+        # Every other backend runs the shared store conformance suite
+        # (`server::store::conformance`, which opens its keyspaces under a
+        # fresh namespace, so it needs no isolation) against a real server:
+        # Redis and DynamoDB Local as service containers, Cosmos DB against
+        # its SDK's in-memory emulator. Firestore's emulator needs the gcloud
+        # CLI, so it runs on a schedule instead (store-emulators.yml); here it
+        # is build-only.
         include:
           - store: store-fjall
             features: "server-core,store-fjall,keyring,passkey,setup-wizard,method-webvh,method-web"
             run_tests: true
           - store: store-redis
-            features: "server-core,store-redis,method-webvh,method-web"
+            features: "server-core,store-redis,test-support,method-webvh,method-web"
             run_tests: false
+            conformance: "--test store_conformance"
+            redis_image: "redis:7-alpine"
           - store: store-dynamodb
-            features: "server-core,store-dynamodb,method-webvh,method-web"
+            features: "server-core,store-dynamodb,test-support,method-webvh,method-web"
             run_tests: false
+            conformance: "--test store_conformance"
+            dynamodb_image: "amazon/dynamodb-local:3.3.2"
           - store: store-firestore
             features: "server-core,store-firestore,method-webvh,method-web"
             run_tests: false
           - store: store-cosmosdb
-            features: "server-core,store-cosmosdb,method-webvh,method-web"
+            features: "server-core,cosmosdb-emulator,method-webvh,method-web"
             run_tests: false
+            conformance: "--lib store::cosmosdb"
+    # A service whose image is empty is not started, so each entry gets only
+    # the server its conformance run needs.
+    services:
+      redis:
+        image: ${{ matrix.redis_image || '' }}
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s
+          --health-timeout 2s --health-retries 15
+      dynamodb:
+        image: ${{ matrix.dynamodb_image || '' }}
+        ports:
+          - 8000:8000
+    env:
+      # Read by tests/store_conformance.rs; a backend left unset is skipped.
+      WEBVH_TEST_REDIS_URL: ${{ matrix.redis_image && 'redis://127.0.0.1:6379' || '' }}
+      WEBVH_TEST_DYNAMODB: ${{ matrix.dynamodb_image && '1' || '' }}
+      AWS_ENDPOINT_URL: ${{ matrix.dynamodb_image && 'http://127.0.0.1:8000' || '' }}
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: conformance
+      AWS_SECRET_ACCESS_KEY: conformance
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -231,20 +263,25 @@ jobs:
       - name: Build did-hosting-common with ${{ matrix.store }}
         # `build`, not `check` — see the note on the `methods` job below.
         #
-        # Still skipped where the suite runs: the `cargo test` step compiles
-        # the same crate with the same features, so building first is work
-        # done twice. That part measured as a real (if small) win and stays.
-        if: ${{ !matrix.run_tests }}
+        # Still skipped where tests run: the `cargo test` step compiles the
+        # same crate with the same features, so building first is work done
+        # twice. That part measured as a real (if small) win and stays.
+        if: ${{ !matrix.run_tests && !matrix.conformance }}
         run: >
           cargo build -p did-hosting-common --no-default-features
           --features "${{ matrix.features }}"
       - name: Test did-hosting-common with ${{ matrix.store }}
-        # Only embedded fjall runs the unit suite (isolated per-test store);
-        # other backends are build-only above.
+        # Only embedded fjall runs the unit suite (isolated per-test store).
         if: matrix.run_tests
         run: >
           cargo test -p did-hosting-common --lib --no-default-features
           --features "${{ matrix.features }}"
+      - name: Store conformance (${{ matrix.store }})
+        if: matrix.conformance
+        run: >
+          cargo test -p did-hosting-common --no-default-features
+          --features "${{ matrix.features }}" ${{ matrix.conformance }}
+          -- --nocapture
 
   test-default:
     name: cargo test (default features)
