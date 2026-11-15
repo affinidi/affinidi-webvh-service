@@ -1,7 +1,9 @@
 # did-hosting Rollout — Task Breakdown
 
+> **Status:** historical — completed task list for 0.7.0.
+
 Plan: [`tasks/did-hosting-rollout-plan.md`](did-hosting-rollout-plan.md)
-Specs: [`docs/multi-domain-spec.md`](../docs/multi-domain-spec.md), [`docs/multi-method-hosting-spec.md`](../docs/multi-method-hosting-spec.md), [`docs/did-hosting-client-crate-spec.md`](../docs/did-hosting-client-crate-spec.md)
+Specs: [`docs/multi-domain-spec.md`](../multi-domain-spec.md), [`docs/multi-method-hosting-spec.md`](../multi-method-hosting-spec.md), `docs/did-hosting-client-crate-spec.md` (never written)
 
 Tasks are numbered in dependency order. Each task is one focused session and one PR. Files lists are upper bounds — actual diffs may touch fewer. `Verify` is the exact command/check that gates the task as done.
 

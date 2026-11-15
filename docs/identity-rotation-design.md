@@ -1,5 +1,7 @@
 # Service identity rotation — design
 
+> **Status:** current — phases 1–4 are built; the operator procedure is the [runbook](identity-rotation-runbook.md)
+
 ## Status
 
 **Built:** phases 1 and 2, wired into **every binary that has an identity** — the generation
@@ -13,7 +15,7 @@ Triggers differ by what each service can observe:
 | Service | Publish hook | Sync-update hook | Periodic sweep |
 |---|---|---|---|
 | control | ✅ `did_ops::register_did_atomic` (`did/register`) and the agent-name ops | — | ✅ |
-| server | — (no management routes) | ✅ `MSG_SYNC_UPDATE` | ✅ |
+| server | — (no management routes) | ✅ a `webvh/sync/update` (or `sync/batch`) of its own DID from the control plane | ✅ |
 | witness | — (hosts no DIDs) | — | ✅ **only trigger** |
 | watcher | — (its own DID is published elsewhere) | — | ✅ **only trigger** |
 | daemon | ✅ via control | — | ✅ via control (`spawn_workers`) |
@@ -63,8 +65,10 @@ didn't.
 
 So:
 
-- **Live service** → `POST /api/identity/generations/{id}/retire`, or the
-  **Key Generations** panel in the control-plane UI. Runs in-process: the key is
+- **Live service** → the `identity/retire/0.1` Trust Task (from an admin: the
+  **Key Generations** panel in the console, or `send-trust-task`; see
+  [sending Trust Tasks](sending-trust-tasks.md)). Served by the control plane
+  and the daemon only. Runs in-process: the key is
   gone from the secrets resolver and the listener profile before the response is
   written. This is the path that matters for a compromise.
 - **Stopped service** → `identity-retire-now --generation <id>` (control, server,
@@ -547,9 +551,9 @@ all), and there is no shared clap module — each binary redeclares its variants
 New commands `identity-list` / `identity-rotate-keys` / `identity-retire-now`,
 flat (house style has no nested subcommand groups), on all three.
 
-**REST/UI** — `GET /api/identity/generations`, `DELETE
-/api/identity/generations/{id}`. A dashboard panel showing live generations and
-their expiry is a natural follow-up, not required for correctness.
+**Trust Tasks / UI** — `identity/list/0.1` and `identity/retire/0.1` on the
+control plane (and so the daemon), admin only, and the console's **Key
+Generations** panel (shown once there is more than one generation).
 
 ## Phasing
 

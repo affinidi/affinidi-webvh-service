@@ -1,5 +1,7 @@
 # GeoIP: sign-in locations
 
+> **Status:** current
+
 When someone signs in to the management UI with their wallet (`auth/oob`),
 the wallet shows them where the sign-in request came from — the
 `requester.location` of `auth/oob` step 2, for example `Vienna, AT`. The

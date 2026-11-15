@@ -1,20 +1,17 @@
 # Affinidi DID Hosting Daemon
 
-The DID Hosting Daemon is a unified binary that embeds all four
-services — [server](../did-hosting-server/),
-[witness](../webvh-witness/), [watcher](../webvh-watcher/), and
-[control plane](../did-hosting-control/) — behind a single TCP listener.
-This is the easiest way to get started with a complete DID Hosting
-deployment.
+The DID Hosting Daemon is a single binary that embeds the main features of
+the [control plane](../did-hosting-control/), the
+[hosting server](../did-hosting-server/), the
+[witness](../webvh-witness/) and the [watcher](../webvh-watcher/) behind one
+listener and one store. It is the recommended deployment for a single host.
 
-Each service is mounted at a path prefix:
-
-| Service | Path prefix | Description |
-| ------- | ----------- | ----------- |
-| Server  | `/`         | Public DID hosting and resolution |
-| Witness | `/witness`  | Witness proof signing |
-| Watcher | `/watcher`  | Read-only DID mirror |
-| Control | `/`         | DID management as Trust Tasks (TSP, DIDComm, `POST /api/trust-tasks`), management UI |
+The daemon coordinates its services in-process rather than over the network:
+the control plane runs the only Trust Task listener (TSP, DIDComm and
+`POST /api/trust-tasks`) on the authoritative store, and the embedded server
+serves public resolution from that same store. It does not register with an
+external control plane — it *is* the control plane. See
+[docs/architecture.md](../docs/architecture.md).
 
 > **IMPORTANT:**
 > did-hosting-service crates are provided "as is" without any
@@ -28,112 +25,48 @@ Each service is mounted at a path prefix:
 
 ### Prerequisites
 
-- Rust 1.94.0+ (2024 Edition)
-- Node.js 20+ (only if building with the management UI)
+- Rust: the workspace MSRV is `rust-version` in the root
+  [`Cargo.toml`](../Cargo.toml) (2024 edition).
+- Node.js: `engines.node` in
+  [`did-hosting-ui/package.json`](../did-hosting-ui/package.json)
+  (currently >= 24.3). The default build needs it: `ui` is a default
+  feature, and the build bundles the console when `../did-hosting-ui` is
+  present and the bundle is stale.
 
 ### 1. Build
 
 ```bash
-# Without UI
+# Default: with the embedded management UI (needs Node.js)
 cargo build --locked -p did-hosting-daemon --release
 
-# With embedded management UI
-cd did-hosting-ui && npm install && npm run build:web && cd ..
-cargo build --locked -p did-hosting-daemon --release --features ui
+# Without the UI (no Node.js needed)
+cargo build --locked -p did-hosting-daemon --release \
+  --no-default-features --features keyring,store-fjall,did-methods
 ```
 
 The binary is produced at `target/release/did-hosting-daemon`.
 
-### 2. Configure
-
-The fastest way to produce a working `config.toml` is to run
-`did-hosting-daemon setup`, which prompts for the values below and emits a
-file you can hand-edit later. A worked example follows for reference:
-
-```toml
-server_did = "did:webvh:example.com"
-mediator_did = "did:webvh:mediator.example.com"
-public_url = "https://example.com"
-
-# Identity mode. Default: "vta". Set to "self-managed" to skip the
-# VTA round-trip and have the daemon self-host its own did:webvh
-# identifier. See docs/self-managed-mode-spec.md for the trade-offs.
-[identity]
-mode = "vta"
-
-[server]
-host = "0.0.0.0"
-port = 8534
-
-[log]
-level = "info"
-
-[auth]
-access_token_expiry = 900
-refresh_token_expiry = 86400
-
-# Secret backend. The daemon's default features include `keyring`; other
-# backends require recompiling with `--features aws-secrets|gcp-secrets|
-# azure-secrets|vault-secrets|k8s-secrets` and setting the matching
-# `[secrets]` fields (the configured backend is selected by priority at
-# runtime). HashiCorp Vault authenticates via the pod's Kubernetes
-# ServiceAccount by default.
-[secrets]
-keyring_service = "did-hosting-daemon"
-# vault_addr = "https://vault.example.com:8200"   # --features vault-secrets
-# vault_secret_path = "webvh/daemon-secrets"
-# vault_k8s_role = "did-hosting-daemon"
-# k8s_secret_name = "did-hosting-daemon-secrets"  # --features k8s-secrets
-
-# Main store (server, watcher, control share this)
-[store]
-data_dir = "data/daemon/store"
-
-# Witness store (separate to avoid keyspace collisions)
-[witness_store]
-data_dir = "data/daemon/witness"
-
-# Which services to enable (all default to true except watcher)
-[enable]
-server = true
-witness = true
-watcher = false
-control = true
-```
-
-For self-managed mode (no VTA), set `[identity] mode = "self-managed"`
-and omit the `[vta]` section entirely. The daemon will mint its own
-Ed25519 + X25519 keys at first run, host its own `did:webvh`
-identifier on `public_url`, and seed an empty ACL — admin enrolment is
-done through `did-hosting-daemon invite --did <DID> --role admin` and the
-passkey enrolment flow. See [docs/self-managed-mode-spec.md](../docs/self-managed-mode-spec.md)
-for the full walkthrough.
-
-### Non-interactive setup (CI / scripted)
-
-`did-hosting-daemon setup --from <recipe.toml>` drives the wizard with no
-TTY. Recipe is declarative TOML; no secrets inside. Example:
+### 2. Set up
 
 ```bash
-# VTA-managed (after `--setup-key-out` enrolment elsewhere):
+did-hosting-daemon setup                       # interactive
+did-hosting-daemon setup --from examples/did-hosting-daemon-self-managed.toml
+                                               # self-managed: no VTA, runs as shipped
 did-hosting-daemon setup --from examples/did-hosting-daemon-build.toml \
-                   --setup-key-file setup.key
-
-# Self-managed (no VTA, no phase-1 needed):
-did-hosting-daemon setup --from examples/did-hosting-daemon-build.toml
-# → recipe has [deployment].vta_mode = "self-managed"
-
-# Air-gapped (no VTA network access from CI):
-did-hosting-daemon setup --from recipe.toml   # phase 1: writes request file
-# (operator ferries to VTA admin, gets sealed bundle back)
-did-hosting-daemon setup --from recipe.toml   # phase 2: opens sealed bundle
+                         --setup-key-file setup.key   # VTA-managed (online)
 ```
 
-Other flags: `--force-reprovision` rotates an existing install (backs
-up `config.toml` first), `did-hosting-daemon uninstall` tears down (clears
-managed secrets + removes config). See
-[docs/bootstrap_startup.md](../docs/bootstrap_startup.md#non-interactive-setup-recipe-driven)
-for the recipe schema and exit codes.
+A **self-managed** daemon (`[identity] mode = "self-managed"`) mints its own
+Ed25519 and X25519 keys, self-hosts its `did:webvh` at `public_url`, and
+needs no VTA. A **VTA-managed** daemon has its keys provisioned from a VTA
+context (online, or the two air-gapped phases `setup-offline-prepare` /
+`setup-offline-complete`). Recipes, exit codes and reprovisioning
+(`--force-reprovision`) are in
+[docs/bootstrap_startup.md](../docs/bootstrap_startup.md#non-interactive-setup-recipe-driven).
+
+Admit your first administrator with `did-hosting-daemon add-acl --did <DID>
+--role admin` (offline, before starting) or a passkey invite
+(`did-hosting-daemon invite --did <DID> --role admin`).
 
 ### 3. Start the daemon
 
@@ -141,226 +74,173 @@ for the recipe schema and exit codes.
 did-hosting-daemon --config config.toml
 ```
 
-The daemon starts all enabled services on a single port and logs which
-services are active. The control plane and `did-hosting-server` (public DID
-resolver) both merge at root; `webvh-witness` and `webvh-watcher` nest
-under their own prefixes:
+It logs which services are active:
 
 ```
 --- daemon services ---
   server (/)
   witness (/witness)
   control (/)
-daemon listening on 0.0.0.0:8534
 ```
 
 ## Configuration
 
-The daemon is configured via a TOML file. By default it looks
-for `config.toml` in the current directory. You can specify a
-different path with the `--config` flag or the
-`DAEMON_CONFIG_PATH` environment variable.
-
-### Shared vs Per-Service Settings
-
-Settings like `server_did`, `mediator_did`, `public_url`,
-`[auth]`, `[secrets]`, and `[log]` are shared across all
-services. Each service gets its own store directory to avoid
-keyspace name collisions (both server and witness use `sessions`
-and `acl` keyspaces).
-
-### Service-Specific Settings
-
-| Section          | Service | Description |
-| ---------------- | ------- | ----------- |
-| `[limits]`       | Server  | Upload body limit, per-account quotas |
-| `[vta]`          | Witness | VTA remote key management |
-| `[watcher_sync]` | Watcher | Push tokens and source servers |
-| `[registry]`     | Control | Service instance registry |
-
-> A default daemon has an empty registry and does not use the reverse proxy, so
-> no extra configuration is needed. **If** you populate `[[registry.instances]]`
-> (or accept `MSG_SERVER_REGISTER`) and proxy to remote instances, you must set
-> `registry.url_allowlist` — the proxy is fail-closed without it. See
-> "Reverse proxy & the registry allowlist" in the
-> [control plane README](../did-hosting-control/README.md).
-
-### Enable/Disable Services
-
-The `[enable]` section controls which services start:
+Every key and environment variable (prefix `DAEMON_`) is listed in
+[docs/configuration.md](../docs/configuration.md#daemon-only-did-hosting-daemon).
+The file is `config.toml` in the working directory unless `--config` or
+`DAEMON_CONFIG_PATH` names another; unknown keys and tables are refused at
+load. An outline:
 
 ```toml
+server_did = "did:webvh:<scid>:example.com"   # written by setup
+mediator_did = "did:webvh:mediator.example.com" # omit for HTTP-only
+public_url = "https://example.com"             # also the passkey origin
+
+[identity]
+mode = "self-managed"   # or "vta"
+
+[features]
+didcomm = true
+tsp = true
+
+[server]
+host = "0.0.0.0"
+port = 8534
+
+[secrets]
+keyring_service = "did-hosting-daemon"
+
+[store]                 # control plane, server and watcher
+data_dir = "data/daemon/store"
+
+[witness_store]         # the embedded witness; must be separate data
+data_dir = "data/daemon/witness"
+
 [enable]
-server = true    # DID hosting (default: true)
-witness = true   # Witness proofs (default: true)
-watcher = false  # DID mirror (default: false)
-control = true   # Management UI (default: true)
+server = true
+witness = true
+watcher = false
+control = true
 ```
 
-### Environment Variable Overrides
+The daemon reads the shared tables, the control plane's `[registry]`,
+`[geoip]`, `[stats_flush]` and `[stats]`, and its own `[witness_store]` and
+`[enable]`. It has no `[sync]`, `[replication]` or edge `[stats]` table:
+its services share one process. `[witness_store]` must reach different data
+from `[store]` (the witness keeps its own ACL there); the daemon refuses to
+start otherwise.
 
-Environment variables use the `DAEMON_` prefix:
+A default daemon's registry is empty. It *can* hold remote instances
+(`[[registry.instances]]`, or edges that register themselves), but the
+daemon does not run the registry health-check loop; use a standalone
+control plane to manage remote services.
 
-| Variable              | Description             |
-| --------------------- | ----------------------- |
-| `DAEMON_CONFIG_PATH`  | Path to config file     |
-| `DAEMON_SERVER_DID`   | Server DID identifier   |
-| `DAEMON_MEDIATOR_DID` | Mediator DID identifier |
-| `DAEMON_PUBLIC_URL`   | Public URL              |
-| `DAEMON_SERVER_HOST`  | Bind host               |
-| `DAEMON_SERVER_PORT`  | Bind port               |
-| `DAEMON_LOG_LEVEL`    | Log level               |
-| `DAEMON_SERVER_RESOLVE_CACHE_MAX_AGE_SECS` | DID-resolution `max-age` (0 = `no-cache`; default 300) |
-| `DAEMON_SERVER_RESOLVE_CACHE_SHARED_MAX_AGE_SECS` | DID-resolution `s-maxage` (empty clears) |
-| `DAEMON_SERVER_RESOLVE_CACHE_STALE_WHILE_REVALIDATE_SECS` | DID-resolution `stale-while-revalidate` (empty clears) |
-| `DAEMON_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW` | Resolution requests per client address per window (empty clears: no limit) |
-| `DAEMON_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS` | Resolution rate-limit window (default 10; empty restores it) |
-| `DAEMON_SERVER_TRUSTED_PROXIES` | Comma-separated proxy addresses or CIDR ranges whose `X-Forwarded-For` is trusted (empty clears) |
-| `DAEMON_STORE_*` | Main store backend (`_DATA_DIR`, `_REDIS_URL`, `_DYNAMODB_TABLE_PREFIX`, …; see `docs/bootstrap_startup.md`) |
-| `DAEMON_WITNESS_STORE_*` | The same settings for `[witness_store]` |
-| `DAEMON_SECRETS_*` | Secret backend (`_AWS_SECRET_NAME`, `_VAULT_ADDR`, …) |
-| `DAEMON_AUTH_*` | Session and challenge lifetimes (`_ACCESS_EXPIRY`, `_CHALLENGE_TTL`, …) |
-| `DAEMON_FEATURES_*` | Feature flags (`_DIDCOMM`, `_TSP`, `_REST_API`, `_AGENT_NAMES`) |
+## HTTP routes
 
-The same settings live in `[server.resolve_cache]` (`max_age_secs`,
-`shared_max_age_secs`, `stale_while_revalidate_secs`).
+One listener serves everything. The control plane and the server merge at
+the root; the witness and watcher nest under prefixes.
 
-| Variable | Description |
-| --- | --- |
-| `DAEMON_REPLAY_MAX_ENTRIES` | Replay cache records, all signers (default 1,000,000, about 32 MB) |
-| `DAEMON_REPLAY_MAX_ENTRIES_PER_SIGNER` | Replay cache records per signer (default 250,000, about 600 signed requests a second) |
+| Path | Source | Description |
+| --- | --- | --- |
+| `GET /health` | daemon | Daemon liveness: `200` while the daemon's own DID is served from its store, `503` (`"status": "degraded"`) otherwise — the control plane's `/api/health` check |
+| `GET /api/health` | control plane | Service health (checks the service's own DID resolves) |
+| `POST /api/trust-tasks` | control plane | Every management operation, as a signed Trust Task (the HTTPS binding) |
+| `GET /api/sign-in/readiness` | control plane | Whether the service DID lists the services wallet sign-in needs |
+| `POST /api/auth/challenge` | control plane | Sign-in challenge nonce for a browser with no key yet |
+| `GET /{mnemonic}/did.jsonl`, `/did-witness.json`, `/did.json` and the `/.well-known/…` forms | server | Public DID resolution |
+| `GET /@`, `/@{name}` | server | Agent-name redirects |
+| `POST /witness/api/trust-tasks` | witness | The witness's Trust Tasks (`webvh/witness/*`, `acl/*`) |
+| `GET /watcher/{mnemonic}/did.jsonl`, … | watcher | Resolution through the embedded watcher (`[enable] watcher = true`) |
+| anything else | control plane | The management UI (`ui` feature) |
 
-These live in `[replay]` and apply to each embedded service that accepts
-signed Trust Tasks: the control plane, the witness and the watcher. Each
-keeps its own cache with these bounds, so the daemon's worst case is up to
-three times `max_entries` records (about 96 MB at the defaults). The
-control plane's README explains the bounds ("Replay cache bounds").
+The embedded witness and watcher have **no health route of their own**
+(`/witness/api/health` and `/watcher/api/health` are not served); probe
+`/health` or `/api/health`. The embedded watcher serves resolution only: it
+has no DID and runs no listener, so nothing syncs into it. A watcher that
+mirrors control planes is a standalone `webvh-watcher`. A test
+(`documented_daemon_routes_are_served` in `tests/e2e_daemon.rs`) holds this
+table.
 
-| Variable | Description |
-| --- | --- |
-| `DAEMON_GEOIP_DATABASE` | Local GeoIP `.mmdb` file for wallet sign-in locations (empty clears) |
-| `DAEMON_STATS_FLUSH_MAX_ROWS_PER_SECOND` | Statistics rows the periodic flush writes a second, at most (default 20) |
-| `DAEMON_STATS_MODE` | Which DIDs keep 5-minute statistics: `auto` (busy ones, default), `fine` (all), `coarse` (none) |
-| `DAEMON_STATS_PROMOTE_PER_HOUR` | Resolves in an hour that promote a DID to 5-minute statistics (default 60) |
-| `DAEMON_STATS_DEMOTE_PER_HOUR` | Hourly resolves below which it is demoted (default 20) |
-| `DAEMON_STATS_MAX_FINE_DIDS` | Most DIDs promoted automatically (default 1,000) |
-
-`[geoip] database` reaches the embedded control plane, which answers wallet
-sign-in. See [`docs/geoip.md`](../docs/geoip.md). `[stats_flush]
-max_rows_per_second` bounds the statistics flush the storage task runs; the
-control plane's README explains it ("Statistics flush budget"). `[stats]`
-chooses which DIDs keep 5-minute statistics, and the storage task migrates
-legacy statistics at startup, as the control plane does; the `stats-show`,
-`stats-set` and `stats-purge-legacy` commands are the same. See
-[`docs/stats-tiers.md`](../docs/stats-tiers.md).
-
-The resolution limit lives in `[server.resolve_rate_limit]` (`max_per_window`,
-`window_secs`) and is off by default; the edge server's README explains it
-("Resolution rate limit"), including `server.trusted_proxies`, which must
-list the load balancer's addresses or subnets before the limit is turned on
-behind one.
-In the daemon one budget covers the server's resolution, the watcher's and
-the root fallback, which also serves the UI.
-
-## CLI Commands
+## CLI commands
 
 Every subcommand, with its full `--help`, is in
-[`docs/cli-reference.md`](../docs/cli-reference.md), generated from the CLI
-(a test keeps it current). Below is a summary. `health` exits non-zero when a
-check fails (`--strict`: also when one warns).
+[`docs/cli-reference.md`](../docs/cli-reference.md). `health` exits non-zero
+when a check fails (`--strict`: also when one warns).
 
 ```
-did-hosting-daemon                      # Run daemon (default)
-did-hosting-daemon setup                # Interactive config wizard
-did-hosting-daemon health               # Run health check diagnostics
-did-hosting-daemon add-acl              # Add ACL entry (--witness: to the embedded witness's ACL)
-did-hosting-daemon list-acl             # List ACL entries (--witness: the embedded witness's ACL)
-did-hosting-daemon reset-witness-kek-claim  # Clear a stuck witness key-encryption-key creation claim
-did-hosting-daemon remove-acl           # Remove ACL entry
-did-hosting-daemon invite               # Create passkey enrollment invite
-did-hosting-daemon list-dids            # List all DIDs in the store
-did-hosting-daemon remove-did           # Remove a DID from the store
-did-hosting-daemon load-did             # Load a DID from existing files
-did-hosting-daemon bootstrap-did        # Bootstrap a DID (defaults to .well-known)
-did-hosting-daemon recreate-did         # Recreate a DID at a given path
-did-hosting-daemon recover-did          # Recover a soft-deleted DID
-did-hosting-daemon import-secrets       # Import secrets from VTA bundle or keys
-did-hosting-daemon backup               # Export data to backup file
-did-hosting-daemon restore              # Restore data from backup file
+did-hosting-daemon                      # Run the daemon (default)
+did-hosting-daemon setup | uninstall | setup-offline-prepare | setup-offline-complete
+did-hosting-daemon health [--strict]
+did-hosting-daemon add-acl | list-acl | remove-acl   # --witness: the embedded witness's ACL (add/list)
+did-hosting-daemon invite               # Passkey enrolment invite
+did-hosting-daemon reset-witness-kek-claim
+did-hosting-daemon stats-show | stats-set | stats-purge-legacy
+did-hosting-daemon fetch-metrics --key <key.json>
+did-hosting-daemon send-trust-task --key <key.json> --type <task>
+did-hosting-daemon identity-list | identity-rotate-keys | identity-scid-alias | identity-retire-now
+did-hosting-daemon tsp-relationship-list | tsp-relationship-reset | tsp-relationship-delete
+did-hosting-daemon list-dids | dump-did | load-did | remove-did | recover-did | bootstrap-did | recreate-did
+did-hosting-daemon import-secrets | export-sealed | import-sealed
+did-hosting-daemon vta-request | vta-open
+did-hosting-daemon backup | restore
 ```
 
-## API Path Mapping
+Management of a running daemon beyond these is a Trust Task: through the
+console, or signed from the command line as
+[docs/sending-trust-tasks.md](../docs/sending-trust-tasks.md) describes.
 
-When all services are enabled, the daemon exposes endpoints
-at the following paths. `did-hosting-server` (the public-DID-resolver edge
-node) and `did-hosting-control` (the Trust Task listener + UI) both merge at
-root — the daemon is a unified front door rather than a multiplexer.
-Witness and watcher are nested under their own prefixes because their
-APIs are operator-facing and benefit from a clean URL boundary.
+### Backup and restore
 
-### Server + Control plane (root, merged)
+`did-hosting-daemon backup` writes its own format (`"format":
+"did-hosting-daemon"`, version 1), not the edge's: both stores (`main` and
+`witness`), with an explicit keyspace list for each — the DIDs, the ACLs,
+passkeys, identity generations, `did:scid` floors, the outbound queue and
+the witness identities — and the configuration file verbatim. Live sessions
+and TSP relationship state are left out (a test holds that every keyspace is
+either backed up or excluded with a reason). Private keys are not in it:
+back up the secrets backend too, including the witness key-encryption key's
+entry. See [docs/backup-and-upgrade.md](../docs/backup-and-upgrade.md).
 
-| Path | Description | Source |
-| ---- | ----------- | ------ |
-| `/api/health` | Combined health endpoint | server / control |
-| `/api/trust-tasks` | Every management operation, as a signed Trust Task (the HTTPS binding) | control plane |
-| `/api/sign-in/readiness` | Whether the service DID lists the services wallet sign-in needs (read by the login page) | control plane |
-| `/api/auth/challenge`, `/api/auth/`, `/api/auth/refresh` | Browser SIOPv2 sign-in and console session refresh | control plane |
-| `/{mnemonic}/did.jsonl` | Public DID resolution | server |
-| `/.well-known/did.jsonl` | Service-DID resolution | server |
-| `/`, `/assets/*` | Management UI (when `ui` feature enabled) | control plane |
+## What the daemon does not do
 
-### Witness (nested at `/witness`)
+These are deliberate (see the "did-hosting-daemon" section of
+[CLAUDE.md](../CLAUDE.md)):
 
-| Path | Description |
-| ---- | ----------- |
-| `/witness/api/health` | Witness health |
-| `/witness/api/trust-tasks` | The witness's Trust Tasks (`webvh/witness/*`, `acl/*`), HTTPS binding |
+- The embedded server runs no DIDComm/TSP listener; the control plane's
+  handles every inbound document.
+- No stats sync: statistics are shared in-process.
+- No registry health-check loop, and no self-registration anywhere.
 
-### Watcher (nested at `/watcher`)
+Identity rotation of the daemon's own DID is owned by its control plane.
 
-| Path | Description |
-| ---- | ----------- |
-| `/watcher/api/health` | Watcher health |
-| `/watcher/{mnemonic}/did.jsonl` | Mirrored public DID resolution |
+## Feature flags
 
-### Daemon
+| Feature | Default | Description |
+| --- | --- | --- |
+| `ui` | on | Embed the management UI |
+| `keyring` | on | OS keyring secrets backend |
+| `store-fjall` | on | Embedded fjall store |
+| `did-methods` | on | `did:webvh` + `did:web` resolution |
+| `method-webs` | off | `did:webs` publication and resolution (pulls the KERI stack) |
+| `aws-secrets`, `gcp-secrets`, `azure-secrets`, `vault-secrets`, `k8s-secrets` | off | Other secrets backends |
+| `store-redis`, `store-dynamodb`, `store-firestore`, `store-cosmosdb` | off | Other store backends (exactly one store backend) |
+| `metrics` | off | Process counters, read with `fetch-metrics` (see [docs/metrics.md](../docs/metrics.md)) |
 
-| Path | Description |
-| ---- | ----------- |
-| `/health` | Daemon liveness: `200` while the daemon's own DID is served from its store, `503` (`"status": "degraded"`) otherwise — the same check as the control plane's `/api/health` |
+Passkey/WebAuthn is always compiled in; it activates when `public_url` is
+set.
 
-## Graceful Shutdown
+## Graceful shutdown
 
-The daemon handles `SIGINT` (Ctrl+C) and `SIGTERM` for graceful
-shutdown, in stages, each given at most 30 seconds: the background
-workers (outbox, sweeps), then the messaging service, then HTTP (a
-connection still open at the deadline is dropped, so one stalled client
-cannot hold up a `SIGTERM`), then the storage task's last statistics
+The daemon handles `SIGINT` and `SIGTERM` in stages, each given at most 30
+seconds: the background workers (outbox, sweeps), then the messaging service,
+then HTTP (a connection still open at the deadline is dropped, so one stalled
+client cannot hold up a `SIGTERM`), then the storage task's last statistics
 flush and the store's persist, then the witness store's.
 
-A background task that stops on its own while the daemon is running is
-logged at `error`: a restartable one (the outbox, the sweeps) is
-restarted with backoff, and a critical one (the HTTP listener, the
-storage task) shuts the daemon down with a non-zero exit, so a
-supervisor or orchestrator restarts it.
-
-## Feature Flags
-
-Features propagate to the underlying service crates:
-
-| Feature | Description |
-| ------- | ----------- |
-| `ui` | Embed the management UI in did-hosting-control |
-| `keyring` | OS keyring secrets backend |
-| `store-fjall` | Fjall embedded storage backend |
-| `did-methods` | Enable did:webvh + did:web resolution (route + dispatcher) |
-
-Default features: `keyring`, `store-fjall`, `ui`, `did-methods`.
-
-Passkey/WebAuthn auth is always compiled in (via the embedded control
-plane) and is not a build feature. It activates at runtime when
-`public_url` is set; otherwise login uses DID challenge-response.
+A background task that stops on its own while the daemon runs is logged at
+`error`: a restartable one (the outbox, the sweeps) is restarted with backoff,
+and a critical one (the HTTP listener, the storage task) shuts the daemon down
+with a non-zero exit, so a supervisor or orchestrator restarts it.
 
 ## Support & feedback
 
@@ -368,25 +248,12 @@ If you face any issues or have suggestions, please don't
 hesitate to contact us using
 [this link](https://share.hsforms.com/1i-4HKZRXSsmENzXtPdIG4g8oa2v).
 
-### Reporting technical issues
-
-If you have a technical issue with the Affinidi DID Hosting Service
-codebase, you can also create an issue directly in GitHub.
-
-1. Ensure the bug was not already reported by searching on
-   GitHub under
-   [Issues](https://github.com/affinidi/did-hosting-service/issues).
-
-2. If you're unable to find an open issue addressing the
-   problem,
-   [open a new one](https://github.com/affinidi/did-hosting-service/issues/new).
-   Be sure to include a **title and clear description**, as
-   much relevant information as possible, and a **code sample**
-   or an **executable test case** demonstrating the expected
-   behaviour that is not occurring.
+If you have a technical issue with the codebase, search the
+[issues](https://github.com/affinidi/affinidi-webvh-service/issues) and, if
+it is not there,
+[open a new one](https://github.com/affinidi/affinidi-webvh-service/issues/new)
+with a clear description and, ideally, a failing test.
 
 ## Contributing
 
-Want to contribute? Head over to our
-[CONTRIBUTING](https://github.com/affinidi/did-hosting-service/blob/main/CONTRIBUTING.md)
-guidelines.
+See [CONTRIBUTING.md](../CONTRIBUTING.md).

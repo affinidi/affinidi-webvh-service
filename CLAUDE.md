@@ -365,32 +365,47 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
 
 This service's primary client is the VTA's `webvh_client`
 (verifiable-trust-infrastructure) — its DID publish/update/delete lifecycle
-depends on this server's exact wire behavior. Before changing any route,
-validation rule, or response shape, read the ecosystem doc set in
-`../design-docs/`:
+depends on this server's exact wire behavior. Before changing any Trust Task
+payload, validation rule, or response shape, read the ecosystem doc set in
+`../design-docs/`. That is an internal Affinidi document set for the wider
+trust-infrastructure stack, checked out beside this repository by maintainers
+and not published (CONTRIBUTING.md says so for outside contributors); the
+rules below are the ones that bind this repository, restated so they stand on
+their own:
 
 - **`vti-stack-development-guide.md`** — binding rules (R-numbers below);
   paste its pre-merge checklist into PRs.
 - **`vti-networking-remediation-plan.md`** — deliverable **D4** covers the
-  VTA↔webvh boundary; two of its findings need server-side changes here.
+  VTA↔webvh boundary.
 - **`vti-architectural-direction.md`** — design-level rationale.
+
+The human-readable architecture and trust model is `docs/architecture.md`; keep
+it in step when you change a rule here.
 
 Rules that bite hardest here:
 
-- **R3.6 — the request contract includes what you *ignore*.** The VTA sends
-  `?domain=` on publish/delete as a cross-tenant safety check and documents a
-  `did-management:unknown_domain` rejection — but the handlers here have no
-  `Query` extractor, so axum silently drops it and the advertised protection
-  doesn't exist on the wire. Either enforce a parameter or coordinate its
-  removal; never silently accept-and-ignore.
-- **Validation rules are contract too:** `validate_mnemonic`'s lowercase-only
-  rule rejects every mixed-case base58 SCID, which (combined with the
-  slot-reservation requirement) makes the VTA's final-mode create impossible.
+- **The request contract includes what you *ignore* (R3.2; R3.6: find every
+  consumer before changing a contract).** Worked example, now resolved: the VTA
+  sends the domain it intends as a cross-tenant safety check and documents a
+  `did-management:unknown_domain` rejection. When management was REST, the
+  handlers had no `Query` extractor, so the parameter was silently dropped and
+  the protection did not exist on the wire. Today the domain is a Trust Task
+  payload field, and the control plane enforces it: `did/register` checks it
+  against the DID's host (`did_ops::ensure_requested_domain_matches_did`) and
+  `did/list` refuses an unknown one, both as `unknown_domain`. Keep it that
+  way for any new safety field: enforce it, or coordinate its removal with the
+  VTA; never accept-and-ignore.
+- **Validation rules are contract too:** `validate_mnemonic` is still
+  lowercase-only (`server::mnemonic`). As of 2026-11 that means a VTA cannot
+  pick a slot path that is a mixed-case base58 SCID; whether the VTA's
+  final-mode create still depends on doing so has to be checked against
+  `webvh_client` in verifiable-trust-infrastructure, not assumed from here.
   Changing or relying on validation behavior requires checking the VTA-side
   callers in the same pass.
 - **R3.2 — reject unknown fields on state-changing bodies** rather than
   ignoring them; a field a client sends and the server drops is a latent
-  cross-tenant or authorization bug.
+  cross-tenant or authorization bug. The generated Trust Task payloads are
+  `deny_unknown_fields`, and so are the config structs.
 
 ## Node DID transport model — the document is authoritative
 

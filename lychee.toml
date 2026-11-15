@@ -1,0 +1,15 @@
+# lychee — the `docs` CI job's link check. Offline: relative links between
+# files in this repository, and their #fragments, only; no network.
+#
+#   lychee --no-progress './**/*.md'
+offline = true
+include_fragments = "anchor-only"
+
+# Build output and dependencies, and CHANGELOG.md, which only the release
+# tooling may edit (RELEASES.md) and so cannot be fixed in an ordinary PR.
+exclude_path = [
+  "(^|/)target/",
+  "(^|/)node_modules/",
+  "(^|/)\\.claude/",
+  "(^|/)CHANGELOG\\.md$",
+]

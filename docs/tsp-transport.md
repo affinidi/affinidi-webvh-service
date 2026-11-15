@@ -1,5 +1,7 @@
 # TSP transport
 
+> **Status:** current
+
 The DID Hosting service speaks two mediator-routed transports:
 **DIDComm v2** and **TSP** (the ToIP [Trust Spanning
 Protocol](https://trustoverip.org/)). Both carry the same Trust-Task
@@ -30,20 +32,31 @@ frame, authenticates the sender VID, and routes it to
 
 ## The preference rule — "when a DID has a TSPTransport, use that"
 
-A `did:webvh` document minted by the VTA advertises, in this order:
+A node's DID document is the source of truth for how to reach it. Every
+setup path mints it through `build_webvh_provision_ask`
+(`did-hosting-common/src/server/vta_setup.rs`), and a node with a mediator
+advertises its messaging transports only — **no `WebVHHosting` service**:
 
 ```json
 "service": [
-  { "id": "…#webvh-hosting", "type": "WebVHHosting",     … },
   { "id": "…#tsp",           "type": "TSPTransport",      "serviceEndpoint": "<mediator-vid>" },
   { "id": "…#vta-didcomm",   "type": "DIDCommMessaging",  … }
 ]
 ```
 
-`didcomm_profile::resolve_transport` reads a peer's document and returns
-its preferred transport: it scans for `TSPTransport` **first**, falling
-back to `DIDCommMessaging`. TSP-capable peers therefore reach each other
-over TSP; DIDComm remains the fallback for peers that advertise only it.
+(`[identity].transport` picks `tsp`, `didcomm` or both; a self-managed
+daemon can also add `TrustTaskHTTPS`.) Only a node with **no** mediator
+advertises `WebVHHosting`, because it has no messaging transport to offer
+instead.
+
+`didcomm_profile::resolve_send_binding` reads a peer's document and picks
+the binding for an outbound Trust Task in this order: `TSPTransport`, then
+`DIDCommMessaging`, then `TrustTaskHTTPS` (the same Trust Task `POST`ed to
+the peer's `{endpoint}/trust-tasks`, subject to the peer-endpoint egress
+policy). If the document advertises none of them, the node's own configured
+mediator is the fallback (TSP or DIDComm only — a document-silent peer is
+never guessed to speak HTTPS); if nothing yields a binding the send fails
+as unroutable. TSP-capable peers therefore reach each other over TSP.
 
 ## Configuration
 
@@ -51,13 +64,13 @@ over TSP; DIDComm remains the fallback for peers that advertise only it.
 toggles the TSP *listener*. It **tracks `features.didcomm` by default**:
 whenever a mediator is configured, TSP is enabled alongside DIDComm.
 
-This default is deliberate. The VTA webvh DID templates advertise a
-`TSPTransport` service **unconditionally** alongside `DIDCommMessaging`
-(both point at the same mediator), and peers prefer TSP — so a
-mediator-connected node must listen on TSP to be reachable consistently.
-The interactive daemon wizard offers an opt-out, but note that opting the
-*listener* out does not remove the advertised service (that is fixed by
-the VTA template), so leaving TSP on is recommended.
+This default is deliberate. With `[identity].transport = "both"` (the
+default) the node's DID advertises `TSPTransport` alongside
+`DIDCommMessaging` (both point at the same mediator), and peers prefer
+TSP — so a mediator-connected node must listen on TSP to be reachable
+consistently. Turning the *listener* off does not remove a service the DID
+document already advertises; change the advertised transports at setup
+(`transport = "didcomm"`) rather than only the listener.
 
 Nodes with no mediator (HTTP-only) speak neither DIDComm nor TSP over the
 mediator; they serve DID resolution and the HTTPS Trust-Task endpoint
@@ -80,14 +93,13 @@ they disagree, because each direction is a distinct fault:
   will never use it;
 - *advertised but not enabled* — peers try it and get nothing. This is
   exactly the state the Configuration note above describes when the
-  wizard's TSP opt-out is taken against a template that advertises
-  `TSPTransport` regardless, and is why leaving TSP on is recommended.
+  listener is turned off for a DID that still advertises `TSPTransport`.
 
 When the control plane's own DID cannot be resolved (or no DID resolver is
 configured) the comparison is impossible; the UI reports "unknown" rather
-than implying agreement. `GET /api/config` and `GET /api/services/overview`
-omit `advertisedServices` entirely in that case — an absent field means
-"not known", never "advertises nothing".
+than implying agreement. The `server/config` and `registry/list` Trust Task
+replies omit `advertisedServices` entirely in that case — an absent field
+means "not known", never "advertises nothing".
 
 Elsewhere the same `service[].type` values render as badges — `Hosting`
 (`WebVHHosting`), `TSP`, `DIDComm`, and `Other` for anything else:
@@ -126,11 +138,14 @@ correct reading: that node is reachable over HTTP only.
 
 ## Control ↔ server infrastructure ops
 
-Server registration, health, and stats sync are **trust tasks**, so the binding is chosen
-from the peer's DID document rather than hard-coded.
+Server registration, health, stats sync, DID sync and domain ops are all
+**signed Trust Tasks**, so the binding is chosen from the peer's DID document
+rather than hard-coded, and each one is authorised on its own proof, never on
+the transport that carried it.
 
-The `MSG_*` constants in `didcomm_types` are already canonical Trust-Task Type
-URIs, with the reply being the `#response` fragment of the request:
+The `MSG_*` constants in `didcomm_types` are canonical Trust-Task Type URIs
+(checked against the generated `Payload::TYPE_URI`), with the reply being the
+`#response` fragment of the request:
 
 ```text
 MSG_SERVER_REGISTER       …/spec/did-management/server/register/0.2
@@ -141,31 +156,35 @@ MSG_STATS_SYNC            …/spec/did-management/server/stats-sync/0.1
 MSG_STATS_ACK             …/spec/did-management/server/stats-sync/0.1#response
 ```
 
-They are reused verbatim as document Type URIs, so an op has **one identity** on
-every wire: as a DIDComm `typ`, inside a trust-task envelope, or as a raw TSP
-frame. `TrustTask::respond_with` derives the reply URI instead of restating it.
-
-> The unused `TASK_SERVER_HEALTH_PING_1_0` / `_PONG_1_0` constants in
-> `did_hosting_tasks` are **not** these. They sit on a `/did-hosting/` authority
-> with no `/spec/` segment, so they do not parse as Type URIs at all, and they
-> model the response as a separate URI rather than a fragment. They are
-> route-header decorators for the HTTPS surface. Do not promote them into the
-> document layer.
+An op therefore has **one identity** on every wire: inside a DIDComm
+trust-task envelope, as a raw TSP frame, or in an HTTPS body.
+`TrustTask::respond_with` derives the reply URI instead of restating it.
 
 Outbound goes through `trust_tasks::send::send_trust_task`, the one place that
-answers "how do I reach this peer": TSP when the peer advertises `TSPTransport`
-(the document's JSON, sealed), otherwise the document inside a
-`trust_tasks_didcomm::ENVELOPE_TYPE` DIDComm message. A TSP send that fails falls
-back to DIDComm, and the function returns the transport that *actually* carried
-the document. Inbound, both shapes converge on `trust_tasks_infra::dispatch` —
-one on the control plane, its mirror on the server. Replies are *returned*, not
-sent, so the framework routes them back over the arriving connection: a ping
-delivered over TSP is ponged over TSP, with no second resolution.
+answers "how do I reach this peer" (`resolve_send_binding`, above): TSP when the
+peer advertises `TSPTransport` (the document's JSON, sealed), the document
+inside a `trust_tasks_didcomm::ENVELOPE_TYPE` DIDComm message for
+`DIDCommMessaging`, or an HTTPS `POST` for `TrustTaskHTTPS`, whose reply is
+verified synchronously. The function returns the transport that *actually*
+carried the document. Every outbound privileged document is signed at send
+time (`build_signed_request`), so a retry is never refused as stale or as a
+replay. Replies to inbound documents are *returned*, not sent, so the framework
+routes them back over the arriving connection: a ping delivered over TSP is
+ponged over TSP, with no second resolution.
 
-This is what makes a **TSP-only server** work. Before it, the server had no
-trust-task dispatcher at all, registration and health lived only on the DIDComm
-router, and a node with `TSPTransport` and DIDComm disabled could never register
-or pong — it sat in the dashboard as `Unreachable` forever.
+- **Registration.** An edge always registers with a signed
+  `server/register/0.2` document (its own hints ride under `ext`, in the
+  `com.affinidi.did-hosting` namespace, because the payload is closed). The
+  control plane admits it only when the document is signed by the edge's DID
+  and that DID holds the `service` role in its ACL. The bare-message form it
+  replaced carried no proof and is no longer routed.
+- **Stats sync.** An edge sends its periodic deltas as a signed
+  `server/stats-sync/0.1` Trust Task over whatever its control plane's DID
+  document advertises. (In the daemon, stats are shared in process; nothing is
+  sent.)
+- **DID sync and domain ops** (control → edge, and control → watcher) are
+  queued in the control plane's transactional outbox and delivered as signed
+  Trust Tasks; see [Scope](#scope).
 
 ### Seeing which transport a server is actually using
 
@@ -194,77 +213,42 @@ A server with `trustTaskCapable: false` is always pinged over DIDComm no matter
 what it advertises; the card says so rather than leaving the operator to wonder
 why a TSP-advertising node never shows TSP.
 
-### Two compatibility rules that look like warts
+### Infrastructure payloads
 
-**The server's TSP handler sniffs the payload.** A trust-task document is tried
-first, then a serialised DIDComm `Message` (the shape the control plane's outbox
-has always used for sync/domain pushes over TSP). The two are unambiguous, but
-not for the obvious reason — a `Message` also has top-level `id` and `type`, and
-its `type` is itself a canonical Type URI. What separates them is `payload`,
-which `TrustTask` requires and `Message` lacks. `didcomm_message_never_parses_as_a_trust_task`
-pins that; were it to stop holding, the `owns()` gate would silently swallow
-every sync push delivered over TSP.
-
-**Registration's framing follows its transport.** A TSP-only server has no
-DIDComm wire on which to send the legacy `MSG_SERVER_REGISTER`, so over TSP it
-registers as a trust task. A DIDComm-reachable server keeps sending the legacy
-message, because an *older* control plane has no `trust_tasks_infra` arm and
-would route a register trust task into `bridge_did_management` — which has never
-heard of `server/register` — leaving the server silently unregistered. Once every
-control plane in a fleet understands the task, this collapses to
-`send_trust_task` unconditionally; `trust-task-discovery/0.1` is the principled
-way to detect that, and is deliberately not attempted yet.
-
-**Stats sync follows the same rule.** A server whose control plane advertises
-`TSPTransport` sends its periodic deltas as a `server/stats-sync/0.1` trust task
-(and the ack comes back the same way); otherwise it sends the legacy
-`MSG_STATS_SYNC`. Advertising TSP is taken as the signal, which is the same bet
-registration makes and carries the same caveat: a control plane that advertises
-TSP but predates the `stats-sync` arm drops the document unrouted, and those
-deltas are lost. **Upgrade the control plane before its servers.** Before this,
-stats were the one periodic exchange still hard-coded to DIDComm, so a
-TSP-configured pair showed a DIDComm round-trip every `stats.sync_interval_secs`.
-
-Both payloads follow the pinned specifications (#449): a sync is `instanceId` +
-`perMnemonic`, its `seq` and latest-event times under `ext.vnd.affinidi.webvh`;
-a ping names the `instanceId` it probes and the pong answers `instanceId`, `ok`,
-`observedAt`, with the edge's version and DID count under the same namespace.
-`did_hosting_common::server::trust_tasks::infra` builds and reads them for both
-ends. A 0.12 control plane still reads the pre-0.12 sync and pong; a pre-0.12
-control plane refuses the new ones, so here too: **upgrade the control plane
-before its servers.**
-
-Servers declare `trust_task_capable: true` in their registration body, under
-`ext` in the `com.affinidi.did-hosting` namespace (`server/register/0.2` is a
-closed payload). The
-control plane records it on `ServiceInstance` and only then sends trust-task
-pings; everything else keeps receiving `MSG_HEALTH_PING`. Absent flag → `false`,
-so upgrading the control plane first never strands a server. Both legacy `MSG_*`
-routes stay registered on both sides and delegate to the same cores as the
-trust-task dispatchers, so the two framings cannot drift.
+Both payloads follow the pinned specifications (#449): a stats sync is
+`instanceId` + `perMnemonic`, its `seq` and latest-event times under
+`ext.vnd.affinidi.webvh`; a health ping names the `instanceId` it probes and the
+pong answers `instanceId`, `ok`, `observedAt`, with the edge's version and DID
+count under the same namespace. `did_hosting_common::server::trust_tasks::infra`
+builds and reads them for both ends. A 0.12 control plane still reads the
+pre-0.12 sync and pong; a pre-0.12 control plane refuses the new ones, so
+**upgrade the control plane before its servers.**
 
 ## Unified dispatch
 
-Both TSP and the DIDComm trust-task envelope route inbound
-`TrustTask<Value>` documents through one shared entry point,
-`messaging::dispatch_trust_task_doc`, which dispatches by Type URI:
+All three transports — HTTPS `POST /api/trust-tasks`, the DIDComm trust-task
+envelope and TSP — open their own binding, establish their own authenticated
+sender, and then hand the document to one entry point,
+`messaging::dispatch_trust_task_doc` (`did-hosting-control/src/messaging.rs`).
+What a document *means* is decided once; the source-level test
+`did-hosting-control/tests/one_inbound_router.rs` fails if a transport grows a
+router of its own.
 
-- **ACL + discovery** ops → the typed framework §7.2 pipeline
-  (`dispatch_inbound`).
-- **DID-management** ops (`did/check-name`, `publish`, `register`,
-  `delete`, `change-owner`, `info`, `list`, `witness/publish`) →
-  `bridge_did_management`, which reuses the transport-agnostic
-  `dispatch_did_op` engine and wraps its reply as a Trust Task
-  `#response` document.
+That entry point runs the proof gate (each row's `ProofRule`) and routes by
+Type URI to:
 
-So **every op is a first-class trust task over TSP and DIDComm** — the
-DID-management ops are reachable as trust-task documents, not only via the
-legacy `MSG_*` messages (which keep working for back-compat).
+- the control plane's Trust Task table, `control_tasks!`
+  (`did-hosting-control/src/control_tasks/mod.rs`) — DID slots, agent names,
+  domains, the registry, identity, stats and the sign-in families;
+- the ACL and discovery family (`did_hosting_common::server::trust_tasks`,
+  the typed SPEC §7.2 pipeline);
+- the infrastructure family (`trust_tasks_infra`) — registration, health,
+  stats sync, and the edges' acknowledgements.
 
-`dispatch_did_op` remains the DID-management engine behind this facade:
-those ops are bound to the control plane's `AppState` and can't move into
-the crate-agnostic framework dispatcher without lifting `AppState` behind
-a context abstraction — a larger refactor with no behavioural change.
+HTTPS differs only in how a refusal is reported (an HTTP status as well as the
+error document) and in being the one transport where a bearer session can add
+context; it is the same dispatch. The full list of tasks, with the proof each
+requires, is the [Trust Task catalogue](trust-tasks.md).
 
 ## Clearing relationship state
 
@@ -291,23 +275,26 @@ recovery re-invites.
 
 - **Inbound request/response over TSP**: fully supported — the handler's
   reply is sealed and routed back automatically.
-- **HTTPS `POST /api/trust-tasks`**: keeps its own dispatch (it maps
-  rejections to HTTP status codes, which the value-returning shared router
-  would flatten). DID-management over HTTPS remains available via
-  `POST /api/didcomm`.
-- **Proactive outbound push over TSP** (control→server sync/domain
-  updates): supported. The control `outbox` prefers TSP when the target
-  server advertises a `TSPTransport` service (`resolve_transport`),
-  serialising the DIDComm `Message` and sending it via `send_tsp`; the
-  server's `ServerTspHandler` deserialises it and applies it through the
-  same `do_*` cores the DIDComm listener uses. Delivery is fire-and-forget
-  (the outbox treats a successful send as delivery), so no ack is routed
-  back over TSP. Falls back to DIDComm for servers that advertise only it.
-- **Step-up authentication is HTTPS-only, by design.** Step-up
-  (`auth/step-up/vta/finish`) elevates a *web session's* assurance level
-  (aal1 → aal2) and binds the wallet's proof to that session via the
-  session id + the JWT-bound session pubkey. TSP has no session and no
-  JWT — every TSP message is independently VID-authenticated — so there is
-  nothing to "step up". If a future op that is gated on `aal2` must be
-  reachable over TSP, define a TSP-native assurance model at that point
-  rather than shoehorning the session-based one onto it.
+- **HTTPS `POST /api/trust-tasks`**: the same dispatch as TSP and DIDComm
+  (see [Unified dispatch](#unified-dispatch)); every management operation is
+  reachable over all three.
+- **Proactive outbound push** (control → edge and control → watcher sync and
+  domain ops): supported over every binding. The control plane's outbox
+  (`did-hosting-control/src/outbox.rs`) stages each push in the same store
+  batch as the mutation, sends it as a freshly signed Trust Task over the
+  binding the target's DID document selects, and removes the row only when
+  the **target itself** acknowledges it with a signed `#response`. A
+  mediator accepting the frame is not delivery. Hard failures retry with
+  exponential backoff (2 s doubling to 5 min, up to 50 attempts); a send the
+  transport accepted but nobody acknowledged is re-sent on a wait that
+  doubles from 1 min to 1 h (up to 24 sends). A row older than 7 days is
+  dropped, and the edge's next registration resyncs whatever it missed.
+  Recipients are idempotent, and each target's rows are delivered in order.
+- **Step-up authentication is a session concept.** `auth/step-up/start` and
+  the approver's `auth/step-up/approve-response` raise a *browser session's*
+  assurance level (aal1 → aal2). A document sent over TSP or DIDComm carries
+  no session — it is authorised by its own proof — so there is nothing to
+  step up, and the destructive tasks that require an aal2 session over HTTPS
+  are not gated that way when a signer's own key sends them. If an op ever
+  needs a second factor over messaging, define a messaging-native assurance
+  model then rather than shoehorning the session one onto it.

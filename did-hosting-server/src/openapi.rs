@@ -11,8 +11,62 @@
 
 use utoipa::OpenApi;
 
-use crate::routes::resolve_webvh;
 use crate::routes::{did_public, health, trust_tasks};
+use crate::routes::{resolve_agent_name, resolve_web, resolve_webvh};
+
+/// Paths the edge serves through its DID-serving fallback
+/// (`did_public::serve_public`) or a second route onto a documented handler.
+/// Each is a real path of the router; utoipa needs one function per path, so
+/// these document them without being handlers.
+mod fallback_paths {
+    /// `GET /{mnemonic}/did-witness.json`.
+    #[utoipa::path(
+        get,
+        path = "/{mnemonic}/did-witness.json",
+        tag = "resolve",
+        params(("mnemonic" = String, Path, description = "Slot path of a hosted did:webvh")),
+        responses(
+            (status = 200, description = "The slot's did:webvh witness proofs", content_type = "application/json"),
+            (status = 404, description = "No DID, or no witness file, hosted at this path"),
+            (status = 429, description = "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`", content_type = "application/json"),
+        ),
+    )]
+    #[allow(dead_code)]
+    pub fn did_witness() {}
+
+    /// `GET /{mnemonic}/did.json`.
+    #[utoipa::path(
+        get,
+        path = "/{mnemonic}/did.json",
+        tag = "resolve",
+        params(("mnemonic" = String, Path, description = "Slot path of a hosted DID")),
+        responses(
+            (status = 200, description = "The slot's did:web document (a did:web record, or the did:web form of a did:webvh)", content_type = "application/did+json"),
+            (status = 404, description = "No DID hosted at this path"),
+            (status = 429, description = "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`", content_type = "application/json"),
+        ),
+    )]
+    #[allow(dead_code)]
+    pub fn did_json() {}
+
+    /// `GET /@{name}/{context}` — the agent-name redirect with a context tail.
+    #[utoipa::path(
+        get,
+        path = "/@{name}/{context}",
+        tag = "resolve",
+        params(
+            ("name" = String, Path, description = "An agent name bound to a hosted DID"),
+            ("context" = String, Path, description = "Any further path; accepted and ignored for the redirect target"),
+        ),
+        responses(
+            (status = 302, description = "Redirect; `Location` is the DID the name is bound to"),
+            (status = 404, description = "No such name, or `features.agent_names` is off"),
+            (status = 429, description = "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`", content_type = "application/json"),
+        ),
+    )]
+    #[allow(dead_code)]
+    pub fn agent_name_context() {}
+}
 
 #[derive(OpenApi)]
 #[openapi(
@@ -30,6 +84,13 @@ use crate::routes::{did_public, health, trust_tasks};
         health::health,
         did_public::serve_public,
         resolve_webvh::serve_root_did_log,
+        resolve_webvh::serve_root_witness,
+        resolve_web::serve_root_did_web,
+        resolve_agent_name::serve_community,
+        resolve_agent_name::serve,
+        fallback_paths::did_witness,
+        fallback_paths::did_json,
+        fallback_paths::agent_name_context,
     ),
     tags(
         (name = "trust-tasks", description = "The HTTPS binding of the Trust Task listener"),

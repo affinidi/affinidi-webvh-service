@@ -1,6 +1,7 @@
 # Spec: Multi-Domain Hosting
 
-Status: Draft — awaiting review
+> **Status:** historical — shipped in 0.7.0. Current behaviour: [architecture](../architecture.md), [configuration](../configuration.md).
+
 Scope: All workspace crates (`did-hosting-common`, `did-hosting-server`, `did-hosting-control`, `did-hosting-daemon`, `did-hosting-ui`, plus the method-specific `webvh-witness` and `webvh-watcher`)
 Author: glenn.gore@gmail.com
 Bundled work: This release atomically delivers **multi-domain hosting** and the **Trust Tasks transport** (ToIP DTGWG canonical spec, per `https://trusttasks.org/`). The two ship as one tagged version. They are sequenced internally for development purposes (see §6) but tagged together.

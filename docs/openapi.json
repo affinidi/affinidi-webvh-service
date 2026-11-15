@@ -13,6 +13,58 @@
     "version": "0.12.0"
   },
   "paths": {
+    "/.well-known/did-witness.json": {
+      "get": {
+        "tags": [
+          "resolve"
+        ],
+        "summary": "`GET /.well-known/did-witness.json` — root-DID witness.",
+        "operationId": "serve_root_witness",
+        "responses": {
+          "200": {
+            "description": "Root DID's did:webvh witness proofs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "No root DID, or no witness file, hosted on this domain"
+          },
+          "429": {
+            "description": "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`",
+            "content": {
+              "application/json": {}
+            }
+          }
+        }
+      }
+    },
+    "/.well-known/did.json": {
+      "get": {
+        "tags": [
+          "resolve"
+        ],
+        "summary": "`GET /.well-known/did.json` — root-DID did:web document.",
+        "operationId": "serve_root_did_web",
+        "responses": {
+          "200": {
+            "description": "Root DID's did:web document (for a did:webvh root, its did:web form)",
+            "content": {
+              "application/did+json": {}
+            }
+          },
+          "404": {
+            "description": "No root DID hosted on this domain"
+          },
+          "429": {
+            "description": "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`",
+            "content": {
+              "application/json": {}
+            }
+          }
+        }
+      }
+    },
     "/.well-known/did.jsonl": {
       "get": {
         "tags": [
@@ -32,6 +84,108 @@
           },
           "404": {
             "description": "No root DID hosted on this domain"
+          },
+          "429": {
+            "description": "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`",
+            "content": {
+              "application/json": {}
+            }
+          }
+        }
+      }
+    },
+    "/@": {
+      "get": {
+        "tags": [
+          "resolve"
+        ],
+        "summary": "`GET /@` — the community name.",
+        "description": "The FAQ gives a name with an empty local part to the verifiable trust\ncommunity that owns the domain, and in this service the domain's own\nidentity is its root DID. So this resolves through exactly the same index\nas every other name: nothing special-cases the root slot here, because\n`validate_agent_name_binding` has already made `.well-known` the only\nmnemonic the empty name can be bound to.\n\nNeeds a separate handler only because a path parameter cannot capture an\nempty segment — `/@` never matches `/@{name}`.",
+        "operationId": "serve_community",
+        "responses": {
+          "302": {
+            "description": "Redirect; `Location` is the domain's root DID (the community name)"
+          },
+          "404": {
+            "description": "No community name bound, or `features.agent_names` is off"
+          },
+          "429": {
+            "description": "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`",
+            "content": {
+              "application/json": {}
+            }
+          }
+        }
+      }
+    },
+    "/@{name}": {
+      "get": {
+        "tags": [
+          "resolve"
+        ],
+        "summary": "`GET /@{name}` and `GET /@{name}/{*context}`.",
+        "description": "The optional `context` tail (`/@alice/h2hsummit`) is accepted and ignored\nfor the redirect target — it is the FAQ's context-path affordance, carried\nthrough for the caller's benefit, not part of the name's identity.",
+        "operationId": "serve",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "An agent name bound to a hosted DID (claimed in its `alsoKnownAs`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect; `Location` is the DID the name is bound to"
+          },
+          "404": {
+            "description": "No such name, or `features.agent_names` is off"
+          },
+          "429": {
+            "description": "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`",
+            "content": {
+              "application/json": {}
+            }
+          }
+        }
+      }
+    },
+    "/@{name}/{context}": {
+      "get": {
+        "tags": [
+          "resolve"
+        ],
+        "summary": "`GET /@{name}/{context}` — the agent-name redirect with a context tail.",
+        "operationId": "agent_name_context",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "An agent name bound to a hosted DID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "context",
+            "in": "path",
+            "description": "Any further path; accepted and ignored for the redirect target",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect; `Location` is the DID the name is bound to"
+          },
+          "404": {
+            "description": "No such name, or `features.agent_names` is off"
           },
           "429": {
             "description": "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`",
@@ -114,6 +268,80 @@
           },
           "503": {
             "description": "The document could not be checked just now; send it again after `Retry-After`. Empty body"
+          }
+        }
+      }
+    },
+    "/{mnemonic}/did-witness.json": {
+      "get": {
+        "tags": [
+          "resolve"
+        ],
+        "summary": "`GET /{mnemonic}/did-witness.json`.",
+        "operationId": "did_witness",
+        "parameters": [
+          {
+            "name": "mnemonic",
+            "in": "path",
+            "description": "Slot path of a hosted did:webvh",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The slot's did:webvh witness proofs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "No DID, or no witness file, hosted at this path"
+          },
+          "429": {
+            "description": "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`",
+            "content": {
+              "application/json": {}
+            }
+          }
+        }
+      }
+    },
+    "/{mnemonic}/did.json": {
+      "get": {
+        "tags": [
+          "resolve"
+        ],
+        "summary": "`GET /{mnemonic}/did.json`.",
+        "operationId": "did_json",
+        "parameters": [
+          {
+            "name": "mnemonic",
+            "in": "path",
+            "description": "Slot path of a hosted DID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The slot's did:web document (a did:web record, or the did:web form of a did:webvh)",
+            "content": {
+              "application/did+json": {}
+            }
+          },
+          "404": {
+            "description": "No DID hosted at this path"
+          },
+          "429": {
+            "description": "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`",
+            "content": {
+              "application/json": {}
+            }
           }
         }
       }

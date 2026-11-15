@@ -44,6 +44,17 @@ use crate::server::AppState;
 /// The optional `context` tail (`/@alice/h2hsummit`) is accepted and ignored
 /// for the redirect target — it is the FAQ's context-path affordance, carried
 /// through for the caller's benefit, not part of the name's identity.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/@{name}",
+    tag = "resolve",
+    params(("name" = String, Path, description = "An agent name bound to a hosted DID (claimed in its `alsoKnownAs`)")),
+    responses(
+        (status = 302, description = "Redirect; `Location` is the DID the name is bound to"),
+        (status = 404, description = "No such name, or `features.agent_names` is off"),
+        (status = 429, description = "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`", content_type = "application/json"),
+    ),
+))]
 pub async fn serve(
     State(state): State<AppState>,
     Path(params): Path<AgentNamePath>,
@@ -78,6 +89,16 @@ pub async fn serve(
 ///
 /// Needs a separate handler only because a path parameter cannot capture an
 /// empty segment — `/@` never matches `/@{name}`.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/@",
+    tag = "resolve",
+    responses(
+        (status = 302, description = "Redirect; `Location` is the domain's root DID (the community name)"),
+        (status = 404, description = "No community name bound, or `features.agent_names` is off"),
+        (status = 429, description = "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`", content_type = "application/json"),
+    ),
+))]
 pub async fn serve_community(State(state): State<AppState>, parts: Parts) -> Response {
     match resolve(&state, "", &parts).await {
         Ok(response) => response,

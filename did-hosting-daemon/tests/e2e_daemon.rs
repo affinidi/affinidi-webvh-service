@@ -726,3 +726,173 @@ async fn every_daemon_surface_carries_the_response_headers() {
 
     daemon.teardown().await;
 }
+
+/// The paths the daemon's README and `docs/configuration.md` document are the
+/// paths it serves: the daemon's own `/health` and the control plane's
+/// `/api/health`, `/api/sign-in/readiness`, `/api/auth/challenge` and
+/// `/api/trust-tasks` at the root; public resolution (`.well-known`, the
+/// agent-name namespace) at the root; the embedded witness's listener under
+/// `/witness` and the embedded watcher's resolution under `/watcher`. The
+/// nested witness and watcher have no health route of their own — the
+/// standalone binaries add `/api/health` themselves — so neither
+/// `/witness/api/health` nor `/watcher/api/health` answers as one.
+#[tokio::test]
+async fn documented_daemon_routes_are_served() {
+    let daemon = Daemon::spawn_with(&[], &[], true).await;
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let url = |path: &str| format!("{}{path}", daemon.base_url);
+
+    let health: serde_json::Value = http
+        .get(url("/health"))
+        .send()
+        .await
+        .expect("GET /health")
+        .json()
+        .await
+        .expect("/health is JSON");
+    assert_eq!(health["service"], "did-hosting-daemon");
+
+    for path in [
+        "/api/health",
+        "/api/sign-in/readiness",
+        "/.well-known/did.jsonl",
+    ] {
+        let resp = http.get(url(path)).send().await.expect("GET the daemon");
+        assert!(resp.status().is_success(), "{path}: {}", resp.status());
+    }
+
+    // The embedded watcher's resolution answers under `/watcher` (an unknown
+    // slot is its 404, not the console).
+    assert_eq!(
+        http.get(url("/watcher/ghost/did.jsonl"))
+            .send()
+            .await
+            .expect("GET the watcher")
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    // The did:web route is the resolver's, not the console's fallback,
+    // whatever it makes of a loopback root DID.
+    let resp = http
+        .get(url("/.well-known/did.json"))
+        .send()
+        .await
+        .expect("GET the daemon");
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !content_type.starts_with("text/html"),
+        "/.well-known/did.json fell through to the console"
+    );
+
+    // Routed, whatever they make of an empty body.
+    for path in [
+        "/api/trust-tasks",
+        "/api/auth/challenge",
+        "/witness/api/trust-tasks",
+    ] {
+        let status = http
+            .post(url(path))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("POST the daemon")
+            .status();
+        assert_ne!(status, reqwest::StatusCode::NOT_FOUND, "{path}");
+        assert_ne!(status, reqwest::StatusCode::METHOD_NOT_ALLOWED, "{path}");
+    }
+
+    // The agent-name namespace is served (no names are bound, so 404 — from
+    // the redirect handler, not the console's fallback).
+    for path in ["/@", "/@nobody"] {
+        let resp = http.get(url(path)).send().await.expect("GET a name");
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+    }
+
+    // No nested health routes.
+    for path in ["/witness/api/health", "/watcher/api/health"] {
+        let resp = http.get(url(path)).send().await.expect("GET the daemon");
+        let is_json = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("application/json"));
+        assert!(
+            !(resp.status().is_success() && is_json),
+            "{path} answered as a health route"
+        );
+    }
+
+    daemon.teardown().await;
+}
+
+/// `send-trust-task` with an admin key: signs `identity/list/0.1`, verifies the
+/// daemon's signed reply, and prints the response payload as JSON (exit 0).
+/// The same key sending a type this workspace does not speak is refused
+/// before anything is sent.
+#[tokio::test]
+async fn send_trust_task_lists_identity_generations() {
+    let key_dir = tempfile::tempdir().expect("key temp dir");
+    let key_path = key_dir.path().join("admin-key.json");
+    let key = EphemeralSetupKey::generate().expect("generate an admin did:key");
+    let admin_did = key.did.clone();
+    key.persist_to(&key_path).expect("persist the admin key");
+
+    let daemon =
+        Daemon::spawn_with_acl(&[(admin_did, did_hosting_common::server::acl::Role::Admin)]).await;
+    let bin = env!("CARGO_BIN_EXE_did-hosting-daemon");
+
+    let out = tokio::process::Command::new(bin)
+        .args(["send-trust-task", "--config"])
+        .arg(&daemon.config_path)
+        .arg("--key")
+        .arg(&key_path)
+        .args(["--type", "identity/list/0.1"])
+        .output()
+        .await
+        .expect("run did-hosting-daemon send-trust-task");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "an admin key must be answered. stdout={stdout:?} stderr={stderr:?}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("output is not JSON: {e}; stdout={stdout:?}"));
+    let generations = parsed["generations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no generations array: {parsed}"));
+    assert_eq!(
+        generations
+            .iter()
+            .filter(|g| g["current"].as_bool() == Some(true))
+            .count(),
+        1,
+        "exactly one current generation: {parsed}"
+    );
+
+    let unknown = tokio::process::Command::new(bin)
+        .args(["send-trust-task", "--config"])
+        .arg(&daemon.config_path)
+        .arg("--key")
+        .arg(&key_path)
+        .args(["--type", "identity/list/9.9"])
+        .output()
+        .await
+        .expect("run did-hosting-daemon send-trust-task");
+    assert!(
+        !unknown.status.success(),
+        "an unknown version must be refused"
+    );
+
+    daemon.teardown().await;
+}

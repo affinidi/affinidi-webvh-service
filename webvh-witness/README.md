@@ -17,7 +17,8 @@ DID document was observed at a specific point in time.
 
 ### Prerequisites
 
-- Rust 1.94.0+ (2024 Edition)
+- Rust: the workspace MSRV is `rust-version` in the root
+  [`Cargo.toml`](../Cargo.toml) (2024 edition).
 
 ### 1. Build
 
@@ -38,19 +39,12 @@ For non-interactive runs see
 [docs/bootstrap_startup.md](../docs/bootstrap_startup.md#non-interactive-setup-recipe-driven)
 and the example recipe at `examples/webvh-witness-build.toml`.
 
-The interactive wizard walks you through configuration:
-
-- **VTA credential** — authenticates with the witness's VTA
-  context and creates the witness DID automatically
-- **Features** — enable DIDComm messaging and/or REST API
-- **DID hosting** — URL and path where did-hosting-server will host
-  the witness DID
-- **Host / port** — listen address (default: `0.0.0.0:8531`)
-- **Log level / format** — logging configuration
-- **Data directory** — persistent storage path
-- **Secrets backend** — where to store private key material
-- **Admin bootstrap** — enter an existing DID or generate a
-  new `did:key` identity
+The interactive wizard asks how to reach the VTA (online, or the two
+air-gapped phases), the features to enable (DIDComm messaging, and the HTTP
+listener for Trust Tasks over HTTPS and `/api/health`), where the witness's
+own DID will be hosted (URL and path), the listen address (default
+`0.0.0.0:8531`), logging, the data directory, the secrets backend, and an
+initial admin ACL entry.
 
 ### 3. Start the witness
 
@@ -60,10 +54,11 @@ webvh-witness --config config.toml
 
 ## Configuration
 
-The witness is configured via a TOML file. By default it looks
-for `config.toml` in the current directory. You can specify a
-different path with the `--config` flag or the
-`WITNESS_CONFIG_PATH` environment variable.
+The witness is configured via a TOML file: `config.toml` in the working
+directory unless `--config` or `WITNESS_CONFIG_PATH` names another. Every key
+and variable is in [docs/configuration.md](../docs/configuration.md); unknown
+keys and tables are refused at load. The witness holds no sessions, so it has
+no `[auth]` table.
 
 ### Example `config.toml`
 
@@ -88,11 +83,6 @@ format = "text"
 [store]
 data_dir = "data/webvh-witness"
 
-[auth]
-access_token_expiry = 900
-refresh_token_expiry = 86400
-challenge_ttl = 300
-
 [secrets]
 keyring_service = "webvh-witness"
 
@@ -103,28 +93,13 @@ keyring_service = "webvh-witness"
 # context_id = "witness-context"
 ```
 
-### Environment Variable Overrides
+### Environment variable overrides
 
-Environment variables use the `WITNESS_` prefix:
-
-| Variable                    | Description               |
-| --------------------------- | ------------------------- |
-| `WITNESS_CONFIG_PATH`       | Path to config file       |
-| `WITNESS_SERVER_DID`        | Witness DID identifier    |
-| `WITNESS_MEDIATOR_DID`      | Mediator DID identifier   |
-| `WITNESS_SERVER_HOST`       | Bind host                 |
-| `WITNESS_SERVER_PORT`       | Bind port                 |
-| `WITNESS_LOG_LEVEL`         | Log level                 |
-| `WITNESS_SERVER_TRUSTED_PROXIES` | Comma-separated proxy addresses or CIDR ranges whose `X-Forwarded-For` is trusted |
-| `WITNESS_VTA_URL`           | VTA REST URL              |
-| `WITNESS_VTA_DID`           | VTA DID                   |
-| `WITNESS_VTA_CONTEXT_ID`    | VTA context ID            |
-| `WITNESS_REPLAY_MAX_ENTRIES` | Replay cache records, all signers (default 1,000,000, about 32 MB) |
-| `WITNESS_REPLAY_MAX_ENTRIES_PER_SIGNER` | Replay cache records per signer (default 250,000, about 600 signed requests a second) |
-
-The replay settings live in `[replay]` (`max_entries`,
-`max_entries_per_signer`). The per-signer bound caps how fast one caller, such as a VTA, can have
-entries witnessed (about 600 a second at the default). The control plane's README explains the
+Every setting has a `WITNESS_`-prefixed variable (`WITNESS_SERVER_PORT`,
+`WITNESS_STORE_DATA_DIR`, `WITNESS_REPLAY_MAX_ENTRIES`, …); the full list is
+in [docs/configuration.md](../docs/configuration.md). The per-signer replay
+bound caps how fast one caller, such as a VTA, can have entries witnessed
+(about 600 a second at the default); the control plane's README explains the
 bounds ("Replay cache bounds").
 
 ### Connection limits and a reverse proxy
@@ -282,7 +257,9 @@ purpose, not addressed to this witness, stale, or a replay — gets no reply
 from a DID the witness does not authorise is refused with a signed
 `permissionDenied`. Every other reply is signed by the witness.
 
-`GET /api/health` stays a plain, unauthenticated liveness probe.
+`GET /api/health` stays a plain, unauthenticated liveness probe. It is
+added by the standalone binary; the daemon's embedded witness has no health
+route of its own (probe the daemon's `/health`).
 
 ## Library Usage
 
@@ -309,11 +286,11 @@ codebase, you can also create an issue directly in GitHub.
 
 1. Ensure the bug was not already reported by searching on
    GitHub under
-   [Issues](https://github.com/affinidi/did-hosting-service/issues).
+   [Issues](https://github.com/affinidi/affinidi-webvh-service/issues).
 
 2. If you're unable to find an open issue addressing the
    problem,
-   [open a new one](https://github.com/affinidi/did-hosting-service/issues/new).
+   [open a new one](https://github.com/affinidi/affinidi-webvh-service/issues/new).
    Be sure to include a **title and clear description**, as
    much relevant information as possible, and a **code sample**
    or an **executable test case** demonstrating the expected
@@ -322,5 +299,4 @@ codebase, you can also create an issue directly in GitHub.
 ## Contributing
 
 Want to contribute? Head over to our
-[CONTRIBUTING](https://github.com/affinidi/did-hosting-service/blob/main/CONTRIBUTING.md)
-guidelines.
+[CONTRIBUTING](../CONTRIBUTING.md) guidelines.

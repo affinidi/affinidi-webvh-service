@@ -94,6 +94,16 @@ async fn serve_did_web(lookup: &Lookup<'_>, mnemonic: &str) -> Result<Response, 
 }
 
 /// `GET /.well-known/did.json` — root-DID did:web document.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/.well-known/did.json",
+    tag = "resolve",
+    responses(
+        (status = 200, description = "Root DID's did:web document (for a did:webvh root, its did:web form)", content_type = "application/did+json"),
+        (status = 404, description = "No root DID hosted on this domain"),
+        (status = 429, description = "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`", content_type = "application/json"),
+    ),
+))]
 pub async fn serve_root_did_web(
     State(state): State<AppState>,
     request: Request,

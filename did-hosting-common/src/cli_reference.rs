@@ -21,6 +21,7 @@ use std::path::Path;
 pub const UPDATE_VAR: &str = "UPDATE_CLI_REFERENCE";
 
 const HEADER: &str = "# CLI reference\n\n\
+> **Status:** current — generated from each binary's clap definition.\n\n\
 <!-- Generated from each binary's clap definition. Do not edit by hand: run\n     \
 `UPDATE_CLI_REFERENCE=1 cargo test -p <crate> --bin <binary> cli_reference`\n     \
 (see did-hosting-common/src/cli_reference.rs). -->\n\n\

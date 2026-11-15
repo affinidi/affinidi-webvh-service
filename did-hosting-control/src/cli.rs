@@ -252,6 +252,36 @@ pub enum AdminCommand {
         #[arg(long)]
         url: Option<String>,
     },
+    /// Send one signed Trust Task to the running service and print the
+    /// response payload as JSON.
+    ///
+    /// Every management operation is a Trust Task (docs/trust-tasks.md lists
+    /// them). Signs the request with the `--key` did:key, POSTs it to the
+    /// running service's `POST /api/trust-tasks`, verifies the reply is the
+    /// service's own signed response, and prints its payload. The key is
+    /// authorised like any other client: by its proof and its ACL entry (add it
+    /// with `add-acl`). A refusal is reported as an error with its code.
+    SendTrustTask {
+        /// Path to the signer's did:key JSON file — same format
+        /// `setup --setup-key-out` writes.
+        #[arg(long)]
+        key: PathBuf,
+        /// The task: a full Type URI, or `<slug>/<version>` such as
+        /// `identity/list/0.1` or `did-management/registry/list/0.2`.
+        #[arg(long = "type", value_name = "TYPE")]
+        task_type: String,
+        /// The request payload as JSON (default `{}`).
+        #[arg(long, conflicts_with = "payload_file")]
+        payload: Option<String>,
+        /// Read the request payload from a JSON file.
+        #[arg(long)]
+        payload_file: Option<PathBuf>,
+        /// Base URL of the running service. Defaults to
+        /// `http://<server.host>:<server.port>` from config (a wildcard bind is
+        /// dialled as loopback).
+        #[arg(long)]
+        url: Option<String>,
+    },
 }
 
 impl AdminCommand {
@@ -304,6 +334,28 @@ impl AdminCommand {
                     url,
                     &config.server().host,
                     config.server().port,
+                )
+                .await
+            }
+            Self::SendTrustTask {
+                key,
+                task_type,
+                payload,
+                payload_file,
+                url,
+            } => {
+                let to = config.server_did().ok_or(
+                    "server_did is not configured; this service has not completed provisioning",
+                )?;
+                did_hosting_common::server::cli_trust_task::run_send_trust_task(
+                    to,
+                    key.as_path(),
+                    url,
+                    &config.server().host,
+                    config.server().port,
+                    &task_type,
+                    payload.as_deref(),
+                    payload_file.as_deref(),
                 )
                 .await
             }

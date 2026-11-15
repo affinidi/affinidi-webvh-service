@@ -65,3 +65,39 @@ fn witness_example_parses() {
 fn watcher_example_parses() {
     load_example("webvh-watcher-build.toml", ServiceKind::Watcher);
 }
+
+#[test]
+fn daemon_self_managed_example_parses() {
+    load_example("did-hosting-daemon-self-managed.toml", ServiceKind::Daemon);
+    let recipe =
+        load_recipe(&examples_dir().join("did-hosting-daemon-self-managed.toml")).expect("loads");
+    assert_eq!(
+        recipe.deployment.vta_mode,
+        did_hosting_common::server::setup_recipe::VtaMode::SelfManaged,
+        "the self-managed example must not need a VTA"
+    );
+}
+
+/// Every `*.toml` in `examples/` is a recipe the docs tell operators to run,
+/// so each one must have a test above. A new example without one fails here.
+#[test]
+fn every_example_is_covered() {
+    let covered = [
+        "did-hosting-daemon-build.toml",
+        "did-hosting-daemon-self-managed.toml",
+        "did-hosting-server-build.toml",
+        "did-hosting-control-build.toml",
+        "webvh-witness-build.toml",
+        "webvh-watcher-build.toml",
+    ];
+    for entry in std::fs::read_dir(examples_dir()).expect("examples dir") {
+        let name = entry.expect("dir entry").file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".toml") {
+            assert!(
+                covered.contains(&name.as_ref()),
+                "examples/{name} has no parse + validate test in recipe_examples.rs"
+            );
+        }
+    }
+}
