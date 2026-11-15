@@ -33,12 +33,12 @@ use crate::method::{method_by_name, parse_did_method};
 /// — operators get the active-domain set via the admin list anyway.
 pub async fn assert_host_is_active_domain(store: &Store, host: &str) -> Result<(), AppError> {
     let entry = get_domain(store, host).await?.ok_or_else(|| {
-        AppError::Validation(format!(
+        AppError::invalid(format!(
             "did host '{host}' is not a configured domain on this server"
         ))
     })?;
     if !entry.status.is_active() {
-        return Err(AppError::Validation(format!(
+        return Err(AppError::invalid(format!(
             "did host '{host}' is configured but disabled"
         )));
     }
@@ -97,15 +97,15 @@ pub fn assert_acl_allows_host(acl_entry: &AclEntry, host: &str) -> Result<(), Ap
 ///   set).
 pub fn extract_did_host(did: &str) -> Result<String, AppError> {
     let method_name = parse_did_method(did)
-        .map_err(|e| AppError::Validation(format!("malformed DID identifier '{did}': {e}")))?;
+        .map_err(|e| AppError::invalid(format!("malformed DID identifier '{did}': {e}")))?;
     let method = method_by_name(method_name).ok_or_else(|| {
-        AppError::Validation(format!(
+        AppError::invalid(format!(
             "DID method '{method_name}' is not supported by this server"
         ))
     })?;
-    let parsed = method.parse_identifier(did).map_err(|e| {
-        AppError::Validation(format!("could not parse DID identifier '{did}': {e}"))
-    })?;
+    let parsed = method
+        .parse_identifier(did)
+        .map_err(|e| AppError::invalid(format!("could not parse DID identifier '{did}': {e}")))?;
     // Percent-decode the host authority (`localhost%3A8534` → `localhost:8534`).
     // Fall back to the raw segment on malformed escapes — see doc comment.
     Ok(percent_decode_to_string(&parsed.domain).unwrap_or(parsed.domain))
@@ -499,7 +499,7 @@ mod tests {
         // set, which is what it used to do with `did:webs`.
         let err =
             extract_did_host("did:example:scid:example.com:user1").expect_err("unknown method");
-        assert!(matches!(err, AppError::Validation(_)));
+        assert!(matches!(err, AppError::Validation { .. }));
     }
 
     /// The host of a `did:webs` identifier is its first label — the AID
@@ -535,7 +535,7 @@ mod tests {
             "did:webs:hosting.example.com:ENro7uf0ePmiK3jdTo2YCdXLqW7z7xoP6qhhBou6gBLe",
         )
         .expect_err("webs is not compiled in");
-        assert!(matches!(err, AppError::Validation(_)));
+        assert!(matches!(err, AppError::Validation { .. }));
     }
 
     #[test]
@@ -554,7 +554,7 @@ mod tests {
     fn extract_host_malformed_rejects() {
         for bad in ["not-a-did", "did:", "did::body", "did:webvh:onlyone"] {
             let err = extract_did_host(bad).expect_err(bad);
-            assert!(matches!(err, AppError::Validation(_)));
+            assert!(matches!(err, AppError::Validation { .. }));
         }
     }
 
@@ -566,7 +566,7 @@ mod tests {
         let err = assert_host_is_active_domain(&store, "missing.example")
             .await
             .expect_err("must reject missing domain");
-        assert!(matches!(err, AppError::Validation(_)));
+        assert!(matches!(err, AppError::Validation { .. }));
         assert!(err.to_string().contains("not a configured domain"));
     }
 
@@ -579,7 +579,7 @@ mod tests {
         let err = assert_host_is_active_domain(&store, "disabled.example")
             .await
             .expect_err("must reject disabled");
-        assert!(matches!(err, AppError::Validation(_)));
+        assert!(matches!(err, AppError::Validation { .. }));
         assert!(err.to_string().contains("disabled"));
     }
 
@@ -898,7 +898,7 @@ mod tests {
         let err = assert_did_host_allowed(&store, &e, did)
             .await
             .expect_err("must reject");
-        assert!(matches!(err, AppError::Validation(_)));
+        assert!(matches!(err, AppError::Validation { .. }));
     }
 
     #[tokio::test]
@@ -938,6 +938,6 @@ mod tests {
         let err = assert_did_host_allowed(&store, &e, did)
             .await
             .expect_err("disabled rejects");
-        assert!(matches!(err, AppError::Validation(_)));
+        assert!(matches!(err, AppError::Validation { .. }));
     }
 }

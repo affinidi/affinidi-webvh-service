@@ -190,7 +190,7 @@ fn verify_webvh(
             && scid(text).as_deref() == Some(held.as_str())
         {
             crate::did_ops::verify_log_extends(Some(&existing), text)
-                .map_err(MethodError::Validation)?;
+                .map_err(|e| MethodError::Validation(e.to_string()))?;
         }
     }
 

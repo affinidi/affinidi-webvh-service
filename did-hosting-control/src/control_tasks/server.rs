@@ -264,7 +264,7 @@ pub(crate) async fn stats_set_resolution(
         .unwrap_or_default();
     let resolution: StatsResolution = wire
         .parse()
-        .map_err(|_| AppError::Validation(format!("unknown resolution `{wire}`")))?;
+        .map_err(|_| AppError::invalid(format!("unknown resolution `{wire}`")))?;
 
     // Ownership is settled above, so a refusal here is an owner asking for
     // `fine`: `permissionDenied`.

@@ -308,7 +308,7 @@ mod tests {
         let err = seed_domains_first_boot(&store, &["Example.com".to_string()], None)
             .await
             .expect_err("non-canonical must reject");
-        assert!(matches!(err, AppError::Validation(_)));
+        assert!(matches!(err, AppError::Validation { .. }));
     }
 
     #[tokio::test]

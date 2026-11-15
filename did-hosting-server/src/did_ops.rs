@@ -21,7 +21,7 @@ pub use did_hosting_common::did_ops::{
 
 /// Validate that every line in the JSONL body is a well-formed did:webvh log entry.
 pub fn validate_did_jsonl(content: &str) -> Result<(), AppError> {
-    did_hosting_common::did_ops::validate_did_jsonl(content).map_err(AppError::Validation)
+    did_hosting_common::did_ops::validate_did_jsonl(content).map_err(AppError::invalid)
 }
 
 // ---------------------------------------------------------------------------

@@ -191,11 +191,14 @@ impl SelfCertifiedWebs {
                 max = self.max_registrations,
                 "did:webs self-registration refused: the domain holds its maximum"
             );
-            return Err(AppError::QuotaExceeded(format!(
-                "domain `{}` already holds its {} self-registered did:webs identifiers \
+            return Err(AppError::quota(
+                did_hosting_common::server::error::QuotaKind::Count,
+                format!(
+                    "domain `{}` already holds its {} self-registered did:webs identifiers \
                  (`max_registrations`); an administrator registers this one, or raises the limit",
-                self.domain, self.max_registrations
-            )));
+                    self.domain, self.max_registrations
+                ),
+            ));
         }
         Ok(guard)
     }

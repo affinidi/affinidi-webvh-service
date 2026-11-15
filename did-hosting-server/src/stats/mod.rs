@@ -37,7 +37,6 @@ pub async fn sync_to_control_messaging(
     use did_hosting_common::server::trust_tasks::send::{
         Peers, build_signed_request, send_trust_task,
     };
-    use serde_json::json;
 
     // Resolve the signer before draining, so a node that cannot sign keeps
     // its deltas for a later tick instead of discarding them.
@@ -68,24 +67,21 @@ pub async fn sync_to_control_messaging(
 
     let seq = SYNC_SEQ.fetch_add(1, Ordering::Relaxed);
 
-    let did_deltas: Vec<_> = deltas
-        .iter()
-        .map(|d| {
-            json!({
-                "mnemonic": d.mnemonic,
-                "resolve_delta": d.resolve_delta,
-                "update_delta": d.update_delta,
-                "last_resolved_at": d.last_resolved_at,
-                "last_updated_at": d.last_updated_at,
+    let body = serde_json::to_value(did_hosting_common::StatsSyncRequest {
+        server_did: Some(server_did.to_string()),
+        seq,
+        did_deltas: deltas
+            .iter()
+            .map(|d| did_hosting_common::StatsSyncRequestDelta {
+                mnemonic: d.mnemonic.clone(),
+                resolve_delta: d.resolve_delta,
+                update_delta: d.update_delta,
+                last_resolved_at: d.last_resolved_at,
+                last_updated_at: d.last_updated_at,
             })
-        })
-        .collect();
-
-    let body = json!({
-        "server_did": server_did,
-        "seq": seq,
-        "did_deltas": did_deltas,
-    });
+            .collect(),
+    })
+    .expect("a stats-sync payload serialises");
 
     let fallback = TransportFallback::from_config(
         state.config.mediator_did.as_deref(),

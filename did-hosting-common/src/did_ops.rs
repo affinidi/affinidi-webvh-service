@@ -285,7 +285,7 @@ pub fn validate_did_jsonl(content: &str) -> Result<(), String> {
 /// pre-rotation key authorisation, and post-deactivation tamper
 /// detection are all enforced. Witness proofs are NOT validated here
 /// (they're optional and uploaded separately via
-/// `MSG_WITNESS_PUBLISH`); use `assert_complete()` if you need to
+/// `webvh/witness/publish/0.1`); use `assert_complete()` if you need to
 /// reject any partial-chain truncation.
 ///
 /// Returns the structural-validation message verbatim on parse-time
@@ -859,6 +859,22 @@ pub fn verify_log_for_witnessing(
     })
 }
 
+/// Why [`verify_log_extends`] refused a log: a typed reason, so a caller
+/// picks its wire code without reading the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LogExtendError {
+    /// The log is shorter than the one held, or diverges from it: a rollback
+    /// or a fork.
+    #[error(
+        "did.jsonl is not an extension of the hosted log ({held} entries held, {received} \
+         received, or the shared history differs); refusing a rollback or fork"
+    )]
+    HistoryRewrite { held: usize, received: usize },
+    /// The held log already deactivated the DID, and this one appends to it.
+    #[error("the hosted DID is deactivated; refusing entries appended after deactivation")]
+    Deactivated,
+}
+
 /// Check that `next` is an acceptable successor of the `did.jsonl` a host
 /// already holds (`previous`), independent of who sent it.
 ///
@@ -876,7 +892,7 @@ pub fn verify_log_for_witnessing(
 /// Resending the identical log is accepted (idempotent sync). This is a
 /// history check only; pair it with [`verify_did_log_proofs`] for the chain's
 /// own validity.
-pub fn verify_log_extends(previous: Option<&str>, next: &str) -> Result<(), String> {
+pub fn verify_log_extends(previous: Option<&str>, next: &str) -> Result<(), LogExtendError> {
     let Some(previous) = previous else {
         return Ok(());
     };
@@ -890,12 +906,10 @@ pub fn verify_log_extends(previous: Option<&str>, next: &str) -> Result<(), Stri
     let old = entries(previous);
     let new = entries(next);
     if new.len() < old.len() || new[..old.len()] != old[..] {
-        return Err(format!(
-            "did.jsonl is not an extension of the hosted log ({} entries held, {} received, \
-             or the shared history differs); refusing a rollback or fork",
-            old.len(),
-            new.len()
-        ));
+        return Err(LogExtendError::HistoryRewrite {
+            held: old.len(),
+            received: new.len(),
+        });
     }
     let deactivated = old.iter().any(|line| {
         serde_json::from_str::<serde_json::Value>(line)
@@ -904,9 +918,7 @@ pub fn verify_log_extends(previous: Option<&str>, next: &str) -> Result<(), Stri
             .unwrap_or(false)
     });
     if deactivated && new.len() != old.len() {
-        return Err(
-            "the hosted DID is deactivated; refusing entries appended after deactivation".into(),
-        );
+        return Err(LogExtendError::Deactivated);
     }
     Ok(())
 }
@@ -1460,7 +1472,7 @@ mod agent_name_tests {
 
 #[cfg(test)]
 mod log_extension_tests {
-    use super::verify_log_extends;
+    use super::{LogExtendError, verify_log_extends};
 
     const V1: &str = r#"{"versionId":"1-a","parameters":{}}"#;
     const V2: &str = r#"{"versionId":"2-b","parameters":{}}"#;
@@ -1486,13 +1498,21 @@ mod log_extension_tests {
     #[test]
     fn a_shorter_log_is_a_rollback() {
         let err = verify_log_extends(Some(&log(&[V1, V2])), &log(&[V1])).unwrap_err();
-        assert!(err.contains("rollback"), "{err}");
+        assert!(matches!(
+            err,
+            LogExtendError::HistoryRewrite {
+                held: 2,
+                received: 1
+            }
+        ));
+        assert!(err.to_string().contains("rollback"), "{err}");
     }
 
     #[test]
     fn a_diverging_log_is_a_fork() {
         let err = verify_log_extends(Some(&log(&[V1, V2])), &log(&[V1, V2_FORK, V3])).unwrap_err();
-        assert!(err.contains("fork"), "{err}");
+        assert!(matches!(err, LogExtendError::HistoryRewrite { .. }));
+        assert!(err.to_string().contains("fork"), "{err}");
     }
 
     #[test]
@@ -1500,9 +1520,12 @@ mod log_extension_tests {
         let held = log(&[V1, V2_DEACT]);
         verify_log_extends(Some(&held), &held).unwrap();
         let err = verify_log_extends(Some(&held), &log(&[V1, V2_DEACT, V3])).unwrap_err();
-        assert!(err.contains("deactivated"), "{err}");
+        assert_eq!(err, LogExtendError::Deactivated);
         // Replacing the deactivating entry is a fork, and refused as one.
-        assert!(verify_log_extends(Some(&held), &log(&[V1, V2, V3])).is_err());
+        assert!(matches!(
+            verify_log_extends(Some(&held), &log(&[V1, V2, V3])),
+            Err(LogExtendError::HistoryRewrite { .. })
+        ));
     }
 }
 
