@@ -1,21 +1,14 @@
 import { useEffect, useState } from "react";
-import {
-  View,
-  Text,
-  StyleSheet,
-  ActivityIndicator,
-  Pressable,
-  TextInput,
-} from "react-native";
+import { View, Text, StyleSheet, ActivityIndicator } from "react-native";
 import { useRouter, useLocalSearchParams } from "expo-router";
 import { AffinidiLogo } from "../components/AffinidiLogo";
+import { Button } from "../components/Button";
+import { Field } from "../components/Field";
+import { Heading } from "../components/Heading";
 import { readPageParam, setNoReferrer, stripPageParam } from "../lib/address-bar";
 import type { RedeemFinishResponse, RedeemStartResponse } from "../lib/api";
-import {
-  completeRedemption,
-  describePurpose,
-  startRedemption,
-} from "../lib/enrol-flow";
+import { completeRedemption, describePurpose, startRedemption } from "../lib/enrol-flow";
+import { errorMessage } from "../lib/errors";
 import { createPasskeyCredential, getPasskeyCredential } from "../lib/passkey";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 
@@ -48,17 +41,15 @@ export default function Enroll() {
   const [label, setLabel] = useState("");
   const [state, setState] = useState<EnrollState>({ phase: "code" });
 
-  const message = (e: unknown, fallback: string) =>
-    e instanceof Error && e.message ? e.message : fallback;
-
   const handleCheck = async () => {
+    if (!claimCode.trim() || state.phase === "checking") return;
     setState({ phase: "checking" });
     try {
       const start = await startRedemption(token ?? "", claimCode);
       if (start.deviceLabel) setLabel(start.deviceLabel);
       setState({ phase: "confirm", start });
-    } catch (e) {
-      setState({ phase: "code", error: message(e, "The invite could not be checked.") });
+    } catch (e: unknown) {
+      setState({ phase: "code", error: errorMessage(e, "The invite could not be checked.") });
     }
   };
 
@@ -71,11 +62,11 @@ export default function Enroll() {
         label,
       );
       setState({ phase: "success", done });
-    } catch (e) {
+    } catch (e: unknown) {
       setState({
         phase: "confirm",
         start,
-        error: message(e, "The passkey could not be registered."),
+        error: errorMessage(e, "The passkey could not be registered."),
       });
     }
   };
@@ -87,8 +78,8 @@ export default function Enroll() {
 
         {!token && (
           <>
-            <Text style={styles.title}>Enrollment Failed</Text>
-            <Text style={[styles.hint, { color: colors.error }]}>
+            <Heading style={styles.title}>Enrollment Failed</Heading>
+            <Text role="alert" style={[styles.hint, styles.error]}>
               This link has no invite token. Open the link you were sent.
             </Text>
           </>
@@ -96,42 +87,37 @@ export default function Enroll() {
 
         {token && (state.phase === "code" || state.phase === "checking") && (
           <>
-            <Text style={styles.title}>Register a Passkey</Text>
+            <Heading style={styles.title}>Register a Passkey</Heading>
             <Text style={styles.hint}>
               Enter the claim code you were sent separately from this link.
             </Text>
-            <TextInput
-              style={styles.input}
+            <Field
+              label="Claim code"
               placeholder="XXXX-XXXX-XXXX"
-              placeholderTextColor={colors.textTertiary}
               value={claimCode}
               onChangeText={setClaimCode}
+              onSubmit={handleCheck}
               autoCapitalize="characters"
               autoComplete="off"
               autoCorrect={false}
               editable={state.phase === "code"}
+              error={state.phase === "code" ? state.error : undefined}
+              style={styles.field}
             />
-            {state.phase === "code" && state.error && (
-              <Text style={[styles.hint, { color: colors.error }]}>{state.error}</Text>
-            )}
-            <Pressable
-              style={[
-                styles.button,
-                (!claimCode.trim() || state.phase === "checking") && styles.disabled,
-              ]}
+            <Button
+              label="Continue"
+              busy={state.phase === "checking"}
+              busyLabel="Checking..."
+              disabled={!claimCode.trim()}
               onPress={handleCheck}
-              disabled={!claimCode.trim() || state.phase === "checking"}
-            >
-              <Text style={styles.buttonText}>
-                {state.phase === "checking" ? "Checking..." : "Continue"}
-              </Text>
-            </Pressable>
+              style={styles.button}
+            />
           </>
         )}
 
         {(state.phase === "confirm" || state.phase === "registering") && (
           <>
-            <Text style={styles.title}>Confirm Your Passkey</Text>
+            <Heading style={styles.title}>Confirm Your Passkey</Heading>
             <Text style={styles.hint}>This passkey will be bound to:</Text>
             <Text style={styles.subject} selectable>
               {state.start.subject}
@@ -145,46 +131,52 @@ export default function Enroll() {
             <Text style={styles.hint}>
               If this is not you, close this page and tell whoever sent the invite.
             </Text>
-            <TextInput
-              style={styles.input}
+            <Field
+              label="Device label (optional)"
               placeholder="Device label (optional)"
-              placeholderTextColor={colors.textTertiary}
               value={label}
               onChangeText={setLabel}
+              onSubmit={() => {
+                if (state.phase === "confirm") void handleRegister(state.start);
+              }}
               maxLength={256}
               editable={state.phase === "confirm"}
+              error={state.phase === "confirm" ? state.error : undefined}
+              style={styles.field}
             />
-            {state.phase === "confirm" && state.error && (
-              <Text style={[styles.hint, { color: colors.error }]}>{state.error}</Text>
-            )}
             {state.phase === "registering" ? (
               <ActivityIndicator
                 color={colors.accent}
                 size="large"
+                aria-label="Registering the passkey"
                 style={{ marginTop: spacing.lg }}
               />
             ) : (
-              <Pressable style={styles.button} onPress={() => handleRegister(state.start)}>
-                <Text style={styles.buttonText}>Create Passkey</Text>
-              </Pressable>
+              <Button
+                label="Create Passkey"
+                onPress={() => handleRegister(state.start)}
+                style={styles.button}
+              />
             )}
           </>
         )}
 
         {state.phase === "success" && (
           <>
-            <Text style={styles.title}>Enrollment Complete</Text>
-            <Text style={[styles.hint, { color: colors.success }]}>
+            <Heading style={styles.title}>Enrollment Complete</Heading>
+            <Text role="status" style={[styles.hint, { color: colors.success }]}>
               Your passkey has been registered for {state.done.subject}.
             </Text>
             {state.done.purpose === "session" ? (
-              <Pressable style={styles.button} onPress={() => router.replace("/login")}>
-                <Text style={styles.buttonText}>Sign In</Text>
-              </Pressable>
+              <Button
+                label="Sign In"
+                onPress={() => router.replace("/login")}
+                style={styles.button}
+              />
             ) : (
               <Text style={styles.hint}>
-                It confirms sensitive actions when you are asked to; it does not
-                sign you in. You can close this page.
+                It confirms sensitive actions when you are asked to; it does not sign you in. You
+                can close this page.
               </Text>
             )}
           </>
@@ -213,8 +205,6 @@ const styles = StyleSheet.create({
   },
   title: {
     fontSize: 22,
-    fontFamily: fonts.bold,
-    color: colors.textPrimary,
     marginTop: spacing.lg,
     marginBottom: spacing.md,
   },
@@ -225,35 +215,19 @@ const styles = StyleSheet.create({
     lineHeight: 20,
     marginBottom: spacing.sm,
   },
+  error: {
+    color: colors.error,
+  },
   subject: {
     fontSize: 13,
     fontFamily: fonts.mono,
     color: colors.textPrimary,
     marginBottom: spacing.md,
   },
-  input: {
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: radii.md,
-    padding: spacing.md,
+  field: {
     marginVertical: spacing.md,
-    color: colors.textPrimary,
-    fontFamily: fonts.regular,
-    fontSize: 15,
   },
   button: {
-    backgroundColor: colors.accent,
-    borderRadius: radii.md,
-    padding: spacing.md,
-    alignItems: "center",
     marginTop: spacing.md,
-  },
-  buttonText: {
-    color: colors.textOnAccent,
-    fontFamily: fonts.bold,
-    fontSize: 15,
-  },
-  disabled: {
-    opacity: 0.5,
   },
 });

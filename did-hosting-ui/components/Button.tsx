@@ -36,6 +36,8 @@ export interface ButtonProps {
   accessibilityLabel?: string;
   /** A toggle button's state: rendered as `aria-pressed`. */
   pressed?: boolean;
+  /** A disclosure button's state: rendered as `aria-expanded`. */
+  expanded?: boolean;
   style?: StyleProp<ViewStyle>;
   textStyle?: StyleProp<TextStyle>;
   testID?: string;
@@ -61,6 +63,7 @@ export function Button({
   busyLabel,
   accessibilityLabel,
   pressed,
+  expanded,
   style,
   textStyle,
   testID,
@@ -76,6 +79,7 @@ export function Button({
       aria-label={accessibilityLabel ?? label}
       aria-disabled={inert}
       aria-busy={busy}
+      aria-expanded={expanded}
       {...webAria(pressed === undefined ? {} : { pressed })}
       disabled={inert}
       onPress={onPress}

@@ -1,28 +1,19 @@
 import { useCallback, useEffect, useState } from "react";
-import {
-  View,
-  Text,
-  TextInput,
-  StyleSheet,
-  Pressable,
-} from "react-native";
-import * as Clipboard from "expo-clipboard";
+import { View, Text, StyleSheet, type TextStyle, type ViewStyle } from "react-native";
 import { useRouter } from "expo-router";
 import { useAuth } from "../components/AuthProvider";
 import { AffinidiLogo } from "../components/AffinidiLogo";
 import { AgentNameChips } from "../components/AgentNameChips";
+import { Button } from "../components/Button";
+import { CopyButton } from "../components/CopyButton";
+import { Dialog } from "../components/Dialog";
+import { Field } from "../components/Field";
+import { Heading } from "../components/Heading";
 import { WalletSignIn } from "../components/WalletSignIn";
-import {
-  api,
-  setAuthMethod,
-  setRefreshToken,
-} from "../lib/api";
+import { api, setAuthMethod, setRefreshToken } from "../lib/api";
+import { errorMessage } from "../lib/errors";
 import { getPasskeyCredential } from "../lib/passkey";
-import {
-  fetchSignInReadiness,
-  notSetUpNote,
-  offersWalletSignIn,
-} from "../lib/sign-in-readiness";
+import { fetchSignInReadiness, notSetUpNote, offersWalletSignIn } from "../lib/sign-in-readiness";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 import {
   isWalletAvailable,
@@ -81,9 +72,7 @@ export default function Login() {
   // signing key never leaves the VTA.
   const [proxyLoading, setProxyLoading] = useState(false);
   const [proxyError, setProxyError] = useState<string | null>(null);
-  const [proxyCandidates, setProxyCandidates] = useState<
-    ProxyVaultEntry[] | null
-  >(null);
+  const [proxyCandidates, setProxyCandidates] = useState<ProxyVaultEntry[] | null>(null);
   const [proxyPicking, setProxyPicking] = useState(false);
 
   // Fetch the server's own DID so the operator can see it on the
@@ -98,7 +87,6 @@ export default function Login() {
   // no extra round-trip — and rendered beneath it, because a name is an alias
   // and the DID stays the thing you paste into a wallet.
   const [serverNames, setServerNames] = useState<string[]>([]);
-  const [copiedServerDid, setCopiedServerDid] = useState(false);
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -117,20 +105,12 @@ export default function Login() {
     };
   }, []);
 
-  const handleCopyServerDid = async () => {
-    if (!serverDid) return;
-    await Clipboard.setStringAsync(serverDid);
-    setCopiedServerDid(true);
-    setTimeout(() => setCopiedServerDid(false), 2000);
-  };
-
   const handlePasskeyLogin = async () => {
+    if (passkeyLoading) return;
     setPasskeyLoading(true);
     setPasskeyError(null);
     try {
-      const { authId, options } = await api.passkeyLoginStart(
-        passkeySubject.trim() || undefined,
-      );
+      const { authId, options } = await api.passkeyLoginStart(passkeySubject.trim() || undefined);
       const credential = await getPasskeyCredential({ publicKey: options });
       const result = await api.passkeyLoginFinish(authId, credential);
       setAuthMethod("passkey");
@@ -140,10 +120,8 @@ export default function Login() {
       setRefreshToken(result.refreshToken);
       login(result.accessToken);
       router.replace("/");
-    } catch (err: any) {
-      setPasskeyError(
-        err?.message || "Passkey login failed. Passkeys may not be configured."
-      );
+    } catch (err: unknown) {
+      setPasskeyError(errorMessage(err, "Passkey login failed. Passkeys may not be configured."));
     } finally {
       setPasskeyLoading(false);
     }
@@ -162,8 +140,8 @@ export default function Login() {
       setRefreshToken(result.refreshToken || null);
       login(result.accessToken);
       router.replace("/");
-    } catch (err: any) {
-      setWalletError(err?.message || "Wallet login failed.");
+    } catch (err: unknown) {
+      setWalletError(errorMessage(err, "Wallet login failed."));
     } finally {
       setWalletLoading(false);
     }
@@ -181,8 +159,8 @@ export default function Login() {
     try {
       const { entry, bound } = await resolveProxyEntry();
       await runProxyLogin(entry, bound);
-    } catch (err: any) {
-      setProxyError(err?.message || "Could not resolve an identity for this site.");
+    } catch (err: unknown) {
+      setProxyError(errorMessage(err, "Could not resolve an identity for this site."));
     } finally {
       setProxyLoading(false);
     }
@@ -210,8 +188,8 @@ export default function Login() {
         setProxyCandidates(candidates);
         setProxyPicking(true);
       }
-    } catch (err: any) {
-      setProxyError(err?.message || "Could not enumerate proxy entries.");
+    } catch (err: unknown) {
+      setProxyError(errorMessage(err, "Could not enumerate proxy entries."));
     } finally {
       setProxyLoading(false);
     }
@@ -230,8 +208,8 @@ export default function Login() {
       setRefreshToken(result.refreshToken || null);
       login(result.accessToken);
       router.replace("/");
-    } catch (err: any) {
-      const base = err?.message || "VTA-proxied login failed.";
+    } catch (err: unknown) {
+      const base = errorMessage(err, "VTA-proxied login failed.");
       // A persona bound a moment ago has never been seen by this RP, so its
       // ACL is by far the likeliest cause. Name the DID: the operator cannot
       // act on a bare refusal, and the DID is not on screen anywhere else.
@@ -257,7 +235,7 @@ export default function Login() {
     <View style={styles.container}>
       <View style={styles.card}>
         <AffinidiLogo size={36} />
-        <Text style={styles.title}>Login</Text>
+        <Heading style={styles.title}>Login</Heading>
 
         {oobUnavailable ? (
           <Text style={styles.hint}>
@@ -265,7 +243,9 @@ export default function Login() {
           </Text>
         ) : (
           <>
-            <Text style={styles.sectionTitle}>Sign in with your wallet</Text>
+            <Heading level={2} style={styles.sectionTitle}>
+              Sign in with your wallet
+            </Heading>
             <WalletSignIn
               serviceDid={serverDid}
               onSignedIn={(accessToken) => {
@@ -277,209 +257,203 @@ export default function Login() {
           </>
         )}
 
-        <View style={styles.divider}>
-          <View style={styles.dividerLine} />
-          <Text style={styles.dividerText}>or</Text>
-          <View style={styles.dividerLine} />
-        </View>
+        <Divider label="or" />
 
         {serverDid && (
           <View style={styles.serverDidRow}>
             <View style={styles.serverDidColumn}>
               <Text style={styles.serverDidLabel}>This server</Text>
-              <Text style={styles.serverDidValue} numberOfLines={1}>
+              <Text style={[styles.serverDidValue, breakAll]} numberOfLines={1} selectable>
                 {serverDid}
               </Text>
               {serverNames.length > 0 && (
                 <View style={styles.serverNamesRow}>
-                  <AgentNameChips
-                    names={serverNames}
-                    didId={serverDid}
-                    size="sm"
-                  />
+                  <AgentNameChips names={serverNames} didId={serverDid} size="sm" />
                 </View>
               )}
               <Text style={styles.serverDidHint}>
                 Your wallet needs a record of this DID to sign in here.
               </Text>
             </View>
-            <Pressable style={styles.copyButton} onPress={() => void handleCopyServerDid()}>
-              <Text style={styles.copyButtonText}>
-                {copiedServerDid ? "Copied!" : "Copy"}
-              </Text>
-            </Pressable>
+            <CopyButton value={serverDid} accessibilityLabel="Copy this server's DID" />
           </View>
         )}
 
-        <TextInput
-          style={styles.subjectInput}
-          placeholder="Your DID (optional; for a security key that is not offered)"
-          placeholderTextColor={colors.textTertiary}
+        <Field
+          label="Your DID (optional; for a security key that is not offered)"
+          accessibilityLabel="Your DID, to sign in with a security key the browser does not offer"
+          placeholder="did:…"
           value={passkeySubject}
           onChangeText={setPasskeySubject}
+          onSubmit={() => void handlePasskeyLogin()}
           autoCapitalize="none"
           autoCorrect={false}
-          accessibilityLabel="Your DID, to sign in with a security key the browser does not offer"
         />
-        <Pressable
-          style={[styles.button, passkeyLoading && styles.disabled]}
+        <Button
+          label="Login with Passkey"
+          busy={passkeyLoading}
+          busyLabel="Authenticating..."
           onPress={handlePasskeyLogin}
-          disabled={passkeyLoading}
-        >
-          <Text style={styles.buttonText}>
-            {passkeyLoading ? "Authenticating..." : "Login with Passkey"}
-          </Text>
-        </Pressable>
+        />
 
         {passkeyError && (
-          <Text style={styles.errorText}>{passkeyError}</Text>
+          <Text role="alert" style={styles.errorText}>
+            {passkeyError}
+          </Text>
         )}
 
-        <Pressable
+        <Button
+          label={showLegacy ? "Hide older wallet options" : "Using an older wallet?"}
+          variant="ghost"
+          size="sm"
+          expanded={showLegacy}
           onPress={() => setShowLegacy(!showLegacy)}
           style={styles.legacyToggle}
-          accessibilityRole="button"
-          accessibilityState={{ expanded: showLegacy }}
-        >
-          <Text style={styles.legacyToggleText}>
-            {showLegacy ? "Hide older wallet options" : "Using an older wallet?"}
-          </Text>
-        </Pressable>
+        />
 
         {showLegacy && (
-        <>
-        {/* @deprecated (contract C7): the VTA Wallet extension's SIOPv2 /
+          <>
+            {/* @deprecated (contract C7): the VTA Wallet extension's SIOPv2 /
             auth/authenticate login and the VTA-proxied SIOP login. Kept for
             wallets that cannot read a sign-in code yet; not deleted until a
             removal date is set. */}
-        <Text style={styles.cliHint}>
-          These sign-in methods are deprecated. Use "Sign in with your wallet"
-          above if your wallet supports it.
-        </Text>
-
-        {walletAvailable && (
-          <Pressable
-            style={walletLoading ? [styles.secondaryButton, styles.disabled] : styles.secondaryButton}
-            onPress={handleWalletLogin}
-            disabled={walletLoading}
-          >
-            <Text style={styles.secondaryButtonText}>
-              {walletLoading ? "Authenticating…" : "Login with VTA Wallet"}
+            <Text style={styles.cliHint}>
+              These sign-in methods are deprecated. Use “Sign in with your wallet” above if your
+              wallet supports it.
             </Text>
-          </Pressable>
-        )}
-        {walletAvailable && walletError && (
-          <Text style={styles.errorText}>{walletError}</Text>
-        )}
-        {!walletAvailable && (
-          <Text style={styles.cliHint}>
-            Install the VTA Wallet browser extension to sign in with your did:peer
-            identity (no passkey required).
-          </Text>
-        )}
 
-        {proxyAvailable && (
-          <>
-            <View style={[styles.divider, { marginTop: spacing.md }]}>
-              <View style={styles.dividerLine} />
-              <Text style={styles.dividerText}>via VTA proxy</Text>
-              <View style={styles.dividerLine} />
-            </View>
-            <Pressable
-              style={proxyLoading ? [styles.secondaryButton, styles.disabled] : styles.secondaryButton}
-              onPress={handleProxyLoginStart}
-              disabled={proxyLoading}
-            >
-              <Text style={styles.secondaryButtonText}>
-                {proxyLoading ? "Authenticating…" : "Login via VTA-proxied SIOP"}
+            {walletAvailable && (
+              <Button
+                label="Login with VTA Wallet"
+                variant="secondary"
+                busy={walletLoading}
+                busyLabel="Authenticating…"
+                onPress={handleWalletLogin}
+              />
+            )}
+            {walletAvailable && walletError && (
+              <Text role="alert" style={styles.errorText}>
+                {walletError}
               </Text>
-            </Pressable>
-            {/* Secondary, and worded as the exception it is. The button above
+            )}
+            {!walletAvailable && (
+              <Text style={styles.cliHint}>
+                Install the VTA Wallet browser extension to sign in with your did:peer identity (no
+                passkey required).
+              </Text>
+            )}
+
+            {proxyAvailable && (
+              <>
+                <Divider label="via VTA proxy" style={{ marginTop: spacing.md }} />
+                <Button
+                  label="Login via VTA-proxied SIOP"
+                  variant="secondary"
+                  busy={proxyLoading}
+                  busyLabel="Authenticating…"
+                  onPress={handleProxyLoginStart}
+                />
+                {/* Secondary, and worded as the exception it is. The button above
                 uses whichever identity the wallet has bound to this site; this
                 is for an operator holding more than one here, and it costs a
                 consent prompt that enumerates the vault to this page. */}
-            <Pressable
-              style={proxyLoading ? [styles.secondaryButton, styles.disabled] : styles.secondaryButton}
-              onPress={handleChooseIdentity}
-              disabled={proxyLoading}
-            >
-              <Text style={styles.secondaryButtonText}>
-                Login as a different identity…
-              </Text>
-            </Pressable>
-            <Text style={styles.cliHint}>
-              VTA mints a SIOP id_token on a vault entry's behalf. The
-              entry's long-term signing key never leaves the VTA — the
-              page only sees the short-lived id_token.
-            </Text>
-            {proxyError && <Text style={styles.errorText}>{proxyError}</Text>}
+                <Button
+                  label="Login as a different identity…"
+                  variant="secondary"
+                  disabled={proxyLoading}
+                  onPress={handleChooseIdentity}
+                  style={{ marginTop: spacing.sm }}
+                />
+                <Text style={styles.cliHint}>
+                  VTA mints a SIOP id_token on a vault entry&apos;s behalf. The entry&apos;s
+                  long-term signing key never leaves the VTA — the page only sees the short-lived
+                  id_token.
+                </Text>
+                {proxyError && (
+                  <Text role="alert" style={styles.errorText}>
+                    {proxyError}
+                  </Text>
+                )}
+              </>
+            )}
           </>
         )}
-        </>
-        )}
 
-        <View style={styles.divider}>
-          <View style={styles.dividerLine} />
-          <Text style={styles.dividerText}>need access?</Text>
-          <View style={styles.dividerLine} />
-        </View>
+        <Divider label="need access?" />
 
         <Text style={styles.cliHint}>
-          Ask a server admin to send you an enrollment link. Open it in this
-          browser to register a passkey, then return here to log in.
+          Ask a server admin to send you an enrollment link. Open it in this browser to register a
+          passkey, then return here to log in.
         </Text>
       </View>
 
-      {proxyPicking && proxyCandidates && (
-        <ProxyCandidatePicker
-          candidates={proxyCandidates}
-          onCancel={() => setProxyPicking(false)}
-          onPick={(entry) => void runProxyLogin(entry)}
-        />
-      )}
+      <ProxyCandidatePicker
+        visible={proxyPicking && proxyCandidates !== null}
+        candidates={proxyCandidates ?? []}
+        onCancel={() => setProxyPicking(false)}
+        onPick={(entry) => void runProxyLogin(entry)}
+      />
+    </View>
+  );
+}
+
+function Divider({ label, style }: { label: string; style?: ViewStyle }) {
+  return (
+    <View style={[styles.divider, style]}>
+      <View style={styles.dividerLine} />
+      <Text style={styles.dividerText}>{label}</Text>
+      <View style={styles.dividerLine} />
     </View>
   );
 }
 
 // ─── M2B.4 picker UI ───
-// Inline modal that lets the user choose among multiple did-self-issued
-// vault entries pinned to this RP's DID. Renders the principal DID +
-// last-used timestamp so the user knows which identity they'd be acting
-// as.
+// A dialog that lets the user choose among multiple did-self-issued vault
+// entries pinned to this RP's DID. Renders the principal DID so the user
+// knows which identity they'd be acting as.
 function ProxyCandidatePicker({
+  visible,
   candidates,
   onCancel,
   onPick,
 }: {
+  visible: boolean;
   candidates: ProxyVaultEntry[];
   onCancel: () => void;
   onPick: (entry: ProxyVaultEntry) => void;
 }) {
   return (
-    <View style={styles.modalBackdrop}>
-      <View style={[styles.card, { maxWidth: 600 }]}>
-        <Text style={styles.title}>Pick a proxy identity</Text>
-        <Text style={styles.hint}>
-          Multiple did-self-issued vault entries are pinned to this RP. Pick
-          which one to log in as.
-        </Text>
-        {candidates.map((c) => (
-          <Pressable
-            key={c.id}
-            style={[styles.secondaryButton, { marginBottom: spacing.sm }]}
-            onPress={() => onPick(c)}
-          >
-            <Text style={styles.secondaryButtonText}>{c.label}</Text>
+    <Dialog
+      visible={visible}
+      title="Pick a proxy identity"
+      onClose={onCancel}
+      style={{ maxWidth: 600 }}
+      actions={<Button label="Cancel" variant="danger" onPress={onCancel} />}
+    >
+      <Text style={styles.hint}>
+        Multiple did-self-issued vault entries are pinned to this RP. Pick which one to log in as.
+      </Text>
+      {candidates.map((c) => (
+        <Button
+          key={c.id}
+          variant="secondary"
+          accessibilityLabel={`${c.label}, ${c.principalDid}`}
+          onPress={() => onPick(c)}
+          style={styles.candidate}
+        >
+          <View>
+            <Text style={styles.candidateLabel}>{c.label}</Text>
             <Text style={[styles.cliHint, { marginTop: 4 }]}>{c.principalDid}</Text>
-          </Pressable>
-        ))}
-        <Pressable style={styles.dangerButton} onPress={onCancel}>
-          <Text style={styles.dangerButtonText}>Cancel</Text>
-        </Pressable>
-      </View>
-    </View>
+          </View>
+        </Button>
+      ))}
+    </Dialog>
   );
 }
+
+/** RN-Web only — break long DIDs gracefully when the truncation ellipsis isn't
+ *  applied (e.g. when zoomed in). Not in React Native's style types. */
+const breakAll = { wordBreak: "break-all" } as TextStyle;
 
 const styles = StyleSheet.create({
   container: {
@@ -513,12 +487,16 @@ const styles = StyleSheet.create({
   },
   legacyToggle: {
     marginTop: spacing.lg,
-    alignItems: "center",
+    alignSelf: "center",
   },
-  legacyToggleText: {
-    color: colors.accent,
-    fontSize: 13,
-    fontFamily: fonts.medium,
+  candidate: {
+    marginBottom: spacing.sm,
+    justifyContent: "flex-start",
+  },
+  candidateLabel: {
+    color: colors.textPrimary,
+    fontSize: 15,
+    fontFamily: fonts.semibold,
   },
   hint: {
     fontSize: 14,
@@ -550,10 +528,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontFamily: fonts.regular,
     color: colors.textPrimary,
-    // RN-Web only — break long DIDs gracefully when the truncation
-    // ellipsis isn't applied (e.g. when zoomed in).
-    wordBreak: "break-all",
-  } as any,
+  },
   serverNamesRow: {
     marginTop: spacing.sm,
   },
@@ -563,72 +538,6 @@ const styles = StyleSheet.create({
     fontFamily: fonts.regular,
     color: colors.textSecondary,
     lineHeight: 16,
-  },
-  copyButton: {
-    backgroundColor: colors.accent,
-    borderRadius: radii.sm,
-    paddingVertical: 6,
-    paddingHorizontal: spacing.md,
-  },
-  copyButtonText: {
-    fontSize: 12,
-    fontFamily: fonts.medium,
-    color: colors.bgPrimary,
-  },
-  button: {
-    backgroundColor: colors.accent,
-    borderRadius: radii.md,
-    paddingVertical: 14,
-    alignItems: "center",
-  },
-  disabled: {
-    opacity: 0.5,
-  },
-  subjectInput: {
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: radii.md,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.sm,
-    marginBottom: spacing.sm,
-    fontSize: 13,
-    fontFamily: fonts.regular,
-    color: colors.textPrimary,
-  },
-  dangerButton: {
-    backgroundColor: "transparent",
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.error,
-    paddingVertical: 14,
-    alignItems: "center",
-    marginTop: spacing.lg,
-  },
-  dangerButtonText: {
-    color: colors.error,
-    fontSize: 16,
-    fontFamily: fonts.semibold,
-  },
-  buttonText: {
-    color: colors.textOnAccent,
-    fontSize: 16,
-    fontFamily: fonts.semibold,
-  },
-  // Visual distinction from the primary passkey button: outlined rather than
-  // filled, so the two options read as peers without one looking like the
-  // canonical answer.
-  secondaryButton: {
-    backgroundColor: "transparent",
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.accent,
-    paddingVertical: 14,
-    alignItems: "center",
-  },
-  secondaryButtonText: {
-    color: colors.accent,
-    fontSize: 16,
-    fontFamily: fonts.semibold,
   },
   divider: {
     flexDirection: "row",
@@ -660,16 +569,5 @@ const styles = StyleSheet.create({
     color: colors.textTertiary,
     lineHeight: 19,
     marginBottom: spacing.sm,
-  },
-  modalBackdrop: {
-    position: "absolute" as const,
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: "rgba(0,0,0,0.4)",
-    alignItems: "center",
-    justifyContent: "center",
-    padding: spacing.lg,
   },
 });

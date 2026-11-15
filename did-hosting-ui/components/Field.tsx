@@ -56,6 +56,9 @@ export function Field({
   const labelId = `${id}-label`;
   const hintId = `${id}-hint`;
   const [focused, setFocused] = useState(false);
+  // A caller-given name replaces the visible label as the accessible name
+  // (aria-labelledby would otherwise win over aria-label).
+  const ownName = input.accessibilityLabel ?? input["aria-label"];
   const described = [hint ? hintId : null, error ? `${id}-error` : null].filter(Boolean).join(" ");
 
   return (
@@ -66,8 +69,9 @@ export function Field({
       </Text>
       <TextInput
         ref={inputRef}
-        aria-labelledby={labelId}
-        aria-label={label}
+        {...(ownName
+          ? { "aria-label": ownName }
+          : { "aria-labelledby": labelId, "aria-label": label })}
         {...webAria({
           ...(described ? { describedBy: described } : {}),
           ...(error ? { invalid: true } : {}),
