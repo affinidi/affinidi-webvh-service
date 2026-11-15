@@ -125,3 +125,25 @@ pub const KS_TSP_RELATIONSHIPS: &str = "tsp_relationships";
 /// the service identity's resolver at boot; see
 /// [`crate::server::scid_floors`].
 pub const KS_SCID_FLOORS: &str = "scid_floors";
+
+/// Every keyspace this workspace opens, so a backend can prepare (or
+/// migrate) each one at startup without waiting for its first use. A new
+/// `KS_*` constant belongs here too.
+pub const ALL_KEYSPACES: &[&str] = &[
+    KS_DIDS,
+    KS_ACL,
+    KS_SESSIONS,
+    KS_PASSKEY_STEP_UP,
+    KS_STATS,
+    KS_TIMESERIES,
+    KS_REGISTRY,
+    KS_WITNESSES,
+    KS_META,
+    KS_DOMAINS,
+    KS_ASSIGNMENTS,
+    KS_PENDING_PURGES,
+    KS_IDENTITY,
+    KS_OUTBOUND_QUEUE,
+    KS_TSP_RELATIONSHIPS,
+    KS_SCID_FLOORS,
+];

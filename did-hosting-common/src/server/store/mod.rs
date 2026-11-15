@@ -1,3 +1,5 @@
+#[cfg(any(test, feature = "test-support"))]
+pub mod conformance;
 #[cfg(feature = "store-cosmosdb")]
 mod cosmosdb;
 #[cfg(feature = "store-dynamodb")]
@@ -15,9 +17,9 @@ mod redis;
 pub(crate) mod test_support;
 
 pub use keyspaces::{
-    KS_ACL, KS_ASSIGNMENTS, KS_DIDS, KS_DOMAINS, KS_IDENTITY, KS_META, KS_OUTBOUND_QUEUE,
-    KS_PASSKEY_STEP_UP, KS_PENDING_PURGES, KS_REGISTRY, KS_SCID_FLOORS, KS_SESSIONS, KS_STATS,
-    KS_TIMESERIES, KS_TSP_RELATIONSHIPS, KS_WITNESSES,
+    ALL_KEYSPACES, KS_ACL, KS_ASSIGNMENTS, KS_DIDS, KS_DOMAINS, KS_IDENTITY, KS_META,
+    KS_OUTBOUND_QUEUE, KS_PASSKEY_STEP_UP, KS_PENDING_PURGES, KS_REGISTRY, KS_SCID_FLOORS,
+    KS_SESSIONS, KS_STATS, KS_TIMESERIES, KS_TSP_RELATIONSHIPS, KS_WITNESSES,
 };
 
 use std::cell::Cell;
@@ -71,14 +73,18 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Refuse a write whose stored item, `size` bytes as `backend` counts it,
 /// is over that backend's per-item `limit`.
 ///
-/// Backends with a per-item limit (DynamoDB, Firestore) check every item
+/// Backends with a per-item limit (DynamoDB, Firestore, Cosmos DB) check every item
 /// before they send anything, so a refused batch writes nothing. The error is
 /// [`AppError::QuotaExceeded`], whose message reaches the caller: a Trust Task
 /// answers `taskFailed` with it (HTTPS `422`), and an edge or watcher refuses
 /// the sync as `taskFailed` rather than retrying it. Left to the backend, the
 /// same write failed as a store error (`500`) that no retry could fix. The
 /// backend is logged here, not told to the caller.
-#[cfg(any(feature = "store-dynamodb", feature = "store-firestore"))]
+#[cfg(any(
+    feature = "store-dynamodb",
+    feature = "store-firestore",
+    feature = "store-cosmosdb"
+))]
 fn check_item_size(backend: &str, size: usize, limit: usize) -> Result<(), AppError> {
     if size > limit {
         tracing::warn!(
@@ -129,8 +135,10 @@ pub trait KeyspaceOps: Send + Sync {
     /// A page may be empty while more follow (a scan whose `limit` keys all
     /// fell outside the prefix); the walk ends when `next` is `None`.
     ///
-    /// `Ok(None)` when the backend cannot page at all; the caller then reads
-    /// the whole prefix with [`Self::prefix_iter_raw`]. That is the default.
+    /// Every backend in this crate pages (the conformance suite checks it),
+    /// so `Ok(None)` comes only from a backend that cannot: a test wrapper,
+    /// or a backend added without paging, which this default stands in for.
+    /// The caller then reads the whole prefix with [`Self::prefix_iter_raw`].
     fn prefix_page_raw(
         &self,
         prefix: Vec<u8>,
@@ -139,6 +147,27 @@ pub trait KeyspaceOps: Send + Sync {
     ) -> BoxFuture<'_, Result<Option<PrefixPage>, AppError>> {
         let _ = (prefix, cursor, limit);
         Box::pin(async { Ok(None) })
+    }
+
+    /// The keys of [`Self::prefix_iter_raw`], without their values, in no
+    /// particular order. Backends that can list keys without reading values
+    /// (a Redis index, a DynamoDB projection, a Cosmos DB `SELECT c.id`)
+    /// override this; the default reads the pairs and drops the values.
+    fn prefix_keys_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<Vec<u8>>, AppError>> {
+        Box::pin(async move {
+            Ok(self
+                .prefix_iter_raw(prefix)
+                .await?
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect())
+        })
+    }
+
+    /// How many keys start with `prefix`. Redis answers from its index
+    /// (`ZLEXCOUNT`); the default counts [`Self::prefix_keys_raw`].
+    fn prefix_count(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<usize, AppError>> {
+        Box::pin(async move { Ok(self.prefix_keys_raw(prefix).await?.len()) })
     }
 
     /// Atomically read a key's value and remove it in one operation.
@@ -202,6 +231,13 @@ pub trait KeyspaceOps: Send + Sync {
 }
 
 /// Atomic multi-key write batch identified by keyspace name.
+///
+/// Every backend applies a committed batch whole or not at all, across
+/// keyspaces: fjall one write batch, Redis one `MULTI`, DynamoDB one
+/// `TransactWriteItems`, Firestore one commit, Cosmos DB one transactional
+/// batch (every keyspace lives in one container and one partition for this).
+/// The bounded ones refuse a batch over their bound before writing anything;
+/// see [`Store::batch`].
 pub trait BatchOps: Send {
     fn insert_raw(&mut self, keyspace: &str, key: Vec<u8>, value: Vec<u8>);
     fn remove(&mut self, keyspace: &str, key: Vec<u8>);
@@ -243,6 +279,12 @@ pub trait StorageBackend: Send + Sync {
 
     fn batch(&self) -> Box<dyn BatchOps>;
     fn persist(&self) -> BoxFuture<'_, Result<(), AppError>>;
+
+    /// See [`Store::max_item_bytes`]. `None` (the default) when the backend
+    /// has no per-item limit a caller would reach.
+    fn max_item_bytes(&self) -> Option<usize> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +370,15 @@ impl Store {
         })
     }
 
+    /// A store over a backend built by hand, for a test that needs to
+    /// configure the backend in a way [`StoreConfig`] cannot (an emulator).
+    #[cfg(all(test, feature = "cosmosdb-emulator"))]
+    pub(crate) fn from_backend(backend: Box<dyn StorageBackend>) -> Self {
+        Self {
+            inner: Arc::from(backend),
+        }
+    }
+
     pub fn keyspace(&self, name: &str) -> Result<KeyspaceHandle, AppError> {
         let (ks_name, ops) = self.inner.keyspace(name)?;
         Ok(KeyspaceHandle {
@@ -367,7 +418,13 @@ impl Store {
         })
     }
 
-    /// Create a new atomic write batch.
+    /// Create a new atomic write batch. It may span keyspaces, and every
+    /// backend commits it whole or not at all. A backend whose transactions
+    /// are bounded refuses a batch over the bound as
+    /// [`AppError::QuotaExceeded`], writing nothing: DynamoDB 100 writes and
+    /// 4 MB, Firestore 500 writes and 10 MB, Cosmos DB 100 writes and 2 MB.
+    /// Nothing a batch reads is isolated from other writers: it is a set of
+    /// writes, not a read-modify-write transaction.
     pub fn batch(&self) -> WriteBatch {
         WriteBatch {
             inner: self.inner.batch(),
@@ -376,6 +433,19 @@ impl Store {
 
     pub async fn persist(&self) -> Result<(), AppError> {
         self.inner.persist().await
+    }
+
+    /// The largest item, key and value bytes together, the backend stores in
+    /// one row; `None` when it has no limit a caller would reach (fjall,
+    /// Redis).
+    /// A write over it is refused as [`AppError::QuotaExceeded`] (DynamoDB,
+    /// Firestore, Cosmos DB), so a caller storing something that grows (a DID
+    /// log) can split it before it gets there. Measured against the backend's
+    /// own encoding: Firestore and Cosmos DB store the value base64-encoded,
+    /// so their figure is about three quarters of their document limit. Keep
+    /// some headroom: a batch carrying the item is bounded too.
+    pub fn max_item_bytes(&self) -> Option<usize> {
+        self.inner.max_item_bytes()
     }
 }
 
@@ -566,6 +636,20 @@ impl KeyspaceHandle {
         self.inner
             .prefix_page_raw(prefix.into(), cursor, limit)
             .await
+    }
+
+    /// The keys starting with `prefix`, without their values, in no
+    /// particular order. See [`KeyspaceOps::prefix_keys_raw`].
+    pub async fn prefix_keys_raw(
+        &self,
+        prefix: impl Into<Vec<u8>>,
+    ) -> Result<Vec<Vec<u8>>, AppError> {
+        self.inner.prefix_keys_raw(prefix.into()).await
+    }
+
+    /// How many keys start with `prefix`. See [`KeyspaceOps::prefix_count`].
+    pub async fn prefix_count(&self, prefix: impl Into<Vec<u8>>) -> Result<usize, AppError> {
+        self.inner.prefix_count(prefix.into()).await
     }
 
     /// Returns the approximate number of items in the keyspace.

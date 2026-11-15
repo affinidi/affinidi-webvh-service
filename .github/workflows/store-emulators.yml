@@ -1,0 +1,74 @@
+name: Store emulators
+
+# The shared store conformance suite (`server::store::conformance`, run by
+# did-hosting-common/tests/store_conformance.rs) against backends whose
+# emulator is too heavy for every PR. Redis, DynamoDB Local and the Cosmos DB
+# SDK's in-memory emulator run on every PR in ci.yml; the Firestore emulator
+# (a JVM from the gcloud CLI) runs here, nightly and on demand.
+#
+# A separate workflow, not a job in ci.yml: the nightly pointer advances on
+# ci.yml's push runs alone, and a scheduled-only job there would only ever
+# show as skipped.
+on:
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+  # And on a PR that changes the Firestore backend or the suite itself.
+  pull_request:
+    branches: [main, "release/**"]
+    paths:
+      - did-hosting-common/src/server/store/firestore.rs
+      - did-hosting-common/src/server/store/conformance.rs
+      - did-hosting-common/src/server/store/mod.rs
+      - did-hosting-common/tests/store_conformance.rs
+      - .github/workflows/store-emulators.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  firestore:
+    name: store conformance (store-firestore)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FIRESTORE_EMULATOR_HOST: 127.0.0.1:8080
+      WEBVH_TEST_FIRESTORE_PROJECT: demo-webvh-conformance
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-runner
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Start the Firestore emulator
+        run: |
+          docker run -d --name firestore -p 8080:8080 \
+            google/cloud-sdk:593.0.0-emulators \
+            gcloud emulators firestore start --host-port=0.0.0.0:8080
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8080/ >/dev/null 2>&1; then
+              echo "emulator up"; exit 0
+            fi
+            sleep 2
+          done
+          docker logs firestore
+          exit 1
+      - name: Store conformance (store-firestore)
+        run: >
+          cargo test -p did-hosting-common --no-default-features
+          --features "server-core,store-firestore,test-support,method-webvh,method-web"
+          --test store_conformance -- --nocapture
+      - name: Emulator log
+        if: failure()
+        run: docker logs firestore
