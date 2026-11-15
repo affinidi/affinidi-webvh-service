@@ -13,6 +13,9 @@ publish.workspace = true
 rust-version.workspace = true
 build = "build.rs"
 
+[lints]
+workspace = true
+
 [features]
 default = ["keyring", "store-fjall", "method-webvh", "method-web"]
 metrics = ["did-hosting-common/metrics"]
@@ -65,7 +68,7 @@ did-hosting-common = { version = "0.12", path = "../did-hosting-common", feature
 # OpenAPI spec generation (behind the off-by-default `openapi` feature).
 utoipa = { version = "6", optional = true }
 vti-common = { version = "0.51", default-features = false }
-async-trait = "0.1"
+async-trait = { workspace = true }
 affinidi-tdk = { workspace = true }
 # Trust Tasks: the server consumes infrastructure trust tasks (health ping,
 # register ack) so those ops are reachable over TSP as well as DIDComm.
@@ -82,7 +85,7 @@ affinidi-messaging-didcomm = { workspace = true }
 affinidi-secrets-resolver = { workspace = true }
 tokio-util = { workspace = true }
 affinidi-did-resolver-cache-sdk = "0.8.43"
-axum = "0.8"
+axum = { workspace = true }
 axum-extra = { workspace = true }
 base64 = { workspace = true }
 bip39 = "3"
@@ -103,9 +106,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
-toml = "1.0"
+toml = { workspace = true }
 vta-sdk = { workspace = true }
-tower-http = { version = "0.7", features = ["trace", "compression-gzip", "compression-br"] }
+tower-http = { workspace = true, features = ["trace", "compression-gzip", "compression-br"] }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -130,7 +133,7 @@ azure_security_keyvault_secrets = { version = "1.0", optional = true }
 azure_identity = { version = "1.0", optional = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 # `tests/edge_trust_tasks.rs` checks every reply against the schema its type
 # names.
 trust-tasks-rs = { workspace = true, features = ["validate"] }
@@ -149,8 +152,8 @@ trust-tasks-proof = { workspace = true }
 # that produced the response. Harmless when `method-webs` is off — the
 # test file is `#![cfg]`-gated out.
 affinidi-did-webs = { workspace = true }
-tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
+tower = { workspace = true, features = ["util"] }
+http-body-util = { workspace = true }
 ratatui = "0.30"
 crossterm = "0.29"
 reqwest = { workspace = true }

@@ -52,7 +52,7 @@
 //!
 //! Like M-01, the walk is paged and each record is re-read and written with a
 //! compare-and-swap that changes `services` alone
-//! ([`super::patch_did_record_field`]), so a concurrent publish is never
+//! (`super::patch_did_record_field`), so a concurrent publish is never
 //! overwritten with a stale record.
 
 use serde::{Deserialize, Serialize};

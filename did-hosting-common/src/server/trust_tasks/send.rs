@@ -30,7 +30,7 @@
 //! not loopback, a private or link-local range, or a special-use name such as
 //! `localhost` — checked on the URL when the binding is chosen, and on every
 //! address the name resolves to when the send connects
-//! ([`crate::http::peer_endpoint_client`]). Redirects are not followed, the
+//! (`crate::http::peer_endpoint_client`). Redirects are not followed, the
 //! request has finite timeouts, and the reply is capped at 1 MiB. An
 //! endpoint outside that policy is treated as not advertised.
 //!
@@ -59,7 +59,7 @@
 //! the mediator connection, verified by the ordinary inbound path
 //! ([`super::bound::verify_sender_bound`]) whenever it shows up. HTTPS has no
 //! separate inbound leg — the reply *is* the HTTP response — so
-//! [`send_over_https`] applies the same rule synchronously: the reply must
+//! `send_over_https` applies the same rule synchronously: the reply must
 //! carry a `proof` binding it to the peer we addressed, must be addressed back
 //! to us, and must thread to the request. A 2xx response that fails any of
 //! these is treated as a send failure, not a success — an unsigned or
@@ -363,7 +363,7 @@ async fn send_over_https(
 /// `url` is one the caller chose (configuration, not a peer's document), so
 /// it is sent with [`crate::http::outbound_client`]'s timeouts and redirect
 /// refusal but no host policy. The reply body is read with a hard cap
-/// ([`HTTPS_MAX_REPLY_BYTES`]).
+/// (`HTTPS_MAX_REPLY_BYTES`).
 pub async fn post_trust_task_https(
     from: &str,
     to: &str,

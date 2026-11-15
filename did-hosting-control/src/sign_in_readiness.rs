@@ -10,7 +10,7 @@
 //!   `auth/oob/*` tasks) — **required**;
 //! - `#webvh-hosting`, `WebVHHosting`, `{ "uri": "<public_url>" }` —
 //!   **recommended**. The wallet uses it only to decide whether to offer a
-//!   server it does not know yet the "Use <host> to host your DIDs?" join; a
+//!   server it does not know yet the "Use `<host>` to host your DIDs?" join; a
 //!   person whose wallet already knows the server signs in without it. So a
 //!   missing or wrong `WebVHHosting` never stops the login page offering
 //!   wallet sign-in. This is consistent with CLAUDE.md's rule that a

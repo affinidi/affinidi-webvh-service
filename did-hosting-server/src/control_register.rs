@@ -772,7 +772,7 @@ pub(crate) fn stage_high_water(
 }
 
 /// Rewrite every high-water row still holding a whole log (written before
-/// the compact [`HighWaterMark`]) as the mark that log implies. Idempotent;
+/// the compact `HighWaterMark`) as the mark that log implies. Idempotent;
 /// run at boot. Returns how many rows were rewritten.
 pub async fn migrate_high_water_marks(
     dids_ks: &KeyspaceHandle,

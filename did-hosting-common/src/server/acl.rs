@@ -190,7 +190,7 @@ pub async fn list_acl_entries(acl: &KeyspaceHandle) -> Result<Vec<AclEntry>, App
 }
 
 /// Count `Owner` ACL entries whose `domains` field is
-/// [`DomainScope::All`] (T52).
+/// [`DomainScope::All`](crate::server::domain::DomainScope::All) (T52).
 ///
 /// Surfaces the post-migration "how many owners still have
 /// unrestricted scope?" signal that the spec wants on a future

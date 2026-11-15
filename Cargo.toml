@@ -117,6 +117,21 @@ zeroize = { version = "1.8", features = ["derive"] }
 # single copy again and this hold should be dropped.
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 
+# HTTP stack, shared by every service crate. Declared once so the members
+# cannot drift onto different majors; each crate adds the features it needs
+# (`tower-http`'s `trace` / `cors`, `tower`'s `util`) at its own use site.
+axum = "0.8"
+tower = "0.5"
+tower-http = "0.7"
+http-body-util = "0.1"
+async-trait = "0.1"
+
+# Config files
+toml = "1.0"
+
+# Test / scratch directories
+tempfile = "3"
+
 # Axum extras (typed headers for Bearer auth)
 axum-extra = { version = "0.12", features = ["typed-header"] }
 
@@ -650,6 +665,14 @@ affinidi-messaging-sdk = { version = "0.44.0", features = ["tsp"] }
 # signature-only-when-issuer-absent path.
 affinidi-data-integrity = "0.8"
 
+# Lints every member opts into with `[lints] workspace = true`.
+[workspace.lints.rust]
+# CONTRIBUTING rule 6: no `unsafe` in production code. `deny`, not `forbid`,
+# so a test module that has to mutate the process environment
+# (`std::env::set_var` is `unsafe` in edition 2024) can opt out locally with
+# `#[allow(unsafe_code)]`; nothing outside a `#[cfg(test)]` module may.
+unsafe_code = "deny"
+
 # Argon2 in an unoptimised build takes seconds per hash, and every test that
 # issues or redeems an enrolment invite runs one; optimise just the hash.
 [profile.dev.package.argon2]
@@ -659,6 +682,18 @@ opt-level = 3
 opt-level = 3
 
 [profile.release]
-# Tell `rustc` to optimize for small code size.
+# Optimise for size. Measured against `opt-level = 3` on the hot path — webvh
+# log verification (`did_ops::verify_did_log_proofs` over the fuzz corpus
+# chains, both with lto + codegen-units = 1): the two were within run-to-run
+# noise of each other (~96-176 us per verify, neither consistently ahead),
+# while 3 made the binary ~27% larger. The work is dominated by the Ed25519 /
+# SHA-2 crates, whose inner loops are hand-tuned either way. Re-measure before
+# changing it.
 opt-level = "s"
 lto = true
+# One codegen unit lets LTO see, and inline across, the whole crate graph.
+codegen-units = 1
+# Release binaries ship without symbol tables, so a panic backtrace from one
+# shows addresses rather than function names. Build with
+# `CARGO_PROFILE_RELEASE_STRIP=none` to debug a release build.
+strip = "symbols"

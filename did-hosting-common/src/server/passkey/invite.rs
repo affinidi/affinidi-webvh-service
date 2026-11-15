@@ -11,7 +11,7 @@
 //!   Argon2id digest, and compared in constant time.
 //!
 //! Wrong claim codes are counted per invite, atomically in the store (so the
-//! count is correct even when replicas share it — see [`ATTEMPT_LOCKS`]).
+//! count is correct even when replicas share it — see `ATTEMPT_LOCKS`).
 //! At [`MAX_WRONG_CODES`] the invite is deleted, so a stolen URL gives an
 //! attacker a handful of guesses at a 60-bit code and no more. An invite
 //! expires, and is consumed exactly once: [`take`] is the atomic step that
@@ -423,7 +423,7 @@ pub async fn issue(
 }
 
 /// Store (or rewrite) an invite and its id index, unlocked: for a new invite,
-/// or under the invite's [`ATTEMPT_LOCKS`] guard. A rewrite of an existing
+/// or under the invite's `ATTEMPT_LOCKS` guard. A rewrite of an existing
 /// invite goes through [`update`], so it cannot bring back one that was taken
 /// meanwhile.
 pub async fn save(ks: &KeyspaceHandle, invite: &Invite) -> Result<(), AppError> {
@@ -472,7 +472,7 @@ pub async fn list(ks: &KeyspaceHandle) -> Result<Vec<Invite>, AppError> {
 /// Consume the invite under `token_hash`, atomically: exactly one caller gets
 /// it. Its id index goes with it.
 ///
-/// Taken under the invite's [`ATTEMPT_LOCKS`] guard, so a wrong-code count,
+/// Taken under the invite's `ATTEMPT_LOCKS` guard, so a wrong-code count,
 /// a ceremony or an administrator's update in flight cannot write the invite
 /// back after it is gone — a consumed or revoked invite stays consumed.
 pub async fn take(ks: &KeyspaceHandle, token_hash: &str) -> Result<Option<Invite>, AppError> {

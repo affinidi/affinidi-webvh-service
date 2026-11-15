@@ -1,3 +1,4 @@
+#[cfg(feature = "ui")]
 use std::path::Path;
 
 fn main() {
@@ -11,14 +12,19 @@ fn main() {
     ];
     let enabled_count = store_features.iter().filter(|&&f| f).count();
 
+    // Exactly one, as did-hosting-server, webvh-witness and webvh-watcher
+    // require: a control plane with no store cannot start, and with several
+    // the one it picks is an accident of cfg ordering.
     if enabled_count == 0 {
-        println!(
-            "cargo:warning=No storage backend feature enabled! Enable one of: store-fjall, store-redis, store-dynamodb, store-firestore, store-cosmosdb"
+        panic!(
+            "No storage backend selected. Enable exactly one: \
+             store-fjall, store-redis, store-dynamodb, store-firestore, or store-cosmosdb"
         );
     }
     if enabled_count > 1 {
-        println!(
-            "cargo:warning=Multiple storage backend features enabled — only one will be used at runtime."
+        panic!(
+            "Multiple storage backends selected. Enable exactly one: \
+             store-fjall, store-redis, store-dynamodb, store-firestore, or store-cosmosdb"
         );
     }
 

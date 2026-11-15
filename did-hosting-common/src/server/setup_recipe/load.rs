@@ -377,6 +377,9 @@ pub fn vta_mode_str(mode: VtaMode) -> &'static str {
 }
 
 #[cfg(test)]
+// `std::env::set_var` / `remove_var` are `unsafe` in edition 2024; these tests
+// mutate the process environment, so they opt out of the workspace ban.
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use crate::server::setup_recipe::schema::{

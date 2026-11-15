@@ -24,7 +24,7 @@
 //!
 //! ## Why not `did_hosting_common::server::trust_tasks::build_dispatcher`
 //!
-//! That dispatcher's [`TrustTaskContext`] carries `acl_ks`, `acl_locks` and
+//! That dispatcher's [`TrustTaskContext`](did_hosting_common::server::trust_tasks::TrustTaskContext) carries `acl_ks`, `acl_locks` and
 //! `my_vid` — it is the ACL family's context. Auth needs session storage,
 //! challenge tracking and token minting, which live on the control plane's
 //! `AppState`. Widening the shared context to carry control-plane state would
@@ -64,7 +64,7 @@
 //!
 //! An authenticate document may name a `sessionKey`, a `did:key` the producer
 //! holds. It sits inside the payload, so the subject's own proof is what
-//! authorises the binding. [`authenticate_arm`] stores its Ed25519 multikey on
+//! authorises the binding. `authenticate_arm` stores its Ed25519 multikey on
 //! the new session row, exactly as a passkey login stores its browser key. From
 //! then on the HTTPS binding accepts that key's `authentication` proofs as the
 //! subject:
