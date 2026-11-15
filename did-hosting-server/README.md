@@ -379,8 +379,7 @@ work but are deprecated, and the `DID_HOSTING_` name wins when both are set.
 | `DID_HOSTING_SERVER_DID`                    | Server DID identifier              |
 | `DID_HOSTING_PUBLIC_URL`                    | Public URL of the server           |
 | `DID_HOSTING_MEDIATOR_DID`                  | Mediator DID identifier            |
-| `DID_HOSTING_FEATURES_DIDCOMM`             | Enable DIDComm (`true` / `1`)      |
-| `DID_HOSTING_FEATURES_REST_API`            | Enable REST API (`true` / `1`)     |
+| `DID_HOSTING_FEATURES_DIDCOMM`             | Enable DIDComm (`1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off`; anything else is refused) |
 | `DID_HOSTING_SERVER_HOST`                   | Bind host                          |
 | `DID_HOSTING_SERVER_PORT`                   | Bind port                          |
 | `DID_HOSTING_LOG_LEVEL`                     | Log level                          |
@@ -462,6 +461,11 @@ enabled by default.
 
 ## CLI Commands
 
+Every subcommand, with its full `--help`, is in
+[`docs/cli-reference.md`](../docs/cli-reference.md), generated from the CLI
+(a test keeps it current). Below is a summary. `health` exits non-zero when a
+check fails (`--strict`: also when one warns).
+
 ```
 did-hosting-server                      # Run server (default)
 did-hosting-server setup                # Interactive config wizard
@@ -483,7 +487,7 @@ did-hosting-server restore              # Restore data from backup file
 ### Backup & Restore
 
 ```bash
-# Backup to default file (webvh-backup.json)
+# Backup to default file (did-hosting-backup.json)
 did-hosting-server backup
 
 # Backup to a specific file
@@ -557,19 +561,26 @@ cargo build --locked --example perf_test -p did-hosting-server
 cargo run --example perf_test -p did-hosting-server -- [OPTIONS]
 ```
 
-The tool supports two modes: **server mode** (default) authenticates
-with a DID Hosting server and discovers DIDs automatically, while
-**file mode** (`--did-file`) reads `did:webvh:...` identifiers from
-a file and works against any hosted WebVH DID without needing
-ACL access.
+The tool supports two modes. **Server mode** (default) signs Trust Tasks
+to a DID Hosting control plane (`did-hosting-control`, or a
+`did-hosting-daemon`'s embedded one) over `POST /api/trust-tasks`, lists
+its active DIDs and resolves each at its hosting URL; it needs
+`--webvh-did` (the service's DID, which every request is addressed to and
+every reply must be signed by) and, when DIDs resolve on a different
+origin than the management URL, `--hosting-url`. **File mode**
+(`--did-file`) reads `did:webvh:...` identifiers from a file and works
+against any hosted WebVH DID without needing ACL access.
 
 ### Options
 
 | Flag | Short | Default | Description |
 | ---- | ----- | ------- | ----------- |
-| `--server-url` | `-s` | `http://localhost:8530` | DID Hosting server URL |
+| `--server-url` | `-s` | `http://localhost:8530` | Management URL (the control plane's, or the daemon's) |
+| `--hosting-url` | | `--server-url` | Public URL DID logs are served from, when it differs from the management URL |
+| `--webvh-did` | | | The service's DID (required in server mode) |
 | `--rate` | `-r` | `10` | Target requests per second (adjustable at runtime) |
 | `--workers` | `-w` | `64` | Maximum concurrent in-flight requests |
+| `--threads` | `-T` | CPU cores | Tokio worker threads |
 | `--timeout` | `-t` | `5` | Request timeout in seconds |
 | `--create-dids` | | `0` | Number of random DIDs to create on startup |
 | `--create-parallel` | | `4` | Parallel concurrency for DID creation |

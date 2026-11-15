@@ -9,6 +9,7 @@ use did_hosting_common::server::error::AppError;
 
 /// Daemon-level configuration combining all services.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     /// Shared listener config (single port for all services).
     #[serde(default = "default_server")]
@@ -52,7 +53,7 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub registry: did_hosting_control::config::RegistryConfig,
 
-    /// Feature flags (didcomm, rest_api).
+    /// Feature flags (didcomm, tsp, http_listener).
     #[serde(default)]
     pub features: FeaturesConfig,
 
@@ -131,6 +132,7 @@ fn default_witness_store() -> StoreConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnableConfig {
     #[serde(default = "default_true")]
     pub server: bool,
@@ -240,7 +242,7 @@ impl DaemonConfig {
         did_hosting_common::server::config::apply_hosting_env_overrides(
             "DAEMON",
             &mut config.hosting,
-        );
+        )?;
 
         if let Ok(v) = std::env::var("DID_HOSTING_IDENTITY_MODE") {
             config.identity.mode = match v.to_ascii_lowercase().as_str() {
@@ -404,9 +406,9 @@ impl DaemonConfig {
         FeaturesConfig {
             didcomm: self.features.didcomm,
             tsp: self.features.tsp,
-            rest_api: self.features.rest_api,
+            http_listener: self.features.http_listener,
             agent_names: self.features.agent_names,
-            deployment_mode: "daemon".to_string(),
+            deployment_mode: did_hosting_common::server::config::DeploymentMode::Daemon,
         }
     }
 }
@@ -492,7 +494,6 @@ data_dir = "data/daemon/witness"
 [auth]
 
 [secrets]
-plaintext = { signing_key = "z3uABC", key_agreement_key = "z3uDEF", jwt_signing_key = "z3uGHI" }
 "#;
 
     /// Minimal VTA-mode config (the back-compat case — no `[identity]`
@@ -518,7 +519,6 @@ data_dir = "data/daemon/witness"
 [auth]
 
 [secrets]
-plaintext = { signing_key = "z3uABC", key_agreement_key = "z3uDEF", jwt_signing_key = "z3uGHI" }
 
 [vta]
 url = "https://vta.example.com"
@@ -532,6 +532,45 @@ context_id = "webvh"
         let mut f = std::fs::File::create(&path).expect("create config");
         f.write_all(contents.as_bytes()).expect("write config");
         (dir, path)
+    }
+
+    /// What the setup wizard and recipe write (a serialised `DaemonConfig`)
+    /// loads back under the strict parser; misspelt keys are refused.
+    #[test]
+    fn a_written_config_loads_and_typos_are_refused() {
+        let (_dir, path) = write_temp_config(SELF_MANAGED_TOML);
+        let mut cfg = DaemonConfig::load(Some(path.clone())).expect("load");
+        cfg.features.didcomm = true;
+        cfg.features.http_listener = true;
+        cfg.hosting.disable_purge_grace =
+            did_hosting_common::server::config::GracePeriod::parse("3d").unwrap();
+        cfg.enable.watcher = true;
+        std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        let loaded = DaemonConfig::load(Some(path.clone())).expect("written config loads");
+        assert!(loaded.features.didcomm && loaded.features.http_listener);
+        assert!(loaded.enable.watcher);
+        assert_eq!(
+            loaded
+                .control_config()
+                .hosting
+                .disable_purge_grace
+                .as_secs(),
+            3 * 86_400
+        );
+        assert_eq!(
+            loaded.control_config().features.deployment_mode,
+            did_hosting_common::server::config::DeploymentMode::Daemon
+        );
+
+        for bad in [
+            "[enable]\nwitnes = false\n",
+            "[limits]\nupload_limit = 5\n",
+            "[hosting]\nunassigned_purge_grace = \"2 weeks\"\n",
+            "public_ulr = \"https://x.example.com\"\n",
+        ] {
+            let (_dir, path) = write_temp_config(&format!("{SELF_MANAGED_TOML}\n{bad}"));
+            assert!(DaemonConfig::load(Some(path)).is_err(), "{bad}");
+        }
     }
 
     #[test]

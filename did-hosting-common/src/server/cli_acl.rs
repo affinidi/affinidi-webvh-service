@@ -45,6 +45,8 @@ pub async fn run_add_acl(
     };
 
     store_acl_entry(&acl_ks, &entry).await?;
+    // Make the entry durable before reporting it, as `run_remove_acl` does.
+    store.persist().await?;
 
     eprintln!();
     eprintln!("  ACL entry created!");
@@ -76,12 +78,13 @@ pub async fn run_list_acl(store_config: &StoreConfig) -> Result<(), Box<dyn std:
         return Ok(());
     }
 
-    eprintln!();
-    eprintln!(
+    // The table is the command's output (stdout, so it can be piped); the
+    // count after it is a diagnostic (stderr).
+    println!(
         "  {:<50} {:<8} {:<15} {:<15} LABEL",
         "DID", "ROLE", "MAX SIZE", "MAX DIDS"
     );
-    eprintln!("  {}", "-".repeat(100));
+    println!("  {}", "-".repeat(100));
 
     for entry in &entries {
         let max_size = entry
@@ -93,7 +96,7 @@ pub async fn run_list_acl(store_config: &StoreConfig) -> Result<(), Box<dyn std:
             .map(|c| c.to_string())
             .unwrap_or_else(|| "-".into());
         let label = entry.label.as_deref().unwrap_or("-");
-        eprintln!(
+        println!(
             "  {:<50} {:<8} {:<15} {:<15} {}",
             entry.did, entry.role, max_size, max_dids, label
         );

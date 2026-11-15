@@ -7,7 +7,7 @@
 # context credential go to the secrets backend.
 #
 # Online mode needs a setup key first:
-#   webvh-watcher setup --setup-key-out setup-key.json --context webvh
+#   webvh-watcher setup --setup-key-out setup-key.json --context did-hosting
 #   (run the printed `pnm contexts create` command)
 #   webvh-watcher setup --from webvh-watcher-build.toml --setup-key-file setup-key.json
 # ============================================================================
@@ -32,7 +32,7 @@ mediator_did = "did:webvh:mediator.example.com"
 
 [vta]
 did = "did:webvh:vta.example.com"
-context_id = "webvh"
+context_id = "did-hosting"
 
 [secrets]
 backend = "keyring"

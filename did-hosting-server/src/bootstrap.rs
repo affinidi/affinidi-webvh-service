@@ -360,14 +360,22 @@ pub async fn replace_own_did(
 /// It names the targeted fix. Deleting the whole store (`data/`) also clears
 /// it, and is what a workaround would reach for, but it removes **every** DID
 /// the service hosts — every tenant's, not just its own.
-pub fn stale_own_did_message(path: &str, existing: Option<&str>, minted: &str) -> String {
+///
+/// `bin` is the binary the operator runs (`did-hosting-server`,
+/// `did-hosting-daemon`), so the command it names is one they have.
+pub fn stale_own_did_message(
+    bin: &str,
+    path: &str,
+    existing: Option<&str>,
+    minted: &str,
+) -> String {
     format!(
         "the store already holds a different DID at '{path}' ({existing}), not the one this \
          setup minted ({minted}). This usually means `public_url` changed: the old DID is \
          still bound to the previous hostname, and serving it from the new one returns 404.\n\
          Remove just that DID and re-run setup:\n  \
-         did-hosting-server remove-did --path {path}\n\
-         (Deleting the data directory also clears it, but removes every DID this daemon \
+         {bin} remove-did --path {path}\n\
+         (Deleting the data directory also clears it, but removes every DID this service \
          hosts, not only its own.)",
         existing = existing.unwrap_or("an unidentified DID"),
     )
@@ -717,8 +725,16 @@ mod own_did_import_tests {
     /// deleting the data directory takes every tenant's DID with it.
     #[test]
     fn the_refusal_names_the_targeted_fix() {
-        let msg = stale_own_did_message(".well-known", Some("did:webvh:old"), "did:webvh:new");
-        assert!(msg.contains("remove-did --path .well-known"), "{msg}");
+        let msg = stale_own_did_message(
+            "did-hosting-daemon",
+            ".well-known",
+            Some("did:webvh:old"),
+            "did:webvh:new",
+        );
+        assert!(
+            msg.contains("did-hosting-daemon remove-did --path .well-known"),
+            "{msg}"
+        );
         assert!(
             msg.contains("did:webvh:old") && msg.contains("did:webvh:new"),
             "{msg}"

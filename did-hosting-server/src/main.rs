@@ -37,8 +37,8 @@ enum Command {
         /// interactive "Has the context been created?" confirmation.
         #[arg(long, conflicts_with = "setup_key_out")]
         setup_key_file: Option<PathBuf>,
-        /// Context id for phase 1's PNM command. Defaults to `webvh`.
-        #[arg(long, default_value = "webvh", requires = "setup_key_out")]
+        /// Context id for phase 1's PNM command. Defaults to `did-hosting`.
+        #[arg(long, default_value = "did-hosting", requires = "setup_key_out")]
         context: String,
         /// Path to a declarative setup recipe TOML. Drives the wizard
         /// non-interactively — see `examples/did-hosting-server-build.toml`.
@@ -65,8 +65,14 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Run health check diagnostics
-    Health,
+    /// Run health check diagnostics. Exits non-zero when a check fails (or,
+    /// with --strict, warns), so it can gate a deploy or a container probe.
+    Health {
+        /// Also exit non-zero when a check only warned (a store held by the
+        /// running service, plaintext secrets, a non-2xx reachability probe).
+        #[arg(long)]
+        strict: bool,
+    },
     /// List the service's own identity generations (key material still honoured).
     IdentityList,
     /// List this service's established TSP relationships (offline; stop the
@@ -165,7 +171,7 @@ enum Command {
     /// Export server data to a backup file
     Backup {
         /// Output file path (use "-" for stdout)
-        #[arg(short, long, default_value = "webvh-backup.json")]
+        #[arg(short, long, default_value = "did-hosting-backup.json")]
         output: String,
     },
     /// Restore server data from a backup file.
@@ -190,7 +196,7 @@ enum Command {
     /// including one since removed with `remove-did`.
     LoadDid {
         /// Path to store the DID at (e.g., "services/control")
-        #[arg(long)]
+        #[arg(long, visible_alias = "mnemonic")]
         path: String,
         /// Path to the did.jsonl file
         #[arg(long)]
@@ -202,14 +208,14 @@ enum Command {
     /// Recreate a DID at a given path (deletes existing, creates new, updates config)
     RecreateDid {
         /// DID path/mnemonic to recreate (e.g. "webvh/server1")
-        #[arg(long)]
+        #[arg(long, visible_alias = "mnemonic")]
         path: String,
     },
     /// Bootstrap a DID for this server (defaults to root .well-known)
     BootstrapDid {
         /// DID path/mnemonic to bootstrap (e.g. "my-org", "services/auth")
         /// Defaults to ".well-known" (the root DID for this server)
-        #[arg(long, default_value = ".well-known")]
+        #[arg(long, visible_alias = "mnemonic", default_value = ".well-known")]
         path: String,
         /// Path to an existing did.jsonl file to import
         #[arg(long)]
@@ -233,13 +239,13 @@ enum Command {
     /// Recover a soft-deleted DID
     RecoverDid {
         /// DID path/mnemonic to recover (e.g. "webvh/server1")
-        #[arg(long)]
+        #[arg(long, visible_alias = "mnemonic")]
         path: String,
     },
     /// Dump the DID log (did.jsonl) for a given path
     DumpDid {
         /// DID path/mnemonic to dump (e.g. ".well-known", "my-org")
-        #[arg(long)]
+        #[arg(long, visible_alias = "mnemonic")]
         path: String,
         /// Also dump the witness proof (did-witness.json)
         #[arg(long)]
@@ -250,7 +256,7 @@ enum Command {
     /// Remove a DID and all its data from the store
     RemoveDid {
         /// DID path/mnemonic to remove (e.g. "glenn", ".well-known")
-        #[arg(long)]
+        #[arg(long, visible_alias = "mnemonic")]
         path: String,
     },
     /// Export this server's DID + signing/KA keys as an HPKE-sealed
@@ -369,17 +375,18 @@ enum Command {
         /// Operator-visible label identifying this request.
         #[arg(long, default_value = "did-hosting-server")]
         label: String,
-        /// Public URL where this server serves DIDs. Bound to the
-        /// `did-hosting-daemon` template's `URL` variable so the rendered DID
-        /// exposes a `WebVHHosting` service at this URL. Runtime DIDComm
-        /// (sync from the control plane) uses the daemon's separately
-        /// configured mediator and is not embedded in this DID document.
+        /// Public URL where this server serves DIDs (e.g.
+        /// `https://server1.example.com`). It names where the VTA publishes
+        /// the DID's log and, through its path, the DID path. With
+        /// `--mediator-did` the DID advertises only its messaging transports
+        /// (`TSPTransport` / `DIDCommMessaging`), not this URL; only an
+        /// HTTP-only DID (no mediator) carries a `WebVHHosting` service here.
         #[arg(long)]
         public_url: String,
         /// VTA context the integration will live in. Embedded as
         /// `contextHint` in the request so the VTA admin can run
         /// `vta bootstrap provision-integration` without `--context`.
-        #[arg(long, default_value = "webvh")]
+        #[arg(long, default_value = "did-hosting")]
         context: String,
         /// DIDComm mediator DID to advertise on this server's DID. When set,
         /// the rendered DID exposes a `TSPTransport` and/or `DIDCommMessaging`
@@ -474,11 +481,12 @@ async fn main() {
                 }
             }
         }
-        Some(Command::Health) => {
-            if let Err(e) = health::run_health(cli.config).await {
-                eprintln!("Health check error: {e}");
-                std::process::exit(1);
-            }
+        Some(Command::Health { strict }) => {
+            let code = did_hosting_common::server::health::finish(
+                health::run_health(cli.config).await,
+                strict,
+            );
+            std::process::exit(code);
         }
         Some(Command::IdentityRotateKeys {
             keys,
@@ -1073,40 +1081,8 @@ async fn run_dump_did(
     mnemonic: String,
     witness: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use did_hosting_common::did_ops::{content_log_key, content_witness_key, did_key};
-
     let config = AppConfig::load(config_path)?;
-    let store_handle = store::Store::open(&config.store).await?;
-    let dids_ks = store_handle.keyspace(KS_DIDS)?;
-
-    // Verify the DID exists
-    let _: did_hosting_common::did_ops::DidRecord = dids_ks
-        .get(did_key(&mnemonic))
-        .await?
-        .ok_or(format!("DID not found at path '{mnemonic}'"))?;
-
-    // Dump did.jsonl to stdout
-    let log_bytes = dids_ks
-        .get_raw(content_log_key(&mnemonic))
-        .await?
-        .ok_or(format!("no log content for path '{mnemonic}'"))?;
-    let log = String::from_utf8(log_bytes)
-        .map_err(|_| format!("invalid UTF-8 in log content for '{mnemonic}'"))?;
-    print!("{log}");
-
-    // Optionally dump witness
-    if witness {
-        if let Some(witness_bytes) = dids_ks.get_raw(content_witness_key(&mnemonic)).await? {
-            let witness_str = String::from_utf8(witness_bytes)
-                .map_err(|_| format!("invalid UTF-8 in witness content for '{mnemonic}'"))?;
-            eprintln!("--- did-witness.json ---");
-            print!("{witness_str}");
-        } else {
-            eprintln!("(no witness content)");
-        }
-    }
-
-    Ok(())
+    did_hosting_common::server::cli_dids::run_dump_did(&config.store, &mnemonic, witness).await
 }
 
 async fn run_list_dids(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
@@ -1747,4 +1723,9 @@ async fn run_identity_rotate_keys(
     eprintln!();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_reference_tests {
+    did_hosting_common::cli_reference_test!(super::Cli, "did-hosting-server");
 }

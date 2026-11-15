@@ -8,10 +8,11 @@ pub use did_hosting_common::server::config::{
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     /// Which transports the Trust Task listener carries on the mediator
     /// connection (`didcomm`, `tsp`), and whether the HTTP listener
-    /// (resolution and `POST /api/trust-tasks`) runs (`rest_api`).
+    /// (resolution and `POST /api/trust-tasks`) runs (`http_listener`, formerly `rest_api`).
     #[serde(default)]
     pub features: FeaturesConfig,
     /// The watcher's own DID, whose keys live in a VTA context: it signs every
@@ -54,6 +55,7 @@ pub struct AppConfig {
 
 /// Where the watcher takes its content from.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SyncConfig {
     /// The DIDs of the control planes this watcher mirrors. A
     /// `webvh/sync/*` document is applied only when its proof binds it to one
@@ -217,6 +219,32 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the setup wizard and recipe write (a serialised `AppConfig`)
+    /// loads back under the strict parser; misspelt keys are refused.
+    #[test]
+    fn a_written_config_loads_and_typos_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = AppConfig {
+            server_did: Some("did:webvh:abc:watcher.example.com".into()),
+            ..AppConfig::default()
+        };
+        config.features.http_listener = true;
+        config.sync.source_dids = vec!["did:webvh:def:control.example.com".into()];
+        std::fs::write(&path, toml::to_string_pretty(&config).unwrap()).unwrap();
+        let loaded = AppConfig::load(Some(path.clone())).expect("written config loads");
+        assert!(loaded.features.http_listener);
+        assert_eq!(loaded.sync.source_count(), 1);
+
+        for bad in [
+            "[sync]\nsource_did = []\n",
+            "mediatr_did = \"did:example:x\"\n",
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(AppConfig::load(Some(path.clone())).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn sources_with_domains_parse_beside_source_dids() {

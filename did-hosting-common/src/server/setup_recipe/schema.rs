@@ -563,10 +563,9 @@ impl SetupRecipe {
         match service {
             ServiceKind::Server => 8530,
             ServiceKind::Control => 8532,
+            ServiceKind::Witness => 8531,
             ServiceKind::Watcher => 8533,
-            // Daemon and witness both default to 8534 in their wizards;
-            // operators usually pick one or the other on a host.
-            ServiceKind::Daemon | ServiceKind::Witness => 8534,
+            ServiceKind::Daemon => 8534,
         }
     }
 
