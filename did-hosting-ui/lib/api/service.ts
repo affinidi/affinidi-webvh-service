@@ -15,11 +15,62 @@ import type * as IdentityRetire from "../trust-tasks/did-management/identity/ret
 import type { Response as ServerInfo } from "../trust-tasks/did-management/server/info/0.1/payload";
 import { request } from "../http";
 import { getServiceInfo, trustTask } from "../trust-task";
-import { configFromWire, identityFromWire, serviceInstanceFromWire, statsFromWire, timeRangeToWire, timeseriesFromWire } from "../wire";
+import {
+  configFromWire,
+  identityFromWire,
+  serviceInstanceFromWire,
+  statsFromWire,
+  timeRangeToWire,
+  timeseriesFromWire,
+} from "../wire";
 import { withStepUp } from "./auth";
 import { T } from "./tasks";
-import type { ControlPlaneConfig, DidStats, HealthResponse, IdentityGenerationsResponse, ServerStats, ServiceInstance, ServiceOverview, TimeRange, TimeSeriesPoint } from "./types";
+import type {
+  ControlPlaneConfig,
+  DidStats,
+  HealthResponse,
+  IdentityGenerationsResponse,
+  ServerStats,
+  ServiceInstance,
+  ServiceOverview,
+  TimeRange,
+  TimeSeriesPoint,
+} from "./types";
 import type { ReadOptions } from "./tasks";
+
+/**
+ * The service overview the dashboard shows, from its three reads. Pure, so a
+ * screen that already holds the reads (cached, polled) composes it without a
+ * fourth request.
+ */
+export function buildServiceOverview(
+  config: ControlPlaneConfig,
+  services: ServiceInstance[],
+  stats: ServerStats,
+): ServiceOverview {
+  const count = (s: ServiceInstance["status"]) => services.filter((i) => i.status === s).length;
+  return {
+    control: {
+      version: config.softwareVersion,
+      serverDid: config.controlDid,
+      publicUrl: config.publicUrl,
+      didcommEnabled: config.didcommEnabled,
+      tspEnabled: config.tspEnabled,
+      ...(config.advertisedServices ? { advertisedServices: config.advertisedServices } : {}),
+      enabledMethods: config.enabledMethods,
+    },
+    services,
+    aggregate: {
+      totalServices: services.length,
+      activeServices: count("active"),
+      degradedServices: count("degraded"),
+      unreachableServices: count("unreachable"),
+      totalDids: stats.totalDids,
+      totalResolves: stats.totalResolves,
+      totalUpdates: stats.totalUpdates,
+    },
+  };
+}
 
 export const serviceApi = {
   /** Unauthenticated liveness probe. Plain HTTP by design. */
@@ -56,30 +107,35 @@ export const serviceApi = {
     ),
 
   getServerStats: async (opts: ReadOptions = {}): Promise<ServerStats> =>
-    statsFromWire(
-      await trustTask<StatsGet.Payload, StatsGet.Response>(T.statsGet, {}, opts),
-    ),
+    statsFromWire(await trustTask<StatsGet.Payload, StatsGet.Response>(T.statsGet, {}, opts)),
 
   getServerTimeseries: async (
     range: TimeRange = "24h",
     domain?: string,
+    opts: ReadOptions = {},
   ): Promise<TimeSeriesPoint[]> =>
     timeseriesFromWire(
-      await trustTask<StatsTimeseries.Payload, StatsTimeseries.Response>(T.statsTimeseries, {
-        range: timeRangeToWire(range),
-        ...(domain ? { domain } : {}),
-      }),
+      await trustTask<StatsTimeseries.Payload, StatsTimeseries.Response>(
+        T.statsTimeseries,
+        {
+          range: timeRangeToWire(range),
+          ...(domain ? { domain } : {}),
+        },
+        opts,
+      ),
     ),
 
   getDidTimeseries: async (
     mnemonic: string,
     range: TimeRange = "24h",
+    opts: ReadOptions = {},
   ): Promise<TimeSeriesPoint[]> =>
     timeseriesFromWire(
-      await trustTask<StatsTimeseries.Payload, StatsTimeseries.Response>(T.statsTimeseries, {
-        range: timeRangeToWire(range),
-        mnemonic,
-      }),
+      await trustTask<StatsTimeseries.Payload, StatsTimeseries.Response>(
+        T.statsTimeseries,
+        { range: timeRangeToWire(range), mnemonic },
+        opts,
+      ),
     ),
 
   // ---- The deployment ----
@@ -96,29 +152,7 @@ export const serviceApi = {
       serviceApi.listRegistry(opts),
       serviceApi.getServerStats(opts),
     ]);
-    const count = (s: ServiceInstance["status"]) =>
-      services.filter((i) => i.status === s).length;
-    return {
-      control: {
-        version: config.softwareVersion,
-        serverDid: config.controlDid,
-        publicUrl: config.publicUrl,
-        didcommEnabled: config.didcommEnabled,
-        tspEnabled: config.tspEnabled,
-        ...(config.advertisedServices ? { advertisedServices: config.advertisedServices } : {}),
-        enabledMethods: config.enabledMethods,
-      },
-      services,
-      aggregate: {
-        totalServices: services.length,
-        activeServices: count("active"),
-        degradedServices: count("degraded"),
-        unreachableServices: count("unreachable"),
-        totalDids: stats.totalDids,
-        totalResolves: stats.totalResolves,
-        totalUpdates: stats.totalUpdates,
-      },
-    };
+    return buildServiceOverview(config, services, stats);
   },
 
   listRegistry: async (opts: ReadOptions = {}): Promise<ServiceInstance[]> =>
@@ -148,11 +182,10 @@ export const serviceApi = {
    *  (`withStepUp`). */
   purgeDomainOnServer: async (instanceId: string, domain: string): Promise<void> => {
     await withStepUp(() =>
-      trustTask<RegistryPurgeDomain.Payload, RegistryPurgeDomain.Response>(
-        T.registryPurgeDomain,
-        { instanceId, domain },
-      ),
+      trustTask<RegistryPurgeDomain.Payload, RegistryPurgeDomain.Response>(T.registryPurgeDomain, {
+        instanceId,
+        domain,
+      }),
     );
   },
-
 };

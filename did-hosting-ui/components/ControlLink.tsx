@@ -16,6 +16,7 @@
 import { View, Text, StyleSheet } from "react-native";
 import { colors, fonts, radii } from "../lib/theme";
 import type { ObservedTransport } from "../lib/api";
+import { formatRelative } from "../lib/time";
 
 const TRANSPORT_LABELS: Record<ObservedTransport, string> = {
   tsp: "TSP",
@@ -29,14 +30,9 @@ const TRANSPORT_COLORS: Record<ObservedTransport, { bg: string; fg: string }> = 
   https: { bg: "rgba(59, 113, 255, 0.15)", fg: colors.accentHover },
 };
 
+/** When `epoch` was, relative to now; `null` when it never was. */
 function timeAgo(epoch?: number): string | null {
-  if (!epoch) return null;
-  const secs = Math.floor(Date.now() / 1000) - epoch;
-  if (secs < 5) return "just now";
-  if (secs < 60) return `${secs}s ago`;
-  if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
-  if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
-  return `${Math.floor(secs / 86400)}d ago`;
+  return epoch ? formatRelative(epoch) : null;
 }
 
 function Direction({
@@ -56,12 +52,7 @@ function Direction({
       <Text style={styles.arrow}>{arrow}</Text>
       <Text style={styles.dirLabel}>{label}</Text>
       {transport ? (
-        <View
-          style={[
-            styles.chip,
-            { backgroundColor: TRANSPORT_COLORS[transport].bg },
-          ]}
-        >
+        <View style={[styles.chip, { backgroundColor: TRANSPORT_COLORS[transport].bg }]}>
           <Text style={[styles.chipText, { color: TRANSPORT_COLORS[transport].fg }]}>
             {TRANSPORT_LABELS[transport]}
           </Text>
@@ -88,18 +79,8 @@ export function ControlLink({
   return (
     <View style={styles.block}>
       <Text style={styles.heading}>Control link</Text>
-      <Direction
-        arrow="↓"
-        label="in"
-        transport={lastInboundTransport}
-        at={lastInboundAt}
-      />
-      <Direction
-        arrow="↑"
-        label="out"
-        transport={lastOutboundTransport}
-        at={lastOutboundAt}
-      />
+      <Direction arrow="↓" label="in" transport={lastInboundTransport} at={lastInboundAt} />
+      <Direction arrow="↑" label="out" transport={lastOutboundTransport} at={lastOutboundAt} />
     </View>
   );
 }
