@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useCallback, useEffect } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import {
   api,
   decodeJwtPayload,
@@ -7,6 +7,7 @@ import {
   restoreSession,
   setToken as storeToken,
 } from "../lib/api";
+import { clearQueryCache } from "../lib/query";
 
 interface AuthState {
   token: string | null;
@@ -75,6 +76,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setTokenState(t);
   }, []);
 
+  const claims = useMemo(
+    () => (token ? decodeJwtClaims(token) : { role: null, did: null }),
+    [token],
+  );
+
+  // Reads are cached per key, not per session: when the signed-in subject
+  // changes (sign-out, or another account), drop what the last one loaded so
+  // it is never painted for the next.
+  useEffect(() => () => clearQueryCache(), [claims.did]);
+
   const logout = useCallback(() => {
     // Revoke at the control plane before the session key is dropped: the
     // revoke is signed with it. The screen signs out at once either way.
@@ -86,7 +97,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     <AuthContext.Provider
       value={{
         token,
-        ...( token ? decodeJwtClaims(token) : { role: null, did: null }),
+        ...claims,
         isAuthenticated: !!token,
         restored,
         login,
