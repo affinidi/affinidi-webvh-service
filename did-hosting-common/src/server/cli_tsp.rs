@@ -60,22 +60,22 @@ pub async fn run_list(store_config: &StoreConfig) -> CliResult {
         .approximate_len()
         .await?;
 
-    eprintln!();
+    println!();
     if established.is_empty() {
         eprintln!("  No established TSP relationships.");
     } else {
         let now_ms = crate::server::auth::session::now_epoch() * 1000;
         for (our, their) in &established {
-            eprintln!("  {their}");
-            eprintln!("    local VID   : {our}");
+            println!("  {their}");
+            println!("    local VID   : {our}");
             match relationships.last_active(our, their).await? {
-                Some(at_ms) => eprintln!(
+                Some(at_ms) => println!(
                     "    last active : {} ago",
                     format_age(now_ms.saturating_sub(at_ms) / 1000)
                 ),
-                None => eprintln!("    last active : never recorded"),
+                None => println!("    last active : never recorded"),
             }
-            eprintln!();
+            println!();
         }
     }
     if records > 0 {

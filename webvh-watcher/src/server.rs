@@ -110,7 +110,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     )
     .await;
 
-    let std_listener = if config.features.rest_api {
+    let std_listener = if config.features.http_listener {
         let addr = format!("{}:{}", config.server.host, config.server.port);
         let listener = std::net::TcpListener::bind(&addr).map_err(AppError::Io)?;
         listener.set_nonblocking(true).map_err(AppError::Io)?;

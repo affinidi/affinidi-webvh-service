@@ -21,7 +21,7 @@ use did_hosting_common::server::setup_recipe::{
     back_up_config, inspect_existing, load_recipe, print_recipe_banner, refuse_overwrite,
     require_service, resolve_secrets_config, run_vta_for_recipe, to_log_format,
 };
-use did_hosting_common::server::vta_setup;
+use did_hosting_common::server::{setup_prompts, vta_setup};
 use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages};
 
 use crate::config::{
@@ -88,10 +88,7 @@ pub async fn run_wizard(
         .with_prompt("Configuration file path")
         .default(default_path)
         .interact_text()?;
-    let host: String = Input::new()
-        .with_prompt("Listen host")
-        .default("0.0.0.0".to_string())
-        .interact_text()?;
+    let host = setup_prompts::prompt_listen_host("0.0.0.0")?;
     let port: u16 = Input::new()
         .with_prompt("Listen port")
         .default(SetupRecipe::default_port(ServiceKind::Watcher))
@@ -105,23 +102,28 @@ pub async fn run_wizard(
     eprintln!("  Sources: the DIDs of the control planes this watcher mirrors.");
     eprintln!("  A sync signed by anyone else is refused.");
     eprintln!();
-    let sources_raw: String = Input::new()
-        .with_prompt("Source control-plane DIDs (comma-separated)")
-        .interact_text()?;
-    let source_dids: Vec<String> = sources_raw
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let source_dids: Vec<String> = loop {
+        let sources_raw: String = Input::new()
+            .with_prompt("Source control-plane DIDs (comma-separated)")
+            .interact_text()?;
+        match sources_raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(setup_prompts::validate_did)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(dids) => break dids,
+            Err(reason) => eprintln!("  {reason}"),
+        }
+    };
 
-    let vta_did: String = Input::new()
-        .with_prompt("VTA DID (e.g. did:webvh:vta.example.com)")
-        .interact_text()?;
+    let vta_did = setup_prompts::prompt_did("VTA DID (e.g. did:webvh:vta.example.com)", false)?;
     let context_id: String = Input::new()
         .with_prompt("VTA context ID")
-        .default("webvh".to_string())
+        .default("did-hosting".to_string())
         .interact_text()?;
-    let vta_mediator = vta_setup::resolve_vta_mediator(&vta_did).await;
+    let vta_mediator = vta_setup::discover_vta_mediator(&vta_did).await;
     let mut options: Vec<String> = Vec::new();
     if let Some(ref did) = vta_mediator {
         options.push(format!("Use VTA's mediator ({did})"));
@@ -134,7 +136,7 @@ pub async fn run_wizard(
         .interact()?;
     let mediator_did = match vta_mediator.filter(|_| options[idx].starts_with("Use VTA")) {
         Some(did) => did,
-        None => Input::new().with_prompt("Mediator DID").interact_text()?,
+        None => setup_prompts::prompt_did("Mediator DID", false)?,
     };
 
     let setup_key = match setup_key_file {
@@ -237,7 +239,7 @@ pub async fn apply_recipe(
         .vta
         .context_id
         .clone()
-        .unwrap_or_else(|| "webvh".to_string());
+        .unwrap_or_else(|| "did-hosting".to_string());
     // A mediator-reachable DID with no HTTP hosting endpoint: the watcher is
     // reached over TSP/DIDComm (and `POST /api/trust-tasks` by config).
     let mediator = recipe.identity.mediator_did.clone().unwrap_or_default();
@@ -301,7 +303,7 @@ pub async fn apply_recipe(
         features: FeaturesConfig {
             didcomm: has_mediator,
             tsp: has_mediator,
-            rest_api: true,
+            http_listener: true,
             ..Default::default()
         },
         server_did: Some(did.clone()),

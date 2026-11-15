@@ -1,3 +1,4 @@
+pub mod cli_reference;
 #[cfg(feature = "server-core")]
 mod client;
 pub mod did;

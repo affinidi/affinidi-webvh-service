@@ -176,13 +176,8 @@ pub(crate) async fn set_state(
     match p.state {
         set_state::v0_1::PayloadState::Active => store::enable_domain(&state.store, &name).await?,
         set_state::v0_1::PayloadState::Disabled => {
-            let grace_seconds =
-                pending_purge::parse_grace_string(&state.config.hosting.disable_purge_grace)
-                    .map_err(|e| {
-                        AppError::Internal(format!(
-                            "config [hosting] disable_purge_grace is invalid: {e}"
-                        ))
-                    })?;
+            // Parsed at config load: a bad value never gets this far.
+            let grace_seconds = state.config.hosting.disable_purge_grace.as_secs();
             store::disable_domain(&state.store, &name, now_epoch(), grace_seconds, &auth.did)
                 .await
                 .map_err(|e| match e {

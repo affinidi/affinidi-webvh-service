@@ -187,7 +187,7 @@ pub async fn apply_recipe(
         features: FeaturesConfig {
             didcomm: recipe.identity.mediator_did.is_some(),
             tsp: recipe.identity.mediator_did.is_some(),
-            rest_api: true,
+            http_listener: true,
             ..Default::default()
         },
         server_did: Some(witness_did.clone()),

@@ -110,27 +110,9 @@ pub async fn run_wizard(
     eprintln!("  unique URL and therefore a unique DID.");
     eprintln!();
     let public_url =
-        setup_prompts::prompt_long_value("Server URL (e.g. https://server1.example.com)", false)?;
-    let public_url = public_url.trim_end_matches('/').to_string();
-
-    // DID path derived from the URL's path component. With a bare host
-    // (`https://example.com`) the DID is published at `.well-known`;
-    // otherwise the URL path becomes the DID path.
-    let did_path = {
-        let after_scheme = public_url
-            .find("://")
-            .map(|i| &public_url[i + 3..])
-            .unwrap_or(&public_url);
-        let path = after_scheme
-            .find('/')
-            .map(|i| after_scheme[i..].trim_matches('/'))
-            .unwrap_or("");
-        if path.is_empty() {
-            ".well-known".to_string()
-        } else {
-            path.to_string()
-        }
-    };
+        setup_prompts::prompt_url("Server URL (e.g. https://server1.example.com)", false)?;
+    // The URL is validated, so the shared splitter sees a well-formed one.
+    let (_, did_path) = split_origin_and_did_path(&public_url);
 
     // 3. VTA online provision — mint ephemeral did:key, print PNM
     //    `contexts create` command, then drive run_provision.
@@ -210,7 +192,7 @@ pub async fn run_wizard(
         features: FeaturesConfig {
             didcomm,
             tsp,
-            rest_api: false,
+            http_listener: false,
             ..Default::default()
         },
         server_did: Some(outcome.integration_did.clone()),
@@ -293,6 +275,7 @@ pub async fn run_wizard(
                 crate::bootstrap::OwnDidImport::HeldByAnother { existing, minted } => {
                     return Err(Box::<dyn std::error::Error>::from(
                         crate::bootstrap::stale_own_did_message(
+                            "did-hosting-server",
                             &did_path,
                             existing.as_deref(),
                             &minted,
@@ -414,11 +397,10 @@ async fn run_online_provision(
     eprintln!();
     eprintln!("  Authenticating to the VTA.");
     eprintln!();
-    let vta_did =
-        setup_prompts::prompt_long_value("VTA DID (e.g. did:webvh:vta.example.com)", false)?;
+    let vta_did = setup_prompts::prompt_did("VTA DID (e.g. did:webvh:vta.example.com)", false)?;
     let context_id: String = Input::new()
         .with_prompt("Context ID")
-        .default("webvh".to_string())
+        .default("did-hosting".to_string())
         .interact_text()?;
 
     let setup_key = match preloaded_setup_key {
@@ -463,7 +445,7 @@ async fn run_online_provision(
     eprintln!();
     eprintln!("  A DIDComm mediator routes sync messages from the control plane.");
     eprintln!();
-    let vta_mediator = vta_setup::resolve_vta_mediator(&vta_did).await;
+    let vta_mediator = vta_setup::discover_vta_mediator(&vta_did).await;
     let mut mediator_options: Vec<String> = vec!["No mediator".into()];
     if let Some(ref did) = vta_mediator {
         mediator_options.push(format!("Use VTA's mediator ({did})"));
@@ -479,7 +461,7 @@ async fn run_online_provision(
     } else if mediator_options[mediator_idx].starts_with("Use VTA") {
         vta_mediator.clone()
     } else {
-        let did: String = setup_prompts::prompt_long_value("Mediator DID", false)?;
+        let did: String = setup_prompts::prompt_did("Mediator DID", false)?;
         if did.is_empty() { None } else { Some(did) }
     };
 
@@ -614,7 +596,7 @@ pub async fn run_setup_offline_prepare(
 
     eprintln!();
     let public_url =
-        setup_prompts::prompt_long_value("Server URL (e.g. https://server1.example.com)", false)?;
+        setup_prompts::prompt_url("Server URL (e.g. https://server1.example.com)", false)?;
     let public_url = public_url.trim_end_matches('/').to_string();
 
     // Origin + DID path from the URL's path component (matches the online
@@ -629,7 +611,7 @@ pub async fn run_setup_offline_prepare(
     eprintln!();
     let context_id: String = Input::new()
         .with_prompt("VTA context ID")
-        .default("webvh".to_string())
+        .default("did-hosting".to_string())
         .interact_text()?;
 
     eprintln!();
@@ -637,8 +619,7 @@ pub async fn run_setup_offline_prepare(
     eprintln!("  In the offline flow we can't auto-discover the VTA's mediator,");
     eprintln!("  so enter the mediator DID manually or skip.");
     eprintln!();
-    let mediator_raw =
-        setup_prompts::prompt_long_value("Mediator DID (leave empty to skip)", true)?;
+    let mediator_raw = setup_prompts::prompt_did("Mediator DID (leave empty to skip)", true)?;
     let mediator_did = if mediator_raw.trim().is_empty() {
         None
     } else {
@@ -807,7 +788,7 @@ pub async fn run_setup_offline_complete(
         features: FeaturesConfig {
             didcomm,
             tsp,
-            rest_api: false,
+            http_listener: false,
             ..Default::default()
         },
         server_did: Some(result.did.clone()),
@@ -896,6 +877,7 @@ pub async fn run_setup_offline_complete(
                 crate::bootstrap::OwnDidImport::HeldByAnother { existing, minted } => {
                     return Err(Box::<dyn std::error::Error>::from(
                         crate::bootstrap::stale_own_did_message(
+                            "did-hosting-server",
                             &state.did_path,
                             existing.as_deref(),
                             &minted,
@@ -974,7 +956,7 @@ pub fn update_server_did_in_config(
 /// The control plane's DID, which an edge requires: asked until one is given.
 fn prompt_control_did() -> Result<String, Box<dyn std::error::Error>> {
     loop {
-        let did = setup_prompts::prompt_long_value("Control plane DID", false)?;
+        let did = setup_prompts::prompt_did("Control plane DID", false)?;
         let did = did.trim().to_string();
         if did.starts_with("did:") {
             return Ok(did);
