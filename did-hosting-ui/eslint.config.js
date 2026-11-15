@@ -78,7 +78,7 @@ module.exports = defineConfig([
     },
   },
   {
-    files: ["eslint.config.js", "vitest.config.ts", "babel.config.js", "metro.config.js"],
+    files: ["eslint.config.js", "vitest.config.mts", "babel.config.js", "metro.config.js"],
     languageOptions: { globals: { module: "writable", require: "readonly" } },
   },
   prettier,
