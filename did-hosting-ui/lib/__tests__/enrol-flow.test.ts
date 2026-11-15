@@ -70,7 +70,10 @@ afterEach(() => {
 
 describe("issuing an invite", () => {
   beforeEach(async () => {
-    stubStorage({ webvh_token: tokenFor(ADMIN, { session_id: "s" }), webvh_auth_method: "passkey" });
+    stubStorage({
+      webvh_token: tokenFor(ADMIN, { session_id: "s" }),
+      webvh_auth_method: "passkey",
+    });
     await generateSessionKeypair();
   });
 
@@ -111,7 +114,10 @@ describe("issuing an invite", () => {
       }),
     );
     await api.createInvite("did:example:carol", "owner", "stepUp");
-    expect(tasks(sent)[0]!.doc.payload).toEqual({ subject: "did:example:carol", purpose: "stepUp" });
+    expect(tasks(sent)[0]!.doc.payload).toEqual({
+      subject: "did:example:carol",
+      purpose: "stepUp",
+    });
   });
 });
 
@@ -190,7 +196,9 @@ describe("redeeming an invite", () => {
   it("says plainly when the code is wrong, and when the invite is locked", async () => {
     installControlPlane(() => rejection("auth/passkey/enroll/redeem/start:inviteInvalid"));
     await expect(startRedemption("inv_tok", "WRONG")).rejects.toThrow(RedemptionError);
-    await expect(startRedemption("inv_tok", "WRONG")).rejects.toThrow(/do not match an open invite/);
+    await expect(startRedemption("inv_tok", "WRONG")).rejects.toThrow(
+      /do not match an open invite/,
+    );
 
     installControlPlane(() => rejection("auth/passkey/enroll/redeem/start:tooManyAttempts"));
     await expect(startRedemption("inv_tok", "WRONG")).rejects.toThrow(/cancelled/);

@@ -9,7 +9,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { hasSessionKeypair, signEnvelope } from "../session-key";
 import { resetServiceInfo } from "../trust-task";
-import { SERVICE_DID, installControlPlane, rejection, seal, stubStorage } from "./fake-control-plane";
+import {
+  SERVICE_DID,
+  installControlPlane,
+  rejection,
+  seal,
+  stubStorage,
+} from "./fake-control-plane";
 import {
   authenticateIdTokenBindingSessionKey,
   loginBindingSessionKey,
@@ -17,7 +23,12 @@ import {
 } from "../wallet-login";
 
 const PARAMS = { rpDid: "did:webvh:QmRp:example.com", baseUrl: "https://console.example.com/api" };
-const TOKENS = { accessToken: "AT", refreshToken: "RT", sessionId: "sess-1", holderDid: "did:peer:2.holder" };
+const TOKENS = {
+  accessToken: "AT",
+  refreshToken: "RT",
+  sessionId: "sess-1",
+  holderDid: "did:peer:2.holder",
+};
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -80,7 +91,12 @@ describe("wallet proxy login", () => {
     principalDid: "did:webvh:QmP:example.com:persona",
   };
   const OK_PAYLOAD = {
-    session: { id: "sess-1", subject: "did:webvh:QmP:example.com:persona", issuedAt: "", expiresAt: "" },
+    session: {
+      id: "sess-1",
+      subject: "did:webvh:QmP:example.com:persona",
+      issuedAt: "",
+      expiresAt: "",
+    },
     tokens: { accessToken: "AT", refreshToken: "RT", tokenType: "Bearer", expiresIn: 900 },
   };
 

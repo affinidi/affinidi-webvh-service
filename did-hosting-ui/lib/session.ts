@@ -101,8 +101,7 @@ function openDb(): Promise<IDBDatabase | null> {
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error ?? new Error("indexedDB.open failed"));
-    req.onblocked = () =>
-      reject(new Error("indexedDB.open blocked by an older connection"));
+    req.onblocked = () => reject(new Error("indexedDB.open blocked by an older connection"));
   });
 }
 
@@ -159,7 +158,6 @@ function persistSession(): void {
     refreshToken: refreshTokenMem,
     authMethod: authMethodMem,
   }).catch((e) => {
-     
     console.warn("session: IDB persist failed", e);
   });
 }
@@ -187,7 +185,6 @@ export async function restoreSession(): Promise<void> {
         authMethodMem = persisted.authMethod;
       }
     } catch (e) {
-       
       console.warn("session: IDB restore failed", e);
     } finally {
       sessionRestored = true;
@@ -422,7 +419,6 @@ export function clearToken(): void {
   // `persistSession()`'s put racing `idbDeleteSession()` below.
   sessionRestored = true;
   idbDeleteSession().catch((e) => {
-     
     console.warn("session: IDB clear failed", e);
   });
   // Drop the session keypair from both memory and IndexedDB.

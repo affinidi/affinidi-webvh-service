@@ -89,7 +89,6 @@ export function splitAgentName(input: string): { domain: string; name: string } 
   return { domain, name };
 }
 
-
 export const aclApi = {
   // ---- ACL ----
   //
@@ -98,7 +97,7 @@ export const aclApi = {
   listAcl: async (): Promise<AclListResponse> => {
     // 0.3 pages by cursor: `nextCursor` is present while entries remain.
     const entries: AclEntry[] = [];
-    for (let cursor: string | undefined; ; ) {
+    for (let cursor: string | undefined; ;) {
       const resp = await trustTask<AclList.Payload, AclList.Response>(
         T.aclList,
         cursor ? { cursor } : {},
@@ -258,7 +257,8 @@ export const aclApi = {
     const label = updates.label === undefined ? base.label : updates.label;
     const maxTotalSize =
       updates.maxTotalSize === undefined ? base.max_total_size : updates.maxTotalSize;
-    const maxDidCount = updates.maxDidCount === undefined ? base.max_did_count : updates.maxDidCount;
+    const maxDidCount =
+      updates.maxDidCount === undefined ? base.max_did_count : updates.maxDidCount;
     // The grant this entry already states, and the one the update asks for.
     // Equal means there is nothing to send.
     const held = aclGrantEntry(
@@ -300,7 +300,6 @@ export const aclApi = {
     }
   },
 
-
   /** Single-entry lookup. `null` when the subject is not in the ACL. */
   aclShow: async (did: string): Promise<AclEntry | null> => {
     const resp = await trustTask<AclShow.Payload, AclShow.Response>(T.aclShow, { subject: did });
@@ -313,5 +312,4 @@ export const aclApi = {
       revocation: { kind: "entry" },
     });
   },
-
 };

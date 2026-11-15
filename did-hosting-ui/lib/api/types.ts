@@ -9,7 +9,6 @@ import type * as RedeemFinish from "../trust-tasks/auth/passkey/enroll/redeem/fi
 import type * as PasskeyRevokeStart from "../trust-tasks/auth/passkey/revoke/start/0.2/payload";
 import { type ScidAliasState } from "../scid-alias";
 
-
 export interface HealthResponse {
   status: string;
   version: string;
@@ -17,7 +16,6 @@ export interface HealthResponse {
 
 /** DID hosting method tag carried on every DidRecord. */
 export type DidMethod = "webvh" | "web" | "webs" | "webplus" | string;
-
 
 /** What `changeOwner` did: `offer` is set when the DID did not move yet and
  *  waits for its recipient to accept. */
@@ -424,7 +422,6 @@ export interface IdentityGenerationsResponse {
   /** How long a generation retired from now would keep being honoured. */
   rotationGraceSecs: number;
 }
-
 
 /** The ACL roles this control plane grants. */
 export type Role = "admin" | "owner" | "service" | "metricsReader";

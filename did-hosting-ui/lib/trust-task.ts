@@ -18,11 +18,7 @@
  */
 
 import { ApiError, request } from "./http";
-import {
-  clearToken,
-  getSessionSubjectDid,
-  restoreSession,
-} from "./session";
+import { clearToken, getSessionSubjectDid, restoreSession } from "./session";
 import {
   generateSessionKeypair,
   getSessionDidKey,
@@ -249,8 +245,7 @@ export function retryDelayMs(
   if (!payload.retryable) return null;
   const safe =
     ALWAYS_RETRY_CODES.has(payload.code) ||
-    (AMBIGUOUS_RETRY_CODES.has(payload.code) &&
-      REISSUE_SAFE_TASK_TYPES.has(typeUri));
+    (AMBIGUOUS_RETRY_CODES.has(payload.code) && REISSUE_SAFE_TASK_TYPES.has(typeUri));
   if (!safe) return null;
 
   if (payload.retryAfter === undefined) {
@@ -477,10 +472,7 @@ async function sign(
     if (typeof window !== "undefined") {
       window.dispatchEvent(new Event("webvh:unauthorized"));
     }
-    throw new ApiError(
-      401,
-      "This browser no longer holds the session key — sign in again.",
-    );
+    throw new ApiError(401, "This browser no longer holds the session key — sign in again.");
   }
   await signEnvelope(doc);
   return doc;
@@ -497,16 +489,13 @@ async function post<Resp>(
 ): Promise<TrustTaskDocument<Resp>> {
   let reply: TrustTaskDocument<Resp | TrustTaskErrorPayload>;
   try {
-    reply = await request<TrustTaskDocument<Resp | TrustTaskErrorPayload>>(
-      TRUST_TASKS_PATH,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(doc),
-        anonymous: opts.anonymous,
-        background: opts.background,
-      },
-    );
+    reply = await request<TrustTaskDocument<Resp | TrustTaskErrorPayload>>(TRUST_TASKS_PATH, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(doc),
+      anonymous: opts.anonymous,
+      background: opts.background,
+    });
   } catch (e) {
     // A rejection is a *document* at a non-2xx status (`status_for_code`:
     // permissionDenied → 403, taskFailed → 422, …). Read the body before
@@ -563,9 +552,7 @@ async function sendOnce<Req, Resp>(
  * resend would be refused as a replay. The bearer goes with it as context
  * only; the document's own proof is what the control plane authorises.
  */
-export async function sendSignedTrustTask<Resp>(
-  doc: TrustTaskDocument<unknown>,
-): Promise<Resp> {
+export async function sendSignedTrustTask<Resp>(doc: TrustTaskDocument<unknown>): Promise<Resp> {
   const { serviceDid } = await getServiceInfo();
   if (doc.recipient !== serviceDid) {
     throw new ApiError(
@@ -602,7 +589,7 @@ export async function trustTask<Req, Resp>(
       }
       const delay = retryDelayMs(typeUri, e.payload, Date.now());
       if (delay === null) throw e;
-       
+
       console.debug(
         `trust task ${typeUri} rejected as ${e.payload.code} (retryable); re-issuing in ${delay}ms`,
       );
@@ -636,4 +623,3 @@ function cryptoRandomUuid(): string {
     .slice(6, 8)
     .join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
 }
-

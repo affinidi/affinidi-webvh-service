@@ -52,11 +52,9 @@ describe("digestPrefix", () => {
     // What the wire carried before the migration. Showing its first six
     // characters would look exactly like a valid code while matching
     // nothing the approver displays.
-    expect(
-      digestPrefix(
-        "3b0c7f1d9e2a5648c1f30b7ae4d2986153ca0f7b8d41e6295af03c8bd71e4a62",
-      ),
-    ).toBe("");
+    expect(digestPrefix("3b0c7f1d9e2a5648c1f30b7ae4d2986153ca0f7b8d41e6295af03c8bd71e4a62")).toBe(
+      "",
+    );
   });
 
   it("fails closed on values it cannot decode", () => {

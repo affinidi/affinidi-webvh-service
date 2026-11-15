@@ -326,12 +326,7 @@ type WireRole = "admin" | "owner" | "service" | "metricsReader";
  *  promote a read-only credential on save; folding it into any other role
  *  would mislabel the row. `undefined` for a value this client predates. */
 function knownRole(r: string | undefined): WireRole | undefined {
-  return r === "admin" ||
-    r === "owner" ||
-    r === "service" ||
-    r === "metricsReader"
-    ? r
-    : undefined;
+  return r === "admin" || r === "owner" || r === "service" || r === "metricsReader" ? r : undefined;
 }
 
 /** Invite roles. The server refuses `metricsReader` on invites, so it only
@@ -447,5 +442,7 @@ export function actNarrowing(current: ActScope, next: ActScope): ActScope | null
   const keep = new Set(next.scope === "contexts" ? next.contexts : []);
   const kept = current.contexts.filter((c) => keep.has(c));
   if (kept.length === current.contexts.length) return null;
-  return kept.length === 0 ? { scope: "none" } : { scope: "contexts", contexts: kept as [string, ...string[]] };
+  return kept.length === 0
+    ? { scope: "none" }
+    : { scope: "contexts", contexts: kept as [string, ...string[]] };
 }

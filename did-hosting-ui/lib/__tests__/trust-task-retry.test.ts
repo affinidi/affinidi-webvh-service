@@ -18,13 +18,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  ApiError,
-  TrustTaskRejection,
-  api,
-  resetServiceInfo,
-  retryDelayMs,
-} from "../api";
+import { ApiError, TrustTaskRejection, api, resetServiceInfo, retryDelayMs } from "../api";
 import { resetSessionCacheForTests, setToken } from "../session";
 import {
   SERVER_INFO,
@@ -47,7 +41,6 @@ vi.mock("../session-key", async (importOriginal) => ({
   },
 }));
 
-
 const SUBJECT = "did:web:admin.example";
 
 const GRANT = "https://trusttasks.org/spec/acl/grant/0.2";
@@ -63,26 +56,21 @@ describe("retryDelayMs — SPEC §8.4 decision table", () => {
   it("never retries when the server says the error is not retryable", () => {
     // The flag is the gate: a code we would otherwise retry is still
     // refused when the server marked it terminal.
-    expect(retryDelayMs(LIST, { code: "internalError", retryable: false }, NOW))
-      .toBeNull();
-    expect(retryDelayMs(LIST, { code: "unavailable", retryable: false }, NOW))
-      .toBeNull();
+    expect(retryDelayMs(LIST, { code: "internalError", retryable: false }, NOW)).toBeNull();
+    expect(retryDelayMs(LIST, { code: "unavailable", retryable: false }, NOW)).toBeNull();
   });
 
   it("does not retry the clock-skew proofInvalid that motivated this work", () => {
     // Post affinidi-data-integrity 0.7.8 a timestamp rejection means the
     // signer is >60s out, which re-issuing cannot fix.
-    expect(retryDelayMs(GRANT, { code: "proofInvalid", retryable: false }, NOW))
-      .toBeNull();
+    expect(retryDelayMs(GRANT, { code: "proofInvalid", retryable: false }, NOW)).toBeNull();
     // Even if a peer marked it retryable, it is not in the allowed set.
-    expect(retryDelayMs(GRANT, { code: "proofInvalid", retryable: true }, NOW))
-      .toBeNull();
+    expect(retryDelayMs(GRANT, { code: "proofInvalid", retryable: true }, NOW)).toBeNull();
   });
 
   it("retries `unavailable` on any mutation — the task provably did not run", () => {
     for (const type of [GRANT, REVOKE, CHANGE_ROLE]) {
-      expect(retryDelayMs(type, { code: "unavailable", retryable: true }, NOW))
-        .toBe(500);
+      expect(retryDelayMs(type, { code: "unavailable", retryable: true }, NOW)).toBe(500);
     }
   });
 
@@ -91,8 +79,7 @@ describe("retryDelayMs — SPEC §8.4 decision table", () => {
     // SPEC §3 ("re-emitting an identical grant produces no state
     // change"), so a re-issue after a silent success changes nothing.
     for (const type of [LIST, SHOW, GRANT]) {
-      expect(retryDelayMs(type, { code: "internalError", retryable: true }, NOW))
-        .toBe(500);
+      expect(retryDelayMs(type, { code: "internalError", retryable: true }, NOW)).toBe(500);
     }
   });
 
@@ -102,42 +89,35 @@ describe("retryDelayMs — SPEC §8.4 decision table", () => {
     // operation that worked: `subject_not_present` for revoke,
     // `state_mismatch` for the state-checked change-role.
     for (const type of [REVOKE, CHANGE_ROLE]) {
-      expect(retryDelayMs(type, { code: "internalError", retryable: true }, NOW))
-        .toBeNull();
+      expect(retryDelayMs(type, { code: "internalError", retryable: true }, NOW)).toBeNull();
     }
   });
 
   it("ignores unknown codes even when flagged retryable", () => {
-    expect(retryDelayMs(LIST, { code: "somethingNew", retryable: true }, NOW))
-      .toBeNull();
+    expect(retryDelayMs(LIST, { code: "somethingNew", retryable: true }, NOW)).toBeNull();
   });
 
   describe("retryAfter", () => {
     const base = { code: "internalError", retryable: true } as const;
 
     it("retries immediately when the hint has already passed", () => {
-      expect(retryDelayMs(LIST, { ...base, retryAfter: at(-5_000) }, NOW))
-        .toBe(0);
+      expect(retryDelayMs(LIST, { ...base, retryAfter: at(-5_000) }, NOW)).toBe(0);
     });
 
     it("waits out a near-future hint", () => {
-      expect(retryDelayMs(LIST, { ...base, retryAfter: at(2_000) }, NOW))
-        .toBe(2_000);
+      expect(retryDelayMs(LIST, { ...base, retryAfter: at(2_000) }, NOW)).toBe(2_000);
     });
 
     it("honors a hint exactly at the cap", () => {
-      expect(retryDelayMs(LIST, { ...base, retryAfter: at(5_000) }, NOW))
-        .toBe(5_000);
+      expect(retryDelayMs(LIST, { ...base, retryAfter: at(5_000) }, NOW)).toBe(5_000);
     });
 
     it("gives up rather than parking the user on a far-future hint", () => {
-      expect(retryDelayMs(LIST, { ...base, retryAfter: at(60_000) }, NOW))
-        .toBeNull();
+      expect(retryDelayMs(LIST, { ...base, retryAfter: at(60_000) }, NOW)).toBeNull();
     });
 
     it("gives up on an unparseable hint rather than hammering the server", () => {
-      expect(retryDelayMs(LIST, { ...base, retryAfter: "not-a-date" }, NOW))
-        .toBeNull();
+      expect(retryDelayMs(LIST, { ...base, retryAfter: "not-a-date" }, NOW)).toBeNull();
     });
   });
 });
@@ -201,10 +181,7 @@ describe("trustTask — re-issue behaviour", () => {
   });
 
   it("re-issues a read-only task after a retryable internalError", async () => {
-    stubFetch([
-      errorResponse("internalError", true),
-      listResponse([]),
-    ]);
+    stubFetch([errorResponse("internalError", true), listResponse([])]);
 
     const promise = api.listAcl();
     await vi.runAllTimersAsync();
@@ -215,10 +192,7 @@ describe("trustTask — re-issue behaviour", () => {
   });
 
   it("stops after one extra attempt and surfaces the original rejection", async () => {
-    stubFetch([
-      errorResponse("internalError", true),
-      errorResponse("internalError", true),
-    ]);
+    stubFetch([errorResponse("internalError", true), errorResponse("internalError", true)]);
 
     const promise = api.listAcl();
     // Attach the rejection handler before advancing timers so the
@@ -287,16 +261,20 @@ describe("trustTask — re-issue behaviour", () => {
         const doc = JSON.parse(String(init?.body ?? "{}")) as Doc;
         if (doc.type === SERVER_INFO) {
           return jsonResponse(
-            seal(doc, { serviceDid: "did:webvh:example:test", agentNames: false, serviceNames: [] }, {
-              issuer: "did:webvh:example:test",
-              proof: {
-                type: "DataIntegrityProof",
-                cryptosuite: "eddsa-jcs-2022",
-                verificationMethod: "did:webvh:example:test#key-0",
-                proofPurpose: "authentication",
-                proofValue: "zSig",
+            seal(
+              doc,
+              { serviceDid: "did:webvh:example:test", agentNames: false, serviceNames: [] },
+              {
+                issuer: "did:webvh:example:test",
+                proof: {
+                  type: "DataIntegrityProof",
+                  cryptosuite: "eddsa-jcs-2022",
+                  verificationMethod: "did:webvh:example:test#key-0",
+                  proofPurpose: "authentication",
+                  proofValue: "zSig",
+                },
               },
-            }),
+            ),
           );
         }
         return {

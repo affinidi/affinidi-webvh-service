@@ -15,7 +15,16 @@ import { isRejection, trustTask } from "../trust-task";
 import { WEBVH_EXT, didRecordFromWire, logEntriesFromWire, logMetadataFromEntries } from "../wire";
 import { withStepUp } from "./auth";
 import { DID_LIST_PAGE, T, didLog } from "./tasks";
-import type { AgentNameAvailability, AgentNameResolveResponse, CheckNameResponse, CreateDidResponse, DidDetailResponse, DidRecord, LogEntryInfo, OwnerChangeResult } from "./types";
+import type {
+  AgentNameAvailability,
+  AgentNameResolveResponse,
+  CheckNameResponse,
+  CreateDidResponse,
+  DidDetailResponse,
+  DidRecord,
+  LogEntryInfo,
+  OwnerChangeResult,
+} from "./types";
 import type { ReadOptions } from "./tasks";
 
 export const didsApi = {
@@ -25,7 +34,7 @@ export const didsApi = {
    *  following `did/list`'s pages to the end. */
   listDids: async (owner?: string): Promise<DidRecord[]> => {
     const out: DidRecord[] = [];
-    for (let cursor: string | undefined; ; ) {
+    for (let cursor: string | undefined; ;) {
       const page = await trustTask<DidList.Payload, DidList.Response>(T.didList, {
         ...(owner ? { owner } : {}),
         limit: DID_LIST_PAGE,
@@ -89,8 +98,7 @@ export const didsApi = {
       { mnemonic, newOwner },
     );
     const host = (resp.ext as Record<string, unknown> | undefined)?.[WEBVH_EXT] as
-      | { ownerTransfer?: { status?: unknown; newOwner?: unknown; expiresAt?: unknown } }
-      | undefined;
+      { ownerTransfer?: { status?: unknown; newOwner?: unknown; expiresAt?: unknown } } | undefined;
     const transfer = host?.ownerTransfer;
     return {
       record: didRecordFromWire(resp.record),
@@ -118,10 +126,10 @@ export const didsApi = {
   /** Is an agent name (`/@name`) free to claim on `domain`? Binding itself is
    *  a signed did.jsonl publish through the user's agent. */
   checkAgentName: async (name: string, domain?: string): Promise<AgentNameAvailability> => {
-    const r = await trustTask<AgentNameCheck.Payload, AgentNameCheck.Response>(
-      T.agentNameCheck,
-      { name, ...(domain ? { domain } : {}) },
-    );
+    const r = await trustTask<AgentNameCheck.Payload, AgentNameCheck.Response>(T.agentNameCheck, {
+      name,
+      ...(domain ? { domain } : {}),
+    });
     return { name: r.name, domain: r.domain, available: r.available, reserved: r.reserved };
   },
 
@@ -183,5 +191,4 @@ export const didsApi = {
     });
     return didRecordFromWire(r.record);
   },
-
 };

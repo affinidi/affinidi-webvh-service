@@ -47,15 +47,30 @@ describe("did:scid alias state", () => {
   });
 
   it("warns that the entry rotates the update key, naming pre-rotation", () => {
-    const plain = scidAliasView({ alias: at("notListed"), owner: VTA, canDelegate: true, preRotation: false });
+    const plain = scidAliasView({
+      alias: at("notListed"),
+      owner: VTA,
+      canDelegate: true,
+      preRotation: false,
+    });
     expect(plain.warning).toMatch(/rotates the DID's update key/);
     expect(plain.warning).not.toMatch(/pre-rotation/);
-    const pre = scidAliasView({ alias: at("notListed"), owner: VTA, canDelegate: true, preRotation: true });
+    const pre = scidAliasView({
+      alias: at("notListed"),
+      owner: VTA,
+      canDelegate: true,
+      preRotation: true,
+    });
     expect(pre.warning).toMatch(/next pre-committed key \(this log uses pre-rotation\)/);
   });
 
   it("is read-only without the wallet relay, pointing at the controller", () => {
-    const v = scidAliasView({ alias: at("listed"), owner: VTA, canDelegate: false, preRotation: true });
+    const v = scidAliasView({
+      alias: at("listed"),
+      owner: VTA,
+      canDelegate: false,
+      preRotation: true,
+    });
     expect(v.actions).toEqual([]);
     expect(v.warning).toBeNull();
     expect(v.readOnlyReason).toMatch(/pnm or the browser-plugin console/);
@@ -63,15 +78,22 @@ describe("did:scid alias state", () => {
   });
 
   it("points a service DID at the offline CLI", () => {
-    const v = scidAliasView({ alias: at("notListed"), owner: SYSTEM_OWNER, canDelegate: true, preRotation: false });
+    const v = scidAliasView({
+      alias: at("notListed"),
+      owner: SYSTEM_OWNER,
+      canDelegate: true,
+      preRotation: false,
+    });
     expect(v.actions).toEqual([]);
     expect(v.readOnlyReason).toMatch(/identity-scid-alias/);
   });
 
   it("says what each action does to the subject", () => {
-    expect(scidAliasConfirm(at("notListed"), { label: "List alias", scidAlsoKnownAs: true })).toContain(URL);
-    expect(scidAliasConfirm(at("listed"), { label: "Remove alias", scidAlsoKnownAs: false })).toMatch(
-      /separate identities/,
-    );
+    expect(
+      scidAliasConfirm(at("notListed"), { label: "List alias", scidAlsoKnownAs: true }),
+    ).toContain(URL);
+    expect(
+      scidAliasConfirm(at("listed"), { label: "Remove alias", scidAlsoKnownAs: false }),
+    ).toMatch(/separate identities/);
   });
 });

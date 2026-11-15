@@ -19,12 +19,39 @@ import type * as RevokeSession from "../trust-tasks/auth/revoke-session/0.2/payl
 import type * as StepUpStart from "../trust-tasks/auth/step-up/start/0.2/payload";
 import type * as StepUpApprove from "../trust-tasks/auth/step-up/approve-response/0.7/payload";
 import { ApiError } from "../http";
-import { clearToken, getAuthMethod, getRefreshToken, getSessionId, getToken, renewSessionNow, restoreSession } from "../session";
+import {
+  clearToken,
+  getAuthMethod,
+  getRefreshToken,
+  getSessionId,
+  getToken,
+  renewSessionNow,
+  restoreSession,
+} from "../session";
 import { hasSessionKeypair, restoreSessionKeypair } from "../session-key";
-import { getServiceInfo, isRejection, sendSignedTrustTask, trustTask, type TrustTaskDocument } from "../trust-task";
+import {
+  getServiceInfo,
+  isRejection,
+  sendSignedTrustTask,
+  trustTask,
+  type TrustTaskDocument,
+} from "../trust-task";
 import { inviteFromWire, passkeyCredentialFromWire } from "../wire";
 import { T } from "./tasks";
-import type { CreateInviteResponse, InviteListItem, InviteListResponse, InvitePurpose, LoginStartResponse, LoginTokens, PasskeyCredential, RedeemFinishResponse, RedeemStartResponse, RevokePasskeyFinishResponse, RevokePasskeyStartResponse, Role } from "./types";
+import type {
+  CreateInviteResponse,
+  InviteListItem,
+  InviteListResponse,
+  InvitePurpose,
+  LoginStartResponse,
+  LoginTokens,
+  PasskeyCredential,
+  RedeemFinishResponse,
+  RedeemStartResponse,
+  RevokePasskeyFinishResponse,
+  RevokePasskeyStartResponse,
+  Role,
+} from "./types";
 
 /**
  * Whether `e` asks for a stepped-up session: the declared `stepUpRequired`
@@ -143,7 +170,10 @@ export const authApi = {
       approveRequest.payload?.sessionId !== sessionId ||
       typeof challenge !== "string"
     ) {
-      throw new ApiError(502, "the control plane answered the step-up with no request for this session");
+      throw new ApiError(
+        502,
+        "the control plane answered the step-up with no request for this session",
+      );
     }
 
     const { approveResponse } = await wallet.approveSessionStepUp({

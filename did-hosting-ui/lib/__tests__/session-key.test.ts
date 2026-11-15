@@ -19,11 +19,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import {
-  generateSessionKeypair,
-  signEnvelope,
-  type SignableEnvelope,
-} from "../session-key";
+import { generateSessionKeypair, signEnvelope, type SignableEnvelope } from "../session-key";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -51,12 +47,12 @@ describe("generateSessionKeypair", () => {
     expect(extractableArg).toBe(false);
     expect(keypair.privateKey.extractable).toBe(false);
 
-    await expect(
-      crypto.subtle.exportKey("pkcs8", keypair.privateKey),
-    ).rejects.toThrow(/not extractable/i);
-    await expect(
-      crypto.subtle.exportKey("jwk", keypair.privateKey),
-    ).rejects.toThrow(/not extractable/i);
+    await expect(crypto.subtle.exportKey("pkcs8", keypair.privateKey)).rejects.toThrow(
+      /not extractable/i,
+    );
+    await expect(crypto.subtle.exportKey("jwk", keypair.privateKey)).rejects.toThrow(
+      /not extractable/i,
+    );
   });
 
   it("still exports the raw public key, which is what the flag is not for", async () => {
@@ -67,9 +63,7 @@ describe("generateSessionKeypair", () => {
     // records, and the reason `false` costs nothing here.
     expect(keypair.publicKey.extractable).toBe(true);
 
-    const raw = new Uint8Array(
-      await crypto.subtle.exportKey("raw", keypair.publicKey),
-    );
+    const raw = new Uint8Array(await crypto.subtle.exportKey("raw", keypair.publicKey));
     expect(raw).toHaveLength(32);
     expect(result.pubkeyMultikey).toMatch(/^z6Mk/);
     expect(result.didKey).toBe(`did:key:${result.pubkeyMultikey}`);

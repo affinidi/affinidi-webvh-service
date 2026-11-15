@@ -20,16 +20,20 @@ interface CredentialDescriptorJson {
 }
 
 /** `PublicKeyCredentialCreationOptions` as JSON: binary members base64url. */
-interface CreationOptionsJson
-  extends Omit<PublicKeyCredentialCreationOptions, "challenge" | "user" | "excludeCredentials"> {
+interface CreationOptionsJson extends Omit<
+  PublicKeyCredentialCreationOptions,
+  "challenge" | "user" | "excludeCredentials"
+> {
   challenge: string;
   user: Omit<PublicKeyCredentialUserEntity, "id"> & { id: string };
   excludeCredentials?: CredentialDescriptorJson[];
 }
 
 /** `PublicKeyCredentialRequestOptions` as JSON: binary members base64url. */
-interface RequestOptionsJson
-  extends Omit<PublicKeyCredentialRequestOptions, "challenge" | "allowCredentials"> {
+interface RequestOptionsJson extends Omit<
+  PublicKeyCredentialRequestOptions,
+  "challenge" | "allowCredentials"
+> {
   challenge: string;
   allowCredentials?: CredentialDescriptorJson[];
 }

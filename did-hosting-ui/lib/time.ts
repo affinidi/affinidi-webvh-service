@@ -32,7 +32,11 @@ export function formatDate(
   const { withTime = false, fallback = "Never" } = opts;
   if (value === null || value === undefined || value === "" || value === 0) return fallback;
   const date =
-    typeof value === "number" ? new Date(value * 1000) : value instanceof Date ? value : new Date(value);
+    typeof value === "number"
+      ? new Date(value * 1000)
+      : value instanceof Date
+        ? value
+        : new Date(value);
   if (Number.isNaN(date.getTime())) return fallback;
   return date.toLocaleString(undefined, {
     year: "numeric",

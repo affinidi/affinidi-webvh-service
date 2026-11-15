@@ -5,13 +5,7 @@
 import type { DidRecord } from "./api";
 import { parseScid } from "./did-scid";
 
-export type DidSortKey =
-  | "mnemonic"
-  | "didId"
-  | "versions"
-  | "created"
-  | "updated"
-  | "resolves";
+export type DidSortKey = "mnemonic" | "didId" | "versions" | "created" | "updated" | "resolves";
 
 export type SortDir = "asc" | "desc";
 

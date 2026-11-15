@@ -70,10 +70,9 @@ export const domainsApi = {
   setDefaultDomain: async (name: string): Promise<DomainEntry> =>
     domainFromWire(
       (
-        await trustTask<DomainSetDefault.Payload, DomainSetDefault.Response>(
-          T.domainSetDefault,
-          { name },
-        )
+        await trustTask<DomainSetDefault.Payload, DomainSetDefault.Response>(T.domainSetDefault, {
+          name,
+        })
       ).entry,
     ),
 
@@ -95,5 +94,4 @@ export const domainsApi = {
       }),
     );
   },
-
 };

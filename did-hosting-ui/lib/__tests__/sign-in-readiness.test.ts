@@ -64,13 +64,18 @@ describe("sign-in readiness", () => {
   it("lists only the missing services, in a fixed order", () => {
     expect(
       notSetUpNote(
-        parseReadiness({ walletSignIn: "not-set-up", missingServices: ["TrustTaskHTTPS", "SignInPortal"] }),
+        parseReadiness({
+          walletSignIn: "not-set-up",
+          missingServices: ["TrustTaskHTTPS", "SignInPortal"],
+        }),
       ),
     ).toBe(
       "Wallet sign-in isn't set up on this server yet: its DID doesn't list SignInPortal and TrustTaskHTTPS.",
     );
     expect(
-      notSetUpNote(parseReadiness({ walletSignIn: "not-set-up", missingServices: ["TrustTaskHTTPS"] })),
+      notSetUpNote(
+        parseReadiness({ walletSignIn: "not-set-up", missingServices: ["TrustTaskHTTPS"] }),
+      ),
     ).toBe("Wallet sign-in isn't set up on this server yet: its DID doesn't list TrustTaskHTTPS.");
   });
 

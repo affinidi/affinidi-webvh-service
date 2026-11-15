@@ -84,7 +84,12 @@ describe("renewSessionNow", () => {
     const sent = installControlPlane((req) =>
       req.type === REFRESH
         ? seal(req, {
-            tokens: { accessToken: next, refreshToken: "refresh-2", tokenType: "Bearer", expiresIn: 900 },
+            tokens: {
+              accessToken: next,
+              refreshToken: "refresh-2",
+              tokenType: "Bearer",
+              expiresIn: 900,
+            },
           })
         : undefined,
     );
@@ -107,7 +112,14 @@ describe("renewSessionNow", () => {
       req.type === REFRESH
         ? seal(
             req,
-            { tokens: { accessToken: "forged", refreshToken: "x", tokenType: "Bearer", expiresIn: 1 } },
+            {
+              tokens: {
+                accessToken: "forged",
+                refreshToken: "x",
+                tokenType: "Bearer",
+                expiresIn: 1,
+              },
+            },
             { issuer: "did:example:someone-else" },
           )
         : undefined,

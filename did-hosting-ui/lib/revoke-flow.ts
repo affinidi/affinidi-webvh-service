@@ -14,11 +14,7 @@
  * WebAuthn is injected so the flow can be exercised without a browser.
  */
 
-import {
-  api,
-  type RevokePasskeyFinishResponse,
-  type RevokePasskeyStartResponse,
-} from "./api";
+import { api, type RevokePasskeyFinishResponse, type RevokePasskeyStartResponse } from "./api";
 import type { AssertionJson } from "./passkey";
 import { isRejection } from "./trust-task";
 
@@ -74,13 +70,8 @@ export async function completeRevocation(
   try {
     return await api.revokePasskeyFinish(start.revocationId, uvCredential);
   } catch (e) {
-    if (
-      isRejection(e, "revocationExpired") ||
-      isRejection(e, "revocationNotFound")
-    ) {
-      throw new RevocationError(
-        "This revocation timed out or was replaced. Start again.",
-      );
+    if (isRejection(e, "revocationExpired") || isRejection(e, "revocationNotFound")) {
+      throw new RevocationError("This revocation timed out or was replaced. Start again.");
     }
     if (isRejection(e, "userVerificationFailed")) {
       throw new RevocationError(
@@ -93,9 +84,7 @@ export async function completeRevocation(
       );
     }
     if (isRejection(e, "notAuthorized")) {
-      throw new RevocationError(
-        "Administrator standing was withdrawn before this could complete.",
-      );
+      throw new RevocationError("Administrator standing was withdrawn before this could complete.");
     }
     throw e;
   }

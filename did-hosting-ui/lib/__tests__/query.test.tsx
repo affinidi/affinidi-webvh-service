@@ -175,10 +175,13 @@ describe("useTrustTaskMutation", () => {
     await waitFor(() => expect(read.result.current.data).toBe(1));
 
     const write = renderHook(() =>
-      useTrustTaskMutation(async (fail: boolean) => {
-        if (fail) throw new Error("nope");
-        return "ok";
-      }, { invalidates: [["domains"]] }),
+      useTrustTaskMutation(
+        async (fail: boolean) => {
+          if (fail) throw new Error("nope");
+          return "ok";
+        },
+        { invalidates: [["domains"]] },
+      ),
     );
     await act(async () => {
       await write.result.current.mutate(false);
