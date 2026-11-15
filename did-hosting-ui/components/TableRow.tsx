@@ -1,26 +1,29 @@
-import { useState, type ComponentProps } from "react";
+import { useState, type ReactNode } from "react";
 import { Pressable, StyleSheet, type StyleProp, type ViewStyle } from "react-native";
 
-type Props = Omit<ComponentProps<typeof Pressable>, "style"> & {
+interface Props {
   style?: StyleProp<ViewStyle>;
   hoverStyle?: StyleProp<ViewStyle>;
-};
+  children?: ReactNode;
+}
 
 /**
- * A pressable table row that can sit under `<Link asChild>`.
+ * A table row (`role="row"`) that highlights under the pointer.
  *
- * On web, Link's Slot merges its own props into its child by object spread,
- * so the child's `style` must be a plain object. A function `style`
- * (Pressable's `({ hovered }) => …`) spreads to nothing, which dropped a row's
- * `flexDirection: "row"` and stacked every cell; an array spreads to
- * `{0: …, 1: …}`, which React DOM refuses and the page goes blank. So the
- * caller passes `StyleSheet.flatten(...)`, and hover is tracked here instead.
+ * The row itself is not interactive — it is not focusable and has no press
+ * handler. What a row leads to is a link inside it (the DID list's name
+ * cell), and its actions (copy, QR) sit beside that link. A row that was
+ * itself a link wrapped those buttons, an interactive control inside
+ * another, which screen readers and keyboards cannot use. `Pressable` is
+ * used only for its hover events.
  */
-export function TableRow({ style, hoverStyle, children, ...rest }: Props) {
+export function TableRow({ style, hoverStyle, children }: Props) {
   const [hovered, setHovered] = useState(false);
   return (
     <Pressable
-      {...rest}
+      role="row"
+      focusable={false}
+      tabIndex={-1}
       onHoverIn={() => setHovered(true)}
       onHoverOut={() => setHovered(false)}
       style={StyleSheet.flatten([style, hovered && hoverStyle])}

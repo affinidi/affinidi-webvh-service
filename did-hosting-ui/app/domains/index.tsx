@@ -16,91 +16,41 @@
  *   * inline actions: Set as default · Disable / Enable
  */
 
-import { useCallback, useEffect, useState } from "react";
-import {
-  ActivityIndicator,
-  FlatList,
-  Pressable,
-  StyleSheet,
-  Text,
-  TextInput,
-  View,
-} from "react-native";
-import { Link } from "expo-router";
+import { useCallback, useState } from "react";
+import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, View } from "react-native";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
+import { Button } from "../../components/Button";
 import { useDomains } from "../../components/DomainProvider";
-import { colors, fonts, radii, spacing } from "../../lib/theme";
+import { Field } from "../../components/Field";
+import { Heading } from "../../components/Heading";
+import { RequireAuth } from "../../components/RequireAuth";
+import { colors, focusRing, fonts, radii, spacing } from "../../lib/theme";
 import { showAlert, showConfirm } from "../../lib/alert";
+import { errorMessage } from "../../lib/errors";
+import { useTrustTaskQuery } from "../../lib/query";
+import { formatDate, formatDuration, formatRelative } from "../../lib/time";
 import type { DomainEntry } from "../../lib/api";
 
-/** Human-readable "in 29 days, 23 hours" / "in 5 hours" / "in 12 minutes"
- *  / "any moment now" given an absolute target epoch. Returns null if
- *  `targetEpochSeconds` is null/undefined. */
-function formatRemaining(targetEpochSeconds: number | null): string | null {
-  if (!targetEpochSeconds) return null;
-  const remaining = targetEpochSeconds - Math.floor(Date.now() / 1000);
-  if (remaining <= 60) return "any moment now";
-  const days = Math.floor(remaining / 86400);
-  const hours = Math.floor((remaining % 86400) / 3600);
-  const minutes = Math.floor((remaining % 3600) / 60);
-  if (days >= 1) {
-    return hours >= 1
-      ? `in ${days} day${days === 1 ? "" : "s"}, ${hours} hour${hours === 1 ? "" : "s"}`
-      : `in ${days} day${days === 1 ? "" : "s"}`;
-  }
-  if (hours >= 1) {
-    return minutes >= 1
-      ? `in ${hours} hour${hours === 1 ? "" : "s"}, ${minutes} minute${minutes === 1 ? "" : "s"}`
-      : `in ${hours} hour${hours === 1 ? "" : "s"}`;
-  }
-  return `in ${minutes} minute${minutes === 1 ? "" : "s"}`;
-}
-
-/** "30 days" / "5 hours" / "12 minutes" — same buckets as
- *  `formatRemaining` but expressed as a fixed duration rather than a
- *  point in time. Used in the disable-confirm dialog. */
-function formatDuration(seconds: number | null): string | null {
-  if (!seconds || seconds <= 0) return null;
-  const days = Math.floor(seconds / 86400);
-  if (days >= 1) return `${days} day${days === 1 ? "" : "s"}`;
-  const hours = Math.floor(seconds / 3600);
-  if (hours >= 1) return `${hours} hour${hours === 1 ? "" : "s"}`;
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes} minute${minutes === 1 ? "" : "s"}`;
-}
-
-function formatAbsolute(epochSeconds: number): string {
-  return new Date(epochSeconds * 1000).toLocaleString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
 export default function DomainsScreen() {
-  const { isAuthenticated, role } = useAuth();
+  return (
+    <RequireAuth purpose="manage domains">
+      <DomainsBody />
+    </RequireAuth>
+  );
+}
+
+function DomainsBody() {
+  const { role } = useAuth();
   const api = useApi();
   const { domains, loaded, error, defaultDomain, refresh } = useDomains();
-  const [graceSeconds, setGraceSeconds] = useState<number | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .serverInfo()
-      .then((info) => {
-        if (!cancelled) setGraceSeconds(info.domainPurgeGraceSeconds ?? null);
-      })
-      .catch(() => {
-        // Server-info is best-effort: a failure here just means we
-        // fall back to generic copy in the disable confirm.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [api]);
+  // Server-info is best-effort: a failure here just means we fall back to
+  // generic copy in the disable confirm. The service DID and its public facts
+  // are stable for the tab, so one read serves every screen.
+  const { data: serverInfo } = useTrustTaskQuery(["server", "info"], () => api.serverInfo(), {
+    staleTime: Infinity,
+  });
+  const graceSeconds = serverInfo?.domainPurgeGraceSeconds ?? null;
 
   const [showForm, setShowForm] = useState(false);
   const [newName, setNewName] = useState("");
@@ -110,6 +60,7 @@ export default function DomainsScreen() {
   const [busy, setBusy] = useState<string | null>(null);
 
   const handleCreate = useCallback(async () => {
+    if (creating) return;
     const name = newName.trim().toLowerCase();
     if (!name) {
       showAlert("Domain name required", "Enter a host like 'example.com'.");
@@ -128,19 +79,16 @@ export default function DomainsScreen() {
       setNewLabel("");
       setMakeDefault(false);
     } catch (e: unknown) {
-      showAlert("Create failed", e instanceof Error ? e.message : String(e));
+      showAlert("Create failed", errorMessage(e));
     } finally {
       setCreating(false);
     }
-  }, [api, newName, newLabel, makeDefault, refresh]);
+  }, [api, creating, newName, newLabel, makeDefault, refresh]);
 
   const handleSetDefault = useCallback(
     async (entry: DomainEntry) => {
       if (entry.status === "disabled") {
-        showAlert(
-          "Domain is disabled",
-          "Re-enable the domain before promoting it to default.",
-        );
+        showAlert("Domain is disabled", "Re-enable the domain before promoting it to default.");
         return;
       }
       setBusy(entry.name);
@@ -148,10 +96,7 @@ export default function DomainsScreen() {
         await api.setDefaultDomain(entry.name);
         await refresh();
       } catch (e: unknown) {
-        showAlert(
-          "Set default failed",
-          e instanceof Error ? e.message : String(e),
-        );
+        showAlert("Set default failed", errorMessage(e));
       } finally {
         setBusy(null);
       }
@@ -161,10 +106,10 @@ export default function DomainsScreen() {
 
   const handleDisable = useCallback(
     (entry: DomainEntry) => {
-      const window = formatDuration(graceSeconds);
-      const body = window
+      const grace = graceSeconds && graceSeconds > 0 ? formatDuration(graceSeconds) : null;
+      const body = grace
         ? `Resolves return 503 immediately. The domain and EVERY hosted DID ` +
-          `will be permanently removed in ${window} unless you re-enable ` +
+          `will be permanently removed in ${grace} unless you re-enable ` +
           `before then.`
         : `Resolves return 503 immediately. The domain and EVERY hosted DID ` +
           `will be permanently removed after the configured grace period ` +
@@ -175,10 +120,7 @@ export default function DomainsScreen() {
           await api.disableDomain(entry.name);
           await refresh();
         } catch (e: unknown) {
-          showAlert(
-            "Disable failed",
-            e instanceof Error ? e.message : String(e),
-          );
+          showAlert("Disable failed", errorMessage(e));
         } finally {
           setBusy(null);
         }
@@ -194,7 +136,7 @@ export default function DomainsScreen() {
         await api.enableDomain(entry.name);
         await refresh();
       } catch (e: unknown) {
-        showAlert("Enable failed", e instanceof Error ? e.message : String(e));
+        showAlert("Enable failed", errorMessage(e));
       } finally {
         setBusy(null);
       }
@@ -216,10 +158,7 @@ export default function DomainsScreen() {
             await api.deleteDomain(entry.name);
             await refresh();
           } catch (e: unknown) {
-            showAlert(
-              "Delete failed",
-              e instanceof Error ? e.message : String(e),
-            );
+            showAlert("Delete failed", errorMessage(e));
           } finally {
             setBusy(null);
           }
@@ -244,10 +183,7 @@ export default function DomainsScreen() {
             await api.deleteDomain(entry.name, { purgeServers: true });
             await refresh();
           } catch (e: unknown) {
-            showAlert(
-              "Purge & delete failed",
-              e instanceof Error ? e.message : String(e),
-            );
+            showAlert("Purge & delete failed", errorMessage(e));
           } finally {
             setBusy(null);
           }
@@ -257,25 +193,10 @@ export default function DomainsScreen() {
     [api, refresh],
   );
 
-  if (!isAuthenticated) {
-    return (
-      <View style={styles.containerCenter}>
-        <Text style={styles.hint}>Please log in to manage domains.</Text>
-        <Link href="/login" asChild>
-          <Pressable style={styles.buttonPrimary}>
-            <Text style={styles.buttonPrimaryText}>Login</Text>
-          </Pressable>
-        </Link>
-      </View>
-    );
-  }
-
   if (role !== "admin") {
     return (
       <View style={styles.containerCenter}>
-        <Text style={styles.hint}>
-          Domain administration is restricted to Admin accounts.
-        </Text>
+        <Text style={styles.hint}>Domain administration is restricted to Admin accounts.</Text>
       </View>
     );
   }
@@ -284,102 +205,80 @@ export default function DomainsScreen() {
     <View style={styles.container}>
       <View style={styles.header}>
         <View style={{ flex: 1 }}>
-          <Text style={styles.title}>Domains</Text>
+          <Heading style={styles.title}>Domains</Heading>
           <Text style={styles.subtitle}>
-            Hosting domains this control plane serves. Set one as the system
-            default — it's used when an Owner registers a DID without a
-            `domain` field.
+            Hosting domains this control plane serves. Set one as the system default — it&apos;s
+            used when an Owner registers a DID without a `domain` field.
           </Text>
         </View>
-        <Pressable
-          accessibilityRole="button"
-          style={styles.buttonPrimary}
+        <Button
+          label={showForm ? "Cancel" : "+ New domain"}
+          expanded={showForm}
           onPress={() => setShowForm((s) => !s)}
-        >
-          <Text style={styles.buttonPrimaryText}>
-            {showForm ? "Cancel" : "+ New domain"}
-          </Text>
-        </Pressable>
+        />
       </View>
 
       {showForm && (
         <View style={styles.formCard}>
-          <Text style={styles.formLabel}>Canonical name</Text>
-          <TextInput
+          <Field
+            label="Canonical name"
             value={newName}
             onChangeText={setNewName}
+            onSubmit={handleCreate}
             autoCapitalize="none"
             autoCorrect={false}
             placeholder="example.com"
-            placeholderTextColor={colors.textTertiary}
-            style={styles.input}
+            hint="Lowercased + IDNA-normalised by the daemon. Public hosts only."
+            inputStyle={styles.input}
           />
-          <Text style={styles.formHint}>
-            Lowercased + IDNA-normalised by the daemon. Public hosts only.
-          </Text>
 
-          <Text style={styles.formLabel}>Friendly label (optional)</Text>
-          <TextInput
+          <Field
+            label="Friendly label (optional)"
             value={newLabel}
             onChangeText={setNewLabel}
+            onSubmit={handleCreate}
             placeholder="Acme Production"
-            placeholderTextColor={colors.textTertiary}
-            style={styles.input}
+            inputStyle={styles.input}
           />
 
-          <Pressable
-            accessibilityRole="checkbox"
-            accessibilityState={{ checked: makeDefault }}
-            onPress={() => setMakeDefault((v) => !v)}
-            style={styles.checkboxRow}
-          >
-            <View
-              style={[
-                styles.checkbox,
-                makeDefault && styles.checkboxChecked,
-              ]}
-            >
-              {makeDefault && <Text style={styles.checkboxTick}>✓</Text>}
-            </View>
-            <Text style={styles.checkboxLabel}>
-              Set as system default after creating
-            </Text>
-          </Pressable>
+          <Checkbox
+            checked={makeDefault}
+            label="Set as system default after creating"
+            onToggle={() => setMakeDefault((v) => !v)}
+          />
 
           <View style={styles.formActions}>
-            <Pressable
-              accessibilityRole="button"
+            <Button
+              label="Create domain"
+              busy={creating}
+              busyLabel="Creating…"
               onPress={handleCreate}
+            />
+            <Button
+              label="Cancel"
+              variant="secondary"
               disabled={creating}
-              style={[
-                styles.buttonPrimary,
-                creating && styles.buttonDisabled,
-              ]}
-            >
-              <Text style={styles.buttonPrimaryText}>
-                {creating ? "Creating…" : "Create domain"}
-              </Text>
-            </Pressable>
-            <Pressable
-              accessibilityRole="button"
               onPress={() => setShowForm(false)}
-              disabled={creating}
-              style={styles.buttonSecondary}
-            >
-              <Text style={styles.buttonSecondaryText}>Cancel</Text>
-            </Pressable>
+            />
           </View>
         </View>
       )}
 
-      {error && <Text style={styles.errorText}>{error}</Text>}
+      {error && (
+        <Text role="alert" style={styles.errorText}>
+          {error}
+        </Text>
+      )}
 
       {!loaded ? (
-        <ActivityIndicator color={colors.accent} size="large" style={styles.spinner} />
+        <ActivityIndicator
+          color={colors.accent}
+          size="large"
+          aria-label="Loading domains"
+          style={styles.spinner}
+        />
       ) : domains.length === 0 ? (
-        <Text style={styles.hint}>
-          No domains yet. Create one above to start hosting DIDs.
-        </Text>
+        <Text style={styles.hint}>No domains yet. Create one above to start hosting DIDs.</Text>
       ) : (
         <FlatList
           data={domains}
@@ -400,6 +299,36 @@ export default function DomainsScreen() {
         />
       )}
     </View>
+  );
+}
+
+/** A labelled checkbox: `role="checkbox"` with its checked state, focusable,
+ *  toggled with Space or Enter. */
+function Checkbox({
+  checked,
+  label,
+  onToggle,
+}: {
+  checked: boolean;
+  label: string;
+  onToggle: () => void;
+}) {
+  const [focused, setFocused] = useState(false);
+  return (
+    <Pressable
+      role="checkbox"
+      aria-checked={checked}
+      aria-label={label}
+      onPress={onToggle}
+      onFocus={() => setFocused(true)}
+      onBlur={() => setFocused(false)}
+      style={StyleSheet.flatten([styles.checkboxRow, focused && focusRing])}
+    >
+      <View style={[styles.checkbox, checked && styles.checkboxChecked]}>
+        {checked && <Text style={styles.checkboxTick}>✓</Text>}
+      </View>
+      <Text style={styles.checkboxLabel}>{label}</Text>
+    </Pressable>
   );
 }
 
@@ -425,16 +354,16 @@ function DomainCard({
   const disabled = entry.status === "disabled";
   return (
     <View
-      style={[
-        styles.card,
-        isDefault && styles.cardDefault,
-        disabled && styles.cardDisabled,
-      ]}
+      role="region"
+      aria-label={entry.name}
+      style={[styles.card, isDefault && styles.cardDefault, disabled && styles.cardDisabled]}
     >
       <View style={styles.cardHeader}>
         <View style={{ flex: 1 }}>
           <View style={styles.nameRow}>
-            <Text style={styles.cardName}>{entry.name}</Text>
+            <Heading level={2} style={styles.cardName}>
+              {entry.name}
+            </Heading>
             {isDefault && (
               <View style={styles.defaultBadge}>
                 <Text style={styles.defaultBadgeText}>Default</Text>
@@ -449,9 +378,7 @@ function DomainCard({
               <Text
                 style={[
                   styles.statusBadgeText,
-                  disabled
-                    ? styles.statusBadgeTextDisabled
-                    : styles.statusBadgeTextActive,
+                  disabled ? styles.statusBadgeTextDisabled : styles.statusBadgeTextActive,
                 ]}
               >
                 {disabled ? "Disabled" : "Active"}
@@ -460,18 +387,13 @@ function DomainCard({
           </View>
           {!!entry.label && <Text style={styles.cardLabel}>{entry.label}</Text>}
           <Text style={styles.cardMeta}>
-            {entry.scheme} · created{" "}
-            {new Date(entry.createdAt * 1000).toLocaleDateString(undefined, {
-              year: "numeric",
-              month: "short",
-              day: "numeric",
-            })}
+            {entry.scheme} · created {formatDate(entry.createdAt)}
             {entry.wellKnownEnabled ? " · /.well-known enabled" : ""}
           </Text>
           {disabled && entry.purgeAt ? (
             <Text style={styles.cardWarning}>
-              Will be permanently removed {formatRemaining(entry.purgeAt)} ·{" "}
-              {formatAbsolute(entry.purgeAt)}. Re-enable to cancel.
+              Will be permanently removed {formatRelative(entry.purgeAt)} ·{" "}
+              {formatDate(entry.purgeAt, { withTime: true })}. Re-enable to cancel.
             </Text>
           ) : null}
         </View>
@@ -479,64 +401,54 @@ function DomainCard({
 
       <View style={styles.cardActions}>
         {!isDefault && !disabled && (
-          <Pressable
-            accessibilityRole="button"
+          <Button
+            label="Set as default"
+            accessibilityLabel={`Set ${entry.name} as default`}
+            variant="secondary"
+            busy={busy}
+            busyLabel="…"
             onPress={onSetDefault}
-            disabled={busy}
-            style={[styles.buttonSecondary, busy && styles.buttonDisabled]}
-          >
-            <Text style={styles.buttonSecondaryText}>
-              {busy ? "…" : "Set as default"}
-            </Text>
-          </Pressable>
+          />
         )}
         {disabled ? (
           <>
-            <Pressable
-              accessibilityRole="button"
+            <Button
+              label="Enable"
+              accessibilityLabel={`Enable ${entry.name}`}
+              variant="secondary"
+              busy={busy}
+              busyLabel="…"
               onPress={onEnable}
-              disabled={busy}
-              style={[styles.buttonSecondary, busy && styles.buttonDisabled]}
-            >
-              <Text style={styles.buttonSecondaryText}>
-                {busy ? "…" : "Enable"}
-              </Text>
-            </Pressable>
-            <Pressable
-              accessibilityRole="button"
+            />
+            <Button
+              label="Delete now"
+              accessibilityLabel={`Delete ${entry.name} now`}
+              variant="danger"
+              busy={busy}
+              busyLabel="…"
               onPress={onDelete}
-              disabled={busy}
-              style={[styles.buttonDanger, busy && styles.buttonDisabled]}
-            >
-              <Text style={styles.buttonDangerText}>
-                {busy ? "…" : "Delete now"}
-              </Text>
-            </Pressable>
-            <Pressable
-              accessibilityRole="button"
+            />
+            <Button
+              label="Purge & delete"
+              accessibilityLabel={`Purge and delete ${entry.name}`}
+              variant="danger"
+              busy={busy}
+              busyLabel="…"
               onPress={onPurgeAndDelete}
-              disabled={busy}
-              style={[styles.buttonDanger, busy && styles.buttonDisabled]}
-            >
-              <Text style={styles.buttonDangerText}>
-                {busy ? "…" : "Purge & delete"}
-              </Text>
-            </Pressable>
+            />
           </>
         ) : (
-          <Pressable
-            accessibilityRole="button"
+          <Button
+            label={isDefault ? "Disable (re-point default first)" : "Disable"}
+            accessibilityLabel={
+              isDefault ? `Disable ${entry.name} (re-point default first)` : `Disable ${entry.name}`
+            }
+            variant="danger"
+            busy={busy}
+            busyLabel="…"
+            disabled={isDefault}
             onPress={onDisable}
-            disabled={busy || isDefault}
-            style={[
-              styles.buttonDanger,
-              (busy || isDefault) && styles.buttonDisabled,
-            ]}
-          >
-            <Text style={styles.buttonDangerText}>
-              {busy ? "…" : isDefault ? "Disable (re-point default first)" : "Disable"}
-            </Text>
-          </Pressable>
+          />
         )}
       </View>
     </View>
@@ -568,6 +480,7 @@ const styles = StyleSheet.create({
     fontSize: 24,
     fontFamily: fonts.bold,
     color: colors.textPrimary,
+    marginBottom: 0,
   },
   subtitle: {
     marginTop: 4,
@@ -595,19 +508,6 @@ const styles = StyleSheet.create({
     borderColor: colors.border,
     padding: spacing.lg,
     gap: spacing.sm,
-  },
-  formLabel: {
-    fontFamily: fonts.semibold,
-    fontSize: 12,
-    color: colors.textTertiary,
-    textTransform: "uppercase",
-    letterSpacing: 0.6,
-    marginTop: spacing.sm,
-  },
-  formHint: {
-    fontSize: 12,
-    fontFamily: fonts.regular,
-    color: colors.textTertiary,
   },
   input: {
     backgroundColor: colors.bgTertiary,
@@ -686,6 +586,7 @@ const styles = StyleSheet.create({
     fontFamily: fonts.semibold,
     fontSize: 16,
     color: colors.textPrimary,
+    marginBottom: 0,
   },
   cardLabel: {
     marginTop: 4,
@@ -740,45 +641,4 @@ const styles = StyleSheet.create({
     gap: spacing.sm,
     flexWrap: "wrap",
   },
-  buttonPrimary: {
-    backgroundColor: colors.accent,
-    borderRadius: radii.md,
-    paddingVertical: 10,
-    paddingHorizontal: spacing.lg,
-    alignItems: "center",
-  },
-  buttonPrimaryText: {
-    color: colors.textOnAccent,
-    fontFamily: fonts.semibold,
-    fontSize: 14,
-  },
-  buttonSecondary: {
-    backgroundColor: "transparent",
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingVertical: 10,
-    paddingHorizontal: spacing.lg,
-    alignItems: "center",
-  },
-  buttonSecondaryText: {
-    color: colors.textSecondary,
-    fontFamily: fonts.semibold,
-    fontSize: 14,
-  },
-  buttonDanger: {
-    backgroundColor: "transparent",
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.error,
-    paddingVertical: 10,
-    paddingHorizontal: spacing.lg,
-    alignItems: "center",
-  },
-  buttonDangerText: {
-    color: colors.error,
-    fontFamily: fonts.semibold,
-    fontSize: 14,
-  },
-  buttonDisabled: { opacity: 0.5 },
 });
