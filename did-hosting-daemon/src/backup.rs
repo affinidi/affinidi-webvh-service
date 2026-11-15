@@ -15,7 +15,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use did_hosting_common::server::backup::{MultiStoreBackup, StoreDump, dump_store, restore_store};
+use did_hosting_common::server::backup::{
+    MultiStoreBackup, StoreDump, dump_store_except, restore_store, write_private_file,
+};
 use did_hosting_common::server::error::AppError;
 use did_hosting_common::server::store::{
     KS_ACL, KS_ASSIGNMENTS, KS_DIDS, KS_DOMAINS, KS_IDENTITY, KS_META, KS_OUTBOUND_QUEUE,
@@ -82,6 +84,15 @@ pub const EXCLUDED: &[(&str, &str)] = &[(
      a restored copy is stale against every peer's",
 )];
 
+/// Entries left out of the keyspaces a backup carries, by key prefix: live
+/// sign-in sessions and their refresh tokens are bearer credentials, so a
+/// backup never holds them (a restored deployment signs its users in again).
+/// The passkey credentials beside them in the same keyspace are kept.
+pub const SKIPPED_PREFIXES: &[(&str, &[&str])] = &[
+    (KS_SESSIONS, &["session:", "refresh:"]),
+    (KS_PASSKEY_STEP_UP, &["session:", "refresh:"]),
+];
+
 /// What each store declares, for [`MultiStoreBackup::check_declared`].
 const DECLARED: &[(&str, &[&str])] = &[
     (MAIN_STORE, MAIN_KEYSPACES),
@@ -126,12 +137,12 @@ pub async fn build_backup(
     let mut stores = BTreeMap::new();
     stores.insert(
         MAIN_STORE.to_string(),
-        dump_store(&main, MAIN_KEYSPACES).await?,
+        dump_store_except(&main, MAIN_KEYSPACES, SKIPPED_PREFIXES).await?,
     );
     if let Some(witness) = witness.as_ref() {
         stores.insert(
             WITNESS_STORE.to_string(),
-            dump_store(witness, WITNESS_KEYSPACES).await?,
+            dump_store_except(witness, WITNESS_KEYSPACES, SKIPPED_PREFIXES).await?,
         );
     }
     Ok(MultiStoreBackup {
@@ -151,7 +162,7 @@ pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<
     if output == "-" {
         println!("{json}");
     } else {
-        std::fs::write(&output, &json).map_err(AppError::Io)?;
+        write_private_file(std::path::Path::new(&output), json.as_bytes())?;
     }
 
     eprintln!();
@@ -166,6 +177,10 @@ pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<
     for (ks, why) in EXCLUDED {
         eprintln!("  not backed up: {ks} ({why})");
     }
+    eprintln!(
+        "  The backup holds the ACL, passkey credentials and the configuration unencrypted: \
+         keep it as you keep the service's secrets."
+    );
     if output != "-" {
         eprintln!("  Output: {output}");
     }
@@ -346,6 +361,11 @@ watcher = true
             let config = DaemonConfig::from_toml(&text, src.path().join("config.toml")).unwrap();
             let (main, witness) = open_stores(&config).await.unwrap();
             let witness = witness.expect("separate stores");
+            main.keyspace(KS_SESSIONS)
+                .unwrap()
+                .insert_raw("session:live", b"bearer".to_vec())
+                .await
+                .unwrap();
             for (ks, key) in [
                 (KS_ACL, "acl:did:example:admin"),
                 (KS_SESSIONS, "pk_user:1"),
@@ -424,6 +444,15 @@ watcher = true
                 .await
                 .unwrap(),
             Some(b"witness".to_vec())
+        );
+        assert!(
+            main.keyspace(KS_SESSIONS)
+                .unwrap()
+                .get_raw("session:live")
+                .await
+                .unwrap()
+                .is_none(),
+            "a live session is never backed up"
         );
         assert!(
             main.keyspace(KS_ACL)

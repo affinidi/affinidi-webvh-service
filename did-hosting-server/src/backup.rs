@@ -118,7 +118,10 @@ pub async fn run_backup(config_path: Option<PathBuf>, output: String) -> Result<
     if output == "-" {
         println!("{json}");
     } else {
-        std::fs::write(&output, &json).map_err(AppError::Io)?;
+        did_hosting_common::server::backup::write_private_file(
+            std::path::Path::new(&output),
+            json.as_bytes(),
+        )?;
     }
 
     let total = backup.keyspaces.dids.len()

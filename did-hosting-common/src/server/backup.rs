@@ -94,12 +94,58 @@ pub type StoreDump = BTreeMap<String, Vec<KvEntry>>;
 
 /// Dump every keyspace in `keyspaces` from `store`.
 pub async fn dump_store(store: &Store, keyspaces: &[&str]) -> Result<StoreDump, AppError> {
+    dump_store_except(store, keyspaces, &[]).await
+}
+
+/// [`dump_store`], leaving out every key that starts with one of the
+/// prefixes `skip` lists for its keyspace (`(keyspace, prefixes)`): state a
+/// backup must not carry, such as live session tokens.
+pub async fn dump_store_except(
+    store: &Store,
+    keyspaces: &[&str],
+    skip: &[(&str, &[&str])],
+) -> Result<StoreDump, AppError> {
     let mut dump = StoreDump::new();
     for name in keyspaces {
         let ks = store.keyspace(name)?;
-        dump.insert((*name).to_string(), encode_pairs(ks.iter_all().await?));
+        let prefixes: &[&str] = skip
+            .iter()
+            .find(|(ks, _)| ks == name)
+            .map(|(_, p)| *p)
+            .unwrap_or(&[]);
+        let pairs = ks
+            .iter_all()
+            .await?
+            .into_iter()
+            .filter(|(k, _)| !prefixes.iter().any(|p| k.starts_with(p.as_bytes())))
+            .collect();
+        dump.insert((*name).to_string(), encode_pairs(pairs));
     }
     Ok(dump)
+}
+
+/// Write a backup file readable by its owner only (mode `0600` on Unix): a
+/// backup carries the ACL, passkey credentials and the configuration, which
+/// base64url encodes but does not protect. An existing file is replaced.
+pub fn write_private_file(path: &std::path::Path, contents: &[u8]) -> Result<(), AppError> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(AppError::Io)?;
+    // A file that already existed keeps its mode through `open`: tighten it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(AppError::Io)?;
+    }
+    file.write_all(contents).map_err(AppError::Io)?;
+    file.sync_all().map_err(AppError::Io)
 }
 
 /// A backup of several named stores and the configuration that names them.
@@ -229,6 +275,46 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// Skipped prefixes are left out of the dump, and only in their keyspace.
+    #[tokio::test]
+    async fn skipped_prefixes_are_left_out() {
+        let a = tempfile::tempdir().unwrap();
+        let store = open(a.path()).await;
+        for (ks, key) in [
+            ("one", "session:x"),
+            ("one", "pk_user:y"),
+            ("two", "session:z"),
+        ] {
+            store
+                .keyspace(ks)
+                .unwrap()
+                .insert_raw(key, b"v".to_vec())
+                .await
+                .unwrap();
+        }
+        let dump = dump_store_except(&store, &["one", "two"], &[("one", &["session:"])])
+            .await
+            .unwrap();
+        assert_eq!(dump["one"].len(), 1);
+        assert_eq!(dump["two"].len(), 1);
+    }
+
+    /// A backup file is readable by its owner only, even when it replaces a
+    /// file that was not.
+    #[cfg(unix)]
+    #[test]
+    fn a_backup_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.json");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private_file(&path, b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

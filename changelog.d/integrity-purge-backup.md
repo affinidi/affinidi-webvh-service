@@ -17,6 +17,11 @@ own history and the target store's before anything is written. A backup an
 earlier daemon wrote is in the edge's format and is refused by
 `did-hosting-daemon restore`; take a fresh backup after upgrading.
 
+A backup never carries live sign-in sessions or refresh tokens (users sign in
+again after a restore), and both binaries now write the backup file readable
+by its owner only (`0600`). It still holds the ACL, passkey credentials and
+the configuration unencrypted, so keep it as you keep the service's secrets.
+
 ### Fixed — a standalone edge runs the purge it acknowledged
 
 An edge answered `replica/domain/unassign` (and a domain disable) with a
