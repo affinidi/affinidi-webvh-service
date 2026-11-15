@@ -55,9 +55,7 @@ describe("draftToScope / aclEntryToDraft round-trip", () => {
   });
 
   it("round-trips Allowed", () => {
-    const draft = aclEntryToDraft(
-      entry({ kind: "allowed", domains: ["a.example", "b.example"] }),
-    );
+    const draft = aclEntryToDraft(entry({ kind: "allowed", domains: ["a.example", "b.example"] }));
     expect(draftToScope(draft)).toEqual({
       kind: "allowed",
       domains: ["a.example", "b.example"],

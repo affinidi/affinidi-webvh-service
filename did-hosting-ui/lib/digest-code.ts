@@ -19,8 +19,7 @@
  */
 export const DIGEST_PREFIX_LEN = 6;
 
-const BASE58BTC_ALPHABET =
-  "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const BASE58BTC_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 /** Multihash prefix for SHA-256 with a 32-byte digest: `0x12 0x20`. */
 const MULTIHASH_SHA2_256_32 = [0x12, 0x20];
@@ -39,7 +38,7 @@ function decodeBase58btc(body: string): Uint8Array | null {
     let carry = BASE58BTC_ALPHABET.indexOf(ch);
     if (carry < 0) return null;
     for (let i = 0; i < bytes.length; i++) {
-      carry += bytes[i] * 58;
+      carry += bytes[i]! * 58;
       bytes[i] = carry & 0xff;
       carry >>= 8;
     }

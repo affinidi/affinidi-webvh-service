@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
-import { View, Text, Pressable, StyleSheet, ActivityIndicator } from "react-native";
+import type { ReactNode } from "react";
+import { useState } from "react";
+import { View, Text, StyleSheet, ActivityIndicator } from "react-native";
 import {
   AreaChart,
   Area,
@@ -7,18 +8,23 @@ import {
   YAxis,
   Tooltip,
   ResponsiveContainer,
+  type TooltipPayloadEntry,
 } from "recharts";
 import { useApi } from "./ApiProvider";
+import { Card } from "./Card";
 import { useDomains } from "./DomainProvider";
+import { SegmentedControl } from "./SegmentedControl";
+import { errorMessage } from "../lib/errors";
+import { useTrustTaskQuery } from "../lib/query";
 import { colors, fonts, radii, spacing } from "../lib/theme";
-import type { TimeSeriesPoint, TimeRange } from "../lib/api";
+import type { TimeRange } from "../lib/api";
 import { formatRate, pointSeconds, STEP_SECS } from "../lib/usage-rate";
 
-const RANGES: { label: string; value: TimeRange }[] = [
-  { label: "1h", value: "1h" },
-  { label: "24h", value: "24h" },
-  { label: "7d", value: "7d" },
-  { label: "30d", value: "30d" },
+const RANGES: { label: string; value: TimeRange; accessibilityLabel: string }[] = [
+  { label: "1h", value: "1h", accessibilityLabel: "Last hour" },
+  { label: "24h", value: "24h", accessibilityLabel: "Last 24 hours" },
+  { label: "7d", value: "7d", accessibilityLabel: "Last 7 days" },
+  { label: "30d", value: "30d", accessibilityLabel: "Last 30 days" },
 ];
 
 function formatTick(ts: number, range: TimeRange): string {
@@ -29,7 +35,7 @@ function formatTick(ts: number, range: TimeRange): string {
   return d.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
-function formatTooltipLabel(label: any): string {
+function formatTooltipLabel(label: ReactNode): string {
   return new Date(Number(label) * 1000).toLocaleString();
 }
 
@@ -41,61 +47,36 @@ export function UsageChart({ mnemonic }: { mnemonic?: string }) {
   // its own series.
   const { currentDomain } = useDomains();
   const [range, setRange] = useState<TimeRange>("24h");
-  const [data, setData] = useState<TimeSeriesPoint[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const domain = mnemonic ? null : (currentDomain ?? null);
 
-  useEffect(() => {
-    setLoading(true);
-    setError(null);
-    const fetcher = mnemonic
-      ? api.getDidTimeseries(mnemonic, range)
-      : api.getServerTimeseries(range, currentDomain ?? undefined);
-    fetcher
-      .then((points) => {
-        setData(points);
-        setLoading(false);
-      })
-      .catch((e) => {
-        setError(e.message);
-        setLoading(false);
-      });
-  }, [api, mnemonic, range, currentDomain]);
+  // The range (and DID or domain) is part of the key, so a quick range switch
+  // can never paint the previous range's answer: each range is its own entry,
+  // and the chart shows only the one it is on.
+  const { data, loading, error } = useTrustTaskQuery(
+    ["stats", "timeseries", mnemonic ?? null, domain, range],
+    ({ background }) =>
+      mnemonic
+        ? api.getDidTimeseries(mnemonic, range, { background })
+        : api.getServerTimeseries(range, domain ?? undefined, { background }),
+  );
 
   return (
-    <View style={styles.card}>
-      <View style={styles.header}>
-        <Text style={styles.title}>Usage Over Time</Text>
-        <View style={styles.rangeRow}>
-          {RANGES.map((r) => (
-            <Pressable
-              key={r.value}
-              onPress={() => setRange(r.value)}
-              style={[
-                styles.rangeButton,
-                range === r.value && styles.rangeButtonActive,
-              ]}
-            >
-              <Text
-                style={[
-                  styles.rangeText,
-                  range === r.value && styles.rangeTextActive,
-                ]}
-              >
-                {r.label}
-              </Text>
-            </Pressable>
-          ))}
-        </View>
-      </View>
-
-      {error ? (
-        <Text style={styles.errorText}>{error}</Text>
+    <Card
+      title="Usage Over Time"
+      style={styles.card}
+      headerRight={
+        <SegmentedControl label="Time range" options={RANGES} value={range} onChange={setRange} />
+      }
+    >
+      {error && !data ? (
+        <Text role="alert" style={styles.errorText}>
+          {errorMessage(error)}
+        </Text>
       ) : loading ? (
         <View style={styles.loadingBox}>
-          <ActivityIndicator color={colors.accent} />
+          <ActivityIndicator color={colors.accent} aria-label="Loading usage" />
         </View>
-      ) : data.length === 0 ? (
+      ) : !data || data.length === 0 ? (
         <View style={styles.loadingBox}>
           <Text style={styles.emptyText}>No usage data yet</Text>
         </View>
@@ -115,7 +96,7 @@ export function UsageChart({ mnemonic }: { mnemonic?: string }) {
               </defs>
               <XAxis
                 dataKey="timestamp"
-                tickFormatter={(ts) => formatTick(ts, range)}
+                tickFormatter={(ts: number) => formatTick(ts, range)}
                 stroke={colors.textTertiary}
                 fontSize={11}
                 tickLine={false}
@@ -134,10 +115,11 @@ export function UsageChart({ mnemonic }: { mnemonic?: string }) {
                 // Each point carries its own width (hourly for a DID without
                 // 5-minute detail); the rate is over the time it covers
                 // (`lib/usage-rate`).
-                formatter={(value: any, name: any, item: any) => {
+                formatter={(value, name, item: TooltipPayloadEntry) => {
+                  const point = item?.payload as { timestamp?: unknown; seconds?: unknown };
                   const count = Number(value) || 0;
-                  const start = Number(item?.payload?.timestamp) || 0;
-                  const step = Number(item?.payload?.seconds) || STEP_SECS[range];
+                  const start = Number(point?.timestamp) || 0;
+                  const step = Number(point?.seconds) || STEP_SECS[range];
                   const secs = pointSeconds(start, step, Math.floor(Date.now() / 1000));
                   return [`${count.toLocaleString()} (${formatRate(count, secs)})`, name];
                 }}
@@ -171,52 +153,13 @@ export function UsageChart({ mnemonic }: { mnemonic?: string }) {
           </ResponsiveContainer>
         </View>
       )}
-    </View>
+    </Card>
   );
 }
 
 const styles = StyleSheet.create({
   card: {
-    backgroundColor: colors.bgSecondary,
-    borderRadius: radii.lg,
-    borderWidth: 1,
-    borderColor: colors.border,
-    padding: spacing.xl,
     marginBottom: spacing.lg,
-  },
-  header: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    marginBottom: spacing.md,
-  },
-  title: {
-    fontSize: 16,
-    fontFamily: fonts.semibold,
-    color: colors.textPrimary,
-  },
-  rangeRow: {
-    flexDirection: "row",
-    gap: spacing.xs,
-  },
-  rangeButton: {
-    paddingVertical: 4,
-    paddingHorizontal: spacing.sm,
-    borderRadius: radii.sm,
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  rangeButtonActive: {
-    backgroundColor: colors.accent,
-    borderColor: colors.accent,
-  },
-  rangeText: {
-    fontSize: 12,
-    fontFamily: fonts.semibold,
-    color: colors.textTertiary,
-  },
-  rangeTextActive: {
-    color: colors.textOnAccent,
   },
   errorText: {
     fontFamily: fonts.medium,

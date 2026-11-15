@@ -1,5 +1,7 @@
 /** Affinidi brand design tokens */
 
+import type { TextStyle, ViewStyle } from "react-native";
+
 export const colors = {
   // Primary palette
   bgPrimary: "#040823", // Black Pearl — main background
@@ -10,13 +12,19 @@ export const colors = {
   // Accent
   accent: "#3B71FF", // Affinidi blue — primary buttons, links
   accentHover: "#5588FF",
+  // Filled button background. White on `accent` is 4.2:1, under AA; this
+  // darker blue is 5.2:1. `accent` stays for borders, focus and icons.
+  accentButton: "#2F62E8",
+  accentButtonHover: "#2A5BDB",
   teal: "#1FE5CD", // Secondary accent — success, highlights
   tealMuted: "rgba(31, 229, 205, 0.15)", // Badge background
 
   // Text
   textPrimary: "#FFFFFF",
   textSecondary: "#A0A8C8", // Muted body text
-  textTertiary: "#6B7194", // Labels, timestamps
+  // Labels, timestamps, placeholders. #8F96B8 clears WCAG AA (4.5:1) on every
+  // background below; the old #6B7194 was 3.6–4.2:1.
+  textTertiary: "#8F96B8",
   textOnAccent: "#FFFFFF",
 
   // Status
@@ -28,6 +36,8 @@ export const colors = {
   // Borders
   border: "#1C2148",
   borderFocus: "#3B71FF",
+  // Keyboard focus outline — bright enough to see on every background.
+  focusRing: "#8FB0FF",
 
   // Misc
   overlay: "rgba(4, 8, 35, 0.8)",
@@ -62,8 +72,6 @@ export const fonts = {
 // Shared component styles
 // ---------------------------------------------------------------------------
 
-import { ViewStyle, TextStyle } from "react-native";
-
 /** Standard card container. */
 export const card: ViewStyle = {
   backgroundColor: colors.bgSecondary,
@@ -75,7 +83,7 @@ export const card: ViewStyle = {
 
 /** Primary action button. */
 export const primaryButton: ViewStyle = {
-  backgroundColor: colors.accent,
+  backgroundColor: colors.accentButton,
   borderRadius: radii.sm,
   paddingVertical: 14,
   paddingHorizontal: spacing.xl,
@@ -91,6 +99,14 @@ export const dangerButton: ViewStyle = {
   paddingVertical: 14,
   paddingHorizontal: spacing.xl,
   alignItems: "center",
+};
+
+/** The keyboard focus outline every interactive primitive draws (web). */
+export const focusRing: ViewStyle = {
+  outlineColor: colors.focusRing,
+  outlineStyle: "solid",
+  outlineWidth: 2,
+  outlineOffset: 2,
 };
 
 /** Muted hint text below inputs or sections. */

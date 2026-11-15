@@ -14,31 +14,24 @@
  * *caller's own* passkey, before anything is unbound.
  */
 
-import { useCallback, useEffect, useState } from "react";
-import {
-  ActivityIndicator,
-  Pressable,
-  StyleSheet,
-  Text,
-  View,
-} from "react-native";
-import { useApi } from "./ApiProvider";
-import { getPasskeyCredential } from "../lib/passkey";
-import {
-  RevocationError,
-  completeRevocation,
-  startRevocation,
-} from "../lib/revoke-flow";
-import { showAlert, showConfirm } from "../lib/alert";
-import { colors, fonts, radii, spacing } from "../lib/theme";
-import type { InvitePurpose, PasskeyCredential } from "../lib/api";
+import { useState } from "react";
+import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
 
-const formatDate = (ts: number) =>
-  new Date(ts * 1000).toLocaleDateString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-  });
+import type { InvitePurpose, PasskeyCredential } from "../lib/api";
+import { showAlert, showConfirm } from "../lib/alert";
+import { errorMessage } from "../lib/errors";
+import { getPasskeyCredential } from "../lib/passkey";
+import { invalidateQueries, useTrustTaskQuery } from "../lib/query";
+import { completeRevocation, startRevocation } from "../lib/revoke-flow";
+import { colors, fonts, spacing } from "../lib/theme";
+import { formatDate } from "../lib/time";
+import { useApi } from "./ApiProvider";
+import { Button } from "./Button";
+import { Card } from "./Card";
+
+/** Every passkey inventory is read under this prefix, so a revocation
+ *  refreshes each card that might show the credential. */
+const PASSKEYS_KEY = ["passkeys"] as const;
 
 function purposeLabel(purpose: InvitePurpose): string {
   return purpose === "stepUp" ? "Step-up" : "Sign-in";
@@ -56,30 +49,13 @@ export interface PasskeysCardProps {
 
 export function PasskeysCard({ subject, purpose, title }: PasskeysCardProps) {
   const api = useApi();
-  const [credentials, setCredentials] = useState<PasskeyCredential[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [revoking, setRevoking] = useState<string | null>(null);
-
-  const load = useCallback(() => {
-    setLoading(true);
-    const fetch = subject
-      ? api.adminListPasskeys(subject, purpose ?? "session")
-      : api.listPasskeys();
-    fetch
-      .then((creds) => {
-        setCredentials(creds);
-        setError(null);
-      })
-      .catch((e) =>
-        setError(e instanceof Error ? e.message : "Failed to load passkeys"),
-      )
-      .finally(() => setLoading(false));
-  }, [api, subject, purpose]);
-
-  useEffect(() => {
-    load();
-  }, [load]);
+  const listPurpose = purpose ?? "session";
+  const passkeys = useTrustTaskQuery<PasskeyCredential[]>(
+    subject ? [...PASSKEYS_KEY, "admin", subject, listPurpose] : [...PASSKEYS_KEY, "own"],
+    () => (subject ? api.adminListPasskeys(subject, listPurpose) : api.listPasskeys()),
+  );
+  const credentials = passkeys.data ?? [];
 
   const revoke = (cred: PasskeyCredential) => {
     const label = cred.deviceLabel ?? "this passkey";
@@ -95,14 +71,9 @@ export function PasskeysCard({ subject, purpose, title }: PasskeysCardProps) {
           try {
             const start = await startRevocation(cred.credentialId, subject);
             await completeRevocation(start, { get: getPasskeyCredential });
-            load();
-          } catch (e) {
-            showAlert(
-              "Could not revoke",
-              e instanceof RevocationError || e instanceof Error
-                ? e.message
-                : "Failed to revoke passkey.",
-            );
+            await invalidateQueries(PASSKEYS_KEY);
+          } catch (e: unknown) {
+            showAlert("Could not revoke", errorMessage(e, "Failed to revoke passkey."));
           } finally {
             setRevoking(null);
           }
@@ -112,57 +83,44 @@ export function PasskeysCard({ subject, purpose, title }: PasskeysCardProps) {
   };
 
   return (
-    <View style={styles.card}>
-      <Text style={styles.sectionTitle}>{title ?? "Passkeys"}</Text>
-      {loading ? (
-        <ActivityIndicator color={colors.accent} />
-      ) : error ? (
-        <Text style={styles.errorText}>{error}</Text>
+    <Card title={title ?? "Passkeys"} style={styles.card}>
+      {passkeys.loading ? (
+        <ActivityIndicator color={colors.accent} aria-label="Loading passkeys" />
+      ) : passkeys.error != null && !passkeys.data ? (
+        <Text role="alert" style={styles.errorText}>
+          {errorMessage(passkeys.error, "Failed to load passkeys")}
+        </Text>
       ) : credentials.length === 0 ? (
         <Text style={styles.hint}>No passkeys enrolled.</Text>
       ) : (
         credentials.map((c) => (
           <View key={c.credentialId} style={styles.row}>
             <View style={styles.info}>
-              <Text style={styles.label}>
-                {c.deviceLabel ?? "Unlabelled passkey"}
-              </Text>
+              <Text style={styles.label}>{c.deviceLabel ?? "Unlabelled passkey"}</Text>
               <Text style={styles.meta}>
-                {purpose ? `${purposeLabel(purpose)} · ` : ""}Enrolled{" "}
-                {formatDate(c.registeredAt)}
+                {purpose ? `${purposeLabel(purpose)} · ` : ""}Enrolled {formatDate(c.registeredAt)}
                 {c.lastUsedAt ? ` · last used ${formatDate(c.lastUsedAt)}` : ""}
               </Text>
             </View>
-            <Pressable
-              style={styles.buttonDanger}
-              disabled={revoking === c.credentialId}
+            <Button
+              label="Revoke"
+              busyLabel="Revoking…"
+              accessibilityLabel={`Revoke ${c.deviceLabel ?? "unlabelled passkey"}`}
+              variant="danger"
+              size="sm"
+              busy={revoking === c.credentialId}
               onPress={() => revoke(c)}
-            >
-              <Text style={styles.buttonDangerText}>
-                {revoking === c.credentialId ? "Revoking…" : "Revoke"}
-              </Text>
-            </Pressable>
+            />
           </View>
         ))
       )}
-    </View>
+    </Card>
   );
 }
 
 const styles = StyleSheet.create({
   card: {
-    backgroundColor: colors.bgSecondary,
-    borderRadius: radii.lg,
-    borderWidth: 1,
-    borderColor: colors.border,
-    padding: spacing.xl,
     marginBottom: spacing.lg,
-  },
-  sectionTitle: {
-    fontSize: 16,
-    fontFamily: fonts.semibold,
-    color: colors.textPrimary,
-    marginBottom: spacing.md,
   },
   row: {
     flexDirection: "row",
@@ -191,17 +149,6 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontFamily: fonts.regular,
     color: colors.textSecondary,
-  },
-  buttonDanger: {
-    backgroundColor: colors.errorBg,
-    borderRadius: radii.md,
-    paddingVertical: 6,
-    paddingHorizontal: spacing.md,
-  },
-  buttonDangerText: {
-    color: colors.error,
-    fontSize: 12,
-    fontFamily: fonts.semibold,
   },
   errorText: {
     fontFamily: fonts.medium,

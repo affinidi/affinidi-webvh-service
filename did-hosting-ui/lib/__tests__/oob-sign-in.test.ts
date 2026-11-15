@@ -33,7 +33,12 @@ describe("trigger link", () => {
   });
 
   it("uses the absolute flow URI on another link host", () => {
-    const link = buildTriggerLink({ from: DID, requestId: RID, exp: 1, linkHost: "links.example.net" });
+    const link = buildTriggerLink({
+      from: DID,
+      requestId: RID,
+      exp: 1,
+      linkHost: "links.example.net",
+    });
     expect(link).toContain("&_type=https://link.trustoverip.org/vti/flow/sign-in/0.1");
   });
 
@@ -43,7 +48,13 @@ describe("trigger link", () => {
 
   it("refuses a link host on the page's own domain (VTI-LNK-084)", () => {
     expect(() =>
-      buildTriggerLink({ from: DID, requestId: RID, exp: 1, linkHost: "link.example.org", pageHost: "dids.example.org" }),
+      buildTriggerLink({
+        from: DID,
+        requestId: RID,
+        exp: 1,
+        linkHost: "link.example.org",
+        pageHost: "dids.example.org",
+      }),
     ).toThrow(/same-domain-host/);
   });
 
@@ -60,15 +71,23 @@ describe("trigger link", () => {
       "did:constructor:x",
     ]) {
       expect(isHostNamedServiceContact(from)).toBe(false);
-      expect(() => buildTriggerLink({ from, requestId: RID, exp: 1 })).toThrow(/bad-from.*VTI-LNK-102/);
+      expect(() => buildTriggerLink({ from, requestId: RID, exp: 1 })).toThrow(
+        /bad-from.*VTI-LNK-102/,
+      );
     }
   });
 
   it("refuses did:key, bad handles, far expiries and over-long links", () => {
-    expect(() => buildTriggerLink({ from: "did:key:z6Mkabc", requestId: RID, exp: 1 })).toThrow(/bad-from/);
+    expect(() => buildTriggerLink({ from: "did:key:z6Mkabc", requestId: RID, exp: 1 })).toThrow(
+      /bad-from/,
+    );
     expect(() => buildTriggerLink({ from: DID, requestId: "short", exp: 1 })).toThrow(/bad-id/);
-    expect(() => buildTriggerLink({ from: DID, requestId: RID, exp: 1000, nowSecs: 600 })).toThrow(/bad-exp/);
-    expect(() => buildTriggerLink({ from: `${DID}:${"x".repeat(200)}`, requestId: RID, exp: 1 })).toThrow(/too-long/);
+    expect(() => buildTriggerLink({ from: DID, requestId: RID, exp: 1000, nowSecs: 600 })).toThrow(
+      /bad-exp/,
+    );
+    expect(() =>
+      buildTriggerLink({ from: `${DID}:${"x".repeat(200)}`, requestId: RID, exp: 1 }),
+    ).toThrow(/too-long/);
   });
 
   it("renders a QR through the supplied encoder with a 4-module quiet zone", () => {
@@ -113,7 +132,8 @@ const keys = (): StarterKeys & { cleared: number } => {
   const k = {
     cleared: 0,
     generate: async () => ({ didKey: "did:key:z6MkStarter" }),
-    sign: async <T extends Record<string, unknown>>(doc: T) => ({ ...doc, proof: { proofValue: "z" } }) as T,
+    sign: async <T extends Record<string, unknown>>(doc: T) =>
+      ({ ...doc, proof: { proofValue: "z" } }) as T,
     clear: () => {
       k.cleared++;
     },
@@ -125,18 +145,26 @@ type Reply = { status: number; body: unknown };
 const ok = (payload: unknown): Reply => ({ status: 200, body: { type: "x#response", payload } });
 const err = (status: number, code: string, details?: unknown): Reply => ({
   status,
-  body: { type: "https://trusttasks.org/spec/trust-task-error/0.6", payload: { code, message: code, details } },
+  body: {
+    type: "https://trusttasks.org/spec/trust-task-error/0.6",
+    payload: { code, message: code, details },
+  },
 });
 
 /** A service that answers `request`, then each redeem from a script. */
 function service(redeems: Reply[], claimWindowSecs = 120) {
-  const sent: Array<Record<string, unknown>> = [];
+  const sent: Record<string, unknown>[] = [];
   const f = (async (_url: string, init: RequestInit) => {
     const doc = JSON.parse(String(init.body)) as Record<string, unknown>;
     sent.push(doc);
     let r: Reply;
     if (String(doc.type).endsWith("/request/0.2")) {
-      r = ok({ requestId: RID, claimClosesAt: new Date((Math.floor(Date.now() / 1000) + claimWindowSecs) * 1000).toISOString() });
+      r = ok({
+        requestId: RID,
+        claimClosesAt: new Date(
+          (Math.floor(Date.now() / 1000) + claimWindowSecs) * 1000,
+        ).toISOString(),
+      });
     } else if (String(doc.type).endsWith("/cancel/0.1")) {
       r = ok({ status: "cancelled" });
     } else {
@@ -160,7 +188,12 @@ describe("sign-in controller", () => {
   it("waits, shows the number, then asks Continue as …", async () => {
     const svc = service([
       err(409, "auth/oob/redeem:pending", { state: "claimed", matchNumber: "47" }),
-      ok({ subject: "did:example:alice", displayName: "Alice", sessionEndsAt: new Date(1_900_000_000_000).toISOString(), amr: ["did", "oob", "uv"] }),
+      ok({
+        subject: "did:example:alice",
+        displayName: "Alice",
+        sessionEndsAt: new Date(1_900_000_000_000).toISOString(),
+        amr: ["did", "oob", "uv"],
+      }),
     ]);
     let redeemed: Record<string, unknown> | undefined;
     const s = createSignIn({
@@ -237,9 +270,21 @@ describe("sign-in controller", () => {
     const svc = service([
       err(409, "auth/oob/redeem:pending", { state: "pending" }),
       err(409, "auth/oob/redeem:pending", { state: "pending" }),
-      ok({ subject: "did:example:alice", displayName: "Alice", sessionEndsAt: new Date(1_900_000_000_000).toISOString(), amr: ["did"] }),
+      ok({
+        subject: "did:example:alice",
+        displayName: "Alice",
+        sessionEndsAt: new Date(1_900_000_000_000).toISOString(),
+        amr: ["did"],
+      }),
     ]);
-    const s = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: svc.f, keys: keys(), document: doc as unknown as Document, pageHost: "dids.example.org" });
+    const s = createSignIn({
+      endpoint: "/e",
+      serviceDid: DID,
+      fetch: svc.f,
+      keys: keys(),
+      document: doc as unknown as Document,
+      pageHost: "dids.example.org",
+    });
     await s.start();
     await until(() => s.state, "waiting");
     doc.hide();
@@ -252,14 +297,25 @@ describe("sign-in controller", () => {
   it("shows a still-unclaimed code again when the tab is visible again", async () => {
     const doc = new FakeDocument();
     const svc = service([]);
-    const s = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: svc.f, keys: keys(), document: doc as unknown as Document, pageHost: "dids.example.org" });
+    const s = createSignIn({
+      endpoint: "/e",
+      serviceDid: DID,
+      fetch: svc.f,
+      keys: keys(),
+      document: doc as unknown as Document,
+      pageHost: "dids.example.org",
+    });
     await s.start();
     const first = await until(() => s.state, "waiting");
     doc.hide();
     expect(s.state).toMatchObject({ status: "waiting", codeVisible: false });
     doc.show();
     // The same request, shown again: no new request, nothing cancelled.
-    expect(s.state).toMatchObject({ status: "waiting", codeVisible: true, requestId: (first as { requestId: string }).requestId });
+    expect(s.state).toMatchObject({
+      status: "waiting",
+      codeVisible: true,
+      requestId: (first as { requestId: string }).requestId,
+    });
     expect(svc.sent.filter((d) => String(d.type).endsWith("/request/0.2"))).toHaveLength(1);
     expect(svc.sent.some((d) => String(d.type).endsWith("/cancel/0.1"))).toBe(false);
     s.destroy();
@@ -268,7 +324,14 @@ describe("sign-in controller", () => {
   it("maps a cancelled request to cancelled and drops the key", async () => {
     const k = keys();
     const svc = service([err(409, "auth/oob/redeem:declined", { state: "cancelled" })]);
-    const s = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: svc.f, keys: k, document: new FakeDocument() as unknown as Document, pageHost: "dids.example.org" });
+    const s = createSignIn({
+      endpoint: "/e",
+      serviceDid: DID,
+      fetch: svc.f,
+      keys: k,
+      document: new FakeDocument() as unknown as Document,
+      pageHost: "dids.example.org",
+    });
     await s.start();
     await until(() => s.state, "cancelled");
     expect(k.cleared).toBe(1);
@@ -276,14 +339,28 @@ describe("sign-in controller", () => {
 
   it("maps an expired request to expired", async () => {
     const svc = service([err(409, "auth/oob:requestExpired", { state: "expired" })]);
-    const s = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: svc.f, keys: keys(), document: new FakeDocument() as unknown as Document, pageHost: "dids.example.org" });
+    const s = createSignIn({
+      endpoint: "/e",
+      serviceDid: DID,
+      fetch: svc.f,
+      keys: keys(),
+      document: new FakeDocument() as unknown as Document,
+      pageHost: "dids.example.org",
+    });
     await s.start();
     await until(() => s.state, "expired");
   });
 
   it("cancel() tells the service", async () => {
     const svc = service([]);
-    const s = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: svc.f, keys: keys(), document: new FakeDocument() as unknown as Document, pageHost: "dids.example.org" });
+    const s = createSignIn({
+      endpoint: "/e",
+      serviceDid: DID,
+      fetch: svc.f,
+      keys: keys(),
+      document: new FakeDocument() as unknown as Document,
+      pageHost: "dids.example.org",
+    });
     await s.start();
     await until(() => s.state, "waiting");
     await s.cancel();
@@ -293,8 +370,18 @@ describe("sign-in controller", () => {
 
   it("reports a server without the sign-in as unavailable, so the page falls back", async () => {
     // A control plane with no service DID or public URL answers a plain 503.
-    const f = (async () => new Response("wallet sign-in is not configured on this server", { status: 503 })) as unknown as typeof fetch;
-    const s = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: f, keys: keys(), document: new FakeDocument() as unknown as Document, pageHost: "dids.example.org" });
+    const f = (async () =>
+      new Response("wallet sign-in is not configured on this server", {
+        status: 503,
+      })) as unknown as typeof fetch;
+    const s = createSignIn({
+      endpoint: "/e",
+      serviceDid: DID,
+      fetch: f,
+      keys: keys(),
+      document: new FakeDocument() as unknown as Document,
+      pageHost: "dids.example.org",
+    });
     await s.start();
     const st = await until(() => s.state, "error");
     expect(isUnavailable(st)).toBe(true);
@@ -302,7 +389,14 @@ describe("sign-in controller", () => {
 
   it("starts at once on a visible page, and only once a hidden one is visible", async () => {
     const svc = service([]);
-    const visible = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: svc.f, keys: keys(), document: new FakeDocument() as unknown as Document, pageHost: "dids.example.org" });
+    const visible = createSignIn({
+      endpoint: "/e",
+      serviceDid: DID,
+      fetch: svc.f,
+      keys: keys(),
+      document: new FakeDocument() as unknown as Document,
+      pageHost: "dids.example.org",
+    });
     visible.startWhenVisible();
     await until(() => visible.state, "waiting");
     visible.destroy();
@@ -310,7 +404,14 @@ describe("sign-in controller", () => {
     const doc = new FakeDocument();
     doc.visibilityState = "hidden";
     const hiddenSvc = service([]);
-    const hidden = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: hiddenSvc.f, keys: keys(), document: doc as unknown as Document, pageHost: "dids.example.org" });
+    const hidden = createSignIn({
+      endpoint: "/e",
+      serviceDid: DID,
+      fetch: hiddenSvc.f,
+      keys: keys(),
+      document: doc as unknown as Document,
+      pageHost: "dids.example.org",
+    });
     hidden.startWhenVisible();
     await new Promise((r) => setTimeout(r, 30));
     expect(hidden.state.status).toBe("idle");
@@ -324,14 +425,28 @@ describe("sign-in controller", () => {
   it("renews an unclaimed code when its claim window closes, on a visible page", async () => {
     // A claim window already closed: the expiry fires at once.
     const svc = service([], 0);
-    const s = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: svc.f, keys: keys(), document: new FakeDocument() as unknown as Document, pageHost: "dids.example.org", renew: true });
+    const s = createSignIn({
+      endpoint: "/e",
+      serviceDid: DID,
+      fetch: svc.f,
+      keys: keys(),
+      document: new FakeDocument() as unknown as Document,
+      pageHost: "dids.example.org",
+      renew: true,
+    });
     const seen: string[] = [];
     s.subscribe((st) => seen.push(st.status));
     s.startWhenVisible();
-    for (let i = 0; i < 200 && svc.sent.filter((d) => String(d.type).endsWith("/request/0.2")).length < 3; i++) {
+    for (
+      let i = 0;
+      i < 200 && svc.sent.filter((d) => String(d.type).endsWith("/request/0.2")).length < 3;
+      i++
+    ) {
       await new Promise((r) => setTimeout(r, 5));
     }
-    expect(svc.sent.filter((d) => String(d.type).endsWith("/request/0.2")).length).toBeGreaterThanOrEqual(3);
+    expect(
+      svc.sent.filter((d) => String(d.type).endsWith("/request/0.2")).length,
+    ).toBeGreaterThanOrEqual(3);
     expect(seen).not.toContain("expired");
     s.destroy();
   });
@@ -340,7 +455,15 @@ describe("sign-in controller", () => {
     const doc = new FakeDocument();
     const svc = service([], 0);
     const requests = () => svc.sent.filter((d) => String(d.type).endsWith("/request/0.2")).length;
-    const s = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: svc.f, keys: keys(), document: doc as unknown as Document, pageHost: "dids.example.org", renew: true });
+    const s = createSignIn({
+      endpoint: "/e",
+      serviceDid: DID,
+      fetch: svc.f,
+      keys: keys(),
+      document: doc as unknown as Document,
+      pageHost: "dids.example.org",
+      renew: true,
+    });
     doc.hide();
     // Opened by hand while hidden: its window closes, and nothing is renewed.
     await s.start();
@@ -358,7 +481,15 @@ describe("sign-in controller", () => {
       err(409, "auth/oob/redeem:pending", { state: "claimed", matchNumber: "47" }),
       err(409, "auth/oob:requestExpired", { state: "expired" }),
     ]);
-    const s = createSignIn({ endpoint: "/e", serviceDid: DID, fetch: svc.f, keys: keys(), document: new FakeDocument() as unknown as Document, pageHost: "dids.example.org", renew: true });
+    const s = createSignIn({
+      endpoint: "/e",
+      serviceDid: DID,
+      fetch: svc.f,
+      keys: keys(),
+      document: new FakeDocument() as unknown as Document,
+      pageHost: "dids.example.org",
+      renew: true,
+    });
     s.startWhenVisible();
     await until(() => s.state, "expired");
     expect(svc.sent.filter((d) => String(d.type).endsWith("/request/0.2"))).toHaveLength(1);
@@ -373,7 +504,13 @@ describe("sign-in controller", () => {
     for (const st of [
       { status: "idle" },
       { status: "starting" },
-      { status: "waiting", requestId: RID, link: "https://x/t", expiresAt: new Date(), codeVisible: true },
+      {
+        status: "waiting",
+        requestId: RID,
+        link: "https://x/t",
+        expiresAt: new Date(),
+        codeVisible: true,
+      },
       { status: "confirm", subject: "did:example:alice" },
       { status: "expired" },
     ] as SignInState[]) {
@@ -382,7 +519,9 @@ describe("sign-in controller", () => {
   });
 
   it("does not treat an ordinary refusal as unavailable", () => {
-    expect(isUnavailable({ status: "error", code: "auth/oob:rateLimited", message: "x" })).toBe(false);
+    expect(isUnavailable({ status: "error", code: "auth/oob:rateLimited", message: "x" })).toBe(
+      false,
+    );
     expect(isUnavailable({ status: "error", code: "timeout", message: "x" })).toBe(false);
     expect(isUnavailable({ status: "expired" })).toBe(false);
   });

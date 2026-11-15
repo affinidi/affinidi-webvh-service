@@ -44,9 +44,12 @@ export const SIGN_IN_MAX_LIFETIME_SECS = 300;
 /** Checked against the generated modules, which are imported for types only
  *  so their schemas stay out of the bundle. */
 export const OOB_TYPES = {
-  request: "https://trusttasks.org/spec/auth/oob/request/0.2" as const satisfies typeof OobRequest.TYPE_URI,
-  redeem: "https://trusttasks.org/spec/auth/oob/redeem/0.2" as const satisfies typeof OobRedeem.TYPE_URI,
-  cancel: "https://trusttasks.org/spec/auth/oob/cancel/0.1" as const satisfies typeof OobCancel.TYPE_URI,
+  request:
+    "https://trusttasks.org/spec/auth/oob/request/0.2" as const satisfies typeof OobRequest.TYPE_URI,
+  redeem:
+    "https://trusttasks.org/spec/auth/oob/redeem/0.2" as const satisfies typeof OobRedeem.TYPE_URI,
+  cancel:
+    "https://trusttasks.org/spec/auth/oob/cancel/0.1" as const satisfies typeof OobCancel.TYPE_URI,
 } as const;
 
 /** An RFC 3339 instant as integer epoch seconds, rounded down so nothing
@@ -76,14 +79,21 @@ export class TriggerLinkError extends Error {
 
 /** Percent-encode `&`, `=`, `#` and `%` in `_from`, and nothing else (C1). */
 export function encodeFromParam(from: string): string {
-  return from.replace(/[&=#%]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0"));
+  return from.replace(
+    /[&=#%]/g,
+    (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0"),
+  );
 }
 
 /** Last two labels, or three under a two-letter ccTLD with a short second level. */
 export function approximateRegistrableDomain(host: string): string {
   const labels = host.toLowerCase().replace(/\.$/, "").split(".");
   const n =
-    labels.length >= 3 && labels[labels.length - 1]!.length === 2 && labels[labels.length - 2]!.length <= 3 ? 3 : 2;
+    labels.length >= 3 &&
+    labels[labels.length - 1]!.length === 2 &&
+    labels[labels.length - 2]!.length <= 3
+      ? 3
+      : 2;
   return labels.slice(-n).join(".");
 }
 
@@ -154,8 +164,14 @@ export function buildTriggerLink(p: BuildTriggerLinkParams): string {
   if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(linkHost)) {
     throw new TriggerLinkError("bad-host", `invalid link host ${linkHost}`);
   }
-  if (p.pageHost && approximateRegistrableDomain(linkHost) === approximateRegistrableDomain(p.pageHost)) {
-    throw new TriggerLinkError("same-domain-host", `link host ${linkHost} is on the page's own domain`);
+  if (
+    p.pageHost &&
+    approximateRegistrableDomain(linkHost) === approximateRegistrableDomain(p.pageHost)
+  ) {
+    throw new TriggerLinkError(
+      "same-domain-host",
+      `link host ${linkHost} is on the page's own domain`,
+    );
   }
   if (!/^did:[a-z0-9]+:\S+$/.test(p.from) || p.from.includes("/@")) {
     throw new TriggerLinkError("bad-from", "_from must be a DID");
@@ -182,9 +198,13 @@ export function buildTriggerLink(p: BuildTriggerLinkParams): string {
   const link =
     `https://${linkHost}${linkPath}#_from=${encodeFromParam(p.from)}` +
     `&_id=${p.requestId}&_exp=${p.exp}&_type=${type}`;
-  if (!/^[\x21-\x7e]*$/.test(link)) throw new TriggerLinkError("non-ascii", "a trigger link must be ASCII");
+  if (!/^[\x21-\x7e]*$/.test(link))
+    throw new TriggerLinkError("non-ascii", "a trigger link must be ASCII");
   if (link.length > TRIGGER_LINK_MAX_BYTES) {
-    throw new TriggerLinkError("too-long", `link is ${link.length} bytes; the level-M limit is ${TRIGGER_LINK_MAX_BYTES}`);
+    throw new TriggerLinkError(
+      "too-long",
+      `link is ${link.length} bytes; the level-M limit is ${TRIGGER_LINK_MAX_BYTES}`,
+    );
   }
   return link;
 }
@@ -221,7 +241,8 @@ export function layoutQr(text: string, encoder: QrEncoder, moduleSize = 4): QrLa
   const m = encoder(text);
   let path = "";
   for (let r = 0; r < m.size; r++) {
-    for (let c = 0; c < m.size; c++) if (m.isDark(r, c)) path += `M${c + quiet} ${r + quiet}h1v1h-1z`;
+    for (let c = 0; c < m.size; c++)
+      if (m.isDark(r, c)) path += `M${c + quiet} ${r + quiet}h1v1h-1z`;
   }
   const units = m.size + 2 * quiet;
   return { units, pixels: units * px, path };
@@ -265,7 +286,7 @@ export interface StarterKeys {
 
 const sessionKeys: StarterKeys = {
   generate: () => generateSessionKeypair(),
-  sign: (doc) => signEnvelope(doc as never),
+  sign: (doc) => signEnvelope(doc),
   clear: () => clearSessionKeypair(),
 };
 
@@ -413,10 +434,15 @@ export class SignInController {
     this.set({ status: "starting" });
     try {
       this.keyDid = (await this.keys.generate()).didKey;
-      const res = await this.post(await this.signed(OOB_TYPES.request, { purpose: "login", mode: "scan" }), this.opts.requestTimeoutMs ?? 15_000);
+      const res = await this.post(
+        await this.signed(OOB_TYPES.request, { purpose: "login", mode: "scan" }),
+        this.opts.requestTimeoutMs ?? 15_000,
+      );
       if (run !== this.run) return;
       if (!res.ok) throw new SignInError(res.code, res.message, res.details);
-      const { requestId, claimClosesAt } = res.payload as Partial<Record<keyof OobRequest.Response, unknown>>;
+      const { requestId, claimClosesAt } = res.payload as Partial<
+        Record<keyof OobRequest.Response, unknown>
+      >;
       const claimDeadline = epochSecondsOf(claimClosesAt);
       if (typeof requestId !== "string" || claimDeadline === null) {
         throw new SignInError("malformedResponse", "the service returned an unusable request");
@@ -427,7 +453,8 @@ export class SignInController {
         exp: claimDeadline,
         linkHost: this.opts.linkHost,
         linkPath: this.opts.linkPath,
-        pageHost: this.opts.pageHost ?? (typeof location !== "undefined" ? location.hostname : undefined),
+        pageHost:
+          this.opts.pageHost ?? (typeof location !== "undefined" ? location.hostname : undefined),
         nowSecs: Math.floor(Date.now() / 1000),
       });
       this.requestId = requestId;
@@ -499,7 +526,11 @@ export class SignInController {
       this.poll = new AbortController();
       let res: PostResult;
       try {
-        res = await this.post(await this.signed(OOB_TYPES.redeem, { requestId }), this.opts.pollTimeoutMs ?? 35_000, this.poll.signal);
+        res = await this.post(
+          await this.signed(OOB_TYPES.redeem, { requestId }),
+          this.opts.pollTimeoutMs ?? 35_000,
+          this.poll.signal,
+        );
       } catch (e) {
         if (run !== this.run) return;
         if (++failures > 5) return this.fail(e);
@@ -575,7 +606,10 @@ export class SignInController {
     this.requestId = null;
     if (requestId && this.keyDid) {
       try {
-        await this.post(await this.signed(OOB_TYPES.cancel, { requestId }), this.opts.requestTimeoutMs ?? 15_000);
+        await this.post(
+          await this.signed(OOB_TYPES.cancel, { requestId }),
+          this.opts.requestTimeoutMs ?? 15_000,
+        );
       } catch {
         // Best effort: the request expires on its own.
       }
@@ -652,7 +686,10 @@ export class SignInController {
   private async post(doc: unknown, timeoutMs: number, signal?: AbortSignal): Promise<PostResult> {
     const f = this.opts.fetch ?? fetch;
     const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(new SignInError("timeout", "the service did not answer")), timeoutMs);
+    const timer = setTimeout(
+      () => ctl.abort(new SignInError("timeout", "the service did not answer")),
+      timeoutMs,
+    );
     const onAbort = () => ctl.abort(signal!.reason);
     signal?.addEventListener("abort", onAbort);
     try {
@@ -665,15 +702,27 @@ export class SignInController {
         body: JSON.stringify(doc),
         signal: ctl.signal,
       });
-      const body = (await res.json().catch(() => null)) as { type?: string; payload?: Record<string, unknown> } | null;
-      const isError = !res.ok || (typeof body?.type === "string" && body.type.includes("/trust-task-error/"));
+      const body = (await res.json().catch(() => null)) as {
+        type?: string;
+        payload?: Record<string, unknown>;
+      } | null;
+      const isError =
+        !res.ok || (typeof body?.type === "string" && body.type.includes("/trust-task-error/"));
       if (!isError) return { ok: true, payload: body?.payload ?? {} };
       const p = body?.payload ?? {};
       return {
         ok: false,
-        code: typeof p.code === "string" ? p.code : res.status === 429 ? "rateLimited" : `http${res.status}`,
-        message: typeof p.message === "string" ? p.message : `${res.status} from the sign-in service`,
-        ...(p.details && typeof p.details === "object" ? { details: p.details as Record<string, unknown> } : {}),
+        code:
+          typeof p.code === "string"
+            ? p.code
+            : res.status === 429
+              ? "rateLimited"
+              : `http${res.status}`,
+        message:
+          typeof p.message === "string" ? p.message : `${res.status} from the sign-in service`,
+        ...(p.details && typeof p.details === "object"
+          ? { details: p.details as Record<string, unknown> }
+          : {}),
       };
     } finally {
       clearTimeout(timer);

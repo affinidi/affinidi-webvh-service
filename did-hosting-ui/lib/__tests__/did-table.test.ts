@@ -25,9 +25,32 @@ function rec(over: Partial<DidRecord>): DidRecord {
   };
 }
 
-const a = rec({ mnemonic: "alpha", didId: "did:webvh:Qm1:example.com:alpha", method: "webvh", versionCount: 3, createdAt: 30, updatedAt: 10, totalResolves: 5 });
-const b = rec({ mnemonic: "bravo", didId: "did:web:example.com:bravo", method: "web", versionCount: 1, createdAt: 10, updatedAt: 30, totalResolves: 500 });
-const c = rec({ mnemonic: "charlie", versionCount: 0, createdAt: 20, updatedAt: 20, totalResolves: 50, agentNames: [{ name: "shop" } as never] });
+const a = rec({
+  mnemonic: "alpha",
+  didId: "did:webvh:Qm1:example.com:alpha",
+  method: "webvh",
+  versionCount: 3,
+  createdAt: 30,
+  updatedAt: 10,
+  totalResolves: 5,
+});
+const b = rec({
+  mnemonic: "bravo",
+  didId: "did:web:example.com:bravo",
+  method: "web",
+  versionCount: 1,
+  createdAt: 10,
+  updatedAt: 30,
+  totalResolves: 500,
+});
+const c = rec({
+  mnemonic: "charlie",
+  versionCount: 0,
+  createdAt: 20,
+  updatedAt: 20,
+  totalResolves: 50,
+  agentNames: [{ name: "shop" } as never],
+});
 
 describe("matchesSearch", () => {
   it("matches name, DID and method case-insensitively", () => {
@@ -49,11 +72,31 @@ describe("matchesSearch", () => {
 describe("sortDids", () => {
   const names = (l: DidRecord[]) => l.map((d) => d.mnemonic);
   it("sorts each column both ways", () => {
-    expect(names(sortDids([c, a, b], { key: "mnemonic", dir: "asc" }))).toEqual(["alpha", "bravo", "charlie"]);
-    expect(names(sortDids([a, b, c], { key: "resolves", dir: "desc" }))).toEqual(["bravo", "charlie", "alpha"]);
-    expect(names(sortDids([a, b, c], { key: "created", dir: "asc" }))).toEqual(["bravo", "charlie", "alpha"]);
-    expect(names(sortDids([a, b, c], { key: "updated", dir: "desc" }))).toEqual(["bravo", "charlie", "alpha"]);
-    expect(names(sortDids([a, b, c], { key: "versions", dir: "asc" }))).toEqual(["charlie", "bravo", "alpha"]);
+    expect(names(sortDids([c, a, b], { key: "mnemonic", dir: "asc" }))).toEqual([
+      "alpha",
+      "bravo",
+      "charlie",
+    ]);
+    expect(names(sortDids([a, b, c], { key: "resolves", dir: "desc" }))).toEqual([
+      "bravo",
+      "charlie",
+      "alpha",
+    ]);
+    expect(names(sortDids([a, b, c], { key: "created", dir: "asc" }))).toEqual([
+      "bravo",
+      "charlie",
+      "alpha",
+    ]);
+    expect(names(sortDids([a, b, c], { key: "updated", dir: "desc" }))).toEqual([
+      "bravo",
+      "charlie",
+      "alpha",
+    ]);
+    expect(names(sortDids([a, b, c], { key: "versions", dir: "asc" }))).toEqual([
+      "charlie",
+      "bravo",
+      "alpha",
+    ]);
   });
   it("does not reorder its input", () => {
     const input = [b, a];
@@ -64,17 +107,26 @@ describe("sortDids", () => {
 
 describe("nextSort", () => {
   it("flips the same column, starts a new one at its default", () => {
-    expect(nextSort({ key: "resolves", dir: "desc" }, "resolves")).toEqual({ key: "resolves", dir: "asc" });
-    expect(nextSort({ key: "resolves", dir: "asc" }, "mnemonic")).toEqual({ key: "mnemonic", dir: "asc" });
-    expect(nextSort({ key: "mnemonic", dir: "asc" }, "updated")).toEqual({ key: "updated", dir: "desc" });
+    expect(nextSort({ key: "resolves", dir: "desc" }, "resolves")).toEqual({
+      key: "resolves",
+      dir: "asc",
+    });
+    expect(nextSort({ key: "resolves", dir: "asc" }, "mnemonic")).toEqual({
+      key: "mnemonic",
+      dir: "asc",
+    });
+    expect(nextSort({ key: "mnemonic", dir: "asc" }, "updated")).toEqual({
+      key: "updated",
+      dir: "desc",
+    });
   });
 });
 
 describe("compactDid", () => {
   it("keeps a webvh DID's method, SCID head and slot", () => {
-    expect(
-      compactDid("did:webvh:QmYaiNjfYLYDabcdefghijklmnop:webvh.storm.ws:bottom-clay"),
-    ).toBe("did:webvh:QmYaiNjfYLYD…:bottom-clay");
+    expect(compactDid("did:webvh:QmYaiNjfYLYDabcdefghijklmnop:webvh.storm.ws:bottom-clay")).toBe(
+      "did:webvh:QmYaiNjfYLYD…:bottom-clay",
+    );
   });
 
   it("ends a root DID with its host", () => {
@@ -91,7 +143,8 @@ describe("compactDid", () => {
 describe("truncateDid", () => {
   it("keeps short DIDs and both ends of long ones", () => {
     expect(truncateDid("did:web:x")).toBe("did:web:x");
-    const long = "did:webvh:QmSNo2TJRq5xiiYhHZNrTqoaq8bivffWq4PZXjQQAzvNtr:webvh.storm.ws:angry-derive";
+    const long =
+      "did:webvh:QmSNo2TJRq5xiiYhHZNrTqoaq8bivffWq4PZXjQQAzvNtr:webvh.storm.ws:angry-derive";
     const t = truncateDid(long, 40);
     expect(t.length).toBe(40);
     expect(t.startsWith("did:webvh:Qm")).toBe(true);
@@ -110,7 +163,9 @@ describe("nameColumnWidth", () => {
 
   it("counts badges and agent-name chips", () => {
     const bare = nameColumnWidth([{ name: "arrange-possible" }]);
-    expect(nameColumnWidth([{ name: "arrange-possible", badges: ["did:webvh", "You"] }])).toBeGreaterThan(bare);
+    expect(
+      nameColumnWidth([{ name: "arrange-possible", badges: ["did:webvh", "You"] }]),
+    ).toBeGreaterThan(bare);
     expect(nameColumnWidth([{ name: "a", chips: ["a-much-longer-agent-name"] }])).toBeGreaterThan(
       nameColumnWidth([{ name: "a" }]),
     );

@@ -1,37 +1,26 @@
-import { useCallback, useEffect, useState } from "react";
-import {
-  View,
-  Text,
-  StyleSheet,
-  Pressable,
-  ActivityIndicator,
-  ScrollView,
-} from "react-native";
-import { Link } from "expo-router";
+import { useState } from "react";
+import { View, Text, StyleSheet, ActivityIndicator, ScrollView } from "react-native";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
+import { Button } from "../../components/Button";
+import { Countdown } from "../../components/Countdown";
+import { Heading } from "../../components/Heading";
+import { RequireAuth } from "../../components/RequireAuth";
 import { ServiceBadges } from "../../components/ServiceBadges";
 import { AgentNameChips } from "../../components/AgentNameChips";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { showConfirm } from "../../lib/alert";
+import { errorMessage } from "../../lib/errors";
+import { useTrustTaskMutation, useTrustTaskQuery } from "../../lib/query";
+import { QK } from "../../lib/query-keys";
+import { formatDuration } from "../../lib/time";
 import { useAgentNames } from "../../lib/use-agent-names";
-import type { ControlPlaneConfig, IdentityGeneration } from "../../lib/api";
+import type { IdentityGeneration } from "../../lib/api";
 import { PasskeysCard } from "../../components/PasskeysCard";
 
-function formatDuration(seconds: number): string {
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
-  return `${Math.floor(seconds / 86400)}d`;
-}
-
-/** How much longer a superseded generation keeps decrypting. */
-function remainingLabel(expiresAt: number, now: number): string {
-  const left = expiresAt - now;
-  if (left <= 0) return "expiring";
-  if (left < 60) return `${left}s`;
-  if (left < 3600) return `${Math.floor(left / 60)}m`;
-  return `${Math.floor(left / 3600)}h ${Math.floor((left % 3600) / 60)}m`;
+/** A configured interval, compact: "15m", "7d". */
+function interval(seconds: number): string {
+  return formatDuration(seconds, { style: "compact" });
 }
 
 function Row({ label, value }: { label: string; value: string }) {
@@ -79,9 +68,7 @@ function DidRow({
 function Badge({ enabled, label }: { enabled: boolean; label?: string }) {
   return (
     <View style={[styles.badge, enabled ? styles.badgeOn : styles.badgeOff]}>
-      <Text style={styles.badgeText}>
-        {label ?? (enabled ? "Enabled" : "Disabled")}
-      </Text>
+      <Text style={styles.badgeText}>{label ?? (enabled ? "Enabled" : "Disabled")}</Text>
     </View>
   );
 }
@@ -96,55 +83,52 @@ function StatusRow({ label, enabled }: { label: string; enabled: boolean }) {
 }
 
 export default function SettingsPage() {
+  return (
+    <RequireAuth purpose="view settings">
+      <Settings />
+    </RequireAuth>
+  );
+}
+
+function Settings() {
   const api = useApi();
-  const { isAuthenticated, role } = useAuth();
+  const { role } = useAuth();
   // Settings shows control-plane topology (mediator/VTA DIDs, listen address,
   // registry, TTLs) — the same operator data the backend now gates behind
   // an admin (`server/config`, `identity/list`). Non-admins get
   // an explanatory panel instead of a blank page or a 403 error box.
   const isAdmin = role === "admin";
 
-  const [config, setConfig] = useState<ControlPlaneConfig | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  // Shared with the dashboard and the service overview (`QK.serverConfig`).
+  const {
+    data: config,
+    loading,
+    error,
+  } = useTrustTaskQuery(QK.serverConfig, ({ background }) => api.getConfig({ background }), {
+    enabled: isAdmin,
+  });
 
   // Called unconditionally, above the early returns, and tolerant of the
   // nulls it sees while `config` is still loading — it re-requests when the
   // set of DIDs actually changes, not on every render.
-  const agentNames = useAgentNames([
-    config?.controlDid,
-    config?.mediatorDid,
-    config?.vtaDid,
-  ]);
+  const agentNames = useAgentNames([config?.controlDid, config?.mediatorDid, config?.vtaDid]);
 
-  const [generations, setGenerations] = useState<IdentityGeneration[]>([]);
-  const [identityError, setIdentityError] = useState<string | null>(null);
+  // A deployment with no DID configured has no generations. That is not an
+  // error worth showing — the panel simply doesn't render.
+  const { data: generations = [] } = useTrustTaskQuery(
+    QK.identityGenerations,
+    () =>
+      api.listIdentityGenerations().then(
+        (d) => d.generations,
+        (): IdentityGeneration[] => [],
+      ),
+    { enabled: isAdmin },
+  );
+  const retire = useTrustTaskMutation((id: number) => api.retireIdentityGeneration(id), {
+    invalidates: [QK.identityGenerations],
+  });
   /** Id currently being retired, so its button can show progress. */
   const [retiring, setRetiring] = useState<number | null>(null);
-  const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
-
-  const loadGenerations = useCallback(() => {
-    api
-      .listIdentityGenerations()
-      .then((data) => {
-        setGenerations(data.generations);
-        setIdentityError(null);
-      })
-      // A deployment with no DID configured has no generations. That is not an
-      // error worth showing — the panel simply doesn't render.
-      .catch(() => setGenerations([]));
-  }, [api]);
-
-  useEffect(() => {
-    if (!isAuthenticated || !isAdmin) return;
-    loadGenerations();
-  }, [isAuthenticated, isAdmin, loadGenerations]);
-
-  // The "honoured for" countdown is only meaningful if it actually counts down.
-  useEffect(() => {
-    const t = setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000);
-    return () => clearInterval(t);
-  }, []);
 
   /**
    * Retire a superseded generation immediately.
@@ -164,56 +148,25 @@ export default function SettingsPage() {
         `Do this if the key is compromised. Otherwise, let the grace period run out.`,
       () => {
         setRetiring(g.id);
-        api
-          .retireIdentityGeneration(g.id)
-          .then(() => {
-            setIdentityError(null);
-            loadGenerations();
+        retire
+          .mutate(g.id)
+          .catch(() => {
+            // Shown below from `retire.error`.
           })
-          .catch((e) =>
-            setIdentityError(
-              e instanceof Error ? e.message : "Failed to retire generation",
-            ),
-          )
           .finally(() => setRetiring(null));
       },
     );
   };
-
-  useEffect(() => {
-    if (!isAuthenticated || !isAdmin) {
-      setLoading(false);
-      return;
-    }
-    api
-      .getConfig()
-      .then((data) => {
-        setConfig(data);
-        setError(null);
-      })
-      .catch((e) => setError(e.message))
-      .finally(() => setLoading(false));
-  }, [api, isAuthenticated, isAdmin]);
-
-  if (!isAuthenticated) {
-    return (
-      <View style={styles.containerCenter}>
-        <Text style={styles.hint}>Please log in to view settings.</Text>
-        <Link href="/login" asChild>
-          <Pressable style={styles.buttonPrimary}>
-            <Text style={styles.buttonPrimaryText}>Login</Text>
-          </Pressable>
-        </Link>
-      </View>
-    );
-  }
+  const identityError = retire.error
+    ? errorMessage(retire.error, "Failed to retire generation")
+    : null;
 
   // Everything below "My Passkeys" is control-plane topology, admin only.
   // Passkeys are the caller's own account, regardless of role.
   if (!isAdmin) {
     return (
       <ScrollView style={styles.scroll} contentContainerStyle={styles.container}>
-        <Text style={styles.title}>Account Settings</Text>
+        <Heading style={styles.title}>Account Settings</Heading>
         <PasskeysCard title="My Passkeys" />
         <Text style={styles.hint}>
           Control plane settings are available to administrators only.
@@ -225,15 +178,17 @@ export default function SettingsPage() {
   if (loading) {
     return (
       <View style={styles.containerCenter}>
-        <ActivityIndicator color={colors.accent} size="large" />
+        <ActivityIndicator color={colors.accent} size="large" aria-label="Loading settings" />
       </View>
     );
   }
 
-  if (error) {
+  if (error && !config) {
     return (
       <View style={styles.containerCenter}>
-        <Text style={styles.errorText}>{error}</Text>
+        <Text role="alert" style={styles.errorText}>
+          {errorMessage(error)}
+        </Text>
       </View>
     );
   }
@@ -241,17 +196,16 @@ export default function SettingsPage() {
   if (!config) return null;
 
   return (
-    <ScrollView
-      style={styles.scroll}
-      contentContainerStyle={styles.container}
-    >
-      <Text style={styles.title}>Control Plane Settings</Text>
+    <ScrollView style={styles.scroll} contentContainerStyle={styles.container}>
+      <Heading style={styles.title}>Control Plane Settings</Heading>
 
       <PasskeysCard title="My Passkeys" />
 
       {/* Identity */}
       <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Identity</Text>
+        <Heading level={2} style={styles.sectionTitle}>
+          Identity
+        </Heading>
         <DidRow
           label="Control Plane DID"
           did={config.controlDid}
@@ -262,13 +216,8 @@ export default function SettingsPage() {
           did={config.mediatorDid}
           names={agentNames[config.mediatorDid ?? ""] ?? []}
         />
-        <Row
-          label="Control Plane URL"
-          value={config.publicUrl ?? "Not configured"}
-        />
-        {config.didHostingUrl && (
-          <Row label="DID Hosting URL" value={config.didHostingUrl} />
-        )}
+        <Row label="Control Plane URL" value={config.publicUrl ?? "Not configured"} />
+        {config.didHostingUrl && <Row label="DID Hosting URL" value={config.didHostingUrl} />}
       </View>
 
       {/* Key generations. Only rendered when there is more than one — a
@@ -276,12 +225,13 @@ export default function SettingsPage() {
           single-row panel would just be noise. */}
       {generations.length > 1 && (
         <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Key Generations</Text>
+          <Heading level={2} style={styles.sectionTitle}>
+            Key Generations
+          </Heading>
           <Text style={styles.explainer}>
-            After a key rotation, peers holding a cached copy of this
-            service&apos;s DID document keep encrypting to the old key. Superseded
-            generations stay decryptable for a grace period so those messages
-            still arrive.
+            After a key rotation, peers holding a cached copy of this service&apos;s DID document
+            keep encrypting to the old key. Superseded generations stay decryptable for a grace
+            period so those messages still arrive.
           </Text>
 
           {generations.map((g) => (
@@ -292,30 +242,32 @@ export default function SettingsPage() {
                   {g.current ? " · current" : ""}
                 </Text>
                 {!g.current && (
-                  <Pressable
-                    style={styles.buttonDanger}
-                    disabled={retiring === g.id}
+                  <Button
+                    label="Retire now"
+                    accessibilityLabel={`Retire generation ${g.id} now`}
+                    variant="danger"
+                    size="sm"
+                    busy={retiring === g.id}
+                    busyLabel="Retiring…"
                     onPress={() => retireGeneration(g)}
-                  >
-                    <Text style={styles.buttonDangerText}>
-                      {retiring === g.id ? "Retiring…" : "Retire now"}
-                    </Text>
-                  </Pressable>
+                  />
                 )}
               </View>
 
               <Row label="Key agreement" value={g.keyAgreementKid} />
               {g.expiresAt !== null && (
-                <Row
-                  label="Honoured for"
-                  value={remainingLabel(g.expiresAt, now)}
-                />
+                <View style={styles.row}>
+                  <Text style={styles.label}>Honoured for</Text>
+                  <Countdown expiresAt={g.expiresAt} style={styles.value} />
+                </View>
               )}
             </View>
           ))}
 
           {identityError && (
-            <Text style={styles.errorText}>{identityError}</Text>
+            <Text role="alert" style={styles.errorText}>
+              {identityError}
+            </Text>
           )}
         </View>
       )}
@@ -325,23 +277,18 @@ export default function SettingsPage() {
           peers. They can disagree — the dashboard's Control Plane card
           spells out the consequences when they do. */}
       <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Connectivity</Text>
-        {config.listenAddress ? (
-          <Row label="Listen Address" value={config.listenAddress} />
-        ) : null}
+        <Heading level={2} style={styles.sectionTitle}>
+          Connectivity
+        </Heading>
+        {config.listenAddress ? <Row label="Listen Address" value={config.listenAddress} /> : null}
         <StatusRow label="DIDComm" enabled={config.didcommEnabled} />
         <StatusRow label="TSP" enabled={config.tspEnabled} />
         <View style={styles.row}>
           <Text style={styles.label}>Advertised services</Text>
           {config.advertisedServices ? (
-            <ServiceBadges
-              services={config.advertisedServices}
-              emptyLabel="none in DID document"
-            />
+            <ServiceBadges services={config.advertisedServices} emptyLabel="none in DID document" />
           ) : (
-            <Text style={styles.advertisedUnknown}>
-              DID not resolved
-            </Text>
+            <Text style={styles.advertisedUnknown}>DID not resolved</Text>
           )}
         </View>
       </View>
@@ -349,14 +296,12 @@ export default function SettingsPage() {
       {/* VTA */}
       {(config.vtaUrl || config.vtaDid) && (
         <View style={styles.card}>
-          <Text style={styles.sectionTitle}>VTA Integration</Text>
+          <Heading level={2} style={styles.sectionTitle}>
+            VTA Integration
+          </Heading>
           {config.vtaUrl && <Row label="VTA URL" value={config.vtaUrl} />}
           {config.vtaDid && (
-            <DidRow
-              label="VTA DID"
-              did={config.vtaDid}
-              names={agentNames[config.vtaDid] ?? []}
-            />
+            <DidRow label="VTA DID" did={config.vtaDid} names={agentNames[config.vtaDid] ?? []} />
           )}
         </View>
       )}
@@ -365,10 +310,12 @@ export default function SettingsPage() {
           only when the control plane states it. */}
       {config.registry && (
         <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Service Registry</Text>
+          <Heading level={2} style={styles.sectionTitle}>
+            Service Registry
+          </Heading>
           <Row
             label="Health Check Interval"
-            value={formatDuration(config.registry.healthCheckIntervalSecs)}
+            value={interval(config.registry.healthCheckIntervalSecs)}
           />
           <Row
             label="Configured Instances"
@@ -379,29 +326,27 @@ export default function SettingsPage() {
 
       {config.sessions && (
         <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Authentication</Text>
+          <Heading level={2} style={styles.sectionTitle}>
+            Authentication
+          </Heading>
           <Row
             label="Sign Out After Inactivity"
-            value={formatDuration(config.sessions.adminIdleTimeout)}
+            value={interval(config.sessions.adminIdleTimeout)}
           />
-          <Row
-            label="Access Token Expiry"
-            value={formatDuration(config.sessions.accessTokenExpiry)}
-          />
-          <Row
-            label="Refresh Token Expiry"
-            value={formatDuration(config.sessions.refreshTokenExpiry)}
-          />
+          <Row label="Access Token Expiry" value={interval(config.sessions.accessTokenExpiry)} />
+          <Row label="Refresh Token Expiry" value={interval(config.sessions.refreshTokenExpiry)} />
           <Row
             label="Passkey Enrollment TTL"
-            value={formatDuration(config.sessions.passkeyEnrollmentTtl)}
+            value={interval(config.sessions.passkeyEnrollmentTtl)}
           />
         </View>
       )}
 
       {config.dataDir || config.logLevel || config.logFormat ? (
         <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Storage & Logging</Text>
+          <Heading level={2} style={styles.sectionTitle}>
+            Storage & Logging
+          </Heading>
           {config.dataDir ? <Row label="Data Directory" value={config.dataDir} /> : null}
           {config.logLevel ? <Row label="Log Level" value={config.logLevel} /> : null}
           {config.logFormat ? <Row label="Log Format" value={config.logFormat} /> : null}
@@ -507,18 +452,6 @@ const styles = StyleSheet.create({
     textAlign: "center",
     marginBottom: spacing.lg,
   },
-  buttonPrimary: {
-    backgroundColor: colors.accent,
-    borderRadius: radii.md,
-    paddingVertical: 12,
-    paddingHorizontal: spacing.xl,
-    alignItems: "center",
-  },
-  buttonPrimaryText: {
-    color: colors.textOnAccent,
-    fontSize: 14,
-    fontFamily: fonts.semibold,
-  },
   explainer: {
     fontSize: 12,
     fontFamily: fonts.regular,
@@ -542,17 +475,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontFamily: fonts.semibold,
     color: colors.textPrimary,
-  },
-  buttonDanger: {
-    backgroundColor: colors.errorBg,
-    borderRadius: radii.md,
-    paddingVertical: 6,
-    paddingHorizontal: spacing.md,
-  },
-  buttonDangerText: {
-    color: colors.error,
-    fontSize: 12,
-    fontFamily: fonts.semibold,
   },
   errorText: {
     fontFamily: fonts.medium,

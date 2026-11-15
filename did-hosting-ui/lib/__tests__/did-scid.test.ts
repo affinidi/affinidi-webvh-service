@@ -19,10 +19,14 @@ describe("did:scid helpers", () => {
   });
 
   it("finds the host only in src", () => {
-    expect(scidHost(`did:scid:vh:1:${SCID}?src=dids.example.org/farm-auth`)).toBe("dids.example.org");
+    expect(scidHost(`did:scid:vh:1:${SCID}?src=dids.example.org/farm-auth`)).toBe(
+      "dids.example.org",
+    );
     expect(scidHost(`did:scid:vh:1:${SCID}?src=localhost%3A8534/x`)).toBe("localhost:8534");
     expect(scidHost(`did:scid:vh:1:${SCID}`)).toBeNull();
-    expect(extractDidHost(`did:scid:vh:1:${SCID}?src=https://dids.example.org`)).toBe("dids.example.org");
+    expect(extractDidHost(`did:scid:vh:1:${SCID}?src=https://dids.example.org`)).toBe(
+      "dids.example.org",
+    );
     // The webvh and web cases are unchanged.
     expect(extractDidHost(`did:webvh:${SCID}:dids.example.org:a`)).toBe("dids.example.org");
   });
@@ -38,7 +42,11 @@ describe("did:scid helpers", () => {
     const webvh = `did:webvh:${SCID}:dids.example.org:farm-auth`;
     const own = `did:scid:vh:1:${SCID}?src=dids.example.org/farm-auth`;
     expect(
-      scidAliasesOf(webvh, [own, "did:scid:vh:1:QmOther?src=x.example", "https://dids.example.org/@farm"]),
+      scidAliasesOf(webvh, [
+        own,
+        "did:scid:vh:1:QmOther?src=x.example",
+        "https://dids.example.org/@farm",
+      ]),
     ).toEqual([own]);
     expect(scidAliasesOf(webvh, undefined)).toEqual([]);
   });

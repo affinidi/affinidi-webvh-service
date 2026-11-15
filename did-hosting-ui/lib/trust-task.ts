@@ -18,13 +18,10 @@
  */
 
 import { ApiError, request } from "./http";
-import {
-  clearToken,
-  getSessionSubjectDid,
-  restoreSession,
-} from "./session";
+import { clearToken, getSessionSubjectDid, restoreSession } from "./session";
 import {
   generateSessionKeypair,
+  getSessionDidKey,
   hasSessionKeypair,
   restoreSessionKeypair,
   signEnvelope,
@@ -247,8 +244,7 @@ export function retryDelayMs(
   if (!payload.retryable) return null;
   const safe =
     ALWAYS_RETRY_CODES.has(payload.code) ||
-    (AMBIGUOUS_RETRY_CODES.has(payload.code) &&
-      REISSUE_SAFE_TASK_TYPES.has(typeUri));
+    (AMBIGUOUS_RETRY_CODES.has(payload.code) && REISSUE_SAFE_TASK_TYPES.has(typeUri));
   if (!safe) return null;
 
   if (payload.retryAfter === undefined) {
@@ -393,6 +389,11 @@ export type Signer =
    *  finish, which binds the new session to the key that signs it. A fresh
    *  key pair is generated for it. */
   | "fresh-session-key"
+  /** The session key this browser already holds, as its own `did:key`
+   *  issuer — renewing a session (`auth/refresh`), and a proxied wallet
+   *  login whose payload names the key it binds (the caller generated it
+   *  first, so the payload could say so). */
+  | "session-key"
   /** No proof and no issuer — only for a task whose proof rule is optional
    *  and that authorises nothing (opening a passkey login ceremony). */
   | "none";
@@ -416,7 +417,18 @@ async function sign(
   if (signer === "fresh-session-key") {
     const { didKey } = await generateSessionKeypair();
     doc.issuer = didKey;
-    await signEnvelope(doc as unknown as Record<string, unknown>);
+    await signEnvelope(doc);
+    return doc;
+  }
+  if (signer === "session-key") {
+    // After a reload the key is only in IndexedDB.
+    if (!hasSessionKeypair()) await restoreSessionKeypair();
+    const didKey = getSessionDidKey();
+    if (!hasSessionKeypair() || !didKey) {
+      throw new ApiError(401, "This browser no longer holds the session key — sign in again.");
+    }
+    doc.issuer = didKey;
+    await signEnvelope(doc);
     return doc;
   }
 
@@ -459,12 +471,9 @@ async function sign(
     if (typeof window !== "undefined") {
       window.dispatchEvent(new Event("webvh:unauthorized"));
     }
-    throw new ApiError(
-      401,
-      "This browser no longer holds the session key — sign in again.",
-    );
+    throw new ApiError(401, "This browser no longer holds the session key — sign in again.");
   }
-  await signEnvelope(doc as unknown as Record<string, unknown>);
+  await signEnvelope(doc);
   return doc;
 }
 
@@ -479,16 +488,13 @@ async function post<Resp>(
 ): Promise<TrustTaskDocument<Resp>> {
   let reply: TrustTaskDocument<Resp | TrustTaskErrorPayload>;
   try {
-    reply = await request<TrustTaskDocument<Resp | TrustTaskErrorPayload>>(
-      TRUST_TASKS_PATH,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(doc),
-        anonymous: opts.anonymous,
-        background: opts.background,
-      },
-    );
+    reply = await request<TrustTaskDocument<Resp | TrustTaskErrorPayload>>(TRUST_TASKS_PATH, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(doc),
+      anonymous: opts.anonymous,
+      background: opts.background,
+    });
   } catch (e) {
     // A rejection is a *document* at a non-2xx status (`status_for_code`:
     // permissionDenied → 403, taskFailed → 422, …). Read the body before
@@ -545,9 +551,7 @@ async function sendOnce<Req, Resp>(
  * resend would be refused as a replay. The bearer goes with it as context
  * only; the document's own proof is what the control plane authorises.
  */
-export async function sendSignedTrustTask<Resp>(
-  doc: TrustTaskDocument<unknown>,
-): Promise<Resp> {
+export async function sendSignedTrustTask<Resp>(doc: TrustTaskDocument<unknown>): Promise<Resp> {
   const { serviceDid } = await getServiceInfo();
   if (doc.recipient !== serviceDid) {
     throw new ApiError(
@@ -584,7 +588,7 @@ export async function trustTask<Req, Resp>(
       }
       const delay = retryDelayMs(typeUri, e.payload, Date.now());
       if (delay === null) throw e;
-      // eslint-disable-next-line no-console
+
       console.debug(
         `trust task ${typeUri} rejected as ${e.payload.code} (retryable); re-issuing in ${delay}ms`,
       );
@@ -611,11 +615,10 @@ function cryptoRandomUuid(): string {
   // RFC 4122 v4 polyfill via getRandomValues.
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
-  bytes[6] = (bytes[6] & 0x0f) | 0x40;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
   const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0"));
   return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex
     .slice(6, 8)
     .join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
 }
-

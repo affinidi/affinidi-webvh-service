@@ -272,17 +272,18 @@ async fn start_messaging_service(
     let config = DIDCommServiceConfig {
         listeners: vec![listener],
     };
-    let svc = if tsp_enabled {
-        DIDCommService::start_with_tsp(
-            config,
-            router,
-            crate::tsp::WatcherTspHandler::new(state.clone()),
-            shutdown,
-        )
-        .await
-    } else {
-        DIDCommService::start(config, router, shutdown).await
-    }
+    // The TSP handler is installed whether or not this listener carries TSP
+    // yet: the service holds one handler for its lifetime and the listener's
+    // `protocols` gate whether TSP frames reach it, so a service started
+    // without one could never dispatch TSP after a rotation rebuilt the
+    // listener with TSP on (`rebuild_own_listener`).
+    let svc = DIDCommService::start_with_tsp(
+        config,
+        router,
+        crate::tsp::WatcherTspHandler::new(state.clone()),
+        shutdown,
+    )
+    .await
     .map_err(|e| AppError::Internal(format!("failed to start messaging service: {e}")))?;
     info!(tsp = tsp_enabled, watcher_did = %identity.did, "messaging service started");
     Ok(Some(svc))

@@ -542,8 +542,8 @@ describe("resolveAclSubject / createAcl (agent names)", () => {
             subject: alice,
             role: "owner",
             act: { scope: "all" },
-              keys: { scope: "none" },
-              capabilities: { scope: "ceiling" },
+            keys: { scope: "none" },
+            capabilities: { scope: "ceiling" },
           },
         });
       }
@@ -623,13 +623,20 @@ describe("updateAcl (AclEntry 0.2: a grant never narrows)", () => {
     });
 
     const entry = await api.updateAcl(BOB, {
-      domains: { kind: "allowed_with_default", domains: ["a.example", "c.example"], default: "c.example" },
+      domains: {
+        kind: "allowed_with_default",
+        domains: ["a.example", "c.example"],
+        default: "c.example",
+      },
     });
 
     const [, revoke, grant] = tasks(sent);
     expect(revoke!.doc).toMatchObject({
       type: `${TT}acl/revoke/0.2`,
-      payload: { subject: BOB, revocation: { kind: "act", act: { scope: "contexts", contexts: ["a.example"] } } },
+      payload: {
+        subject: BOB,
+        revocation: { kind: "act", act: { scope: "contexts", contexts: ["a.example"] } },
+      },
     });
     expect(grant!.doc.payload.entry).toEqual({
       subject: BOB,
@@ -659,6 +666,83 @@ describe("updateAcl (AclEntry 0.2: a grant never narrows)", () => {
 
     expect(tasks(sent).map((s) => s.doc.type)).toEqual([`${TT}acl/show/0.2`, `${TT}acl/grant/0.2`]);
     expect(tasks(sent)[1]!.doc.payload.entry.act).toEqual({ scope: "all" });
+  });
+
+  describe("diffed against the loaded entry", () => {
+    const loaded = {
+      did: BOB,
+      role: "owner" as const,
+      label: "Bob",
+      created_at: 0,
+      max_total_size: null,
+      max_did_count: 5,
+      domains: { kind: "allowed" as const, domains: ["a.example"] },
+    };
+
+    it("sends nothing when nothing changed", async () => {
+      const sent = installControlPlane(() => undefined);
+      const entry = await api.updateAcl(
+        BOB,
+        { role: "owner", label: "Bob", maxDidCount: 5, domains: loaded.domains },
+        loaded,
+      );
+      expect(tasks(sent)).toHaveLength(0);
+      expect(entry).toBe(loaded);
+    });
+
+    it("sends one grant for a label edit, with no show first", async () => {
+      const sent = installControlPlane((req) =>
+        req.type === `${TT}acl/grant/0.2` ? seal(req, { entry: req.payload.entry }) : undefined,
+      );
+      const entry = await api.updateAcl(BOB, { role: "owner", label: "Robert" }, loaded);
+      expect(tasks(sent).map((s) => s.doc.type)).toEqual([`${TT}acl/grant/0.2`]);
+      expect(tasks(sent)[0]!.doc.payload.entry).toMatchObject({
+        label: "Robert",
+        act: { scope: "contexts", contexts: ["a.example"] },
+        ext: { "vnd.affinidi.webvh": { quota: { maxDidCount: 5 } } },
+      });
+      expect(entry.label).toBe("Robert");
+    });
+
+    it("sends only change-role for a role change", async () => {
+      const sent = installControlPlane((req) =>
+        req.type === `${TT}acl/change-role/0.2`
+          ? seal(req, {
+              entry: {
+                ...owner({ scope: "contexts", contexts: ["a.example"] }),
+                role: "metricsReader",
+                label: "Bob",
+                ext: { "vnd.affinidi.webvh": { quota: { maxDidCount: 5 } } },
+              },
+            })
+          : undefined,
+      );
+      await api.updateAcl(BOB, { role: "metricsReader", label: "Bob", maxDidCount: 5 }, loaded);
+      expect(tasks(sent).map((s) => s.doc.type)).toEqual([`${TT}acl/change-role/0.2`]);
+      expect(tasks(sent)[0]!.doc.payload).toEqual({
+        subject: BOB,
+        fromRole: "owner",
+        toRole: "metricsReader",
+      });
+    });
+
+    it("names the half-applied state when the grant after a role change fails", async () => {
+      installControlPlane((req) => {
+        if (req.type === `${TT}acl/change-role/0.2`) {
+          return seal(req, {
+            entry: {
+              ...owner({ scope: "contexts", contexts: ["a.example"] }),
+              role: "metricsReader",
+            },
+          });
+        }
+        if (req.type === `${TT}acl/grant/0.2`) return rejection("taskFailed");
+        return undefined;
+      });
+      await expect(
+        api.updateAcl(BOB, { role: "metricsReader", label: "New" }, loaded),
+      ).rejects.toThrow(/after the role change was applied/);
+    });
   });
 
   it("removes an entry with revocation kind entry", async () => {
@@ -771,7 +855,12 @@ describe("step-up (wallet session)", () => {
           );
         case REFRESH:
           return seal(req, {
-            tokens: { accessToken: ELEVATED, refreshToken: "refresh-2", tokenType: "Bearer", expiresIn: 900 },
+            tokens: {
+              accessToken: ELEVATED,
+              refreshToken: "refresh-2",
+              tokenType: "Bearer",
+              expiresIn: 900,
+            },
           });
         default:
           return undefined;
@@ -800,13 +889,21 @@ describe("step-up (wallet session)", () => {
 
     await api.deleteDomain("old.example");
 
-    expect(tasks(sent).map((s) => s.doc.type)).toEqual([PURGE, START, APPROVE_RESPONSE, REFRESH, PURGE]);
+    expect(tasks(sent).map((s) => s.doc.type)).toEqual([
+      PURGE,
+      START,
+      APPROVE_RESPONSE,
+      REFRESH,
+      PURGE,
+    ]);
     const [, start, answer, refresh, retried] = tasks(sent);
 
     // 1. The session key opens the step-up for its own session.
     expect(start!.doc.payload).toEqual({ sessionId: "sess-1" });
     expect(start!.doc.issuer).toBe(SUBJECT);
-    expect(start!.doc.proof.verificationMethod).toBe(`${didKey}#${didKey.slice("did:key:".length)}`);
+    expect(start!.doc.proof.verificationMethod).toBe(
+      `${didKey}#${didKey.slice("did:key:".length)}`,
+    );
     expect(start!.bearer).toBe(`Bearer ${TOKEN}`);
 
     // 2. The wallet gets the service's signed approve-request and nothing
@@ -826,7 +923,9 @@ describe("step-up (wallet session)", () => {
     // 4. The console renews with its own session key and refresh token.
     expect(refresh!.doc.issuer).toBe(didKey);
     expect(refresh!.doc.payload).toEqual({ refreshToken: "refresh-1" });
-    expect(refresh!.doc.proof.verificationMethod).toBe(`${didKey}#${didKey.slice("did:key:".length)}`);
+    expect(refresh!.doc.proof.verificationMethod).toBe(
+      `${didKey}#${didKey.slice("did:key:".length)}`,
+    );
     expect(refresh!.bearer).toBeUndefined();
 
     expect(store.get("webvh_token")).toBe(ELEVATED);
@@ -946,7 +1045,11 @@ describe("step-up (wallet session)", () => {
   });
 
   it("sends nothing on when the wallet answers a different challenge", async () => {
-    const store = stubStorage({ webvh_token: TOKEN, webvh_refresh_token: "refresh-1", webvh_auth_method: "wallet" });
+    const store = stubStorage({
+      webvh_token: TOKEN,
+      webvh_refresh_token: "refresh-1",
+      webvh_auth_method: "wallet",
+    });
     await generateSessionKeypair();
     stubWallet(
       vi.fn(async ({ approveRequest: request }: { approveRequest: Doc }) => ({
@@ -961,7 +1064,11 @@ describe("step-up (wallet session)", () => {
   });
 
   it("sends nothing on when the wallet declines", async () => {
-    stubStorage({ webvh_token: TOKEN, webvh_refresh_token: "refresh-1", webvh_auth_method: "wallet" });
+    stubStorage({
+      webvh_token: TOKEN,
+      webvh_refresh_token: "refresh-1",
+      webvh_auth_method: "wallet",
+    });
     await generateSessionKeypair();
     stubWallet(vi.fn().mockRejectedValue(new Error("step-up denied by user")));
     const sent = controlPlane(PURGE, rejection("stepUpRequired"), purged);
@@ -971,7 +1078,11 @@ describe("step-up (wallet session)", () => {
   });
 
   it("does not hand the wallet an approve-request for another session", async () => {
-    stubStorage({ webvh_token: TOKEN, webvh_refresh_token: "refresh-1", webvh_auth_method: "wallet" });
+    stubStorage({
+      webvh_token: TOKEN,
+      webvh_refresh_token: "refresh-1",
+      webvh_auth_method: "wallet",
+    });
     await generateSessionKeypair();
     const approve = stubWallet(vi.fn());
     const other = approveRequest();
@@ -983,7 +1094,11 @@ describe("step-up (wallet session)", () => {
   });
 
   it("does not renew when the control plane does not raise the session", async () => {
-    const store = stubStorage({ webvh_token: TOKEN, webvh_refresh_token: "refresh-1", webvh_auth_method: "wallet" });
+    const store = stubStorage({
+      webvh_token: TOKEN,
+      webvh_refresh_token: "refresh-1",
+      webvh_auth_method: "wallet",
+    });
     await generateSessionKeypair();
     stubWallet(
       vi.fn(async ({ approveRequest: request }: { approveRequest: Doc }) => ({

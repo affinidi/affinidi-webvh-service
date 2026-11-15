@@ -22,9 +22,12 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Platform, Pressable, StyleSheet, Text, View } from "react-native";
+import { Platform, StyleSheet, Text, View } from "react-native";
 
-import { api, setAuthMethod, setRefreshToken, setToken } from "../lib/api";
+import { Button } from "./Button";
+
+import { setAuthMethod, setRefreshToken, setToken } from "../lib/api";
+import { useApi } from "./ApiProvider";
 import { getApiBase } from "../lib/api-base";
 import {
   configuredLinkHost,
@@ -70,6 +73,7 @@ export function WalletSignIn({
    *  so the page can fall back to its other login methods. */
   onUnavailable?: () => void;
 }) {
+  const api = useApi();
   const [state, setState] = useState<SignInState>({ status: "idle" });
   // State, not a ref: creating the controller must re-render, or the
   // buttons that need it stay disabled.
@@ -134,13 +138,7 @@ export function WalletSignIn({
   };
 
   const newCode = (label: string) => (
-    <Pressable
-      style={[styles.button, (!c || !serviceDid) && styles.disabled]}
-      onPress={() => void c?.start()}
-      disabled={!c || !serviceDid}
-    >
-      <Text style={styles.buttonText}>{label}</Text>
-    </Pressable>
+    <Button label={label} onPress={() => void c?.start()} disabled={!c || !serviceDid} />
   );
 
   switch (state.status) {
@@ -163,9 +161,7 @@ export function WalletSignIn({
             Scan with your wallet, or click the code. It expires at{" "}
             {state.expiresAt.toLocaleTimeString()}.
           </Text>
-          <Pressable style={styles.linkButton} onPress={() => void c?.cancel()}>
-            <Text style={styles.linkButtonText}>Cancel</Text>
-          </Pressable>
+          <Button label="Cancel" variant="ghost" size="sm" onPress={() => void c?.cancel()} />
         </View>
       );
     case "claimed":
@@ -178,9 +174,7 @@ export function WalletSignIn({
               {state.matchNumber}
             </Text>
           </div>
-          <Pressable style={styles.linkButton} onPress={() => void c?.cancel()}>
-            <Text style={styles.linkButtonText}>Cancel</Text>
-          </Pressable>
+          <Button label="Cancel" variant="ghost" size="sm" onPress={() => void c?.cancel()} />
         </View>
       );
     case "confirm":
@@ -194,12 +188,8 @@ export function WalletSignIn({
               {state.subject}
             </Text>
           )}
-          <Pressable style={styles.button} onPress={onContinue}>
-            <Text style={styles.buttonText}>Continue</Text>
-          </Pressable>
-          <Pressable style={styles.linkButton} onPress={() => void onNotMe()}>
-            <Text style={styles.linkButtonText}>Not me</Text>
-          </Pressable>
+          <Button label="Continue" onPress={onContinue} />
+          <Button label="Not me" variant="ghost" size="sm" onPress={() => void onNotMe()} />
         </View>
       );
     case "signedIn":
@@ -222,7 +212,9 @@ export function WalletSignIn({
     case "error":
       return (
         <View>
-          <Text style={styles.errorText}>{state.message}</Text>
+          <Text role="alert" style={styles.errorText}>
+            {state.message}
+          </Text>
           {newCode("Try again")}
         </View>
       );
@@ -254,7 +246,12 @@ function TriggerLinkCode({ link }: { link: string }) {
           href={link}
           rel="noreferrer"
           referrerPolicy="no-referrer"
-          style={{ display: "inline-block", lineHeight: 0, background: QR_LIGHT, borderRadius: radii.md }}
+          style={{
+            display: "inline-block",
+            lineHeight: 0,
+            background: QR_LIGHT,
+            borderRadius: radii.md,
+          }}
         >
           <svg
             xmlns="http://www.w3.org/2000/svg"
@@ -271,7 +268,12 @@ function TriggerLinkCode({ link }: { link: string }) {
           </svg>
         </a>
       )}
-      <a href={link} rel="noreferrer" referrerPolicy="no-referrer" style={{ textDecoration: "none" }}>
+      <a
+        href={link}
+        rel="noreferrer"
+        referrerPolicy="no-referrer"
+        style={{ textDecoration: "none" }}
+      >
         <View style={styles.button}>
           <Text style={styles.buttonText}>Open in your wallet</Text>
         </View>
@@ -291,7 +293,12 @@ const styles = StyleSheet.create({
     textAlign: "center",
   },
   number: { fontSize: 48, fontFamily: fonts.bold, color: colors.textPrimary, letterSpacing: 4 },
-  confirm: { fontSize: 18, fontFamily: fonts.regular, color: colors.textPrimary, marginBottom: spacing.sm },
+  confirm: {
+    fontSize: 18,
+    fontFamily: fonts.regular,
+    color: colors.textPrimary,
+    marginBottom: spacing.sm,
+  },
   bold: { fontFamily: fonts.bold },
   mono: {
     fontFamily: "ui-monospace, monospace",
@@ -300,16 +307,13 @@ const styles = StyleSheet.create({
     marginBottom: spacing.md,
   },
   button: {
-    backgroundColor: colors.accent,
+    backgroundColor: colors.accentButton,
     borderRadius: radii.md,
     paddingVertical: 14,
     paddingHorizontal: spacing.lg,
     alignItems: "center",
   },
   buttonText: { color: colors.textOnAccent, fontSize: 16, fontFamily: fonts.semibold },
-  disabled: { opacity: 0.5 },
-  linkButton: { paddingVertical: spacing.sm, alignItems: "center" },
-  linkButtonText: { color: colors.accent, fontSize: 14, fontFamily: fonts.medium },
   errorText: {
     color: colors.error,
     fontSize: 13,
