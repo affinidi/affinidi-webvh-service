@@ -109,10 +109,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setSessionExpired(false);
   }, []);
 
-  const claims = useMemo(
-    () => (token ? decodeJwtClaims(token) : { role: null, did: null }),
-    [token],
-  );
+  // While a session has expired, the screen under the sign-in prompt keeps
+  // rendering as it did — an admin page must not flip to its "admins only"
+  // view and drop what was typed — so the last session's claims stay.
+  // Nothing is sent with them: there is no token.
+  const lastClaims = useRef<ReturnType<typeof decodeJwtClaims>>({ role: null, did: null });
+  const claims = useMemo(() => {
+    if (token) {
+      lastClaims.current = decodeJwtClaims(token);
+      return lastClaims.current;
+    }
+    return sessionExpired ? lastClaims.current : { role: null, did: null };
+  }, [token, sessionExpired]);
 
   // Reads are cached per key, not per session: when a different subject signs
   // in, drop what the last one loaded so it is never painted for the next.
