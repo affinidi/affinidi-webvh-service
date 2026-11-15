@@ -72,9 +72,12 @@ module.exports = defineConfig([
   },
   {
     // Tests stub wire documents; `any` there reads better than a cast chain.
+    // Screen tests import the module under test after the `vi.mock` stubs
+    // whose spies they share, so imports below code are deliberate there.
     files: ["**/__tests__/**"],
     rules: {
       "@typescript-eslint/no-explicit-any": "off",
+      "import/first": "off",
     },
   },
   {
