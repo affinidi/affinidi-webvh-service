@@ -880,7 +880,7 @@ async fn rewrite_if_present(
 /// Record that the entry is about to be handed to the transport as document
 /// `doc_id` carrying content with fingerprint `fp`. Written *before* the
 /// send, so an acknowledgement that arrives first still finds the row. The
-/// entry then waits [`ack_wait`] for the target's ack. Returns the entry as
+/// entry then waits `ack_wait` for the target's ack. Returns the entry as
 /// written, or `None` if the row was removed meanwhile (send nothing).
 pub async fn record_sent(
     store: &Store,

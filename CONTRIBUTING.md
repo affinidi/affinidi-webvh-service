@@ -104,7 +104,9 @@ git config user.email "you@example.com"
    non-trivial loops; no abbreviations that aren't already canonical
    (`did`, `acl`, `kv` are fine; `mnem`, `dscv` are not).
 6. **No `unsafe`** in production code without a sign-off in the PR
-   description.
+   description. The workspace lint `unsafe_code = "deny"` enforces it; an
+   approved exception (or a test module that mutates the environment)
+   carries a scoped `#[allow(unsafe_code)]`.
 7. **No `unwrap`/`expect` on user-supplied input.** Use `?` and route
    the error through `AppError`. `unwrap` on `Mutex`-poisoned state or
    on internal-invariant assertions is fine.

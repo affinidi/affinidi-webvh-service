@@ -1113,7 +1113,7 @@ pub async fn start_didcomm_service(
 /// Populate the per-DID service-badge cache (`DidRecord.services`) for records
 /// written before that field existed.
 ///
-/// Runs **only** `M-02`, not the full [`migrations::registry`]. The standalone
+/// Runs **only** `M-02`, not the full `migrations::registry`. The standalone
 /// control plane has never invoked the migration runner, so a store here may
 /// never have seen `M-01` either — switching the whole set on as a side effect
 /// of adding badges would fill `domain` from the system-default tier on records

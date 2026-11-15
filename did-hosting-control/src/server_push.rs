@@ -535,7 +535,7 @@ pub(crate) async fn stage_did_sync(
 /// Queue a DID's current state to every active server (and the watchers its
 /// log names) outside a mutation — for a slot written by something other than
 /// the DID operations, which stage their rows transactionally
-/// ([`stage_did_sync`]). Runs on a task of its own.
+/// (`stage_did_sync`). Runs on a task of its own.
 pub fn notify_servers_did(state: &AppState, mnemonic: String) {
     let tracker = state.background.clone();
     let state = state.clone();

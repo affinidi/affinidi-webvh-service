@@ -389,9 +389,9 @@ pub fn stale_own_did_message(
 ///
 /// The log is held to what a synced one is: its chain and witness proofs
 /// must verify, and it must strictly extend every history this store has
-/// served for the same DID and slot ([`verify_history`]), including one
+/// served for the same DID and slot (`verify_history`), including one
 /// since removed, so a remove followed by a load cannot put an older log
-/// back. The high-water marks then record it ([`stage_high_water`]).
+/// back. The high-water marks then record it (`stage_high_water`).
 pub async fn import_did_at_path(
     store: &Store,
     dids_ks: &KeyspaceHandle,

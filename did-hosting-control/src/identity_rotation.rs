@@ -1,7 +1,7 @@
 //! Rotation of the control plane's *own* DID identity.
 //!
 //! Three entry points, all of which end in the same place — the live set in
-//! [`ServiceIdentity`] changes, so the listener's profile has to be rebuilt:
+//! [`ServiceIdentity`](did_hosting_common::server::identity::ServiceIdentity) changes, so the listener's profile has to be rebuilt:
 //!
 //! - [`on_did_published`] — the trigger. Fires from the publish path on every
 //!   publish of a DID, and does real work only when the DID is ours.

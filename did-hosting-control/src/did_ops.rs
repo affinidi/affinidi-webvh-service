@@ -2135,7 +2135,7 @@ const LIST_SCAN_BUDGET: usize = 5000;
 ///   `domain:` index ([`did_index`]) or the `did:` records — and stops once
 ///   the page is full, so an unfiltered page reads about `limit` rows
 ///   whatever the store holds. A `search` reads at most
-///   [`LIST_SCAN_BUDGET`] rows a page.
+///   `LIST_SCAN_BUDGET` rows a page.
 /// - **Hash-ordered (DynamoDB, Cosmos DB, Firestore).** Pages are not in key
 ///   order, so the only correct page is a full walk of the records keeping
 ///   the `limit` smallest mnemonics after `after` — memory stays at one page,
@@ -2669,11 +2669,11 @@ async fn check_recipient_may_hold(
 ///   It must hold the live offer from the slot's current owner.
 ///
 /// Whichever way the slot moves, the recipient must be able to hold it
-/// ([`check_recipient_may_hold`]): an ACL entry whose role owns DIDs, a
+/// (`check_recipient_may_hold`): an ACL entry whose role owns DIDs, a
 /// domain scope covering the slot, and room in its quotas.
 ///
 /// `request_domain`, when given, must be the slot's domain
-/// ([`ensure_slot_domain_matches`]); it is checked once the caller is known
+/// (`ensure_slot_domain_matches`); it is checked once the caller is known
 /// to have standing on the slot, before anything is written.
 pub async fn change_did_owner(
     auth: &AuthClaims,

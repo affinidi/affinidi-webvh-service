@@ -40,7 +40,7 @@
 //! The walk is paged and only selects candidates. Each record is re-read
 //! through a consistent handle just before it is written, only `domain` is
 //! changed, and the write is a compare-and-swap against the bytes read
-//! ([`super::patch_did_record_field`]) — so a publish committed by another
+//! (`super::patch_did_record_field`) — so a publish committed by another
 //! replica during a rolling upgrade is never overwritten with a stale
 //! record.
 //!
