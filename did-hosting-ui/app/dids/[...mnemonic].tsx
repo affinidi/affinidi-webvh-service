@@ -1,256 +1,145 @@
-import { useEffect, useState, useCallback, useRef } from "react";
-import {
-  View,
-  Text,
-  TextInput,
-  StyleSheet,
-  Pressable,
-  ScrollView,
-  ActivityIndicator,
-} from "react-native";
-import { Link, useLocalSearchParams, useRouter } from "expo-router";
-import * as Clipboard from "expo-clipboard";
+/**
+ * One DID: its addresses, stats, document, names and the actions on it.
+ *
+ * The cards live in `components/did/`; this route reads the DID, derives what
+ * they share, and wires the delegated edits (`useDelegatedTask`) — every
+ * change to the document goes through the user's agent, which holds the
+ * update key we never will.
+ */
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { ScrollView, StyleSheet, View } from "react-native";
+import { useLocalSearchParams, useRouter } from "expo-router";
+
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
-import { AgentNameChips } from "../../components/AgentNameChips";
-import { useAgentNames } from "../../lib/use-agent-names";
-import { hasLogMovedPast } from "../../lib/pinned-edit";
-import { startPolling } from "../../lib/poll";
-import { extractDidHost } from "../../lib/domain";
-import { scidAliasesOf } from "../../lib/did-scid";
-import {
-  scidAliasConfirm,
-  scidAliasView,
-  type ScidAliasAction,
-} from "../../lib/scid-alias";
-import { ChipInput } from "../../components/ChipInput";
+import { useDomains } from "../../components/DomainProvider";
+import { RequireAuth } from "../../components/RequireAuth";
 import { UsageChart } from "../../components/UsageChart";
-import { colors, fonts, radii, spacing } from "../../lib/theme";
+import { AgentNamesCard } from "../../components/did/AgentNamesCard";
+import { ConsentPanel } from "../../components/did/ConsentPanel";
+import { DangerZone } from "../../components/did/DangerZone";
+import { DidDocumentCard } from "../../components/did/DidDocumentCard";
+import { DidHeader } from "../../components/did/DidHeader";
+import { DidDetailsCard, DidStatsCard } from "../../components/did/DidStatsCard";
+import { OwnershipCard } from "../../components/did/OwnershipCard";
+import { ParametersCard } from "../../components/did/ParametersCard";
+import { ScidAliasCard } from "../../components/did/ScidAliasCard";
+import { UploadCards } from "../../components/did/UploadCards";
+import {
+  agentDomainOf,
+  agentNameLabel,
+  agentNameLocalPart,
+  alsoKnownAsOf,
+} from "../../components/did/agent-names";
 import { showAlert, showConfirm } from "../../lib/alert";
+import type { DidDetailResponse, LogEntryInfo } from "../../lib/api";
+import { ownerMismatchWarning } from "../../lib/delegation-guard";
+import { scidAliasesOf } from "../../lib/did-scid";
+import { errorMessage } from "../../lib/errors";
+import { invalidateQueries, setQueryData, useTrustTaskQuery } from "../../lib/query";
+import { scidAliasConfirm, scidAliasView, type ScidAliasAction } from "../../lib/scid-alias";
+import { colors, spacing } from "../../lib/theme";
+import { useAgentNames } from "../../lib/use-agent-names";
+import { useDelegatedTask, type DelegatedResult } from "../../lib/use-delegated-task";
 import {
   isWalletTaskRelayAvailable,
-  requestDidUpdate,
   requestAgentNameTask,
+  requestDidUpdate,
   requestScidAliasUpdate,
-  digestPrefix,
-  type TaskConsentRequired,
-  type RequestTaskOutcome,
 } from "../../lib/wallet";
-import { orphanHint, ownerMismatchWarning } from "../../lib/delegation-guard";
-import { useDomains } from "../../components/DomainProvider";
-import type {
-  DidStats,
-  DidDetailResponse,
-  LogEntryInfo,
-} from "../../lib/api";
 
-// ---------------------------------------------------------------------------
-// Agent-name helpers
-// ---------------------------------------------------------------------------
-
-/** The hosting domain a name is scoped to — the DID's own host. Prefer the
- *  record's tagged `domain`; fall back to the host segment of the identifier.
- *
- *  Delegates to the shared [`extractDidHost`] rather than re-parsing here. The
- *  local copy this replaces required at least five colon-separated segments,
- *  which silently excluded **root DIDs**: `did:webvh:<scid>:<host>` has exactly
- *  four, because the root DID's path is implicit (`/.well-known/did.jsonl`) and
- *  absent from the identifier. A root record whose `domain` had not been tagged
- *  therefore resolved to no domain at all, disabling the whole Agent Names card
- *  — on precisely the DID that owns the domain's community name. */
-function agentDomainOf(detail: DidDetailResponse | null): string | null {
-  return detail?.domain || extractDidHost(detail?.didId);
-}
-
-/** How a bound name is written back to the operator.
- *
- *  `@alice` for an ordinary name, and `domain/@` for the community name —
- *  whose local part is empty, so the usual `@` + local part renders as a lone
- *  `@` and reads as a typo or a stray character in a confirm dialog. */
-function agentNameLabel(name: string, domain: string | null): string {
-  return name === "" ? `${domain ?? ""}/@` : `@${name}`;
-}
-
-/** If `aka` is an agent name (`…/@local`) on `domain`, return its local part.
- *  Host match is case-insensitive; the local part is returned verbatim (the
- *  spec compares it case-sensitively).
- *
- *  Returns `""` — not `null` — for the **community name** (`domain/@`), whose
- *  local part is genuinely empty. `null` means "not an agent name on this
- *  domain" and is the only value callers should discard; a caller that filters
- *  on truthiness instead drops the community name along with the non-matches. */
-function agentNameLocalPart(aka: string, domain: string): string | null {
-  const noScheme = aka.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
-  const marker = noScheme.indexOf("/@");
-  if (marker < 0) return null;
-  const host = noScheme.slice(0, marker);
-  const local = noScheme.slice(marker + 2).split("/")[0];
-  if (host.toLowerCase() !== domain.toLowerCase()) return null;
-  return local;
-}
-
-// ---------------------------------------------------------------------------
-// Main component
-// ---------------------------------------------------------------------------
+/** A stable empty log, so effects keyed on the entries do not re-run on every
+ *  render while nothing has loaded. */
+const NO_ENTRIES: LogEntryInfo[] = [];
 
 export default function DidDetail() {
+  return (
+    <RequireAuth purpose="view DID details">
+      <DidDetailScreen />
+    </RequireAuth>
+  );
+}
+
+function DidDetailScreen() {
   const { mnemonic: rawMnemonic } = useLocalSearchParams<{ mnemonic: string | string[] }>();
-  const mnemonic = Array.isArray(rawMnemonic) ? rawMnemonic.join("/") : rawMnemonic;
+  const mnemonic = (Array.isArray(rawMnemonic) ? rawMnemonic.join("/") : rawMnemonic) ?? "";
   const api = useApi();
-  const { isAuthenticated, role, did: callerDid } = useAuth();
+  const { role, did: callerDid } = useAuth();
   const router = useRouter();
 
-  const [stats, setStats] = useState<DidStats | null>(null);
-  const [statsError, setStatsError] = useState<string | null>(null);
-  const [didDetail, setDidDetail] = useState<DidDetailResponse | null>(null);
+  // ── Reads ──────────────────────────────────────────────────────────────────
+  const key = useMemo(() => ["did", mnemonic] as const, [mnemonic]);
+  const enabled = mnemonic !== "";
+  const stats = useTrustTaskQuery(
+    [...key, "stats"],
+    ({ background }) => api.getStats(mnemonic, { background }),
+    { enabled },
+  );
+  const detailQuery = useTrustTaskQuery(
+    [...key, "detail"],
+    ({ background }) => api.getDid(mnemonic, { background }),
+    { enabled },
+  );
+  const logQuery = useTrustTaskQuery(
+    [...key, "log"],
+    ({ background }) => api.getDidLog(mnemonic, { background }),
+    { enabled },
+  );
+  const didDetail = detailQuery.data ?? null;
+  const logEntries = logQuery.data ?? NO_ENTRIES;
+
+  const reload = useCallback(() => void invalidateQueries(key), [key]);
+
+  // ── Shared page state ─────────────────────────────────────────────────────
+  const [selectedVersion, setSelectedVersion] = useState(-1);
+  // Every (re)load shows the newest version.
+  useEffect(() => {
+    setSelectedVersion(logEntries.length - 1);
+  }, [logEntries]);
+  const [editingDoc, setEditingDoc] = useState(false);
+  // The upload card's textarea — the document card's "Copy to Upload" fills it.
+  const [logContent, setLogContent] = useState("");
+  const [loadingRaw, setLoadingRaw] = useState(false);
+
+  // ── Derived ───────────────────────────────────────────────────────────────
   // The owner's own handle, if this service hosts the owner's DID too — the
   // common case, since a VTA usually registers itself here before its DIDs.
   const ownerNameMap = useAgentNames([didDetail?.owner]);
   const ownerNames = ownerNameMap[didDetail?.owner ?? ""] ?? [];
-  // Rendered beside the delegated-edit actions when this DID belongs to someone
-  // other than the identity we signed in as. `null` when they match or either
-  // is unknown — see `delegation-guard` for why this warns rather than gates.
+  // Shown beside the delegated-edit actions when this DID belongs to someone
+  // other than the identity we signed in as — see `delegation-guard` for why
+  // this warns rather than gates.
   const delegationWarning = ownerMismatchWarning(didDetail?.owner, callerDid);
-  const [copied, setCopied] = useState(false);
-  const [didContent, setDidContent] = useState("");
-  const [witnessContent, setWitnessContent] = useState("");
-  const [logEntries, setLogEntries] = useState<LogEntryInfo[]>([]);
-  const [selectedVersion, setSelectedVersion] = useState(-1);
-  const [uploading, setUploading] = useState(false);
-  const [deleting, setDeleting] = useState(false);
-  const [rollingBack, setRollingBack] = useState(false);
-  const [loadingRaw, setLoadingRaw] = useState(false);
-  const [showChangeOwner, setShowChangeOwner] = useState(false);
-  const [newOwnerInput, setNewOwnerInput] = useState("");
-  const [changingOwner, setChangingOwner] = useState(false);
-  const [editingDoc, setEditingDoc] = useState(false);
-  const [docEditValue, setDocEditValue] = useState("");
-  // Delegated publish: the VTA holds the update key, so we propose and it decides.
-  const [publishing, setPublishing] = useState(false);
-  const [consent, setConsent] = useState<TaskConsentRequired | null>(null);
-  // Which card asked for the outstanding approval, so its code is shown once,
-  // beside the action that raised it.
-  const [consentOrigin, setConsentOrigin] = useState<"scidAlias" | "other">("other");
-  // The exact re-submit the outstanding approval is bound to — a document
-  // publish OR an agent-name park/resume.
-  //
-  // The approval is bound to a digest of the *payload*, so a retry MUST send
-  // the identical request. If the user edited the textarea (or typed a
-  // different name) while their phone was buzzing and we then submitted the new
-  // input, the digest would not match, the grant would not be found, and the
-  // VTA would raise a fresh approval — the *safe* failure, but a baffling one.
-  // Pinning the exact re-submit closure keeps "I approved it" meaning what the
-  // user thinks it means. A ref, not state: it is read only from the
-  // grant-event handler and the manual button, never rendered.
-  const resubmitRef = useRef<
-    ((opts?: { silent?: boolean }) => Promise<"accepted" | "consent" | "error">) | null
-  >(null);
-  // The log version the pinned re-submit above was built against, captured when
-  // the VTA asked for consent. The refresh below compares it against the live
-  // log to notice that the pinned payload has been overtaken — see the comment
-  // there. A ref for the same reason as `resubmitRef`: never rendered.
-  const pinnedVersionRef = useRef<string | null>(null);
-  const [editingParams, setEditingParams] = useState(false);
-  const [paramWatchers, setParamWatchers] = useState<string[]>([]);
-  const [paramWitnesses, setParamWitnesses] = useState<string[]>([]);
-  const [paramAlsoKnownAs, setParamAlsoKnownAs] = useState<string[]>([]);
-  const [paramPortable, setParamPortable] = useState(false);
-  const [paramTtl, setParamTtl] = useState<string>("");
-  // Agent names (`/@alice`)
-  const [nameInput, setNameInput] = useState("");
-  const [nameStatus, setNameStatus] = useState<
-    "checking" | "available" | "taken" | "reserved" | "error" | null
-  >(null);
-  const nameDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Guards the one-time path prefill below so it never clobbers later edits.
-  const namePrefilled = useRef(false);
+  const withDelegationWarning = (body: string) =>
+    delegationWarning ? `${body}\n\n${delegationWarning}` : body;
 
-  // `background`: the reload follows a timer-driven check rather than the
-  // operator, so it must not keep the session alive (see `lib/poll.ts`).
-  const loadData = useCallback((opts: { background?: boolean } = {}) => {
-    if (!mnemonic || !isAuthenticated) return;
-    api
-      .getStats(mnemonic, opts)
-      .then(setStats)
-      .catch((e) => setStatsError(e.message));
-    api
-      .getDid(mnemonic, opts)
-      .then(setDidDetail)
-      .catch(() => {});
-    api
-      .getDidLog(mnemonic, opts)
-      .then((entries) => {
-        setLogEntries(entries);
-        setSelectedVersion(entries.length - 1);
-      })
-      .catch(() => {});
-  }, [api, mnemonic, isAuthenticated]);
-
-  useEffect(() => {
-    loadData();
-  }, [loadData]);
-
-  // Sync parameter editor state when detail or log entries change
-  useEffect(() => {
-    if (!logEntries.length) return;
-    const latest = logEntries[logEntries.length - 1];
-    const params = latest?.parameters;
-    const state = latest?.state;
-
-    if (params) {
-      setParamPortable(params.portable === true);
-      setParamTtl(typeof params.ttl === "number" ? String(params.ttl) : "");
-
-      const watchers: string[] = Array.isArray(params.watchers)
-        ? params.watchers.filter((w: unknown) => typeof w === "string")
-        : [];
-      setParamWatchers(watchers);
-
-      const witnessParam = params.witness as { witnesses?: unknown } | null | undefined;
-      const witnesses: string[] = Array.isArray(witnessParam?.witnesses)
-        ? witnessParam.witnesses
-            .map((w: unknown) => (w && typeof w === "object" ? (w as { id?: unknown }).id : null))
-            .filter((id: unknown): id is string => typeof id === "string")
-        : [];
-      setParamWitnesses(witnesses);
-    }
-
-    if (state) {
-      const aka: string[] = Array.isArray(state.alsoKnownAs)
-        ? state.alsoKnownAs.filter((a: unknown) => typeof a === "string")
-        : [];
-      setParamAlsoKnownAs(aka);
-    }
-  }, [logEntries]);
-
-  // The hosting domain this DID's names are scoped to.
   const agentDomain = agentDomainOf(didDetail);
-
-  // Watcher URLs to suggest in the parameter editor: the ones this DID's
-  // hosting domain is configured with.
   const { domains } = useDomains();
-  const knownWatcherUrls =
-    domains.find((d) => d.name === agentDomain)?.watchers ?? [];
+  const knownWatcherUrls = domains.find((d) => d.name === agentDomain)?.watchers ?? [];
 
-  // The names currently claimed by the live document, parsed from its
-  // `alsoKnownAs`. Source of truth is the signed log — the edge serves exactly
-  // what the document claims — so this list mirrors what actually resolves.
-  const currentState = logEntries[logEntries.length - 1]?.state ?? null;
+  const latestEntry = logEntries[logEntries.length - 1];
+  const currentState = latestEntry?.state ?? null;
+  const latestVersionId = latestEntry?.versionId ?? null;
+  // The names the live document claims, parsed from its `alsoKnownAs`. The
+  // signed log is the source of truth — the edge serves exactly what the
+  // document claims — so this mirrors what actually resolves.
   const boundNames: string[] = agentDomain
-    ? (Array.isArray(currentState?.alsoKnownAs) ? currentState!.alsoKnownAs : [])
-        .map((a: unknown) => (typeof a === "string" ? agentNameLocalPart(a, agentDomain) : null))
+    ? alsoKnownAsOf(currentState?.alsoKnownAs)
+        .map((a) => agentNameLocalPart(a, agentDomain))
         // `!== null`, not truthiness: the community name's local part is the
-        // empty string, and a truthy filter would silently drop it — leaving a
-        // root DID that serves `domain/@` reading as "No names bound yet".
+        // empty string, and a truthy filter would drop it.
         .filter((n): n is string => n !== null)
     : [];
+  // Parked names come from the host's authoritative registry — they are
+  // deliberately absent from the document.
+  const parkedNames = (didDetail?.agentNames ?? []).filter((e) => !e.enabled).map((e) => e.name);
+  const registry = useMemo(() => (didDetail ? (didDetail.agentNames ?? []) : null), [didDetail]);
 
-  // The did:scid alias the live document lists for itself, if any: the same
-  // log under its did:scid DID, linked as one subject by the listing.
+  // The did:scid alias the live document lists for itself, if any.
   const scidAliases = scidAliasesOf(didDetail?.didId, currentState?.alsoKnownAs);
   // What the did:scid alias card shows and offers. The state comes from the
-  // control plane (`did/info`), which derives the alias for the log's current
-  // location; who can change it decides the actions.
+  // control plane (`did/info`); who can change it decides the actions.
   const scidAliasPanel = didDetail?.scidAlias
     ? scidAliasView({
         alias: didDetail.scidAlias,
@@ -260,297 +149,78 @@ export default function DidDetail() {
       })
     : null;
 
-  // Parked names come from the host's authoritative registry — they are
-  // deliberately absent from the document, so they cannot be derived like the
-  // served ones above.
-  const parkedNames: string[] = (didDetail?.agentNames ?? [])
-    .filter((e) => !e.enabled)
-    .map((e) => e.name);
-
-  // Debounced availability probe as the user types a new name.
-  useEffect(() => {
-    if (nameDebounce.current) clearTimeout(nameDebounce.current);
-    const trimmed = nameInput.trim().replace(/^@/, "");
-    if (trimmed.length < 2 || !agentDomain) {
-      setNameStatus(null);
-      return;
-    }
-    setNameStatus("checking");
-    nameDebounce.current = setTimeout(() => {
-      api
-        .checkAgentName(trimmed, agentDomain)
-        .then((r) =>
-          setNameStatus(r.reserved ? "reserved" : r.available ? "available" : "taken"),
-        )
-        .catch(() => setNameStatus("error"));
-    }, 400);
-    return () => {
-      if (nameDebounce.current) clearTimeout(nameDebounce.current);
-    };
-  }, [nameInput, agentDomain, api]);
-
-  // Suggest the DID's own path as the agent name. An agent name's grammar is
-  // deliberately identical to a path segment's, so the path is a valid name by
-  // construction and is almost always the one the owner wants. Fires once, and
-  // only when nothing is bound yet (the first-bind case), so it never overrides
-  // a later edit or suggests a name this DID already holds. The availability
-  // probe above then runs on the suggestion automatically.
-  useEffect(() => {
-    if (namePrefilled.current || !didDetail || nameInput !== "") return;
-    // `didDetail.agentNames` is the authoritative registry (served + parked);
-    // if it has anything, the owner is adding a further name — leave it blank.
-    if ((didDetail.agentNames ?? []).length > 0) return;
-    // The root DID has no path segment to borrow.
-    if (mnemonic === ".well-known") return;
-    const segment = mnemonic.split("/").filter(Boolean).pop() ?? "";
-    // Skip a segment that isn't a valid name (uppercase, odd chars) rather than
-    // prefill something the availability check would immediately reject.
-    if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(segment)) return;
-    namePrefilled.current = true;
-    setNameInput(segment);
-  }, [didDetail, mnemonic, nameInput]);
-
-  const handleCopyDidId = async () => {
-    if (!didDetail?.didId) return;
-    await Clipboard.setStringAsync(didDetail.didId);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
-  const handleLoadCurrentJsonl = async () => {
-    if (!mnemonic) return;
-    setLoadingRaw(true);
-    try {
-      const raw = await api.getRawLog(mnemonic);
-      setDidContent(raw);
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Failed to load raw log";
-      showAlert("Error", msg);
-    } finally {
-      setLoadingRaw(false);
-    }
-  };
-
-  const handleUploadDid = async () => {
-    if (!mnemonic || !didContent.trim()) return;
-    setUploading(true);
-    try {
-      await api.uploadDid(mnemonic, didContent);
-      showAlert("Success", "DID log uploaded successfully");
-      setDidContent("");
-      loadData();
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Upload failed";
-      showAlert("Error", msg);
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  const handleUploadWitness = async () => {
-    if (!mnemonic || !witnessContent.trim()) return;
-    setUploading(true);
-    try {
-      await api.uploadWitness(mnemonic, witnessContent);
-      showAlert("Success", "Witness proof uploaded successfully");
-      setWitnessContent("");
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Upload failed";
-      showAlert("Error", msg);
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  const handleRollback = () => {
-    if (!mnemonic) return;
-    showConfirm(
-      "Rollback Last Entry",
-      "Are you sure you want to remove the last log entry? This cannot be undone.",
-      async () => {
-        setRollingBack(true);
-        try {
-          if (!didDetail) return;
-          await api.rollbackDid(mnemonic, didDetail.versionCount);
-          loadData();
-          showAlert("Success", "Last log entry has been rolled back");
-        } catch (e: unknown) {
-          const msg = e instanceof Error ? e.message : "Rollback failed";
-          showAlert("Error", msg);
-        } finally {
-          setRollingBack(false);
-        }
-      },
-    );
-  };
-
-  const handleDelete = async () => {
-    if (!mnemonic) return;
-    showConfirm(
-      "Delete DID",
-      `Are you sure you want to delete "${mnemonic}"? This cannot be undone.`,
-      async () => {
-        setDeleting(true);
-        try {
-          await api.deleteDid(mnemonic);
-          router.replace("/dids");
-        } catch (e: unknown) {
-          const msg = e instanceof Error ? e.message : "Delete failed";
-          showAlert("Error", msg);
-          setDeleting(false);
-        }
-      },
-    );
-  };
-
-  const handleChangeOwner = async () => {
-    if (!mnemonic) return;
-    const newOwner = newOwnerInput.trim();
-    if (!newOwner) return;
-    showConfirm(
-      "Change Owner",
-      role === "admin"
-        ? `Transfer ownership of "${mnemonic}" to ${newOwner}? The new owner must be in the ACL, and its domain scope and quota must allow this DID.`
-        : `Offer "${mnemonic}" to ${newOwner}? It moves when they accept it from their DID list.`,
-      async () => {
-        setChangingOwner(true);
-        try {
-          const { record, offer } = await api.changeOwner(mnemonic, newOwner);
-          setDidDetail((prev) =>
-            prev ? { ...prev, owner: record.owner, updatedAt: record.updatedAt } : prev,
-          );
-          setNewOwnerInput("");
-          setShowChangeOwner(false);
-          if (offer) {
-            const until = offer.expiresAt ? new Date(offer.expiresAt).toLocaleString() : "";
-            showAlert(
-              "Offer sent",
-              `${offer.newOwner} can accept "${mnemonic}" from their DID list${until ? ` until ${until}` : ""}. You stay the owner until then.`,
-            );
-          } else {
-            showAlert("Success", "DID owner changed");
-          }
-        } catch (e: unknown) {
-          const msg = e instanceof Error ? e.message : "Change owner failed";
-          showAlert("Error", msg);
-        } finally {
-          setChangingOwner(false);
-        }
-      },
-    );
-  };
-
-  /**
-   * Publish the edited document through the user's agent.
-   *
-   * We do not hold this DID's update key and never will. We propose the new
-   * document; the VTA dry-runs its own update handler against the authoritative
-   * log to work out what our edit would actually do — including the update-key
-   * rotation that any document change causes, which is nowhere in what we sent
-   * and which we could not have told the user about if we tried — and then
-   * decides, per the user's policy, whether a human has to approve it.
-   */
-  // Result of one publish attempt, so the auto-apply poll can decide whether to
-  // keep waiting (`consent`), stop on success (`accepted`), or back off (`error`).
-  type PublishResult = "accepted" | "consent" | "error";
-
-  // `opts.silent` is the background poll: it suppresses the toast and the
-  // `publishing` spinner (so the button doesn't flicker "Checking…" on every
-  // tick) but still resolves the approval — a granted update is always announced.
-  // Run one delegated task through the wallet: submit, and on a
-  // `consentRequired` refusal pin the exact re-submit so the grant event (and
-  // the manual button) can replay it byte-identically. `submit` and `resubmit`
-  // MUST produce the same payload, or the approved digest won't match.
-  const runDelegatedTask = async (
-    submit: () => Promise<RequestTaskOutcome>,
-    resubmit: (opts?: { silent?: boolean }) => Promise<PublishResult>,
-    successMsg: string,
-    opts?: { silent?: boolean },
-    origin: "scidAlias" | "other" = "other",
-  ): Promise<PublishResult> => {
-    const silent = opts?.silent ?? false;
-    if (!silent) setPublishing(true);
-    try {
-      const outcome = await submit();
-      if (outcome.kind === "consentRequired") {
-        resubmitRef.current = resubmit;
-        pinnedVersionRef.current = logEntries[logEntries.length - 1]?.versionId ?? null;
-        setConsentOrigin(origin);
-        setConsent(outcome);
-        return "consent";
-      }
-      resubmitRef.current = null;
-      pinnedVersionRef.current = null;
-      setConsent(null);
+  // ── Delegated edits ───────────────────────────────────────────────────────
+  const task = useDelegatedTask({
+    latestVersionId,
+    notify: showAlert,
+    onAccepted: () => {
       setEditingDoc(false);
-      showAlert("Done", successMsg);
-      loadData();
-      return "accepted";
-    } catch (e: unknown) {
-      // The wallet flattens the agent's rejection to a message string on its
-      // way through the extension bridge, so there is no `code` here — the
-      // message is all we get, and `orphanHint` is written to work from it.
-      const message = e instanceof Error ? e.message : "The request failed.";
-      const hint = orphanHint(undefined, message);
-      if (!silent) showAlert("Error", hint ? `${message}\n\n${hint}` : message);
-      return "error";
-    } finally {
-      if (!silent) setPublishing(false);
-    }
+      reload();
+    },
+    // While an approval is outstanding, re-read the log in the background:
+    // an approval granted on another device applies server-side with nothing
+    // dispatched to this tab.
+    readLog: () => api.getDidLog(mnemonic, { background: true }),
+    onMovedOn: (entries) => {
+      setQueryData([...key, "log"], entries);
+      // Background reads, like the watch that noticed: no operator did this.
+      void api
+        .getDid(mnemonic, { background: true })
+        .then((d) => setQueryData([...key, "detail"], d))
+        .catch(() => {});
+      void api
+        .getStats(mnemonic, { background: true })
+        .then((s) => setQueryData([...key, "stats"], s))
+        .catch(() => {});
+      // Deliberately not "your change was applied": the log advancing proves
+      // only that it moved, not who moved it.
+      showAlert(
+        "This DID has moved on",
+        `It is now at version ${entries.length}. If that was your approved change, it has been applied and the current document is shown below — otherwise re-apply your edit on top of it.`,
+      );
+    },
+  });
+
+  const noIdentifier = (silent?: boolean): Promise<DelegatedResult> => {
+    if (!silent) showAlert("Error", "This DID has no published identifier yet.");
+    return Promise.resolve("error");
   };
 
-  const handlePublishViaVta = async (
-    retryOf?: Record<string, unknown>,
+  /** Publish `document` through the agent, pinned to the version it was
+   *  composed against: a human in the approval loop makes the window minutes
+   *  wide, and without the pin the VTA would apply our edit on top of someone
+   *  else's with every signature still verifying. */
+  const publishDocument = (
+    document: Record<string, unknown>,
     opts?: { silent?: boolean },
-  ): Promise<PublishResult> => {
+  ): Promise<DelegatedResult> => {
     const didId = didDetail?.didId;
-    if (!didId) {
-      if (!opts?.silent) showAlert("Error", "This DID has no published identifier yet.");
-      return "error";
-    }
-    let document: Record<string, unknown>;
-    if (retryOf) {
-      document = retryOf;
-    } else {
-      try {
-        document = JSON.parse(docEditValue) as Record<string, unknown>;
-      } catch {
-        if (!opts?.silent) showAlert("Error", "The document is not valid JSON.");
-        return "error";
-      }
-    }
-    // The version we based this edit on. A human in the approval loop makes the
-    // window minutes wide, so the log really can move underneath us; without this
-    // the VTA would apply our edit on top of someone else's and every signature in
-    // the resulting chain would still verify.
-    const expectedVersionId = logEntries[logEntries.length - 1]?.versionId ?? undefined;
-    return runDelegatedTask(
+    if (!didId) return noIdentifier(opts?.silent);
+    const expectedVersionId = latestVersionId ?? undefined;
+    return task.run(
       () =>
         requestDidUpdate({
           did: didId,
           document,
           ...(expectedVersionId ? { expectedVersionId } : {}),
         }),
-      (o) => handlePublishViaVta(document, o),
+      (o) => publishDocument(document, o),
       "Your agent signed and published the update.",
       opts,
     );
   };
 
-  // Park (`enable === false`) or resume (`enable === true`) an agent name
-  // through the agent. The VTA reads the current document, edits `alsoKnownAs`,
-  // signs, and calls the host — so unlike a bind/remove we send only the name.
+  // Park (`enable === false`) or resume an agent name. The VTA reads the
+  // current document, edits `alsoKnownAs`, signs and calls the host — so we
+  // send only the name.
   const runParkResume = (
     name: string,
     enable: boolean,
     opts?: { silent?: boolean },
-  ): Promise<PublishResult> => {
+  ): Promise<DelegatedResult> => {
     const didId = didDetail?.didId;
-    if (!didId) {
-      if (!opts?.silent) showAlert("Error", "This DID has no published identifier yet.");
-      return Promise.resolve("error");
-    }
-    return runDelegatedTask(
+    if (!didId) return noIdentifier(opts?.silent);
+    return task.run(
       () => requestAgentNameTask({ did: didId, name, enable }),
       (o) => runParkResume(name, enable, o),
       enable
@@ -560,22 +230,16 @@ export default function DidDetail() {
     );
   };
 
-  // List or remove the did:scid alias through the agent. Like park/resume, no
-  // document is sent: the VTA derives the DID URL, edits `alsoKnownAs`, signs
-  // and publishes (`vta/webvh/dids/update/1.1`, `scidAlsoKnownAs`). The version
-  // the user looked at is pinned once, so a re-submit after approval sends the
-  // byte-identical payload the approval digest covers.
+  // List or remove the did:scid alias. The version the user looked at is
+  // pinned once, so a re-submit sends the byte-identical payload.
   const runScidAlias = (
     scidAlsoKnownAs: boolean,
     expectedVersionId: string | undefined,
     opts?: { silent?: boolean },
-  ): Promise<PublishResult> => {
+  ): Promise<DelegatedResult> => {
     const didId = didDetail?.didId;
-    if (!didId) {
-      if (!opts?.silent) showAlert("Error", "This DID has no published identifier yet.");
-      return Promise.resolve("error");
-    }
-    return runDelegatedTask(
+    if (!didId) return noIdentifier(opts?.silent);
+    return task.run(
       () =>
         requestScidAliasUpdate({
           did: didId,
@@ -594,7 +258,7 @@ export default function DidDetail() {
   const handleScidAlias = (action: ScidAliasAction) => {
     const alias = didDetail?.scidAlias;
     if (!alias || !scidAliasPanel) return;
-    const expectedVersionId = logEntries[logEntries.length - 1]?.versionId ?? undefined;
+    const expectedVersionId = latestVersionId ?? undefined;
     showConfirm(
       action.label,
       withDelegationWarning(
@@ -604,136 +268,24 @@ export default function DidDetail() {
     );
   };
 
-  // ── Auto-apply: run the moment the approval lands ──────────────────────────
-  //
-  // Event-driven only. The wallet emits `vtawallet:consentgranted` (with the
-  // payloadDigest) the instant the VTA reports the grant, and we replay the
-  // *pinned* re-submit exactly once — its payload digest matches the
-  // outstanding approval, so the VTA applies it. The manual button is the
-  // fallback for a missed event.
-  //
-  // There is deliberately NO timer poll. Every re-submit goes through the
-  // wallet's `requestTask`, which shows an un-skippable worker-mode confirm.
-  // A blind re-submit loop would re-open that popup on every tick; a single
-  // re-submit on the grant event is the only safe re-attempt.
-  const autoApplying = consent != null;
-
-  // Event-driven: re-attempt the instant the wallet reports our approval landed.
-  useEffect(() => {
-    const digest = consent?.payloadDigest;
-    if (!digest || typeof window === "undefined" || !window.addEventListener) return;
-    const onGranted = (ev: Event) => {
-      const detail = (ev as CustomEvent).detail as { payloadDigest?: string } | undefined;
-      // Only the approval we're waiting on — ignore events for other tasks.
-      if (detail?.payloadDigest !== digest) return;
-      void resubmitRef.current?.({ silent: true });
-    };
-    window.addEventListener("vtawallet:consentgranted", onGranted);
-    return () => window.removeEventListener("vtawallet:consentgranted", onGranted);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [consent?.payloadDigest]);
-
-  // ── While an approval is outstanding, re-read the log ──────────────────────
-  //
-  // Read-only, and that is the whole distinction from the rule above: "no timer
-  // poll" is about *re-submitting*, which reopens the wallet's un-skippable
-  // worker-mode confirm on every tick. Re-reading the log is an authenticated
-  // GET that touches no wallet, so it carries none of that cost — and without
-  // it this screen cannot notice that the approval has already been applied.
-  //
-  // It routinely won't notice otherwise. The grant event only fires in the tab
-  // whose wallet relayed the decision; approve on a paired mobile approver and
-  // the VTA applies the update server-side with nothing to dispatch here. The
-  // tab then sits on the banner showing a stale document, and every way out
-  // fails the same way: the "Publish now" button replays a payload pinned to a
-  // version the log has already left, and a fresh edit is composed from that
-  // same stale `currentState` — both rejected by the VTA's dry-run as
-  // `concurrent update`, with a manual browser reload the only escape.
-  useEffect(() => {
-    if (!consent || !mnemonic || !isAuthenticated) return;
-    let cancelled = false;
-    // Every check is a background read: it runs on a timer while the page
-    // waits, and must not keep an unattended session alive.
-    const check = async () => {
-      let entries: LogEntryInfo[];
-      try {
-        entries = await api.getDidLog(mnemonic, { background: true });
-      } catch {
-        // Transient — the next tick retries. Never surfaced: a failed poll is
-        // indistinguishable to the user from still waiting.
-        return;
-      }
-      if (cancelled) return;
-      // Unchanged — still genuinely waiting on the approver.
-      if (!hasLogMovedPast(pinnedVersionRef.current, entries)) return;
-      // The log moved. Whatever the pinned payload was, it can no longer apply,
-      // so retire it rather than leave a button that can only fail.
-      resubmitRef.current = null;
-      pinnedVersionRef.current = null;
-      setConsent(null);
-      loadData({ background: true });
-      // Deliberately not "your change was applied": the log advancing proves
-      // only that it moved, not who moved it. Another admin, or the owner's own
-      // agent, could have published in the same window, and claiming credit for
-      // someone else's version is exactly the sort of thing that makes an
-      // operator trust the wrong document.
-      showAlert(
-        "This DID has moved on",
-        `It is now at version ${entries.length}. If that was your approved change, it has been applied and the current document is shown below — otherwise re-apply your edit on top of it.`,
-      );
-    };
-    void check();
-    const stop = startPolling(() => void check(), 5000);
-    return () => {
-      cancelled = true;
-      stop();
-    };
-  }, [consent, mnemonic, isAuthenticated, api, loadData]);
-
-  // Bind a name: publish a new version whose `alsoKnownAs` claims
-  // `https://<domain>/@<name>`. The edge derives the served name from that
-  // signed claim, so the redirect starts resolving once the agent publishes —
-  // no separate provisioning call needed.
-  /// Publish a version that additionally claims `name`.
-  ///
-  /// Takes the local part, so the community name is `""` — the one caller that
-  /// cannot come from the text field. Shared so the typed path and the
-  /// community-name button build the identical `alsoKnownAs` entry; the URL
-  /// shape is what a resolver compares against, and two copies of it would be
-  /// two chances to drift.
-  const bindName = async (name: string) => {
-    if (!agentDomain || !currentState) return;
+  /** Publish a version that additionally claims `name` (the local part; the
+   *  community name is `""`). `false` when refused before anything was sent. */
+  const bindName = (name: string): boolean => {
+    if (!agentDomain || !currentState) return false;
     if (boundNames.includes(name)) {
-      showAlert(
-        "Already bound",
-        `${agentNameLabel(name, agentDomain)} is already on this DID.`,
-      );
-      return;
+      showAlert("Already bound", `${agentNameLabel(name, agentDomain)} is already on this DID.`);
+      return false;
     }
-    const currentAka: string[] = Array.isArray(currentState.alsoKnownAs)
-      ? currentState.alsoKnownAs.filter((a: unknown) => typeof a === "string")
-      : [];
-    const nextDoc = {
+    void publishDocument({
       ...currentState,
-      alsoKnownAs: [...currentAka, `https://${agentDomain}/@${name}`],
-    };
-    setNameInput("");
-    setNameStatus(null);
-    await handlePublishViaVta(nextDoc);
+      alsoKnownAs: [...alsoKnownAsOf(currentState.alsoKnownAs), `https://${agentDomain}/@${name}`],
+    });
+    return true;
   };
 
-  const handleBindName = async () => {
-    const name = nameInput.trim().replace(/^@/, "");
-    // The text field never binds the community name: an empty input is "the
-    // user has not typed yet", not a request. The button below is the
-    // deliberate affordance for it.
-    if (!name) return;
-    await bindName(name);
-  };
-
-  /// Only the root DID may hold `{domain}/@` — the control plane enforces that
-  /// structurally (`validate_agent_name_binding`), so offering the control on a
-  /// tenant slot would advertise something the server refuses.
+  // Only the root DID may hold `{domain}/@` — the control plane enforces that
+  // structurally, so offering it on a tenant slot would advertise something
+  // the server refuses.
   const canBindCommunityName =
     mnemonic === ".well-known" &&
     !!agentDomain &&
@@ -748,42 +300,30 @@ export default function DidDetail() {
       `Claim ${agentDomain}/@ for this DID?\n\n` +
         `This is the name of the trust community that owns ${agentDomain}, and it ` +
         `resolves to this root DID. Your agent will publish a new version claiming it.`,
-      () => {
-        void bindName("");
-      },
+      () => void bindName(""),
     );
   };
 
-  // Remove a name: publish a version that no longer claims it. The redirect
-  // stops resolving and the name is freed for anyone to reclaim. Distinct from
-  // parking (below), which keeps the name reserved to this DID.
+  // Remove: publish a version that no longer claims the name. Distinct from
+  // parking, which keeps it reserved to this DID.
   const handleUnbindName = (name: string) => {
     if (!agentDomain || !currentState) return;
     showConfirm(
       "Remove name",
       `Stop serving ${agentNameLabel(name, agentDomain)}? Your agent will publish a new version that no longer claims it — the redirect stops resolving and the name is freed for anyone to claim.`,
       async () => {
-        const currentAka: string[] = Array.isArray(currentState.alsoKnownAs)
-          ? currentState.alsoKnownAs.filter((a: unknown) => typeof a === "string")
-          : [];
-        const nextAka = currentAka.filter(
+        const nextAka = alsoKnownAsOf(currentState.alsoKnownAs).filter(
           (a) => agentNameLocalPart(a, agentDomain) !== name,
         );
-        await handlePublishViaVta({ ...currentState, alsoKnownAs: nextAka });
+        await publishDocument({ ...currentState, alsoKnownAs: nextAka });
       },
     );
   };
 
-  // Park a name: stop serving it but keep it reserved to this DID. Unlike
-  // remove, the agent runs a dedicated task that both drops the claim and tells
-  // the host to hold the reservation — so nobody else can take it while parked.
-  // Park and resume are delegated publishes like any other, so the same
-  // ownership caveat applies — and the confirm is the last thing read before
-  // the agent is asked, which makes it the right place to say so.
-  const withDelegationWarning = (body: string) =>
-    delegationWarning ? `${body}\n\n${delegationWarning}` : body;
-
-  const handleParkName = (name: string) => {
+  // Park and resume are delegated publishes like any other, so the ownership
+  // caveat applies — and the confirm is the last thing read before the agent
+  // is asked.
+  const handleParkName = (name: string) =>
     showConfirm(
       "Park name",
       withDelegationWarning(
@@ -791,10 +331,8 @@ export default function DidDetail() {
       ),
       () => void runParkResume(name, false),
     );
-  };
 
-  // Resume a parked name — picked from the registry list, so no typing.
-  const handleResumeName = (name: string) => {
+  const handleResumeName = (name: string) =>
     showConfirm(
       "Resume name",
       withDelegationWarning(
@@ -802,1001 +340,135 @@ export default function DidDetail() {
       ),
       () => void runParkResume(name, true),
     );
-  };
 
-  // The cross-device approval code, shown wherever a publish is awaiting the
-  // user's approval — a plain document edit OR an agent-name change, since both
-  // go through the same delegated-publish flow. Returns null when idle.
-  const consentMatchPanel = () =>
-    consent ? (
-      <View
-        style={{
-          marginTop: spacing.md,
-          padding: spacing.md,
-          borderWidth: 1,
-          borderColor: colors.warning ?? colors.border,
-          borderRadius: radii.sm,
-          gap: spacing.sm,
-        }}
-      >
-        <Text style={[styles.sectionTitle, { marginBottom: 0 }]}>
-          Approve this on your device
-        </Text>
-        <Text style={styles.hint}>
-          {consent.sideEffects === "destructive"
-            ? "This cannot be undone. Your agent has sent the change to your approving device, which will ask you to TYPE the code below. Do not type it from memory of this screen — read it from here, and only approve if the device shows the same code."
-            : "Your agent has sent this change to your approving device, with a description of what it will do. Check that the code shown there matches the one below, then approve it."}
-        </Text>
-        <Text
-          style={{
-            fontFamily: fonts.mono,
-            fontSize: 28,
-            letterSpacing: 6,
-            color: colors.textPrimary,
-            textAlign: "center",
-            paddingVertical: spacing.sm,
-          }}
-          selectable
-        >
-          {digestPrefix(consent.payloadDigest)}
-        </Text>
-        <Text style={styles.hint}>
-          If the codes differ, deny it. A code that does not match means the
-          change your device is showing you is not the change that would be made.
-        </Text>
-        {autoApplying && (
-          <Text style={[styles.hint, { textAlign: "center" }]}>
-            Waiting for your approval — this will publish automatically the
-            moment you approve.
-          </Text>
-        )}
-        <Pressable
-          style={[styles.outlineButton, publishing && styles.disabled]}
-          onPress={() => void resubmitRef.current?.()}
-          disabled={publishing}
-        >
-          <Text style={styles.outlineButtonText}>
-            {publishing
-              ? "Checking..."
-              : autoApplying
-                ? "Publish now"
-                : "I have approved it — publish"}
-          </Text>
-        </Pressable>
-      </View>
-    ) : null;
-
-  const handleToggleDocEdit = () => {
-    if (!editingDoc && logEntries[selectedVersion]?.state) {
-      setDocEditValue(
-        JSON.stringify(logEntries[selectedVersion].state, null, 2),
-      );
-    }
-    setEditingDoc(!editingDoc);
-  };
-
-  const handleCopyDocToUpload = async () => {
-    if (!mnemonic) return;
+  // ── Raw log ────────────────────────────────────────────────────────────────
+  const loadRawLog = async (thenCloseEditor: boolean) => {
     setLoadingRaw(true);
     try {
-      const raw = await api.getRawLog(mnemonic);
-      setDidContent(raw);
-      setEditingDoc(false);
+      setLogContent(await api.getRawLog(mnemonic));
+      if (thenCloseEditor) setEditingDoc(false);
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Failed to load raw log";
-      showAlert("Error", msg);
+      showAlert("Error", errorMessage(e, "Failed to load raw log"));
     } finally {
       setLoadingRaw(false);
     }
   };
 
-  if (!isAuthenticated) {
-    return (
-      <View style={styles.containerCenter}>
-        <Text style={styles.hint}>Please log in to view DID details.</Text>
-        <Link href="/login" asChild>
-          <Pressable style={styles.button}>
-            <Text style={styles.buttonText}>Login</Text>
-          </Pressable>
-        </Link>
-      </View>
-    );
-  }
-
-  const formatDate = (ts: number | null) =>
-    ts ? new Date(ts * 1000).toLocaleString() : "Never";
-
+  const consentPanel = (
+    <ConsentPanel
+      consent={task.consent}
+      publishing={task.publishing}
+      onPublishNow={task.resubmitNow}
+    />
+  );
   const logEntryCount = didDetail?.log?.logEntryCount ?? 0;
+  const canDelegate = isWalletTaskRelayAvailable();
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
       <View style={styles.wide}>
-        <Text style={styles.title}>
-          {mnemonic === ".well-known" ? "Root DID (.well-known)" : mnemonic}
-        </Text>
+        <DidHeader
+          mnemonic={mnemonic}
+          detail={didDetail}
+          scidAliases={scidAliases}
+          boundNames={boundNames}
+          agentDomain={agentDomain}
+          ownerNames={ownerNames}
+        />
 
-        {/* DID ID directly under title */}
-        {didDetail && (
-          didDetail.didId ? (
-            <View
-              style={[
-                styles.didIdRow,
-                boundNames.length > 0 && styles.didIdRowTight,
-              ]}
-            >
-              <Text style={styles.didIdText} numberOfLines={1}>
-                {didDetail.didId}
-              </Text>
-              <Pressable style={styles.copyButton} onPress={handleCopyDidId}>
-                <Text style={styles.copyButtonText}>
-                  {copied ? "Copied" : "Copy"}
-                </Text>
-              </Pressable>
-            </View>
-          ) : (
-            <Text style={styles.pendingText}>Pending upload</Text>
-          )
-        )}
-        {scidAliases.map((alias) => (
-          <View key={alias} style={styles.didIdRow}>
-            <Text style={styles.didIdText} numberOfLines={1}>
-              {alias}
-            </Text>
-            <Pressable
-              style={styles.copyButton}
-              onPress={() => Clipboard.setStringAsync(alias)}
-            >
-              <Text style={styles.copyButtonText}>Copy</Text>
-            </Pressable>
-          </View>
-        ))}
-        {/* Agent names, directly under the DID they redirect to.
+        <DidStatsCard
+          stats={stats.data}
+          error={stats.error ? errorMessage(stats.error, "Could not load statistics") : null}
+        />
 
-            Copy-only here; binding and parking stay in the Agent Names card
-            below. The card is where you *manage* names, but it sits under the
-            document viewer — too far to reach for the everyday act of copying
-            a handle to give someone, which is what this line is for.
+        {didDetail?.log && <DidDetailsCard detail={didDetail} />}
 
-            Not in the DID Details panel either: that panel is log metadata
-            (version, method, entry count) — facts you look up. An agent name
-            is an address you hand out, so it belongs beside the other address
-            on the page. Several names wrap for free here; the panel's
-            right-aligned label/value rows would not take a list.
+        <UsageChart mnemonic={mnemonic} />
 
-            `boundNames` (not the registry) so this never contradicts the card
-            below — both show what the live document claims.
-
-            The DID row tightens its bottom margin only when names follow, so a
-            DID with no names keeps exactly the spacing it has today. */}
-        {boundNames.length > 0 && (
-          <View style={styles.agentNamesRow}>
-            <AgentNameChips
-              names={boundNames}
-              domain={agentDomain}
-              didId={didDetail?.didId}
-            />
-          </View>
-        )}
-        {/* Owner. The owner is a DID like any other — usually the VTA that
-            registered this slot — so if it is hosted here and serves a name,
-            show the handle under it. Foreign owners resolve to nothing and
-            render exactly as before. */}
-        {didDetail && (
-          <View style={styles.ownerRow}>
-            <Text style={styles.ownerText}>Owner: {didDetail.owner}</Text>
-            {ownerNames.length > 0 && (
-              <AgentNameChips
-                names={ownerNames}
-                didId={didDetail.owner}
-                size="sm"
-              />
-            )}
-          </View>
-        )}
-
-        {/* Stats */}
-        <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Statistics</Text>
-          {statsError ? (
-            <Text style={styles.errorText}>{statsError}</Text>
-          ) : stats ? (
-            <View style={styles.statsGrid}>
-              <View style={styles.statItem}>
-                <Text style={styles.statValue}>{stats.totalResolves.toLocaleString()}</Text>
-                <Text style={styles.statLabel}>Resolves</Text>
-              </View>
-              <View style={styles.statItem}>
-                <Text style={styles.statValue}>{stats.totalUpdates.toLocaleString()}</Text>
-                <Text style={styles.statLabel}>Updates</Text>
-              </View>
-              <View style={styles.statItem}>
-                <Text style={styles.statSmall}>
-                  {formatDate(stats.lastResolvedAt)}
-                </Text>
-                <Text style={styles.statLabel}>Last Resolved</Text>
-              </View>
-              <View style={styles.statItem}>
-                <Text style={styles.statSmall}>
-                  {formatDate(stats.lastUpdatedAt)}
-                </Text>
-                <Text style={styles.statLabel}>Last Updated</Text>
-              </View>
-            </View>
-          ) : (
-            <ActivityIndicator color={colors.accent} />
-          )}
-        </View>
-
-        {/* DID Details — parsed from log entries */}
-        {didDetail?.log && (
-          <View style={styles.card}>
-            <Text style={styles.sectionTitle}>DID Details</Text>
-            <View style={styles.detailsGrid}>
-              <View style={styles.detailRow}>
-                <Text style={styles.detailLabel}>Version</Text>
-                <Text style={styles.detailValue}>
-                  {didDetail.log.latestVersionId ?? "-"}
-                </Text>
-              </View>
-              {didDetail.log.latestVersionTime && (
-                <View style={styles.detailRow}>
-                  <Text style={styles.detailLabel}>Version Time</Text>
-                  <Text style={styles.detailValue}>
-                    {new Date(didDetail.log.latestVersionTime).toLocaleString()}
-                  </Text>
-                </View>
-              )}
-              {(didDetail.method ?? didDetail.log.method) && (
-                <View style={styles.detailRow}>
-                  <Text style={styles.detailLabel}>Method</Text>
-                  <Text style={styles.detailValueMono}>
-                    {didDetail.method ?? didDetail.log.method}
-                  </Text>
-                </View>
-              )}
-              {didDetail.domain && (
-                <View style={styles.detailRow}>
-                  <Text style={styles.detailLabel}>Domain</Text>
-                  <Text style={styles.detailValueMono}>
-                    {didDetail.domain}
-                  </Text>
-                </View>
-              )}
-              <View style={styles.detailRow}>
-                <Text style={styles.detailLabel}>Log Entries</Text>
-                <Text style={styles.detailValue}>
-                  {didDetail.log.logEntryCount.toLocaleString()}
-                </Text>
-              </View>
-              {didDetail.log.ttl != null && (
-                <View style={styles.detailRow}>
-                  <Text style={styles.detailLabel}>TTL</Text>
-                  <Text style={styles.detailValue}>
-                    {didDetail.log.ttl}s
-                  </Text>
-                </View>
-              )}
-            </View>
-
-            <Text style={[styles.sectionTitle, { marginTop: spacing.lg }]}>
-              Options
-            </Text>
-            <View style={styles.optionsGrid}>
-              <View style={styles.optionItem}>
-                <Text
-                  style={
-                    didDetail.log.portable
-                      ? styles.optionEnabled
-                      : styles.optionDisabled
-                  }
-                >
-                  {didDetail.log.portable ? "Yes" : "No"}
-                </Text>
-                <Text style={styles.statLabel}>Portable</Text>
-              </View>
-              <View style={styles.optionItem}>
-                <Text
-                  style={
-                    didDetail.log.preRotation
-                      ? styles.optionEnabled
-                      : styles.optionDisabled
-                  }
-                >
-                  {didDetail.log.preRotation ? "Yes" : "No"}
-                </Text>
-                <Text style={styles.statLabel}>Pre-rotation</Text>
-              </View>
-              <View style={styles.optionItem}>
-                <Text
-                  style={
-                    didDetail.log.witnesses
-                      ? styles.optionEnabled
-                      : styles.optionDisabled
-                  }
-                >
-                  {didDetail.log.witnesses
-                    ? `${didDetail.log.witnessThreshold}/${didDetail.log.witnessCount}`
-                    : "None"}
-                </Text>
-                <Text style={styles.statLabel}>Witnesses</Text>
-              </View>
-              <View style={styles.optionItem}>
-                <Text
-                  style={
-                    didDetail.log.watchers
-                      ? styles.optionEnabled
-                      : styles.optionDisabled
-                  }
-                >
-                  {didDetail.log.watchers
-                    ? String(didDetail.log.watcherCount)
-                    : "None"}
-                </Text>
-                <Text style={styles.statLabel}>Watchers</Text>
-              </View>
-              <View style={styles.optionItem}>
-                <Text
-                  style={
-                    didDetail.log.deactivated
-                      ? styles.optionDeactivated
-                      : styles.optionEnabled
-                  }
-                >
-                  {didDetail.log.deactivated ? "Yes" : "No"}
-                </Text>
-                <Text style={styles.statLabel}>Deactivated</Text>
-              </View>
-            </View>
-          </View>
-        )}
-
-        {/* Usage chart */}
-        {mnemonic && <UsageChart mnemonic={mnemonic} />}
-
-        {/* DID Document viewer / editor */}
         {logEntries.length > 0 && (
-          <View style={styles.card}>
-            <View style={styles.sectionTitleRow}>
-              <Text style={styles.sectionTitle}>DID Document</Text>
-              <View style={styles.sectionActions}>
-                <Pressable
-                  style={styles.smallButton}
-                  onPress={handleToggleDocEdit}
-                >
-                  <Text style={styles.smallButtonText}>
-                    {editingDoc ? "Cancel" : "Edit"}
-                  </Text>
-                </Pressable>
-                {editingDoc && (
-                  <Pressable
-                    style={[styles.smallButton, loadingRaw && styles.disabled]}
-                    onPress={handleCopyDocToUpload}
-                    disabled={loadingRaw}
-                  >
-                    <Text style={styles.smallButtonText}>
-                      {loadingRaw ? "Loading..." : "Copy to Upload"}
-                    </Text>
-                  </Pressable>
-                )}
-              </View>
-            </View>
-            <View style={styles.versionRow}>
-              <Text style={styles.detailLabel}>Version</Text>
-              <View style={styles.selectWrapper}>
-                <select
-                  value={selectedVersion}
-                  onChange={(e: any) => {
-                    const v = Number(e.target.value);
-                    setSelectedVersion(v);
-                    if (editingDoc && logEntries[v]?.state) {
-                      setDocEditValue(
-                        JSON.stringify(logEntries[v].state, null, 2),
-                      );
-                    }
-                  }}
-                  style={{
-                    backgroundColor: colors.bgPrimary,
-                    color: colors.textPrimary,
-                    border: `1px solid ${colors.border}`,
-                    borderRadius: radii.sm,
-                    padding: "6px 10px",
-                    fontFamily: fonts.mono,
-                    fontSize: 13,
-                    width: "100%",
-                  }}
-                >
-                  {logEntries.map((entry, idx) => (
-                    <option key={idx} value={idx}>
-                      Version {idx + 1}
-                      {entry.versionId ? ` — ${entry.versionId}` : ""}
-                      {entry.versionTime ? ` (${entry.versionTime})` : ""}
-                    </option>
-                  ))}
-                </select>
-              </View>
-            </View>
-            {editingDoc ? (
-              <>
-                <TextInput
-                  style={[styles.textarea, { minHeight: 300 }]}
-                  value={docEditValue}
-                  onChangeText={setDocEditValue}
-                  multiline
-                />
-                {isWalletTaskRelayAvailable() && (
-                  <View style={{ marginTop: spacing.md, gap: spacing.sm }}>
-                    <Pressable
-                      style={[styles.button, publishing && styles.disabled]}
-                      onPress={() => void handlePublishViaVta()}
-                      disabled={publishing}
-                    >
-                      <Text style={styles.buttonText}>
-                        {publishing ? "Asking your agent..." : "Publish with my agent"}
-                      </Text>
-                    </Pressable>
-                    <Text style={styles.hint}>
-                      Your agent holds this DID&apos;s update key. It will work out what this
-                      change actually does before it signs anything — including effects that
-                      are not visible in the document above.
-                    </Text>
-                    {/*
-                      Shown, not enforced. An admin sees every DID on this server,
-                      so the button used to be offered on DIDs no agent of theirs
-                      could sign for — but the page cannot identify which agent the
-                      wallet holds, so a hard gate would also block the legitimate
-                      case (passkey session, wallet connected to the owning agent).
-                      Say what is odd and let the operator decide.
-                    */}
-                    {delegationWarning && (
-                      <Text style={[styles.hint, { color: colors.warning }]}>
-                        {delegationWarning}
-                      </Text>
-                    )}
-                  </View>
-                )}
-
-                {/*
-                  The cross-device match. Extracted to `consentMatchPanel` so
-                  the same approval code renders for an agent-name change too;
-                  see the note there.
-
-                  Every other check in this design assumes an honest device. Only
-                  this one survives a compromised one, because only this one moves
-                  the comparison into the user's head, across two screens that an
-                  attacker would have to control both of. It is the reason this is
-                  a code to compare and not a "waiting for approval..." spinner —
-                  a spinner is something you wait out; a code is something you
-                  check.
-                */}
-                {consentMatchPanel()}
-              </>
-            ) : (
-              logEntries[selectedVersion]?.state && (
-                <div style={{
-                  backgroundColor: colors.bgPrimary,
-                  border: `1px solid ${colors.border}`,
-                  borderRadius: radii.sm,
-                  overflow: "auto",
-                  maxHeight: 500,
-                  padding: spacing.md,
-                }}>
-                  <pre style={{
-                    margin: 0,
-                    fontFamily: fonts.mono,
-                    fontSize: 12,
-                    lineHeight: "18px",
-                    color: colors.textPrimary,
-                    whiteSpace: "pre",
-                  }}>
-                    {JSON.stringify(logEntries[selectedVersion].state, null, 2)}
-                  </pre>
-                </div>
-              )
-            )}
-          </View>
+          <DidDocumentCard
+            logEntries={logEntries}
+            selectedVersion={selectedVersion}
+            onSelectVersion={setSelectedVersion}
+            editing={editingDoc}
+            onEditingChange={setEditingDoc}
+            loadingRaw={loadingRaw}
+            onCopyToUpload={() => void loadRawLog(true)}
+            canPublish={canDelegate}
+            publishing={task.publishing}
+            onPublish={(doc) => void publishDocument(doc)}
+            delegationWarning={delegationWarning}
+            consentPanel={consentPanel}
+            notify={showAlert}
+          />
         )}
 
-        {/* did:scid alias */}
         {didDetail?.scidAlias && scidAliasPanel && (
-          <View style={styles.card}>
-            <Text style={styles.sectionTitle}>did:scid Alias</Text>
-            <Text style={styles.hint}>
-              This log also verifies {didDetail.scidAlias.didUrl}. The two forms
-              are one subject only while the document lists it in alsoKnownAs.
-            </Text>
-            <Text
-              style={{
-                marginTop: spacing.md,
-                color:
-                  didDetail.scidAlias.status === "listed"
-                    ? colors.success
-                    : didDetail.scidAlias.status === "stale"
-                      ? (colors.warning ?? colors.textPrimary)
-                      : colors.textSecondary,
-              }}
-            >
-              {scidAliasPanel.summary}
-            </Text>
-            {scidAliasPanel.readOnlyReason ? (
-              <Text style={[styles.hint, { marginTop: spacing.md }]}>
-                {scidAliasPanel.readOnlyReason}
-              </Text>
-            ) : (
-              <View style={{ marginTop: spacing.md, gap: spacing.sm }}>
-                {scidAliasPanel.warning && (
-                  <Text style={styles.hint}>{scidAliasPanel.warning}</Text>
-                )}
-                <View style={{ flexDirection: "row", gap: spacing.sm }}>
-                  {scidAliasPanel.actions.map((action) => (
-                    <Pressable
-                      key={action.label}
-                      style={[styles.smallButton, publishing && styles.disabled]}
-                      onPress={() => handleScidAlias(action)}
-                      disabled={publishing}
-                    >
-                      <Text style={styles.smallButtonText}>
-                        {publishing ? "Asking your agent..." : action.label}
-                      </Text>
-                    </Pressable>
-                  ))}
-                </View>
-                {!editingDoc && consentOrigin === "scidAlias" && consentMatchPanel()}
-              </View>
-            )}
-          </View>
-        )}
-
-        {/* Agent names */}
-        {logEntries.length > 0 && (
-          <View style={styles.card}>
-            <Text style={styles.sectionTitle}>Agent Names</Text>
-            <Text style={styles.hint}>
-              A human-memorable shortcut —{" "}
-              {agentDomain ? `${agentDomain}/@name` : "yourdomain/@name"} — that
-              redirects to this DID. A name is served because the signed document
-              claims it via alsoKnownAs, so binding one publishes a new version
-              through your agent.
-            </Text>
-
-            {boundNames.length > 0 ? (
-              <View style={{ gap: spacing.sm, marginTop: spacing.md }}>
-                {boundNames.map((name) => (
-                  <View
-                    key={name}
-                    style={{
-                      flexDirection: "row",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      gap: spacing.md,
-                    }}
-                  >
-                    {/* The community name has no local part, so `@` alone
-                        would read as a stray character next to Park/Remove.
-                        Spell it as the FAQ writes it — `domain/@`. */}
-                    <Text style={{ fontFamily: fonts.mono, color: colors.textPrimary }}>
-                      {agentNameLabel(name, agentDomain)}
-                    </Text>
-                    <View style={{ flexDirection: "row", gap: spacing.sm }}>
-                      <Pressable
-                        style={[styles.smallButton, publishing && styles.disabled]}
-                        onPress={() => handleParkName(name)}
-                        disabled={publishing}
-                      >
-                        <Text style={styles.smallButtonText}>Park</Text>
-                      </Pressable>
-                      <Pressable
-                        style={[styles.smallButton, publishing && styles.disabled]}
-                        onPress={() => handleUnbindName(name)}
-                        disabled={publishing}
-                      >
-                        <Text style={styles.smallButtonText}>Remove</Text>
-                      </Pressable>
-                    </View>
-                  </View>
-                ))}
-              </View>
-            ) : (
-              <Text style={[styles.hint, { marginTop: spacing.sm }]}>
-                No names bound yet.
-              </Text>
-            )}
-
-            {/* No domain means we cannot scope a name — names are
-                domain-scoped, so `@alice` is meaningless without one. Say what
-                is actually missing: the previous copy claimed the DID had no
-                published document, which was a guess at the cause rather than
-                an observation, and read as a flat contradiction on a slot whose
-                document is rendered a few hundred pixels above. */}
-            {!agentDomain ? (
-              <Text style={[styles.hint, { marginTop: spacing.md }]}>
-                {didDetail?.didId
-                  ? "This DID's hosting domain could not be determined, so a name cannot be scoped to it."
-                  : "This DID has no published document yet — publish one before binding a name."}
-              </Text>
-            ) : isWalletTaskRelayAvailable() ? (
-              <View style={{ marginTop: spacing.md, gap: spacing.sm }}>
-                <View
-                  style={{ flexDirection: "row", alignItems: "center", gap: spacing.sm }}
-                >
-                  <Text style={{ color: colors.textSecondary, fontFamily: fonts.mono }}>
-                    @
-                  </Text>
-                  <input
-                    type="text"
-                    value={nameInput}
-                    onChange={(e) => setNameInput(e.target.value)}
-                    placeholder="alice"
-                    disabled={publishing}
-                    style={{
-                      flex: 1,
-                      backgroundColor: colors.bgPrimary,
-                      color: colors.textPrimary,
-                      border: `1px solid ${colors.border}`,
-                      borderRadius: radii.sm,
-                      padding: "6px 10px",
-                      fontFamily: fonts.mono,
-                      fontSize: 14,
-                    }}
-                  />
-                  <Pressable
-                    style={[
-                      styles.button,
-                      { marginTop: 0 },
-                      (publishing || nameStatus !== "available") && styles.disabled,
-                    ]}
-                    onPress={() => void handleBindName()}
-                    disabled={publishing || nameStatus !== "available"}
-                  >
-                    <Text style={styles.buttonText}>
-                      {publishing ? "Asking your agent..." : "Bind name"}
-                    </Text>
-                  </Pressable>
-                </View>
-                {nameStatus && (
-                  <Text
-                    style={{
-                      fontSize: 13,
-                      color:
-                        nameStatus === "available"
-                          ? colors.success
-                          : nameStatus === "checking"
-                            ? colors.textSecondary
-                            : colors.error,
-                    }}
-                  >
-                    {nameStatus === "checking"
-                      ? "Checking…"
-                      : nameStatus === "available"
-                        ? "Available"
-                        : nameStatus === "taken"
-                          ? "Already taken on this domain"
-                          : nameStatus === "reserved"
-                            ? "Reserved by the host"
-                            : "Could not check availability"}
-                  </Text>
-                )}
-                {/* The community name gets its own control rather than a
-                    spelling in the text field above. It is a single specific
-                    name, not something to type, and an empty input already
-                    means "nothing entered yet" — overloading it would make an
-                    accidental Enter publish a document version. Root DID only:
-                    the control plane binds `{domain}/@` to `.well-known`
-                    structurally, so offering it elsewhere would advertise
-                    something the server refuses. */}
-                {canBindCommunityName && (
-                  <View style={{ marginTop: spacing.lg, gap: spacing.sm }}>
-                    <Text style={styles.hint}>
-                      This is the domain&apos;s root DID, so it can also hold the
-                      community name — {agentDomain}/@ — which identifies the
-                      trust community that owns {agentDomain}.
-                    </Text>
-                    <Pressable
-                      style={[styles.smallButton, publishing && styles.disabled]}
-                      onPress={handleBindCommunityName}
-                      disabled={publishing}
-                    >
-                      <Text style={styles.smallButtonText}>
-                        {publishing
-                          ? "Asking your agent..."
-                          : `Bind ${agentDomain}/@`}
-                      </Text>
-                    </Pressable>
-                  </View>
-                )}
-
-                {/* Parked names, from the host's authoritative registry —
-                    they're deliberately absent from the document, so this is
-                    the only place they can come from. */}
-                {parkedNames.length > 0 && (
-                  <View style={{ gap: spacing.sm, marginTop: spacing.md }}>
-                    <Text style={styles.hint}>
-                      Parked — reserved to this DID, not currently served.
-                    </Text>
-                    {parkedNames.map((name) => (
-                      <View
-                        key={name}
-                        style={{
-                          flexDirection: "row",
-                          alignItems: "center",
-                          justifyContent: "space-between",
-                          gap: spacing.md,
-                        }}
-                      >
-                        <Text
-                          style={{
-                            fontFamily: fonts.mono,
-                            color: colors.textSecondary,
-                          }}
-                        >
-                          {agentNameLabel(name, agentDomain)}
-                        </Text>
-                        <Pressable
-                          style={[styles.smallButton, publishing && styles.disabled]}
-                          onPress={() => handleResumeName(name)}
-                          disabled={publishing}
-                        >
-                          <Text style={styles.smallButtonText}>Resume</Text>
-                        </Pressable>
-                      </View>
-                    ))}
-                  </View>
-                )}
-                {/* The approval code lands here when a name change is pending
-                    (the doc editor shows it in its own section when open; the
-                    did:scid alias card shows its own). */}
-                {!editingDoc && consentOrigin !== "scidAlias" && consentMatchPanel()}
-              </View>
-            ) : (
-              <Text style={[styles.hint, { marginTop: spacing.md }]}>
-                Binding a name needs a connected agent wallet to sign the update.
-              </Text>
-            )}
-          </View>
-        )}
-
-        {/* Parameters editor */}
-        {logEntries.length > 0 && (
-          <View style={styles.card}>
-            <View style={styles.sectionTitleRow}>
-              <Text style={styles.sectionTitle}>Parameters</Text>
-              <Pressable
-                style={styles.smallButton}
-                onPress={() => setEditingParams(!editingParams)}
-              >
-                <Text style={styles.smallButtonText}>
-                  {editingParams ? "Done" : "Edit Parameters"}
-                </Text>
-              </Pressable>
-            </View>
-            {!editingParams && (
-              <Text style={styles.hint}>
-                View and configure parameters for the next log entry.
-                Editing is informational — use these values when constructing signed JSONL.
-              </Text>
-            )}
-
-            <View style={styles.paramField}>
-              <Text style={styles.paramLabel}>Watchers</Text>
-              <ChipInput
-                values={paramWatchers}
-                onChange={setParamWatchers}
-                suggestions={knownWatcherUrls}
-                placeholder="Add watcher URL..."
-                readOnly={!editingParams}
-              />
-            </View>
-
-            <View style={styles.paramField}>
-              <Text style={styles.paramLabel}>Witnesses</Text>
-              <ChipInput
-                values={paramWitnesses}
-                onChange={setParamWitnesses}
-                placeholder="Add witness DID..."
-                readOnly={!editingParams}
-              />
-            </View>
-
-            <View style={styles.paramField}>
-              <Text style={styles.paramLabel}>Also Known As</Text>
-              <ChipInput
-                values={paramAlsoKnownAs}
-                onChange={setParamAlsoKnownAs}
-                placeholder="Add alternate identifier..."
-                readOnly={!editingParams}
-              />
-            </View>
-
-            <View style={[styles.paramField, { flexDirection: "row", alignItems: "center", gap: spacing.lg }]}>
-              <View style={{ flexDirection: "row", alignItems: "center", gap: spacing.sm }}>
-                <Text style={styles.paramLabel}>Portable</Text>
-                <input
-                  type="checkbox"
-                  checked={paramPortable}
-                  onChange={(e) => setParamPortable(e.target.checked)}
-                  disabled={!editingParams}
-                  style={{ accentColor: colors.accent }}
-                />
-              </View>
-              <View style={{ flexDirection: "row", alignItems: "center", gap: spacing.sm }}>
-                <Text style={styles.paramLabel}>TTL</Text>
-                <input
-                  type="number"
-                  value={paramTtl}
-                  onChange={(e) => setParamTtl(e.target.value)}
-                  disabled={!editingParams}
-                  placeholder="seconds"
-                  style={{
-                    width: 100,
-                    backgroundColor: colors.bgPrimary,
-                    color: colors.textPrimary,
-                    border: `1px solid ${colors.border}`,
-                    borderRadius: radii.sm,
-                    padding: "4px 8px",
-                    fontFamily: fonts.mono,
-                    fontSize: 12,
-                  }}
-                />
-              </View>
-            </View>
-          </View>
-        )}
-
-        {/* Upload DID log */}
-        <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Upload DID Log</Text>
-          <Text style={styles.hint}>
-            Paste the JSONL content for the did.jsonl file.
-          </Text>
-          {didDetail && didDetail.versionCount > 0 && (
-            <Pressable
-              style={[styles.outlineButton, loadingRaw && styles.disabled]}
-              onPress={handleLoadCurrentJsonl}
-              disabled={loadingRaw}
-            >
-              <Text style={styles.outlineButtonText}>
-                {loadingRaw ? "Loading..." : "Load Current JSONL"}
-              </Text>
-            </Pressable>
-          )}
-          <TextInput
-            style={styles.textarea}
-            placeholder='{"versionId":"1",...}'
-            placeholderTextColor={colors.textTertiary}
-            value={didContent}
-            onChangeText={setDidContent}
-            multiline
+          <ScidAliasCard
+            alias={didDetail.scidAlias}
+            panel={scidAliasPanel}
+            publishing={task.publishing}
+            onAction={handleScidAlias}
+            consentPanel={!editingDoc && task.consentOrigin === "scidAlias" ? consentPanel : null}
           />
-          <Pressable
-            style={[
-              styles.button,
-              (!didContent.trim() || uploading) && styles.disabled,
-            ]}
-            onPress={handleUploadDid}
-            disabled={!didContent.trim() || uploading}
-          >
-            <Text style={styles.buttonText}>
-              {uploading ? "Uploading..." : "Upload DID Log"}
-            </Text>
-          </Pressable>
-        </View>
+        )}
 
-        {/* Upload witness */}
-        <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Upload Witness Proof</Text>
-          <Text style={styles.hint}>
-            Paste the JSON content for the witness proof.
-          </Text>
-          <TextInput
-            style={styles.textarea}
-            placeholder='{"witness":...}'
-            placeholderTextColor={colors.textTertiary}
-            value={witnessContent}
-            onChangeText={setWitnessContent}
-            multiline
+        {logEntries.length > 0 && (
+          <AgentNamesCard
+            mnemonic={mnemonic}
+            agentDomain={agentDomain}
+            hasDidId={!!didDetail?.didId}
+            registry={registry}
+            boundNames={boundNames}
+            parkedNames={parkedNames}
+            canBindCommunityName={canBindCommunityName}
+            canDelegate={canDelegate}
+            publishing={task.publishing}
+            onBind={bindName}
+            onBindCommunityName={handleBindCommunityName}
+            onPark={handleParkName}
+            onUnbind={handleUnbindName}
+            onResume={handleResumeName}
+            consentPanel={!editingDoc && task.consentOrigin !== "scidAlias" ? consentPanel : null}
           />
-          <Pressable
-            style={[
-              styles.button,
-              (!witnessContent.trim() || uploading) && styles.disabled,
-            ]}
-            onPress={handleUploadWitness}
-            disabled={!witnessContent.trim() || uploading}
-          >
-            <Text style={styles.buttonText}>
-              {uploading ? "Uploading..." : "Upload Witness"}
-            </Text>
-          </Pressable>
-        </View>
+        )}
 
-        {/* Change Owner — visible to admins or the current owner */}
-        {didDetail &&
-          (role === "admin" || (callerDid && callerDid === didDetail.owner)) && (
-            <View style={styles.card}>
-              <View style={styles.sectionTitleRow}>
-                <Text style={styles.sectionTitle}>Ownership</Text>
-                <Pressable
-                  style={styles.smallButton}
-                  onPress={() => {
-                    setShowChangeOwner(!showChangeOwner);
-                    if (showChangeOwner) setNewOwnerInput("");
-                  }}
-                >
-                  <Text style={styles.smallButtonText}>
-                    {showChangeOwner ? "Cancel" : "Change Owner"}
-                  </Text>
-                </Pressable>
-              </View>
-              <Text style={styles.hint}>
-                {role === "admin"
-                  ? "Transfer this DID to a different identity. The new owner must be in the ACL, with a domain scope and quota that allow this DID."
-                  : "Offer this DID to a different identity. It moves only when they accept it, within 72 hours."}
-              </Text>
-              {showChangeOwner && (
-                <>
-                  <TextInput
-                    style={styles.ownerInput}
-                    placeholder="did:webvh:..."
-                    placeholderTextColor={colors.textTertiary}
-                    value={newOwnerInput}
-                    onChangeText={setNewOwnerInput}
-                    autoCapitalize="none"
-                    autoCorrect={false}
-                  />
-                  <Pressable
-                    style={[
-                      styles.button,
-                      (!newOwnerInput.trim() || changingOwner) && styles.disabled,
-                    ]}
-                    onPress={handleChangeOwner}
-                    disabled={!newOwnerInput.trim() || changingOwner}
-                  >
-                    <Text style={styles.buttonText}>
-                      {changingOwner
-                        ? "Sending..."
-                        : role === "admin"
-                          ? "Transfer Ownership"
-                          : "Offer Ownership"}
-                    </Text>
-                  </Pressable>
-                </>
-              )}
-            </View>
-          )}
+        {logEntries.length > 0 && (
+          <ParametersCard latest={latestEntry} knownWatcherUrls={knownWatcherUrls} />
+        )}
 
-        {/* Danger Zone */}
-        <View style={[styles.card, styles.dangerCard]}>
-          <Text style={styles.sectionTitle}>Danger Zone</Text>
+        <UploadCards
+          mnemonic={mnemonic}
+          versionCount={didDetail?.versionCount ?? 0}
+          logContent={logContent}
+          onLogContentChange={setLogContent}
+          loadingRaw={loadingRaw}
+          onLoadCurrent={() => void loadRawLog(false)}
+          onUploaded={reload}
+          notify={showAlert}
+        />
 
-          {/* Rollback */}
-          <Pressable
-            style={[
-              styles.warningButton,
-              (logEntryCount < 2 || rollingBack) && styles.disabled,
-            ]}
-            onPress={handleRollback}
-            disabled={logEntryCount < 2 || rollingBack}
-          >
-            <Text style={styles.warningButtonText}>
-              {rollingBack ? "Rolling back..." : "Rollback Last Entry"}
-            </Text>
-          </Pressable>
-          {logEntryCount < 2 && logEntryCount > 0 && (
-            <Text style={[styles.hint, { marginTop: spacing.xs, marginBottom: spacing.md }]}>
-              Cannot rollback — only one log entry exists.
-            </Text>
-          )}
+        {didDetail && (role === "admin" || (callerDid && callerDid === didDetail.owner)) && (
+          <OwnershipCard
+            mnemonic={mnemonic}
+            isAdmin={role === "admin"}
+            onChanged={(record) =>
+              setQueryData<DidDetailResponse | undefined>([...key, "detail"], (prev) =>
+                prev ? { ...prev, owner: record.owner, updatedAt: record.updatedAt } : prev,
+              )
+            }
+            notify={showAlert}
+          />
+        )}
 
-          {/* Delete */}
-          <Pressable
-            style={[styles.dangerButton, deleting && styles.disabled]}
-            onPress={handleDelete}
-            disabled={deleting}
-          >
-            <Text style={styles.dangerButtonText}>
-              {deleting ? "Deleting..." : "Delete DID"}
-            </Text>
-          </Pressable>
-        </View>
+        <DangerZone
+          mnemonic={mnemonic}
+          versionCount={didDetail?.versionCount ?? null}
+          logEntryCount={logEntryCount}
+          onRolledBack={reload}
+          onDeleted={() => router.replace("/dids")}
+          notify={showAlert}
+        />
       </View>
     </ScrollView>
   );
@@ -1807,12 +479,6 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: colors.bgPrimary,
   },
-  containerCenter: {
-    flex: 1,
-    backgroundColor: colors.bgPrimary,
-    alignItems: "center",
-    justifyContent: "center",
-  },
   content: {
     padding: spacing.xl,
   },
@@ -1820,281 +486,5 @@ const styles = StyleSheet.create({
     maxWidth: 1200,
     alignSelf: "center",
     width: "100%",
-  },
-  title: {
-    fontSize: 20,
-    fontFamily: fonts.mono,
-    fontWeight: "bold",
-    color: colors.accent,
-    marginBottom: spacing.sm,
-  },
-  card: {
-    backgroundColor: colors.bgSecondary,
-    borderRadius: radii.lg,
-    borderWidth: 1,
-    borderColor: colors.border,
-    padding: spacing.xl,
-    marginBottom: spacing.lg,
-  },
-  dangerCard: {
-    borderColor: "rgba(255, 92, 92, 0.25)",
-  },
-  sectionTitle: {
-    fontSize: 16,
-    fontFamily: fonts.semibold,
-    color: colors.textPrimary,
-    marginBottom: spacing.md,
-  },
-  sectionTitleRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    marginBottom: spacing.md,
-  },
-  sectionActions: {
-    flexDirection: "row",
-    gap: spacing.sm,
-  },
-  statsGrid: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: spacing.lg,
-  },
-  statItem: {
-    minWidth: 120,
-  },
-  statValue: {
-    fontSize: 24,
-    fontFamily: fonts.bold,
-    color: colors.accent,
-  },
-  statSmall: {
-    fontSize: 14,
-    fontFamily: fonts.regular,
-    color: colors.textPrimary,
-  },
-  statLabel: {
-    fontSize: 11,
-    fontFamily: fonts.semibold,
-    color: colors.textTertiary,
-    textTransform: "uppercase",
-    letterSpacing: 1,
-    marginTop: 2,
-  },
-  hint: {
-    fontSize: 13,
-    fontFamily: fonts.regular,
-    color: colors.textSecondary,
-    marginBottom: spacing.md,
-    lineHeight: 18,
-  },
-  textarea: {
-    backgroundColor: colors.bgPrimary,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: radii.sm,
-    padding: spacing.md,
-    color: colors.textPrimary,
-    fontSize: 13,
-    fontFamily: fonts.mono,
-    minHeight: 100,
-    marginBottom: spacing.md,
-  },
-  button: {
-    backgroundColor: colors.accent,
-    borderRadius: radii.md,
-    paddingVertical: 12,
-    alignItems: "center",
-  },
-  disabled: {
-    opacity: 0.5,
-  },
-  smallButton: {
-    borderRadius: radii.sm,
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingVertical: 4,
-    paddingHorizontal: spacing.md,
-  },
-  smallButtonText: {
-    fontSize: 12,
-    fontFamily: fonts.semibold,
-    color: colors.textSecondary,
-  },
-  outlineButton: {
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.accent,
-    paddingVertical: 10,
-    alignItems: "center",
-    marginBottom: spacing.md,
-  },
-  outlineButtonText: {
-    color: colors.accent,
-    fontSize: 13,
-    fontFamily: fonts.semibold,
-  },
-  warningButton: {
-    backgroundColor: "transparent",
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.warning,
-    paddingVertical: 14,
-    alignItems: "center",
-    marginBottom: spacing.md,
-  },
-  warningButtonText: {
-    color: colors.warning,
-    fontSize: 14,
-    fontFamily: fonts.semibold,
-  },
-  dangerButton: {
-    backgroundColor: "transparent",
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.error,
-    paddingVertical: 14,
-    alignItems: "center",
-  },
-  dangerButtonText: {
-    color: colors.error,
-    fontSize: 14,
-    fontFamily: fonts.semibold,
-  },
-  buttonText: {
-    color: colors.textOnAccent,
-    fontSize: 14,
-    fontFamily: fonts.semibold,
-  },
-  didIdRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    alignSelf: "flex-start",
-    gap: spacing.sm,
-    marginBottom: spacing.xl,
-  },
-  didIdRowTight: {
-    marginBottom: spacing.sm,
-  },
-  agentNamesRow: {
-    alignSelf: "flex-start",
-    marginBottom: spacing.xl,
-  },
-  didIdText: {
-    fontSize: 13,
-    fontFamily: fonts.mono,
-    color: colors.teal,
-  },
-  copyButton: {
-    borderRadius: radii.sm,
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingVertical: 4,
-    paddingHorizontal: spacing.sm,
-  },
-  copyButtonText: {
-    fontSize: 13,
-    fontFamily: fonts.semibold,
-    color: colors.textSecondary,
-  },
-  pendingText: {
-    fontSize: 14,
-    fontFamily: fonts.medium,
-    color: colors.warning,
-    marginBottom: spacing.xl,
-  },
-  ownerRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    flexWrap: "wrap",
-    gap: spacing.sm,
-    marginBottom: spacing.lg,
-  },
-  ownerText: {
-    fontSize: 13,
-    fontFamily: fonts.mono,
-    color: colors.textSecondary,
-  },
-  ownerInput: {
-    backgroundColor: colors.bgPrimary,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: radii.sm,
-    padding: spacing.md,
-    color: colors.textPrimary,
-    fontSize: 13,
-    fontFamily: fonts.mono,
-    marginBottom: spacing.md,
-  },
-  detailsGrid: {
-    gap: spacing.sm,
-  },
-  detailRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-  },
-  detailLabel: {
-    fontSize: 13,
-    fontFamily: fonts.medium,
-    color: colors.textTertiary,
-  },
-  detailValue: {
-    fontSize: 13,
-    fontFamily: fonts.regular,
-    color: colors.textPrimary,
-  },
-  detailValueMono: {
-    fontSize: 13,
-    fontFamily: fonts.mono,
-    color: colors.textPrimary,
-  },
-  optionsGrid: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: spacing.lg,
-  },
-  optionItem: {
-    minWidth: 90,
-  },
-  optionEnabled: {
-    fontSize: 16,
-    fontFamily: fonts.bold,
-    color: colors.success,
-  },
-  optionDisabled: {
-    fontSize: 16,
-    fontFamily: fonts.bold,
-    color: colors.textTertiary,
-  },
-  optionDeactivated: {
-    fontSize: 16,
-    fontFamily: fonts.bold,
-    color: colors.error,
-  },
-  errorText: {
-    fontFamily: fonts.medium,
-    color: colors.error,
-    fontSize: 14,
-  },
-  versionRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: spacing.md,
-    marginBottom: spacing.md,
-  },
-  selectWrapper: {
-    flex: 1,
-  },
-  paramField: {
-    marginBottom: spacing.md,
-  },
-  paramLabel: {
-    fontSize: 12,
-    fontFamily: fonts.semibold,
-    color: colors.textTertiary,
-    textTransform: "uppercase",
-    letterSpacing: 1,
-    marginBottom: spacing.xs,
   },
 });
