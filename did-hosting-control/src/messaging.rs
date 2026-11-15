@@ -413,15 +413,12 @@ pub(crate) async fn do_health_pong(state: &AppState, signer: &str, body: &Value)
     // DID whose registry id collides with it is not that instance.
     let instance_id = registry::instance_id_for(signer);
     let now = crate::auth::session::now_epoch();
-    let updated = match registry::get_instance_for_did(&state.registry_ks, signer).await {
-        Ok(Some(mut instance)) => {
-            instance.status = ServiceStatus::Active;
-            instance.last_health_check = Some(now);
-            registry::register_instance(&state.registry_ks, &instance).await
-        }
-        Ok(None) => Ok(()),
-        Err(e) => Err(e),
-    };
+    let updated = registry::update_instance_for_did(&state.registry_ks, signer, |instance| {
+        instance.status = ServiceStatus::Active;
+        instance.last_health_check = Some(now);
+        true
+    })
+    .await;
     if let Err(e) = updated {
         warn!(instance_id, error = %e, "failed to update instance status from health pong");
     }
@@ -544,34 +541,35 @@ pub(crate) async fn do_domain_ack(state: &AppState, signer: &str, type_uri: &str
         "unassign" => crate::server_push::DomainOp::Unassign,
         _ => crate::server_push::DomainOp::Purge,
     };
-    crate::server_push::settle_domain_intent(state, signer, domain, settled).await;
+    // `replica/domain/assign/0.1` answers only `applied`.
+    let add = op == "assign" && status == "applied";
+    crate::server_push::settle_domain_intent(state, signer, domain, settled, add).await;
 
     let instance_id = crate::registry::instance_id_for(signer);
-    match crate::registry::get_instance_for_did(&state.registry_ks, signer).await {
-        Ok(Some(mut instance)) => {
-            // `replica/domain/assign/0.1` answers only `applied`.
-            let add = op == "assign" && status == "applied";
-            let mutated = if add {
-                if !instance.served_domains.iter().any(|d| d == domain) {
-                    instance.served_domains.push(domain.to_string());
-                    instance.served_domains.sort();
-                    true
-                } else {
-                    false
+    // Under the instance's lock, so a concurrent registration or status sweep
+    // cannot drop this change to `served_domains` (which the purge fan-out
+    // reads).
+    let mut found = false;
+    let updated =
+        crate::registry::update_instance_for_did(&state.registry_ks, signer, |instance| {
+            found = true;
+            if add {
+                if instance.served_domains.iter().any(|d| d == domain) {
+                    return false;
                 }
+                instance.served_domains.push(domain.to_string());
+                instance.served_domains.sort();
+                true
             } else {
                 let before = instance.served_domains.len();
                 instance.served_domains.retain(|d| d != domain);
                 instance.served_domains.len() != before
-            };
-            if mutated
-                && let Err(e) =
-                    crate::registry::register_instance(&state.registry_ks, &instance).await
-            {
-                warn!(instance_id, error = %e, "failed to update served_domains after domain ack");
             }
-        }
-        Ok(None) => {
+        })
+        .await;
+    match updated.map(|_| found) {
+        Ok(true) => {}
+        Ok(false) => {
             // Ack arrived before registration, or the registry was wiped; the
             // next register cycle reconciles.
             warn!(
@@ -906,7 +904,8 @@ pub(crate) async fn do_server_register(
     // the operator keeps seeing the last known services instead of an empty
     // badge row.
 
-    let instance = ServiceInstance {
+    let resync_domains = served_domains.clone();
+    let build = |previous: Option<ServiceInstance>| ServiceInstance {
         instance_id: instance_id.clone(),
         service_type: ServiceType::Server,
         label,
@@ -937,7 +936,30 @@ pub(crate) async fn do_server_register(
         last_reconcile_at: previous.as_ref().and_then(|p| p.last_reconcile_at),
     };
 
-    if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {
+    // Built from the record as it stands under the instance's lock, so a pong
+    // or ack recorded since `previous` was read above is carried forward too.
+    // A record another DID took meanwhile is left alone.
+    let written = registry::upsert_instance(&state.registry_ks, &instance_id, |current| {
+        match current.as_ref().and_then(|c| c.did()) {
+            Some(holder) if holder != signer => None,
+            _ => Some(build(current)),
+        }
+    })
+    .await;
+    let written = match written {
+        Ok(Some(instance)) if instance.did() == Some(signer) => Ok(()),
+        Ok(_) => {
+            warn!(
+                did = signer,
+                instance_id, "server registration rejected: instance id taken meanwhile"
+            );
+            return Err(InfraRejection::conflict(
+                "another server's registration holds this instance id",
+            ));
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = written {
         warn!(did = signer, error = %e, "server registration failed");
         // The store's own text stays in the log: it describes this service,
         // not the request.
@@ -975,9 +997,11 @@ pub(crate) async fn do_server_register(
     // (mnemonic → DID + version_count); anything absent, stale, or a different
     // DID at that slot is pushed. A server with an empty store sends none and
     // gets a full push. This is what stops a reboot from re-syncing every DID.
+    //
+    // Domains first, then DIDs, in one task: the order their rows queue in
+    // for this server is then deterministic.
     let reported = server_push::parse_reported(&hints);
-    server_push::sync_all_dids_to_server(state, signer.to_string(), reported);
-    server_push::sync_all_domains_to_server(state, signer.to_string());
+    server_push::resync_server(state, signer.to_string(), reported, resync_domains);
 
     Ok(
         did_hosting_common::tasks::did_management::server::register::v0_2::Response::builder()
@@ -3572,21 +3596,132 @@ mod tests {
                 { "mnemonic": "alice", "did_id": "did:webvh:QmOld:host:alice", "version_count": 1 },
             ]
         }));
-        crate::server_push::sync_all_dids_to_server(&state, edge.to_string(), reported);
+        crate::server_push::sync_all_dids_now(&state, edge, reported.clone()).await;
+        let rows = crate::outbox::list_pending_for_target(&state.store, edge)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the new DID is pushed");
+        let sent = crate::outbox::prepare(&state, &rows[0].1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sent.msg_type, MSG_SYNC_UPDATE);
+        assert_eq!(sent.body["didId"], "did:webvh:QmNew:host:alice");
+        assert_eq!(sent.body["disabled"], false);
+
+        // The edge registers again before the row drained: the same delta is
+        // not queued a second time.
+        crate::server_push::sync_all_dids_now(&state, edge, reported).await;
+        assert_eq!(
+            crate::outbox::list_pending_for_target(&state.store, edge)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a resync coalesces onto what is already queued"
+        );
+    }
+
+    /// A batch-capable edge's resync is queued as batch rows, and a resync
+    /// while one is still queued adds nothing.
+    #[tokio::test]
+    async fn a_batched_resync_is_not_appended_while_one_is_queued() {
+        let (state, _dir) = test_state().await;
+        let edge = "did:example:edge-batch";
+        for m in ["a", "b", "c"] {
+            state
+                .dids_ks
+                .insert(
+                    did_key(m),
+                    &record_at(m, &format!("did:webvh:Q:host:{m}"), 1),
+                )
+                .await
+                .unwrap();
+            state
+                .dids_ks
+                .insert_raw(
+                    did_hosting_common::did_ops::content_log_key(m),
+                    b"{}".to_vec(),
+                )
+                .await
+                .unwrap();
+        }
+        let mut instance: crate::registry::ServiceInstance = serde_json::from_value(json!({
+            "instanceId": crate::registry::instance_id_for(edge),
+            "serviceType": "server",
+            "url": "https://edge.example",
+            "status": "active",
+            "registeredAt": 1,
+            "metadata": { "did": edge },
+        }))
+        .unwrap();
+        instance.sync_batch_capable = true;
+        crate::registry::register_instance(&state.registry_ks, &instance)
+            .await
+            .unwrap();
+
+        crate::server_push::sync_all_dids_now(&state, edge, Default::default()).await;
+        let rows = crate::outbox::list_pending_for_target(&state.store, edge)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "three DIDs, one batch row");
+        let sent = crate::outbox::prepare(&state, &rows[0].1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sent.msg_type, MSG_SYNC_BATCH);
+        assert_eq!(sent.body["updates"].as_array().unwrap().len(), 3);
+
+        crate::server_push::sync_all_dids_now(&state, edge, Default::default()).await;
+        assert_eq!(
+            crate::outbox::list_pending_for_target(&state.store, edge)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// A registration queues the server's domain rows ahead of its DID rows.
+    #[tokio::test]
+    async fn a_resync_queues_domains_before_dids() {
+        let (state, _dir) = test_state().await;
+        let edge = "did:example:edge-order";
+        seed_service(&state, edge).await;
+        state
+            .dids_ks
+            .insert(
+                did_key("alice"),
+                &record_at("alice", "did:webvh:Q:host:alice", 1),
+            )
+            .await
+            .unwrap();
+        state
+            .dids_ks
+            .insert_raw(
+                did_hosting_common::did_ops::content_log_key("alice"),
+                b"{}".to_vec(),
+            )
+            .await
+            .unwrap();
+        crate::server_push::send_domain_assign(&state, edge, "a.example")
+            .await
+            .unwrap();
+        clear_outbox(&state, edge).await;
+
+        crate::server_push::resync_server(&state, edge.to_string(), Default::default(), vec![]);
         let mut rows = Vec::new();
-        for _ in 0..100 {
+        for _ in 0..200 {
             rows = crate::outbox::list_pending_for_target(&state.store, edge)
                 .await
                 .unwrap();
-            if !rows.is_empty() {
+            if rows.iter().any(|(_, e)| e.msg_type == MSG_SYNC_UPDATE) {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert_eq!(rows.len(), 1, "the new DID is pushed");
-        assert_eq!(rows[0].1.msg_type, MSG_SYNC_UPDATE);
-        assert_eq!(rows[0].1.body["didId"], "did:webvh:QmNew:host:alice");
-        assert_eq!(rows[0].1.body["disabled"], false);
+        let types: Vec<_> = rows.iter().map(|(_, e)| e.msg_type.as_str()).collect();
+        assert_eq!(types, vec![MSG_REPLICA_DOMAIN_ASSIGN, MSG_SYNC_UPDATE]);
     }
 
     // ── Domain ops are re-sent on registration until settled ───────────
@@ -3704,6 +3839,32 @@ mod tests {
         assert_eq!(intents.len(), 1, "{intents:?}");
         assert_eq!(intents[0].domain, "kept.example");
         assert_eq!(intents[0].op, DomainOp::Assign);
+        assert!(
+            intents[0].acked,
+            "the applied assign is marked acknowledged"
+        );
+
+        // An acknowledged assign is not re-sent to a server that still serves
+        // the domain — but is to one that registers without it (wiped).
+        clear_outbox(&state, edge).await;
+        crate::server_push::resend_domain_intents_for(
+            &state,
+            edge,
+            Some(&["kept.example".to_string()]),
+        )
+        .await;
+        assert!(pending_ops(&state, edge).await.is_empty());
+        crate::server_push::resend_domain_intents_for(&state, edge, Some(&[])).await;
+        assert_eq!(
+            pending_ops(&state, edge).await,
+            vec![(
+                MSG_REPLICA_DOMAIN_ASSIGN.to_string(),
+                "kept.example".to_string()
+            )]
+        );
+        // Re-sent again while still queued: not queued twice.
+        crate::server_push::resend_domain_intents_for(&state, edge, Some(&[])).await;
+        assert_eq!(pending_ops(&state, edge).await.len(), 1);
     }
 
     /// The ack of an older unassign cannot erase a newer assign, and a stranger

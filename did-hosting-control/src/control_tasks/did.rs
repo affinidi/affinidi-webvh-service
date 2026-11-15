@@ -18,7 +18,6 @@ use super::{Cx, TaskError, at, spec_record, typed};
 use crate::did_ops;
 use crate::error::AppError;
 use crate::server::AppState;
-use crate::server_push;
 
 /// `did/check-name/0.1`: an availability probe, or (`reserve: true`) an atomic
 /// claim of a slot — auto-assigned when `path` is absent.
@@ -166,7 +165,6 @@ pub(crate) async fn register(
         // again and grants it then.
         webs.grant_owner_entry(state, &record).await?;
     }
-    server_push::notify_servers_did(state, record.mnemonic.clone());
 
     typed(
         json!({ "record": spec_record::<register::v0_1::DidRecord>(state, &record)? }),
@@ -560,7 +558,6 @@ pub(crate) async fn delete(
     let state = cx.state;
     let (record, _) = did_ops::get_did_info(&auth, state, &p.mnemonic).await?;
     did_ops::delete_did(&auth, state, &p.mnemonic, p.domain.as_deref()).await?;
-    server_push::notify_servers_delete(state, p.mnemonic.to_string());
     typed(
         json!({ "record": spec_record::<delete::v0_1::DidRecord>(state, &record)? }),
         "delete response",
@@ -632,7 +629,6 @@ pub(crate) async fn witness_publish(
         base_url.trim_end_matches('/'),
         p.mnemonic.as_str()
     );
-    server_push::notify_servers_did(state, p.mnemonic.to_string());
     info!(did = %auth.did, mnemonic = %p.mnemonic.as_str(), "witness proofs published");
     typed(
         json!({ "mnemonic": p.mnemonic.as_str(), "witnessUrl": witness_url }),
@@ -656,7 +652,6 @@ pub(crate) async fn set_state(
         _ => return Err(AppError::invalid("unsupported DID state").into()),
     };
     let record = did_ops::set_did_disabled(&auth, state, &p.mnemonic, disabled).await?;
-    server_push::notify_servers_did(state, p.mnemonic.to_string());
     typed(
         json!({ "record": spec_record::<set_state::v0_1::DidRecord>(state, &record)? }),
         "set-state response",
@@ -686,9 +681,6 @@ pub(crate) async fn rollback(
                 }
                 other => other.into(),
             })?;
-    if removed > 0 {
-        server_push::notify_servers_did(state, p.mnemonic.to_string());
-    }
     typed(
         json!({
             "record": spec_record::<rollback::v0_1::DidRecord>(state, &record)?,

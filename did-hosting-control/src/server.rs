@@ -892,7 +892,21 @@ pub async fn backfill_service_badges(store: &Store) {
 // ---------------------------------------------------------------------------
 
 /// Seed the registry with statically configured instances.
+///
+/// Each `[[registry.instances]]` entry is kept under a stable id derived from
+/// its type and URL ([`registry::seeded_instance_id`]) and upserted: a restart
+/// refreshes its label and leaves what the registry has observed about it
+/// (status, badges, transports) in place, rather than adding another record.
+/// Records an earlier version seeded under a random id for the same entry
+/// (no DID, same type and URL) are removed.
 pub async fn seed_registry(state: &AppState) {
+    let existing = match registry::list_instances(&state.registry_ks).await {
+        Ok(existing) => existing,
+        Err(e) => {
+            warn!(error = %e, "failed to list the registry; not seeding configured instances");
+            return;
+        }
+    };
     for instance_config in &state.config.registry.instances {
         let service_type = match instance_config.service_type.as_str() {
             "server" => registry::ServiceType::Server,
@@ -904,45 +918,79 @@ pub async fn seed_registry(state: &AppState) {
             }
         };
 
-        let instance_id = uuid::Uuid::new_v4().to_string();
-        let instance = registry::ServiceInstance {
-            instance_id,
-            service_type,
-            label: instance_config.label.clone(),
-            url: instance_config.url.clone(),
-            status: ServiceStatus::Active,
-            last_health_check: None,
-            registered_at: crate::auth::session::now_epoch(),
-            metadata: serde_json::Value::Null,
-            // Config-seeded instances pre-date T27's capability
-            // declaration; assume webvh-only until the instance
-            // re-registers and reports its compile-time methods.
-            enabled_methods: vec!["webvh".to_string()],
-            served_domains: Vec::new(),
-            protocol_version: "1.0".to_string(),
-            // Config-seeded instances carry no DID (`metadata` is Null).
-            // The health-check loop fills these once the instance
-            // re-registers over DIDComm and records one.
-            advertised_services: None,
-            services_checked_at: None,
-            trust_task_capable: false,
-            sync_batch_capable: false,
-            last_inbound_transport: None,
-            last_inbound_at: None,
-            last_outbound_transport: None,
-            last_outbound_at: None,
-            last_ack_at: None,
-            last_reconcile_at: None,
-        };
-
-        if let Err(e) = registry::register_instance(&state.registry_ks, &instance).await {
-            warn!(url = %instance_config.url, error = %e, "failed to seed registry instance");
-        } else {
-            info!(
+        let instance_id = registry::seeded_instance_id(&service_type, &instance_config.url);
+        let label = instance_config.label.clone();
+        let url = instance_config.url.clone();
+        let seeded = registry::upsert_instance(&state.registry_ks, &instance_id, |current| {
+            Some(match current {
+                Some(mut known) => {
+                    known.label = label;
+                    known.url = url;
+                    known
+                }
+                None => registry::ServiceInstance {
+                    instance_id: instance_id.clone(),
+                    service_type: service_type.clone(),
+                    label,
+                    url,
+                    status: ServiceStatus::Active,
+                    last_health_check: None,
+                    registered_at: crate::auth::session::now_epoch(),
+                    metadata: serde_json::Value::Null,
+                    // Config-seeded instances pre-date T27's capability
+                    // declaration; assume webvh-only until the instance
+                    // re-registers and reports its compile-time methods.
+                    enabled_methods: vec!["webvh".to_string()],
+                    served_domains: Vec::new(),
+                    protocol_version: "1.0".to_string(),
+                    // Config-seeded instances carry no DID (`metadata` is
+                    // Null), so there is no document to read badges from.
+                    advertised_services: None,
+                    services_checked_at: None,
+                    trust_task_capable: false,
+                    sync_batch_capable: false,
+                    last_inbound_transport: None,
+                    last_inbound_at: None,
+                    last_outbound_transport: None,
+                    last_outbound_at: None,
+                    last_ack_at: None,
+                    last_reconcile_at: None,
+                },
+            })
+        })
+        .await;
+        match seeded {
+            Ok(_) => info!(
                 url = %instance_config.url,
                 service_type = %instance_config.service_type,
+                instance_id = %instance_id,
                 "seeded registry instance"
-            );
+            ),
+            Err(e) => {
+                warn!(url = %instance_config.url, error = %e, "failed to seed registry instance");
+                continue;
+            }
+        }
+
+        // Duplicates an earlier version seeded on every boot.
+        for stale in existing.iter().filter(|i| {
+            i.instance_id != instance_id
+                && i.did().is_none()
+                && i.service_type == service_type
+                && i.url.trim_end_matches('/') == instance_config.url.trim_end_matches('/')
+        }) {
+            match registry::deregister_instance(&state.registry_ks, &stale.instance_id).await {
+                Ok(()) => info!(
+                    instance_id = %stale.instance_id,
+                    url = %stale.url,
+                    "removed a duplicate seeded registry instance"
+                ),
+                Err(e) => warn!(
+                    instance_id = %stale.instance_id,
+                    error = %e,
+                    "failed to remove a duplicate seeded registry instance"
+                ),
+            }
         }
     }
 }
@@ -1238,8 +1286,20 @@ pub async fn run_health_checks(
                 new_status = ?new_status,
                 "instance status changed"
             );
-            registry::update_instance_status(registry_ks, &inst.instance_id, new_status, now)
-                .await?;
+            // Re-derived under the instance's lock from the record as it is
+            // now: a pong that landed since the listing above is not undone
+            // by a status computed from the older copy.
+            registry::update_instance(registry_ks, &inst.instance_id, |current| {
+                let status =
+                    registry::health_status_from_timestamp(current, now, health_interval_secs);
+                if status == current.status {
+                    return false;
+                }
+                current.status = status;
+                current.last_health_check = Some(now);
+                true
+            })
+            .await?;
         }
     }
 
@@ -1267,4 +1327,102 @@ pub async fn run_health_checks(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod seed_registry_tests {
+    use super::*;
+    use crate::config::InstanceConfig;
+
+    /// A configured instance is one record however often the control plane
+    /// starts, under an id derived from its type and URL; what the registry
+    /// observed about it survives a restart, and the duplicates an earlier
+    /// version left (one random id per boot) are removed.
+    #[tokio::test]
+    async fn seeding_on_every_boot_keeps_one_record_per_configured_instance() {
+        let (mut state, _dir) = crate::control_tasks::harness::state().await;
+        let mut config = (*state.config).clone();
+        config.registry.instances = vec![InstanceConfig {
+            label: Some("edge one".into()),
+            service_type: "server".into(),
+            url: "https://edge-one.example".into(),
+        }];
+        state.config = std::sync::Arc::new(config);
+
+        // What an earlier version left behind: a record per boot.
+        for n in 0..3 {
+            let stale: registry::ServiceInstance = serde_json::from_value(serde_json::json!({
+                "instanceId": format!("0000-old-{n}"),
+                "serviceType": "server",
+                "label": "edge one",
+                "url": "https://edge-one.example/",
+                "status": "unreachable",
+                "registeredAt": 1,
+                "metadata": null,
+            }))
+            .unwrap();
+            registry::register_instance(&state.registry_ks, &stale)
+                .await
+                .unwrap();
+        }
+
+        seed_registry(&state).await;
+        let id = registry::seeded_instance_id(
+            &registry::ServiceType::Server,
+            "https://edge-one.example",
+        );
+        registry::update_instance_status(&state.registry_ks, &id, ServiceStatus::Degraded, 42)
+            .await
+            .unwrap();
+        seed_registry(&state).await;
+        seed_registry(&state).await;
+
+        let all = registry::list_instances(&state.registry_ks).await.unwrap();
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert_eq!(all[0].instance_id, id);
+        assert_eq!(all[0].label.as_deref(), Some("edge one"));
+        assert_eq!(
+            all[0].status,
+            ServiceStatus::Degraded,
+            "a restart keeps what the registry observed"
+        );
+    }
+
+    /// Concurrent writers to one instance each keep their change: no
+    /// read-modify-write loses another's.
+    #[tokio::test]
+    async fn concurrent_instance_updates_are_not_lost() {
+        let (state, _dir) = crate::control_tasks::harness::state().await;
+        let edge = "did:example:edge-concurrent";
+        let instance: registry::ServiceInstance = serde_json::from_value(serde_json::json!({
+            "instanceId": registry::instance_id_for(edge),
+            "serviceType": "server",
+            "url": "https://edge.example",
+            "status": "active",
+            "registeredAt": 1,
+            "metadata": { "did": edge },
+        }))
+        .unwrap();
+        registry::register_instance(&state.registry_ks, &instance)
+            .await
+            .unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for n in 0..32u64 {
+            let ks = state.registry_ks.clone();
+            tasks.spawn(async move {
+                registry::update_instance_for_did(&ks, edge, |i| {
+                    i.served_domains.push(format!("d{n}.example"));
+                    true
+                })
+                .await
+                .unwrap();
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+        let stored = registry::get_instance_for_did(&state.registry_ks, edge)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.served_domains.len(), 32);
+    }
 }

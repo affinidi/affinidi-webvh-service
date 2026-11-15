@@ -15,14 +15,36 @@ static AUTH_FAILURES: AtomicU64 = AtomicU64::new(0);
 static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static STATS_SYNCS: AtomicU64 = AtomicU64::new(0);
+static OUTBOX_ENQUEUE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static OUTBOX_DELIVERY_FAILURES: AtomicU64 = AtomicU64::new(0);
+static OUTBOX_UNACKED_RESENDS: AtomicU64 = AtomicU64::new(0);
+static OUTBOX_DROPPED: AtomicU64 = AtomicU64::new(0);
+static OUTBOX_RECORD_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Every counter, with the name it is reported under, sorted by name.
-static COUNTERS: [(&str, &AtomicU64); 8] = [
+static COUNTERS: [(&str, &AtomicU64); 13] = [
     ("webvh_auth_challenges_total", &AUTH_CHALLENGES),
     ("webvh_auth_failures_total", &AUTH_FAILURES),
     ("webvh_auth_successes_total", &AUTH_SUCCESSES),
     ("webvh_cache_hits_total", &CACHE_HITS),
     ("webvh_cache_misses_total", &CACHE_MISSES),
+    (
+        "webvh_outbox_delivery_failures_total",
+        &OUTBOX_DELIVERY_FAILURES,
+    ),
+    ("webvh_outbox_dropped_total", &OUTBOX_DROPPED),
+    (
+        "webvh_outbox_enqueue_failures_total",
+        &OUTBOX_ENQUEUE_FAILURES,
+    ),
+    (
+        "webvh_outbox_record_failures_total",
+        &OUTBOX_RECORD_FAILURES,
+    ),
+    (
+        "webvh_outbox_unacked_resends_total",
+        &OUTBOX_UNACKED_RESENDS,
+    ),
     ("webvh_resolves_total", &RESOLVES),
     ("webvh_stats_syncs_total", &STATS_SYNCS),
     ("webvh_updates_total", &UPDATES),
@@ -70,6 +92,34 @@ pub fn inc_cache_miss() {
 /// Increment the stats sync counter.
 pub fn inc_stats_sync() {
     inc(&STATS_SYNCS);
+}
+
+/// An outbox row could not be enqueued (the change reaches the target only on
+/// its next registration).
+pub fn inc_outbox_enqueue_failure() {
+    inc(&OUTBOX_ENQUEUE_FAILURES);
+}
+
+/// An outbox send failed hard (the transport refused it, or it could not be
+/// built).
+pub fn inc_outbox_delivery_failure() {
+    inc(&OUTBOX_DELIVERY_FAILURES);
+}
+
+/// An outbox entry the transport accepted was re-sent because its target
+/// did not acknowledge it in time.
+pub fn inc_outbox_unacked_resend() {
+    inc(&OUTBOX_UNACKED_RESENDS);
+}
+
+/// An outbox entry was dropped past its retry budget.
+pub fn inc_outbox_dropped() {
+    inc(&OUTBOX_DROPPED);
+}
+
+/// The outbox failed to record a send, a failure, or a settle.
+pub fn inc_outbox_record_failure() {
+    inc(&OUTBOX_RECORD_FAILURES);
 }
 
 /// Every counter this service keeps, as `(name, value)`, sorted by name.
