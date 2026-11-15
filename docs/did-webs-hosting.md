@@ -1,7 +1,8 @@
 # Hosting `did:webs`
 
-Status: implemented, off by default (`method-webs`)
-Extends: `docs/multi-method-hosting-spec.md`
+> **Status:** current — implemented, off by default (`method-webs`)
+
+Extends: [the multi-method hosting spec](archive/multi-method-hosting-spec.md) (historical)
 
 `did:webs` is `did:web` discovery with KERI-verified key state. A DID's last
 label is a KERI **AID**, and it publishes two artifacts:
@@ -158,9 +159,11 @@ published under, because it never gets to assert one.
 
 Two consequences:
 
-- **A domain is required.** `register_did_atomic` takes one (the REST handler
-  passes the already-resolved domain). Publishing without it would mean
-  verifying the stream against an identifier we invented.
+- **A domain is required.** A `did:webs` is published with the
+  `did/register/0.1` Trust Task carrying `method: "webs"`; the control plane
+  resolves the slot's domain (the payload's `domain`, else the caller's ACL
+  default, else the system default) and passes it to `register_did_atomic`. Publishing without
+  one would mean verifying the stream against an identifier we invented.
 - **The record must carry its domain.** Unlike webvh, whose `domain` is a
   convenience backfilled by migration, a `did:webs` record's domain is load
   bearing — the document is re-derived from the identifier on every read.

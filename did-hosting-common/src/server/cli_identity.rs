@@ -13,9 +13,10 @@
 //!
 //! So the split is deliberate:
 //!
-//! - **Live service** → `POST /api/identity/generations/{id}/retire` (or the UI
-//!   button). Runs in-process; the key is gone from the resolver before the
-//!   response is written.
+//! - **Live service** → the `identity/retire/0.1` Trust Task, which the control
+//!   plane (and so the daemon) serves to an admin: the console's Key Generations
+//!   panel, or `send-trust-task`. Runs in-process; the key is gone from the
+//!   resolver before the reply is written.
 //! - **Stopped service** → these commands. They remove the record and the key
 //!   material from disk, so the generation is never loaded again on next boot.
 //!

@@ -40,8 +40,44 @@ fn main() {
     build_ui();
 }
 
+/// The Node.js floor is `engines.node` in `did-hosting-ui/package.json` — the
+/// one place it is stated. This build script reads it from there (it only
+/// checks Node when that workspace is present), so the two cannot drift.
 #[cfg(feature = "ui")]
-const MIN_NODE_MAJOR: u32 = 20;
+fn node_floor(ui_dir: &Path) -> (u32, u32, u32) {
+    let path = ui_dir.join("package.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    parse_engines_node(&text).unwrap_or_else(|| {
+        panic!(
+            "{} must declare `engines.node` as \">=MAJOR.MINOR.PATCH\"",
+            path.display()
+        )
+    })
+}
+
+/// `">=24.3.0"` (the value of `"node"` inside `"engines"`) → `(24, 3, 0)`.
+/// A deliberately small reader: the build script has no JSON dependency, and
+/// the shape is ours.
+#[cfg(feature = "ui")]
+fn parse_engines_node(package_json: &str) -> Option<(u32, u32, u32)> {
+    let engines = &package_json[package_json.find("\"engines\"")?..];
+    let node = &engines[engines.find("\"node\"")? + "\"node\"".len()..];
+    let open = node.find('"')? + 1;
+    let close = open + node[open..].find('"')?;
+    parse_version(node[open..close].trim().strip_prefix(">=")?.trim())
+}
+
+#[cfg(feature = "ui")]
+fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = v.trim_start_matches('v').split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().map_or(Some(0), |p| p.parse().ok())?;
+    let patch = parts
+        .next()
+        .map_or(Some(0), |p| p.split(['-', '+']).next()?.parse().ok())?;
+    Some((major, minor, patch))
+}
 
 #[cfg(feature = "ui")]
 fn mtime(path: &Path) -> Option<std::time::SystemTime> {
@@ -112,7 +148,7 @@ fn build_ui() {
 
     // Only now that a bundler run is actually due does Node become a hard
     // requirement — a fresh `ui-dist` builds fine without it.
-    check_node_version();
+    check_node_version(ui_dir);
 
     // Install deps when `node_modules` is missing OR out of sync with the
     // lockfile. npm writes `node_modules/.package-lock.json` on a successful
@@ -146,38 +182,38 @@ fn build_ui() {
 /// Fail fast with a clear error if `node` is missing or older than the Metro
 /// / Expo floor. Otherwise a bundler failure deep in `expo export` surfaces as
 /// `TypeError: configs.toReversed is not a function` — a known ES2023 symptom
-/// of Node < 20.
+/// of an old Node. The floor is `engines.node` in `did-hosting-ui/package.json`
+/// ([`node_floor`]).
 #[cfg(feature = "ui")]
-fn check_node_version() {
+fn check_node_version(ui_dir: &Path) {
+    let (fmaj, fmin, fpat) = node_floor(ui_dir);
+    let floor = format!("{fmaj}.{fmin}.{fpat}");
     let output = match std::process::Command::new("node").arg("--version").output() {
         Ok(o) => o,
         Err(e) => panic!(
             "failed to invoke `node --version`: {e}. The `ui` feature requires \
-             Node.js {MIN_NODE_MAJOR}+ to build the management UI. Install it \
-             (e.g. via nvm) or disable the `ui` feature."
+             Node.js >= {floor} (engines.node in did-hosting-ui/package.json) to \
+             build the management UI. Install it (e.g. via nvm) or build without \
+             the `ui` feature (see the crate README)."
         ),
     };
     if !output.status.success() {
         panic!(
-            "`node --version` exited non-zero. Install Node.js {MIN_NODE_MAJOR}+ \
-             or disable the `ui` feature."
+            "`node --version` exited non-zero. Install Node.js >= {floor} or build \
+             without the `ui` feature."
         );
     }
     let raw = String::from_utf8_lossy(&output.stdout);
-    let version = raw.trim().trim_start_matches('v');
-    let major: u32 = version
-        .split('.')
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            panic!("could not parse Node.js version from `node --version` output: {raw:?}")
-        });
-    if major < MIN_NODE_MAJOR {
+    let found = parse_version(raw.trim()).unwrap_or_else(|| {
+        panic!("could not parse Node.js version from `node --version` output: {raw:?}")
+    });
+    if found < (fmaj, fmin, fpat) {
         panic!(
-            "Node.js {major} detected; the `ui` feature requires Node.js \
-             {MIN_NODE_MAJOR}+ (Metro/Expo depend on Array.prototype.toReversed, \
-             added in Node 20). Upgrade Node — e.g. `nvm install 22 && nvm use \
-             22` — or disable the `ui` feature."
+            "Node.js {} detected; the `ui` feature requires Node.js >= {floor} \
+             (engines.node in did-hosting-ui/package.json). Upgrade Node — e.g. \
+             `nvm install {fmaj} && nvm use {fmaj}` — or build without the `ui` \
+             feature (see the crate README).",
+            raw.trim()
         );
     }
 }

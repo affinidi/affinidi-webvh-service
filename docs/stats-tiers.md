@@ -1,5 +1,7 @@
 # Tiered statistics
 
+> **Status:** current
+
 The control plane (and the daemon's embedded control plane) keeps per-DID
 usage statistics: totals, and a time series for the usage chart. Since this
 change every DID keeps a cheap **coarse** series, and only busy DIDs, or DIDs

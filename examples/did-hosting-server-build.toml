@@ -1,10 +1,12 @@
 # ============================================================================
-# WebVH Server Build Recipe
+# DID Hosting Server (edge) Build Recipe
 # ============================================================================
 #
 # Drives `did-hosting-server setup --from <this-file>` non-interactively. The
-# did-hosting-server hosts DID documents over HTTP and receives sync updates
-# from the control plane over DIDComm.
+# did-hosting-server is an edge: it serves DID documents over HTTP and
+# receives signed sync updates from its control plane (over TSP, DIDComm or
+# HTTPS, whichever the edge's DID document advertises). Set
+# `[identity].control_did` below before running it.
 #
 # SECURITY: This file contains NO secrets.
 # ============================================================================
@@ -32,9 +34,13 @@ public_url = "https://server1.example.com"
 # applies when `mediator_did` is set; both ride the mediator socket.
 # transport = "both"
 
-# Control plane's DID for authenticating sync messages. The server
-# refuses sync from any other DID once this is set.
-# control_did = "did:webvh:..."
+# REQUIRED. The DID of the control plane that drives this edge. The edge
+# accepts sync, domain and registration replies only from documents signed
+# by this DID, and `setup` refuses a recipe without it. Replace the
+# placeholder with your control plane's DID (printed by
+# `did-hosting-control setup`, and in its config.toml as `server_did`).
+# For a single host with no separate control plane, use did-hosting-daemon.
+control_did = "did:webvh:QmControlPlaneScidPlaceholder:control.example.com"
 # Optional HTTP URL of the control plane (used by tooling, not the runtime).
 # control_url = "https://control.example.com"
 

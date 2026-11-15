@@ -126,6 +126,26 @@ python3 scripts/changelog_fragments.py --dry-run   # the next section, as it wou
 python3 scripts/changelog_fragments.py --check     # validate the fragments
 ```
 
+### Where a release's notes live
+
+Because the cut and GA write to different branches, `main`'s and a release
+branch's `CHANGELOG.md` differ by design:
+
+- **On `main`** each release appears once, as assembled at its cut:
+  `## 0.11.0 (release/0.11)`. `main` never receives the GA date or any patch
+  section — patches happen only on the release branch, and backports carry no
+  changelog notes.
+- **On `release/<major.minor>`** the same section is re-headed at GA as
+  `## 0.11.0 (<date>)`, and each patch adds its own section
+  (`## 0.11.1 (<date>)`) above it.
+- **The GitHub Release** for each tag carries that version's section, so it is
+  the place to read a patch's notes from `main`'s point of view.
+
+Releases before 0.9 (before release branches) were headed with dates on
+`main`. Only the release tooling edits `CHANGELOG.md`; a correction to an
+existing section goes through it too (a `release-direct` prep, or the next
+cut), never through a normal PR.
+
 ## Procedures
 
 ### Cut

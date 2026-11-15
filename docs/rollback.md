@@ -1,196 +1,159 @@
 # Rollback playbook
 
-Recovery procedure for operators who need to step a deployment
-back to an earlier release. The most common scenarios — and what
-this doc covers — are:
+> **Status:** current — covers the supported releases (N = 0.11, N-1 = 0.10) and the upgrade to 0.12; older paths are in [archive](archive/migrations/v0.6.0-to-v0.7.0.md)
 
-1. **Roll back v0.7 → v0.6** after the multi-domain migration
-   has run. **Forward-migrated stores cannot be downgraded**;
-   restore-from-backup is mandatory.
-2. **Roll back a future v0.7 point release** (e.g. v0.7.x → v0.7.0).
-   In-place binary swap is safe; no migration to undo.
-3. **Recover from a failed multi-domain assignment / purge**
-   without rolling back the binary at all.
+How to step a deployment back to an earlier release, and how to undo an
+assignment or purge without changing binaries at all. Read
+[backup and upgrade](backup-and-upgrade.md) first: every rollback below that
+crosses a minor release starts from a backup taken **before** the upgrade.
 
-> Run every step under a maintenance window. Stop every daemon
-> reading or writing the target data directory before doing
-> anything destructive. Multi-process contention on a restore is
-> not supported.
+Releases are `major.minor`, each on its own `release/<major.minor>` branch
+([RELEASES.md](../RELEASES.md)). The newest two GA releases are supported;
+patches (`0.11.1`, …) only ever happen on the release branch and never change
+the store format.
 
-## Scenario 1: v0.7 → v0.6 (major rollback)
+> Do every step in a maintenance window. Stop every process that reads or
+> writes the target store before doing anything destructive — with fjall the
+> store is exclusively locked anyway, and a restore into a store another
+> process is writing is not supported.
 
-### Why a restore is mandatory
+## Which kind of rollback is this?
 
-The v0.7 daemon runs the **M-01 migration** on first boot, which
-adds the `domain` field to every `DidRecord`. The v0.6 binary's
-`DidRecord` deserialiser doesn't know about that field; serde
-will tolerate the unknown key on most platforms but the absence
-of the multi-domain enforcement code in v0.6 means resolves
-fail in subtle ways. **Don't trust an in-place downgrade — use
-the backup.**
+| From → to | What to do |
+|---|---|
+| A patch to an earlier patch of the same release (`0.11.2` → `0.11.1`) | [In-place binary swap](#patch-rollback-same-release). |
+| N → N-1 (`0.11.x` → `0.10.x`) | [Minor rollback](#minor-rollback-n--n-1): config check, binary swap; restore only if a one-way step below applies. |
+| `main` / 0.12 → 0.11 | [Rolling back from 0.12](#rolling-back-from-012): several one-way steps; plan on restoring. |
+| Any release to v0.6 | Restore from a v0.6 backup — see the [archived v0.6 → v0.7 guide](archive/migrations/v0.6.0-to-v0.7.0.md). |
+| A bad assignment, unassignment or purge | [No binary rollback](#recovering-an-assignment-or-purge). |
 
-### Steps
+## Patch rollback (same release)
 
-1. **Stop every v0.7 binary** writing to the data directory:
+Patches do not change the schema, so a binary swap is safe:
 
-   ```sh
-   systemctl stop did-hosting-daemon          # or your unit name
-   ```
+1. Stop the service (`systemctl stop did-hosting-daemon`, or your unit).
+2. Replace the binary.
+3. `did-hosting-daemon --config config.toml health` — it exits non-zero on a
+   failed check.
+4. Start the service and resolve a known DID:
+   `curl -sS https://<host>/<path>/did.jsonl | head -1`.
 
-2. **Move the v0.7 data directory aside** (don't delete — you
-   may need it for forensics):
+## Minor rollback (N → N-1)
 
-   ```sh
-   mv /var/lib/did-hosting/store /var/lib/did-hosting/store.v0.7
-   ```
+0.11 changed the wire, not the store layout:
 
-3. **Restore the most recent v0.6 backup**:
+- **Trust Task versions.** 0.11 serves only the latest version of every Trust
+  Task. Clients upgraded alongside it (the VTA, the console, other nodes) may
+  send versions 0.10 does not serve; roll them back together, or expect
+  `unsupportedType` refusals.
+- **`trusted_proxies` takes CIDR ranges** in 0.11. Restore the 0.10 config file
+  rather than reusing the 0.11 one.
+- **`did:scid` aliases.** A DID that `identity-scid-alias list` gave an alias
+  keeps it in its log; 0.10 serves the log as it is.
 
-   ```sh
-   webvh-server restore --input /var/backups/did-hosting/2026-05-17.json
-   # Or, if you took a directory-level snapshot:
-   tar -xzf /var/backups/did-hosting/2026-05-17.tar.gz \
-       -C /var/lib/did-hosting/
-   ```
+Steps:
 
-4. **Install the v0.6 binary** alongside (don't overwrite v0.7
-   yet — keep both available until verified):
+1. Take a backup on 0.11 anyway (`backup`, below), and keep the 0.11 store
+   directory aside.
+2. Stop every node. For a distributed deployment, roll the **control plane**
+   back last and start it first, so edges never talk to a newer control plane
+   than they understand.
+3. Install the 0.10 binaries and the 0.10 config files.
+4. `health` each config, then start the services and resolve a known DID.
 
-   ```sh
-   cp ./bin/webvh-server-0.6.0 /usr/local/bin/webvh-server
-   cp ./bin/webvh-control-0.6.0 /usr/local/bin/webvh-control
-   ```
+If 0.10 refuses to start or misbehaves against the 0.11 store, restore the
+backup you took on 0.10 before upgrading.
 
-5. **Restore the v0.6 config**. The v0.7 config has new fields
-   (`[hosting]`, `server.trusted_proxy_cidrs`) that v0.6's
-   parser doesn't recognise. Restore from the pre-upgrade
-   config backup or strip the new keys manually.
+## Rolling back from 0.12
 
-6. **Start v0.6** and verify:
+0.12 (in development on `main`) has several one-way steps. If any of these
+applied to your deployment, an in-place swap back to 0.11 is not enough —
+restore the store from a backup taken on 0.11:
 
-   ```sh
-   systemctl start did-hosting-daemon
-   curl -sS "https://example.com/<known-mnemonic>/did.jsonl" | head -5
-   ```
+| Change in 0.12 | Effect on a rollback |
+|---|---|
+| **Cosmos DB single container.** On first start each per-keyspace container is copied once into `store.cosmosdb_container` (default `kv`). | 0.11 reads the old per-keyspace containers, which stopped receiving writes at the upgrade. Restore, or accept losing everything written since. Do not delete the old containers until you no longer need to roll back. |
+| **Redis per-keyspace index** (`__index__:<keyspace>`), built once on open and marked done by the `__index_version__` key. | 0.11 ignores the index, so rolling back works, but 0.11 writes rows the index does not list. Before upgrading again, delete `__index_version__` and the `__index__:*` keys so 0.12 rebuilds the index. Never run 0.11 and 0.12 replicas against one database. |
+| **Tiered statistics.** Legacy `ts:` rows are folded into the new rows at startup and deleted after 30 days. | 0.11 still reads `ts:` rows, but any deleted after 30 days are gone from its charts. Statistics only; DIDs are unaffected. When you upgrade again, the migration picks up `ts:` rows 0.11 wrote meanwhile. |
+| **Refresh tokens stored as SHA-256 digests.** | 0.11 cannot redeem a session issued by 0.12: users sign in again. |
+| **Daemon backup format.** `did-hosting-daemon backup` writes a daemon document (both stores and the config verbatim). | 0.11's `did-hosting-daemon restore` cannot read it. Keep a backup taken by 0.11 for a 0.11 restore. |
+| **Strict config parsing.** | Nothing to undo; a 0.12 config without new keys loads on 0.11. |
+| **Outbox reference rows.** Queued rows are re-keyed when the 0.12 worker starts. | 0.11 does not understand the new rows. Let the outbox drain before rolling back (`did_hosting_replication_pending` at 0 for every target, in the admin gauges of `server/metrics/0.1`); anything left is re-derived on each edge's next registration. |
 
-7. **Once verified**, archive the v0.7 store directory and
-   binaries. Don't delete them — the operations team may need
-   them for post-incident review.
+Restore with the backup tool of the release you are going back to, into an
+empty store; see [backup and upgrade](backup-and-upgrade.md#restore).
 
-### What if you don't have a v0.6 backup
+## Recovering an assignment or purge
 
-You're stuck on v0.7. The v0.7 daemon is stable on every
-verified migration path; if the rollback was triggered by a
-specific bug, file an issue and we'll cut a point release.
-**Don't attempt to hand-edit DID records back to the v0.6
-shape** — the M-01 migration touches every row, and a partial
-revert leaves the store in an unanchored state.
+None of these need a binary rollback. Each is a Trust Task; send it from the
+console (**Servers** and **Domains** pages) or with
+`send-trust-task` (see [sending Trust Tasks](sending-trust-tasks.md); the
+payloads are in the [catalogue](trust-tasks.md)). The signing key must be an
+`admin` in the control plane's ACL.
 
-## Scenario 2: v0.7.x point rollback
+### A domain was unassigned by mistake
 
-In-place binary swap. No migration to undo (point releases don't
-change the schema).
+An unassignment schedules a purge on the edge after
+`hosting.unassigned_purge_grace` (default 2 h). Within the grace window,
+assign it again — the edge cancels the pending purge:
 
-1. Stop the daemon.
-2. Replace the binary with the older one.
-3. Start the daemon.
-4. Verify resolves with `curl`.
-
-The store format is forward-compatible within v0.7.x. v0.7.0
-reads later-v0.7.x stored records fine — the only schema
-additions within the v0.7 line are `#[serde(default)]` and
-deserialise back to defaults.
-
-## Scenario 3: Failed assignment / purge (no binary rollback)
-
-You don't need to roll back the binary for an assignment-layer
-mistake. The v0.7 admin surface has direct controls:
-
-### "We accidentally unassigned a domain"
-
-If the grace window hasn't elapsed (default 2h), re-assign:
-
-```sh
-curl -sS -X POST \
-     -H "Authorization: Bearer $ADMIN_TOKEN" \
-     "https://control.example.com/api/control/registry/<instance_id>/domains/<domain>/assign"
+```bash
+did-hosting-control send-trust-task --key admin-key.json \
+  --type domain/assign/0.1 \
+  --payload '{"instanceId":"<instance-id>","domain":"<domain>"}'
 ```
 
-The server-side handler cancels the pending purge atomically;
-the audit log records the cancellation.
+Find the instance id with `registry/list/0.2`. A standalone edge runs the purge
+sweep itself (every minute), as the daemon does, so once the grace has passed
+the DIDs are gone from that edge. They are still on the control plane, which
+holds the record: re-assign the domain and the edge is resynced. Only the
+control plane's own copy needs a backup to recover.
 
-If the grace has elapsed and the DIDs are gone, restore from
-backup (the v0.7 backup format dumps `pending_purges` +
-`assignments` keyspaces — those carry the trail of what was
-where).
+### "Purge now" hit the wrong domain
 
-A restore into a store that is still in use never rolls a DID's
-history back: each restored `did:webvh` (or `did:webs`) log must
-extend the log and high-water marks the store already holds for
-that DID, even one since purged. If a DID changed after the backup
-was taken, the restore is refused and nothing is written, not even
-`config.toml`. On an edge, re-sync from the control plane instead,
-which sends each DID's current log. Restoring into an empty store
-(scenario 1) works for any consistent backup. A backup whose own log
-is behind its own high-water mark is refused even there, and the
-refusal says so. The data goes into the store the backup's config
-names (`store.data_dir`, after environment overrides such as
-`DID_HOSTING_STORE_DATA_DIR`), so check it matches the running
-service before restoring. If a restore is interrupted, run it
-again: it is safe to repeat.
+`domain/purge/0.1` deletes every DID on the named domain from the control
+plane immediately, with no grace (and from the edges, with `purgeServers`).
+There is no in-place recovery: restore the control plane's store (or the
+daemon's) from backup. Edges are then resynced from it.
 
-### "An admin Purge Now hit the wrong domain"
+`registry/purge-domain/0.1` (`{"instanceId", "domain"}`) purges one domain from
+one edge only. The control plane still holds the DIDs: assign the domain to the
+edge again to restore them.
 
-The `domain/purge/1.0` Trust Task bypasses the grace and
-deletes every DID on the named domain immediately. There is no
-in-place recovery. Restore from backup.
+### A deleted domain left DIDs behind
 
-### "A domain was deleted but DIDs survived in storage"
+Run the purge once more:
 
-This shouldn't happen — `purge_domain_dids` runs every time
-either via the sweep or admin trust task. If it does, run the
-admin purge once more to clean up:
-
-```sh
-curl -sS -X POST \
-     -H "Authorization: Bearer $ADMIN_TOKEN" \
-     "https://control.example.com/api/control/registry/<instance_id>/domains/<domain>/purge"
+```bash
+did-hosting-control send-trust-task --key admin-key.json \
+  --type registry/purge-domain/0.1 \
+  --payload '{"instanceId":"<instance-id>","domain":"<domain>"}'
 ```
 
-## What gets dumped in a v0.7 backup
+### A restore refuses a DID
 
-The v0.7 backup tool (`webvh-server backup`) dumps every
-keyspace:
-
-- `dids` — DID records + their content.
-- `acl` — ACL entries (Admin / Owner / Service roles, scopes).
-- `stats` — accumulated resolve / update counters.
-- `sessions` — durable passkey enrolments (transient session
-  state is filtered out).
-- `domains` — `DomainEntry` records (multi-domain config).
-- `assignments` — which domains this server is authoritative for.
-- `pending_purges` — in-flight unassignment purges (preserves the
-  audit trail across a restart).
-- `registry` — registered service instances + their capabilities.
-- `timeseries` — per-DID time-series metrics.
-- `meta` — bookkeeping (migration applied-markers, default-domain
-  pointer).
-- `witnesses` — webvh witness assignments.
-
-v1 backups (pre-v0.7) load against the v0.7 binary; missing
-keyspaces default to empty and the first-boot seed re-populates
-`domains` + `assignments` from the config.
+A restore never rolls a DID's history back: each restored `did:webvh` (or
+`did:webs`) log must verify, match its record, and extend both the backup's
+own high-water mark and whatever the target store already holds for that DID.
+If a DID changed after the backup was taken, the restore is refused and nothing
+is written, not even `config.toml`. Restore into an empty store to start from
+the backup's state; on an edge, prefer a resync from the control plane, which
+sends each DID's current log. An interrupted restore is safe to run again.
 
 ## Audit trail
 
-After any non-trivial rollback or recovery, capture:
+After any non-trivial rollback or recovery, record:
 
-- The exact backup file used.
-- Timestamps for stop / restore / start.
-- A list of mnemonics + their post-recovery domains
-  (`curl /api/dids | jq '.[] | {mnemonic, domain}'`).
-- Snapshot of `pending_purges` if any were in flight.
+- the backup file used and the release that wrote it;
+- times of stop, restore and start;
+- the DIDs and their domains afterwards — the console's DID list, or
+  `did/list/0.2`:
 
-Attach this to the incident record. Future audits will want to
-correlate it with the original action that triggered the
-rollback.
+  ```bash
+  did-hosting-control send-trust-task --key admin-key.json --type did/list/0.2 \
+    | jq '.records[] | {mnemonic, domain}'
+  ```
+
+- the instances and their served domains (`registry/list/0.2`).
+
+Attach these to the incident record.

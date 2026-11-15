@@ -1,9 +1,11 @@
 # Plan: did-hosting Rollout (Multi-Domain + Multi-Method + Rename + Client)
 
+> **Status:** historical — completed implementation plan for 0.7.0.
+
 Specs:
-- [`docs/multi-domain-spec.md`](../docs/multi-domain-spec.md)
-- [`docs/multi-method-hosting-spec.md`](../docs/multi-method-hosting-spec.md)
-- [`docs/did-hosting-client-crate-spec.md`](../docs/did-hosting-client-crate-spec.md)
+- [`docs/multi-domain-spec.md`](../multi-domain-spec.md)
+- [`docs/multi-method-hosting-spec.md`](../multi-method-hosting-spec.md)
+- `docs/did-hosting-client-crate-spec.md` (never written)
 
 Scope: One coordinated release that delivers all three specs as a single tagged version.
 

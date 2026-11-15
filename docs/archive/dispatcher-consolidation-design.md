@@ -1,12 +1,14 @@
 # Design note — DIDComm dispatcher consolidation
 
+> **Status:** historical — `dispatch_did_op` and both transports it consolidated were removed; every operation is now a row of `control_tasks!` ([catalogue](../trust-tasks.md)).
+
 > **Update.** Both transports this document consolidates — the bare DIDComm
 > `MSG_*` routes and `POST /api/didcomm` — have since been removed.
 > `dispatch_did_op` is reached only through `bridge_did_management`, after the
 > unified trust-task dispatcher has verified the document's sender-bound proof.
 
-**Status:** implemented. The single `dispatch_did_op`
-(`did-hosting-control/src/messaging.rs`) is now the one per-message
+At the time of writing, the single `dispatch_did_op`
+(`did-hosting-control/src/messaging.rs`) was the one per-message
 dispatch table; both the framework-routed and HTTP-signed transports call
 it, error codes flow through `AppError::didcomm_code()`, and the shared
 `ReplayCache` (`replay.rs`) gates both. A third transport (TSP) rides the

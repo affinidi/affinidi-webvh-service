@@ -1,5 +1,7 @@
 # WebVH DIDComm DID Management Protocol
 
+> **Status:** historical — superseded by signed Trust Tasks over TSP, DIDComm and HTTPS; see the [Trust Task catalogue](../trust-tasks.md) and [TSP transport](../tsp-transport.md).
+
 > **Superseded transport.** The bare DIDComm messages and the HTTP-signed
 > `POST /api/didcomm` endpoint described here have been removed. The same
 > operations are carried as signed Trust Task documents — inside the DIDComm
@@ -9,7 +11,6 @@
 > ("privileged messages must carry a proof bound to their sender").
 
 **Version:** 1.0
-**Status:** Draft
 **Protocol URI Base:** `https://affinidi.com/webvh/1.0/did`
 
 ## Overview
@@ -26,7 +27,7 @@ The protocol covers:
 
 ## Prerequisites
 
-- The client MUST have an authenticated session with the DID Hosting server, obtained via the existing [authentication protocol](../did-hosting-server/README.md) (`https://affinidi.com/webvh/1.0/authenticate`).
+- The client MUST have an authenticated session with the DID Hosting server, obtained via the existing [authentication protocol](../../did-hosting-server/README.md) (`https://affinidi.com/webvh/1.0/authenticate`).
 - The client MUST possess a `did:key` identity with Ed25519 signing and X25519 key agreement keys.
 - The server MUST have a resolvable DID with key agreement capabilities for DIDComm encryption.
 
@@ -271,7 +272,7 @@ re-claim it. After the wipe, the path's `did/offer` reservation is
 fresh — *no log content has been published yet*. Downstream
 resolvers retain their previous copy of the DID document until the
 caller follows up with `did/publish`. If you need an atomic
-ownership-takeover with no resolvability gap, use [`did/register`](#3-did-register)
+ownership-takeover with no resolvability gap, use [`did/register`](#14-did-register)
 instead — it claims and publishes in a single message and triggers a
 single fan-out to downstream servers.
 

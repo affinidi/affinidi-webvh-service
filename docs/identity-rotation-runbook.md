@@ -1,9 +1,30 @@
 # Service identity rotation — test runbook
 
+> **Status:** current
+
 How to exercise runtime DID rotation against a live deployment, and what
 "working" looks like at each step.
 
-Design: `docs/identity-rotation-design.md`.
+Design: [identity-rotation-design.md](identity-rotation-design.md).
+
+**Reading the live generations.** A running control plane or daemon serves the
+`identity/list/0.1` and `identity/retire/0.1` Trust Tasks to an `admin`. Send
+them from the console (**Settings → Key Generations**) or with `send-trust-task`
+(see [sending Trust Tasks](sending-trust-tasks.md)), signed by a `did:key` that
+is an admin in the ACL:
+
+```bash
+# $BIN is did-hosting-daemon or did-hosting-control.
+$BIN --config config.toml send-trust-task --key admin-key.json --type identity/list/0.1
+```
+
+The reply lists `generations` (current first: `generationId`, `current`,
+`signingKeyId`, `keyAgreementKeyId`, `mediatorDid`, `transports`, `createdAt`,
+and for a retired one `retiredAt` / `expiresAt`) and `rotationGraceSeconds`.
+
+An edge, witness or watcher has no live identity task. Use
+`identity-list` against a stopped edge (or control plane, or daemon), and the
+logs below for the witness and watcher.
 
 ---
 
@@ -19,8 +40,8 @@ A **root DID must be pathless** — `did:webvh:<scid>:did.example.com`. That is 
 correct and canonical shape; its document is *stored and served* at
 `/.well-known/did.jsonl`, but `.well-known` is not part of the identifier.
 
-If your `server_did` **ends in `:.well-known`**, it was minted by a build
-predating this PR and **cannot resolve at all** — a conforming resolver strips
+If your `server_did` **ends in `:.well-known`**, it was minted by an old
+build and **cannot resolve at all** — a conforming resolver strips
 the suffix on the round-trip and then rejects the document because the `id`
 inside no longer matches:
 
@@ -29,10 +50,10 @@ DID being resolved (did:webvh:Qm…:did.example.com)
 does not match the top-level 'id' in any DIDDoc version
 ```
 
-This PR fixes the *minting* (new DIDs come out pathless), but **an existing DID
+Current builds mint pathless DIDs, but **an existing DID
 cannot be corrected in place** — the SCID is derived from the document, so
 changing the `id` means a new DID. Affected deployments must recreate theirs. On
-boot you will now get an explicit warning saying exactly that, instead of a
+boot the service logs an explicit warning saying exactly that, instead of a
 resolution error that looks like a network problem.
 
 Confirm the identifier the document actually carries matches the DID you
@@ -59,18 +80,17 @@ the clear to the `<config>.secrets.plaintext` file beside `config.toml`.
 
 ```bash
 # Service running.
-curl -sH "Authorization: Bearer $ADMIN_JWT" \
-  https://<control>/api/identity/generations | jq
+$BIN --config config.toml send-trust-task --key admin-key.json --type identity/list/0.1 | jq
 ```
 
-Expect exactly one generation, `"current": true`, `expires_at: null`, and
-`key_agreement_kid` matching what your DID document actually advertises:
+Expect exactly one generation, `"current": true`, no `expiresAt`, and
+`keyAgreementKeyId` matching what your DID document actually advertises:
 
 ```bash
 curl -s https://<host>/<path>/did.jsonl | tail -1 | jq -r '.state.keyAgreement[0]'
 ```
 
-**Those two must be identical.** If the API shows `#key-1` but the document shows
+**Those two must be identical.** If the listing shows `#key-1` but the document shows
 something else, the identity never established — go back to 0a.
 
 Also confirm in the logs, at boot:
@@ -136,12 +156,12 @@ INFO service identity loaded  generation=1  live_generations=2
 ```bash
 did-hosting-daemon --config config.toml identity-list      # stopped
 # or, live:
-curl -sH "Authorization: Bearer $ADMIN_JWT" \
-  https://<control>/api/identity/generations | jq
+did-hosting-daemon --config config.toml send-trust-task --key admin-key.json \
+  --type identity/list/0.1 | jq
 ```
 
 - Generation 1: `current`, new fragment.
-- Generation 0: `retired_at` set, `expires_at ≈ now + 3600`.
+- Generation 0: `retiredAt` set, `expiresAt ≈ retiredAt + 1h`.
 
 **The behaviour that matters:** a peer whose cached DID document still names the
 *old* key can still reach you. Verify by sending from a peer that has not
@@ -169,9 +189,12 @@ new log entry), each node notices on its own trigger — no restart needed:
 | witness | within 5 minutes — the identity sweep's reload |
 | watcher | within 5 minutes — the identity sweep's reload |
 
-Look for `service identity rotated — rebuilding listener` (or the witness's and
-watcher's equivalents). The rebuilt listener carries the same transports the node
-booted with, including TSP.
+Every node also re-resolves its own DID every 5 minutes as a backstop, so none
+of them needs a restart after its DID rotates — the watcher included (before
+0.12 it loaded its identity once and needed one). Look for
+`service identity rotated — rebuilding listener` (or the witness's and
+watcher's equivalents). The rebuilt listener carries the same transports the
+node booted with, including TSP and its TSP relationships.
 
 ## 2. Restart mid-window — the durability requirement
 
@@ -193,8 +216,8 @@ came back from the secret store, so a peer with a stale document can *still*
 reach you after a restart. Confirm:
 
 ```bash
-curl -sH "Authorization: Bearer $ADMIN_JWT" \
-  https://<control>/api/identity/generations | jq '.generations | length'   # 2
+$BIN --config config.toml send-trust-task --key admin-key.json \
+  --type identity/list/0.1 | jq '.generations | length'   # 2
 ```
 
 If you see `live_generations=1` and only one generation, the retired key material
@@ -254,24 +277,37 @@ elapsed.**
 
 ### Live (the one that matters for a compromise)
 
-UI → **Settings → Key Generations → Retire now**, or:
+UI → **Settings → Key Generations → Retire now** (the console asks for a
+stepped-up session first), or, from a shell on a control plane or daemon:
 
 ```bash
-curl -X POST -H "Authorization: Bearer $ADMIN_JWT" \
-  https://<control>/api/identity/generations/0/retire     # 204
+$BIN --config config.toml send-trust-task --key admin-key.json \
+  --type identity/retire/0.1 --payload '{"generationId": 0}'
+# → {"generationId": 0, "droppedAt": "…"}
 ```
 
+A document signed by the admin's own key and sent without a browser session is
+authorised by its proof alone; the console's step-up applies only to bearer
+sessions.
+
 This runs **in-process**: the key is gone from the running secrets resolver and
-the listener profile before the response is written. Verify it actually stopped
+the listener profile before the reply is written. Verify it actually stopped
 being honoured — a peer still encrypting to the old key should now fail, and:
 
 ```bash
-curl -sH "Authorization: Bearer $ADMIN_JWT" \
-  https://<control>/api/identity/generations | jq '.generations | length'   # 1
+$BIN --config config.toml send-trust-task --key admin-key.json \
+  --type identity/list/0.1 | jq '.generations | length'   # 1
 ```
 
-Retiring the **current** generation is refused (it is the key the service is
-actively using).
+Retiring the **current** generation is refused
+(`did-management/identity/retire:current`: it is the key the service is
+actively using), and so is a generation it does not honour
+(`did-management/identity/retire:notFound`).
+
+An edge, witness or watcher has no live kill switch: stop it and use the
+offline command below (the witness and watcher have none, so for them publish a
+new DID version and let the generation expire, with `rotation_grace_period =
+"0"` for an immediate cut-over).
 
 ### Offline (stopped service)
 
@@ -297,7 +333,7 @@ Within 60s of expiry:
 INFO identity generation expired — its key material is no longer honoured  id=0
 ```
 
-`GET /api/identity/generations` drops to one. A peer still encrypting to the old
+`identity/list/0.1` drops to one generation. A peer still encrypting to the old
 key now fails — as intended.
 
 ---
@@ -311,15 +347,15 @@ reads `signing_key` / `key_agreement_key` exactly as before.
 
 The one thing that does not roll back: if you have already rotated your DID
 document to new keys, the old build will use the guessed `#key-0`/`#key-1` kids
-against it, which is the pre-existing bug this PR fixes. Roll the *document* back
+against it, which is the bug the generation model fixed. Roll the *document* back
 too, or stay on the new build.
 
 ---
 
-## What I could not verify locally
+## Not covered by CI
 
-No mediator was available, so these are covered by unit tests and construction
-only — they are the highest-value things for you to watch:
+CI has no real mediator, so these are covered by unit tests and construction
+only — they are the highest-value things to watch in a live test:
 
 - the listener rebuild against a real mediator (§1);
 - two-mediator coexistence and the drain (§3).

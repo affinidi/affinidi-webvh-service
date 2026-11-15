@@ -1,6 +1,8 @@
 # Plan: Self-Managed (No-VTA) Operating Mode
 
-Spec: [`docs/self-managed-mode-spec.md`](../docs/self-managed-mode-spec.md)
+> **Status:** historical — completed implementation plan for self-managed mode (0.6.0).
+
+Spec: [`docs/self-managed-mode-spec.md`](../self-managed-mode-spec.md)
 Scope: `webvh-daemon` only (v1)
 Branch base: `release/0.6.0`
 

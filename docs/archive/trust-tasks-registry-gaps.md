@@ -1,5 +1,7 @@
 # Trust Tasks registry gaps — webvh ops not yet upstream
 
+> **Status:** historical — every task the service speaks is now pinned in `did-hosting-common/trust-tasks.lock` and generated from the registry; see the [Trust Task catalogue](../trust-tasks.md).
+
 This document catalogues the wire operations the webvh control plane
 emits today that are **not** covered by the public
 [Trust Tasks registry](https://trusttasks.org/registry). For each gap
@@ -239,4 +241,4 @@ another ecosystem implementor signals interest.
 
 - [`docs/trust-tasks-acl-migration.md`](trust-tasks-acl-migration.md) — client-facing migration for the `acl/*` family (already in the registry)
 - [`docs/multi-method-hosting-spec.md`](multi-method-hosting-spec.md) — the `webvh/*` vs. `did-hosting/*` URL convention
-- [`did-hosting-common/src/did_hosting_tasks.rs`](../did-hosting-common/src/did_hosting_tasks.rs) — the registered URL constants
+- `did-hosting-common/src/did_hosting_tasks.rs` (since removed; the types are generated from `did-hosting-common/trust-tasks.lock`) — the registered URL constants

@@ -1,653 +1,528 @@
 # Bootstrap & Startup Guide
 
-This document explains how to set up a complete DID Hosting environment with DIDComm-based authentication between services.
+> **Status:** current
+
+How to stand up a DID Hosting deployment from nothing: a single
+`did-hosting-daemon`, or a distributed control plane with one or more edges
+(and, optionally, a witness and a watcher).
+
+Every command below is in the generated [CLI reference](cli-reference.md);
+every config key and environment variable is in the
+[configuration reference](configuration.md). The words *edge*, *control plane*,
+*slot* and *owner* are defined in the [glossary](glossary.md).
+
+## Pick a topology
+
+| You want | Run | Notes |
+|---|---|---|
+| One host serving DIDs, with the management UI | `did-hosting-daemon` | Recommended. Control plane, edge, witness (and optionally watcher) in one process, sharing one store. |
+| Several hosts serving the same DIDs, managed centrally | `did-hosting-control` + N × `did-hosting-server` | The control plane is the only source of record; edges are caches it fills. |
+| Witness proofs for `did:webvh` logs | `webvh-witness` (or `[enable] witness = true` in the daemon) | Optional. |
+| A read-only mirror of DIDs from other hosts | `webvh-watcher` (or `[enable] watcher = true`) | Optional. |
+
+Default ports: daemon `8534`, control `8532`, server `8530`, witness `8531`,
+watcher `8533`.
 
 ## Prerequisites
 
-- VTA (Verifiable Trust Agent) credentials for each service's context
-  - Each service gets its own isolated VTA context
-  - Credentials are base64url-encoded strings issued by the VTA operator
-- Compiled DID Hosting binaries: `did-hosting-server`, `did-hosting-control`, `webvh-witness`
-- A public URL where the server will serve DIDs (e.g., `https://did.example.com`)
+- The binaries, built from this workspace (see the [root README](../README.md))
+  or installed from crates.io.
+- For a **VTA-managed** identity (every standalone binary, and the daemon in
+  its default mode): access to a VTA, and an admin there who can create a
+  context for each service (`pnm contexts create`, printed for you by the
+  wizard).
+- For a **self-managed** daemon: nothing else — see
+  [Self-managed mode](#self-managed-mode-no-vta--daemon-only).
+- A public origin for each node's own `did:webvh`
+  (e.g. `https://did.example.com`). For anything but local testing, a TLS
+  terminator in front of it — see [deployment](deployment.md).
+- Optionally a DIDComm/TSP **mediator** DID. A node with a mediator advertises
+  `TSPTransport` / `DIDCommMessaging` in its DID document and talks to its peers
+  over it. A node without one is HTTP-only.
 
-## Architecture Overview
+## Daemon (all-in-one)
 
-Services authenticate with each other using DIDComm challenge-response:
+The quickest working install needs no VTA at all:
 
-- **did-hosting-control** — manages service registration, ACLs, and DID sync (set up first)
-- **did-hosting-server** — hosts DID documents at public URLs (set up second)
-- **webvh-witness** — provides witness proofs for DID log entries (optional, set up last)
+```bash
+did-hosting-daemon setup --from examples/did-hosting-daemon-self-managed.toml
+did-hosting-daemon invite --did <your-admin-did> --role admin
+did-hosting-daemon
+```
 
-Each service connects to its own VTA context during setup, creates its own DID, retrieves keys, and stores them locally. No external PNM CLI is needed.
+`invite` prints an enrolment URL and, separately, a claim code: open the URL,
+type the code, and bind a passkey. From then on, sign in to the console at the
+daemon's `public_url`.
 
-## Sequence Diagram
+For a VTA-managed daemon run the interactive wizard (`did-hosting-daemon
+setup`) or drive it from `examples/did-hosting-daemon-build.toml` — see
+[Non-interactive setup](#non-interactive-setup-recipe-driven).
+
+A daemon config looks like:
+
+```toml
+server_did = "did:webvh:<scid>:did.example.com"
+public_url = "https://did.example.com"
+did_hosting_url = "https://did.example.com"
+# mediator_did = "did:webvh:..."   # optional: TSP / DIDComm reachability
+
+[server]
+host = "0.0.0.0"
+port = 8534
+
+[enable]
+server = true    # public DID resolution
+control = true   # the control plane: Trust Tasks, UI, sign-in
+witness = true
+watcher = false
+```
+
+In daemon mode the services coordinate in-process: there is no registration,
+no stats sync and no outbound push between them. The DIDs the control plane
+stores are the DIDs the embedded server resolves.
+
+## Distributed: control plane + edges
+
+### How the pieces trust each other
+
+There are no shared secrets and no sessions between nodes. Each node has its
+own `did:webvh`, and every message between nodes is a **signed Trust Task**:
+
+- The **control plane** authorises an edge by its DID: the edge's DID must be in
+  the control plane's ACL with the `service` role.
+- An **edge** takes directives from exactly one party, its configured
+  `control_did`. It checks every inbound document's proof against that DID and
+  answers nothing else. It keeps no ACL and no sessions of its own.
+- How a message travels — TSP, DIDComm or HTTPS — is read from the recipient's
+  DID document (`TSPTransport`, then `DIDCommMessaging`, then
+  `TrustTaskHTTPS`), falling back to the sender's own configured mediator. See
+  [TSP transport](tsp-transport.md).
 
 ```mermaid
 sequenceDiagram
     participant Admin
     participant VTA
     participant Control as did-hosting-control
-    participant Server as did-hosting-server
-    participant Witness as webvh-witness
+    participant Edge as did-hosting-server
 
     rect rgb(230, 240, 255)
-        Note over Admin,VTA: Phase 1 — Control Plane Setup (first)
+        Note over Admin,Control: 1 — Control plane setup
         Admin->>Control: did-hosting-control setup
-        Control->>VTA: Authenticate with VTA credential
-        VTA->>Control: Session established
-        Control->>VTA: Create control DID
-        VTA->>Control: DID + signing key + KA key
-        Control->>Admin: Writes control-did.jsonl<br/>Outputs control DID string
+        Control->>VTA: provision the control plane's DID
+        VTA->>Control: DID + keys (log written to control-did.jsonl)
     end
 
     rect rgb(235, 245, 255)
-        Note over Admin,Server: Phase 2 — Server Setup
-        Admin->>Server: did-hosting-server setup
-        Server->>VTA: Authenticate with VTA credential
-        VTA->>Server: Session established
-        Server->>VTA: Create server root DID
-        VTA->>Server: DID + signing key + KA key + log entry
-        Note over Server: Auto-imports root DID at .well-known
-        Admin->>Admin: Enter control_url + control_did from Phase 1
-    end
-
-    rect rgb(240, 248, 255)
-        Note over Admin,Server: Phase 2b — Bootstrap Control DID on Server
-        Admin->>Server: did-hosting-server bootstrap-did<br/>--path services/control<br/>--did-log control-did.jsonl
-        Admin->>Control: did-hosting-control add-acl<br/>--did <server-did> --role admin
+        Note over Admin,Edge: 2 — Edge setup
+        Admin->>Edge: did-hosting-server setup (asks for the control DID)
+        Edge->>VTA: provision the edge's DID
+        VTA->>Edge: DID + keys (imported at the edge's own slot)
+        Admin->>Control: did-hosting-control add-acl --did <edge-did> --role service
     end
 
     rect rgb(245, 255, 245)
-        Note over Admin,Witness: Phase 3 — Witness Setup (optional)
-        Admin->>Witness: webvh-witness setup
-        Witness->>VTA: Authenticate with VTA credential
-        VTA->>Witness: Session established
-        Witness->>VTA: Create witness DID
-        VTA->>Witness: DID + signing key + KA key + log entry
-        Witness->>Admin: Writes witness-did.jsonl
-        Admin->>Server: did-hosting-server bootstrap-did<br/>--path services/witness<br/>--did-log witness-did.jsonl
-    end
-
-    rect rgb(255, 248, 240)
-        Note over Server,Control: Phase 4 — Start Services
-        Admin->>Server: Start did-hosting-server
-        Admin->>Control: Start did-hosting-control
-        Admin->>Witness: Start webvh-witness
-        Server->>Control: DIDComm challenge-response auth
-        Control->>Server: JWT access token
-        Server->>Control: Register service + report preloaded DIDs
+        Note over Edge,Control: 3 — Start and register
+        Admin->>Control: start did-hosting-control
+        Admin->>Edge: start did-hosting-server
+        Edge->>Control: signed server/register/0.2 (DIDs it holds, domains it serves)
+        Control->>Edge: signed #response
+        Control-->>Edge: outbox: sync/* for every DID the edge is missing or behind on
+        Edge-->>Control: signed acknowledgement per item
     end
 ```
 
-## Step-by-Step Setup
-
-### Phase 1: Control Plane (set up first — other services need its DID)
+### 1. Control plane
 
 ```bash
 did-hosting-control setup
 ```
 
-The wizard prompts for:
-1. **VTA credential** — base64url string for the control plane's VTA context
-2. **DID hosting URL** — where did-hosting-server will serve DIDs (e.g., `https://did.example.com`)
-3. **DID path** — path on the server (default: `services/control`)
-4. **Public URL** — control plane's own URL for WebAuthn (e.g., `http://localhost:8532`)
-5. Host, port, log level, data directory, secrets backend
-6. **Admin ACL** — enter an existing DID or generate a new `did:key`
+The wizard asks how to reach the VTA (online, or the two offline phases), the
+**DID hosting URL** and **path** for the control plane's own DID (the log is
+written to `control-did.jsonl`), the messaging transport, the **public URL** the
+browser console and WebAuthn use, host/port (default `8532`), log settings,
+data directory, the secrets backend, and an optional first **admin** ACL entry
+(an existing DID or a freshly generated `did:key`).
 
-Output:
-- `config.toml` — control plane configuration
-- `control-did.jsonl` — DID log entry to import on the server
-- Control DID string (displayed on screen)
+Note the control plane's DID (`server_did` in the written `config.toml`): every
+edge needs it.
 
-**Save the control DID** — you'll need it when setting up the server.
-
-### Phase 2: Server (set up second — hosts all DIDs)
+### 2. Each edge
 
 ```bash
 did-hosting-server setup
 ```
 
-The wizard prompts for:
-1. **VTA credential** — base64url string for the server's VTA context
-2. **Public URL** — where DIDs are served (e.g., `https://did.example.com`)
-3. Features (DIDComm, REST API)
-4. **Control plane URL** — e.g., `http://localhost:8532` (from Phase 1)
-5. **Control plane DID** — paste the DID from Phase 1
-6. Host, port, log level, data directory, secrets backend
-7. **Admin ACL** — enter an existing DID or generate a new `did:key`
-
-The wizard automatically creates the root DID and imports it at `.well-known`.
-
-### Phase 2b: Bootstrap Control DID on Server
-
-Import the control plane's DID log entry onto the server:
+The wizard asks how to reach the VTA, the edge's **public URL** (this becomes
+its `did:webvh`, so each edge gets its own), the mediator and transports, the
+**control plane's DID** (required — the edge does not start without
+`control_did`), host/port (default `8530`), log settings, data directory and
+the secrets backend. It imports the edge's own DID at its slot and prints the
+command that admits it to the control plane:
 
 ```bash
-did-hosting-server bootstrap-did \
-  --path services/control \
-  --did-log control-did.jsonl
+did-hosting-control add-acl --did <edge-did> --role service
 ```
 
-Grant the server admin access to the control plane:
+`add-acl` writes to the control plane's store directly, so run it with the
+control plane stopped (or grant the entry live from the console's **Access** page, or
+with an `acl/grant/0.2` Trust Task).
+
+### 3. Host the control plane's own DID
+
+Edges verify every document the control plane sends by resolving
+`control_did`, so that DID must resolve. Publish it **through the control
+plane** so that it is part of the authoritative store and is replicated to
+every edge: a `did/register/0.1` Trust Task for the control DID's slot (the VTA
+does this when this control plane is its webvh hosting server; otherwise an
+admin can send it — see [sending Trust Tasks](sending-trust-tasks.md)).
+
+`did-hosting-server bootstrap-did --path <path> --did-log control-did.jsonl`
+loads the log on one edge directly, which is enough to break the
+chicken-and-egg on first start. It is not a substitute: an edge is a cache, and
+when it registers, the control plane queues a `sync/delete` for every slot the
+edge reports that the control plane does not itself publish. Only the edge's
+own DID is exempt.
+
+### 4. Start
 
 ```bash
-did-hosting-control add-acl --did <server-DID> --role admin
+did-hosting-control --config control/config.toml
+did-hosting-server  --config edge/config.toml
 ```
 
-Replace `<server-DID>` with the DID printed during server setup.
+On startup an edge with a mediator:
 
-### Phase 3: Witness (optional — set up after server)
+1. serves HTTP first (its own DID must be resolvable before it can
+   authenticate to the mediator), then resolves its own DID and establishes its
+   identity;
+2. connects to the mediator and, for TSP, establishes a relationship with the
+   control plane (on every connect, not just the first);
+3. sends a signed `server/register/0.2` to `control_did`, listing the DIDs it
+   holds (except its own) and the domains it serves. It re-registers on every
+   mediator reconnect and every 10 minutes; each registration is a delta
+   resync request;
+4. reconciles against the control plane every `replication.reconcile_interval_secs`
+   (60 s). If it goes longer than `replication.staleness_bound_secs` (300 s)
+   without a clean reconcile, `/api/health` answers `503` so a load balancer
+   drains it.
+
+The control plane checks the registration's proof and that its signer has the
+`service` role, records the edge in the registry, and queues — in its
+**transactional outbox** — a `sync/*` row for each DID the edge is missing or
+behind on, and a delete for each slot it should no longer serve. Every later
+change (publish, delete, rollback, suspension, agent-name change, domain
+assign/unassign/purge) is queued in the same store transaction as the change
+itself. The outbox worker sends each row as a freshly signed document and
+removes it only when the edge returns a signed acknowledgement; unacknowledged
+rows are resent with backoff and are re-derived on the edge's next
+registration if they are ever dropped.
+
+An edge **without** a mediator has no messaging service: it cannot register or
+reconcile, logs `no messaging service: this edge cannot reconcile with its
+control plane`, and reports degraded once the staleness bound passes. Add it to
+the registry with the `registry/admin-register/0.2` Trust Task (the console's
+**Servers** page) and give its DID document a `TrustTaskHTTPS` service so the
+control plane can push to it.
+
+### Witness and watcher (optional)
 
 ```bash
-webvh-witness setup
+webvh-witness setup     # default port 8531
+webvh-watcher setup     # default port 8533
 ```
 
-The wizard prompts for:
-1. **VTA credential** — base64url string for the witness's VTA context
-2. **DID hosting URL** — the server's public URL
-3. **DID path** — path on the server (default: `services/witness`)
-4. Features, host, port, log level, data directory, secrets backend
-5. **Admin ACL**
+Each mints its own DID the same way. Host each DID through the control plane
+(as in step 3). A watcher the control plane should push to is listed in the
+control plane's `[[registry.watchers]]` (`url` + `did`).
 
-Import the witness DID on the server:
+## Verifying the setup
 
 ```bash
-did-hosting-server bootstrap-did \
-  --path services/witness \
-  --did-log witness-did.jsonl
+# Liveness + own DID served (+ replication fresh, on an edge). 200 or 503.
+curl -i http://localhost:8530/api/health
+
+# Resolution. The root DID's log is served at /.well-known/did.jsonl.
+curl http://localhost:8530/.well-known/did.jsonl
+curl http://localhost:8530/<path>/did.jsonl
+
+# Offline diagnostics for each config (exits non-zero on a failed check).
+did-hosting-server  --config edge/config.toml    health
+did-hosting-control --config control/config.toml health
+
+# The ACL (offline, reads the store directly).
+did-hosting-control --config control/config.toml list-acl
 ```
 
-### Phase 4: Start Services
+The fleet as the control plane sees it — registered edges, status, last
+inbound/outbound transport, served domains — is the console's **Servers** page,
+or the `registry/list/0.2` Trust Task:
 
 ```bash
-# Terminal 1
-did-hosting-server --config config.toml
-
-# Terminal 2
-did-hosting-control --config config.toml
-
-# Terminal 3 (if witness is configured)
-webvh-witness --config config.toml
+did-hosting-control send-trust-task --key admin-key.json --type registry/list/0.2
 ```
 
-On startup, the server will:
-1. Authenticate with the control plane via DIDComm challenge-response
-2. Register itself, reporting all preloaded DIDs
-3. Apply any DID updates received from the control plane
+There is no REST registry endpoint; see
+[sending Trust Tasks](sending-trust-tasks.md) and the
+[Trust Task catalogue](trust-tasks.md).
 
-## Daemon Mode (All-in-One)
+## Self-managed mode (no VTA — daemon only)
 
-For development or simple deployments, use `did-hosting-daemon` which runs all services in a single process:
-
-```toml
-# daemon-config.toml
-server_did = "did:webvh:..."
-public_url = "https://did.example.com"
-did_hosting_url = "https://did.example.com"
-
-[server]
-host = "0.0.0.0"
-port = 8534
-
-[enable]
-server = true
-control = true
-witness = true
-watcher = false
-```
-
-```bash
-did-hosting-daemon --config daemon-config.toml
-```
-
-In daemon mode, inter-service communication happens in-process without network calls.
-
-## Self-Managed Mode (no VTA — daemon only)
-
-For deployments that don't have a parent VTA bootstrapping the daemon's own identity — internal-only deployments, dev/test environments, or operators who want to be their own trust root — the daemon can self-manage its keys and DID.
-
-### What "self-managed" means
+For deployments with no parent VTA — internal-only installs, dev/test, or
+operators who want to be their own trust root — the daemon can generate its own
+keys and DID.
 
 | | VTA mode (default) | Self-managed mode |
 |---|---|---|
-| Daemon's signing + KA keys | Provisioned by parent VTA at setup | Generated locally at setup |
-| Daemon's own DID | Minted by parent VTA | Locally-built `did:webvh`, hosted by the daemon at its own well-known URL |
-| `vta_credential` in secrets | Set, used for re-auth | Permanently `None` |
-| `[vta]` config table | Required (`url`, `did`, `context_id`) | Empty / omitted |
-| Tenant DID provisioning | External tenant VTAs DIDComm in to provision tenant DIDs | **Identical** — external tenant VTAs can still DIDComm in. Self-managed only changes how the daemon obtains *its own* identity, not how it serves tenants. |
+| Daemon's signing + key-agreement keys | Provisioned by the VTA at setup | Generated locally at setup |
+| Daemon's own DID | Minted by the VTA | A locally built `did:webvh`, hosted by the daemon itself |
+| `vta_credential` in secrets | Set | Never set |
+| `[vta]` config table | `url`, `did`, `context_id` | Empty / omitted |
+| Tenant DID publication | Tenants' VTAs publish over TSP / DIDComm / HTTPS | **Identical** — self-managed changes only how the daemon gets *its own* identity |
 
-**Daemon-only.** `did-hosting-server`, `did-hosting-control`, `webvh-witness` standalone binaries reject the self-managed setup choice with a clear error in v1. If you want a no-VTA deployment, run `did-hosting-daemon`.
-
-**No migration path.** A self-managed daemon cannot be migrated onto a VTA later; the mode is permanent at setup time. (If you need to switch, start a fresh deployment.)
-
-### Setup walkthrough
+**Daemon only.** The standalone binaries refuse the self-managed choice.
+**Permanent.** A self-managed daemon cannot later be moved onto a VTA; start a
+fresh deployment instead.
 
 ```bash
 did-hosting-daemon setup
+#  > Self-managed (no VTA — daemon manages its own DID)
 ```
 
-When the wizard asks _"How will the daemon obtain its identity?"_, choose:
+The wizard skips every VTA prompt, generates the keys, builds and imports the
+daemon's `did:webvh`, and writes `[identity] mode = "self-managed"`. It warns
+(but accepts) an `http://` or loopback public URL, for local use.
 
-```
-> Self-managed (no VTA — daemon manages its own DID)
-```
-
-The wizard then prompts for the same daemon settings as VTA mode (public URL, mediator, host/port, log, data dir, secrets backend) but skips every VTA-specific prompt (no VTA DID, no context ID, no PNM `contexts create` step). Keys are generated locally; the daemon's `did:webvh` is built and imported into the local store; the config is written with `[identity] mode = "self-managed"` and an empty `[vta]` table.
-
-A loud warning fires if the public URL is `http://` or points at `localhost` / `127.0.0.1` / `::1`. The wizard accepts these (useful for dev) but the warning makes it hard to ship one of these into production by accident.
-
-### After setup: enrolling an admin
-
-The wizard does **not** seed an admin DID into the ACL. Self-managed mode uses passkey-invite-only admin authentication:
+It does not seed an admin. Enrol the first one with a passkey invite:
 
 ```bash
-# 1. Start the daemon
-did-hosting-daemon --config config.toml
-
-# 2. In another terminal, mint your first admin enrolment URL.
-#    <ADMIN_DID> is the DID the admin will authenticate as
-#    (typically a did:key from a wallet you control).
 did-hosting-daemon invite --did <ADMIN_DID> --role admin --config config.toml
-
-# 3. It prints an enrolment URL and, separately, a claim code. Open the URL
-#    in a browser, type the claim code, and bind a passkey.
-#    Subsequent admin login uses the passkey.
 ```
 
-The URL and the claim code are two halves of one invite: deliver them over different channels when the admin is someone else. Neither is stored — the control plane keeps only their hashes — and five wrong claim codes cancel the invite.
+The URL and the claim code are two halves of one invite: deliver them over
+different channels when the admin is someone else. Neither is stored (only
+their hashes), and five wrong claim codes cancel the invite. Once an admin is
+signed in, further invites come from the console
+(`auth/passkey/enroll/invite/0.3`); run `invite` again if one is lost.
 
-The `invite` subcommand is the operator's bootstrap for admin onboarding; once an admin is signed in, further invites are issued from the console (`auth/passkey/enroll/invite/0.3`). Lost the URL or the code before redeeming? Run `did-hosting-daemon invite` again to mint a new invite.
+A config without an `[identity]` block loads as `mode = "vta"`. The mode can
+also be set with `DID_HOSTING_IDENTITY_MODE` (`vta` or `self-managed`).
 
-### Config shape
+## Non-interactive setup (recipe-driven)
 
-A self-managed `config.toml` looks like:
-
-```toml
-public_url = "https://daemon.example.com"
-did_hosting_url = "https://daemon.example.com"
-server_did = "did:webvh:<scid>:daemon.example.com"
-# mediator_did = "did:webvh:..."  # optional — for inbound DIDComm
-
-[identity]
-mode = "self-managed"
-
-[vta]
-# empty — no parent VTA
-
-[server]
-host = "0.0.0.0"
-port = 8534
-
-[enable]
-server = true
-control = true
-witness = true
-watcher = false
-
-# ... [auth], [log], [store], [witness_store], [secrets], [features], etc.
-```
-
-Existing VTA-mode configs without an `[identity]` block continue to load unchanged — the loader defaults `identity.mode = "vta"` for back-compat.
-
-See `docs/self-managed-mode-spec.md` for the full design spec, `tasks/runtime-audit-T3.md` for the runtime VTA-dependency audit, and `tasks/plan.md` for the implementation breakdown.
-
-## Non-Interactive Setup (Recipe-Driven)
-
-For CI / scripted deployments, every `setup` subcommand accepts a
-**recipe TOML** that captures the answers the interactive wizard would
-prompt for. The recipe contains no secrets — keys are generated by
+Every `setup` subcommand accepts a **recipe** TOML holding the answers the
+wizard would prompt for. A recipe contains no secrets: keys are generated by
 setup, cloud credentials come from the environment.
 
 ```bash
-# Run setup with no prompts. For online VTA mode, phase 1 still mints
-# the ephemeral did:key separately; the recipe drives phase 2.
+# Online VTA mode: phase 1 mints an ephemeral did:key for the VTA admin to enrol.
 did-hosting-server setup --setup-key-out setup.key --context did-hosting
-# (operator enrols the printed did:key at the VTA)
+# (the VTA admin enrols the printed did:key)
 did-hosting-server setup --from examples/did-hosting-server-build.toml \
-                   --setup-key-file setup.key
+                         --setup-key-file setup.key
 ```
-
-For VTA-less deployments the daemon supports `vta_mode = "self-managed"`:
 
 ```bash
-# No phase-1 / phase-2; the daemon generates its own keys.
-did-hosting-daemon setup --from examples/did-hosting-daemon-build.toml
+# Self-managed daemon: one step.
+did-hosting-daemon setup --from examples/did-hosting-daemon-self-managed.toml
 ```
 
-For fully **air-gapped** deployments — where the CI runner has no VTA
-network access at all — both phases of the sealed-bundle flow run
-non-interactively from the same recipe file:
+Fully **air-gapped** installs run both phases of the sealed-bundle flow from
+the same recipe:
 
 ```bash
-# Phase 1: write a sealed bootstrap request. Persists the ephemeral
-# seed to the configured secret backend. Exits.
+# Phase 1: [deployment].vta_mode = "offline-prepare", [vta].request_path = "bootstrap-request.json".
+# Writes the request and keeps the ephemeral seed in the configured secret backend.
 did-hosting-server setup --from recipe.toml
-#   ▶ recipe.toml has  [deployment].vta_mode = "offline-prepare"
-#                      [vta].request_path    = "bootstrap-request.json"
 
-# Operator ferries bootstrap-request.json to the VTA admin, receives
-# bundle.armor + SHA-256 digest back out-of-band.
+# The VTA admin returns bundle.armor and its SHA-256 digest out of band.
 
-# Phase 2: same recipe, switched to offline-complete + bundle fields.
-# The seed comes back out of the same secret backend automatically.
+# Phase 2: vta_mode = "offline-complete", [vta].bundle_path, [vta].expect_digest.
 did-hosting-server setup --from recipe.toml
-#   ▶ recipe.toml now has  [deployment].vta_mode = "offline-complete"
-#                          [vta].bundle_path     = "bundle.armor"
-#                          [vta].expect_digest   = "<hex-sha256>"
 ```
 
-The recipe is the only state file — no separate state TOML is needed.
-The same secret backend keys both phases; if you rotate `[secrets]`
-between calls phase 2 cannot find the seed and exits with an error.
+Both phases must use the same `[secrets]` backend, or phase 2 cannot find the
+seed.
 
-Recipes are shipped under `examples/`:
-
-| Recipe | Drives |
+| Recipe (`examples/`) | Drives |
 |---|---|
-| `did-hosting-daemon-build.toml`  | `did-hosting-daemon setup --from` |
-| `did-hosting-server-build.toml`  | `did-hosting-server setup --from` |
+| `did-hosting-daemon-self-managed.toml` | `did-hosting-daemon setup --from`, no VTA |
+| `did-hosting-daemon-build.toml` | `did-hosting-daemon setup --from`, VTA-managed |
+| `did-hosting-server-build.toml` | `did-hosting-server setup --from` (set `[identity].control_did`) |
 | `did-hosting-control-build.toml` | `did-hosting-control setup --from` |
 | `webvh-witness-build.toml` | `webvh-witness setup --from` |
 | `webvh-watcher-build.toml` | `webvh-watcher setup --from` |
 
-### CLI flags added to each binary's `setup`
-
-| Flag | Effect |
+| `setup` flag | Effect |
 |---|---|
-| `--from <path>` | Drive setup from a recipe TOML; skip every prompt. |
+| `--from <path>` | Drive setup from a recipe; skip every prompt. |
 | `--force-reprovision` | Allow overwriting an existing install (backs up `config.toml` to `config.toml.bak` first). |
-| `--non-interactive` | Requires `--from`. Fail fast if a required field is missing rather than silently dropping into a prompt that would hang in CI. |
+| `--non-interactive` | Requires `--from`; fail rather than fall back to a prompt. |
 
-### Reprovision safety
+**Reprovision safety.** Before rotating any credential, setup probes the
+configured secret backend. If an install is already provisioned it refuses
+(exit code 4) unless `--force-reprovision` or `[reprovision].force = true` is
+set.
 
-Before any non-interactive run rotates credentials, the wizard probes
-the configured secret backend. If a live `ServerSecrets` entry is
-present it refuses (exit code 4) unless `--force-reprovision` or
-`[reprovision].force = true` is set. Rotating silently would invalidate
-JWTs and break the active VTA session.
+**Uninstall.** `did-hosting-{daemon,server,control} uninstall` and
+`webvh-witness uninstall` list the managed secret entries and companion files,
+ask for a typed `DELETE`, and remove them (`--yes` skips the prompt). The store
+and data directory are not removed.
 
-### Uninstall
-
-`webvh-{daemon,server,control,witness} uninstall` lists the managed
-secret-store entries + companion files, prompts for a typed `DELETE`
-confirmation, and removes them. Pass `--yes` in CI to skip the prompt.
-DIDs in the local store and the data directory are NOT removed; delete
-those manually if you want a clean slate.
-
-### Exit codes
-
-| Code | Meaning |
+| Exit code | Meaning |
 |---|---|
 | 0 | Success |
+| 1 | Anything else |
 | 2 | VTA: no transport worked (every advertised pre-auth path failed) |
 | 3 | VTA: post-auth request body rejected |
-| 4 | Reprovision refused (existing install detected; pass `--force-reprovision` to rotate) |
-| 5 | Recipe parse/validation failed |
-| 1 | Anything else |
+| 4 | Reprovision refused (an install exists; pass `--force-reprovision`) |
+| 5 | Recipe parse / validation failed |
 
-### Environment-variable overlay
+Recipe fields can be overridden at load time by the runtime environment
+variables below, so one recipe can be templated across environments.
 
-Recipe fields can be overridden at load time via the runtime env vars
-documented under [Environment Variables](#environment-variables). The
-recipe value loses to the env var so one recipe can be templated
-across dev / staging / prod by setting `DAEMON_PUBLIC_URL` etc. per
-environment.
+## Cold-start bootstrap (no running services)
 
-## Cold-Start Bootstrap (No Running Services)
+Bootstraps a VTA, a mediator and a DID host from nothing, when none of them can
+yet resolve the others. Use the **daemon** as the DID host: a standalone edge
+needs a control plane, and anything loaded on an edge directly is removed when
+it first registers.
 
-Bootstraps a complete environment from scratch — no DID resolution, no DIDComm, no running services. All DIDs are created offline on the VTA and loaded manually.
+1. **VTA (offline):** `vta setup`, creating the VTA DID in serverless mode. Keep
+   `did-vta.jsonl` and the VTA credential.
+2. **DIDs (offline):** `vta create-did-webvh --context <ctx> --label daemon` and
+   `--context mediator --label mediator`, exporting each secrets bundle.
+3. **Daemon (offline):**
 
-### Prerequisites
+   ```bash
+   did-hosting-daemon import-secrets --config config.toml --vta-bundle <daemon-bundle>
+   did-hosting-daemon load-did --config config.toml --path .well-known   --did-log did-daemon.jsonl
+   did-hosting-daemon load-did --config config.toml --path <vta-path>      --did-log did-vta.jsonl
+   did-hosting-daemon load-did --config config.toml --path <mediator-path> --did-log did-mediator.jsonl
+   ```
 
-- Compiled binaries: `vta`, `did-hosting-server`, `mediator-setup-vta`, `mediator`
-- A minimal `config.toml` for the did-hosting-server (`public_url`, `[server]`, `[store]`, `[secrets]`)
-- A `mediator.toml` for the mediator (use the template in `conf/mediator.toml`)
-- Redis running (required by the mediator)
+4. **Start the daemon.** All three DIDs now resolve over HTTP.
+5. **Mediator:** `mediator-setup-vta --import-bundle`, giving it the mediator
+   bundle, the VTA credential and `did-mediator.jsonl` (so it resolves its own
+   DID locally); then start it.
+6. **Start the VTA.** Everything can now resolve everything else.
 
-### Step 1: VTA Setup (offline)
+Afterwards, register the daemon with the VTA as a webvh server
+(`vta webvh add-server --id <id> --did <daemon-did>`) and change the mediator's
+`jwt_authorization_secret` for production.
 
-```bash
-vta setup
-```
+## Environment variables
 
-Creates the master seed, VTA DID, and local data store. When prompted, choose to create the VTA DID in serverless mode. Save the `did-vta.jsonl` and note the VTA credential.
+Every binary reads its config file, then applies environment overrides under
+its own prefix. The full list, with every config key, is in the
+[configuration reference](configuration.md); the overview:
 
-### Step 2: Create DIDs on the VTA (offline)
+| Binary | Prefix | Config path variable |
+|---|---|---|
+| `did-hosting-server` | `DID_HOSTING_` (the deprecated `WEBVH_` is still read; `DID_HOSTING_` wins) | `DID_HOSTING_CONFIG_PATH` |
+| `did-hosting-control` | `CONTROL_` | `CONTROL_CONFIG_PATH` |
+| `did-hosting-daemon` | `DAEMON_` (and `DAEMON_WITNESS_STORE_*` for `[witness_store]`) | `DAEMON_CONFIG_PATH` |
+| `webvh-witness` | `WITNESS_` | `WITNESS_CONFIG_PATH` |
+| `webvh-watcher` | `WATCHER_` | `WATCHER_CONFIG_PATH` |
 
-```bash
-vta create-did-webvh --context ctx1 --label server
-vta create-did-webvh --context mediator --label mediator
-```
+### Identity and peers
 
-Each command prompts for a DID hosting URL, creates the DID locally (serverless mode), and saves a `did.jsonl` file. When prompted, **export the secrets bundle** for each — copy the base64url output.
+| Variable | Binaries | Config key |
+|---|---|---|
+| `<PREFIX>_SERVER_DID` | all | `server_did` (this node's own DID) |
+| `<PREFIX>_MEDIATOR_DID` | all | `mediator_did` |
+| `DID_HOSTING_PUBLIC_URL`, `CONTROL_PUBLIC_URL`, `DAEMON_PUBLIC_URL` | server, control, daemon | `public_url` |
+| `CONTROL_DID_HOSTING_URL`, `DAEMON_DID_HOSTING_URL` | control, daemon | `did_hosting_url` |
+| `DID_HOSTING_CONTROL_DID` | server | `control_did` |
+| `<PREFIX>_VTA_URL`, `_VTA_DID`, `_VTA_CONTEXT_ID` | server, control, witness | `[vta]` |
+| `CONTROL_REGISTRY_HEALTH_CHECK_INTERVAL` | control | `registry.health_check_interval` |
+| `WATCHER_SOURCE_DIDS` | watcher | `sync.source_dids` (comma-separated) |
+| `DID_HOSTING_IDENTITY_MODE` | daemon | `identity.mode` |
 
-You should now have:
-- `did-vta.jsonl` + VTA credential (from step 1)
-- `did-server.jsonl` + server secrets bundle (from step 2)
-- `did-mediator.jsonl` + mediator secrets bundle (from step 2)
+### Shared by every prefix
 
-### Step 3: Set up the DID Hosting Server (offline)
+| Variable | Config key |
+|---|---|
+| `<PREFIX>_SERVER_HOST`, `_SERVER_PORT` | `server.host`, `server.port` |
+| `<PREFIX>_SERVER_TRUSTED_PROXIES` | `server.trusted_proxies` |
+| `<PREFIX>_LOG_LEVEL`, `_LOG_FORMAT` | `log.level`, `log.format` |
+| `<PREFIX>_FEATURES_DIDCOMM`, `_TSP`, `_AGENT_NAMES`, `_HTTP_LISTENER` (`_REST_API` is the old name) | `[features]` |
+| `<PREFIX>_REPLAY_*` | `[replay]` |
+| `<PREFIX>_AUTH_*` (control and daemon; the edge, witness and watcher hold no sessions) | `[auth]` |
 
-```bash
-# Import the server's keys
-did-hosting-server import-secrets --config config.toml \
-  --vta-bundle <server-secrets-bundle>
+Boolean variables accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`, in
+any case; anything else stops the service with a message naming the variable.
 
-# Load all three DIDs
-did-hosting-server load-did --path .well-known --did-log did-server.jsonl
-did-hosting-server load-did --path <vta-path> --did-log did-vta.jsonl
-did-hosting-server load-did --path <mediator-path> --did-log did-mediator.jsonl
-```
-
-### Step 4: Start the DID Hosting Server
-
-```bash
-did-hosting-server --config config.toml
-```
-
-All three DIDs are now resolvable via HTTP.
-
-### Step 5: Set up the Mediator (offline)
-
-```bash
-mediator-setup-vta --import-bundle --config conf/mediator.toml
-```
-
-When prompted:
-1. Paste the **mediator secrets bundle**
-2. Paste the **VTA credential**
-3. Choose a storage backend (string/AWS/keyring)
-4. Provide `did-mediator.jsonl` path — enables the mediator to resolve its own DID locally, so it can restart independently of the did-hosting-server
-5. Enter the VTA context ID (e.g., `mediator`)
-
-### Step 6: Start the Mediator
-
-```bash
-mediator
-```
-
-Falls back to cached secrets (VTA not yet running). Resolves its own DID from the local document.
-
-### Step 7: Start the VTA
-
-```bash
-vta --config config.toml
-```
-
-All services can now resolve each other. DIDComm is fully operational.
-
-### Post-Bootstrap
-
-After all services are running:
-
-- **Register the did-hosting-server with the VTA** (required for creating new DIDs via VTA):
-  ```bash
-  vta webvh add-server --id <server-id> --did <server-did>
-  ```
-- **Change the mediator JWT key** for production — update `jwt_authorization_secret` in `mediator.toml`
-- **Optional:** Pass `--vta-credential` to `did-hosting-server import-secrets` if you want the server to refresh keys from the VTA automatically on restart
-
-### Restart Behavior
-
-All services restart cleanly during normal operations:
-
-- **DID Hosting server** — loads DIDs from persistent store, re-registers with control plane in background
-- **Mediator** — fetches fresh secrets from VTA if available, falls back to cache if VTA is down. Resolves own DID from local document (no did-hosting-server dependency)
-- **VTA** — DIDComm retries mediator connection with backoff. REST API works immediately
-
-### Cold-Start Summary
-
-| Step | Action | Network? | Services Running |
-|------|--------|----------|------------------|
-| 1 | `vta setup` | No | None |
-| 2 | `vta create-did-webvh` (×2) | No | None |
-| 3 | `did-hosting-server import-secrets` + `load-did` (×3) | No | None |
-| 4 | Start did-hosting-server | No | DID Hosting |
-| 5 | `mediator-setup-vta --import-bundle` | No | DID Hosting |
-| 6 | Start mediator | Yes (DID resolution) | DID Hosting, Mediator |
-| 7 | Start VTA | Yes (DID resolution) | All |
-
-## Verifying the Setup
-
-### Check server health
-```bash
-curl http://localhost:8530/api/health
-```
-
-### Check DID resolution
-```bash
-curl http://localhost:8530/.well-known/did.jsonl
-curl http://localhost:8530/services/control/did.jsonl
-```
-
-### Check control plane registry
-```bash
-# Requires admin auth token
-curl -H "Authorization: Bearer <token>" \
-  http://localhost:8532/api/control/registry
-```
-
-### Check ACL entries
-```bash
-did-hosting-server list-acl
-did-hosting-control list-acl
-```
-
-## Environment Variables
-
-### did-hosting-server
-| Variable | Description |
-|----------|-------------|
-| `DID_HOSTING_SERVER_DID` | Server's DID |
-| `DID_HOSTING_PUBLIC_URL` | Public-facing URL |
-| `DID_HOSTING_CONTROL_URL` | Control plane URL |
-| `DID_HOSTING_CONTROL_DID` | Control plane's DID |
-| `DID_HOSTING_VTA_URL` | VTA REST URL |
-| `DID_HOSTING_VTA_DID` | VTA DID for DIDComm |
-| `DID_HOSTING_VTA_CONTEXT_ID` | VTA context ID |
-
-### did-hosting-control
-| Variable | Description |
-|----------|-------------|
-| `CONTROL_SERVER_DID` | Control plane's DID |
-| `CONTROL_PUBLIC_URL` | Public-facing URL |
-| `CONTROL_DID_HOSTING_URL` | DID hosting URL (where DIDs are publicly served) |
-| `CONTROL_VTA_URL` | VTA REST URL |
-| `CONTROL_VTA_DID` | VTA DID for DIDComm |
-| `CONTROL_VTA_CONTEXT_ID` | VTA context ID |
-
-### webvh-witness
-| Variable | Description |
-|----------|-------------|
-| `WITNESS_SERVER_DID` | Witness's DID |
-| `WITNESS_VTA_URL` | VTA REST URL |
-| `WITNESS_VTA_DID` | VTA DID for DIDComm |
-| `WITNESS_VTA_CONTEXT_ID` | VTA context ID |
-
-### Cloud secret backends (all binaries)
-
-The same env-var prefix that scopes `DID_HOSTING_*` / `CONTROL_*` / `WITNESS_*`
-also scopes the cloud secret backends. Replace `<PREFIX>` below with
-`WEBVH`, `CONTROL`, `WITNESS`, or `DAEMON`.
+### Cloud secret backends
 
 | Variable | Description |
-|----------|-------------|
-| `<PREFIX>_SECRETS_KEYRING_SERVICE` | OS keyring service name (default backend) |
-| `<PREFIX>_SECRETS_AWS_SECRET_NAME` | AWS Secrets Manager secret name |
-| `<PREFIX>_SECRETS_AWS_REGION` | AWS region (e.g. `us-east-1`) |
-| `<PREFIX>_SECRETS_GCP_PROJECT` | GCP project ID |
-| `<PREFIX>_SECRETS_GCP_SECRET_NAME` | GCP Secret Manager secret name |
-| `<PREFIX>_SECRETS_AZURE_VAULT_URL` | Azure Key Vault URL (e.g. `https://my-vault.vault.azure.net/`) |
-| `<PREFIX>_SECRETS_AZURE_SECRET_NAME` | Azure Key Vault secret name |
+|---|---|
+| `<PREFIX>_SECRETS_KEYRING_SERVICE` | OS keyring service name |
+| `<PREFIX>_SECRETS_AWS_SECRET_NAME`, `_AWS_REGION` | AWS Secrets Manager |
+| `<PREFIX>_SECRETS_GCP_PROJECT`, `_GCP_SECRET_NAME` | GCP Secret Manager |
+| `<PREFIX>_SECRETS_AZURE_VAULT_URL`, `_AZURE_SECRET_NAME` | Azure Key Vault |
+| `<PREFIX>_SECRETS_VAULT_ADDR`, `_VAULT_KV_MOUNT`, `_VAULT_SECRET_PATH`, `_VAULT_SECRET_KEY`, `_VAULT_NAMESPACE`, `_VAULT_AUTH_METHOD`, `_VAULT_TOKEN`, `_VAULT_APPROLE_ROLE_ID`, `_VAULT_APPROLE_SECRET_ID`, `_VAULT_APPROLE_MOUNT`, `_VAULT_SKIP_VERIFY` | HashiCorp Vault |
+| `<PREFIX>_SECRETS_K8S_SECRET_NAME`, `_K8S_NAMESPACE`, `_K8S_SECRET_KEY` | Kubernetes Secret |
 
 `secrets.backend`, when set, selects the backend outright. Otherwise the
 precedence is AWS → GCP → Azure → Vault → Kubernetes → keyring. Plaintext is
 never chosen implicitly: it needs `backend = "plaintext"` and
 `confirm_plaintext = true`, and is for tests only. A backend selected on a
 binary built without its feature, or a keyring that cannot be opened, is a
-startup error listing the secure backends. Compile-time feature gates
-(`aws-secrets`, `gcp-secrets`, `azure-secrets`, `vault-secrets`,
-`k8s-secrets`, `keyring`) decide which backends are compiled in. Only compile in the
-backends you'll use — they each pull a sizable cloud SDK.
+startup error. Compile in only the backends you use (`aws-secrets`,
+`gcp-secrets`, `azure-secrets`, `vault-secrets`, `k8s-secrets`, `keyring`).
 
-### Storage backends (all binaries)
+### Storage backends
 
 | Variable | Description |
-|----------|-------------|
-| `<PREFIX>_STORE_DATA_DIR` | Fjall on-disk path (default backend) |
+|---|---|
+| `<PREFIX>_STORE_DATA_DIR` | fjall on-disk path (default backend) |
 | `<PREFIX>_STORE_REDIS_URL` | Redis connection URL |
 | `<PREFIX>_STORE_DYNAMODB_TABLE_PREFIX` | DynamoDB table name prefix (one table per keyspace, `<prefix>_<keyspace>`) |
 | `<PREFIX>_STORE_DYNAMODB_REGION` | AWS region for DynamoDB |
-| `<PREFIX>_STORE_DYNAMODB_BILLING_MODE` | Billing for tables the service creates: `pay_per_request` (default) or `provisioned:<read>:<write>` |
-| `<PREFIX>_STORE_DYNAMODB_AUTO_CREATE` | `false` to refuse, rather than create, a missing table (pre-provisioned tables, no `dynamodb:CreateTable`) |
-| `<PREFIX>_STORE_FIRESTORE_PROJECT` | GCP project ID for Firestore |
-| `<PREFIX>_STORE_FIRESTORE_DATABASE` | Firestore database id |
+| `<PREFIX>_STORE_DYNAMODB_BILLING_MODE` | `pay_per_request` (default) or `provisioned:<read>:<write>`, for tables the service creates |
+| `<PREFIX>_STORE_DYNAMODB_AUTO_CREATE` | `false` to refuse, rather than create, a missing table |
+| `<PREFIX>_STORE_FIRESTORE_PROJECT`, `_FIRESTORE_DATABASE` | Firestore project and database id |
 | `<PREFIX>_STORE_COSMOSDB_CONNECTION_STRING` | Cosmos DB `AccountEndpoint=...;AccountKey=...` |
 | `<PREFIX>_STORE_COSMOSDB_DATABASE` | Cosmos DB database name |
-| `<PREFIX>_STORE_COSMOSDB_CONTAINER` | Cosmos DB container holding every keyspace (default `kv`, partitioned on `/pk`, created if missing) |
-| `<PREFIX>_STORE_COSMOSDB_REGION` | Azure region (display form `"West US 2"` or normalised `"westus2"`; defaults to `eastus`) |
+| `<PREFIX>_STORE_COSMOSDB_CONTAINER` | The one container holding every keyspace (default `kv`, partitioned on `/pk`, created if missing) |
+| `<PREFIX>_STORE_COSMOSDB_REGION` | Azure region (`"West US 2"` or `"westus2"`; default `eastus`) |
 
-The daemon's second store, `[witness_store]`, takes the same variables
-under `DAEMON_WITNESS_STORE_` (for example `DAEMON_WITNESS_STORE_REDIS_URL`).
+The daemon's second store, `[witness_store]`, takes the same variables under
+`DAEMON_WITNESS_STORE_` (for example `DAEMON_WITNESS_STORE_REDIS_URL`).
+Exactly one of `store-fjall`, `store-redis`, `store-dynamodb`,
+`store-firestore`, `store-cosmosdb` is compiled in.
 
-Storage backends are mutually exclusive — exactly one of `store-fjall`,
-`store-redis`, `store-dynamodb`, `store-firestore`, `store-cosmosdb`
-must be enabled at build time.
+### Fjall memory settings (`store-fjall` only)
 
-### Fjall memory settings (all binaries, `store-fjall` only)
+The embedded store grows three memory-backed pools with the data set: a block
+cache for reads, unflushed writes across every keyspace the process opens, and
+the write-ahead journal it replays at startup. Three optional settings cap them,
+in a `[fjall]` table (a sibling of `[store]`) or as environment variables with
+the **same unprefixed names for every binary** — it is a pod-level setting. The
+daemon's `store` and `witness_store` share one `[fjall]` table.
 
-The embedded on-disk store (fjall) grows three memory-backed pools with
-the data set: a block cache for reads, buffered writes across every
-keyspace the process opens, and the write-ahead journal it replays at
-startup. Left at fjall's own defaults, none of these are aware of a
-Kubernetes pod's memory `limits` — a service under sustained write load
-can be OOMKilled by its own storage layer even though the request path
-looks fine.
+| Config key | Env var | What it bounds | Default (unset) |
+|---|---|---|---|
+| `fjall.block_cache` | `STORAGE_FJALL_BLOCK_CACHE` | fjall's block cache (`cache_size`) | 32 MiB (fjall's default) |
+| `fjall.write_buffer` | `STORAGE_FJALL_WRITE_BUFFER` | Unflushed bytes across all keyspaces, enforced by the store's background flusher | 8 MiB |
+| `fjall.max_journal` | `STORAGE_FJALL_MAX_JOURNAL` | Total journal size (`max_journaling_size`), checked by fjall when it flushes | 512 MiB (fjall's default) |
 
-Three optional settings cap them, in a `[fjall]` table in `config.toml`
-(a sibling of `[store]`) or, equivalently, as environment variables —
-the **same three names for every binary** (did-hosting-server,
-did-hosting-control, webvh-witness, webvh-watcher, and
-did-hosting-daemon, which shares one `[fjall]` table across its `store`
-and `witness_store`), since this is a pod-level setting, not a
-per-service one:
+fjall 3.1 stores its own `max_write_buffer_size` but never enforces it, and only
+flushes a keyspace's memtable once that one keyspace holds 64 MiB, so a service
+that spreads writes over many small keyspaces would otherwise never flush. The
+store therefore runs a background flusher (`store::flusher`): every 5 seconds it
+checks the database's unflushed bytes, and seals every non-empty keyspace when
+the total reaches `write_buffer`, or when anything has sat unflushed for 5
+minutes. Since it seals regularly, the journal limit is checked regularly too.
+This applies whether or not `[fjall]` is set.
 
-| Config key | Env var | fjall knob | Default (unset) |
-|------------|---------|------------|------------------|
-| `fjall.block_cache` | `STORAGE_FJALL_BLOCK_CACHE` | `Database::builder(..).cache_size(..)` | 32 MiB |
-| `fjall.write_buffer` | `STORAGE_FJALL_WRITE_BUFFER` | `Database::builder(..).max_write_buffer_size(..)` | unbounded |
-| `fjall.max_journal` | `STORAGE_FJALL_MAX_JOURNAL` | `Database::builder(..).max_journaling_size(..)` | 512 MiB |
-
-Each value is a byte size — a plain integer, or a number with a binary
-(`KiB`/`MiB`/`GiB`/`TiB`) or decimal (`KB`/`MB`/`GB`/`TB`/`B`) suffix,
-e.g. `"64MiB"`, `"512MB"`, `"1GiB"`. All three are optional; leaving them
-unset keeps today's behaviour unchanged, byte for byte. An env var
-overrides whatever the config file set. An invalid, zero, or absurdly
-small value — fjall itself refuses a write buffer under 1 MiB or a
-journal under 64 MiB — fails startup with an error naming the setting;
-nothing is ever silently clamped or ignored. The effective values are
-logged once when the store opens.
+Each value is a byte size — a plain integer or a number with a binary
+(`KiB`/`MiB`/`GiB`/`TiB`) or decimal (`KB`/`MB`/`GB`/`TB`/`B`) suffix, e.g.
+`"64MiB"`. An env var overrides the config file. A value that does not parse,
+is zero, or is below the floor (1 MiB for the cache and write buffer, 64 MiB for
+the journal) stops startup with an error naming the setting; nothing is clamped.
+The effective values are logged when the store opens.
 
 ```toml
 [store]
@@ -659,18 +534,10 @@ write_buffer = "32MiB"
 max_journal  = "128MiB"
 ```
 
-**Sizing against the pod's memory limit.** Budget roughly
-`block_cache + write_buffer + max_journal` plus headroom for the rest of
-the process (connections, in-flight requests, DIDComm/TSP state) — a
-common starting point is to keep that sum at 40–60% of the container's
-memory `limit` and leave the remainder for everything else. Startup's
-journal replay briefly holds close to `max_journal` in memory, so a
-limit set right at the steady-state sum above can still OOM on a
-restart. `did-hosting-daemon` opens two fjall stores (`store` and
-`witness_store`) from the *same* `[fjall]` table, so double the budget
-above when sizing its pod.
-
-Only the `store-fjall` backend reads these settings — `store-redis`,
-`store-dynamodb`, `store-firestore`, and `store-cosmosdb` ignore them
-entirely, since they have no local cache, write buffer, or journal of
-their own to tune.
+**Sizing against a pod's memory limit.** Budget roughly
+`block_cache + write_buffer + max_journal` plus headroom for the rest of the
+process; keeping that sum at 40–60% of the container's limit is a reasonable
+start. Journal replay at startup briefly holds close to `max_journal`, so a
+limit set at the steady-state sum can still OOM on restart. The daemon opens two
+fjall stores from the same table, so double the budget for its pod. The other
+backends ignore `[fjall]`.

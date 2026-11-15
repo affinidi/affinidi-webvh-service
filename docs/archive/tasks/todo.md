@@ -1,6 +1,8 @@
 # Self-Managed Mode — Todo
 
-Spec: [`docs/self-managed-mode-spec.md`](../docs/self-managed-mode-spec.md)
+> **Status:** historical — completed task list for self-managed mode (0.6.0).
+
+Spec: [`docs/self-managed-mode-spec.md`](../self-managed-mode-spec.md)
 Plan: [`tasks/plan.md`](plan.md)
 
 ## Phase 1 — Foundations

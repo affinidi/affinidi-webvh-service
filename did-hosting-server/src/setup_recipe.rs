@@ -41,19 +41,10 @@ pub async fn run_from_recipe(
     apply_recipe(recipe, setup_key_file, force_reprovision).await
 }
 
-/// Apply an already-loaded recipe. Split out so the future
-/// `--non-interactive` shortcut (which builds a recipe in-memory) can
-/// reuse this path.
-pub async fn apply_recipe(
-    mut recipe: SetupRecipe,
-    setup_key_file: Option<PathBuf>,
-    force_reprovision: bool,
-) -> Result<(), AppError> {
-    apply_env_overrides(&mut recipe);
-    print_recipe_banner("did-hosting-server", &recipe);
-
-    // An edge is driven by its control plane and nothing else; refuse before
-    // any VTA round-trip rather than write a config the server won't start on.
+/// An edge is driven by its control plane and nothing else; refuse a recipe
+/// without `identity.control_did` before any VTA round-trip rather than write
+/// a config the server won't start on.
+fn require_control_did(recipe: &SetupRecipe) -> Result<(), AppError> {
     if recipe
         .identity
         .control_did
@@ -66,6 +57,21 @@ pub async fn apply_recipe(
                 .into(),
         ));
     }
+    Ok(())
+}
+
+/// Apply an already-loaded recipe. Split out so the future
+/// `--non-interactive` shortcut (which builds a recipe in-memory) can
+/// reuse this path.
+pub async fn apply_recipe(
+    mut recipe: SetupRecipe,
+    setup_key_file: Option<PathBuf>,
+    force_reprovision: bool,
+) -> Result<(), AppError> {
+    apply_env_overrides(&mut recipe);
+    print_recipe_banner("did-hosting-server", &recipe);
+
+    require_control_did(&recipe)?;
 
     // Reprovision scan happens BEFORE any VTA round-trip so we don't
     // burn an enrolled setup DID on an install that's going to refuse.
@@ -483,5 +489,38 @@ pub fn map_exit_code(err: &AppError) -> i32 {
         EXIT_RECIPE_INVALID
     } else {
         1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shipped server recipe must pass every check `setup --from` runs
+    /// before it talks to a VTA: the shared load + validate, the service kind,
+    /// and the edge's own `identity.control_did` requirement. A recipe the
+    /// README tells operators to run must not be refused as shipped.
+    #[test]
+    fn shipped_server_recipe_passes_the_pre_vta_checks() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .join("examples/did-hosting-server-build.toml");
+        let recipe = load_recipe(&path).expect("example loads and validates");
+        require_service(&recipe, ServiceKind::Server).expect("targets the server");
+        require_control_did(&recipe).expect("example sets identity.control_did");
+    }
+
+    #[test]
+    fn recipe_without_control_did_is_refused() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .join("examples/did-hosting-server-build.toml");
+        let mut recipe = load_recipe(&path).expect("example loads");
+        recipe.identity.control_did = None;
+        assert!(require_control_did(&recipe).is_err());
+        recipe.identity.control_did = Some(String::new());
+        assert!(require_control_did(&recipe).is_err());
     }
 }
