@@ -8,10 +8,16 @@ use did_hosting_common::server::auth::extractor::AuthState;
 use did_hosting_common::server::didcomm_profile::{build_own_listener, wait_for_did_resolution};
 use did_hosting_common::server::identity::{self, ServiceIdentity};
 use did_hosting_common::server::init;
+use did_hosting_common::server::stats_collector::StatsCollector;
 use did_hosting_common::server::store::{
     KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
 };
+use did_hosting_common::server::supervise::{
+    PeriodicTask, Policy, SHUTDOWN_STAGE_DEADLINE, Stage, Supervisor, retry_with_backoff,
+    run_periodic,
+};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use webauthn_rs::prelude::Webauthn;
 
 use crate::auth::jwt::JwtKeys;
@@ -25,7 +31,7 @@ use crate::secret_store::ServerSecrets;
 use crate::store::{KeyspaceHandle, Store};
 use tokio::sync::{oneshot, watch};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
-use tracing::{Level, debug, error, info, warn};
+use tracing::{Level, debug, info, warn};
 
 /// What a cache-eviction hook is told has changed in the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +88,11 @@ pub struct AppState {
         Option<Arc<did_hosting_common::server::trust_tasks::TransportBoundVerifier>>,
     pub jwt_keys: Option<Arc<JwtKeys>>,
     pub webauthn: Option<Arc<Webauthn>>,
-    pub http_client: reqwest::Client,
+    /// Work a request or message hands off to run after it is answered (a
+    /// re-registering edge's resync, a sync queued outside a mutation — see
+    /// [`crate::server_push`]). Tracked so shutdown waits for it, within its
+    /// deadline, before the store is persisted.
+    pub background: TaskTracker,
     /// DIDComm service for inbound/outbound mediator messaging.
     /// Wrapped in `OnceLock` so cloned states see it once it's initialized
     /// (the service starts after REST + DIDComm router are already cloned).
@@ -233,6 +243,146 @@ impl AppState {
             .ok_or_else(|| AppError::Authentication("JWT keys not configured".into()))?;
         Ok((did_resolver, secrets_resolver.as_ref(), jwt_keys.as_ref()))
     }
+
+    /// Assemble a control plane's state over `store`: the one recipe the
+    /// standalone [`run`], the daemon and the tests share, so a field added
+    /// here reaches all of them.
+    ///
+    /// Opens the keyspaces, takes the resolvers and the Trust Task verifier
+    /// from `identity`, the JWT keys from `secrets` (none without), WebAuthn
+    /// from `config.public_url`, and builds the limiters and caches.
+    /// `overrides` supplies what a caller shares with something else in the
+    /// same process (the daemon's statistics collector, its cache hook, its
+    /// client-address rule).
+    ///
+    /// Builds state only; it starts nothing. [`startup`] runs the boot steps.
+    pub async fn build(
+        config: AppConfig,
+        store: Store,
+        secrets: Option<&ServerSecrets>,
+        identity: Option<Arc<ServiceIdentity>>,
+        overrides: AppStateOverrides,
+    ) -> Result<Self, AppError> {
+        let sessions_ks = store.keyspace(KS_SESSIONS)?;
+        let acl_ks = store.keyspace(KS_ACL)?;
+        let registry_ks = store.keyspace(KS_REGISTRY)?;
+        // Strongly consistent: the control plane's DID reads decide writes
+        // (ownership, slot existence, what to push to edges), so a read that
+        // missed a just-committed write could hand one owner's slot to another.
+        let dids_ks = store.keyspace_consistent(KS_DIDS)?;
+        let stats_ks = store.keyspace(KS_STATS)?;
+        // Time-series buckets live in their own keyspace from v0.7 — see
+        // the `timeseries_ks` field doc.
+        let timeseries_ks = store.keyspace(KS_TIMESERIES)?;
+
+        let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
+        let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
+        // Over the identity's DID cache, so `did:web` / `did:webvh`
+        // verificationMethod lookups hit the cache the DIDComm path already
+        // populates.
+        let trust_tasks_verifier =
+            did_hosting_common::server::trust_tasks::build_verifier(did_resolver.as_ref());
+        let jwt_keys = secrets.and_then(init::init_jwt_keys);
+
+        let webauthn = config.public_url.as_ref().and_then(|url| {
+            match did_hosting_common::server::passkey::build_webauthn(url) {
+                Ok(w) => {
+                    info!("WebAuthn (passkey) auth enabled");
+                    Some(Arc::new(w))
+                }
+                Err(e) => {
+                    warn!("WebAuthn initialization failed: {e} — passkey auth disabled");
+                    None
+                }
+            }
+        });
+
+        let stats_collector = match overrides.stats_collector {
+            Some(collector) => collector,
+            None => {
+                use did_hosting_common::server::stats_collector::seed_from_store;
+                let collector = StatsCollector::new();
+                // The aggregate, the DID count and the per-DID statistics
+                // overrides, from the store; then the `[stats]` policy.
+                let agg = seed_from_store(&collector, &stats_ks, &dids_ks).await;
+                collector.configure_tiers(config.stats);
+                info!(
+                    total_dids = agg.total_dids,
+                    total_resolves = agg.total_resolves,
+                    total_updates = agg.total_updates,
+                    "stats collector seeded from store"
+                );
+                Arc::new(collector)
+            }
+        };
+        let client_ips = match overrides.client_ips {
+            Some(ips) => ips,
+            None => did_hosting_common::server::rate_limit::ClientIps::from_server_config(
+                &config.server,
+            )?,
+        };
+        // The local GeoIP database, if configured (base design §12.6).
+        // Advisory: a file that cannot be read is a warning, and sign-in
+        // locations show as "unknown".
+        let geoip = open_geoip(&config.geoip).await?;
+        let pending_challenges =
+            crate::pending_challenges::PendingChallengeTracker::for_auth_config(&config.auth);
+        let replay_cache = crate::replay::ReplayCache::with_config(config.replay.clone())?;
+
+        Ok(Self {
+            store,
+            sessions_ks,
+            acl_ks,
+            registry_ks,
+            dids_ks,
+            config: Arc::new(config),
+            did_resolver,
+            secrets_resolver,
+            identity,
+            trust_tasks_verifier,
+            jwt_keys,
+            webauthn,
+            background: TaskTracker::new(),
+            didcomm_service: Arc::new(std::sync::OnceLock::new()),
+            stats_collector,
+            stats_ks,
+            timeseries_ks,
+            unlisted_signers: Default::default(),
+            replay_cache: Arc::new(replay_cache),
+            path_locks: crate::path_locks::PathLocks::new(),
+            acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
+            pending_challenges: Arc::new(pending_challenges),
+            client_ips,
+            ip_rate_limiter: Arc::new(crate::rate_limit::challenge_limiter()),
+            login_start_rate_limiter: Arc::new(crate::rate_limit::login_start_limiter()),
+            redeem_rate_limiter: Arc::new(crate::rate_limit::redeem_limiter()),
+            webs_self_register_limiter: Arc::new(crate::rate_limit::webs_self_register_limiter()),
+            webs_self_register_global_limiter: Arc::new(
+                crate::rate_limit::webs_self_register_global_limiter(),
+            ),
+            large_document_budget: Arc::new(
+                did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
+            ),
+            outbox_notify: Arc::new(tokio::sync::Notify::new()),
+            cache_invalidate: overrides.cache_invalidate,
+            oob: Arc::new(crate::oob::OobRuntime::with_geoip(geoip)),
+        })
+    }
+}
+
+/// What [`AppState::build`] takes from its caller instead of making its own.
+/// `Default` is a standalone control plane: it makes all of them.
+#[derive(Default)]
+pub struct AppStateOverrides {
+    /// The statistics collector. `None` makes one seeded from the store; the
+    /// daemon passes the one its embedded server records resolutions in.
+    pub stats_collector: Option<Arc<StatsCollector>>,
+    /// The hook clearing what the embedded server cached (the daemon). See
+    /// [`AppState::cache_invalidate`].
+    pub cache_invalidate: Option<Arc<CacheInvalidateFn>>,
+    /// The client-address rule. `None` builds one from `[server]`; the daemon
+    /// passes the one every service it embeds shares.
+    pub client_ips: Option<did_hosting_common::server::rate_limit::ClientIps>,
 }
 
 impl AuthState for AppState {
@@ -280,6 +430,396 @@ pub async fn open_geoip(
         .map_err(|e| AppError::Internal(format!("GeoIP database load task: {e}")))
 }
 
+/// The names of the control plane's background tasks: what its supervisor
+/// logs, and what the daemon's skip list and parity test refer to.
+pub mod tasks {
+    /// Expired sessions and challenges are deleted (storage).
+    pub const SESSION_CLEANUP: &str = "session-cleanup";
+    /// Statistics deltas are flushed, and the tiered-statistics migration
+    /// stepped (storage).
+    pub const STATS_FLUSH: &str = "stats-flush";
+    /// The hosted-DID count is recounted from the records (storage).
+    pub const DID_COUNT_RECONCILE: &str = "did-count-reconcile";
+    /// Ripe `disable-grace` domain records are deleted.
+    pub const DOMAIN_PURGE_SWEEP: &str = "domain-purge-sweep";
+    /// Superseded identity generations past their grace period are dropped.
+    pub const IDENTITY_EXPIRY: &str = "identity-expiry";
+    /// The service re-resolves its own DID document (a backstop for changes
+    /// that did not come through its own publish).
+    pub const IDENTITY_RELOAD: &str = "identity-reload";
+    /// Registered instances are pinged and their status re-evaluated.
+    pub const REGISTRY_HEALTH_CHECK: &str = "registry-health-check";
+    /// The GeoIP database is reloaded when its file changes.
+    pub const GEOIP_RELOAD: &str = "geoip-reload";
+    /// The durable outbound queue is delivered (a worker, not a tick).
+    pub const OUTBOX: &str = "outbox";
+    /// The periodic tasks of [`super::background_tasks`], run together.
+    pub const BACKGROUND: &str = "control-background";
+
+    /// Every storage tick ([`super::storage_tasks`]).
+    pub const STORAGE: [&str; 3] = [SESSION_CLEANUP, STATS_FLUSH, DID_COUNT_RECONCILE];
+    /// Every background tick ([`super::background_tasks`]).
+    pub const PERIODIC: [&str; 5] = [
+        DOMAIN_PURGE_SWEEP,
+        IDENTITY_EXPIRY,
+        IDENTITY_RELOAD,
+        REGISTRY_HEALTH_CHECK,
+        GEOIP_RELOAD,
+    ];
+}
+
+/// Boot steps that run once a control plane's state is built, before it
+/// serves: shared by the standalone [`run`] and the daemon, so a step added
+/// here cannot be missed by one of them.
+///
+/// - Reload challenges issued before a restart, so the caps hold across it.
+/// - The service-badge backfill and the DID index build (`M-02`, `M-03`;
+///   marker-gated, so a no-op once applied — the daemon has already run them
+///   with the rest of its migrations).
+/// - Seed the registry from `[[registry.instances]]`.
+/// - Check, in the background, that the service's DID lists the services
+///   wallet sign-in needs; warn once with the fix if not. Never blocks.
+pub async fn startup(state: &AppState) -> Result<(), AppError> {
+    state
+        .pending_challenges
+        .seed_from_sessions_or_warn(&state.sessions_ks)
+        .await;
+    backfill_service_badges(&state.store).await;
+    index_did_records(&state.store).await?;
+    seed_registry(state).await;
+    crate::sign_in_readiness::spawn(state);
+    Ok(())
+}
+
+/// What the control plane's storage ticks work on. Built from a control
+/// plane's state ([`ControlStorage::of`]), or by the daemon from its own
+/// handles, which it has whether or not the control plane runs.
+#[derive(Clone)]
+pub struct ControlStorage {
+    pub sessions_ks: KeyspaceHandle,
+    pub stats_ks: KeyspaceHandle,
+    pub timeseries_ks: KeyspaceHandle,
+    /// Strongly consistent, as the control plane's.
+    pub dids_ks: KeyspaceHandle,
+    pub auth: AuthConfig,
+    /// Whether there are sessions to clean up (the service signs them).
+    pub has_auth: bool,
+    pub collector: Arc<StatsCollector>,
+    pub stats_flush: crate::config::StatsFlushConfig,
+}
+
+impl ControlStorage {
+    /// The storage of a control plane's state.
+    pub fn of(state: &AppState) -> Self {
+        Self {
+            sessions_ks: state.sessions_ks.clone(),
+            stats_ks: state.stats_ks.clone(),
+            timeseries_ks: state.timeseries_ks.clone(),
+            dids_ks: state.dids_ks.clone(),
+            auth: state.config.auth.clone(),
+            has_auth: state.jwt_keys.is_some(),
+            collector: state.stats_collector.clone(),
+            stats_flush: state.config.stats_flush,
+        }
+    }
+
+    /// The last flush, at shutdown: every delta still held.
+    pub async fn final_flush(&self) {
+        flush_remaining_stats(&self.collector, &self.stats_ks, &self.timeseries_ks).await;
+    }
+}
+
+/// The control plane's storage ticks ([`tasks::STORAGE`]): run on its
+/// storage thread, and in the daemon's storage task.
+pub fn storage_tasks(storage: &ControlStorage) -> Vec<PeriodicTask> {
+    let sessions = {
+        let s = storage.clone();
+        PeriodicTask::new(
+            tasks::SESSION_CLEANUP,
+            Duration::from_secs(s.auth.session_cleanup_interval),
+            move |_| {
+                let s = s.clone();
+                async move {
+                    if let Err(e) =
+                        cleanup_expired_sessions(&s.sessions_ks, s.auth.challenge_ttl).await
+                    {
+                        warn!("session cleanup error: {e}");
+                    }
+                }
+            },
+        )
+        .enabled_if(storage.has_auth)
+    };
+
+    // The migration to (and clean-up after) the tiered statistics format,
+    // stepped a flush's worth at a time after each flush.
+    let maintenance = Arc::new(tokio::sync::Mutex::new(
+        crate::stats_migration::StatsMaintenance::new(
+            storage.stats_ks.clone(),
+            storage.timeseries_ks.clone(),
+            storage.dids_ks.clone(),
+        ),
+    ));
+    let flush = {
+        let s = storage.clone();
+        PeriodicTask::new(
+            tasks::STATS_FLUSH,
+            crate::config::STATS_FLUSH_INTERVAL,
+            move |shutdown| {
+                let s = s.clone();
+                let maintenance = maintenance.clone();
+                async move {
+                    // One deadline for the tick: the flush, then the migration
+                    // in what is left of it, so the tick keeps its interval.
+                    let deadline =
+                        tokio::time::Instant::now() + crate::config::STATS_FLUSH_INTERVAL;
+                    if let Err(e) = flush_stats_paced_until(
+                        &s.collector,
+                        &s.stats_ks,
+                        &s.timeseries_ks,
+                        &s.stats_flush,
+                        shutdown.clone(),
+                        deadline,
+                    )
+                    .await
+                    {
+                        warn!("stats flush error: {e}");
+                    }
+                    if let Err(e) = maintenance
+                        .lock()
+                        .await
+                        .step(&s.collector, &s.stats_flush, shutdown, deadline)
+                        .await
+                    {
+                        warn!("stats migration error: {e}");
+                    }
+                }
+            },
+        )
+        // A flush that overruns its interval is followed by a full interval,
+        // not an immediate catch-up flush.
+        .delay_missed()
+    };
+
+    let recount = {
+        let s = storage.clone();
+        PeriodicTask::new(
+            tasks::DID_COUNT_RECONCILE,
+            did_hosting_common::server::stats_collector::DID_COUNT_RECONCILE_INTERVAL,
+            move |_| {
+                let s = s.clone();
+                async move {
+                    if let Err(e) =
+                        did_hosting_common::server::stats_collector::reconcile_total_dids(
+                            &s.collector,
+                            &s.dids_ks,
+                        )
+                        .await
+                    {
+                        warn!("DID count reconcile error: {e}");
+                    }
+                }
+            },
+        )
+    };
+
+    vec![sessions, flush, recount]
+}
+
+/// The control plane's background ticks ([`tasks::PERIODIC`]).
+pub fn background_tasks(state: &AppState) -> Vec<PeriodicTask> {
+    let purge = {
+        let store = state.store.clone();
+        PeriodicTask::new(
+            tasks::DOMAIN_PURGE_SWEEP,
+            crate::purge_sweep::DEFAULT_SWEEP_INTERVAL,
+            move |_| {
+                let store = store.clone();
+                async move {
+                    let purged = crate::purge_sweep::run_sweep_once(&store).await;
+                    if purged > 0 {
+                        info!(count = purged, "control purge sweep tick completed");
+                    }
+                }
+            },
+        )
+    };
+
+    // Identity expiry is local and cheap, so it runs on the tight interval
+    // and retires a superseded key promptly; it also picks up a generation
+    // the offline CLI retired out of band.
+    let expiry = {
+        let state = state.clone();
+        PeriodicTask::new(
+            tasks::IDENTITY_EXPIRY,
+            crate::identity_rotation::SWEEP_INTERVAL,
+            move |_| {
+                let state = state.clone();
+                async move { crate::identity_rotation::expire_due(&state).await }
+            },
+        )
+    };
+
+    // The reload re-resolves our DID document over the network. Only a
+    // backstop (the publish hook catches a rotation the instant it happens),
+    // so it runs on the slower interval.
+    let reload = {
+        let state = state.clone();
+        PeriodicTask::new(
+            tasks::IDENTITY_RELOAD,
+            crate::identity_rotation::RELOAD_INTERVAL,
+            move |_| {
+                let state = state.clone();
+                async move {
+                    if let Err(e) = crate::identity_rotation::reload_now(&state).await {
+                        debug!("identity backstop reload failed: {e}");
+                    }
+                }
+            },
+        )
+    };
+
+    let health = {
+        let state = state.clone();
+        let interval_secs = state.config.registry.health_check_interval.max(10);
+        PeriodicTask::new(
+            tasks::REGISTRY_HEALTH_CHECK,
+            Duration::from_secs(interval_secs),
+            move |_| {
+                let state = state.clone();
+                async move {
+                    // Control's own configured mediator: the send fallback when
+                    // a target's document advertises no transport.
+                    let fallback =
+                        did_hosting_common::server::didcomm_profile::TransportFallback::from_config(
+                            state.config.mediator_did.as_deref(),
+                            state.config.features.tsp,
+                        );
+                    if let Err(e) = run_health_checks(
+                        &state.registry_ks,
+                        &state.didcomm_service,
+                        state.config.server_did.as_deref(),
+                        interval_secs,
+                        &fallback,
+                        // The verifier inbound documents are checked with, so
+                        // a pong answered over HTTPS is held to the same
+                        // per-DID limits.
+                        did_hosting_common::server::trust_tasks::send::Peers::new(
+                            state.did_resolver.as_ref(),
+                            state.trust_tasks_verifier.as_deref(),
+                        ),
+                        state.identity.as_deref(),
+                    )
+                    .await
+                    {
+                        warn!("health check error: {e}");
+                    }
+                }
+            },
+        )
+    };
+
+    vec![
+        purge,
+        expiry,
+        reload,
+        health,
+        state.oob.geoip().reload_task(),
+    ]
+}
+
+/// Start the control plane's background workers under `sup`, leaving out the
+/// periodic tasks `skip` names: shared by the standalone [`run`] (which skips
+/// nothing) and the daemon (which skips what CLAUDE.md lists as its
+/// deliberate omissions).
+///
+/// Both restart with backoff if they stop ([`Policy::Restart`]): the outbox's
+/// queue is durable and every tick is idempotent, so running again is always
+/// safe, and stopping would silently stop replication or identity expiry.
+///
+/// - [`tasks::OUTBOX`] — the durable outbox worker. Idle until a messaging
+///   service is up, then delivers every queued mutation; started before the
+///   service, so it cannot miss the first notify.
+/// - [`tasks::BACKGROUND`] — [`background_tasks`], minus `skip`.
+pub fn spawn_workers(state: &AppState, sup: &mut Supervisor, skip: &'static [&'static str]) {
+    let outbox_state = state.clone();
+    sup.spawn(Stage::Workers, tasks::OUTBOX, Policy::Restart, move |sd| {
+        crate::outbox::run_outbox_loop(
+            outbox_state.clone(),
+            outbox_state.outbox_notify.clone(),
+            sd.watch(),
+        )
+    });
+    let periodic_state = state.clone();
+    sup.spawn(
+        Stage::Workers,
+        tasks::BACKGROUND,
+        Policy::Restart,
+        move |sd| {
+            let tasks = background_tasks(&periodic_state)
+                .into_iter()
+                .filter(|t| !skip.contains(&t.name))
+                .collect();
+            run_periodic(tasks, sd.watch())
+        },
+    );
+}
+
+/// Start the messaging service (DIDComm and/or TSP), retrying with backoff
+/// while it fails, until it starts or `shutdown` is cancelled. `None` when
+/// none is configured (no `server_did` or no mediator) or on shutdown.
+pub async fn start_messaging(
+    state: &AppState,
+    shutdown: CancellationToken,
+) -> Option<DIDCommService> {
+    retry_with_backoff("the messaging service", &shutdown, || {
+        start_didcomm_service(state, shutdown.clone())
+    })
+    .await
+    .flatten()
+}
+
+/// Stop what [`run`] (or the daemon) started, in order, and report what
+/// failed: the workers (and with them the messaging service, which is
+/// awaited); then the HTTP listener; then the hand-offs requests left
+/// running ([`AppState::background`]); then storage, whose last flush and
+/// persist therefore see every write.
+pub async fn shutdown(state: &AppState, mut sup: Supervisor) -> Result<(), AppError> {
+    sup.stop_stage(Stage::Workers, SHUTDOWN_STAGE_DEADLINE)
+        .await;
+    if let Some(svc) = state.didcomm_service.get() {
+        match tokio::time::timeout(SHUTDOWN_STAGE_DEADLINE, svc.shutdown()).await {
+            Ok(()) => info!("DIDComm service stopped"),
+            Err(_) => warn!("DIDComm service did not stop within {SHUTDOWN_STAGE_DEADLINE:?}"),
+        }
+    }
+    sup.stop_stage(Stage::Listeners, SHUTDOWN_STAGE_DEADLINE)
+        .await;
+    state.background.close();
+    if tokio::time::timeout(SHUTDOWN_STAGE_DEADLINE, state.background.wait())
+        .await
+        .is_err()
+    {
+        warn!(
+            remaining = state.background.len(),
+            "background hand-offs did not finish within the shutdown deadline"
+        );
+    }
+    sup.finish(SHUTDOWN_STAGE_DEADLINE)
+        .await
+        .map_err(|failures| {
+            AppError::Internal(format!(
+                "{} task(s) failed: {}",
+                failures.len(),
+                failures
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ))
+        })
+}
+
 pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
     // Validate that at least one management interface is enabled
     if !config.features.http_listener && !config.features.didcomm && !config.features.tsp {
@@ -295,19 +835,6 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
             "UI feature is compiled in but http_listener is disabled — UI will not be accessible"
         );
     }
-
-    // Open keyspace handles
-    let sessions_ks = store.keyspace(KS_SESSIONS)?;
-    let acl_ks = store.keyspace(KS_ACL)?;
-    let registry_ks = store.keyspace(KS_REGISTRY)?;
-    // Strongly consistent: the control plane's DID reads decide writes
-    // (ownership, slot existence, what to push to edges), so a read that
-    // missed a just-committed write could hand one owner's slot to another.
-    let dids_ks = store.keyspace_consistent(KS_DIDS)?;
-    let stats_ks = store.keyspace(KS_STATS)?;
-    // Time-series buckets live in their own keyspace from v0.7 — see
-    // the `timeseries_ks` field doc on `AppState`.
-    let timeseries_ks = store.keyspace(KS_TIMESERIES)?;
 
     // Load the service's own identity (requires server_did). This resolves the
     // DID document for the *real* verification-method key IDs and seeds the
@@ -325,25 +852,6 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     .await;
     // No unsigned mode: a control plane that cannot sign refuses to start.
     crate::signing::require_signing_identity(identity.as_deref(), config.server_did.as_deref())?;
-    let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
-    let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
-
-    // Initialize JWT keys
-    let jwt_keys = init::init_jwt_keys(&secrets);
-
-    // Initialize WebAuthn for passkeys
-    let webauthn = config.public_url.as_ref().and_then(|url| {
-        match did_hosting_common::server::passkey::build_webauthn(url) {
-            Ok(w) => {
-                info!("WebAuthn (passkey) auth enabled");
-                Some(Arc::new(w))
-            }
-            Err(e) => {
-                warn!("WebAuthn initialization failed: {e} — passkey auth disabled");
-                None
-            }
-        }
-    });
 
     // Bind TCP listener on the main thread
     let std_listener = if config.features.http_listener {
@@ -356,115 +864,15 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         None
     };
 
-    // Gather storage thread inputs before moving config into Arc
-    let storage_sessions_ks = sessions_ks.clone();
-    let storage_auth_config = config.auth.clone();
-    let replay_config = config.replay.clone();
-    let has_auth = jwt_keys.is_some();
-
-    let stats_dids_ks = dids_ks.clone();
-    let stats_tiers = config.stats;
-    // Trust Tasks verifier — over the configured DID cache, so `did:web` /
-    // `did:webvh` verificationMethod lookups hit the same cache the DIDComm
-    // path already populates. Built by the one shared constructor (the daemon
-    // builds its control-plane verifier with it too).
-    let trust_tasks_verifier =
-        did_hosting_common::server::trust_tasks::build_verifier(did_resolver.as_ref());
-
-    let pending_challenges =
-        crate::pending_challenges::PendingChallengeTracker::for_auth_config(&config.auth);
-
-    // The local GeoIP database, if configured (base design §12.6). Advisory:
-    // a file that cannot be read is a warning, and sign-in locations show as
-    // "unknown". Read off the runtime's workers — it can be 100+ MB.
-    let geoip = open_geoip(&config.geoip).await?;
-    let client_ips =
-        did_hosting_common::server::rate_limit::ClientIps::from_server_config(&config.server)?;
-
-    let state = AppState {
-        store: store.clone(),
-        sessions_ks,
-        acl_ks,
-        registry_ks,
-        dids_ks,
-        config: Arc::new(config),
-        did_resolver,
-        secrets_resolver,
+    let state = AppState::build(
+        config,
+        store,
+        Some(&secrets),
         identity,
-        trust_tasks_verifier,
-        jwt_keys,
-        webauthn,
-        // Disable redirect-following: combined with the proxy's
-        // Authorization-header passthrough, an attacker-registered backend
-        // URL must not be able to redirect the proxy onto a third-party host
-        // and harvest the forwarded JWT.
-        http_client: reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            // Fail fast: this client backs the Admin reverse proxy, so a slow or
-            // hung (even allow-listed) backend must not pin the handler task and
-            // its connection open indefinitely. Matches the edge/daemon clients.
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("reqwest client construction must succeed"),
-        didcomm_service: Arc::new(std::sync::OnceLock::new()),
-        stats_collector: {
-            use did_hosting_common::server::stats_collector::{StatsCollector, seed_from_store};
-            let collector = StatsCollector::new();
-            // The aggregate, the DID count and the per-DID statistics
-            // overrides, from the store; then the `[stats]` policy.
-            let agg = seed_from_store(&collector, &stats_ks, &stats_dids_ks).await;
-            collector.configure_tiers(stats_tiers);
-            info!(
-                total_dids = agg.total_dids,
-                total_resolves = agg.total_resolves,
-                total_updates = agg.total_updates,
-                "stats collector seeded from store"
-            );
-            Arc::new(collector)
-        },
-        stats_ks: stats_ks.clone(),
-        timeseries_ks: timeseries_ks.clone(),
-        unlisted_signers: Default::default(),
-        replay_cache: Arc::new(crate::replay::ReplayCache::with_config(replay_config)?),
-        path_locks: crate::path_locks::PathLocks::new(),
-        acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
-        pending_challenges: Arc::new(pending_challenges),
-        client_ips,
-        ip_rate_limiter: Arc::new(crate::rate_limit::challenge_limiter()),
-        login_start_rate_limiter: Arc::new(crate::rate_limit::login_start_limiter()),
-        redeem_rate_limiter: Arc::new(crate::rate_limit::redeem_limiter()),
-        webs_self_register_limiter: Arc::new(crate::rate_limit::webs_self_register_limiter()),
-        webs_self_register_global_limiter: Arc::new(
-            crate::rate_limit::webs_self_register_global_limiter(),
-        ),
-        large_document_budget: Arc::new(
-            did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
-        ),
-        outbox_notify: Arc::new(tokio::sync::Notify::new()),
-        // Standalone control plane: no content cache of its own to
-        // invalidate. See the field doc.
-        cache_invalidate: None,
-        oob: Arc::new(crate::oob::OobRuntime::with_geoip(geoip)),
-    };
-
-    // Reload challenges issued before a restart, so the caps hold across it.
-    state
-        .pending_challenges
-        .seed_from_sessions_or_warn(&state.sessions_ks)
-        .await;
-
-    backfill_service_badges(&state.store).await;
-    index_did_records(&state.store).await?;
-
-    // Seed registry from static config
-    seed_registry(&state).await;
-
-    // Sweep idle clients out of the rate limiters on this runtime, not the
-    // REST thread's: invite redemption is charged over DIDComm and TSP too,
-    // so the sweep runs whether or not the HTTP listener is on.
-    let rate_limit_gc = CancellationToken::new();
-    state.spawn_rate_limit_gc(&rate_limit_gc);
+        AppStateOverrides::default(),
+    )
+    .await?;
+    startup(&state).await?;
 
     // Log startup configuration
     info!("--- enabled services ---");
@@ -494,52 +902,34 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         info!("  mediator DID : {did}");
     }
 
-    // Shutdown channels
-    let (rest_shutdown_tx, rest_shutdown_rx) = watch::channel(false);
-    let (storage_shutdown_tx, storage_shutdown_rx) = watch::channel(false);
-    let (rest_ready_tx, rest_ready_rx) = oneshot::channel::<()>();
+    let mut sup = Supervisor::new("did-hosting-control");
+    let mut signal = std::pin::pin!(init::shutdown_signal());
 
-    // 1. Spawn REST thread
-    let rest_handle = if let Some(listener) = std_listener {
-        let mut rest_shutdown = rest_shutdown_rx.clone();
+    // Sweep idle clients out of the rate limiters on this runtime, not the
+    // REST thread's: invite redemption is charged over DIDComm and TSP too,
+    // so the sweep runs whether or not the HTTP listener is on.
+    state.spawn_rate_limit_gc(&sup.signal(Stage::Workers).token());
+
+    // 1. The REST thread. Critical: it owns the listening socket.
+    let (rest_ready_tx, rest_ready_rx) = oneshot::channel::<()>();
+    if let Some(listener) = std_listener {
         let rest_state = state.clone();
-        Some(
-            std::thread::Builder::new()
-                .name("control-rest".into())
-                .spawn(move || {
-                    run_rest_thread(listener, rest_state, &mut rest_shutdown, rest_ready_tx)
-                })
-                .map_err(|e| AppError::Internal(format!("failed to spawn REST thread: {e}")))?,
-        )
+        sup.spawn_thread(Stage::Listeners, "control-rest", move |sd| {
+            run_rest_thread(listener, rest_state, sd.watch(), rest_ready_tx)
+        })
+        .map_err(|e| AppError::Internal(format!("failed to spawn REST thread: {e}")))?;
     } else {
         let _ = rest_ready_tx.send(());
-        None
-    };
+    }
 
-    // 2. Spawn storage thread (cleanup + stats flush)
-    let mut storage_shutdown = storage_shutdown_rx.clone();
-    let storage_stats_ks = state.stats_ks.clone();
-    let storage_timeseries_ks = state.timeseries_ks.clone();
-    let storage_dids_ks = state.dids_ks.clone();
-    let storage_collector = state.stats_collector.clone();
-    let stats_flush = state.config.stats_flush;
-    let storage_handle = std::thread::Builder::new()
-        .name("control-storage".into())
-        .spawn(move || {
-            run_storage_thread(
-                store,
-                storage_sessions_ks,
-                storage_stats_ks,
-                storage_timeseries_ks,
-                storage_dids_ks,
-                storage_auth_config,
-                has_auth,
-                storage_collector,
-                stats_flush,
-                &mut storage_shutdown,
-            )
-        })
-        .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
+    // 2. The storage thread (cleanup + stats flush, then the last flush and
+    //    the persist). Critical: it is what persists the store at shutdown.
+    let storage = ControlStorage::of(&state);
+    let storage_store = state.store.clone();
+    sup.spawn_thread(Stage::Storage, "control-storage", move |sd| {
+        run_storage_thread(storage_store, storage, sd.watch())
+    })
+    .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
 
     // Wait for REST to be ready before starting DIDComm
     let _ = rest_ready_rx.await;
@@ -558,176 +948,39 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         warn!("failed to establish the service identity from its DID document: {e}");
     }
 
-    // 3. Start the mediator messaging service (DIDComm and/or TSP) for
-    //    inbound + outbound messages. TSP-only deployments (didcomm off,
-    //    tsp on) must still start it.
-    let didcomm_shutdown = CancellationToken::new();
+    // 3. The workers: the outbox and the periodic sweeps. Shared with the
+    //    daemon; started before messaging so the outbox is waiting for it.
+    spawn_workers(&state, &mut sup, &[]);
+
+    // 4. The mediator messaging service (DIDComm and/or TSP) for inbound +
+    //    outbound messages, retried with backoff while it fails. TSP-only
+    //    deployments (didcomm off, tsp on) must still start it.
+    let mut interrupted = false;
     if state.config.features.didcomm || state.config.features.tsp {
-        match start_didcomm_service(&state, didcomm_shutdown.clone()).await {
-            Ok(Some(svc)) => {
-                let _ = state.didcomm_service.set(svc);
+        tokio::select! {
+            svc = start_messaging(&state, sup.signal(Stage::Workers).token()) => {
+                if let Some(svc) = svc {
+                    let _ = state.didcomm_service.set(svc);
+                }
             }
-            Ok(None) => {}
-            Err(e) => {
-                warn!("failed to start DIDComm service: {e}");
-            }
+            _ = &mut signal => interrupted = true,
         }
     }
 
-    // 3b. Everything that has to follow the listener — shared with the daemon.
+    // 4b. Everything that has to follow the listener — shared with the daemon.
     post_listener_startup(&state);
 
-    // 4. Spawn DIDComm health check task (runs on main tokio runtime)
-    let health_shutdown = CancellationToken::new();
-    let health_token = health_shutdown.clone();
-    let health_registry_ks = state.registry_ks.clone();
-    let health_didcomm = state.didcomm_service.clone();
-    let health_control_did = state.config.server_did.clone();
-    let health_interval_secs = state.config.registry.health_check_interval.max(10);
-    let health_resolver = state.did_resolver.clone();
-    // The same verifier inbound documents are checked with, so a pong
-    // answered over HTTPS is held to the same per-DID limits.
-    let health_verifier = state.trust_tasks_verifier.clone();
-    let health_identity = state.identity.clone();
-    // Control's own configured mediator, used as the send fallback when a
-    // target server's document advertises no transport.
-    let health_fallback =
-        did_hosting_common::server::didcomm_profile::TransportFallback::from_config(
-            state.config.mediator_did.as_deref(),
-            state.config.features.tsp,
-        );
-    tokio::spawn(async move {
-        let mut timer = tokio::time::interval(Duration::from_secs(health_interval_secs));
-        timer.tick().await; // skip first tick
-        loop {
-            tokio::select! {
-                _ = timer.tick() => {
-                    if let Err(e) = run_health_checks(
-                        &health_registry_ks,
-                        &health_didcomm,
-                        health_control_did.as_deref(),
-                        health_interval_secs,
-                        &health_fallback,
-                        did_hosting_common::server::trust_tasks::send::Peers::new(
-                            health_resolver.as_ref(),
-                            health_verifier.as_deref(),
-                        ),
-                        health_identity.as_deref(),
-                    ).await {
-                        warn!("health check error: {e}");
-                    }
-                }
-                _ = health_token.cancelled() => break,
-            }
-        }
-    });
-
-    // 5. Spawn the control-plane purge sweep. Mirrors the server-side
-    // sweep but only deletes DomainEntry rows for ripe `disable-grace`
-    // pending purges — control has no hosted DIDs to clean up.
-    let (purge_shutdown_tx, purge_shutdown_rx) = tokio::sync::watch::channel(false);
-    let purge_store = state.store.clone();
-    let purge_handle = tokio::spawn(async move {
-        crate::purge_sweep::run_purge_sweep_loop(purge_store, purge_shutdown_rx).await;
-    });
-
-    // 5b. Spawn the identity sweep. Expires generations whose grace period has
-    // elapsed (dropping their key material, so a superseded key stops
-    // decrypting), and doubles as the backstop for identity changes that never
-    // came through our own publish path — an out-of-band update, or one applied
-    // while this process was down.
-    let (identity_shutdown_tx, identity_shutdown_rx) = tokio::sync::watch::channel(false);
-    let identity_state = state.clone();
-    let identity_handle = tokio::spawn(async move {
-        crate::identity_rotation::run_identity_sweep_loop(identity_state, identity_shutdown_rx)
-            .await;
-    });
-
-    // 6. Spawn the durable outbox worker. Drains
-    // `crate::outbox::KS_OUTBOUND_QUEUE` per-target FIFO; wakes on
-    // `state.outbox_notify` (fired by every enqueue) for the low-
-    // latency happy path, falls back to a 30 s tick to retry backed-
-    // off entries.
-    let (outbox_shutdown_tx, outbox_shutdown_rx) = tokio::sync::watch::channel(false);
-    let outbox_state = state.clone();
-    let outbox_notify = state.outbox_notify.clone();
-    // The GeoIP reloader (step 8) stops on the same signal.
-    let geoip_shutdown_rx = outbox_shutdown_rx.clone();
-    let outbox_handle = tokio::spawn(async move {
-        crate::outbox::run_outbox_loop(outbox_state, outbox_notify, outbox_shutdown_rx).await;
-    });
-
-    // 7. Check, in the background, that our own DID lists the services
-    // wallet sign-in needs; warn once with the fix if not. Never blocks.
-    crate::sign_in_readiness::spawn(&state);
-
-    // 8. A refreshed GeoIP database is picked up without a restart.
-    let geoip_reloader = state.oob.geoip().spawn_reloader(geoip_shutdown_rx);
-
-    // Wait for shutdown signal
-    init::shutdown_signal().await;
-
-    // Ordered shutdown: health → DIDComm → REST → Storage
-    let mut any_panic = false;
-
-    health_shutdown.cancel();
-    didcomm_shutdown.cancel();
-    rate_limit_gc.cancel();
-    let _ = purge_shutdown_tx.send(true);
-    let _ = identity_shutdown_tx.send(true);
-    let _ = outbox_shutdown_tx.send(true);
-    // DIDCommService shutdown is handled by the cancellation token
-
-    let _ = rest_shutdown_tx.send(true);
-    if let Some(handle) = rest_handle {
-        match tokio::task::spawn_blocking(move || handle.join()).await {
-            Ok(Ok(())) => info!("REST thread stopped"),
-            Ok(Err(_)) => {
-                error!("REST thread panicked");
-                any_panic = true;
-            }
-            Err(e) => {
-                error!("failed to join REST thread: {e}");
-                any_panic = true;
-            }
-        }
+    // Run until the shutdown signal, or until a critical task stops.
+    let outcome = if interrupted {
+        Ok(())
+    } else {
+        sup.run_until(&mut signal).await
+    };
+    let stopped = shutdown(&state, sup).await;
+    if let Err(failure) = outcome {
+        return Err(AppError::Internal(format!("shut down because {failure}")));
     }
-
-    let _ = storage_shutdown_tx.send(true);
-    match tokio::task::spawn_blocking(move || storage_handle.join()).await {
-        Ok(Ok(())) => info!("storage thread stopped"),
-        Ok(Err(_)) => {
-            error!("storage thread panicked");
-            any_panic = true;
-        }
-        Err(e) => {
-            error!("failed to join storage thread: {e}");
-            any_panic = true;
-        }
-    }
-
-    if let Err(e) = purge_handle.await {
-        warn!("purge sweep task didn't shut down cleanly: {e}");
-    }
-
-    if let Err(e) = identity_handle.await {
-        warn!("identity sweep task didn't shut down cleanly: {e}");
-    }
-
-    if let Err(e) = outbox_handle.await {
-        warn!("outbox worker didn't shut down cleanly: {e}");
-    }
-
-    if let Some(handle) = geoip_reloader
-        && let Err(e) = handle.await
-    {
-        warn!("GeoIP reloader didn't shut down cleanly: {e}");
-    }
-
-    if any_panic {
-        return Err(AppError::Internal("one or more threads panicked".into()));
-    }
-
+    stopped?;
     info!("control plane shut down");
     Ok(())
 }
@@ -1015,7 +1268,7 @@ pub async fn seed_registry(state: &AppState) {
 fn run_rest_thread(
     std_listener: std::net::TcpListener,
     state: AppState,
-    shutdown_rx: &mut watch::Receiver<bool>,
+    mut shutdown_rx: watch::Receiver<bool>,
     ready_tx: oneshot::Sender<()>,
 ) {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1048,17 +1301,20 @@ fn run_rest_thread(
 
         let _ = ready_tx.send(());
 
-        let mut rx = shutdown_rx.clone();
         // Header, idle, connection and per-address limits: see `listener`.
-        axum::serve(
+        // An error ends the thread, which the supervisor reports as a
+        // critical exit.
+        if let Err(e) = axum::serve(
             did_hosting_common::server::listener::bounded(listener, &trusted_proxies),
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .with_graceful_shutdown(async move {
-            let _ = rx.changed().await;
+            let _ = shutdown_rx.changed().await;
         })
         .await
-        .expect("axum serve failed");
+        {
+            tracing::error!("HTTP server failed: {e}");
+        }
 
         info!("REST thread shutting down");
     });
@@ -1068,19 +1324,10 @@ fn run_rest_thread(
 // Storage thread
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-fn run_storage_thread(
-    store: Store,
-    sessions_ks: KeyspaceHandle,
-    stats_ks: KeyspaceHandle,
-    timeseries_ks: KeyspaceHandle,
-    dids_ks: KeyspaceHandle,
-    auth_config: AuthConfig,
-    has_auth: bool,
-    collector: Arc<did_hosting_common::server::stats_collector::StatsCollector>,
-    stats_flush: crate::config::StatsFlushConfig,
-    shutdown_rx: &mut watch::Receiver<bool>,
-) {
+/// The storage ticks ([`storage_tasks`]) on a runtime of their own until
+/// shutdown, then the last statistics flush and the store's persist. Storage
+/// is the last stage [`shutdown`] stops, so both see every write.
+fn run_storage_thread(store: Store, storage: ControlStorage, shutdown_rx: watch::Receiver<bool>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1088,67 +1335,12 @@ fn run_storage_thread(
 
     rt.block_on(async {
         info!("storage thread started");
+        run_periodic(storage_tasks(&storage), shutdown_rx).await;
+        info!("storage thread shutting down");
 
-        let session_interval = Duration::from_secs(auth_config.session_cleanup_interval);
-        let flush_interval = crate::config::STATS_FLUSH_INTERVAL;
-
-        let mut session_timer = tokio::time::interval(session_interval);
-        let mut flush_timer = tokio::time::interval(flush_interval);
-        // A flush that overruns its interval is followed by a full interval,
-        // not an immediate catch-up flush.
-        flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut did_count_timer = tokio::time::interval(
-            did_hosting_common::server::stats_collector::DID_COUNT_RECONCILE_INTERVAL,
-        );
-        let mut stats_maintenance = crate::stats_migration::StatsMaintenance::new(
-            stats_ks.clone(),
-            timeseries_ks.clone(),
-            dids_ks.clone(),
-        );
-
-        // Skip first tick (immediate)
-        session_timer.tick().await;
-        flush_timer.tick().await;
-        did_count_timer.tick().await;
-
-        loop {
-            tokio::select! {
-                _ = session_timer.tick(), if has_auth => {
-                    if let Err(e) = cleanup_expired_sessions(&sessions_ks, auth_config.challenge_ttl).await {
-                        warn!("session cleanup error: {e}");
-                    }
-                }
-                _ = flush_timer.tick() => {
-                    // One deadline for the tick: the flush, then the migration
-                    // in what is left of it, so the tick keeps its interval.
-                    let deadline = tokio::time::Instant::now() + crate::config::STATS_FLUSH_INTERVAL;
-                    // Flush accumulated per-DID stats deltas to persistent store
-                    if let Err(e) = flush_stats_paced_until(&collector, &stats_ks, &timeseries_ks, &stats_flush, shutdown_rx.clone(), deadline).await {
-                        warn!("stats flush error: {e}");
-                    }
-                    // Then the migration to (and clean-up after) the tiered
-                    // statistics format, a flush's worth at a time.
-                    if let Err(e) = stats_maintenance.step(&collector, &stats_flush, shutdown_rx.clone(), deadline).await {
-                        warn!("stats migration error: {e}");
-                    }
-                }
-                _ = did_count_timer.tick() => {
-                    if let Err(e) = did_hosting_common::server::stats_collector::reconcile_total_dids(&collector, &dids_ks).await {
-                        warn!("DID count reconcile error: {e}");
-                    }
-                }
-                _ = shutdown_rx.changed() => {
-                    info!("storage thread shutting down");
-                    break;
-                }
-            }
-        }
-
-        // Final flush before shutdown
-        flush_remaining_stats(&collector, &stats_ks, &timeseries_ks).await;
-
+        storage.final_flush().await;
         if let Err(e) = store.persist().await {
-            error!("failed to persist store on shutdown: {e}");
+            tracing::error!("failed to persist store on shutdown: {e}");
         } else {
             info!("store persisted");
         }

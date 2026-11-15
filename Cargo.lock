@@ -3155,6 +3155,7 @@ dependencies = [
  "azure_data_cosmos_driver",
  "base64 0.23.1",
  "chrono",
+ "clap",
  "dialoguer",
  "didwebvh-rs",
  "ed25519-dalek 3.0.0",

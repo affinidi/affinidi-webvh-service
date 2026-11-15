@@ -430,6 +430,56 @@ impl DaemonConfig {
     }
 }
 
+/// What the shared subcommands read: the daemon's own configuration, with the
+/// embedded witness's store for `--witness`.
+impl did_hosting_common::server::cli::ServiceConfig for DaemonConfig {
+    fn config_path(&self) -> &std::path::Path {
+        &self.config_path
+    }
+    fn store(&self) -> &StoreConfig {
+        &self.store
+    }
+    fn secrets(&self) -> &SecretsConfig {
+        &self.secrets
+    }
+    fn server_did(&self) -> Option<&str> {
+        self.server_did.as_deref()
+    }
+    fn mediator_did(&self) -> Option<&str> {
+        self.mediator_did.as_deref()
+    }
+    fn public_url(&self) -> Option<&str> {
+        self.public_url.as_deref()
+    }
+    fn features(&self) -> &FeaturesConfig {
+        &self.features
+    }
+    fn hosting(&self) -> &HostingConfig {
+        &self.hosting
+    }
+    fn identity(&self) -> &IdentityConfig {
+        &self.identity
+    }
+    fn server(&self) -> &ServerConfig {
+        &self.server
+    }
+    fn auth(&self) -> &AuthConfig {
+        &self.auth
+    }
+    fn witness_store(&self) -> Option<&StoreConfig> {
+        Some(&self.witness_store)
+    }
+}
+
+impl did_hosting_control::cli::StatsSettings for DaemonConfig {
+    fn stats_flush(&self) -> &did_hosting_control::config::StatsFlushConfig {
+        &self.stats_flush
+    }
+    fn stats_tiers(&self) -> &did_hosting_control::config::StatsTierConfig {
+        &self.stats
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

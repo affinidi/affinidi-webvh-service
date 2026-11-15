@@ -16,7 +16,7 @@ Triggers differ by what each service can observe:
 | server | — (no management routes) | ✅ `MSG_SYNC_UPDATE` | ✅ |
 | witness | — (hosts no DIDs) | — | ✅ **only trigger** |
 | watcher | — (its own DID is published elsewhere) | — | ✅ **only trigger** |
-| daemon | ✅ via control | — | ✅ in the unified storage task |
+| daemon | ✅ via control | — | ✅ via control (`spawn_workers`) |
 
 The witness has no `dids` keyspace and no publish path, and the watcher's own DID
 is likewise published by another process (it mirrors DIDs from its sources, but a

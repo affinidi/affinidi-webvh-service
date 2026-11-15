@@ -12,9 +12,12 @@ use ipnetwork::IpNetwork;
 use did_hosting_common::server::didcomm_profile::{build_own_listener, wait_for_did_resolution};
 use did_hosting_common::server::identity::{self, ServiceIdentity};
 use did_hosting_common::server::init;
+use did_hosting_common::server::supervise::{
+    PeriodicTask, Policy, SHUTDOWN_STAGE_DEADLINE, Stage, Supervisor, run_periodic,
+};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{AppConfig, AuthConfig};
+use crate::config::AppConfig;
 use crate::control_register;
 use crate::did_ops::cleanup_empty_dids;
 use crate::error::AppError;
@@ -199,11 +202,161 @@ pub fn require_control_plane(config: &AppConfig) -> Result<(), AppError> {
     Ok(())
 }
 
-pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
-    require_control_plane(&config)?;
-    let dids_ks = store.keyspace(KS_DIDS)?;
+/// The names of the edge's background tasks: what its supervisor logs, and
+/// what the daemon's skip list and parity test refer to.
+pub mod tasks {
+    /// Empty DID slots past their TTL are deleted (storage).
+    pub const EMPTY_DID_CLEANUP: &str = "empty-did-cleanup";
+    /// The hosted-DID count is recounted from the keys (storage). The
+    /// control plane's tick of the same name does the same.
+    pub const DID_COUNT_RECONCILE: &str = "did-count-reconcile";
+    /// Ripe pending purges (an unassign or a domain disable past its grace)
+    /// are carried out, and expired resolution cache entries dropped
+    /// (storage).
+    pub const PURGE_SWEEP: &str = "purge-sweep";
+    /// Registration with the control plane, repeated on every reconnect and
+    /// every [`super::RESYNC_INTERVAL`].
+    pub const KEEP_REGISTERED: &str = "keep-registered";
+    /// The reconcile loop against the control plane's listing.
+    pub const REPLICATION_RECONCILE: &str = "replication-reconcile";
+    /// The TSP relationship with the control plane, re-ensured on reconnect.
+    pub const CONTROL_TSP_RELATIONSHIP: &str = "control-tsp-relationship";
+    /// Statistics deltas sent to the control plane.
+    pub const STATS_SYNC: &str = "stats-sync";
+    /// The edge's own identity expiry and reload.
+    pub const IDENTITY_SWEEP: &str = "identity-sweep";
 
-    // Integrity check on DID keyspace
+    /// Every storage tick ([`super::storage_tasks`]).
+    pub const STORAGE: [&str; 3] = [EMPTY_DID_CLEANUP, DID_COUNT_RECONCILE, PURGE_SWEEP];
+    /// Every task that talks to the control plane or runs the edge's own
+    /// identity: all need the edge's own messaging service.
+    pub const MESSAGING: [&str; 5] = [
+        KEEP_REGISTERED,
+        REPLICATION_RECONCILE,
+        CONTROL_TSP_RELATIONSHIP,
+        STATS_SYNC,
+        IDENTITY_SWEEP,
+    ];
+}
+
+/// Told the mnemonics of the DIDs a storage tick deleted (the daemon deletes
+/// their statistics, which an edge does not keep).
+pub type RemovedDidsHook =
+    Arc<dyn Fn(Vec<String>) -> did_hosting_common::server::supervise::BoxFuture + Send + Sync>;
+
+/// What the edge's storage ticks work on. The daemon builds one over its own
+/// store, with its control plane's path locks and a hook for statistics.
+#[derive(Clone)]
+pub struct EdgeStorage {
+    pub store: Store,
+    pub dids_ks: KeyspaceHandle,
+    /// How long an empty slot is kept (`auth.cleanup_ttl_minutes`).
+    pub did_ttl_seconds: u64,
+    pub collector: Arc<stats::StatsCollector>,
+    pub caches: crate::cache::ResolutionCaches,
+    /// The path locks of a control plane writing the same store (the
+    /// daemon); `None` on an edge, whose writes take none.
+    pub path_locks: Option<did_hosting_common::server::path_locks::PathLocks>,
+    pub on_removed: Option<RemovedDidsHook>,
+}
+
+impl EdgeStorage {
+    async fn removed(&self, mnemonics: Vec<String>) {
+        if let Some(hook) = &self.on_removed
+            && !mnemonics.is_empty()
+        {
+            hook(mnemonics).await;
+        }
+    }
+}
+
+/// The edge's storage ticks ([`tasks::STORAGE`]): run on its storage thread,
+/// and in the daemon's storage task.
+pub fn storage_tasks(storage: &EdgeStorage) -> Vec<PeriodicTask> {
+    let cleanup = {
+        let s = storage.clone();
+        PeriodicTask::new(
+            tasks::EMPTY_DID_CLEANUP,
+            Duration::from_secs(s.did_ttl_seconds.max(60)),
+            move |_| {
+                let s = s.clone();
+                async move {
+                    match cleanup_empty_dids(&s.dids_ks, s.did_ttl_seconds, s.path_locks.as_ref())
+                        .await
+                    {
+                        Ok(removed) if removed.is_empty() => {}
+                        Ok(removed) => {
+                            info!(count = removed.len(), "cleaned up empty DID records");
+                            for mnemonic in &removed {
+                                s.caches.forget_did(mnemonic);
+                            }
+                            s.collector.subtract_total_dids(removed.len() as u64);
+                            s.removed(removed).await;
+                        }
+                        Err(e) => warn!("DID cleanup error: {e}"),
+                    }
+                }
+            },
+        )
+    };
+
+    // DIDs reach an edge by sync, which does not count them; the recount
+    // keeps the edge's figure in step.
+    let recount = {
+        let s = storage.clone();
+        PeriodicTask::new(
+            tasks::DID_COUNT_RECONCILE,
+            did_hosting_common::server::stats_collector::DID_COUNT_RECONCILE_INTERVAL,
+            move |_| {
+                let s = s.clone();
+                async move {
+                    if let Err(e) =
+                        did_hosting_common::server::stats_collector::reconcile_total_dids(
+                            &s.collector,
+                            &s.dids_ks,
+                        )
+                        .await
+                    {
+                        warn!("DID count reconcile error: {e}");
+                    }
+                }
+            },
+        )
+    };
+
+    // Each minute: run the grace-expired purge sweep (the schedule an
+    // unassign or a domain disable acknowledged to the control plane), then
+    // drop expired content cache entries (they live `RESOLUTION_CACHE_TTL`)
+    // so DIDs nobody asks for again do not stay in memory — or the whole
+    // cache, when the sweep purged something.
+    let purge = {
+        let s = storage.clone();
+        PeriodicTask::new(
+            tasks::PURGE_SWEEP,
+            crate::purge_sweep::DEFAULT_SWEEP_INTERVAL,
+            move |_| {
+                let s = s.clone();
+                async move {
+                    let sweep = crate::purge_sweep::run_edge_sweep_tick(
+                        &s.store,
+                        s.path_locks.as_ref(),
+                        &s.caches.content,
+                        s.caches.gate.as_deref(),
+                        Some(&s.collector),
+                    )
+                    .await;
+                    s.removed(sweep.purged_dids).await;
+                }
+            },
+        )
+    };
+
+    vec![cleanup, recount, purge]
+}
+
+/// Integrity check of the DID keyspace: logged, never fatal. Shared with the
+/// daemon.
+pub async fn check_store_integrity(dids_ks: &KeyspaceHandle) {
     match dids_ks.verify_integrity().await {
         Ok(0) => debug!("store integrity check passed"),
         Ok(n) => warn!(
@@ -212,31 +365,156 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         ),
         Err(e) => warn!(error = %e, "store integrity check failed"),
     }
+}
 
-    // First-boot multi-domain init (daemon parity with
-    // did-hosting-daemon/src/main.rs:544-622). Three idempotent steps:
-    //
-    //   1. seed_domains_first_boot — populates KS_DOMAINS from
-    //      `[hosting] bootstrap_domains`, falling back to legacy
-    //      `public_url` host on upgrade. Without this, the
-    //      resolve-side safety check (assert_resolution_allowed) takes
-    //      the "permissive skip" branch on every resolve and emits a
-    //      warn-log per request — annoying noise on standalone v0.6
-    //      → v0.7 upgrades.
-    //   2. seed_assignments_first_boot — same tier chain, populates
-    //      KS_ASSIGNMENTS so this server knows which domains it
-    //      serves (matters once a control plane starts driving
-    //      replica/domain/assign / unassign).
-    //   3. MigrationRunner::run_pending — runs T13 M-01 which fills
-    //      DidRecord.domain for legacy records by parsing the
-    //      embedded did_id host. Required for write-side checks
-    //      that key on domain once domains are configured.
-    //
-    // All three are idempotent (markers in `meta` keyspace gate the
-    // migration; existing keyspace entries short-circuit the seeds),
-    // so re-running on every boot is cheap.
-    run_first_boot_init(&store, &config).await;
-    // High-water rows written before the compact mark held whole logs.
+/// Start the edge's messaging service (DIDComm and/or TSP), retrying with
+/// backoff while it fails — an edge without one can never reconcile —
+/// until it starts or `shutdown` is cancelled. `None` when none is
+/// configured or on shutdown.
+pub async fn start_messaging(
+    state: &AppState,
+    shutdown: CancellationToken,
+) -> Option<DIDCommService> {
+    did_hosting_common::server::supervise::retry_with_backoff(
+        "the messaging service",
+        &shutdown,
+        || start_didcomm_service(state, shutdown.clone()),
+    )
+    .await
+    .flatten()
+}
+
+/// Start the tasks that talk to the control plane over `svc`
+/// ([`tasks::MESSAGING`] but the identity sweep, which needs no service).
+/// Each restarts with backoff if it stops: all are idempotent, and each one
+/// stopping would silently stop this edge following its control plane.
+fn spawn_messaging_tasks(state: &AppState, svc: &DIDCommService, sup: &mut Supervisor) {
+    // Register with control plane via DIDComm (uses the shared connection)
+    if state.config.control_did.is_some() {
+        let (state, svc) = (state.clone(), svc.clone());
+        sup.spawn(
+            Stage::Workers,
+            tasks::KEEP_REGISTERED,
+            Policy::Restart,
+            move |sd| {
+                let (state, svc) = (state.clone(), svc.clone());
+                async move {
+                    tokio::select! {
+                        _ = keep_registered(state, svc) => {}
+                        _ = sd.stopped() => {}
+                    }
+                }
+            },
+        );
+    }
+
+    // Reconcile against the control plane's listing every interval — the
+    // backstop behind the outbox, and what the staleness bound measures.
+    {
+        let (state, svc) = (state.clone(), svc.clone());
+        sup.spawn(
+            Stage::Workers,
+            tasks::REPLICATION_RECONCILE,
+            Policy::Restart,
+            move |sd| {
+                crate::replication::run_reconcile_loop(state.clone(), svc.clone(), sd.watch())
+            },
+        );
+    }
+
+    // Keep a TSP relationship with the control plane established. Under Rev 3
+    // §7.2.2 the control plane's application pushes (sync/health) are dropped
+    // unless this edge holds a relationship with it, and forming one is the
+    // edge's job — the control plane persists its half and does not re-invite.
+    // The ensure is idempotent (skips when already Bidirectional) and MUST
+    // fire on every (re)connect, not just first boot: a control-plane restart,
+    // or a handshake that never completed, is repaired on the edge's next
+    // connect. See docs/tsp-transport.md.
+    if let Some(control_did) = state.config.control_did.clone()
+        && state.config.features.tsp
+    {
+        let svc = svc.clone();
+        sup.spawn(
+            Stage::Workers,
+            tasks::CONTROL_TSP_RELATIONSHIP,
+            Policy::Restart,
+            move |sd| {
+                let (svc, control_did) = (svc.clone(), control_did.clone());
+                async move {
+                    tokio::select! {
+                        _ = ensure_control_tsp_relationship(svc, control_did) => {}
+                        _ = sd.stopped() => {}
+                    }
+                }
+            },
+        );
+    }
+
+    // Stats sync — TSP or DIDComm, per the control DID.
+    let interval = state.config.stats.sync_interval_secs;
+    if let (Some(control_did), Some(server_did), Some(collector)) = (
+        state.config.control_did.clone(),
+        state.config.server_did.clone(),
+        state.stats_collector.clone(),
+    ) && interval > 0
+    {
+        let (state, svc) = (state.clone(), svc.clone());
+        sup.spawn(
+            Stage::Workers,
+            tasks::STATS_SYNC,
+            Policy::Restart,
+            move |sd| {
+                let task = {
+                    let (state, svc) = (state.clone(), svc.clone());
+                    let (control_did, server_did) = (control_did.clone(), server_did.clone());
+                    let collector = collector.clone();
+                    PeriodicTask::new(
+                        tasks::STATS_SYNC,
+                        Duration::from_secs(interval.max(1)),
+                        move |_| {
+                            let (state, svc) = (state.clone(), svc.clone());
+                            let (control_did, server_did) =
+                                (control_did.clone(), server_did.clone());
+                            let collector = collector.clone();
+                            async move {
+                                stats::sync_to_control_messaging(
+                                    &svc,
+                                    &state,
+                                    &server_did,
+                                    &control_did,
+                                    &collector,
+                                )
+                                .await;
+                            }
+                        },
+                    )
+                };
+                run_periodic(vec![task], sd.watch())
+            },
+        );
+    }
+}
+
+pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Result<(), AppError> {
+    require_control_plane(&config)?;
+    let dids_ks = store.keyspace(KS_DIDS)?;
+
+    check_store_integrity(&dids_ks).await;
+
+    // First-boot multi-domain init, shared with the daemon (which treats a
+    // failure as fatal). See `run_first_boot_init`.
+    if let Err(e) = run_first_boot_init(
+        &store,
+        &config,
+        did_hosting_common::server::migrations::registry(),
+        FirstBoot::Lenient,
+    )
+    .await
+    {
+        warn!(error = %e, "first-boot init incomplete");
+    }
+    // High-water rows written before the compact mark held whole logs. An
+    // edge's own state (the daemon keeps no high-water rows).
     match crate::control_register::migrate_high_water_marks(&dids_ks, &store).await {
         Ok(0) => {}
         Ok(n) => info!(rewritten = n, "high-water marks compacted"),
@@ -278,12 +556,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         listener
     };
 
-    // Gather storage thread inputs before moving config into Arc
-    let storage_dids_ks = dids_ks.clone();
-    let storage_auth_config = config.auth.clone();
-
+    let did_ttl_seconds = config.auth.cleanup_ttl_minutes * 60;
     let upload_body_limit = config.limits.upload_body_limit;
-    let stats_config = config.stats.clone();
 
     // Initialize in-memory stats collector (starts at zero — no disk persistence)
     let stats_collector = {
@@ -291,7 +565,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         // buckets: nothing would ever drain them.
         let collector = stats::StatsCollector::without_timeseries();
         // Counted from the keys, without reading the records.
-        let total_dids = match storage_dids_ks.prefix_count("did:").await {
+        let total_dids = match dids_ks.prefix_count("did:").await {
             Ok(n) => n as u64,
             Err(e) => {
                 warn!(error = %e, "could not count hosted DIDs; the hourly recount will");
@@ -330,51 +604,42 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         info!("  mediator DID : {did}");
     }
 
-    // Separate shutdown channels for ordered shutdown (DIDComm → REST → Storage)
-    let (rest_shutdown_tx, rest_shutdown_rx) = watch::channel(false);
-    let (storage_shutdown_tx, storage_shutdown_rx) = watch::channel(false);
+    let mut sup = Supervisor::new("did-hosting-server");
+    let mut signal = std::pin::pin!(init::shutdown_signal());
 
     // REST ready signal — DIDComm waits for this before starting
     let (rest_ready_tx, rest_ready_rx) = oneshot::channel::<()>();
 
-    // 1. Spawn HTTP thread first — must be serving before DIDComm starts
-    //    (the server's own DID needs to be resolvable for mediator auth)
-    let mut rest_shutdown = rest_shutdown_rx.clone();
+    // 1. HTTP thread first — must be serving before DIDComm starts (the
+    //    server's own DID needs to be resolvable for mediator auth). Critical:
+    //    it owns the listening socket, and an edge without HTTP serves nothing.
     let rest_state = state.clone();
-    let rest_handle = std::thread::Builder::new()
-        .name("webvh-rest".into())
-        .spawn(move || {
-            run_rest_thread(
-                std_listener,
-                rest_state,
-                upload_body_limit,
-                &mut rest_shutdown,
-                rest_ready_tx,
-            )
-        })
-        .map_err(|e| AppError::Internal(format!("failed to spawn HTTP thread: {e}")))?;
+    sup.spawn_thread(Stage::Listeners, "webvh-rest", move |sd| {
+        run_rest_thread(
+            std_listener,
+            rest_state,
+            upload_body_limit,
+            sd.watch(),
+            rest_ready_tx,
+        )
+    })
+    .map_err(|e| AppError::Internal(format!("failed to spawn HTTP thread: {e}")))?;
 
-    // 2. Spawn storage thread (independent cleanup, flush, sync)
-    let mut storage_shutdown = storage_shutdown_rx.clone();
-    let storage_collector = stats_collector.clone();
-    let storage_stats_config = stats_config;
-    let storage_caches = state.resolution_caches();
-    let storage_handle = std::thread::Builder::new()
-        .name("webvh-storage".into())
-        .spawn(move || {
-            run_storage_thread(
-                StorageThreadParams {
-                    store,
-                    dids_ks: storage_dids_ks,
-                    auth_config: storage_auth_config,
-                    collector: storage_collector,
-                    stats_config: storage_stats_config,
-                    caches: storage_caches,
-                },
-                &mut storage_shutdown,
-            )
-        })
-        .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
+    // 2. The storage thread (cleanup, recount, purge; then the persist).
+    //    Critical: it is what persists the store at shutdown.
+    let storage = EdgeStorage {
+        store: store.clone(),
+        dids_ks,
+        did_ttl_seconds,
+        collector: stats_collector,
+        caches: state.resolution_caches(),
+        path_locks: None,
+        on_removed: None,
+    };
+    sup.spawn_thread(Stage::Storage, "webvh-storage", move |sd| {
+        run_storage_thread(storage, sd.watch())
+    })
+    .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
 
     // 3. Wait for REST to be serving before starting DIDComm
     //    (the server's own DID needs to be resolvable for mediator auth)
@@ -389,100 +654,43 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         warn!("failed to establish the service identity from its DID document: {e}");
     }
 
-    // 4. Start the mediator messaging service (DIDComm and/or TSP) — one
-    //    connection for both receiving and sending. TSP-only deployments
-    //    (didcomm off, tsp on) must still start it.
-    let didcomm_shutdown = CancellationToken::new();
+    // 4. The identity sweep. Expires generations whose grace period has
+    // elapsed (so a superseded key stops decrypting) and backstops identity
+    // changes that never came through our own publish or sync path — one
+    // applied out-of-band, or while this process was down.
+    let identity_state = state.clone();
+    sup.spawn(
+        Stage::Workers,
+        tasks::IDENTITY_SWEEP,
+        Policy::Restart,
+        move |sd| {
+            crate::identity_rotation::run_identity_sweep_loop(identity_state.clone(), sd.watch())
+        },
+    );
+
+    // 5. The mediator messaging service (DIDComm and/or TSP) — one connection
+    //    for both receiving and sending, retried with backoff while it fails.
+    //    TSP-only deployments (didcomm off, tsp on) must still start it.
+    let mut interrupted = false;
     if state.config.features.didcomm || state.config.features.tsp {
-        match start_didcomm_service(&state, didcomm_shutdown.clone()).await {
-            Ok(Some(svc)) => {
-                let _ = state.didcomm_service.set(svc);
+        tokio::select! {
+            svc = start_messaging(&state, sup.signal(Stage::Workers).token()) => {
+                if let Some(svc) = svc {
+                    let _ = state.didcomm_service.set(svc);
+                }
             }
-            Ok(None) => {}
-            Err(e) => warn!("failed to start DIDComm service: {e}"),
+            _ = &mut signal => interrupted = true,
         }
     }
-    let didcomm_service = state.didcomm_service.get();
 
-    // 5. Register with control plane via DIDComm (uses the shared connection)
-    if let Some(svc) = didcomm_service
-        && state.config.control_did.is_some()
-    {
-        let reg_state = state.clone();
-        let reg_svc = svc.clone();
-        tokio::spawn(async move {
-            keep_registered(reg_state, reg_svc).await;
-        });
-    }
-
-    // 5a. Reconcile against the control plane's listing every interval — the
-    //     backstop behind the outbox, and what the staleness bound measures.
-    let (reconcile_shutdown_tx, reconcile_shutdown_rx) = watch::channel(false);
-    if let Some(svc) = didcomm_service {
-        let rec_state = state.clone();
-        let rec_svc = svc.clone();
-        tokio::spawn(async move {
-            crate::replication::run_reconcile_loop(rec_state, rec_svc, reconcile_shutdown_rx).await;
-        });
-    } else {
+    // 6. Registration, reconcile, the TSP relationship and stats sync.
+    if let Some(svc) = state.didcomm_service.get() {
+        spawn_messaging_tasks(&state, svc, &mut sup);
+    } else if !interrupted {
         warn!(
             "no messaging service: this edge cannot reconcile with its control plane, and will \
              report degraded once the staleness bound passes"
         );
-    }
-
-    // 5b. Keep a TSP relationship with the control plane established. Under Rev 3
-    //     §7.2.2 the control plane's application pushes (sync/health) are dropped
-    //     unless this edge holds a relationship with it, and forming one is the
-    //     edge's job — the control plane persists its half and does not re-invite.
-    //     The ensure is idempotent (skips when already Bidirectional) and MUST
-    //     fire on every (re)connect, not just first boot: a control-plane restart,
-    //     or a handshake that never completed, is repaired on the edge's next
-    //     connect. See docs/tsp-transport.md.
-    if let (Some(svc), Some(control_did)) = (didcomm_service, state.config.control_did.as_ref())
-        && state.config.features.tsp
-    {
-        let svc = svc.clone();
-        let control_did = control_did.clone();
-        tokio::spawn(async move {
-            ensure_control_tsp_relationship(svc, control_did).await;
-        });
-    }
-
-    // 6. Spawn stats sync task — TSP or DIDComm, per the control DID (main runtime)
-    let stats_sync_shutdown = CancellationToken::new();
-    let didcomm_sync_interval = state.config.stats.sync_interval_secs;
-    if let (Some(svc), Some(control_did), Some(server_did)) = (
-        didcomm_service,
-        state.config.control_did.as_ref(),
-        state.config.server_did.as_ref(),
-    ) && didcomm_sync_interval > 0
-    {
-        let token = stats_sync_shutdown.clone();
-        let svc = svc.clone();
-        let control_did = control_did.clone();
-        let server_did = server_did.clone();
-        let collector = stats_collector.clone();
-        let sync_state = state.clone();
-        tokio::spawn(async move {
-            let mut timer =
-                tokio::time::interval(Duration::from_secs(didcomm_sync_interval.max(1)));
-            timer.tick().await; // skip first tick
-            loop {
-                tokio::select! {
-                    _ = timer.tick() => {
-                        stats::sync_to_control_messaging(
-                            &svc,
-                            &sync_state,
-                            &server_did,
-                            &control_did,
-                            &collector,
-                        ).await;
-                    }
-                    _ = token.cancelled() => break,
-                }
-            }
-        });
     }
 
     // 6b. Reconnect to any mediator we rotated *away* from but whose grace period
@@ -491,85 +699,39 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // queue. No-op unless a rotation actually changed the mediator.
     crate::identity_rotation::resume_mediator_drains(&state);
 
-    // 7. Spawn the identity sweep. Expires generations whose grace period has
-    // elapsed (so a superseded key stops decrypting) and backstops identity
-    // changes that never came through our own publish or sync path — one
-    // applied out-of-band, or while this process was down.
-    let (identity_shutdown_tx, identity_shutdown_rx) = watch::channel(false);
-    let identity_state = state.clone();
-    let identity_handle = tokio::spawn(async move {
-        crate::identity_rotation::run_identity_sweep_loop(identity_state, identity_shutdown_rx)
-            .await;
-    });
+    // Run until the shutdown signal, or until a critical task stops.
+    let outcome = if interrupted {
+        Ok(())
+    } else {
+        sup.run_until(&mut signal).await
+    };
 
-    // Wait for shutdown signal
-    init::shutdown_signal().await;
-
-    // Ordered shutdown: identity → stats sync → DIDComm → REST → Storage
-    let mut any_panic = false;
-
-    let _ = identity_shutdown_tx.send(true);
-    if let Err(e) = identity_handle.await {
-        warn!("identity sweep task didn't shut down cleanly: {e}");
-    }
-
-    let _ = reconcile_shutdown_tx.send(true);
-    stats_sync_shutdown.cancel();
-    didcomm_shutdown.cancel();
-    if let Some(svc) = didcomm_service {
-        svc.shutdown().await;
-        info!("DIDComm service stopped");
-    }
-
-    let _ = rest_shutdown_tx.send(true);
-    {
-        let handle = rest_handle;
-        match tokio::time::timeout(
-            Duration::from_secs(30),
-            tokio::task::spawn_blocking(move || handle.join()),
-        )
-        .await
-        {
-            Ok(Ok(Ok(()))) => info!("REST thread stopped"),
-            Ok(Ok(Err(_panic))) => {
-                error!("REST thread panicked");
-                any_panic = true;
-            }
-            Ok(Err(e)) => {
-                error!("failed to join REST thread: {e}");
-                any_panic = true;
-            }
-            Err(_) => {
-                error!("REST thread shutdown timed out (30s)");
-                any_panic = true;
-            }
+    // Ordered shutdown: workers (identity, registration, reconcile, stats
+    // sync) → the messaging service, awaited → HTTP → storage (persist), each
+    // within `SHUTDOWN_STAGE_DEADLINE`.
+    sup.stop_stage(Stage::Workers, SHUTDOWN_STAGE_DEADLINE)
+        .await;
+    if let Some(svc) = state.didcomm_service.get() {
+        match tokio::time::timeout(SHUTDOWN_STAGE_DEADLINE, svc.shutdown()).await {
+            Ok(()) => info!("DIDComm service stopped"),
+            Err(_) => warn!("DIDComm service did not stop within {SHUTDOWN_STAGE_DEADLINE:?}"),
         }
     }
+    let stopped = sup.finish(SHUTDOWN_STAGE_DEADLINE).await;
 
-    let _ = storage_shutdown_tx.send(true);
-    match tokio::time::timeout(
-        Duration::from_secs(30),
-        tokio::task::spawn_blocking(move || storage_handle.join()),
-    )
-    .await
-    {
-        Ok(Ok(Ok(()))) => info!("storage thread stopped"),
-        Ok(Ok(Err(_panic))) => {
-            error!("storage thread panicked");
-            any_panic = true;
-        }
-        Ok(Err(e)) => {
-            error!("failed to join storage thread: {e}");
-            any_panic = true;
-        }
-        Err(_) => {
-            error!("storage thread shutdown timed out (30s)");
-            any_panic = true;
-        }
+    if let Err(failure) = outcome {
+        return Err(AppError::Internal(format!("shut down because {failure}")));
     }
-
-    if any_panic {
-        return Err(AppError::Internal("one or more threads panicked".into()));
+    if let Err(failures) = stopped {
+        return Err(AppError::Internal(format!(
+            "{} task(s) failed: {}",
+            failures.len(),
+            failures
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        )));
     }
 
     info!("server shut down");
@@ -771,7 +933,7 @@ fn run_rest_thread(
     std_listener: std::net::TcpListener,
     state: AppState,
     upload_body_limit: usize,
-    shutdown_rx: &mut watch::Receiver<bool>,
+    mut shutdown_rx: watch::Receiver<bool>,
     ready_tx: oneshot::Sender<()>,
 ) {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -835,18 +997,20 @@ fn run_rest_thread(
         // Signal that REST is ready to serve
         let _ = ready_tx.send(());
 
-        let shutdown_rx = shutdown_rx.clone();
         // Header, idle, connection and per-address limits: see `listener`.
-        axum::serve(
+        // An error ends the thread, which the supervisor reports as a
+        // critical exit.
+        if let Err(e) = axum::serve(
             did_hosting_common::server::listener::bounded(listener, &trusted_proxies),
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .with_graceful_shutdown(async move {
-            let mut rx = shutdown_rx;
-            let _ = rx.changed().await;
+            let _ = shutdown_rx.changed().await;
         })
         .await
-        .expect("axum serve failed");
+        {
+            error!("HTTP server failed: {e}");
+        }
 
         rate_limit_gc.cancel();
         info!("REST thread shutting down");
@@ -857,103 +1021,22 @@ fn run_rest_thread(
 // Storage thread
 // ---------------------------------------------------------------------------
 
-/// Parameters for the background storage thread.
-struct StorageThreadParams {
-    store: Store,
-    dids_ks: KeyspaceHandle,
-    auth_config: AuthConfig,
-    collector: Arc<stats::StatsCollector>,
-    stats_config: crate::config::StatsConfig,
-    caches: crate::cache::ResolutionCaches,
-}
-
-fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Receiver<bool>) {
-    let StorageThreadParams {
-        store,
-        dids_ks,
-        auth_config,
-        collector,
-        stats_config,
-        caches,
-    } = params;
+/// The storage ticks ([`storage_tasks`]) on a runtime of their own until
+/// shutdown, then the store's persist. Storage is the last stage stopped, so
+/// the persist sees every write.
+fn run_storage_thread(storage: EdgeStorage, shutdown_rx: watch::Receiver<bool>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("failed to build storage runtime");
 
     rt.block_on(async {
-        info!(
-            flush_interval = stats_config.flush_interval_secs,
-            "storage thread started"
-        );
-
-        let did_ttl_seconds = auth_config.cleanup_ttl_minutes * 60;
-        let did_interval = Duration::from_secs(did_ttl_seconds.max(60));
-        let mut did_timer = tokio::time::interval(did_interval);
-
-        // DIDs reach an edge by sync, which does not count them; the
-        // recount keeps the edge's figure in step.
-        let mut did_count_timer = tokio::time::interval(
-            did_hosting_common::server::stats_collector::DID_COUNT_RECONCILE_INTERVAL,
-        );
-
-        // Each minute: run the grace-expired purge sweep (the schedule an
-        // unassign or a domain disable acknowledged to the control plane),
-        // then drop expired content cache entries (they live
-        // `RESOLUTION_CACHE_TTL`) so DIDs nobody asks for again do not stay
-        // in memory — or the whole cache, when the sweep purged something.
-        let mut purge_timer =
-            tokio::time::interval(crate::purge_sweep::DEFAULT_SWEEP_INTERVAL);
-
-        // First tick completes immediately; skip so cleanup doesn't run at startup
-        did_timer.tick().await;
-        did_count_timer.tick().await;
-        purge_timer.tick().await;
-
-        loop {
-            tokio::select! {
-                _ = did_timer.tick() => {
-                    // An edge writes DID records only from its control
-                    // plane's directives, which take no path lock.
-                    match cleanup_empty_dids(&dids_ks, did_ttl_seconds, None).await {
-                        Ok(removed) if removed.is_empty() => {}
-                        // An edge keeps no statistics rows to delete with them.
-                        Ok(removed) => {
-                            info!(count = removed.len(), "cleaned up empty DID records");
-                            for mnemonic in &removed {
-                                caches.forget_did(mnemonic);
-                            }
-                            collector.subtract_total_dids(removed.len() as u64);
-                        }
-                        Err(e) => warn!("DID cleanup error: {e}"),
-                    }
-                }
-                _ = did_count_timer.tick() => {
-                    if let Err(e) = did_hosting_common::server::stats_collector::reconcile_total_dids(
-                        &collector,
-                        &dids_ks,
-                    ).await {
-                        warn!("DID count reconcile error: {e}");
-                    }
-                }
-                _ = purge_timer.tick() => {
-                    crate::purge_sweep::run_edge_sweep_tick(
-                        &store,
-                        &caches.content,
-                        caches.gate.as_deref(),
-                        Some(&collector),
-                    )
-                    .await;
-                }
-                _ = shutdown_rx.changed() => {
-                    info!("storage thread shutting down");
-                    break;
-                }
-            }
-        }
+        info!("storage thread started");
+        run_periodic(storage_tasks(&storage), shutdown_rx).await;
+        info!("storage thread shutting down");
 
         // Persist store before closing
-        if let Err(e) = store.persist().await {
+        if let Err(e) = storage.store.persist().await {
             error!("failed to persist store on shutdown: {e}");
         } else {
             info!("store persisted");
@@ -972,11 +1055,22 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
 /// gates the rotation trigger. One copy, so the two cannot drift.
 use did_hosting_common::server::identity::mnemonic_from_did;
 
-/// First-boot multi-domain init for the standalone server.
-///
-/// Mirrors the daemon's `did-hosting-daemon/src/main.rs:544-622` block
-/// so a standalone `did-hosting-server` deployment gets the same
-/// effective state on first boot. Three steps, in order:
+/// How [`run_first_boot_init`] treats a failed step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstBoot {
+    /// Log it and go on to the next step; succeed. The standalone edge: it
+    /// treats domain seeding as best-effort metadata, so a legacy
+    /// single-domain deployment without `bootstrap_domains` boots into the
+    /// permissive-skip state (with warnings) rather than refusing to serve.
+    Lenient,
+    /// Stop at it and return it. The daemon: it owns the control plane and
+    /// must have a domain catalogue for the admin write paths to work.
+    Strict,
+}
+
+/// First-boot multi-domain init, shared by the standalone edge and the
+/// daemon so both get the same effective state on first boot. Three steps,
+/// in order:
 ///
 /// 1. **Domain catalog seed** (`seed_domains_first_boot`) — populates
 ///    `KS_DOMAINS` from `[hosting] bootstrap_domains` or the legacy
@@ -986,26 +1080,32 @@ use did_hosting_common::server::identity::mnemonic_from_did;
 /// 2. **Assignment seed** (`seed_assignments_first_boot`) — same tier
 ///    chain, populates `KS_ASSIGNMENTS`. Matters once a control plane
 ///    starts driving `replica/domain/assign` / unassign messages.
-/// 3. **Migration runner** (`MigrationRunner::run_pending`) — runs
-///    `m01_tag_did_records_with_domain` which fills
-///    `DidRecord.domain` for legacy records by parsing the embedded
-///    `did_id` host. Required for any write path that keys on
-///    `domain` once domains are configured.
+/// 3. **Migration runner** — `migrations`: the edge runs
+///    [`did_hosting_common::server::migrations::registry`] (M-01 fills
+///    `DidRecord.domain` for legacy records by parsing the embedded `did_id`
+///    host), the daemon
+///    [`did_hosting_common::server::migrations::control_plane_registry`],
+///    which adds the control plane's derived rows.
 ///
 /// All three are idempotent — subsequent boots short-circuit
 /// (existing keyspace entries / migration markers in `meta`) so this
-/// is cheap to call on every startup.
-///
-/// Failures log loudly but do **not** abort startup. The standalone
-/// server's design treats domain seeding as best-effort metadata: a
-/// legacy single-domain deployment without `bootstrap_domains`
-/// configured boots into the permissive-skip state (with warnings)
-/// rather than refusing to serve. The daemon's stricter
-/// `std::process::exit(1)` is appropriate there because the daemon
-/// owns the control plane and *must* have a domain catalog to make
-/// admin write paths work; the standalone server has no such
-/// guarantee.
-pub async fn run_first_boot_init(store: &Store, config: &AppConfig) {
+/// is cheap to call on every startup. `mode` says what a failure does.
+pub async fn run_first_boot_init(
+    store: &Store,
+    config: &AppConfig,
+    migrations: Vec<Arc<dyn did_hosting_common::server::migrations::Migration>>,
+    mode: FirstBoot,
+) -> Result<(), AppError> {
+    let failed = |step: &str, e: AppError| -> Result<(), AppError> {
+        match mode {
+            FirstBoot::Lenient => {
+                warn!(error = %e, "{step} failed");
+                Ok(())
+            }
+            FirstBoot::Strict => Err(AppError::Internal(format!("{step} failed: {e}"))),
+        }
+    };
+
     // 1. Domain catalog
     match did_hosting_common::server::domain::seed_domains_first_boot(
         store,
@@ -1020,7 +1120,7 @@ pub async fn run_first_boot_init(store: &Store, config: &AppConfig) {
             default = ?outcome.default,
             "first-boot domain seed"
         ),
-        Err(e) => warn!(error = %e, "first-boot domain seed failed"),
+        Err(e) => failed("first-boot domain seed", e)?,
     }
 
     // 2. Per-server assignments
@@ -1038,21 +1138,20 @@ pub async fn run_first_boot_init(store: &Store, config: &AppConfig) {
             count = outcome.final_count,
             "first-boot assignment seed"
         ),
-        Err(e) => warn!(error = %e, "first-boot assignment seed failed"),
+        Err(e) => failed("first-boot assignment seed", e)?,
     }
 
-    // 3. Storage migrations (T2 runner + T13 M-01)
-    let runner = did_hosting_common::server::migrations::MigrationRunner::new(
-        did_hosting_common::server::migrations::registry(),
-    );
+    // 3. Storage migrations
+    let runner = did_hosting_common::server::migrations::MigrationRunner::new(migrations);
     match runner.run_pending(store).await {
         Ok(summary) => info!(
             applied = ?summary.applied,
             skipped = ?summary.skipped,
             "migration runner complete"
         ),
-        Err(e) => warn!(error = %e, "migration runner failed"),
+        Err(e) => failed("migration runner", e)?,
     }
+    Ok(())
 }
 
 /// Verify DIDs in the store and log their status.

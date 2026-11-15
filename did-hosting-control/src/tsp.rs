@@ -187,15 +187,13 @@ pub(crate) async fn run_tsp_trust_task(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
 
     use did_hosting_common::server::config::{
         AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
     };
-    use did_hosting_common::server::stats_collector::StatsCollector;
-    use did_hosting_common::server::store::{
-        KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES, Store,
-    };
+
+    use did_hosting_common::server::store::Store;
     use serde_json::{Value, json};
 
     use crate::config::{AppConfig, RegistryConfig};
@@ -239,52 +237,17 @@ mod tests {
             stats: Default::default(),
             config_path: PathBuf::new(),
         };
-        let state = AppState {
-            store: store.clone(),
-            sessions_ks: store.keyspace(KS_SESSIONS).unwrap(),
-            acl_ks: store.keyspace(KS_ACL).unwrap(),
-            registry_ks: store.keyspace(KS_REGISTRY).unwrap(),
-            dids_ks: store.keyspace(KS_DIDS).unwrap(),
-            config: Arc::new(config),
-            did_resolver: None,
-            secrets_resolver: None,
-            identity: Some(
-                did_hosting_common::server::identity::ServiceIdentity::generated_for(SERVICE_DID)
-                    .await
-                    .unwrap(),
+        let identity =
+            did_hosting_common::server::identity::ServiceIdentity::generated_for(SERVICE_DID)
+                .await
+                .unwrap();
+        let mut state = crate::test_support::bare_state(config, store, Some(identity)).await;
+        state.trust_tasks_verifier = Some(Arc::new(
+            did_hosting_common::server::trust_tasks::TransportBoundVerifier::with_resolver(
+                Arc::new(affinidi_data_integrity::DidKeyResolver),
             ),
-            trust_tasks_verifier: Some(Arc::new(
-                did_hosting_common::server::trust_tasks::TransportBoundVerifier::with_resolver(
-                    Arc::new(affinidi_data_integrity::DidKeyResolver),
-                ),
-            )),
-            jwt_keys: None,
-            webauthn: None,
-            http_client: reqwest::Client::new(),
-            didcomm_service: Arc::new(OnceLock::new()),
-            stats_collector: Arc::new(StatsCollector::new()),
-            stats_ks: store.keyspace(KS_STATS).unwrap(),
-            timeseries_ks: store.keyspace(KS_TIMESERIES).unwrap(),
-            unlisted_signers: Default::default(),
-            replay_cache: Arc::new(crate::replay::ReplayCache::new()),
-            path_locks: crate::path_locks::PathLocks::new(),
-            acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
-            pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
-            client_ips: Default::default(),
-            ip_rate_limiter: Arc::new(crate::rate_limit::challenge_limiter()),
-            login_start_rate_limiter: Arc::new(crate::rate_limit::login_start_limiter()),
-            redeem_rate_limiter: Arc::new(crate::rate_limit::redeem_limiter()),
-            webs_self_register_limiter: Arc::new(crate::rate_limit::webs_self_register_limiter()),
-            webs_self_register_global_limiter: Arc::new(
-                crate::rate_limit::webs_self_register_global_limiter(),
-            ),
-            large_document_budget: Arc::new(
-                did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
-            ),
-            outbox_notify: Arc::new(tokio::sync::Notify::new()),
-            cache_invalidate: None,
-            oob: Default::default(),
-        };
+        ));
+
         (state, dir)
     }
 

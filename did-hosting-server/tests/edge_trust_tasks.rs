@@ -591,6 +591,7 @@ async fn an_unassigned_domain_is_purged_by_the_edge_sweep_once_its_grace_elapses
 
     let sweep = did_hosting_server::purge_sweep::run_edge_sweep_tick(
         &state.store,
+        None,
         &state.did_cache,
         state.gate_cache.as_deref(),
         None,

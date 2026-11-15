@@ -936,7 +936,7 @@ fn cleanup_offline_artifacts(state_path: &Path) {
 }
 
 pub fn update_server_did_in_config(
-    config_path: &PathBuf,
+    config_path: &std::path::Path,
     server_did: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let contents = std::fs::read_to_string(config_path)?;

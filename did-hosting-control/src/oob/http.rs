@@ -149,7 +149,7 @@ impl OobRuntime {
     }
 
     /// The local GeoIP database, for the process to keep current
-    /// ([`GeoIp::spawn_reloader`]).
+    /// ([`GeoIp::reload_task`]).
     pub fn geoip(&self) -> &Arc<GeoIp> {
         &self.geoip
     }

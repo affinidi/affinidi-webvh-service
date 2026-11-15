@@ -17,7 +17,7 @@
 //!
 //! The file is read into memory, and re-read when it changes on disk (a
 //! periodic check of its modification time and length,
-//! [`GeoIp::spawn_reloader`]), so a monthly database refresh needs no restart.
+//! [`GeoIp::reload_task`]), so a monthly database refresh needs no restart.
 //! A replacement that cannot be read keeps the database already loaded. A
 //! configured file that cannot be read at startup is a warning, not a boot
 //! failure: location is advisory, and the sign-in flow is complete without it.
@@ -34,7 +34,7 @@ use ipnetwork::IpNetwork;
 use maxminddb::{Reader, geoip2};
 use tracing::{info, warn};
 
-/// How often [`GeoIp::spawn_reloader`] checks the database file for a change.
+/// How often [`GeoIp::reload_task`] checks the database file for a change.
 /// One `stat` a minute; the read only happens when the file has changed.
 pub const RELOAD_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -211,26 +211,23 @@ impl GeoIp {
     }
 
     /// Check the database file every [`RELOAD_CHECK_INTERVAL`] and reload it
-    /// when it changes, until shutdown. Does nothing when no database is
-    /// configured.
-    pub fn spawn_reloader(
-        self: &Arc<Self>,
-        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    ) -> Option<tokio::task::JoinHandle<()>> {
-        self.path.as_ref()?;
+    /// when it changes: the control plane's `geoip-reload` task. Disabled
+    /// when no database is configured.
+    pub fn reload_task(self: &Arc<Self>) -> did_hosting_common::server::supervise::PeriodicTask {
         let geoip = Arc::clone(self);
-        Some(tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = shutdown_rx.changed() => return,
-                    _ = tokio::time::sleep(RELOAD_CHECK_INTERVAL) => {}
-                }
+        did_hosting_common::server::supervise::PeriodicTask::new(
+            crate::server::tasks::GEOIP_RELOAD,
+            RELOAD_CHECK_INTERVAL,
+            move |_| {
                 let g = Arc::clone(&geoip);
-                if let Err(e) = tokio::task::spawn_blocking(move || g.refresh()).await {
-                    warn!(error = %e, "GeoIP reload check failed");
+                async move {
+                    if let Err(e) = tokio::task::spawn_blocking(move || g.refresh()).await {
+                        warn!(error = %e, "GeoIP reload check failed");
+                    }
                 }
-            }
-        }))
+            },
+        )
+        .enabled_if(self.path.is_some())
     }
 
     /// City and country of `ip` from the local database: `"City, CC"`, or the

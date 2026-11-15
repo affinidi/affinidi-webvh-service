@@ -11,6 +11,7 @@
 
 pub mod acl;
 pub mod auth;
+pub mod cli;
 pub mod config;
 pub(crate) mod control_tasks;
 pub mod did_ops;

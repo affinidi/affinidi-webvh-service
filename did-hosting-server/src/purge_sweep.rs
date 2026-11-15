@@ -186,23 +186,25 @@ async fn still_due(store: &Store, entry: &pending_purge::PendingPurge) -> bool {
     }
 }
 
-/// One purge tick on a standalone edge, run by its storage thread every
-/// [`DEFAULT_SWEEP_INTERVAL`] (the daemon runs [`run_sweep_once_locked`]
-/// from its own storage task instead).
+/// One purge tick: the `purge-sweep` task of an edge's storage thread and of
+/// the daemon's storage task, every [`DEFAULT_SWEEP_INTERVAL`].
 ///
-/// An edge writes DID records only from its control plane's directives,
-/// which take no path lock, so the sweep runs unlocked. A purge deletes DIDs
+/// `locks` are the path locks of a control plane writing the same store (the
+/// daemon), taken for each purged slot; an edge writes DID records only from
+/// its control plane's directives, which take no path lock, so it passes
+/// `None`. A purge deletes DIDs
 /// (and, for a disabled domain, its record) behind the resolver's back, so
 /// when anything was purged the caches are dropped whole; otherwise the
 /// content cache just loses what has outlived its TTL. The edge's DID count
 /// is adjusted by what was deleted.
 pub async fn run_edge_sweep_tick(
     store: &Store,
+    locks: Option<&did_hosting_common::server::path_locks::PathLocks>,
     did_cache: &crate::cache::ContentCache,
     gate_cache: Option<&crate::cache::GateCache>,
     collector: Option<&StatsCollector>,
 ) -> SweepReport {
-    let sweep = run_sweep_once(store).await;
+    let sweep = run_sweep_once_locked(store, locks).await;
     if sweep.entries > 0 {
         info!(count = sweep.entries, "purge sweep tick completed");
     }

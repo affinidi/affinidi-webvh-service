@@ -2321,11 +2321,9 @@ pub(crate) fn require_verifier(
 
 #[cfg(test)]
 mod tests {
-    use did_hosting_common::server::store::{
-        KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
-    };
+
     use std::path::PathBuf;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
 
     use affinidi_messaging_didcomm::Message;
     use did_hosting_common::did_ops::{DidRecord, did_key, owner_key};
@@ -2333,7 +2331,7 @@ mod tests {
     use did_hosting_common::server::config::{
         AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
     };
-    use did_hosting_common::server::stats_collector::StatsCollector;
+
     use did_hosting_common::server::store::Store;
     use serde_json::json;
 
@@ -2386,11 +2384,6 @@ mod tests {
             ..StoreConfig::default()
         };
         let store = Store::open(&store_config).await.expect("open store");
-        let sessions_ks = store.keyspace(KS_SESSIONS).expect("sessions ks");
-        let acl_ks = store.keyspace(KS_ACL).expect("acl ks");
-        let registry_ks = store.keyspace(KS_REGISTRY).expect("registry ks");
-        let dids_ks = store.keyspace(KS_DIDS).expect("dids ks");
-        let stats_ks = store.keyspace(KS_STATS).expect("stats ks");
 
         let config = AppConfig {
             features: FeaturesConfig::default(),
@@ -2416,50 +2409,12 @@ mod tests {
             config_path: PathBuf::new(),
         };
 
-        let state = AppState {
-            store: store.clone(),
-            sessions_ks,
-            acl_ks,
-            registry_ks,
-            dids_ks,
-            config: Arc::new(config),
-            did_resolver: None,
-            secrets_resolver: None,
-            identity: Some(
-                did_hosting_common::server::identity::ServiceIdentity::generated_for(
-                    "did:webvh:test:control.example.com",
-                )
-                .await
-                .unwrap(),
-            ),
-            trust_tasks_verifier: None,
-            jwt_keys: None,
-            webauthn: None,
-            http_client: reqwest::Client::new(),
-            didcomm_service: Arc::new(OnceLock::new()),
-            stats_collector: Arc::new(StatsCollector::new()),
-            stats_ks: stats_ks.clone(),
-            timeseries_ks: store.keyspace(KS_TIMESERIES).expect("timeseries ks"),
-            unlisted_signers: Default::default(),
-            replay_cache: Arc::new(crate::replay::ReplayCache::new()),
-            path_locks: crate::path_locks::PathLocks::new(),
-            acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
-            pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
-            client_ips: Default::default(),
-            ip_rate_limiter: Arc::new(crate::rate_limit::challenge_limiter()),
-            login_start_rate_limiter: Arc::new(crate::rate_limit::login_start_limiter()),
-            redeem_rate_limiter: Arc::new(crate::rate_limit::redeem_limiter()),
-            webs_self_register_limiter: Arc::new(crate::rate_limit::webs_self_register_limiter()),
-            webs_self_register_global_limiter: Arc::new(
-                crate::rate_limit::webs_self_register_global_limiter(),
-            ),
-            large_document_budget: Arc::new(
-                did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
-            ),
-            outbox_notify: Arc::new(tokio::sync::Notify::new()),
-            cache_invalidate: None,
-            oob: Default::default(),
-        };
+        let identity = did_hosting_common::server::identity::ServiceIdentity::generated_for(
+            "did:webvh:test:control.example.com",
+        )
+        .await
+        .unwrap();
+        let state = crate::test_support::bare_state(config, store, Some(identity)).await;
 
         (state, dir)
     }

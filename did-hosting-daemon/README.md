@@ -328,13 +328,22 @@ APIs are operator-facing and benefit from a clean URL boundary.
 
 | Path | Description |
 | ---- | ----------- |
-| `/health` | Daemon-level health |
+| `/health` | Daemon liveness: `200` while the daemon's own DID is served from its store, `503` (`"status": "degraded"`) otherwise — the same check as the control plane's `/api/health` |
 
 ## Graceful Shutdown
 
 The daemon handles `SIGINT` (Ctrl+C) and `SIGTERM` for graceful
-shutdown. On shutdown, all service stores are persisted before
-the process exits.
+shutdown, in stages, each given at most 30 seconds: the background
+workers (outbox, sweeps), then the messaging service, then HTTP (a
+connection still open at the deadline is dropped, so one stalled client
+cannot hold up a `SIGTERM`), then the storage task's last statistics
+flush and the store's persist, then the witness store's.
+
+A background task that stops on its own while the daemon is running is
+logged at `error`: a restartable one (the outbox, the sweeps) is
+restarted with backoff, and a critical one (the HTTP listener, the
+storage task) shuts the daemon down with a non-zero exit, so a
+supervisor or orchestrator restarts it.
 
 ## Feature Flags
 

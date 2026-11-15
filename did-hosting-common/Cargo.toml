@@ -43,7 +43,7 @@ server-core = [
     "dep:affinidi-messaging-didcomm-service", "dep:affinidi-messaging-didcomm",
     "dep:affinidi-tsp", "dep:affinidi-messaging-sdk",
     "dep:trust-tasks-build", "dep:affinidi-rate-limit", "dep:affinidi-net-guard",
-    "dep:zeroize",
+    "dep:zeroize", "dep:clap",
 ]
 store-fjall = ["server-core", "dep:fjall"]
 store-redis = ["server-core", "dep:redis"]
@@ -159,6 +159,8 @@ tokio-util = { workspace = true, optional = true }
 tower-http = { version = "0.7", features = ["trace", "cors"], optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 hex = { version = "0.4", optional = true }
+# The subcommand groups the service binaries share (`server::cli`).
+clap = { workspace = true, optional = true }
 toml = "1.0"
 
 # Trust Tasks framework — see workspace Cargo.toml for the version pin.
@@ -255,7 +257,7 @@ trust-tasks-build = { workspace = true, optional = true }
 tempfile = "3"
 # Deletes the keyring round-trip test's entry; the store itself is `vti-secrets`'.
 keyring-core = "1"
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time", "test-util"] }
 # Deterministic versionTime stamps in the fuzz seed-corpus generator
 # (`examples/gen_corpus.rs`).
 chrono = { workspace = true }

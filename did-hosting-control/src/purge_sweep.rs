@@ -12,7 +12,7 @@
 //!   `DomainEntry` for ripe `disable-grace` rows — control has no
 //!   hosted DIDs to purge, and never schedules `grace-expired` rows.
 //!
-//! Without this loop, a disabled-then-grace-expired domain would stay
+//! Without this sweep, a disabled-then-grace-expired domain would stay
 //! in control's `KS_DOMAINS` forever, even though every server
 //! serving it has already wiped its own copy.
 //!
@@ -24,7 +24,6 @@ use std::time::Duration;
 use did_hosting_common::server::domain::{self, DISABLE_PURGE_REASON};
 use did_hosting_common::server::pending_purge::{self, PurgeCheck};
 use did_hosting_common::server::store::Store;
-use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::auth::session::now_epoch;
@@ -111,31 +110,6 @@ pub async fn run_sweep_once(store: &Store) -> u64 {
         purged += 1;
     }
     purged
-}
-
-/// Long-running background driver for [`run_sweep_once`]. Spawn one
-/// of these per control-plane process; standalone control binaries
-/// call it from their startup chain.
-pub async fn run_purge_sweep_loop(store: Store, mut shutdown: watch::Receiver<bool>) {
-    let mut ticker = tokio::time::interval(DEFAULT_SWEEP_INTERVAL);
-    // First-tick: skip the immediate fire so startup logs aren't
-    // crowded by an empty-sweep line.
-    ticker.tick().await;
-
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {
-                let purged = run_sweep_once(&store).await;
-                if purged > 0 {
-                    info!(count = purged, "control purge sweep tick completed");
-                }
-            }
-            _ = shutdown.changed() => {
-                info!("control purge sweep loop shutting down");
-                return;
-            }
-        }
-    }
 }
 
 #[cfg(test)]

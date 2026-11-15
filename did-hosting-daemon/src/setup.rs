@@ -1696,7 +1696,7 @@ async fn finalize_daemon_setup(
             }
         };
         did_hosting_server::setup::update_server_did_in_config(
-            &output_path.to_path_buf(),
+            output_path,
             &did_id,
         )?;
         eprintln!("  server_did updated in {}", output_path.display());

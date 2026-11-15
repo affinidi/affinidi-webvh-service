@@ -363,7 +363,7 @@ Style notes:
 **Always:**
 - Run `cargo fmt`, `cargo clippy --workspace --all-targets`, and the full test suite before committing (per repo CLAUDE.md).
 - Sign commits with `-s` (DCO).
-- Keep the daemon's run-loop parity rules (project CLAUDE.md) intact: any new domain-aware background task or startup step (including the purge sweep) must land in `run_daemon()` and `run_daemon_storage_task` as well.
+- Keep the daemon's run-loop parity rules (project CLAUDE.md) intact: any new domain-aware background task or startup step (including the purge sweep) must land in the shared startup function or task list the daemon also consumes (`storage_tasks` / `background_tasks`; see CLAUDE.md).
 - Treat the `v1.0` `MSG_*` protocol and existing REST routes as load-bearing public surface — every alias must be regression-tested with the parity harness.
 - Normalize every domain at the input boundary (REST handler, DIDComm handler, CLI). Never store or compare un-normalized names.
 - Validate every domain input via the `domain_normalize` helper before letting it touch storage — never trust caller-supplied names.

@@ -1,12 +1,11 @@
 //! In-process test harness for the control plane — enabled by the
 //! `test-support` feature.
 //!
-//! Every integration test, and every downstream consumer that wants to cover a
-//! control-plane path in its own suite, otherwise hand-assembles an
-//! [`AppState`] with ~25 fields over six fjall keyspaces. That boilerplate had
-//! drifted between test files and could not be reproduced outside this crate at
-//! all — the `AppState` fields are `pub` but the *recipe* for a valid one is
-//! not. This module is that recipe, in one place.
+//! A control plane's state is built by [`AppState::build`] — the recipe the
+//! standalone control plane and the daemon use too, so a field added to the
+//! state reaches every test. [`bare_state`] is that recipe without network
+//! wiring, for a test to fill in what it exercises; [`TestServer`] wraps it
+//! over a temporary fjall store with the common defaults.
 //!
 //! ```no_run
 //! # async fn ex() {
@@ -31,7 +30,7 @@
 //! `pub` field on [`TestServer::state`].
 
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use did_hosting_common::did_ops::{DidRecord, did_key, owner_key};
 use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};
@@ -40,10 +39,7 @@ use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
 };
 use did_hosting_common::server::domain::DomainScope;
-use did_hosting_common::server::stats_collector::StatsCollector;
-use did_hosting_common::server::store::{
-    KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES, Store,
-};
+use did_hosting_common::server::store::Store;
 
 use crate::auth::jwt::JwtKeys;
 use crate::config::{AppConfig, RegistryConfig};
@@ -91,6 +87,31 @@ impl TestServerOptions {
     }
 }
 
+/// A control plane's state built by [`AppState::build`] — the recipe `run`
+/// and the daemon use — with no network wiring: no DID resolver, secrets
+/// resolver or proof verifier (whatever `identity` would bring), no JWT keys
+/// and no WebAuthn. A test sets the ones it exercises on the returned state.
+pub async fn bare_state(
+    config: AppConfig,
+    store: Store,
+    identity: Option<Arc<did_hosting_common::server::identity::ServiceIdentity>>,
+) -> AppState {
+    let mut state = AppState::build(
+        config,
+        store,
+        None,
+        identity,
+        crate::server::AppStateOverrides::default(),
+    )
+    .await
+    .expect("build state");
+    state.did_resolver = None;
+    state.secrets_resolver = None;
+    state.trust_tasks_verifier = None;
+    state.webauthn = None;
+    state
+}
+
 /// A running in-process control plane over a temporary fjall store.
 ///
 /// Keep the value alive for the duration of the test: dropping it removes the
@@ -118,15 +139,6 @@ impl TestServer {
             ..StoreConfig::default()
         };
         let store = Store::open(&store_config).await.expect("open store");
-
-        // Open every keyspace up front — the same set `run_control()` opens, so
-        // a harness never trips over a missing one mid-test.
-        let sessions_ks = store.keyspace(KS_SESSIONS).expect("sessions ks");
-        let acl_ks = store.keyspace(KS_ACL).expect("acl ks");
-        let registry_ks = store.keyspace(KS_REGISTRY).expect("registry ks");
-        let dids_ks = store.keyspace_consistent(KS_DIDS).expect("dids ks");
-        let stats_ks = store.keyspace(KS_STATS).expect("stats ks");
-        let timeseries_ks = store.keyspace(KS_TIMESERIES).expect("timeseries ks");
 
         let server_did = opts
             .server_did
@@ -174,44 +186,8 @@ impl TestServer {
             ),
             None => None,
         };
-        let state = AppState {
-            store: store.clone(),
-            sessions_ks,
-            acl_ks,
-            registry_ks,
-            dids_ks,
-            config: Arc::new(config),
-            did_resolver: None,
-            secrets_resolver: None,
-            identity,
-            trust_tasks_verifier: None,
-            jwt_keys,
-            webauthn: None,
-            http_client: reqwest::Client::new(),
-            didcomm_service: Arc::new(OnceLock::new()),
-            stats_collector: Arc::new(StatsCollector::new()),
-            stats_ks,
-            timeseries_ks,
-            unlisted_signers: Default::default(),
-            replay_cache: Arc::new(crate::replay::ReplayCache::new()),
-            path_locks: crate::path_locks::PathLocks::new(),
-            acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
-            pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
-            client_ips: Default::default(),
-            ip_rate_limiter: Arc::new(crate::rate_limit::challenge_limiter()),
-            login_start_rate_limiter: Arc::new(crate::rate_limit::login_start_limiter()),
-            redeem_rate_limiter: Arc::new(crate::rate_limit::redeem_limiter()),
-            webs_self_register_limiter: Arc::new(crate::rate_limit::webs_self_register_limiter()),
-            webs_self_register_global_limiter: Arc::new(
-                crate::rate_limit::webs_self_register_global_limiter(),
-            ),
-            large_document_budget: Arc::new(
-                did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
-            ),
-            outbox_notify: Arc::new(tokio::sync::Notify::new()),
-            cache_invalidate: None,
-            oob: Default::default(),
-        };
+        let mut state = bare_state(config, store, identity).await;
+        state.jwt_keys = jwt_keys;
 
         Self { state, _dir: dir }
     }

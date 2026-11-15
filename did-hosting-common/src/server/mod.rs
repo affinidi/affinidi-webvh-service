@@ -5,6 +5,9 @@ pub mod assignment;
 pub mod assignment_seed;
 pub mod auth;
 pub mod backup;
+/// Subcommand groups the service binaries share.
+#[cfg(feature = "server-core")]
+pub mod cli;
 pub mod cli_acl;
 pub mod cli_dids;
 pub mod cli_identity;
@@ -45,6 +48,9 @@ pub mod setup_recipe;
 pub mod stats_collector;
 pub mod stats_tiers;
 pub mod store;
+/// Background work as data, and the supervisor that runs and stops it.
+#[cfg(feature = "server-core")]
+pub mod supervise;
 /// New trust-tasks framework integration (SPEC.md 0.1). Gated behind
 /// `server-core` because the dispatcher only runs on the server side;
 /// the client crate (no trust-tasks admin surface yet) doesn't compile

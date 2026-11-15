@@ -14,6 +14,7 @@
 pub mod backup;
 pub mod bootstrap;
 pub mod cache;
+pub mod cli;
 pub mod config;
 pub mod control_register;
 pub mod did_ops;
