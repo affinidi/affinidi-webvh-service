@@ -71,11 +71,26 @@ afterEach(() => {
 });
 
 describe("DID list", () => {
-  it("asks a signed-out visitor to log in", () => {
+  it("reads nothing for a signed-out visitor (the route guard sends them to sign in)", () => {
     auth = { ...auth, isAuthenticated: false };
     render(<DidList />);
-    expect(screen.getByText("Please log in to manage DIDs.")).toBeTruthy();
+    expect(screen.getByLabelText("Loading — manage DIDs")).toBeTruthy();
+    expect(screen.queryByText(/Please log in/)).toBeNull();
     expect(listDidPage).not.toHaveBeenCalled();
+  });
+
+  it("shows a failed load as an error with Retry, not as an empty list", async () => {
+    listDidPage.mockRejectedValueOnce(new Error("control plane down"));
+    await act(async () => {
+      render(<DidList />);
+    });
+    expect(screen.getByRole("alert").textContent).toMatch(/Could not load the DIDs/);
+    expect(screen.queryByText(/No DIDs yet/)).toBeNull();
+    listDidPage.mockResolvedValue({ records: [did("alice")] });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry loading the DIDs" }));
+    });
+    expect(screen.getByRole("link", { name: "alice" })).toBeTruthy();
   });
 
   it("shows a spinner while the list loads", () => {

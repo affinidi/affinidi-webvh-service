@@ -26,9 +26,11 @@ import { Field } from "../../components/Field";
 import { Heading } from "../../components/Heading";
 import { RequireAuth } from "../../components/RequireAuth";
 import { colors, focusRing, fonts, radii, spacing } from "../../lib/theme";
-import { showAlert, showConfirm } from "../../lib/alert";
+import { confirm, notify } from "../../lib/feedback";
+import { domainNameError } from "../../lib/validation";
 import { errorMessage } from "../../lib/errors";
 import { useTrustTaskQuery } from "../../lib/query";
+import { ErrorWithRetry } from "../../components/QueryState";
 import { formatDate, formatDuration, formatRelative } from "../../lib/time";
 import type { DomainEntry } from "../../lib/api";
 
@@ -44,6 +46,7 @@ function DomainsBody() {
   const { role } = useAuth();
   const api = useApi();
   const { domains, loaded, error, defaultDomain, refresh } = useDomains();
+  const [retrying, setRetrying] = useState(false);
   // Server-info is best-effort: a failure here just means we fall back to
   // generic copy in the disable confirm. The service DID and its public facts
   // are stable for the tab, so one read serves every screen.
@@ -59,14 +62,15 @@ function DomainsBody() {
   const [creating, setCreating] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
 
+  const nameError = newName === "" ? null : domainNameError(newName);
+  const [createError, setCreateError] = useState<string | null>(null);
+
   const handleCreate = useCallback(async () => {
     if (creating) return;
-    const name = newName.trim().toLowerCase();
-    if (!name) {
-      showAlert("Domain name required", "Enter a host like 'example.com'.");
-      return;
-    }
+    const name = newName;
+    if (domainNameError(name)) return; // shown inline
     setCreating(true);
+    setCreateError(null);
     try {
       await api.createDomain({
         name,
@@ -78,8 +82,15 @@ function DomainsBody() {
       setNewName("");
       setNewLabel("");
       setMakeDefault(false);
+      notify(
+        "success",
+        `${name} created`,
+        makeDefault
+          ? "It is now the default domain. Assign it to a hosting server on the Servers page so its DIDs resolve."
+          : "Assign it to a hosting server on the Servers page so its DIDs resolve.",
+      );
     } catch (e: unknown) {
-      showAlert("Create failed", errorMessage(e));
+      setCreateError(errorMessage(e));
     } finally {
       setCreating(false);
     }
@@ -88,15 +99,16 @@ function DomainsBody() {
   const handleSetDefault = useCallback(
     async (entry: DomainEntry) => {
       if (entry.status === "disabled") {
-        showAlert("Domain is disabled", "Re-enable the domain before promoting it to default.");
+        notify("info", "Domain is disabled", "Re-enable the domain before making it the default.");
         return;
       }
       setBusy(entry.name);
       try {
         await api.setDefaultDomain(entry.name);
         await refresh();
+        notify("success", "Default domain changed", `${entry.name} is now the default.`);
       } catch (e: unknown) {
-        showAlert("Set default failed", errorMessage(e));
+        notify("error", "Could not set the default", errorMessage(e));
       } finally {
         setBusy(null);
       }
@@ -105,26 +117,33 @@ function DomainsBody() {
   );
 
   const handleDisable = useCallback(
-    (entry: DomainEntry) => {
+    async (entry: DomainEntry) => {
       const grace = graceSeconds && graceSeconds > 0 ? formatDuration(graceSeconds) : null;
-      const body = grace
-        ? `Resolves return 503 immediately. The domain and EVERY hosted DID ` +
-          `will be permanently removed in ${grace} unless you re-enable ` +
-          `before then.`
-        : `Resolves return 503 immediately. The domain and EVERY hosted DID ` +
-          `will be permanently removed after the configured grace period ` +
-          `unless you re-enable before then.`;
-      showConfirm(`Disable ${entry.name}?`, body, async () => {
-        setBusy(entry.name);
-        try {
-          await api.disableDomain(entry.name);
-          await refresh();
-        } catch (e: unknown) {
-          showAlert("Disable failed", errorMessage(e));
-        } finally {
-          setBusy(null);
-        }
+      const body =
+        `DIDs on ${entry.name} stop resolving immediately. The domain and every DID ` +
+        `hosted on it will be permanently removed ` +
+        (grace ? `in ${grace}` : "after the configured grace period") +
+        ` unless you re-enable it before then.`;
+      const ok = await confirm({
+        title: `Disable ${entry.name}?`,
+        body,
+        confirmLabel: "Disable domain",
       });
+      if (!ok) return;
+      setBusy(entry.name);
+      try {
+        await api.disableDomain(entry.name);
+        await refresh();
+        notify(
+          "success",
+          `${entry.name} disabled`,
+          "Re-enable it before the grace period ends to keep its DIDs.",
+        );
+      } catch (e: unknown) {
+        notify("error", "Could not disable the domain", errorMessage(e));
+      } finally {
+        setBusy(null);
+      }
     },
     [api, refresh, graceSeconds],
   );
@@ -135,8 +154,13 @@ function DomainsBody() {
       try {
         await api.enableDomain(entry.name);
         await refresh();
+        notify(
+          "success",
+          `${entry.name} enabled`,
+          "Its DIDs resolve again and the scheduled removal is cancelled.",
+        );
       } catch (e: unknown) {
-        showAlert("Enable failed", errorMessage(e));
+        notify("error", "Could not enable the domain", errorMessage(e));
       } finally {
         setBusy(null);
       }
@@ -145,50 +169,76 @@ function DomainsBody() {
   );
 
   const handleDelete = useCallback(
-    (entry: DomainEntry) => {
-      showConfirm(
-        `Delete ${entry.name} now?`,
-        `This bypasses the cooling-off window and removes the domain ` +
-          `record immediately. Hosted DIDs (if any) are not removed — ` +
-          `purge them per-server first if you want a clean wipe. This ` +
-          `cannot be undone.`,
-        async () => {
-          setBusy(entry.name);
-          try {
-            await api.deleteDomain(entry.name);
-            await refresh();
-          } catch (e: unknown) {
-            showAlert("Delete failed", errorMessage(e));
-          } finally {
-            setBusy(null);
-          }
-        },
-      );
+    async (entry: DomainEntry) => {
+      const ok = await confirm({
+        title: `Delete ${entry.name} now?`,
+        body:
+          `This skips the rest of the grace period and removes the domain from the control ` +
+          `plane immediately. DIDs already copied to hosting servers are not removed there — ` +
+          `use “Purge & delete” for that. This cannot be undone.`,
+        confirmLabel: "Delete domain",
+        typeToConfirm: entry.name,
+      });
+      if (!ok) return;
+      setBusy(entry.name);
+      try {
+        await api.deleteDomain(entry.name);
+        await refresh();
+        notify("success", `${entry.name} deleted`);
+      } catch (e: unknown) {
+        notify("error", "Could not delete the domain", errorMessage(e));
+      } finally {
+        setBusy(null);
+      }
     },
     [api, refresh],
   );
 
   const handlePurgeAndDelete = useCallback(
-    (entry: DomainEntry) => {
-      showConfirm(
-        `Purge & delete ${entry.name}?`,
-        `Every server serving this domain will receive a domain.purge ` +
-          `message — every DID hosted on the domain across the fleet ` +
-          `will be permanently removed. The control-plane domain ` +
-          `record is then deleted. Server purges are fire-and-forget ` +
-          `over DIDComm; this UI won't wait for acks. Cannot be undone.`,
-        async () => {
-          setBusy(entry.name);
-          try {
-            await api.deleteDomain(entry.name, { purgeServers: true });
-            await refresh();
-          } catch (e: unknown) {
-            showAlert("Purge & delete failed", errorMessage(e));
-          } finally {
-            setBusy(null);
-          }
-        },
-      );
+    async (entry: DomainEntry) => {
+      const ok = await confirm({
+        title: `Purge & delete ${entry.name}?`,
+        body:
+          `Every DID hosted on ${entry.name} is permanently deleted from every hosting ` +
+          `server that serves it, and the domain is removed from the control plane. The ` +
+          `servers are told straight away and carry it out on their own; this page does ` +
+          `not wait for each one to finish. This cannot be undone.`,
+        confirmLabel: "Purge & delete",
+        typeToConfirm: entry.name,
+      });
+      if (!ok) return;
+      setBusy(entry.name);
+      try {
+        await api.deleteDomain(entry.name, { purgeServers: true });
+        await refresh();
+        notify(
+          "success",
+          `${entry.name} deleted`,
+          "Hosting servers have been told to purge its DIDs.",
+        );
+      } catch (e: unknown) {
+        notify("error", "Could not purge the domain", errorMessage(e));
+      } finally {
+        setBusy(null);
+      }
+    },
+    [api, refresh],
+  );
+
+  const handleRename = useCallback(
+    async (entry: DomainEntry, label: string) => {
+      setBusy(entry.name);
+      try {
+        await api.updateDomainLabel(entry.name, label);
+        await refresh();
+        notify("success", "Label saved", entry.name);
+        return true;
+      } catch (e: unknown) {
+        notify("error", "Could not save the label", errorMessage(e));
+        return false;
+      } finally {
+        setBusy(null);
+      }
     },
     [api, refresh],
   );
@@ -228,7 +278,8 @@ function DomainsBody() {
             autoCapitalize="none"
             autoCorrect={false}
             placeholder="example.com"
-            hint="Lowercased + IDNA-normalised by the daemon. Public hosts only."
+            hint="The host name exactly as DIDs will use it: lowercase, internationalised names in punycode (xn--…). An optional :port or /path-prefix is allowed."
+            error={nameError ?? createError}
             inputStyle={styles.input}
           />
 
@@ -250,6 +301,7 @@ function DomainsBody() {
           <View style={styles.formActions}>
             <Button
               label="Create domain"
+              disabled={!newName || !!nameError}
               busy={creating}
               busyLabel="Creating…"
               onPress={handleCreate}
@@ -264,13 +316,23 @@ function DomainsBody() {
         </View>
       )}
 
-      {error && (
+      {error && !loaded ? (
+        <ErrorWithRetry
+          error={error}
+          what="domains"
+          retrying={retrying}
+          onRetry={() => {
+            setRetrying(true);
+            void refresh().finally(() => setRetrying(false));
+          }}
+        />
+      ) : error ? (
         <Text role="alert" style={styles.errorText}>
           {error}
         </Text>
-      )}
+      ) : null}
 
-      {!loaded ? (
+      {error && !loaded ? null : !loaded ? (
         <ActivityIndicator
           color={colors.accent}
           size="large"
@@ -294,6 +356,7 @@ function DomainsBody() {
               onEnable={() => handleEnable(item)}
               onDelete={() => handleDelete(item)}
               onPurgeAndDelete={() => handlePurgeAndDelete(item)}
+              onRename={(label) => handleRename(item, label)}
             />
           )}
         />
@@ -341,6 +404,7 @@ function DomainCard({
   onEnable,
   onDelete,
   onPurgeAndDelete,
+  onRename,
 }: {
   entry: DomainEntry;
   isDefault: boolean;
@@ -350,8 +414,11 @@ function DomainCard({
   onEnable: () => void;
   onDelete: () => void;
   onPurgeAndDelete: () => void;
+  /** Save a new label; resolves `true` when it was saved. */
+  onRename: (label: string) => Promise<boolean>;
 }) {
   const disabled = entry.status === "disabled";
+  const [editingLabel, setEditingLabel] = useState<string | null>(null);
   return (
     <View
       role="region"
@@ -385,7 +452,37 @@ function DomainCard({
               </Text>
             </View>
           </View>
-          {!!entry.label && <Text style={styles.cardLabel}>{entry.label}</Text>}
+          {editingLabel !== null ? (
+            <View style={styles.labelEdit}>
+              <Field
+                label={`Label for ${entry.name}`}
+                value={editingLabel}
+                onChangeText={setEditingLabel}
+                onSubmit={() =>
+                  void onRename(editingLabel.trim()).then((ok) => ok && setEditingLabel(null))
+                }
+                placeholder="Acme Production"
+                inputStyle={styles.input}
+                style={styles.labelField}
+              />
+              <Button
+                label="Save"
+                size="sm"
+                busy={busy}
+                onPress={() =>
+                  void onRename(editingLabel.trim()).then((ok) => ok && setEditingLabel(null))
+                }
+              />
+              <Button
+                label="Cancel"
+                size="sm"
+                variant="secondary"
+                onPress={() => setEditingLabel(null)}
+              />
+            </View>
+          ) : (
+            !!entry.label && <Text style={styles.cardLabel}>{entry.label}</Text>
+          )}
           <Text style={styles.cardMeta}>
             {entry.scheme} · created {formatDate(entry.createdAt)}
             {entry.wellKnownEnabled ? " · /.well-known enabled" : ""}
@@ -400,6 +497,14 @@ function DomainCard({
       </View>
 
       <View style={styles.cardActions}>
+        {editingLabel === null && (
+          <Button
+            label={entry.label ? "Edit label" : "Add label"}
+            accessibilityLabel={`Edit the label of ${entry.name}`}
+            variant="secondary"
+            onPress={() => setEditingLabel(entry.label ?? "")}
+          />
+        )}
         {!isDefault && !disabled && (
           <Button
             label="Set as default"
@@ -461,6 +566,18 @@ const styles = StyleSheet.create({
     padding: spacing.xl,
     backgroundColor: colors.bgPrimary,
     gap: spacing.lg,
+  },
+  labelEdit: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "flex-end",
+    gap: spacing.sm,
+    marginTop: spacing.xs,
+  },
+  labelField: {
+    flex: 1,
+    minWidth: 200,
+    marginBottom: 0,
   },
   containerCenter: {
     flex: 1,

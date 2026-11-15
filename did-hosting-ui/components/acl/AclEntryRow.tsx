@@ -11,7 +11,8 @@ import { Button } from "../Button";
 import { Field } from "../Field";
 import { PasskeysCard } from "../PasskeysCard";
 import { SegmentedControl } from "../SegmentedControl";
-import { ENTRY_ROLES, RoleBadge } from "./roles";
+import { quotaError } from "../../lib/validation";
+import { ENTRY_ROLES, ROLE_DESCRIPTIONS, RoleBadge } from "./roles";
 import { ScopeBadges, ScopeEditor, type AvailableDomain } from "./ScopeEditor";
 
 /** The inline editor's draft of one entry. */
@@ -63,8 +64,11 @@ export const AclEntryRow = memo(function AclEntryRow({
 }: AclEntryRowProps) {
   const draft = editing?.did === item.did ? editing : null;
   const scopeError = draft ? validateScopeDraft(draft.scope) : null;
+  const sizeError = draft ? quotaError(draft.maxTotalSize) : null;
+  const countError = draft ? quotaError(draft.maxDidCount, { integer: true }) : null;
+  const invalid = !!(scopeError || sizeError || countError);
   const save = () => {
-    if (!saving && !scopeError) onSave(item);
+    if (!saving && !invalid) onSave(item);
   };
 
   return (
@@ -89,6 +93,7 @@ export const AclEntryRow = memo(function AclEntryRow({
                 onChange={onChangeRole}
                 style={styles.roleRow}
               />
+              <Text style={styles.roleHint}>{ROLE_DESCRIPTIONS[draft.role]}</Text>
               <Field
                 label="Label"
                 placeholder="Label"
@@ -103,6 +108,7 @@ export const AclEntryRow = memo(function AclEntryRow({
                   value={draft.maxTotalSize}
                   onChangeText={onChangeMaxTotalSize}
                   keyboardType="numeric"
+                  error={sizeError}
                   onSubmit={save}
                   style={styles.half}
                 />
@@ -112,6 +118,7 @@ export const AclEntryRow = memo(function AclEntryRow({
                   value={draft.maxDidCount}
                   onChangeText={onChangeMaxDidCount}
                   keyboardType="numeric"
+                  error={countError}
                   onSubmit={save}
                   style={styles.half}
                 />
@@ -132,7 +139,7 @@ export const AclEntryRow = memo(function AclEntryRow({
                   busyLabel="Saving..."
                   size="sm"
                   busy={saving}
-                  disabled={!!scopeError}
+                  disabled={invalid}
                   onPress={save}
                 />
                 <Button label="Cancel" variant="secondary" size="sm" onPress={onCancelEdit} />
@@ -254,6 +261,12 @@ const styles = StyleSheet.create({
   passkeysPanel: {
     marginTop: spacing.md,
     gap: spacing.sm,
+  },
+  roleHint: {
+    fontSize: 12,
+    fontFamily: fonts.regular,
+    color: colors.textSecondary,
+    marginBottom: spacing.sm,
   },
   editFields: {
     marginTop: spacing.sm,

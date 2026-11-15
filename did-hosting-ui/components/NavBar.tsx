@@ -1,23 +1,24 @@
 /**
  * Top NavBar — primary navigation + domain switcher.
  *
- * v0.7 redesign:
  * - Logo on the left, primary nav links beside it.
- * - Domain switcher chip (admin-or-multi-domain caller) sits to
- *   the right of the nav links — operators jump between domains
- *   without leaving the current view.
- * - Admin-only entries (`Domains`, `Servers`) hidden from
- *   non-admins. Settings stays universal.
- * - Logout pushed to the far right.
+ * - Domain switcher chip (admin-or-multi-domain caller) sits to the right of
+ *   the nav links — operators jump between domains without leaving the
+ *   current view.
+ * - Admin-only entries (`Domains`, `Access`, `Servers`) hidden from
+ *   non-admins. Settings stays universal (it holds the caller's passkeys).
+ * - Sign out pushed to the far right.
+ * - Under `COLLAPSE_BELOW` px the links, the switcher and Sign out fold into
+ *   a Menu button, so nothing sits off-screen in a sideways scroll.
  *
- * Why two admin entries: domain ↔ server is a many-to-many
- * relationship (a domain can be hosted by multiple servers; a
- * server can host multiple domains). Folding both views into one
- * page made the unassign / purge flow confusing; two pages with
- * focused jobs is clearer.
+ * Why two admin entries for domains and servers: domain ↔ server is
+ * many-to-many (a domain can be hosted by multiple servers; a server can host
+ * multiple domains), and one page for both made the unassign / purge flow
+ * confusing.
  */
 
-import { View, Text, StyleSheet, Pressable, ScrollView } from "react-native";
+import { useEffect, useState } from "react";
+import { View, Text, StyleSheet, Pressable, useWindowDimensions } from "react-native";
 import { Link, usePathname, type Href } from "expo-router";
 import { useAuth } from "./AuthProvider";
 import { AffinidiLogo } from "./AffinidiLogo";
@@ -33,22 +34,68 @@ type NavItem = {
   adminOnly?: boolean;
 };
 
-const NAV_ITEMS: readonly NavItem[] = [
+export const NAV_ITEMS: readonly NavItem[] = [
   { href: "/", label: "Dashboard" },
   { href: "/dids", label: "DIDs" },
   { href: "/domains", label: "Domains", adminOnly: true },
-  { href: "/acl", label: "Access" },
+  { href: "/acl", label: "Access", adminOnly: true },
   { href: "/servers", label: "Servers", adminOnly: true },
   { href: "/settings", label: "Settings" },
 ] as const;
 
-export function NavBar() {
-  const { isAuthenticated, role, logout } = useAuth();
-  const pathname = usePathname();
+/** Below this window width the nav collapses into a menu. */
+export const COLLAPSE_BELOW = 700;
 
-  if (!isAuthenticated) return null;
+export function NavBar() {
+  const { isAuthenticated, sessionExpired, role, logout } = useAuth();
+  const pathname = usePathname();
+  const { width } = useWindowDimensions();
+  const [menuOpen, setMenuOpen] = useState(false);
+  // 0 = not measured yet (and in tests): lay out wide.
+  const collapsed = width > 0 && width < COLLAPSE_BELOW;
+
+  // Navigating closes the menu.
+  useEffect(() => setMenuOpen(false), [pathname]);
+
+  if (!isAuthenticated && !sessionExpired) return null;
 
   const items = NAV_ITEMS.filter((item) => !item.adminOnly || role === "admin");
+
+  const links = items.map((item) => {
+    const active = item.href === "/" ? pathname === "/" : pathname.startsWith(item.href);
+    // Pre-flatten the style arrays. `<Link asChild>` clones the Pressable and
+    // forwards its props; an array `style` survives the clone and reaches
+    // react-dom's `setValueForStyles`, which crashes the page with "Indexed
+    // property setter is not supported." A single object sidesteps it.
+    const buttonStyle = StyleSheet.flatten([
+      styles.linkButton,
+      collapsed && styles.linkButtonStacked,
+      active && styles.linkButtonActive,
+    ]);
+    const textStyle = StyleSheet.flatten([styles.linkText, active && styles.linkTextActive]);
+    return (
+      <Link key={item.href} href={item.href} asChild>
+        <Pressable
+          role="link"
+          aria-label={item.label}
+          {...webAria(active ? { current: "page" } : {})}
+          style={buttonStyle}
+        >
+          <Text style={textStyle}>{item.label}</Text>
+        </Pressable>
+      </Link>
+    );
+  });
+
+  const signOut = (
+    <Button
+      label="Sign out"
+      accessibilityLabel="Sign out"
+      variant="secondary"
+      size="sm"
+      onPress={logout}
+    />
+  );
 
   return (
     <View style={styles.bar}>
@@ -59,58 +106,41 @@ export function NavBar() {
           </Pressable>
         </Link>
 
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={styles.links}
-          role="navigation"
-          aria-label="Main"
-        >
-          {items.map((item) => {
-            const active = item.href === "/" ? pathname === "/" : pathname.startsWith(item.href);
-            // Pre-flatten the style arrays. `<Link asChild>` clones the
-            // Pressable + forwards its props; with Expo SDK 54 / React 19 /
-            // react-native-web 0.21, an array `style` prop survives the
-            // clone and reaches react-dom's `setValueForStyles`, which then
-            // tries to write `element.style[0] = …` and crashes the whole
-            // page with "Indexed property setter is not supported." Passing
-            // a single flattened object sidesteps the bug.
-            const buttonStyle = StyleSheet.flatten([
-              styles.linkButton,
-              active && styles.linkButtonActive,
-            ]);
-            const textStyle = StyleSheet.flatten([
-              styles.linkText,
-              active && styles.linkTextActive,
-            ]);
-            return (
-              <Link key={item.href} href={item.href} asChild>
-                <Pressable
-                  role="link"
-                  aria-label={item.label}
-                  {...webAria(active ? { current: "page" } : {})}
-                  style={buttonStyle}
-                >
-                  <Text style={textStyle}>{item.label}</Text>
-                </Pressable>
-              </Link>
-            );
-          })}
-        </ScrollView>
+        {!collapsed && (
+          <View style={styles.links} role="navigation" aria-label="Main">
+            {links}
+          </View>
+        )}
 
         <View style={styles.spacer} />
 
-        <View style={styles.rightCluster}>
-          <DomainSwitcher />
+        {collapsed ? (
           <Button
-            label="Logout"
-            accessibilityLabel="Log out"
+            label={menuOpen ? "Close menu" : "Menu"}
             variant="secondary"
             size="sm"
-            onPress={logout}
+            expanded={menuOpen}
+            onPress={() => setMenuOpen((o) => !o)}
           />
-        </View>
+        ) : (
+          <View style={styles.rightCluster}>
+            <DomainSwitcher />
+            {signOut}
+          </View>
+        )}
       </View>
+
+      {collapsed && menuOpen && (
+        <View style={styles.menu} testID="nav-menu">
+          <View role="navigation" aria-label="Main" style={styles.menuLinks}>
+            {links}
+          </View>
+          <View style={styles.menuFooter}>
+            <DomainSwitcher />
+            {signOut}
+          </View>
+        </View>
+      )}
     </View>
   );
 }
@@ -136,6 +166,7 @@ const styles = StyleSheet.create({
   },
   links: {
     flexDirection: "row",
+    flexWrap: "wrap",
     alignItems: "center",
     gap: spacing.xs,
   },
@@ -152,6 +183,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.md,
     borderRadius: radii.sm,
   },
+  linkButtonStacked: {
+    paddingVertical: spacing.sm,
+  },
   linkButtonActive: {
     backgroundColor: colors.bgTertiary,
   },
@@ -162,5 +196,22 @@ const styles = StyleSheet.create({
   },
   linkTextActive: {
     color: colors.textPrimary,
+  },
+  menu: {
+    marginTop: spacing.md,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    paddingTop: spacing.sm,
+    gap: spacing.md,
+  },
+  menuLinks: {
+    gap: 2,
+  },
+  menuFooter: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacing.sm,
   },
 });

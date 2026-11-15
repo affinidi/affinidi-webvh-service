@@ -1,5 +1,13 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { View, Text, StyleSheet, FlatList, ScrollView, ActivityIndicator } from "react-native";
+import {
+  View,
+  Text,
+  StyleSheet,
+  FlatList,
+  ScrollView,
+  ActivityIndicator,
+  useWindowDimensions,
+} from "react-native";
 import { Link, useLocalSearchParams, useRouter } from "expo-router";
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
@@ -13,8 +21,12 @@ import { RequireAuth } from "../../components/RequireAuth";
 import { SegmentedControl } from "../../components/SegmentedControl";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { webAria } from "../../lib/a11y";
-import { showAlert } from "../../lib/alert";
+import { confirm, notify } from "../../lib/feedback";
+import { didPathError } from "../../lib/validation";
+import { ErrorWithRetry } from "../../components/QueryState";
+import { DidCards } from "../../components/DidCards";
 import { errorMessage } from "../../lib/errors";
+import { matchesDomain } from "../../lib/domain";
 import { plural } from "../../lib/plural";
 import { invalidateQueries, useTrustTaskQuery } from "../../lib/query";
 import type { DidListPage, DidRecord } from "../../lib/api";
@@ -114,6 +126,7 @@ function DidListBody() {
     data: firstPage,
     loading,
     error: loadError,
+    refetch,
   } = useTrustTaskQuery(
     [...DIDS_KEY, "page", owner ?? null, currentDomain, query],
     ({ background }) => api.listDidPage({ ...filters, limit: PAGE_SIZE }, { background }),
@@ -150,7 +163,9 @@ function DidListBody() {
       setLoadingMore(false);
     }
   };
-  const error = loadError ? errorMessage(loadError, "Failed to load DIDs") : moreError;
+  const { width } = useWindowDimensions();
+  // Under this width the table would scroll sideways; rows become cards.
+  const narrow = width > 0 && width < 700;
   const refresh = () => void invalidateQueries([...DIDS_KEY]);
   const [creating, setCreating] = useState(false);
 
@@ -180,12 +195,19 @@ function DidListBody() {
     setPathStatus(null);
   };
 
+  // Checked here first with the server's own path grammar, so a path the
+  // server would refuse is said at once and never sent.
+  const pathError = didPathError(customPath.trim());
+  const trimmedPath = customPath.trim();
+  // An empty path asks for a random name; anything else must be free.
+  const canCreate = !creating && !pathError && (trimmedPath === "" || pathStatus === "available");
+
   // Debounced availability check as user types
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
 
     const trimmed = customPath.trim();
-    if (trimmed.length < 2) {
+    if (trimmed.length < 2 || didPathError(trimmed)) {
       setPathStatus(null);
       return;
     }
@@ -204,15 +226,20 @@ function DidListBody() {
   }, [customPath, api, createDomain]);
 
   const handleCreate = async () => {
-    if (creating) return;
+    if (!canCreate) return;
     setCreating(true);
     try {
       const path = customPath.trim() || undefined;
-      await api.createDid(path, createDomain ?? undefined);
+      const created = await api.createDid(path, createDomain ?? undefined);
       resetForm();
       refresh();
+      notify(
+        "success",
+        `Reserved “${created.mnemonic}”`,
+        `Next: have the DID's agent sign its first did.jsonl and publish it here${created.didUrl ? ` (${created.didUrl})` : ""} — or open the DID and upload the file. Until then it shows as “Pending upload”.`,
+      );
     } catch (e: unknown) {
-      showAlert("Error", errorMessage(e, "Failed to create DID"));
+      notify("error", "Could not create the DID", errorMessage(e, "Failed to create DID"));
     } finally {
       setCreating(false);
     }
@@ -227,21 +254,45 @@ function DidListBody() {
       setAcceptPath("");
       setShowAccept(false);
       refresh();
-      showAlert("Success", `"${path}" is now yours`);
+      notify("success", "DID accepted", `"${path}" is now yours.`);
     } catch (e: unknown) {
-      showAlert("Error", errorMessage(e, "Failed to accept the DID"));
+      notify("error", "Could not accept the DID", errorMessage(e, "Failed to accept the DID"));
     } finally {
       setAccepting(false);
     }
   };
 
+  // The root DID belongs to one domain: the one the switcher is on, else the
+  // default.
+  const rootDomain = currentDomain ?? defaultDomain ?? null;
   const handleCreateRootDid = async () => {
+    if (!rootDomain) return;
+    const ok = await confirm({
+      title: `Reserve the root DID for ${rootDomain}?`,
+      body:
+        `The root DID stands for the domain itself: it resolves at ` +
+        `https://${rootDomain}/.well-known/did.jsonl, and it is the only DID that can hold ` +
+        `the community name ${rootDomain}/@. This reserves the slot; its agent then ` +
+        `publishes the signed did.jsonl, as for any other DID.`,
+      confirmLabel: "Reserve root DID",
+      destructive: false,
+    });
+    if (!ok) return;
     setCreatingRoot(true);
     try {
-      await api.createDid(".well-known");
+      await api.createDid(".well-known", rootDomain);
       refresh();
+      notify(
+        "success",
+        `Root DID reserved for ${rootDomain}`,
+        "Next: have its agent publish the signed did.jsonl, or open it and upload the file.",
+      );
     } catch (e: unknown) {
-      showAlert("Error", errorMessage(e, "Failed to create root DID"));
+      notify(
+        "error",
+        "Could not create the root DID",
+        errorMessage(e, "Failed to create root DID"),
+      );
     } finally {
       setCreatingRoot(false);
     }
@@ -250,7 +301,12 @@ function DidListBody() {
   // `.well-known` sorts before every other name, so an unsearched first page
   // holds it when it exists.
   const showRootDidButton =
-    role === "admin" && !query && !loading && !dids.some((d) => d.mnemonic === ".well-known");
+    role === "admin" &&
+    !!rootDomain &&
+    !query &&
+    !loading &&
+    !loadError &&
+    !dids.some((d) => d.mnemonic === ".well-known" && matchesDomain(d, rootDomain));
 
   // Domain and search are applied by the control plane (a slot with no
   // recorded domain is matched on its DID's host there); only the sort is
@@ -337,7 +393,7 @@ function DidListBody() {
         <View style={styles.headerActions}>
           {showRootDidButton && (
             <Button
-              label="Create Root DID"
+              label={`Create root DID for ${rootDomain}`}
               variant="secondary"
               busy={creatingRoot}
               busyLabel="Creating..."
@@ -393,13 +449,14 @@ function DidListBody() {
       {showForm && (
         <View style={styles.formCard}>
           <Field
-            label="DID path or mnemonic"
+            label="DID path (optional)"
             hideLabel
             inputStyle={styles.input}
             placeholder="custom-name or path/to/name (optional)"
             value={customPath}
             onChangeText={setCustomPath}
             onSubmit={handleCreate}
+            error={trimmedPath ? pathError : null}
             autoCapitalize="none"
             autoCorrect={false}
             style={styles.fieldTight}
@@ -407,7 +464,7 @@ function DidListBody() {
           <Text style={styles.validationHint}>
             Segments: 2–63 chars, lowercase letters, digits, and hyphens.
             {"\n"}Use / for folders (e.g. people/staff/glenn).
-            {"\n"}Leave blank for a random mnemonic.
+            {"\n"}Leave blank for a random name.
           </Text>
 
           {domainsLoaded && domains.length > 0 && (
@@ -425,8 +482,8 @@ function DidListBody() {
                 style={styles.domainPickerRow}
               />
               <Text style={styles.validationHint}>
-                The selected domain becomes the DID&apos;s host. Omit (rare) to let the daemon pick
-                your ACL default.
+                The selected domain becomes the DID&apos;s host. With none selected, the control
+                plane uses your default domain.
               </Text>
             </View>
           )}
@@ -443,19 +500,27 @@ function DidListBody() {
           </View>
 
           <View style={styles.formActions}>
-            <Button label="Create" busy={creating} busyLabel="Creating..." onPress={handleCreate} />
+            <Button
+              label="Create"
+              busy={creating}
+              busyLabel="Creating..."
+              disabled={!canCreate}
+              onPress={handleCreate}
+            />
             <Button label="Cancel" variant="secondary" disabled={creating} onPress={resetForm} />
           </View>
         </View>
       )}
 
-      {error && (
+      {moreError && (
         <Text role="alert" style={styles.errorText}>
-          {error}
+          {moreError}
         </Text>
       )}
 
-      {loading && !search && !query ? (
+      {loadError != null && !firstPage ? (
+        <ErrorWithRetry error={loadError} what="the DIDs" onRetry={() => void refetch()} />
+      ) : loading && !search && !query ? (
         <ActivityIndicator
           color={colors.accent}
           size="large"
@@ -487,63 +552,74 @@ function DidListBody() {
               {cursor ? " shown · more available" : ""}
             </Text>
           </View>
-          <ScrollView horizontal contentContainerStyle={styles.tableScroll}>
-            <View
-              role="table"
-              aria-label="DIDs"
-              style={[styles.table, { minWidth: tableMinWidth }]}
-            >
-              <View style={styles.headRow} role="row">
-                {COLUMNS.map((c) => {
-                  const active = sort.key === c.key;
-                  return (
-                    <View
-                      key={c.key}
-                      role="columnheader"
-                      {...webAria({
-                        sort: active ? (sort.dir === "asc" ? "ascending" : "descending") : "none",
-                      })}
-                      style={[
-                        styles.cell,
-                        columnStyle(c.key),
-                        c.align === "right" && styles.cellRight,
-                        c.gapAfter && styles.cellGapAfter,
-                      ]}
-                    >
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        accessibilityLabel={`Sort by ${c.label}`}
-                        onPress={() => setSort(nextSort(sort, c.key))}
-                        style={styles.headButton}
+          {narrow ? (
+            <DidCards
+              rows={rows}
+              search={search}
+              myDid={myDid}
+              markOwners={markOwners}
+              showMethod={showMethod}
+              showDomain={currentDomain === null}
+            />
+          ) : (
+            <ScrollView horizontal contentContainerStyle={styles.tableScroll}>
+              <View
+                role="table"
+                aria-label="DIDs"
+                style={[styles.table, { minWidth: tableMinWidth }]}
+              >
+                <View style={styles.headRow} role="row">
+                  {COLUMNS.map((c) => {
+                    const active = sort.key === c.key;
+                    return (
+                      <View
+                        key={c.key}
+                        role="columnheader"
+                        {...webAria({
+                          sort: active ? (sort.dir === "asc" ? "ascending" : "descending") : "none",
+                        })}
+                        style={[
+                          styles.cell,
+                          columnStyle(c.key),
+                          c.align === "right" && styles.cellRight,
+                          c.gapAfter && styles.cellGapAfter,
+                        ]}
                       >
-                        <Text
-                          style={[styles.headText, active && styles.headTextActive]}
-                          numberOfLines={1}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          accessibilityLabel={`Sort by ${c.label}`}
+                          onPress={() => setSort(nextSort(sort, c.key))}
+                          style={styles.headButton}
                         >
-                          {c.label}
-                          {active ? (sort.dir === "asc" ? " ▲" : " ▼") : ""}
-                        </Text>
-                      </Button>
-                    </View>
-                  );
-                })}
+                          <Text
+                            style={[styles.headText, active && styles.headTextActive]}
+                            numberOfLines={1}
+                          >
+                            {c.label}
+                            {active ? (sort.dir === "asc" ? " ▲" : " ▼") : ""}
+                          </Text>
+                        </Button>
+                      </View>
+                    );
+                  })}
+                </View>
+                {rows.length === 0 ? (
+                  <Text style={styles.hint}>
+                    {loading
+                      ? "Searching..."
+                      : cursor
+                        ? "No matches in the DIDs searched so far."
+                        : query
+                          ? `No DIDs match “${query}”.`
+                          : "No DIDs."}
+                  </Text>
+                ) : (
+                  <FlatList data={rows} keyExtractor={keyOf} renderItem={renderItem} />
+                )}
               </View>
-              {rows.length === 0 ? (
-                <Text style={styles.hint}>
-                  {loading
-                    ? "Searching..."
-                    : cursor
-                      ? "No matches in the DIDs searched so far."
-                      : query
-                        ? `No DIDs match “${query}”.`
-                        : "No DIDs."}
-                </Text>
-              ) : (
-                <FlatList data={rows} keyExtractor={keyOf} renderItem={renderItem} />
-              )}
-            </View>
-          </ScrollView>
+            </ScrollView>
+          )}
           {cursor && (
             <View style={styles.loadMoreRow}>
               <Button
@@ -645,7 +721,12 @@ const DidRow = memo(function DidRow({
       </View>
       <View role="cell" style={[styles.cell, columns.didId]}>
         {item.versionCount === 0 ? (
-          <Text style={styles.statusPending}>Pending upload</Text>
+          <Text
+            style={styles.statusPending}
+            {...titleAttr("Reserved — waiting for its first signed did.jsonl")}
+          >
+            Pending upload
+          </Text>
         ) : item.didId ? (
           <View style={styles.didIdRow}>
             <Text

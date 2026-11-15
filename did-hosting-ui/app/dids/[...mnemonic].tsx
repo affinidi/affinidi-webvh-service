@@ -8,13 +8,17 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ScrollView, StyleSheet, View } from "react-native";
-import { useLocalSearchParams, useRouter } from "expo-router";
+import { ActivityIndicator, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Link, useLocalSearchParams, useRouter } from "expo-router";
 
 import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { useDomains } from "../../components/DomainProvider";
 import { RequireAuth } from "../../components/RequireAuth";
+import { Button } from "../../components/Button";
+import { Heading } from "../../components/Heading";
+import { ErrorWithRetry } from "../../components/QueryState";
+import { StatsResolutionCard } from "../../components/did/StatsResolutionCard";
 import { LazyUsageChart } from "../../components/LazyUsageChart";
 import { AgentNamesCard } from "../../components/did/AgentNamesCard";
 import { ConsentPanel } from "../../components/did/ConsentPanel";
@@ -32,14 +36,15 @@ import {
   agentNameLocalPart,
   alsoKnownAsOf,
 } from "../../components/did/agent-names";
-import { showAlert, showConfirm } from "../../lib/alert";
+import { confirm, notify, showMessage } from "../../lib/feedback";
 import type { DidDetailResponse, LogEntryInfo } from "../../lib/api";
 import { ownerMismatchWarning } from "../../lib/delegation-guard";
 import { scidAliasesOf } from "../../lib/did-scid";
-import { errorMessage } from "../../lib/errors";
+import { errorMessage, isNotFound } from "../../lib/errors";
+import { isRejection } from "../../lib/api";
 import { invalidateQueries, setQueryData, useTrustTaskQuery } from "../../lib/query";
 import { scidAliasConfirm, scidAliasView, type ScidAliasAction } from "../../lib/scid-alias";
-import { colors, spacing } from "../../lib/theme";
+import { colors, fonts, spacing } from "../../lib/theme";
 import { useAgentNames } from "../../lib/use-agent-names";
 import { useDelegatedTask, type DelegatedResult } from "../../lib/use-delegated-task";
 import {
@@ -149,7 +154,7 @@ function DidDetailScreen() {
   // ── Delegated edits ───────────────────────────────────────────────────────
   const task = useDelegatedTask({
     latestVersionId,
-    notify: showAlert,
+    notify: showMessage,
     onAccepted: () => {
       setEditingDoc(false);
       reload();
@@ -173,7 +178,8 @@ function DidDetailScreen() {
         .catch(() => {});
       // Deliberately not "your change was applied": the log advancing proves
       // only that it moved, not who moved it.
-      showAlert(
+      notify(
+        "info",
         "This DID has moved on",
         `It is now at version ${entries.length}. If that was your approved change, it has been applied and the current document is shown below — otherwise re-apply your edit on top of it.`,
       );
@@ -181,7 +187,8 @@ function DidDetailScreen() {
   });
 
   const noIdentifier = (silent?: boolean): Promise<DelegatedResult> => {
-    if (!silent) showAlert("Error", "This DID has no published identifier yet.");
+    if (!silent)
+      notify("error", "Nothing to change yet", "This DID has no published identifier yet.");
     return Promise.resolve("error");
   };
 
@@ -254,17 +261,19 @@ function DidDetailScreen() {
     );
   };
 
-  const handleScidAlias = (action: ScidAliasAction) => {
+  const handleScidAlias = async (action: ScidAliasAction) => {
     const alias = didDetail?.scidAlias;
     if (!alias || !scidAliasPanel) return;
     const expectedVersionId = latestVersionId ?? undefined;
-    showConfirm(
-      action.label,
-      withDelegationWarning(
+    const ok = await confirm({
+      title: action.label,
+      body: withDelegationWarning(
         `${scidAliasConfirm(alias, action)}\n\n${scidAliasPanel.warning ?? ""}`.trim(),
       ),
-      () => void runScidAlias(action.scidAlsoKnownAs, expectedVersionId),
-    );
+      confirmLabel: action.label,
+      destructive: false,
+    });
+    if (ok) void runScidAlias(action.scidAlsoKnownAs, expectedVersionId);
   };
 
   /** Publish a version that additionally claims `name` (the local part; the
@@ -272,7 +281,11 @@ function DidDetailScreen() {
   const bindName = (name: string): boolean => {
     if (!agentDomain || !currentState) return false;
     if (boundNames.includes(name)) {
-      showAlert("Already bound", `${agentNameLabel(name, agentDomain)} is already on this DID.`);
+      notify(
+        "info",
+        "Already bound",
+        `${agentNameLabel(name, agentDomain)} is already on this DID.`,
+      );
       return false;
     }
     void publishDocument({
@@ -292,62 +305,70 @@ function DidDetailScreen() {
     !boundNames.includes("") &&
     !parkedNames.includes("");
 
-  const handleBindCommunityName = () => {
+  const handleBindCommunityName = async () => {
     if (!agentDomain) return;
-    showConfirm(
-      "Bind the community name",
-      `Claim ${agentDomain}/@ for this DID?\n\n` +
+    const ok = await confirm({
+      title: "Bind the community name",
+      body:
+        `Claim ${agentDomain}/@ for this DID?\n\n` +
         `This is the name of the trust community that owns ${agentDomain}, and it ` +
         `resolves to this root DID. Your agent will publish a new version claiming it.`,
-      () => void bindName(""),
-    );
+      confirmLabel: "Bind name",
+      destructive: false,
+    });
+    if (ok) bindName("");
   };
 
   // Remove: publish a version that no longer claims the name. Distinct from
   // parking, which keeps it reserved to this DID.
-  const handleUnbindName = (name: string) => {
+  const handleUnbindName = async (name: string) => {
     if (!agentDomain || !currentState) return;
-    showConfirm(
-      "Remove name",
-      `Stop serving ${agentNameLabel(name, agentDomain)}? Your agent will publish a new version that no longer claims it — the redirect stops resolving and the name is freed for anyone to claim.`,
-      async () => {
-        const nextAka = alsoKnownAsOf(currentState.alsoKnownAs).filter(
-          (a) => agentNameLocalPart(a, agentDomain) !== name,
-        );
-        await publishDocument({ ...currentState, alsoKnownAs: nextAka });
-      },
+    const ok = await confirm({
+      title: "Remove name",
+      body: `Stop serving ${agentNameLabel(name, agentDomain)}? Your agent will publish a new version that no longer claims it — the redirect stops resolving and the name is freed for anyone to claim.`,
+      confirmLabel: "Remove name",
+    });
+    if (!ok) return;
+    const nextAka = alsoKnownAsOf(currentState.alsoKnownAs).filter(
+      (a) => agentNameLocalPart(a, agentDomain) !== name,
     );
+    await publishDocument({ ...currentState, alsoKnownAs: nextAka });
   };
 
   // Park and resume are delegated publishes like any other, so the ownership
   // caveat applies — and the confirm is the last thing read before the agent
   // is asked.
-  const handleParkName = (name: string) =>
-    showConfirm(
-      "Park name",
-      withDelegationWarning(
+  const handleParkName = async (name: string) => {
+    const ok = await confirm({
+      title: "Park name",
+      body: withDelegationWarning(
         `Park ${agentNameLabel(name, agentDomain)}? Your agent publishes a version that stops serving it, but the name stays reserved to this DID — nobody else can claim it, and you can resume it any time.`,
       ),
-      () => void runParkResume(name, false),
-    );
+      confirmLabel: "Park name",
+      destructive: false,
+    });
+    if (ok) void runParkResume(name, false);
+  };
 
-  const handleResumeName = (name: string) =>
-    showConfirm(
-      "Resume name",
-      withDelegationWarning(
+  const handleResumeName = async (name: string) => {
+    const ok = await confirm({
+      title: "Resume name",
+      body: withDelegationWarning(
         `Serve ${agentNameLabel(name, agentDomain)} again? Your agent will publish a version that claims it, and the redirect starts resolving.`,
       ),
-      () => void runParkResume(name, true),
-    );
+      confirmLabel: "Resume name",
+      destructive: false,
+    });
+    if (ok) void runParkResume(name, true);
+  };
 
   // ── Raw log ────────────────────────────────────────────────────────────────
-  const loadRawLog = async (thenCloseEditor: boolean) => {
+  const loadRawLog = async () => {
     setLoadingRaw(true);
     try {
       setLogContent(await api.getRawLog(mnemonic));
-      if (thenCloseEditor) setEditingDoc(false);
     } catch (e: unknown) {
-      showAlert("Error", errorMessage(e, "Failed to load raw log"));
+      notify("error", "Could not load did.jsonl", errorMessage(e, "Failed to load raw log"));
     } finally {
       setLoadingRaw(false);
     }
@@ -362,6 +383,43 @@ function DidDetailScreen() {
   );
   const logEntryCount = didDetail?.log?.logEntryCount ?? 0;
   const canDelegate = isWalletTaskRelayAvailable();
+
+  // A path that names no DID — or one this session may not see, which the
+  // control plane answers the same way — gets a page saying so, and none of
+  // the actions that would only fail on it.
+  if (
+    !didDetail &&
+    detailQuery.error != null &&
+    (isNotFound(detailQuery.error) || isRejection(detailQuery.error, "permissionDenied"))
+  ) {
+    return (
+      <View style={styles.notFound}>
+        <Heading level={1}>DID not found</Heading>
+        <Text style={styles.notFoundText}>
+          There is no DID at “{mnemonic}”, or it is not one you can see. Check the address, or find
+          it in the DID list.
+        </Text>
+        <Link href="/dids" asChild>
+          <Button label="Go to the DID list" />
+        </Link>
+      </View>
+    );
+  }
+  if (!didDetail) {
+    return (
+      <View style={styles.notFound}>
+        {detailQuery.error != null ? (
+          <ErrorWithRetry
+            error={detailQuery.error}
+            what="this DID"
+            onRetry={() => void detailQuery.refetch()}
+          />
+        ) : (
+          <ActivityIndicator color={colors.accent} size="large" aria-label="Loading the DID" />
+        )}
+      </View>
+    );
+  }
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
@@ -391,14 +449,11 @@ function DidDetailScreen() {
             onSelectVersion={setSelectedVersion}
             editing={editingDoc}
             onEditingChange={setEditingDoc}
-            loadingRaw={loadingRaw}
-            onCopyToUpload={() => void loadRawLog(true)}
             canPublish={canDelegate}
             publishing={task.publishing}
             onPublish={(doc) => void publishDocument(doc)}
             delegationWarning={delegationWarning}
             consentPanel={consentPanel}
-            notify={showAlert}
           />
         )}
 
@@ -442,9 +497,9 @@ function DidDetailScreen() {
           logContent={logContent}
           onLogContentChange={setLogContent}
           loadingRaw={loadingRaw}
-          onLoadCurrent={() => void loadRawLog(false)}
+          onLoadCurrent={() => void loadRawLog()}
           onUploaded={reload}
-          notify={showAlert}
+          notify={showMessage}
         />
 
         {didDetail && (role === "admin" || (callerDid && callerDid === didDetail.owner)) && (
@@ -456,17 +511,26 @@ function DidDetailScreen() {
                 prev ? { ...prev, owner: record.owner, updatedAt: record.updatedAt } : prev,
               )
             }
-            notify={showAlert}
+            notify={showMessage}
           />
         )}
 
+        <StatsResolutionCard mnemonic={mnemonic} isAdmin={role === "admin"} />
+
         <DangerZone
           mnemonic={mnemonic}
-          versionCount={didDetail?.versionCount ?? null}
+          versionCount={didDetail.versionCount}
           logEntryCount={logEntryCount}
+          suspended={didDetail.disabled}
           onRolledBack={reload}
-          onDeleted={() => router.replace("/dids")}
-          notify={showAlert}
+          onStateChanged={() => {
+            reload();
+            void invalidateQueries(["dids"]);
+          }}
+          onDeleted={() => {
+            void invalidateQueries(["dids"]);
+            router.replace("/dids");
+          }}
         />
       </View>
     </ScrollView>
@@ -480,6 +544,21 @@ const styles = StyleSheet.create({
   },
   content: {
     padding: spacing.xl,
+  },
+  notFound: {
+    flex: 1,
+    padding: spacing.xl,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.bgPrimary,
+    gap: spacing.md,
+  },
+  notFoundText: {
+    fontFamily: fonts.regular,
+    fontSize: 15,
+    color: colors.textSecondary,
+    textAlign: "center",
+    maxWidth: 520,
   },
   wide: {
     maxWidth: 1200,

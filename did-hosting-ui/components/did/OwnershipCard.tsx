@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Text } from "react-native";
 
-import { showConfirm } from "../../lib/alert";
+import { confirm } from "../../lib/feedback";
 import type { DidRecord } from "../../lib/api";
 import { errorMessage } from "../../lib/errors";
 import { formatDate } from "../../lib/time";
@@ -32,37 +32,39 @@ export function OwnershipCard({
   const [newOwner, setNewOwner] = useState("");
   const [changing, setChanging] = useState(false);
 
-  const change = () => {
+  const change = async () => {
     const target = newOwner.trim();
     if (!target || changing) return;
-    showConfirm(
-      "Change Owner",
-      isAdmin
-        ? `Transfer ownership of "${mnemonic}" to ${target}? The new owner must be in the ACL, and its domain scope and quota must allow this DID.`
+    const ok = await confirm({
+      title: isAdmin ? "Transfer ownership?" : "Offer this DID?",
+      body: isAdmin
+        ? `Transfer ownership of "${mnemonic}" to ${target}? The new owner must have access here, and its domain scope and quota must allow this DID.`
         : `Offer "${mnemonic}" to ${target}? It moves when they accept it from their DID list.`,
-      async () => {
-        setChanging(true);
-        try {
-          const { record, offer } = await api.changeOwner(mnemonic, target);
-          onChanged(record);
-          setNewOwner("");
-          setOpen(false);
-          if (offer) {
-            const until = formatDate(offer.expiresAt, { withTime: true, fallback: "" });
-            notify(
-              "Offer sent",
-              `${offer.newOwner} can accept "${mnemonic}" from their DID list${until ? ` until ${until}` : ""}. You stay the owner until then.`,
-            );
-          } else {
-            notify("Success", "DID owner changed");
-          }
-        } catch (e: unknown) {
-          notify("Error", errorMessage(e, "Change owner failed"));
-        } finally {
-          setChanging(false);
+      confirmLabel: isAdmin ? "Transfer ownership" : "Send offer",
+    });
+    if (!ok) return;
+    await (async () => {
+      setChanging(true);
+      try {
+        const { record, offer } = await api.changeOwner(mnemonic, target);
+        onChanged(record);
+        setNewOwner("");
+        setOpen(false);
+        if (offer) {
+          const until = formatDate(offer.expiresAt, { withTime: true, fallback: "" });
+          notify(
+            "Offer sent",
+            `${offer.newOwner} can accept "${mnemonic}" from their DID list${until ? ` until ${until}` : ""}. You stay the owner until then.`,
+          );
+        } else {
+          notify("Success", "DID owner changed");
         }
-      },
-    );
+      } catch (e: unknown) {
+        notify("Error", errorMessage(e, "Change owner failed"));
+      } finally {
+        setChanging(false);
+      }
+    })();
   };
 
   return (

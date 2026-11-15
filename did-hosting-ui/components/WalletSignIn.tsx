@@ -25,6 +25,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Platform, StyleSheet, Text, View } from "react-native";
 
 import { Button } from "./Button";
+import { Countdown } from "./Countdown";
 
 import { setAuthMethod, setRefreshToken, setToken } from "../lib/api";
 import { useApi } from "./ApiProvider";
@@ -155,11 +156,15 @@ export function WalletSignIn({
           ) : (
             // C9: hidden, not cancelled; the request is still being polled,
             // and the code shows again when the tab does.
-            <Text style={styles.hint}>The code is hidden while this tab is in the background.</Text>
+            <Text style={styles.hint}>
+              The code is hidden while this tab is in the background, and shows again when you
+              return to it.
+            </Text>
           )}
           <Text style={styles.hint}>
-            Scan with your wallet, or click the code. It expires at{" "}
-            {state.expiresAt.toLocaleTimeString()}.
+            Scan the code with your wallet app, or click it to use the wallet in this browser. It
+            expires in <Countdown expiresAt={Math.floor(state.expiresAt.getTime() / 1000)} /> (at{" "}
+            {state.expiresAt.toLocaleTimeString()}).
           </Text>
           <Button label="Cancel" variant="ghost" size="sm" onPress={() => void c?.cancel()} />
         </View>
@@ -167,7 +172,12 @@ export function WalletSignIn({
     case "claimed":
       return (
         <View style={styles.center}>
-          <Text style={styles.hint}>Approve on your phone. Your number is</Text>
+          {/* The page cannot tell a phone wallet from the browser plugin on
+              this device (the plugin reads the number off this element), so
+              the words fit both. */}
+          <Text style={styles.hint}>
+            Approve the sign-in in your wallet. If it asks for a number, it is
+          </Text>
           {/* C11: the number for the browser plugin, on this element only. */}
           <div {...matchNumberHandOff(state)}>
             <Text style={styles.number} accessibilityLabel={`Your number is ${state.matchNumber}`}>

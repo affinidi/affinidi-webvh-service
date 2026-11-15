@@ -7,6 +7,7 @@ import type * as DidRegister from "../trust-tasks/did-management/did/register/0.
 import type * as DidDelete from "../trust-tasks/did-management/did/delete/0.1/payload";
 import type * as DidChangeOwner from "../trust-tasks/did-management/did/change-owner/0.1/payload";
 import type * as DidRollback from "../trust-tasks/did-management/did/rollback/0.1/payload";
+import type * as DidSetState from "../trust-tasks/did-management/did/set-state/0.1/payload";
 import type * as WitnessPublish from "../trust-tasks/webvh/witness/publish/0.1/payload";
 import type * as AgentNameCheck from "../trust-tasks/did-management/agent-name/check/0.1/payload";
 import type * as AgentNameResolve from "../trust-tasks/did-management/agent-name/resolve/0.1/payload";
@@ -211,6 +212,19 @@ export const didsApi = {
     await withStepUp(() =>
       trustTask<DidDelete.Payload, DidDelete.Response>(T.didDelete, { mnemonic }),
     );
+  },
+
+  /**
+   * Suspend a DID (resolvers get a deactivation marker; the log is kept) or
+   * resume it. An administrator's suspension can only be lifted by an
+   * administrator.
+   */
+  setDidState: async (mnemonic: string, state: "active" | "suspended"): Promise<DidRecord> => {
+    const r = await trustTask<DidSetState.Payload, DidSetState.Response>(T.didSetState, {
+      mnemonic,
+      state,
+    });
+    return didRecordFromWire(r.record);
   },
 
   /** Discard the last log entry: roll back to `versionCount - 1`. */

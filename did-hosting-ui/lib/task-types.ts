@@ -20,6 +20,7 @@ import type * as DidRegister from "./trust-tasks/did-management/did/register/0.1
 import type * as DidDelete from "./trust-tasks/did-management/did/delete/0.1/payload";
 import type * as DidChangeOwner from "./trust-tasks/did-management/did/change-owner/0.1/payload";
 import type * as DidRollback from "./trust-tasks/did-management/did/rollback/0.1/payload";
+import type * as DidSetState from "./trust-tasks/did-management/did/set-state/0.1/payload";
 import type * as WitnessPublish from "./trust-tasks/webvh/witness/publish/0.1/payload";
 import type * as AgentNameCheck from "./trust-tasks/did-management/agent-name/check/0.1/payload";
 import type * as AgentNameResolve from "./trust-tasks/did-management/agent-name/resolve/0.1/payload";
@@ -27,6 +28,8 @@ import type * as DomainList from "./trust-tasks/did-management/domain/list/0.1/p
 import type * as MeDomains from "./trust-tasks/did-management/me/domains/0.1/payload";
 import type * as DomainCreate from "./trust-tasks/did-management/domain/create/0.1/payload";
 import type * as DomainSetState from "./trust-tasks/did-management/domain/set-state/0.1/payload";
+import type * as DomainUpdate from "./trust-tasks/did-management/domain/update/0.1/payload";
+import type * as StatsSetResolution from "./trust-tasks/did-management/stats/set-resolution/0.1/payload";
 import type * as DomainSetDefault from "./trust-tasks/did-management/domain/set-default/0.1/payload";
 import type * as DomainPurge from "./trust-tasks/did-management/domain/purge/0.1/payload";
 import type * as DomainAssign from "./trust-tasks/did-management/domain/assign/0.1/payload";
@@ -78,6 +81,7 @@ export const T = {
   didDelete: `${DM}did/delete/0.1` as const satisfies typeof DidDelete.TYPE_URI,
   didChangeOwner: `${DM}did/change-owner/0.1` as const satisfies typeof DidChangeOwner.TYPE_URI,
   didRollback: `${DM}did/rollback/0.1` as const satisfies typeof DidRollback.TYPE_URI,
+  didSetState: `${DM}did/set-state/0.1` as const satisfies typeof DidSetState.TYPE_URI,
   witnessPublish:
     `${TT}webvh/witness/publish/0.1` as const satisfies typeof WitnessPublish.TYPE_URI,
   agentNameCheck: `${DM}agent-name/check/0.1` as const satisfies typeof AgentNameCheck.TYPE_URI,
@@ -87,6 +91,7 @@ export const T = {
   meDomains: `${DM}me/domains/0.1` as const satisfies typeof MeDomains.TYPE_URI,
   domainCreate: `${DM}domain/create/0.1` as const satisfies typeof DomainCreate.TYPE_URI,
   domainSetState: `${DM}domain/set-state/0.1` as const satisfies typeof DomainSetState.TYPE_URI,
+  domainUpdate: `${DM}domain/update/0.1` as const satisfies typeof DomainUpdate.TYPE_URI,
   domainSetDefault:
     `${DM}domain/set-default/0.1` as const satisfies typeof DomainSetDefault.TYPE_URI,
   domainPurge: `${DM}domain/purge/0.1` as const satisfies typeof DomainPurge.TYPE_URI,
@@ -96,6 +101,8 @@ export const T = {
   registryPurgeDomain:
     `${DM}registry/purge-domain/0.1` as const satisfies typeof RegistryPurgeDomain.TYPE_URI,
   statsGet: `${DM}stats/get/0.1` as const satisfies typeof StatsGet.TYPE_URI,
+  statsSetResolution:
+    `${DM}stats/set-resolution/0.1` as const satisfies typeof StatsSetResolution.TYPE_URI,
   statsTimeseries: `${DM}stats/timeseries/0.2` as const satisfies typeof StatsTimeseries.TYPE_URI,
   serverConfig: `${DM}server/config/0.1` as const satisfies typeof ServerConfig.TYPE_URI,
   identityList: `${DM}identity/list/0.1` as const satisfies typeof IdentityList.TYPE_URI,

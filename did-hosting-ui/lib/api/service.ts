@@ -8,6 +8,7 @@ import type * as DomainUnassign from "../trust-tasks/did-management/domain/unass
 import type * as RegistryList from "../trust-tasks/did-management/registry/list/0.2/payload";
 import type * as RegistryPurgeDomain from "../trust-tasks/did-management/registry/purge-domain/0.1/payload";
 import type * as StatsGet from "../trust-tasks/did-management/stats/get/0.1/payload";
+import type * as StatsSetResolution from "../trust-tasks/did-management/stats/set-resolution/0.1/payload";
 import type * as StatsTimeseries from "../trust-tasks/did-management/stats/timeseries/0.2/payload";
 import type * as ServerConfig from "../trust-tasks/did-management/server/config/0.1/payload";
 import type * as IdentityList from "../trust-tasks/did-management/identity/list/0.1/payload";
@@ -101,6 +102,20 @@ export const serviceApi = {
   },
 
   // ---- Stats ----
+
+  /**
+   * How much statistical detail to keep over time for one DID: `auto` (the
+   * service decides from its traffic), `fine` (5-minute series; admin only),
+   * `coarse` (hourly and daily only) or `off` (totals only).
+   */
+  setStatsResolution: async (
+    mnemonic: string,
+    resolution: StatsSetResolution.Payload["resolution"],
+  ): Promise<StatsSetResolution.Response> =>
+    trustTask<StatsSetResolution.Payload, StatsSetResolution.Response>(T.statsSetResolution, {
+      mnemonic,
+      resolution,
+    }),
 
   getStats: async (mnemonic: string, opts: ReadOptions = {}): Promise<DidStats> =>
     statsFromWire(
