@@ -54,13 +54,15 @@ pub struct AppState {
     pub acl_locks: PathLocks,
     /// Requests already acted on, keyed on `(proven issuer, document id)`.
     pub replay_cache: Arc<ReplayCache>,
-    /// Serialises this process's `witness/sign` requests. What keeps two
-    /// forks of one DID from both being witnessed is not this lock but the
-    /// store: the witnessed mark is moved by compare-and-swap before signing
-    /// (`witness_ops::advance_witnessed_mark`), which holds across processes
-    /// sharing a store and across restarts. The lock only spares this
-    /// process's own concurrent requests the swap's retry.
-    pub sign_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serialises this process's `witness/sign` requests for one witness
+    /// identity and one DID, while each moves the witnessed mark. What keeps
+    /// two forks of one DID from both being witnessed is not this lock but
+    /// the store: the witnessed mark is moved by compare-and-swap before
+    /// signing (`witness_ops::advance_witnessed_mark`), which holds across
+    /// processes sharing a store and across restarts. The lock only spares
+    /// this process's own concurrent requests the swap's retry; requests for
+    /// other DIDs or identities do not wait on it.
+    pub sign_locks: PathLocks,
     /// Per-address rate limiter for `POST /api/trust-tasks`. Applied before
     /// the document's claimed issuer is checked against the ACL, so a single
     /// address cannot force unbounded DID-resolution work by posting
@@ -109,7 +111,7 @@ impl AppState {
             witness_keys,
             acl_locks: PathLocks::new(),
             replay_cache,
-            sign_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sign_locks: PathLocks::new(),
             client_ips,
             body_read_timeout: did_hosting_common::server::listener::BODY_READ_TIMEOUT,
             trust_tasks_rate_limiter: Arc::new(
