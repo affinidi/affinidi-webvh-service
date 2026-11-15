@@ -43,16 +43,22 @@ use super::store::{KS_META, KeyspaceHandle, Store};
 
 pub mod m01_tag_did_records_with_domain;
 pub mod m02_cache_did_record_services;
+pub mod m03_index_did_records;
 pub mod runner;
 
 pub use m01_tag_did_records_with_domain::M01TagDidRecordsWithDomain;
 pub use m02_cache_did_record_services::M02CacheDidRecordServices;
+pub use m03_index_did_records::M03IndexDidRecords;
 pub use runner::{MigrationRunner, RunSummary};
 
 /// Boxed future used by [`Migration::run`] so the trait stays object-safe
 /// without pulling in `async-trait`. Matches the pattern used by the
 /// storage backends in `super::store`.
 pub type MigrationFuture<'a> = Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + 'a>>;
+
+/// Records a page of a migration's walk over the `dids` keyspace reads, so a
+/// migration holds one page, never the whole store.
+pub(crate) const MIGRATION_PAGE_ROWS: usize = 256;
 
 /// Key prefix inside the `meta` keyspace for applied-migration markers.
 const APPLIED_KEY_PREFIX: &str = "migration:applied:";
@@ -139,4 +145,13 @@ pub fn registry() -> Vec<Arc<dyn Migration>> {
         Arc::new(M01TagDidRecordsWithDomain),
         Arc::new(M02CacheDidRecordServices),
     ]
+}
+
+/// [`registry`] plus the migrations only a control plane runs: the derived
+/// rows its writes keep current ([`M03IndexDidRecords`]). The daemon runs
+/// this; a standalone control plane runs [`M03IndexDidRecords`] on its own.
+pub fn control_plane_registry() -> Vec<Arc<dyn Migration>> {
+    let mut migrations = registry();
+    migrations.push(Arc::new(M03IndexDidRecords));
+    migrations
 }

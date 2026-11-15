@@ -300,6 +300,18 @@ pub(crate) async fn stats_get(
 ) -> Result<stats_get::v0_1::Response, TaskError> {
     let auth = cx.auth().await?;
     let state = cx.state;
+    let ext: did_hosting_common::server::trust_tasks::ext::WebvhStatsGetExt =
+        did_hosting_common::server::trust_tasks::ext::request_webvh_ext(&p.ext)
+            .map_err(|e| TaskError::Standard(trust_tasks_rs::StandardCode::MalformedRequest, e))?;
+    if let Some(domain) = ext.domain.as_deref() {
+        if p.mnemonic.is_some() {
+            return Err(TaskError::Standard(
+                trust_tasks_rs::StandardCode::MalformedRequest,
+                "the per-domain aggregate takes no `mnemonic`".into(),
+            ));
+        }
+        return stats_get_domain(&auth, state, domain).await;
+    }
     let Some(mnemonic) = p.mnemonic.as_deref() else {
         let auth = cx.admin().await?;
         let _ = auth;
@@ -338,6 +350,68 @@ pub(crate) async fn stats_get(
         body.insert("lastResolvedAt".into(), json!(at(t)));
     }
     if let Some(t) = stats.last_updated_at {
+        body.insert("lastUpdatedAt".into(), json!(at(t)));
+    }
+    typed(Value::Object(body), "stats/get response")
+}
+
+/// `stats/get` with `ext.vnd.affinidi.webvh.domain`: the counters summed over
+/// the slots on one domain the caller may read — every slot there for an
+/// admin, the caller's own for anyone else — with `totalDids` their number.
+/// A domain that does not exist, or that a non-admin's scope does not reach,
+/// is the same `notFound` (as a slot the caller may not read is).
+async fn stats_get_domain(
+    auth: &crate::auth::AuthClaims,
+    state: &AppState,
+    domain: &str,
+) -> Result<stats_get::v0_1::Response, TaskError> {
+    use crate::acl::Role;
+
+    let not_found = || {
+        TaskError::Declared(
+            stats_get::v0_1::error_codes::NOT_FOUND,
+            "no such domain".into(),
+        )
+    };
+    let canonical = did_hosting_common::server::domain::normalize_domain_name(domain)
+        .map_err(|_| not_found())?;
+    if did_hosting_common::server::domain::get_domain(&state.store, &canonical)
+        .await?
+        .is_none()
+    {
+        return Err(not_found());
+    }
+    let mnemonics = if auth.role == Role::Admin {
+        super::queries::domain_mnemonics(state, &canonical).await?
+    } else {
+        let scope =
+            match did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &auth.did).await? {
+                Some(e) => e.domains,
+                None => did_hosting_common::server::domain::DomainScope::All,
+            };
+        if !scope.allows(&canonical) {
+            return Err(not_found());
+        }
+        did_ops::owner_mnemonics_on_domain(state, &auth.did, &canonical).await?
+    };
+
+    let (mut resolves, mut updates) = (0u64, 0u64);
+    let (mut last_resolved, mut last_updated) = (None, None);
+    for mnemonic in &mnemonics {
+        let stats = crate::stats_admin::live_did_stats(state, mnemonic).await?;
+        resolves = resolves.saturating_add(stats.total_resolves);
+        updates = updates.saturating_add(stats.total_updates);
+        last_resolved = last_resolved.max(stats.last_resolved_at);
+        last_updated = last_updated.max(stats.last_updated_at);
+    }
+    let mut body = serde_json::Map::new();
+    body.insert("totalDids".into(), json!(mnemonics.len()));
+    body.insert("totalResolves".into(), json!(resolves));
+    body.insert("totalUpdates".into(), json!(updates));
+    if let Some(t) = last_resolved {
+        body.insert("lastResolvedAt".into(), json!(at(t)));
+    }
+    if let Some(t) = last_updated {
         body.insert("lastUpdatedAt".into(), json!(at(t)));
     }
     typed(Value::Object(body), "stats/get response")

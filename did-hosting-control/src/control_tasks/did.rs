@@ -278,8 +278,35 @@ pub(crate) async fn list(
     // already hands it every slot's content. The listing it gets withholds
     // each slot's owner and resolve count (below), so it discloses nothing
     // beyond that sync.
+    // The webvh extension's filters: `search`, and `agentName` (which needs
+    // the `domain` it is held on).
+    let ext: did_hosting_common::server::trust_tasks::ext::WebvhDidListExt =
+        did_hosting_common::server::trust_tasks::ext::request_webvh_ext(&p.ext)
+            .map_err(|e| TaskError::Standard(StandardCode::MalformedRequest, e))?;
+    if let Some(search) = ext.search.as_deref()
+        && (search.is_empty() || search.chars().count() > 200)
+    {
+        return Err(TaskError::Standard(
+            StandardCode::MalformedRequest,
+            "`search` must be 1 to 200 characters".into(),
+        ));
+    }
+    if ext.agent_name.is_some() && domain.is_none() {
+        return Err(TaskError::Standard(
+            StandardCode::MalformedRequest,
+            "`agentName` needs the `domain` it is held on".into(),
+        ));
+    }
+
     let replica = auth.role == Role::Service && is_hosting_server(state, &auth.did).await;
-    let binding = list_cursor::binding(&auth.did, replica, p.owner.as_deref(), domain.as_deref());
+    let binding = list_cursor::binding(
+        &auth.did,
+        replica,
+        p.owner.as_deref(),
+        domain.as_deref(),
+        ext.search.as_deref(),
+        ext.agent_name.as_deref(),
+    );
     let cursor_key = list_cursor::key(state).await?;
     let after = match p.cursor.as_deref() {
         Some(c) => Some(list_cursor::open(&cursor_key, c, &binding).ok_or_else(|| {
@@ -293,23 +320,25 @@ pub(crate) async fn list(
     if replica && p.owner.is_none() && after.is_none() {
         crate::registry::record_reconcile(&state.registry_ks, &auth.did, now_epoch()).await;
     }
-    let (records, has_more) = did_ops::list_dids_page(
+    let did_ops::ListPage {
+        records,
+        resume_after,
+    } = did_ops::list_dids_page(
         &auth,
         replica,
         state,
-        p.owner.as_deref(),
-        domain.as_deref(),
-        p.limit.map(|l| l.get() as usize),
+        &did_ops::ListFilter {
+            owner: p.owner.as_deref(),
+            domain: domain.as_deref(),
+            search: ext.search.as_deref(),
+            agent_name: ext.agent_name.as_deref(),
+        },
+        p.limit
+            .map(|l| usize::try_from(l.get()).unwrap_or(usize::MAX)),
         after.as_deref(),
     )
     .await?;
-    let next_cursor = has_more
-        .then(|| {
-            records
-                .last()
-                .map(|(r, _)| list_cursor::seal(&cursor_key, &r.mnemonic, &binding))
-        })
-        .flatten();
+    let next_cursor = resume_after.map(|after| list_cursor::seal(&cursor_key, &after, &binding));
     let records = records
         .iter()
         .map(|(record, total_resolves)| {
@@ -424,26 +453,37 @@ mod list_cursor {
 
     /// The listing a cursor belongs to. Length-prefixed, so no two distinct
     /// listings share an encoding.
+    ///
+    /// The `search` and `agentName` filters are appended only when given, so
+    /// a cursor issued before they existed still opens for the same listing.
     pub(super) fn binding(
         caller: &str,
         replica: bool,
         owner: Option<&str>,
         domain: Option<&str>,
+        search: Option<&str>,
+        agent_name: Option<&str>,
     ) -> Vec<u8> {
         let mut out = Vec::new();
+        let mut push = |part: Option<&str>| match part {
+            Some(p) => {
+                out.extend_from_slice(&(p.len() as u32).to_be_bytes());
+                out.extend_from_slice(p.as_bytes());
+            }
+            None => out.extend_from_slice(&u32::MAX.to_be_bytes()),
+        };
         for part in [
             Some(caller),
             Some(if replica { "r" } else { "-" }),
             owner,
             domain,
         ] {
-            match part {
-                Some(p) => {
-                    out.extend_from_slice(&(p.len() as u32).to_be_bytes());
-                    out.extend_from_slice(p.as_bytes());
-                }
-                None => out.extend_from_slice(&u32::MAX.to_be_bytes()),
-            }
+            push(part);
+        }
+        if search.is_some() || agent_name.is_some() {
+            push(Some("filters"));
+            push(search);
+            push(agent_name);
         }
         out
     }
@@ -494,7 +534,14 @@ mod list_cursor {
         #[test]
         fn round_trips_only_for_its_own_listing() {
             let k: Key = [7; 32];
-            let b = binding("did:example:a", false, None, Some("example.com"));
+            let b = binding(
+                "did:example:a",
+                false,
+                None,
+                Some("example.com"),
+                None,
+                None,
+            );
             let c = seal(&k, "abc", &b);
             assert_eq!(open(&k, &c, &b).as_deref(), Some("abc"));
             // Another caller, another filter, the replica view: refused.
@@ -502,16 +549,30 @@ mod list_cursor {
                 open(
                     &k,
                     &c,
-                    &binding("did:example:b", false, None, Some("example.com"))
+                    &binding(
+                        "did:example:b",
+                        false,
+                        None,
+                        Some("example.com"),
+                        None,
+                        None
+                    )
                 )
                 .is_none()
             );
-            assert!(open(&k, &c, &binding("did:example:a", false, None, None)).is_none());
             assert!(
                 open(
                     &k,
                     &c,
-                    &binding("did:example:a", true, None, Some("example.com"))
+                    &binding("did:example:a", false, None, None, None, None)
+                )
+                .is_none()
+            );
+            assert!(
+                open(
+                    &k,
+                    &c,
+                    &binding("did:example:a", true, None, Some("example.com"), None, None)
                 )
                 .is_none()
             );
@@ -522,7 +583,7 @@ mod list_cursor {
         #[test]
         fn refuses_forged_and_malformed_cursors() {
             let k: Key = [7; 32];
-            let b = binding("did:example:a", false, None, None);
+            let b = binding("did:example:a", false, None, None, None, None);
             let c = seal(&k, "abc", &b);
             let forged = c.replacen(&hex_encode("abc"), &hex_encode("abd"), 1);
             assert!(open(&k, &forged, &b).is_none());

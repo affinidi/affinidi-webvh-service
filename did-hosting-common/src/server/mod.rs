@@ -9,6 +9,7 @@ pub mod cli_identity;
 pub mod cli_metrics;
 pub mod cli_tsp;
 pub mod config;
+pub mod did_index;
 pub mod didcomm_profile;
 pub mod didcomm_unpack;
 pub mod domain;

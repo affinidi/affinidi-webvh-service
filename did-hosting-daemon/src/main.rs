@@ -926,7 +926,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     // keyspace gate re-runs across boots.
     {
         let runner = did_hosting_common::server::migrations::MigrationRunner::new(
-            did_hosting_common::server::migrations::registry(),
+            did_hosting_common::server::migrations::control_plane_registry(),
         );
         match runner.run_pending(&main_store).await {
             Ok(summary) => {
@@ -2745,6 +2745,16 @@ async fn run_remove_did(
     batch.remove(&dids_ks, content_log_key(&path));
     batch.remove(&dids_ks, content_witness_key(&path));
     batch.remove(&dids_ks, owner_key(&record.owner, &path));
+    // The usage counter and domain index row go with the record (the daemon
+    // is stopped for this command, so nothing else writes them).
+    did_hosting_common::server::did_index::stage_record_change(
+        &mut batch,
+        &dids_ks,
+        None,
+        Some(&record),
+        None,
+    )
+    .await?;
     batch.commit().await?;
 
     eprintln!("  DID removed.");

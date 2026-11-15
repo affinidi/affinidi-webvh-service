@@ -315,12 +315,25 @@ impl TestServer {
     /// Write a `DidRecord` to the `dids` keyspace verbatim. Pairs with
     /// [`Self::seed_did`] when a test has hand-built a record (a specific
     /// domain, pre-existing agent names, a takeover state) it wants persisted.
+    /// The derived rows (usage counter, domain index) follow, as on every
+    /// real write.
     pub async fn put_did(&self, record: &DidRecord) {
-        self.state
-            .dids_ks
-            .insert(did_key(&record.mnemonic), record)
-            .await
-            .expect("put did record");
+        let ks = &self.state.dids_ks;
+        let old: Option<DidRecord> = ks.get(did_key(&record.mnemonic)).await.expect("read did");
+        let mut batch = self.state.store.batch();
+        batch
+            .insert(ks, did_key(&record.mnemonic), record)
+            .expect("stage did record");
+        did_hosting_common::server::did_index::stage_record_change(
+            &mut batch,
+            ks,
+            None,
+            old.as_ref(),
+            Some(record),
+        )
+        .await
+        .expect("stage did index");
+        batch.commit().await.expect("put did record");
     }
 }
 

@@ -92,62 +92,76 @@ impl Migration for M01TagDidRecordsWithDomain {
 
             // Walk every `did:{mnemonic}` key. Prefix-scan filters out
             // `content:`, `owner:`, `watcher_sync:` neighbours.
-            let raw = dids.prefix_iter_raw(b"did:".to_vec()).await?;
-            for (key, value) in raw {
-                let mnemonic = match std::str::from_utf8(&key) {
-                    Ok(k) => k.strip_prefix("did:").unwrap_or(k).to_string(),
-                    Err(_) => {
-                        warn!(migration_id = ID, "skipping non-UTF-8 key in dids keyspace");
+            let mut walk = dids.walk(b"did:".to_vec(), super::MIGRATION_PAGE_ROWS);
+            while let Some(rows) = walk.next_page().await? {
+                for (key, value) in rows {
+                    let mnemonic = match std::str::from_utf8(&key) {
+                        Ok(k) => k.strip_prefix("did:").unwrap_or(k).to_string(),
+                        Err(_) => {
+                            warn!(migration_id = ID, "skipping non-UTF-8 key in dids keyspace");
+                            continue;
+                        }
+                    };
+                    let mut record: DidRecord = match serde_json::from_slice(&value) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(
+                                migration_id = ID,
+                                mnemonic = %mnemonic,
+                                error = %e,
+                                "skipping unparseable DidRecord"
+                            );
+                            continue;
+                        }
+                    };
+                    if !record.domain.is_empty() {
+                        counters.already_tagged += 1;
                         continue;
                     }
-                };
-                let mut record: DidRecord = match serde_json::from_slice(&value) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!(
-                            migration_id = ID,
-                            mnemonic = %mnemonic,
-                            error = %e,
-                            "skipping unparseable DidRecord"
-                        );
-                        continue;
-                    }
-                };
-                if !record.domain.is_empty() {
-                    counters.already_tagged += 1;
-                    continue;
-                }
-                // Tier 1: parse host out of did_id.
-                let from_did_id = record
-                    .did_id
-                    .as_deref()
-                    .and_then(|d| extract_did_host(d).ok());
-                let new_domain = match from_did_id {
-                    Some(host) => {
-                        counters.tagged_from_did_id += 1;
-                        host
-                    }
-                    None => {
-                        // Tier 2: system default.
-                        match &system_default {
-                            Some(d) => {
-                                counters.tagged_from_default += 1;
-                                d.clone()
-                            }
-                            None => {
-                                counters.deferred_no_default += 1;
-                                debug!(
-                                    migration_id = ID,
-                                    mnemonic = %mnemonic,
-                                    "deferred: no did_id host and no system default"
-                                );
-                                continue;
+                    // Tier 1: parse host out of did_id.
+                    let from_did_id = record
+                        .did_id
+                        .as_deref()
+                        .and_then(|d| extract_did_host(d).ok());
+                    let new_domain = match from_did_id {
+                        Some(host) => {
+                            counters.tagged_from_did_id += 1;
+                            host
+                        }
+                        None => {
+                            // Tier 2: system default.
+                            match &system_default {
+                                Some(d) => {
+                                    counters.tagged_from_default += 1;
+                                    d.clone()
+                                }
+                                None => {
+                                    counters.deferred_no_default += 1;
+                                    debug!(
+                                        migration_id = ID,
+                                        mnemonic = %mnemonic,
+                                        "deferred: no did_id host and no system default"
+                                    );
+                                    continue;
+                                }
                             }
                         }
-                    }
-                };
-                record.domain = new_domain;
-                dids.insert(did_key(&mnemonic), &record).await?;
+                    };
+                    let old = record.clone();
+                    record.domain = new_domain;
+                    // The record moves into a domain: its index row goes with it.
+                    let mut batch = store.batch();
+                    batch.insert(&dids, did_key(&mnemonic), &record)?;
+                    crate::server::did_index::stage_record_change(
+                        &mut batch,
+                        &dids,
+                        None,
+                        Some(&old),
+                        Some(&record),
+                    )
+                    .await?;
+                    batch.commit().await?;
+                }
             }
 
             info!(

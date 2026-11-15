@@ -452,6 +452,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         .await;
 
     backfill_service_badges(&state.store).await;
+    index_did_records(&state.store).await?;
 
     // Seed registry from static config
     seed_registry(&state).await;
@@ -870,6 +871,23 @@ pub async fn start_didcomm_service(
 /// Failure is non-fatal. The daemon exits when its migrations fail, but missing
 /// badges are cosmetic and must not stop the control plane from starting —
 /// `register_did_atomic` self-heals each record on its next publish regardless.
+/// Build the per-owner usage counters and the per-domain DID index from the
+/// records ([`did_hosting_common::server::migrations::M03IndexDidRecords`]),
+/// once, on the first boot after upgrade.
+///
+/// Fatal on failure, unlike the badge backfill: the quota checks read the
+/// counters, so a control plane serving without them would admit writes over
+/// an owner's quota.
+pub async fn index_did_records(store: &Store) -> Result<(), AppError> {
+    use did_hosting_common::server::migrations::{M03IndexDidRecords, MigrationRunner};
+
+    let summary = MigrationRunner::new(vec![Arc::new(M03IndexDidRecords)])
+        .run_pending(store)
+        .await?;
+    info!(applied = ?summary.applied, "DID index backfill complete");
+    Ok(())
+}
+
 pub async fn backfill_service_badges(store: &Store) {
     use did_hosting_common::server::migrations::{M02CacheDidRecordServices, MigrationRunner};
 
