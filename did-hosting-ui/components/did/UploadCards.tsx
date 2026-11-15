@@ -74,7 +74,7 @@ export function UploadCards({
         {versionCount > 0 && (
           <Button
             variant="secondary"
-            label="Load Current JSONL"
+            label="Load current did.jsonl into this box"
             busy={loadingRaw}
             busyLabel="Loading..."
             onPress={onLoadCurrent}

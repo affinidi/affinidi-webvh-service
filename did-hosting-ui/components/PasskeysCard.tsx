@@ -18,7 +18,7 @@ import { useState } from "react";
 import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
 
 import type { InvitePurpose, PasskeyCredential } from "../lib/api";
-import { showAlert, showConfirm } from "../lib/alert";
+import { confirm, notify } from "../lib/feedback";
 import { errorMessage } from "../lib/errors";
 import { getPasskeyCredential } from "../lib/passkey";
 import { invalidateQueries, useTrustTaskQuery } from "../lib/query";
@@ -28,6 +28,7 @@ import { formatDate } from "../lib/time";
 import { useApi } from "./ApiProvider";
 import { Button } from "./Button";
 import { Card } from "./Card";
+import { ErrorWithRetry } from "./QueryState";
 
 /** Every passkey inventory is read under this prefix, so a revocation
  *  refreshes each card that might show the credential. */
@@ -57,29 +58,28 @@ export function PasskeysCard({ subject, purpose, title }: PasskeysCardProps) {
   );
   const credentials = passkeys.data ?? [];
 
-  const revoke = (cred: PasskeyCredential) => {
+  const revoke = async (cred: PasskeyCredential) => {
     const label = cred.deviceLabel ?? "this passkey";
-    showConfirm(
-      "Revoke passkey?",
-      subject
+    const ok = await confirm({
+      title: "Revoke passkey?",
+      body: subject
         ? `Revoke ${label} for ${subject}? If it was their only sign-in passkey, ` +
-            `they will need to be re-invited to enrol a replacement.`
+          `they will need to be re-invited to enrol a replacement.`
         : `Revoke ${label}? You will confirm with another passkey you hold before it's removed.`,
-      () => {
-        setRevoking(cred.credentialId);
-        (async () => {
-          try {
-            const start = await startRevocation(cred.credentialId, subject);
-            await completeRevocation(start, { get: getPasskeyCredential });
-            await invalidateQueries(PASSKEYS_KEY);
-          } catch (e: unknown) {
-            showAlert("Could not revoke", errorMessage(e, "Failed to revoke passkey."));
-          } finally {
-            setRevoking(null);
-          }
-        })();
-      },
-    );
+      confirmLabel: "Revoke passkey",
+    });
+    if (!ok) return;
+    setRevoking(cred.credentialId);
+    try {
+      const start = await startRevocation(cred.credentialId, subject);
+      await completeRevocation(start, { get: getPasskeyCredential });
+      await invalidateQueries(PASSKEYS_KEY);
+      notify("success", "Passkey revoked", label);
+    } catch (e: unknown) {
+      notify("error", "Could not revoke the passkey", errorMessage(e, "Failed to revoke passkey."));
+    } finally {
+      setRevoking(null);
+    }
   };
 
   return (
@@ -87,9 +87,11 @@ export function PasskeysCard({ subject, purpose, title }: PasskeysCardProps) {
       {passkeys.loading ? (
         <ActivityIndicator color={colors.accent} aria-label="Loading passkeys" />
       ) : passkeys.error != null && !passkeys.data ? (
-        <Text role="alert" style={styles.errorText}>
-          {errorMessage(passkeys.error, "Failed to load passkeys")}
-        </Text>
+        <ErrorWithRetry
+          error={passkeys.error}
+          what="passkeys"
+          onRetry={() => void passkeys.refetch()}
+        />
       ) : credentials.length === 0 ? (
         <Text style={styles.hint}>No passkeys enrolled.</Text>
       ) : (

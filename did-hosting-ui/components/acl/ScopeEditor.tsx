@@ -5,6 +5,7 @@ import type { ScopeDraft, ScopeKind } from "../../lib/acl-scope";
 import { colors, fonts, spacing } from "../../lib/theme";
 import { Button } from "../Button";
 import { SegmentedControl } from "../SegmentedControl";
+import { Term } from "../Term";
 
 /** A domain as the scope editor offers it. */
 export interface AvailableDomain {
@@ -96,7 +97,7 @@ export function ScopeEditor({
 
   return (
     <View style={styles.editor}>
-      <Text style={styles.label}>Domain scope</Text>
+      <Term term="scopeDefault" label="Domain scope" style={styles.label} />
       <SegmentedControl
         label="Domain scope"
         options={KINDS}

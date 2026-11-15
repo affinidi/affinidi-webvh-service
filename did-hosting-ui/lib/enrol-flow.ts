@@ -29,6 +29,22 @@ export interface WebAuthnCeremonies {
 /** A refusal worded for the invitee, not the operator. */
 export class RedemptionError extends Error {}
 
+/** Claim codes are 12 symbols, shown grouped `XXXX-XXXX-XXXX`. */
+const CLAIM_CODE_LEN = 12;
+
+/**
+ * Format a claim code as it is typed: upper-case, only letters and digits,
+ * grouped in fours — so a pasted or hand-typed code looks like the one that
+ * was sent. The control plane ignores grouping and case anyway.
+ */
+export function formatClaimCode(input: string): string {
+  const symbols = input
+    .toUpperCase()
+    .replace(/[^0-9A-Z]/g, "")
+    .slice(0, CLAIM_CODE_LEN);
+  return symbols.replace(/(.{4})(?=.)/g, "$1-");
+}
+
 /** Present the token and claim code; answer the ceremony to confirm. */
 export async function startRedemption(
   token: string,

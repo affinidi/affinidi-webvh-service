@@ -2,6 +2,7 @@ import { useState, type ChangeEvent, type ReactNode } from "react";
 import { StyleSheet, Text, View } from "react-native";
 
 import type { DidDocumentState, LogEntryInfo } from "../../lib/api";
+import { notify } from "../../lib/feedback";
 import { colors, fonts, radii, spacing } from "../../lib/theme";
 import { Button } from "../Button";
 import { Card } from "../Card";
@@ -27,31 +28,25 @@ export function DidDocumentCard({
   onSelectVersion,
   editing,
   onEditingChange,
-  loadingRaw,
-  onCopyToUpload,
   canPublish,
   publishing,
   onPublish,
   delegationWarning,
   consentPanel,
-  notify,
 }: {
   logEntries: LogEntryInfo[];
   selectedVersion: number;
   onSelectVersion: (index: number) => void;
   editing: boolean;
   onEditingChange: (editing: boolean) => void;
-  loadingRaw: boolean;
-  /** Put the raw log in the upload card, and close the editor. */
-  onCopyToUpload: () => void;
-  /** A connected wallet can relay a delegated publish. */
+  /** A connected wallet can relay a delegated publish. Without one there is
+   *  no way to sign an edit from here, so the editor is not offered. */
   canPublish: boolean;
   publishing: boolean;
   onPublish: (document: Record<string, unknown>) => void;
   delegationWarning: string | null;
   /** The approval code, while a publish waits on the user. */
   consentPanel: ReactNode;
-  notify: (title: string, message: string) => void;
 }) {
   const [draft, setDraft] = useState("");
   const selected = logEntries[selectedVersion]?.state;
@@ -73,7 +68,7 @@ export function DidDocumentCard({
     try {
       document = JSON.parse(draft) as Record<string, unknown>;
     } catch {
-      notify("Error", "The document is not valid JSON.");
+      notify("error", "Not published", "The document is not valid JSON.");
       return;
     }
     onPublish(document);
@@ -84,7 +79,7 @@ export function DidDocumentCard({
       title="DID Document"
       style={didStyles.card}
       headerRight={
-        <View style={didStyles.row}>
+        canPublish ? (
           <Button
             size="sm"
             variant="secondary"
@@ -92,19 +87,16 @@ export function DidDocumentCard({
             accessibilityLabel={editing ? "Cancel editing the document" : "Edit the document"}
             onPress={toggleEdit}
           />
-          {editing && (
-            <Button
-              size="sm"
-              variant="secondary"
-              label="Copy to Upload"
-              busy={loadingRaw}
-              busyLabel="Loading..."
-              onPress={onCopyToUpload}
-            />
-          )}
-        </View>
+        ) : undefined
       }
     >
+      {!canPublish && (
+        <Text style={didStyles.hint}>
+          Changes to this document must be signed by the DID&apos;s agent, which holds its update
+          key. Connect a wallet that can relay to your agent to edit it here, or have the agent
+          publish a new version and upload the signed did.jsonl below.
+        </Text>
+      )}
       <View style={styles.versionRow}>
         <Text style={didStyles.label}>Version</Text>
         <View style={styles.selectWrapper}>
@@ -133,7 +125,7 @@ export function DidDocumentCard({
           </select>
         </View>
       </View>
-      {editing ? (
+      {editing && canPublish ? (
         <>
           <Field
             label="DID document (JSON)"
@@ -143,20 +135,19 @@ export function DidDocumentCard({
             multiline
             inputStyle={[didStyles.textarea, styles.editor]}
           />
-          {canPublish && (
-            <View style={didStyles.stack}>
-              <Button
-                label="Publish with my agent"
-                busy={publishing}
-                busyLabel="Asking your agent..."
-                onPress={publish}
-              />
-              <Text style={didStyles.hint}>
-                Your agent holds this DID&apos;s update key. It will work out what this change
-                actually does before it signs anything — including effects that are not visible in
-                the document above.
-              </Text>
-              {/*
+          <View style={didStyles.stack}>
+            <Button
+              label="Publish with my agent"
+              busy={publishing}
+              busyLabel="Asking your agent..."
+              onPress={publish}
+            />
+            <Text style={didStyles.hint}>
+              Your agent holds this DID&apos;s update key. It will work out what this change
+              actually does before it signs anything — including effects that are not visible in the
+              document above.
+            </Text>
+            {/*
                 Shown, not enforced. An admin sees every DID on this server, so
                 the button used to be offered on DIDs no agent of theirs could
                 sign for — but the page cannot identify which agent the wallet
@@ -164,11 +155,10 @@ export function DidDocumentCard({
                 (passkey session, wallet connected to the owning agent). Say
                 what is odd and let the operator decide.
               */}
-              {delegationWarning && (
-                <Text style={[didStyles.hint, didStyles.warning]}>{delegationWarning}</Text>
-              )}
-            </View>
-          )}
+            {delegationWarning && (
+              <Text style={[didStyles.hint, didStyles.warning]}>{delegationWarning}</Text>
+            )}
+          </View>
           {consentPanel}
         </>
       ) : (
