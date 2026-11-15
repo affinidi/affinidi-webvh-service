@@ -353,6 +353,9 @@ impl RedisKeyspace {
 }
 
 impl KeyspaceOps for RedisKeyspace {
+    fn pages_in_key_order(&self) -> bool {
+        true
+    }
     fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async move {
             let fk = self.full_key(&key);

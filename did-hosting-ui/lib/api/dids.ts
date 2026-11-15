@@ -18,6 +18,8 @@ import { withStepUp } from "./auth";
 import { DID_LIST_PAGE, T, didLog } from "./tasks";
 import type {
   AgentNameAvailability,
+  DidListPage,
+  DidListQuery,
   AgentNameResolveResponse,
   CheckNameResponse,
   CreateDidResponse,
@@ -31,8 +33,35 @@ import type { ReadOptions } from "./tasks";
 export const didsApi = {
   // ---- DIDs ----
 
+  /** One page of `did/list`, narrowed server-side. Pages are in mnemonic
+   *  order; `nextCursor` is present while more may follow (a page can be
+   *  short, even empty, and still have one). The cursor is bound to the
+   *  filters: change one and start again without it. */
+  listDidPage: async (q: DidListQuery = {}, opts: ReadOptions = {}): Promise<DidListPage> => {
+    const webvh = {
+      ...(q.search ? { search: q.search } : {}),
+      ...(q.agentName ? { agentName: q.agentName } : {}),
+    };
+    const page = await trustTask<DidList.Payload, DidList.Response>(
+      T.didList,
+      {
+        ...(q.owner ? { owner: q.owner } : {}),
+        ...(q.domain ? { domain: q.domain } : {}),
+        limit: q.limit ?? DID_LIST_PAGE,
+        ...(q.cursor ? { cursor: q.cursor } : {}),
+        ...(Object.keys(webvh).length > 0 ? { ext: { [WEBVH_EXT]: webvh } } : {}),
+      },
+      opts,
+    );
+    return {
+      records: page.records.map(didRecordFromWire),
+      ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+    };
+  },
+
   /** Every slot the caller may see (an admin may name another `owner`),
-   *  following `did/list`'s pages to the end. */
+   *  following `did/list`'s pages to the end. Only for a caller that truly
+   *  needs all of them; a screen pages with `listDidPage`. */
   listDids: async (owner?: string): Promise<DidRecord[]> => {
     const out: DidRecord[] = [];
     for (let cursor: string | undefined; ;) {
@@ -59,9 +88,13 @@ export const didsApi = {
         throw e;
       }),
     ]);
+    // The entries are returned too, so a page showing the log does not
+    // fetch `did/log` a second time.
+    const entries = log ? logEntriesFromWire(log) : [];
     return {
       ...didRecordFromWire(info.record),
-      log: log ? logMetadataFromEntries(logEntriesFromWire(log)) : null,
+      log: log ? logMetadataFromEntries(entries) : null,
+      entries,
     };
   },
 

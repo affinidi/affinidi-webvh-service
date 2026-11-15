@@ -24,6 +24,7 @@ pub mod messaging;
 pub mod mnemonic;
 #[cfg(feature = "openapi")]
 pub mod openapi;
+pub mod paging;
 pub mod purge_sweep;
 pub mod replication;
 pub mod routes;

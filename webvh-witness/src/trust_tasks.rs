@@ -472,7 +472,19 @@ async fn sign_task(
             .with_message(format!("no witness identity {witness_id}")));
     };
 
-    let witnessed = match verify_log_for_witnessing(&p.log_content, version_id, &record.did) {
+    // Up to `MAX_LOG_ENTRIES` signature checks: on a blocking thread, not an
+    // async worker.
+    let verified = {
+        let (log, version, did) = (
+            p.log_content.to_string(),
+            version_id.to_string(),
+            record.did.clone(),
+        );
+        tokio::task::spawn_blocking(move || verify_log_for_witnessing(&log, &version, &did))
+            .await
+            .map_err(internal)?
+    };
+    let witnessed = match verified {
         Ok(w) => w,
         Err(refusal) => {
             warn!(
@@ -513,8 +525,12 @@ async fn sign_task(
     // before anything is signed: another process sharing the store (a second
     // replica, or the CLI) that checked a different log against the same mark
     // cannot also move it, and re-checks against the mark this one left.
-    // `sign_lock` only spares this process's own requests that round trip.
-    let _guard = state.sign_lock.lock().await;
+    // `sign_locks` only spares this process's own requests for this identity
+    // and DID that round trip; it is released once the mark has moved.
+    let guard = state
+        .sign_locks
+        .guard(&format!("{witness_id}:{}", witnessed.scid))
+        .await;
     let version_number = witnessed.version_ids.len() as u64;
     let mut attempt = 0;
     loop {
@@ -575,6 +591,8 @@ async fn sign_task(
             return Err(store_failure(AppError::store_throttled()));
         }
     }
+    // The mark is durable before anything is signed: signing needs no lock.
+    drop(guard);
 
     let (version_id, proof) = witness_ops::sign_witness_proof(
         &state.store,
@@ -585,7 +603,6 @@ async fn sign_task(
     )
     .await
     .map_err(store_failure)?;
-    drop(_guard);
     let did = did_hosting_common::did_ops::extract_did_id(&p.log_content).unwrap_or_default();
     info!(
         audit = true,

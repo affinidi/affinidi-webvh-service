@@ -129,12 +129,12 @@ pub(crate) async fn do_health_ping(state: &AppState, ping: &Value) -> Option<Val
         }
     }
 
-    let did_count = state
-        .dids_ks
-        .prefix_iter_raw("did:")
-        .await
-        .map(|v| v.len() as u64)
-        .unwrap_or(0);
+    // The collector's count: seeded at boot and recounted hourly from the
+    // keys, so a ping (every few minutes, per edge) reads nothing.
+    let did_count = match state.stats_collector.as_ref() {
+        Some(collector) => collector.get_aggregate().total_dids,
+        None => state.dids_ks.prefix_count("did:").await.unwrap_or(0) as u64,
+    };
 
     match infra::health_pong_body(
         &own,

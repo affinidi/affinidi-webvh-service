@@ -131,37 +131,28 @@ pub(crate) async fn query_timeseries(
     Ok(points)
 }
 
-/// The mnemonics of the DIDs hosted under `domain`: every record whose
-/// `domain` matches, with a fallback to the host segment of `did_id` for
-/// slots that haven't been backfilled yet.
+/// The mnemonics of the DIDs hosted under `domain` (canonical): every record
+/// whose `domain`, or for a slot not yet backfilled the host of its DID, is
+/// `domain` — read from the domain index, in no particular order.
 pub(crate) async fn domain_mnemonics(
     state: &AppState,
     domain: &str,
 ) -> Result<Vec<String>, AppError> {
-    use did_hosting_common::server::domain::extract_did_host;
+    use did_hosting_common::server::did_index::{
+        domain_index_key, domain_index_prefix, index_row_mnemonic,
+    };
 
-    // The `dids` keyspace key shape is `did:{mnemonic}` for the record
-    // blob plus `owner:…` / content keys; filter on the `did:` prefix and
-    // skip anything that deserialises as something other than a `DidRecord`.
-    let raw = state.dids_ks.prefix_iter_raw("did:").await?;
+    // The domain's index rows (kept in step with the records by every write,
+    // see `did_index`), not every record: a key read per slot on the domain.
+    // A row of a longer domain sharing the prefix (`a.example:8443`) is not
+    // this domain's, and is dropped by the exact-key check.
     let mut mnemonics: Vec<String> = Vec::new();
-    for (_key, value) in &raw {
-        let Ok(record) = serde_json::from_slice::<did_hosting_common::did_ops::DidRecord>(value)
-        else {
-            continue;
-        };
-        let matches = if !record.domain.is_empty() {
-            record.domain == domain
-        } else if let Some(did_id) = record.did_id.as_deref() {
-            extract_did_host(did_id)
-                .map(|h| h == domain)
-                .unwrap_or(false)
-        } else {
-            false
-        };
-        if matches {
-            mnemonics.push(record.mnemonic);
-        }
+    let mut walk = state.dids_ks.walk(domain_index_prefix(domain), 512);
+    while let Some(rows) = walk.next_page().await? {
+        mnemonics.extend(
+            rows.iter()
+                .filter_map(|(k, v)| index_row_mnemonic(k, v, |m| domain_index_key(domain, m))),
+        );
     }
     Ok(mnemonics)
 }

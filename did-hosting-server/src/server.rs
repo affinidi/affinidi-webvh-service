@@ -59,7 +59,8 @@ pub struct AppState {
     pub did_cache: Arc<crate::cache::ContentCache>,
     /// The records and domains resolution checks, cached. `None` (read the
     /// store on every resolve) unless every change to them is made in this
-    /// process: only the daemon sets it. See [`crate::cache::GateCache`].
+    /// process: a standalone edge (`run`) and a daemon with its control plane
+    /// on set it. See [`crate::cache::GateCache`].
     pub gate_cache: Option<Arc<crate::cache::GateCache>>,
     /// Parsed `server.trusted_proxy_cidrs` — peers inside this set
     /// have their `Forwarded` / `X-Forwarded-Host` headers honoured
@@ -77,12 +78,15 @@ pub struct AppState {
     /// once with the state and shared by the Trust Task listener and the
     /// resolution limit.
     pub client_ips: did_hosting_common::server::rate_limit::ClientIps,
-    /// Serialises `sync/update`, `sync/batch` and `sync/delete`: each reads
-    /// what this edge holds for a slot, checks the new log extends it (or, for
-    /// a delete, reads the record to remove), and writes — two such
-    /// operations running at once could each pass their read-check against
-    /// the same stale state. Mirrors the watcher's `sync_lock`.
-    pub sync_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-slot and per-DID locks serialising `sync/update`, `sync/batch`,
+    /// `sync/delete` and the reconcile repair: each reads what this edge holds
+    /// for a slot (and the high-water mark of its DID), checks the new log
+    /// extends it, and writes — two such operations on the same slot or DID
+    /// running at once could each pass their read-check against the same stale
+    /// state. Operations on different slots run in parallel. A writer takes
+    /// the slot's lock ([`crate::control_register::slot_lock_key`]) before the
+    /// DID's ([`crate::control_register::identity_lock_key`]).
+    pub sync_locks: did_hosting_common::server::path_locks::PathLocks,
     /// Control-plane documents already applied, keyed on `(issuer, id)`,
     /// with this edge's `[replay]` bounds. Every sync document is signed by
     /// the control plane, so its per-signer bound caps how fast the edge
@@ -118,6 +122,7 @@ impl AppState {
         );
         let client_ips =
             did_hosting_common::server::rate_limit::ClientIps::from_server_config(&config.server)?;
+        let content_cache_bytes = config.limits.content_cache_bytes;
         Ok(Self {
             dids_ks: store.keyspace(KS_DIDS)?,
             store,
@@ -129,8 +134,9 @@ impl AppState {
             identity: None,
             didcomm_service: Arc::new(OnceLock::new()),
             stats_collector: None,
-            did_cache: Arc::new(crate::cache::ContentCache::new(
+            did_cache: Arc::new(crate::cache::ContentCache::with_capacity(
                 crate::cache::RESOLUTION_CACHE_TTL,
+                content_cache_bytes,
             )),
             gate_cache: None,
             trusted_proxy_cidrs: Arc::new(parsed_cidrs),
@@ -145,8 +151,17 @@ impl AppState {
                     did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
                 ),
             ),
-            sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sync_locks: did_hosting_common::server::path_locks::PathLocks::new(),
         })
+    }
+
+    /// The caches resolution reads through, to clear after a write: the one
+    /// way every edge write path tells resolution what changed.
+    pub fn resolution_caches(&self) -> crate::cache::ResolutionCaches {
+        crate::cache::ResolutionCaches {
+            content: self.did_cache.clone(),
+            gate: self.gate_cache.clone(),
+        }
     }
 
     /// Carry `identity`: the resolvers and proof verifier are taken from it.
@@ -221,6 +236,12 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // migration; existing keyspace entries short-circuit the seeds),
     // so re-running on every boot is cheap.
     run_first_boot_init(&store, &config).await;
+    // High-water rows written before the compact mark held whole logs.
+    match crate::control_register::migrate_high_water_marks(&dids_ks, &store).await {
+        Ok(0) => {}
+        Ok(n) => info!(rewritten = n, "high-water marks compacted"),
+        Err(e) => warn!(error = %e, "high-water mark migration failed; legacy rows are still read"),
+    }
     // Auto-bootstrap DIDs if public_url is set and they don't exist yet
     let config =
         auto_bootstrap_dids("did-hosting-server", config, &store, &dids_ks, &secrets).await;
@@ -269,11 +290,14 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         // An edge syncs only per-DID deltas, so it keeps no time-series
         // buckets: nothing would ever drain them.
         let collector = stats::StatsCollector::without_timeseries();
-        let total_dids = storage_dids_ks
-            .prefix_iter_raw("did:")
-            .await
-            .map(|v| v.len())
-            .unwrap_or(0) as u64;
+        // Counted from the keys, without reading the records.
+        let total_dids = match storage_dids_ks.prefix_count("did:").await {
+            Ok(n) => n as u64,
+            Err(e) => {
+                warn!(error = %e, "could not count hosted DIDs; the hourly recount will");
+                0
+            }
+        };
         collector.set_total_dids(total_dids);
         info!(total_dids, "stats collector initialized");
         Arc::new(collector)
@@ -281,6 +305,13 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 
     let mut state = AppState::new(store.clone(), config)?.with_identity(identity);
     state.stats_collector = Some(stats_collector.clone());
+    // Every change an edge serves arrives as a directive it applies in this
+    // process, and each clears what it changed (`AppState::resolution_caches`),
+    // so a warm resolve reads nothing from the store.
+    state.gate_cache = Some(Arc::new(crate::cache::GateCache::new(
+        &store,
+        crate::cache::RESOLUTION_CACHE_TTL,
+    )?));
 
     // Log startup configuration
     info!("--- enabled services ---");
@@ -327,8 +358,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let mut storage_shutdown = storage_shutdown_rx.clone();
     let storage_collector = stats_collector.clone();
     let storage_stats_config = stats_config;
-    let storage_did_cache = state.did_cache.clone();
-    let storage_gate_cache = state.gate_cache.clone();
+    let storage_caches = state.resolution_caches();
     let storage_handle = std::thread::Builder::new()
         .name("webvh-storage".into())
         .spawn(move || {
@@ -339,8 +369,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
                     auth_config: storage_auth_config,
                     collector: storage_collector,
                     stats_config: storage_stats_config,
-                    did_cache: storage_did_cache,
-                    gate_cache: storage_gate_cache,
+                    caches: storage_caches,
                 },
                 &mut storage_shutdown,
             )
@@ -746,7 +775,7 @@ fn run_rest_thread(
     ready_tx: oneshot::Sender<()>,
 ) {
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+        .worker_threads(state.config.limits.http_workers())
         .enable_all()
         .build()
         .expect("failed to build REST runtime");
@@ -835,8 +864,7 @@ struct StorageThreadParams {
     auth_config: AuthConfig,
     collector: Arc<stats::StatsCollector>,
     stats_config: crate::config::StatsConfig,
-    did_cache: Arc<crate::cache::ContentCache>,
-    gate_cache: Option<Arc<crate::cache::GateCache>>,
+    caches: crate::cache::ResolutionCaches,
 }
 
 fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Receiver<bool>) {
@@ -846,8 +874,7 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
         auth_config,
         collector,
         stats_config,
-        did_cache,
-        gate_cache,
+        caches,
     } = params;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -893,6 +920,9 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
                         // An edge keeps no statistics rows to delete with them.
                         Ok(removed) => {
                             info!(count = removed.len(), "cleaned up empty DID records");
+                            for mnemonic in &removed {
+                                caches.forget_did(mnemonic);
+                            }
                             collector.subtract_total_dids(removed.len() as u64);
                         }
                         Err(e) => warn!("DID cleanup error: {e}"),
@@ -909,8 +939,8 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
                 _ = purge_timer.tick() => {
                     crate::purge_sweep::run_edge_sweep_tick(
                         &store,
-                        &did_cache,
-                        gate_cache.as_deref(),
+                        &caches.content,
+                        caches.gate.as_deref(),
                         Some(&collector),
                     )
                     .await;
@@ -1061,24 +1091,24 @@ pub async fn auto_bootstrap_dids(
         }
     }
 
-    // Log all DIDs present in the store
-    match dids_ks.prefix_iter_raw("did:").await {
-        Ok(entries) => {
-            let count = entries.len();
-            if count == 0 {
-                warn!("no DIDs in store — run `{bin} bootstrap-did` to create one");
-            } else {
-                info!(count, "DIDs in store:");
-                for (key, _) in &entries {
-                    let mnemonic = String::from_utf8_lossy(key)
-                        .strip_prefix("did:")
-                        .unwrap_or("?")
-                        .to_string();
-                    info!(path = %mnemonic, "  DID loaded");
+    // How many DIDs the store holds: counted from the keys, without reading
+    // a record. Each one is listed only at debug level.
+    match dids_ks.prefix_count("did:").await {
+        Ok(0) => {
+            warn!("no DIDs in store — run `{bin} bootstrap-did` to create one")
+        }
+        Ok(count) => {
+            info!(count, "DIDs in store");
+            if tracing::enabled!(Level::DEBUG)
+                && let Ok(keys) = dids_ks.prefix_keys_raw("did:").await
+            {
+                for key in keys {
+                    let key = String::from_utf8_lossy(&key);
+                    debug!(path = %key.strip_prefix("did:").unwrap_or("?"), "  DID loaded");
                 }
             }
         }
-        Err(e) => warn!("failed to list DIDs: {e}"),
+        Err(e) => warn!("failed to count DIDs: {e}"),
     }
 
     config

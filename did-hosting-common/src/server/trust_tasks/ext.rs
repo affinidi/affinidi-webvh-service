@@ -80,6 +80,55 @@ pub struct WebvhQuota {
     pub max_did_count: Option<u64>,
 }
 
+/// The `vnd.affinidi.webvh` member of a request's `ext`, read as `T`, or
+/// `T::default()` when the request has no such member. `ext` is whatever
+/// the generated payload carries (an `Option<Ext>`); a member that does not
+/// read as `T` (an unknown field, a wrong type) is an error naming why, so a
+/// handler refuses it rather than ignoring it (R3.2).
+pub fn request_webvh_ext<T>(ext: &impl Serialize) -> Result<T, String>
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = serde_json::to_value(ext).map_err(|e| e.to_string())?;
+    match value.get(WEBVH_EXT_KEY) {
+        None => Ok(T::default()),
+        Some(member) => serde_json::from_value(member.clone())
+            .map_err(|e| format!("`ext.{WEBVH_EXT_KEY}`: {e}")),
+    }
+}
+
+/// `did/list`'s webvh request extension.
+///
+/// ```json
+/// "ext": { "vnd.affinidi.webvh": { "search": "ali", "agentName": "alice" } }
+/// ```
+///
+/// - `search` — keep slots whose mnemonic, DID or an agent name contains it,
+///   ignoring case (1–200 characters).
+/// - `agentName` — keep the slot holding this agent name on the request's
+///   `domain`, which it requires: one name-index read, not a scan.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WebvhDidListExt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+}
+
+/// `stats/get`'s webvh request extension: `domain` asks for the per-domain
+/// aggregate (no `mnemonic`), which the base task does not offer.
+///
+/// ```json
+/// "ext": { "vnd.affinidi.webvh": { "domain": "a.example" } }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WebvhStatsGetExt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+}
+
 impl WebvhQuota {
     /// Whether every member is `None`. Drives `skip_serializing_if` on
     /// [`WebvhAclEntryExt::quota`] so an empty quota object doesn't
