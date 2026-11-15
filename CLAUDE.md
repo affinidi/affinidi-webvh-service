@@ -20,19 +20,47 @@ fewer wires.
 When you add capability to `did-hosting-server` or `did-hosting-control`, mirror it
 in the daemon if it falls into any of these buckets:
 
-- **CLI commands.** Subcommands added to either standalone binary
-  should also be reachable through `did-hosting-daemon`.
-- **Startup initialisation.** Auto-bootstrap, integrity checks, stats
-  seeding, registry seeding, key/secret loading — anything the
-  standalone services do at boot belongs in `run_daemon()` too.
-- **Background tasks.** Session cleanup, DID cleanup, stats flush, the
-  domain purge sweep, identity expiry, and similar periodic work runs in
-  `run_daemon_storage_task` (a single unified task, rather than one per
-  service). New periodic work in standalone services should land here.
-  The purge sweep runs in all three shapes: the standalone control plane
-  (`purge_sweep::run_purge_sweep_loop`), the standalone edge
-  (`purge_sweep::run_edge_sweep_tick`, so an edge drops a purged domain's
-  DIDs itself), and the daemon's storage task.
+Parity is kept by construction, not by copying, and tests fail when it
+breaks:
+
+- **CLI commands.** Shared subcommands are `#[derive(Subcommand)]` groups
+  defined once — `did_hosting_common::server::cli` (identity, TSP, keys,
+  VTA), `did_hosting_server::cli::DidCommand`,
+  `did_hosting_control::cli::{AdminCommand, StatsCommand}` — that each
+  binary `#[command(flatten)]`s into its `Command`. Add a subcommand to a
+  group, not to one binary. Each standalone `Cli` lives in its crate's
+  library so `parity_tests` in the daemon can check that the daemon's
+  subcommands cover both (minus an explicit, normally empty, allowlist).
+- **Startup initialisation.** Shared boot steps are functions both
+  sides call: `did_hosting_server::server::run_first_boot_init` (lenient
+  on an edge, strict in the daemon), `check_store_integrity`,
+  `auto_bootstrap_dids`; `did_hosting_control::server::AppState::build`
+  (the one recipe for a control plane's state — `run`, the daemon's
+  `build_control` and the tests use it) and `startup` (challenges, badge
+  backfill, DID index, registry seed, sign-in readiness). A new boot step
+  goes in one of these, not in `run()` or `run_daemon()` alone.
+- **Background tasks.** Periodic work is data: each service builds its
+  ticks as `PeriodicTask`s (`did_hosting_common::server::supervise`) —
+  `did_hosting_server::server::storage_tasks`,
+  `did_hosting_control::server::{storage_tasks, background_tasks}` —
+  named by constants in each crate's `server::tasks`. The standalone
+  binaries run them with `run_periodic`; the daemon merges the storage
+  lists into `run_daemon_storage_task` (one task, first name wins) and
+  starts the control plane's workers with the same `spawn_workers` the
+  standalone control plane uses, both minus `DAEMON_SKIPPED_TASKS` — the
+  omissions below, by name. `parity_tests` fails if a standalone task is
+  neither run by the daemon nor skipped. Add new periodic work to a
+  service's task list and its name to `tasks`; never to `run()` alone.
+- **Supervision.** Long-running work runs under a `Supervisor`: a
+  restartable task (`Policy::Restart` — the outbox, the sweeps, the
+  edge's registration and reconcile loops, stats sync) restarts with
+  backoff; a critical one (`Policy::Critical` — the HTTP listener, the
+  storage thread/task) shuts the process down non-zero. Shutdown runs in
+  stages, each within `SHUTDOWN_STAGE_DEADLINE` (30 s): workers, then the
+  messaging service (awaited), then HTTP, then hand-offs
+  (`AppState::background`), then storage — so the last flush and persist
+  see every write. Spawn new long-running work on the supervisor, not
+  with a bare `tokio::spawn`.
 - **Route changes.** The daemon merges server (public DID resolution
   only) + control (its Trust Task listener, `/api/health`, the browser
   sign-in routes and the UI) at root. Neither has a REST management surface:
@@ -68,7 +96,11 @@ in the daemon if it falls into any of these buckets:
 
 These are deliberate omissions, not parity violations. If you find
 yourself about to "fix" one of these, check first whether it makes
-sense in the all-in-one model.
+sense in the all-in-one model. Each background task they mean is named
+in the daemon's `DAEMON_SKIPPED_TASKS`; the control plane's
+`domain-purge-sweep` is skipped there too, because the server's
+`purge-sweep` (which the daemon runs, under the control plane's path
+locks) deletes the domain record as well.
 
 - **The server's own DIDComm listener.** The daemon's embedded server
   does not run its own DIDComm — the control plane's listener handles
@@ -107,8 +139,9 @@ sense in the all-in-one model.
 Contributors hesitating between "mirror this in the daemon" and "skip
 it" should ask: *does this capability require coordinating with
 something outside this process?* If yes, it's probably one of the
-intentional omissions above. If no, it's parity work and belongs in
-`run_daemon()` or `run_daemon_storage_task`.
+intentional omissions above. If no, it's parity work: put it in the
+shared function, group or task list both sides consume (above), and the
+daemon picks it up.
 
 ## Source of record: control plane authoritative, edges ephemeral
 

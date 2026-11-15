@@ -66,10 +66,7 @@ use did_hosting_common::server::domain::{
     self, DomainEntry, DomainScope, DomainStatus, DomainUrlScheme,
 };
 use did_hosting_common::server::identity::{ProtocolSet, ServiceIdentity};
-use did_hosting_common::server::stats_collector::StatsCollector;
-use did_hosting_common::server::store::{
-    KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES, Store,
-};
+use did_hosting_common::server::store::{KS_DIDS, Store};
 use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -212,52 +209,15 @@ async fn control_state(
         stats: Default::default(),
         config_path: PathBuf::new(),
     };
-    let state = did_hosting_control::server::AppState {
-        store: store.clone(),
-        sessions_ks: store.keyspace(KS_SESSIONS).unwrap(),
-        acl_ks: store.keyspace(KS_ACL).unwrap(),
-        registry_ks: store.keyspace(KS_REGISTRY).unwrap(),
-        dids_ks: store.keyspace(KS_DIDS).unwrap(),
-        config: Arc::new(config),
-        did_resolver: Some(did_resolver.clone()),
-        secrets_resolver: None,
-        identity: Some(identity),
-        trust_tasks_verifier: Some(Arc::new(TransportBoundVerifier::with_did_cache(
-            did_resolver,
-        ))),
-        jwt_keys: Some(Arc::new(
-            did_hosting_control::auth::jwt::JwtKeys::from_ed25519_bytes(&[7u8; 32]).unwrap(),
-        )),
-        webauthn: None,
-        http_client: reqwest::Client::new(),
-        didcomm_service: Arc::new(OnceLock::new()),
-        stats_collector: Arc::new(StatsCollector::new()),
-        stats_ks: store.keyspace(KS_STATS).unwrap(),
-        timeseries_ks: store.keyspace(KS_TIMESERIES).unwrap(),
-        unlisted_signers: Default::default(),
-        replay_cache: Arc::new(did_hosting_control::replay::ReplayCache::new()),
-        path_locks: did_hosting_control::path_locks::PathLocks::new(),
-        acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
-        pending_challenges: Arc::new(
-            did_hosting_control::pending_challenges::PendingChallengeTracker::new(),
-        ),
-        client_ips: Default::default(),
-        ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::challenge_limiter()),
-        login_start_rate_limiter: Arc::new(did_hosting_control::rate_limit::login_start_limiter()),
-        redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::redeem_limiter()),
-        webs_self_register_limiter: Arc::new(
-            did_hosting_control::rate_limit::webs_self_register_limiter(),
-        ),
-        webs_self_register_global_limiter: Arc::new(
-            did_hosting_control::rate_limit::webs_self_register_global_limiter(),
-        ),
-        large_document_budget: Arc::new(
-            did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
-        ),
-        outbox_notify: Arc::new(tokio::sync::Notify::new()),
-        cache_invalidate: None,
-        oob: Default::default(),
-    };
+    let mut state =
+        did_hosting_control::test_support::bare_state(config, store.clone(), Some(identity)).await;
+    state.did_resolver = Some(did_resolver.clone());
+    state.trust_tasks_verifier = Some(Arc::new(TransportBoundVerifier::with_did_cache(
+        did_resolver,
+    )));
+    state.jwt_keys = Some(Arc::new(
+        did_hosting_control::auth::jwt::JwtKeys::from_ed25519_bytes(&[7u8; 32]).unwrap(),
+    ));
     (state, dir)
 }
 

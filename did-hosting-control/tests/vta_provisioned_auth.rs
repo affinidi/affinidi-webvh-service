@@ -26,7 +26,7 @@
 //! `POST /api/trust-tasks` — the framework's own proof, not a bespoke JWS.
 
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use affinidi_data_integrity::DidKeyResolver;
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
@@ -41,11 +41,7 @@ use did_hosting_common::server::acl::{Role, seed_provisioning_vta_acl};
 use did_hosting_common::server::config::{
     AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
 };
-use did_hosting_common::server::stats_collector::StatsCollector;
 use did_hosting_common::server::store::Store;
-use did_hosting_common::server::store::{
-    KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
-};
 use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
 use did_hosting_control::auth::jwt::JwtKeys;
 use did_hosting_control::config::{AppConfig, RegistryConfig};
@@ -74,11 +70,6 @@ async fn make_harness() -> Harness {
         ..StoreConfig::default()
     };
     let store = Store::open(&store_config).await.expect("open store");
-    let sessions_ks = store.keyspace(KS_SESSIONS).expect("sessions ks");
-    let acl_ks = store.keyspace(KS_ACL).expect("acl ks");
-    let registry_ks = store.keyspace(KS_REGISTRY).expect("registry ks");
-    let dids_ks = store.keyspace(KS_DIDS).expect("dids ks");
-    let stats_ks = store.keyspace(KS_STATS).expect("stats ks");
 
     let config = AppConfig {
         features: FeaturesConfig::default(),
@@ -127,55 +118,19 @@ async fn make_harness() -> Harness {
         .await
         .expect("test identity");
 
-    let state = AppState {
-        store: store.clone(),
-        sessions_ks,
-        acl_ks,
-        registry_ks,
-        dids_ks,
-        config: Arc::new(config),
-        did_resolver: Some(did_resolver),
-        secrets_resolver: Some(secrets_resolver),
-        identity: Some(identity),
-        // `auth/authenticate/0.3` documents now travel over `/api/trust-tasks`
-        // (see the module doc), so the outer envelope's framework proof —
-        // the *delegate*'s own signature, independent of the SIOP `id_token`
-        // inside `delegationEvidence` — needs a verifier configured. A
-        // `did:key` resolver is enough: every identity here is one.
-        trust_tasks_verifier: Some(Arc::new(TransportBoundVerifier::with_resolver(Arc::new(
-            DidKeyResolver,
-        )))),
-        jwt_keys: Some(jwt_keys),
-        webauthn: None,
-        http_client: reqwest::Client::new(),
-        didcomm_service: Arc::new(OnceLock::new()),
-        stats_collector: Arc::new(StatsCollector::new()),
-        stats_ks: stats_ks.clone(),
-        timeseries_ks: store.keyspace(KS_TIMESERIES).expect("timeseries ks"),
-        unlisted_signers: Default::default(),
-        replay_cache: Arc::new(did_hosting_control::replay::ReplayCache::new()),
-        path_locks: did_hosting_control::path_locks::PathLocks::new(),
-        acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
-        pending_challenges: Arc::new(
-            did_hosting_control::pending_challenges::PendingChallengeTracker::new(),
-        ),
-        client_ips: Default::default(),
-        ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::challenge_limiter()),
-        login_start_rate_limiter: Arc::new(did_hosting_control::rate_limit::login_start_limiter()),
-        redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::redeem_limiter()),
-        webs_self_register_limiter: Arc::new(
-            did_hosting_control::rate_limit::webs_self_register_limiter(),
-        ),
-        webs_self_register_global_limiter: Arc::new(
-            did_hosting_control::rate_limit::webs_self_register_global_limiter(),
-        ),
-        large_document_budget: Arc::new(
-            did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
-        ),
-        outbox_notify: Arc::new(tokio::sync::Notify::new()),
-        cache_invalidate: None,
-        oob: Default::default(),
-    };
+    let mut state =
+        did_hosting_control::test_support::bare_state(config, store.clone(), Some(identity)).await;
+    state.did_resolver = Some(did_resolver);
+    state.secrets_resolver = Some(secrets_resolver);
+    // `auth/authenticate/0.3` documents now travel over `/api/trust-tasks`
+    // (see the module doc), so the outer envelope's framework proof —
+    // the *delegate*'s own signature, independent of the SIOP `id_token`
+    // inside `delegationEvidence` — needs a verifier configured. A
+    // `did:key` resolver is enough: every identity here is one.
+    state.trust_tasks_verifier = Some(Arc::new(TransportBoundVerifier::with_resolver(Arc::new(
+        DidKeyResolver,
+    ))));
+    state.jwt_keys = Some(jwt_keys);
 
     Harness { state, _dir: dir }
 }

@@ -142,7 +142,7 @@ the root; the witness and watcher nest under prefixes.
 
 | Path | Source | Description |
 | --- | --- | --- |
-| `GET /health` | daemon | Daemon liveness (`{"status":"ok","service":"did-hosting-daemon"}`) |
+| `GET /health` | daemon | Daemon liveness: `200` while the daemon's own DID is served from its store, `503` (`"status": "degraded"`) otherwise — the control plane's `/api/health` check |
 | `GET /api/health` | control plane | Service health (checks the service's own DID resolves) |
 | `POST /api/trust-tasks` | control plane | Every management operation, as a signed Trust Task (the HTTPS binding) |
 | `GET /api/sign-in/readiness` | control plane | Whether the service DID lists the services wallet sign-in needs |
@@ -176,12 +176,13 @@ did-hosting-daemon invite               # Passkey enrolment invite
 did-hosting-daemon reset-witness-kek-claim
 did-hosting-daemon stats-show | stats-set | stats-purge-legacy
 did-hosting-daemon fetch-metrics --key <key.json>
+did-hosting-daemon send-trust-task --key <key.json> --type <task>
 did-hosting-daemon identity-list | identity-rotate-keys | identity-scid-alias | identity-retire-now
 did-hosting-daemon tsp-relationship-list | tsp-relationship-reset | tsp-relationship-delete
 did-hosting-daemon list-dids | dump-did | load-did | remove-did | recover-did | bootstrap-did | recreate-did
-did-hosting-daemon import-secrets
+did-hosting-daemon import-secrets | export-sealed | import-sealed
+did-hosting-daemon vta-request | vta-open
 did-hosting-daemon backup | restore
-did-hosting-daemon migrate-from-webvh-config
 ```
 
 Management of a running daemon beyond these is a Trust Task: through the
@@ -230,8 +231,16 @@ set.
 
 ## Graceful shutdown
 
-The daemon handles `SIGINT` and `SIGTERM`: it stops accepting connections,
-stops its background tasks and persists its stores before exiting.
+The daemon handles `SIGINT` and `SIGTERM` in stages, each given at most 30
+seconds: the background workers (outbox, sweeps), then the messaging service,
+then HTTP (a connection still open at the deadline is dropped, so one stalled
+client cannot hold up a `SIGTERM`), then the storage task's last statistics
+flush and the store's persist, then the witness store's.
+
+A background task that stops on its own while the daemon runs is logged at
+`error`: a restartable one (the outbox, the sweeps) is restarted with backoff,
+and a critical one (the HTTP listener, the storage task) shuts the daemon down
+with a non-zero exit, so a supervisor or orchestrator restarts it.
 
 ## Support & feedback
 

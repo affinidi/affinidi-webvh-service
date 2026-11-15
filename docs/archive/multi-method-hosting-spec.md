@@ -438,7 +438,7 @@ Style notes:
 
 ## 14. Risks
 
-- **Rename blast radius.** Operators upgrading from `webvh-*` binaries to `did-hosting-*` binaries do a config + binary + env-var swap simultaneously. Mitigation: detailed migration guide; one-shot config-rewrite CLI subcommand (`did-hosting-daemon migrate-from-webvh-config /path/to/old.toml`) that ingests the old config and produces the new shape.
+- **Rename blast radius.** Operators upgrading from `webvh-*` binaries to `did-hosting-*` binaries do a config + binary + env-var swap simultaneously. Mitigation: detailed migration guide. (A config-rewrite subcommand was stubbed and later removed: config keys did not change, only binary names and environment variable prefixes.)
 - **Compile-time gating mistake.** Disabling `method-webvh` should remove all webvh-resolution routes; a missing `#[cfg]` somewhere causes runtime errors instead of clean removal. Mitigation: CI matrix explicitly builds `--no-default-features --features method-web` and runs smoke tests; absence of webvh routes verified in test.
 - **Resolution route shadowing.** `GET /{*path}/did.json` is a catch-all; if registered ahead of `/api/...` it'd shadow management routes. Mitigation: router build order codified in `did-hosting-server::server.rs` with an inline comment + a test that asserts `/api/health` still resolves with both methods enabled.
 - **Storage migration ordering.** Multi-domain migration (assigns `domain`) and multi-method migration (tags `method`) both run on first boot at new version. Order matters because the multi-method migration needs `domain` populated to derive the `DidRecord`. Mitigation: explicit ordering in the migration runner; idempotent so reruns are safe.

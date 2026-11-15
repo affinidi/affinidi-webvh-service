@@ -5,7 +5,6 @@ mod setup_recipe;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::Router;
 use axum::handler::Handler;
@@ -16,8 +15,9 @@ use clap::{Parser, Subcommand};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
-use tracing::{Level, debug, error, info, warn};
+use tracing::{Level, error, info, warn};
 
+use did_hosting_common::server::cli;
 use did_hosting_common::server::config::init_tracing;
 use did_hosting_common::server::error::AppError;
 use did_hosting_common::server::identity::ServiceIdentity;
@@ -25,11 +25,13 @@ use did_hosting_common::server::init;
 use did_hosting_common::server::secret_store::ServerSecrets;
 use did_hosting_common::server::stats_collector::StatsCollector;
 use did_hosting_common::server::store::{KeyspaceHandle, Store};
+use did_hosting_common::server::supervise::{
+    PeriodicTask, SHUTDOWN_STAGE_DEADLINE, Stage, Supervisor, merge_tasks, run_periodic,
+};
+use did_hosting_server::server::FirstBoot;
 
 use config::DaemonConfig;
-use did_hosting_common::server::store::{
-    KS_ACL, KS_DIDS, KS_REGISTRY, KS_SESSIONS, KS_STATS, KS_TIMESERIES,
-};
+use did_hosting_common::server::store::{KS_DIDS, KS_SESSIONS, KS_STATS, KS_TIMESERIES};
 
 #[derive(Parser)]
 #[command(
@@ -46,6 +48,9 @@ struct Cli {
     command: Option<Command>,
 }
 
+/// The daemon's subcommands: its own, then every group the standalone
+/// binaries share, flattened in. A test (`cli_parity_tests`) checks they
+/// cover `did-hosting-server`'s and `did-hosting-control`'s.
 #[derive(Subcommand)]
 enum Command {
     /// Run interactive setup wizard to generate config.toml.
@@ -126,317 +131,10 @@ enum Command {
         #[arg(long)]
         strict: bool,
     },
-    /// Add an ACL entry
-    AddAcl {
-        /// DID to add to the ACL
-        #[arg(long)]
-        did: String,
-        /// Role (admin or owner)
-        #[arg(long, default_value = "owner")]
-        role: String,
-        /// Optional label
-        #[arg(long)]
-        label: Option<String>,
-        /// Add the entry to the embedded witness's ACL (`[witness_store]`)
-        /// instead of the control plane's. The role must then be `admin`
-        /// or `service` (request witness signatures only).
-        #[arg(long)]
-        witness: bool,
-    },
-    /// List all ACL entries
-    ListAcl {
-        /// List the embedded witness's ACL (`[witness_store]`) instead of
-        /// the control plane's.
-        #[arg(long)]
-        witness: bool,
-    },
     /// Clear the embedded witness's key-encryption-key creation claim left
     /// by a start that stopped while creating the key (`[witness_store]`).
     /// Refused once a key is held or recorded.
     ResetWitnessKekClaim,
-    /// Show a DID's statistics resolution, recorded tier and totals
-    /// (offline; stop the service first).
-    StatsShow {
-        /// The DID's path (mnemonic), e.g. ".well-known" or "my-org".
-        #[arg(long, visible_alias = "path")]
-        mnemonic: String,
-    },
-    /// Set a DID's statistics resolution (offline; stop the service first):
-    /// `auto` (by traffic), `fine` (always 5-minute detail), `coarse` (never
-    /// promoted) or `off` (totals only). Applied at the next start.
-    StatsSet {
-        /// The DID's path (mnemonic), e.g. ".well-known" or "my-org".
-        #[arg(long, visible_alias = "path")]
-        mnemonic: String,
-        /// auto, fine, coarse or off.
-        #[arg(long, value_parser = ["auto", "fine", "coarse", "off"])]
-        resolution: String,
-    },
-    /// Finish the move to tiered statistics and delete the legacy time-series
-    /// rows now, instead of 30 days after the migration (offline; stop the
-    /// service first). An older version rolled back to afterwards has no
-    /// time-series history.
-    StatsPurgeLegacy,
-    /// Send one signed Trust Task to the running daemon and print the
-    /// response payload as JSON.
-    ///
-    /// Every management operation is a Trust Task (docs/trust-tasks.md lists
-    /// them). Signs the request with the `--key` did:key, POSTs it to the
-    /// running daemon's `POST /api/trust-tasks`, verifies the reply is the
-    /// service's own signed response, and prints its payload. The key is
-    /// authorised like any other client: by its proof and its ACL entry (add it
-    /// with `add-acl`). A refusal is reported as an error with its code.
-    SendTrustTask {
-        /// Path to the signer's did:key JSON file — same format
-        /// `setup --setup-key-out` writes.
-        #[arg(long)]
-        key: PathBuf,
-        /// The task: a full Type URI, or `<slug>/<version>` such as
-        /// `identity/list/0.1` or `did-management/registry/list/0.2`.
-        #[arg(long = "type", value_name = "TYPE")]
-        task_type: String,
-        /// The request payload as JSON (default `{}`).
-        #[arg(long, conflicts_with = "payload_file")]
-        payload: Option<String>,
-        /// Read the request payload from a JSON file.
-        #[arg(long)]
-        payload_file: Option<PathBuf>,
-        /// Base URL of the running daemon. Defaults to
-        /// `http://<server.host>:<server.port>` from config (a wildcard bind is
-        /// dialled as loopback).
-        #[arg(long)]
-        url: Option<String>,
-    },
-    /// Read the service's own counters via the authenticated
-    /// `server/metrics/0.1` Trust Task and print them as JSON.
-    ///
-    /// The counters live in the running daemon's process memory and are
-    /// reachable only through this signed localhost task — there is no
-    /// unauthenticated scrape endpoint. Signs the task with the `--key`
-    /// did:key (granted `MetricsReader` in the ACL) and POSTs it to the
-    /// running daemon's `POST /api/trust-tasks`. Only `counters` are returned
-    /// (gauges require Admin and are omitted). Prints the counters as JSON on
-    /// stdout, ready to pipe into any monitoring agent or metrics exporter.
-    ///
-    /// Counter instrumentation is opt-in: the `webvh_*` counters are populated
-    /// only when the daemon is built with the `metrics` feature. Against a
-    /// daemon built without it this prints an empty array `[]` — a genuine
-    /// refusal (an ungranted/revoked key) is reported as an error instead.
-    FetchMetrics {
-        /// Path to the signer's did:key JSON file — the MetricsReader key,
-        /// same format `setup --setup-key-out` writes.
-        #[arg(long)]
-        key: PathBuf,
-        /// Base URL of the running daemon. Defaults to
-        /// `http://<server.host>:<server.port>` from config (host `0.0.0.0`
-        /// is dialled as `127.0.0.1`).
-        #[arg(long)]
-        url: Option<String>,
-    },
-    /// List the service's own identity generations (key material still honoured).
-    IdentityList,
-    /// List this service's established TSP relationships (offline; stop the
-    /// service first).
-    ///
-    /// Each endpoint keeps its own half of every relationship; the mediator holds
-    /// none, so resetting a peer pairing means clearing both ends.
-    TspRelationshipList,
-    /// Reset our half of a TSP relationship to `None`, so the next send to the
-    /// peer re-invites (offline). Keeps the cached peer capability.
-    TspRelationshipReset {
-        /// The peer's DID (its TSP VID).
-        #[arg(long)]
-        peer: String,
-        /// This service's VID for the pair. Needed only for a half-formed
-        /// relationship, which `tsp-relationship-list` cannot show.
-        #[arg(long)]
-        our: Option<String>,
-    },
-    /// Delete TSP relationship records outright (offline).
-    TspRelationshipDelete {
-        /// The peer's DID (its TSP VID).
-        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
-        peer: Option<String>,
-        /// This service's VID for the pair. Needed only for a half-formed
-        /// relationship, which `tsp-relationship-list` cannot show.
-        #[arg(long, requires = "peer", conflicts_with = "all")]
-        our: Option<String>,
-        /// Delete every record, established or half-formed.
-        #[arg(long)]
-        all: bool,
-        /// Confirm `--all`. Without it, only reports what would be deleted.
-        #[arg(long, short = 'y')]
-        yes: bool,
-    },
-    /// Rotate the service's own key-agreement key.
-    ///
-    /// Publishes a new DID log entry installing a fresh key-agreement key on a
-    /// NEW verification-method fragment, and keeps the outgoing key honoured for
-    /// the grace period so peers holding a cached DID document can still reach
-    /// this service.
-    ///
-    /// The fresh fragment is not cosmetic: a kid identifies exactly one key, so
-    /// reusing `#key-1` would make any grace period impossible.
-    ///
-    /// The service must be STOPPED (the store is exclusively locked).
-    IdentityRotateKeys {
-        /// Which keys to rotate: "ka" (default), "signing", or "both".
-        ///
-        /// "ka"      — the encryption key. This is what the grace period covers.
-        /// "signing" — the DID's updateKeys: the authority to publish updates.
-        ///             Revoked IMMEDIATELY; there is no grace period for it, and
-        ///             for a compromised key that is exactly what you want.
-        #[arg(long, default_value = "ka")]
-        keys: String,
-        /// X25519 key-agreement key to install (multibase). Generated if omitted.
-        #[arg(long)]
-        ka_key: Option<String>,
-        /// Ed25519 signing key to install (multibase). Generated if omitted.
-        #[arg(long)]
-        signing_key: Option<String>,
-        /// How long to keep honouring the outgoing key-agreement key ("1h", "0").
-        /// Defaults to `[identity] rotation_grace_period`.
-        #[arg(long)]
-        grace: Option<String>,
-    },
-    /// List or remove the did:scid alias of the service's own DID.
-    ///
-    /// Publishes a new DID log entry whose `alsoKnownAs` lists (`list`) or no
-    /// longer lists (`remove`) `did:scid:vh:1:<scid>?src=<location>` — the
-    /// listing that makes the DID's did:webvh and did:scid forms one subject
-    /// (VTI-KEY-164). `list` replaces an alias listed for an older location.
-    /// Refused when nothing would change. Signed with the current update key,
-    /// which does not rotate.
-    ///
-    /// The service must be STOPPED (the store is exclusively locked).
-    IdentityScidAlias {
-        /// "list" or "remove".
-        #[arg(value_parser = ["list", "remove"])]
-        action: String,
-    },
-    /// Stop honouring a superseded identity generation immediately.
-    ///
-    /// The offline kill switch, for a compromised key. Messages still addressed
-    /// to that generation's key-agreement key will no longer decrypt.
-    ///
-    /// The service must be stopped (the store is exclusively locked). For a
-    /// LIVE service use the control plane's `identity/retire/0.1` Trust Task
-    /// (`send-trust-task`, see docs/sending-trust-tasks.md) or the UI button,
-    /// which drops the key from the running process immediately.
-    IdentityRetireNow {
-        /// Generation id to retire (see `identity-list`).
-        #[arg(long)]
-        generation: u64,
-    },
-    /// Remove an ACL entry
-    RemoveAcl {
-        /// DID to remove from the ACL
-        #[arg(long)]
-        did: String,
-    },
-    /// Create a passkey enrollment invite
-    Invite {
-        /// DID to invite
-        #[arg(long)]
-        did: String,
-        /// Role (admin or owner)
-        #[arg(long, default_value = "owner")]
-        role: String,
-        /// Invite lifetime in hours (default: `auth.passkey_enrollment_ttl`)
-        #[arg(long)]
-        ttl_hours: Option<u64>,
-    },
-    /// Bootstrap a DID for this server
-    BootstrapDid {
-        /// DID path/mnemonic to bootstrap (e.g. "my-org", "services/auth").
-        /// Defaults to ".well-known" (the root DID for this server)
-        #[arg(long, visible_alias = "mnemonic", default_value = ".well-known")]
-        path: String,
-        /// Path to an existing did.jsonl file to import
-        #[arg(long)]
-        did_log: Option<PathBuf>,
-        /// Path to an existing did-witness.json file to import (requires --did-log)
-        #[arg(long)]
-        did_witness: Option<PathBuf>,
-        /// Witness service URL for requesting a proof
-        #[arg(long, requires = "witness_did")]
-        witness_url: Option<String>,
-        /// Witness ID to use when requesting a proof
-        #[arg(long)]
-        witness_id: Option<String>,
-        /// The witness server's own DID (its `server_did`), required with
-        /// --witness-url. The sign-in is addressed to it, and the witness
-        /// server refuses one addressed elsewhere. This is not --witness-id,
-        /// which names one of the witnesses that server hosts.
-        #[arg(long)]
-        witness_did: Option<String>,
-    },
-    /// Recreate a DID at a given path (deletes existing, creates new, updates config)
-    RecreateDid {
-        /// DID path/mnemonic to recreate (e.g. "webvh/server1")
-        #[arg(long, visible_alias = "mnemonic")]
-        path: String,
-    },
-    /// Recover a soft-deleted DID
-    RecoverDid {
-        /// DID path/mnemonic to recover (e.g. "webvh/server1")
-        #[arg(long, visible_alias = "mnemonic")]
-        path: String,
-    },
-    /// Dump the DID log (did.jsonl) for a given path
-    DumpDid {
-        /// DID path/mnemonic to dump (e.g. ".well-known", "my-org")
-        #[arg(long, visible_alias = "mnemonic")]
-        path: String,
-        /// Also dump the witness proof (did-witness.json)
-        #[arg(long)]
-        witness: bool,
-    },
-    /// List all DIDs in the store
-    ListDids,
-    /// Remove a DID and all its data from the store
-    RemoveDid {
-        /// DID path/mnemonic to remove (e.g. "glenn", ".well-known")
-        #[arg(long, visible_alias = "mnemonic")]
-        path: String,
-    },
-    /// Load a DID at an arbitrary path (e.g., "services/control").
-    ///
-    /// The log must verify (and its witness proofs, if it is witnessed) and
-    /// must extend every history this store has served for that DID,
-    /// including one since removed with `remove-did`.
-    LoadDid {
-        /// Path to store the DID at (e.g., "services/control")
-        #[arg(long, visible_alias = "mnemonic")]
-        path: String,
-        /// Path to the did.jsonl file
-        #[arg(long)]
-        did_log: PathBuf,
-        /// Optional did-witness.json file
-        #[arg(long)]
-        did_witness: Option<PathBuf>,
-    },
-    /// Import secrets from a VTA bundle or individual keys
-    ImportSecrets {
-        /// Base64url-encoded VTA secrets bundle
-        #[arg(long, group = "source")]
-        vta_bundle: Option<String>,
-        /// Ed25519 signing key (multibase-encoded)
-        #[arg(long, group = "source")]
-        signing_key: Option<String>,
-        /// X25519 key agreement key (multibase-encoded)
-        #[arg(long)]
-        ka_key: Option<String>,
-        /// Ed25519 JWT signing key (multibase-encoded, auto-generated if omitted)
-        #[arg(long)]
-        jwt_key: Option<String>,
-        /// VTA credential bundle (base64url-encoded)
-        #[arg(long)]
-        vta_credential: Option<String>,
-        /// Overwrite existing secrets without prompting
-        #[arg(long)]
-        force: bool,
-    },
     /// Export the daemon's data to a backup file: both stores (`[store]`,
     /// with the ACL, passkeys, identity generations and outbound queue, and
     /// `[witness_store]`) and the configuration file, verbatim.
@@ -461,32 +159,35 @@ enum Command {
         #[arg(short, long)]
         input: String,
     },
-    /// Migrate a legacy `webvh-*` config file to the new `did-hosting-*`
-    /// shape (env-var renames, repo-rename pointer updates).
-    ///
-    /// Stub in v0.7.0: the rewriter is implemented in a follow-up task
-    /// (the migration runner work in T7/M-02 will share its scaffolding).
-    /// This subcommand exists so operators have a stable invocation name
-    /// to script against once the implementation lands.
-    MigrateFromWebvhConfig {
-        /// Path to the legacy `webvh-*` config file to migrate.
-        #[arg(long, value_name = "FILE")]
-        input: PathBuf,
-        /// Path to write the migrated config to. Defaults to
-        /// `<input>.migrated`.
-        #[arg(long, value_name = "FILE")]
-        output: Option<PathBuf>,
-        /// Overwrite the output file if it already exists.
-        #[arg(long)]
-        force: bool,
-    },
+    #[command(flatten)]
+    Admin(did_hosting_control::cli::AdminCommand),
+    #[command(flatten)]
+    Stats(did_hosting_control::cli::StatsCommand),
+    #[command(flatten)]
+    Identity(cli::IdentityCommand),
+    #[command(flatten)]
+    Tsp(cli::TspCommand),
+    #[command(flatten)]
+    Did(did_hosting_server::cli::DidCommand),
+    #[command(flatten)]
+    Keys(cli::KeysCommand),
+    #[command(flatten)]
+    Vta(cli::VtaCommand),
 }
+
+const SERVICE: cli::Service = cli::Service::Daemon;
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
     print_banner();
+
+    let config_path = cli.config;
+    let load = || -> cli::Loader<'static, DaemonConfig> {
+        let path = config_path.clone();
+        Box::new(move || Ok(DaemonConfig::load(path)?))
+    };
 
     match cli.command {
         Some(Command::Setup {
@@ -498,386 +199,115 @@ async fn main() {
             non_interactive: _,
         }) => {
             if let Some(path) = setup_key_out {
-                if let Err(e) = setup::run_setup_phase1(&path, &context).await {
-                    eprintln!("Setup error: {e}");
-                    std::process::exit(1);
-                }
+                cli::exit_on_error(
+                    "Setup error",
+                    setup::run_setup_phase1(&path, &context).await,
+                );
             } else if let Some(recipe_path) = from {
-                match setup_recipe::run_from_recipe(&recipe_path, setup_key_file, force_reprovision)
-                    .await
+                if let Err(e) =
+                    setup_recipe::run_from_recipe(&recipe_path, setup_key_file, force_reprovision)
+                        .await
                 {
-                    Ok(()) => {}
-                    Err(e) => {
-                        eprintln!("Setup error: {e}");
-                        std::process::exit(setup_recipe::map_exit_code(&e));
-                    }
+                    eprintln!("Setup error: {e}");
+                    std::process::exit(setup_recipe::map_exit_code(&e));
                 }
-            } else if let Err(e) = setup::run_wizard(cli.config, setup_key_file).await {
-                eprintln!("Setup error: {e}");
-                std::process::exit(1);
+            } else {
+                cli::exit_on_error(
+                    "Setup error",
+                    setup::run_wizard(config_path.clone(), setup_key_file).await,
+                );
             }
         }
         Some(Command::Uninstall { yes }) => {
-            let config_path = cli
-                .config
+            let config_path = config_path
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("config.toml"));
-            if let Err(e) = setup_recipe::run_uninstall(&config_path, yes).await {
-                eprintln!("Uninstall error: {e}");
-                std::process::exit(1);
-            }
+            cli::exit_on_error(
+                "Uninstall error",
+                setup_recipe::run_uninstall(&config_path, yes).await,
+            );
         }
-        Some(Command::SetupOfflinePrepare { request, state }) => {
-            if let Err(e) = setup::run_setup_offline_prepare(cli.config, request, state).await {
-                eprintln!("Setup error: {e}");
-                std::process::exit(1);
-            }
-        }
+        Some(Command::SetupOfflinePrepare { request, state }) => cli::exit_on_error(
+            "Setup error",
+            setup::run_setup_offline_prepare(config_path.clone(), request, state).await,
+        ),
         Some(Command::SetupOfflineComplete {
             bundle,
             expect_digest,
             state,
-        }) => {
-            if let Err(e) = setup::run_setup_offline_complete(bundle, expect_digest, state).await {
-                eprintln!("Setup error: {e}");
-                std::process::exit(1);
-            }
-        }
+        }) => cli::exit_on_error(
+            "Setup error",
+            setup::run_setup_offline_complete(bundle, expect_digest, state).await,
+        ),
         Some(Command::Health { strict }) => {
-            let code =
-                did_hosting_common::server::health::finish(run_health(cli.config).await, strict);
+            let code = did_hosting_common::server::health::finish(
+                run_health(config_path.clone()).await,
+                strict,
+            );
             std::process::exit(code);
         }
-        Some(Command::AddAcl {
-            did,
-            role,
-            label,
-            witness,
-        }) => {
-            if let Err(e) = run_add_acl(cli.config, did, role, label, witness).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+        Some(Command::ResetWitnessKekClaim) => cli::exit_on_error(
+            "Error",
+            run_reset_witness_kek_claim(config_path.clone()).await,
+        ),
+        Some(Command::Backup { output }) => cli::exit_on_error(
+            "Backup error",
+            backup::run_backup(config_path.clone(), output).await,
+        ),
+        Some(Command::Restore { input }) => cli::exit_on_error(
+            "Restore error",
+            backup::run_restore(config_path.clone(), input).await,
+        ),
+        Some(Command::Admin(cmd)) => cli::exit_on_error("Error", cmd.run(load()).await),
+        Some(Command::Stats(cmd)) => cli::exit_on_error("Error", cmd.run(load()).await),
+        Some(Command::Identity(cmd)) => cli::exit_on_error("Error", cmd.run(load()).await),
+        Some(Command::Tsp(cmd)) => cli::exit_on_error("Error", cmd.run(load()).await),
+        Some(Command::Did(cmd)) => {
+            cli::exit_on_error("Error", cmd.run(SERVICE.binary(), load()).await)
         }
-        Some(Command::StatsShow { mnemonic }) => {
-            let result = match DaemonConfig::load(cli.config) {
-                Ok(config) => {
-                    did_hosting_control::stats_cli::run_stats_show(&config.store, &mnemonic).await
-                }
-                Err(e) => Err(e.into()),
-            };
-            if let Err(e) = result {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::StatsSet {
-            mnemonic,
-            resolution,
-        }) => {
-            let result = match DaemonConfig::load(cli.config) {
-                Ok(config) => {
-                    did_hosting_control::stats_cli::run_stats_set(
-                        &config.store,
-                        &mnemonic,
-                        &resolution,
-                    )
-                    .await
-                }
-                Err(e) => Err(e.into()),
-            };
-            if let Err(e) = result {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::StatsPurgeLegacy) => {
-            let result = match DaemonConfig::load(cli.config) {
-                Ok(config) => {
-                    did_hosting_control::stats_cli::run_stats_purge_legacy(
-                        &config.store,
-                        &config.stats_flush,
-                        &config.stats,
-                    )
-                    .await
-                }
-                Err(e) => Err(e.into()),
-            };
-            if let Err(e) = result {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::ListAcl { witness }) => {
-            if let Err(e) = run_list_acl(cli.config, witness).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::SendTrustTask {
-            key,
-            task_type,
-            payload,
-            payload_file,
-            url,
-        }) => {
-            if let Err(e) =
-                run_send_trust_task(cli.config, key, task_type, payload, payload_file, url).await
-            {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::FetchMetrics { key, url }) => {
-            if let Err(e) = run_fetch_metrics(cli.config, key, url).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::IdentityRotateKeys {
-            keys,
-            ka_key,
-            signing_key,
-            grace,
-        }) => {
-            if let Err(e) =
-                run_identity_rotate_keys(cli.config, keys, ka_key, signing_key, grace).await
-            {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::TspRelationshipList) => {
-            if let Err(e) = run_tsp_relationship_list(cli.config).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::TspRelationshipReset { peer, our }) => {
-            if let Err(e) = run_tsp_relationship_reset(cli.config, peer, our).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::TspRelationshipDelete {
-            peer,
-            our,
-            all,
-            yes,
-        }) => {
-            if let Err(e) = run_tsp_relationship_delete(cli.config, peer, our, all, yes).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::IdentityList) => {
-            if let Err(e) = run_identity_list(cli.config).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::IdentityScidAlias { action }) => {
-            if let Err(e) = run_identity_scid_alias(cli.config, action).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::IdentityRetireNow { generation }) => {
-            if let Err(e) = run_identity_retire_now(cli.config, generation).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::ResetWitnessKekClaim) => {
-            if let Err(e) = run_reset_witness_kek_claim(cli.config).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::RemoveAcl { did }) => {
-            if let Err(e) = run_remove_acl(cli.config, did).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::Invite {
-            did,
-            role,
-            ttl_hours,
-        }) => {
-            if let Err(e) = run_invite(cli.config, did, role, ttl_hours).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::BootstrapDid {
-            path,
-            did_log,
-            did_witness,
-            witness_url,
-            witness_id,
-            witness_did,
-        }) => {
-            if let Err(e) = run_bootstrap_did(
-                cli.config,
-                path,
-                did_log,
-                did_witness,
-                witness_url,
-                witness_id,
-                witness_did,
-            )
-            .await
-            {
-                eprintln!("Bootstrap error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::RecreateDid { path }) => {
-            if let Err(e) = run_recreate_did(cli.config, path).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::RecoverDid { path }) => {
-            if let Err(e) = run_recover_did(cli.config, path).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::DumpDid { path, witness }) => {
-            let result = match DaemonConfig::load(cli.config) {
-                Ok(config) => {
-                    did_hosting_common::server::cli_dids::run_dump_did(
-                        &config.store,
-                        &path,
-                        witness,
-                    )
-                    .await
-                }
-                Err(e) => Err(e.into()),
-            };
-            if let Err(e) = result {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::ListDids) => {
-            if let Err(e) = run_list_dids(cli.config).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::RemoveDid { path }) => {
-            if let Err(e) = run_remove_did(cli.config, path).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::LoadDid {
-            path,
-            did_log,
-            did_witness,
-        }) => {
-            if let Err(e) = run_load_did(cli.config, path, did_log, did_witness).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::ImportSecrets {
-            vta_bundle,
-            signing_key,
-            ka_key,
-            jwt_key,
-            vta_credential,
-            force,
-        }) => {
-            if let Err(e) = run_import_secrets(
-                cli.config,
-                vta_bundle,
-                signing_key,
-                ka_key,
-                jwt_key,
-                vta_credential,
-                force,
-            )
-            .await
-            {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::Backup { output }) => {
-            if let Err(e) = backup::run_backup(cli.config, output).await {
-                eprintln!("Backup error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::Restore { input }) => {
-            if let Err(e) = backup::run_restore(cli.config, input).await {
-                eprintln!("Restore error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::MigrateFromWebvhConfig {
-            input,
-            output,
-            force,
-        }) => {
-            if let Err(e) = run_migrate_from_webvh_config(&input, output.as_deref(), force) {
-                eprintln!("Config migration error: {e}");
-                std::process::exit(1);
-            }
-        }
-        None => run_daemon(cli.config).await,
-    }
-}
-
-/// Skeleton for the legacy-config migration subcommand. Verifies the
-/// input file exists and prints a clear "not yet implemented in v0.7.0"
-/// message pointing to the rollout plan. The full rewriter lands in the
-/// T7/M-02 migration runner work and slots in here.
-fn run_migrate_from_webvh_config(
-    input: &std::path::Path,
-    output: Option<&std::path::Path>,
-    _force: bool,
-) -> Result<(), String> {
-    if !input.exists() {
-        return Err(format!("input config not found: {}", input.display()));
-    }
-    let default_out;
-    let out: &std::path::Path = match output {
-        Some(p) => p,
+        Some(Command::Keys(cmd)) => cli::exit_on_error("Error", cmd.run(SERVICE, load()).await),
+        Some(Command::Vta(cmd)) => cli::exit_on_error("Error", cmd.run(SERVICE).await),
         None => {
-            let mut s = input.as_os_str().to_owned();
-            s.push(".migrated");
-            default_out = std::path::PathBuf::from(s);
-            default_out.as_path()
+            if let Err(e) = run_daemon(config_path).await {
+                error!("daemon error: {e}");
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
         }
-    };
-    eprintln!(
-        "migrate-from-webvh-config: stub in v0.7.0\n  \
-         input:  {}\n  \
-         output: {} (would be written)\n\n\
-         The rewriter is implemented in a follow-up release (see \
-         tasks/did-hosting-rollout-plan.md WS-7). For now, rename the \
-         crate refs / env vars manually:\n  \
-         - WEBVH_*           env vars  → DID_HOSTING_*\n  \
-         - webvh-server      binary    → did-hosting-server\n  \
-         - webvh-control     binary    → did-hosting-control\n  \
-         - webvh-daemon      binary    → did-hosting-daemon\n  \
-         - (webvh-witness / webvh-watcher keep their names)",
-        input.display(),
-        out.display(),
-    );
-    Ok(())
+    }
 }
 
 // ===========================================================================
 // Daemon lifecycle
 // ===========================================================================
 
-async fn run_daemon(config_path: Option<PathBuf>) {
+/// The standalone services' background tasks the daemon deliberately does not
+/// run, by name (CLAUDE.md, "What the daemon intentionally does NOT
+/// mirror"). Every other task of `did-hosting-server` and
+/// `did-hosting-control` runs here, built by the same functions the
+/// standalone binaries use; `task_parity_tests` checks that each one is
+/// either run or named here.
+const DAEMON_SKIPPED_TASKS: [&str; 7] = [
+    // The daemon is its own control plane: it registers nowhere…
+    did_hosting_server::server::tasks::KEEP_REGISTERED,
+    // …reconciles with no one (the embedded server reads the control
+    // plane's own store)…
+    did_hosting_server::server::tasks::REPLICATION_RECONCILE,
+    // …and has no remote control plane to keep a TSP relationship with.
+    did_hosting_server::server::tasks::CONTROL_TSP_RELATIONSHIP,
+    // Statistics are shared in-process (`Arc<StatsCollector>`).
+    did_hosting_server::server::tasks::STATS_SYNC,
+    // The daemon's identity is the control plane's: the embedded server runs
+    // no listener, so its rotation path is inert by construction.
+    did_hosting_server::server::tasks::IDENTITY_SWEEP,
+    // The registry is empty in a default daemon deployment.
+    did_hosting_control::server::tasks::REGISTRY_HEALTH_CHECK,
+    // Superseded by the server's `purge-sweep`, which deletes a disabled
+    // domain's record as well as its DIDs, under the control plane's locks.
+    did_hosting_control::server::tasks::DOMAIN_PURGE_SWEEP,
+];
+
+async fn run_daemon(config_path: Option<PathBuf>) -> Result<(), AppError> {
     let mut config = match DaemonConfig::load(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -898,31 +328,21 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     // fjall locks the directory, so server/watcher/control share one handle.
     let main_store = Store::open_with(&config.store, &config.fjall)
         .await
-        .unwrap_or_else(|e| {
-            error!("failed to open main store: {e}");
-            std::process::exit(1);
-        });
-
+        .map_err(|e| AppError::Internal(format!("failed to open main store: {e}")))?;
     let witness_store = Store::open_with(&config.witness_store, &config.fjall)
         .await
-        .unwrap_or_else(|e| {
-            error!("failed to open witness store: {e}");
-            std::process::exit(1);
-        });
+        .map_err(|e| AppError::Internal(format!("failed to open witness store: {e}")))?;
 
     // The embedded witness keeps its own ACL only if its store is its own.
     // Found by trying it, so any spelling of the same data is caught.
     if config.enable.witness {
         match config::witness_store_shares_main_data(&main_store, &witness_store).await {
             Ok(false) => {}
-            Ok(true) => {
-                error!("{}", config::shared_witness_store_refusal());
-                eprintln!("Error: {}", config::shared_witness_store_refusal());
-                std::process::exit(1);
-            }
+            Ok(true) => return Err(AppError::Config(config::shared_witness_store_refusal())),
             Err(e) => {
-                error!("could not check that [witness_store] is separate from [store]: {e}");
-                std::process::exit(1);
+                return Err(AppError::Internal(format!(
+                    "could not check that [witness_store] is separate from [store]: {e}"
+                )));
             }
         }
     }
@@ -930,119 +350,32 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     // Open keyspaces early — needed for bootstrap, stats seeding, and builders.
     // Strongly consistent: the storage task's DID cleanup re-reads a record
     // to decide whether to delete it. Resolution does not use this handle.
-    let dids_ks = main_store.keyspace_consistent(KS_DIDS).unwrap_or_else(|e| {
-        error!("failed to open dids keyspace: {e}");
-        std::process::exit(1);
-    });
-    let stats_ks = main_store.keyspace(KS_STATS).unwrap_or_else(|e| {
-        error!("failed to open stats keyspace: {e}");
-        std::process::exit(1);
-    });
-    let timeseries_ks = main_store.keyspace(KS_TIMESERIES).unwrap_or_else(|e| {
-        error!("failed to open timeseries keyspace: {e}");
-        std::process::exit(1);
-    });
+    let dids_ks = main_store.keyspace_consistent(KS_DIDS)?;
+    let stats_ks = main_store.keyspace(KS_STATS)?;
+    let timeseries_ks = main_store.keyspace(KS_TIMESERIES)?;
 
-    // First-boot domain seed (T18). Three-tier fallback:
-    //   1. `[hosting] bootstrap_domains`
-    //   2. legacy `public_url` host (upgrade path)
-    //   3. empty (loud warn — daemon boots but won't accept new DIDs
-    //      until an admin creates a domain)
-    // Idempotent: subsequent boots find the `domains` keyspace
-    // already populated and short-circuit.
-    match did_hosting_common::server::domain::seed_domains_first_boot(
+    // ── Phase 1: Pre-serve initialization (shared with the standalone
+    //    services) ─────────────────────────────────────────────────────
+
+    // 1a. First-boot domain and assignment seed, then the control plane's
+    // migrations — the edge's `run_first_boot_init`, strict: the daemon owns
+    // the control plane, whose write paths need the domain catalogue.
+    did_hosting_server::server::run_first_boot_init(
         &main_store,
-        &config.hosting.bootstrap_domains,
-        config.public_url.as_deref(),
+        &config.server_config(),
+        did_hosting_common::server::migrations::control_plane_registry(),
+        FirstBoot::Strict,
     )
-    .await
-    {
-        Ok(outcome) => {
-            info!(
-                tier = ?outcome.tier,
-                count = outcome.final_count,
-                default = ?outcome.default,
-                "first-boot domain seed"
-            );
-        }
-        Err(e) => {
-            error!("first-boot domain seed failed: {e}");
-            std::process::exit(1);
-        }
-    }
+    .await?;
 
-    // First-boot assignment seed (T29). Mirrors the T18 tier chain so
-    // a freshly-deployed daemon — even with no control plane
-    // reachable — has the same effective assignments and will host
-    // its bootstrap_domains immediately. Once the control plane sends
-    // `replica/domain/assign` the keyspace is the same; subsequent boots
-    // short-circuit at tier 0.
-    let assignment_now = did_hosting_common::server::auth::session::now_epoch();
-    match did_hosting_common::server::assignment_seed::seed_assignments_first_boot(
-        &main_store,
-        &config.hosting.bootstrap_domains,
-        config.public_url.as_deref(),
-        assignment_now,
-    )
-    .await
-    {
-        Ok(outcome) => {
-            info!(
-                tier = ?outcome.tier,
-                count = outcome.final_count,
-                "first-boot assignment seed"
-            );
-        }
-        Err(e) => {
-            error!("first-boot assignment seed failed: {e}");
-            std::process::exit(1);
-        }
-    }
-
-    // Storage migrations (T2 runner + T13 M-01). Runs after the
-    // domain seed so M-01 can use the system default as a tier-2
-    // fallback for legacy records that have no `did_id` to derive a
-    // host from. Idempotent — applied markers in the `meta`
-    // keyspace gate re-runs across boots.
-    {
-        let runner = did_hosting_common::server::migrations::MigrationRunner::new(
-            did_hosting_common::server::migrations::control_plane_registry(),
-        );
-        match runner.run_pending(&main_store).await {
-            Ok(summary) => {
-                info!(
-                    applied = ?summary.applied,
-                    skipped = ?summary.skipped,
-                    "migration runner complete"
-                );
-            }
-            Err(e) => {
-                error!("migration runner failed: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-
-    // ── Phase 1: Pre-serve initialization ─────────────────────────────
-
-    // 1a. DID store integrity check
     if config.enable.server {
-        match dids_ks.verify_integrity().await {
-            Ok(0) => debug!("store integrity check passed"),
-            Ok(n) => warn!(
-                corrupted = n,
-                "store integrity check found corrupted entries"
-            ),
-            Err(e) => warn!(error = %e, "store integrity check failed"),
-        }
-    }
+        // 1b. DID store integrity check
+        did_hosting_server::server::check_store_integrity(&dids_ks).await;
 
-    // 1b. Auto-bootstrap root DID (if server enabled and public_url set)
-    if config.enable.server {
-        let server_config = config.server_config();
+        // 1c. Report the root DID (if server enabled and public_url set)
         let bootstrapped = did_hosting_server::server::auto_bootstrap_dids(
             "did-hosting-daemon",
-            server_config,
+            config.server_config(),
             &main_store,
             &dids_ks,
             &secrets,
@@ -1054,7 +387,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         }
     }
 
-    // 1c. Seed stats collector from persisted store: the aggregate, the DID
+    // 1d. Seed stats collector from persisted store: the aggregate, the DID
     // count and the per-DID statistics overrides; then the `[stats]` policy.
     let stats_collector = {
         let collector = StatsCollector::new();
@@ -1074,15 +407,9 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // ── Phase 1.5: Load the daemon's own identity ─────────────────────
     //
-    // One identity, shared by every embedded service.
-    //
-    // The standalone binaries each build their own DID resolver and secrets
-    // resolver, and the daemon used to do the same thing three times over —
-    // `build_server`, `build_witness` and `build_control` each called
-    // `init_didcomm_auth` with the same `server_did`, yielding three
-    // `DIDCacheClient`s and three `ThreadedSecretsResolver`s for one DID. That
-    // was already wasteful; with rotation it would be three copies of the key
-    // material a reload has to keep in step. They now share one.
+    // One identity, shared by every embedded service: one DID resolver and
+    // one secrets resolver, rather than a copy of the key material per
+    // service for a rotation to keep in step.
     //
     // Loaded after `auto_bootstrap_dids`, which may have backfilled
     // `server_did` — resolving before that would find nothing.
@@ -1104,18 +431,13 @@ async fn run_daemon(config_path: Option<PathBuf>) {
 
     // ── Phase 2: Build service routers ────────────────────────────────
 
+    let mut sup = Supervisor::new("did-hosting-daemon");
+    let mut signal = std::pin::pin!(init::shutdown_signal());
+
     let mut combined: Router = Router::new();
     let mut server_state: Option<did_hosting_server::server::AppState> = None;
 
     let mut enabled_services = Vec::new();
-
-    // HTTP client with timeouts (shared config for both server and control)
-    let http_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .connect_timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("failed to build HTTP client");
 
     // One per-address resolution limit for the whole process, so a client's
     // budget covers the server's routes, the DID-serving fallback and the
@@ -1125,11 +447,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     // and every handler that charges a client address, so a proxy's invalid
     // chain is logged once a minute whichever path met it.
     let client_ips =
-        did_hosting_common::server::rate_limit::ClientIps::from_server_config(&config.server)
-            .unwrap_or_else(|e| {
-                error!("failed to build the client-address rule: {e}");
-                std::process::exit(1);
-            });
+        did_hosting_common::server::rate_limit::ClientIps::from_server_config(&config.server)?;
     let resolve_limit = Arc::new(
         did_hosting_common::server::rate_limit::ResolveRateLimiter::new(
             &config.server,
@@ -1138,12 +456,12 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     );
     // Sweeps idle clients out of every rate limiter the daemon serves, until
     // the HTTP server stops.
-    let rate_limit_gc = CancellationToken::new();
+    let rate_limit_gc = sup.signal(Stage::Listeners).token();
     resolve_limit.spawn_gc(rate_limit_gc.clone());
 
     // 2a. Server — public DID-serving routes only (.well-known)
     if config.enable.server {
-        match build_server(
+        let (router, state) = build_server(
             &config,
             &main_store,
             &stats_collector,
@@ -1151,22 +469,15 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             resolve_limit.clone(),
         )
         .await
-        {
-            Ok((router, state)) => {
-                combined = combined.merge(router);
-                server_state = Some(state);
-                enabled_services.push("server (/)");
-            }
-            Err(e) => {
-                error!("failed to initialize server: {e}");
-                std::process::exit(1);
-            }
-        }
+        .map_err(|e| AppError::Internal(format!("failed to initialize server: {e}")))?;
+        combined = combined.merge(router);
+        server_state = Some(state);
+        enabled_services.push("server (/)");
     }
 
     // 2b. Witness (nested at /witness)
     if config.enable.witness {
-        match build_witness(
+        let router = build_witness(
             &config,
             &witness_store,
             identity.clone(),
@@ -1174,58 +485,38 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             &rate_limit_gc,
         )
         .await
-        {
-            Ok(router) => {
-                combined = combined.nest("/witness", router);
-                enabled_services.push("witness (/witness)");
-            }
-            Err(e) => {
-                error!("failed to initialize witness: {e}");
-                std::process::exit(1);
-            }
-        }
+        .map_err(|e| AppError::Internal(format!("failed to initialize witness: {e}")))?;
+        combined = combined.nest("/witness", router);
+        enabled_services.push("witness (/witness)");
     }
 
     // 2c. Watcher (nested at /watcher)
     if config.enable.watcher {
-        match build_watcher(&config, &main_store, resolve_limit.clone()).await {
-            Ok(router) => {
-                combined = combined.nest("/watcher", router);
-                enabled_services.push("watcher (/watcher)");
-            }
-            Err(e) => {
-                error!("failed to initialize watcher: {e}");
-                std::process::exit(1);
-            }
-        }
+        let router = build_watcher(&config, &main_store, resolve_limit.clone())
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to initialize watcher: {e}")))?;
+        combined = combined.nest("/watcher", router);
+        enabled_services.push("watcher (/watcher)");
     }
 
     // 2d. Control plane — merged at root (no prefix)
     let mut control_state: Option<did_hosting_control::server::AppState> = None;
     if config.enable.control {
-        match build_control(
+        let (router, state) = build_control(
             &config,
             &secrets,
             &main_store,
             &stats_collector,
-            &http_client,
             identity.clone(),
             server_state.as_ref(),
             &client_ips,
         )
         .await
-        {
-            Ok((router, state)) => {
-                combined = combined.merge(router);
-                state.spawn_rate_limit_gc(&rate_limit_gc);
-                control_state = Some(state);
-                enabled_services.push("control (/)");
-            }
-            Err(e) => {
-                error!("failed to initialize control plane: {e}");
-                std::process::exit(1);
-            }
-        }
+        .map_err(|e| AppError::Internal(format!("failed to initialize control plane: {e}")))?;
+        combined = combined.merge(router);
+        state.spawn_rate_limit_gc(&sup.signal(Stage::Workers).token());
+        control_state = Some(state);
+        enabled_services.push("control (/)");
     }
 
     // Combined fallback: try DID public serving first, then the SPA UI.
@@ -1278,6 +569,8 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     };
 
     // Apply tracing layer, then add health route *after* so it's not traced
+    let health_ks = dids_ks.clone();
+    let health_did = config.server_did.clone();
     let app = combined
         .layer(
             TraceLayer::new_for_http()
@@ -1300,7 +593,13 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         // Allow browser-based resolvers to fetch public DID documents
         // cross-origin. Read-only, unauthenticated, wildcard origin.
         .layer(did_hosting_common::server::public_resolution_cors())
-        .route("/health", get(daemon_health));
+        .route(
+            "/health",
+            get(move || {
+                let (ks, did) = (health_ks.clone(), health_did.clone());
+                async move { daemon_health(&ks, did.as_deref()).await }
+            }),
+        );
 
     // Log startup summary
     info!("--- daemon services ---");
@@ -1308,31 +607,51 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         info!("  {svc}");
     }
 
-    // ── Phase 3: Spawn background tasks ───────────────────────────────
+    // ── Phase 3: Background tasks ─────────────────────────────────────
 
-    // 3a. Unified storage task (session cleanup, DID cleanup, stats flush, health checks)
-    let (storage_shutdown_tx, storage_shutdown_rx) = watch::channel(false);
-    let sessions_ks = main_store.keyspace(KS_SESSIONS).unwrap_or_else(|e| {
-        error!("failed to open sessions keyspace: {e}");
-        std::process::exit(1);
-    });
-    let storage_handle = tokio::spawn(run_daemon_storage_task(
-        DaemonStorageParams {
+    // 3a. The storage task: the server's and the control plane's storage
+    // ticks, merged (session cleanup, DID cleanup, stats flush, DID recount,
+    // purge sweep), then the last flush and the persist. Critical: it is
+    // what persists the store, and it is stopped last.
+    let storage = DaemonStorageParams {
+        store: main_store.clone(),
+        edge: did_hosting_server::server::EdgeStorage {
             store: main_store.clone(),
-            sessions_ks,
             dids_ks: dids_ks.clone(),
+            did_ttl_seconds: config.auth.cleanup_ttl_minutes * 60,
+            collector: stats_collector.clone(),
+            caches: server_state
+                .as_ref()
+                .map(|s| s.resolution_caches())
+                .unwrap_or_else(|| did_hosting_server::cache::ResolutionCaches {
+                    content: Arc::new(did_hosting_server::cache::ContentCache::new(
+                        did_hosting_server::cache::RESOLUTION_CACHE_TTL,
+                    )),
+                    gate: None,
+                }),
+            // The control plane publishes into slots under its path locks;
+            // the cleanup and the purge take the same lock before deleting.
+            path_locks: control_state.as_ref().map(|s| s.path_locks.clone()),
+            on_removed: Some(removed_dids_stats_hook(
+                stats_collector.clone(),
+                stats_ks.clone(),
+                timeseries_ks.clone(),
+            )),
+        },
+        control: did_hosting_control::server::ControlStorage {
+            sessions_ks: main_store.keyspace(KS_SESSIONS)?,
             stats_ks,
-            timeseries_ks: timeseries_ks.clone(),
-            auth_config: config.auth.clone(),
+            timeseries_ks,
+            dids_ks: dids_ks.clone(),
+            auth: config.auth.clone(),
             has_auth: config.server_did.is_some(),
             collector: stats_collector.clone(),
             stats_flush: config.stats_flush,
-            control_state: control_state.clone(),
-            content_cache: server_state.as_ref().map(|s| s.did_cache.clone()),
-            gate_cache: server_state.as_ref().and_then(|s| s.gate_cache.clone()),
         },
-        storage_shutdown_rx,
-    ));
+    };
+    sup.spawn_critical(Stage::Storage, "daemon-storage", move |sd| {
+        run_daemon_storage_task(storage, sd.watch())
+    });
 
     // ── Phase 4: Serve HTTP (must start before DIDComm so self-hosted
     //    DIDs are resolvable when the mediator connection is established) ──
@@ -1340,181 +659,146 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
-        .unwrap_or_else(|e| {
-            error!("failed to bind {addr}: {e}");
-            std::process::exit(1);
-        });
+        .map_err(|e| AppError::Internal(format!("failed to bind {addr}: {e}")))?;
     info!("daemon listening on {addr}");
 
+    // Critical: it owns the listening socket, and a daemon that cannot serve
+    // HTTP serves nothing. Stopped (gracefully, within the shutdown
+    // deadline) after the workers.
     let (http_ready_tx, http_ready_rx) = tokio::sync::oneshot::channel::<()>();
     let trusted_proxies = config.server.trusted_proxies.clone();
-    let http_handle = tokio::spawn(async move {
+    sup.spawn_critical(Stage::Listeners, "daemon-http", move |sd| async move {
         let _ = http_ready_tx.send(());
         // Header, idle, connection and per-address limits: see `listener`.
-        axum::serve(
+        if let Err(e) = axum::serve(
             did_hosting_common::server::listener::bounded(listener, &trusted_proxies),
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-        .with_graceful_shutdown(init::shutdown_signal())
+        .with_graceful_shutdown(async move { sd.stopped().await })
         .await
-        .expect("axum serve failed");
+        {
+            error!("HTTP server failed: {e}");
+        }
     });
 
     // Wait for HTTP to be serving before starting DIDComm — the mediator DID
     // may be hosted by this daemon and needs to be resolvable.
     let _ = http_ready_rx.await;
 
-    // 4a. The daemon's *own* DID is hosted by the daemon, so it was not
-    // resolvable when the identity was loaded — `load_identity` came up on
-    // guessed `#key-0`/`#key-1` kids and deliberately persisted nothing. This is
-    // the first moment the document is fetchable, so it is where generation 0 is
-    // recorded with the kids the document actually uses.
-    //
-    // Must run before the DIDComm listener starts, or its profile would be built
-    // on the guess.
-    if let Some(ref state) = control_state
-        && let Err(e) = did_hosting_control::identity_rotation::reload_now(state).await
-    {
-        warn!("failed to establish the service identity from its DID document: {e}");
-    }
+    let mut interrupted = false;
+    if let Some(ref state) = control_state {
+        // 4a. The daemon's *own* DID is hosted by the daemon, so it was not
+        // resolvable when the identity was loaded — `load_identity` came up
+        // on guessed `#key-0`/`#key-1` kids and deliberately persisted
+        // nothing. This is the first moment the document is fetchable, so it
+        // is where generation 0 is recorded with the kids the document
+        // actually uses. Must run before the DIDComm listener starts, or its
+        // profile would be built on the guess.
+        if let Err(e) = did_hosting_control::identity_rotation::reload_now(state).await {
+            warn!("failed to establish the service identity from its DID document: {e}");
+        }
 
-    // 4b. DIDComm service (for VTA integration via control plane)
-    //     Stored in the control state so server_push and handlers
-    //     can send messages through the same connection.
-    let didcomm_shutdown = CancellationToken::new();
-    // Start the mediator messaging service when *either* transport is
-    // enabled — TSP-only deployments (didcomm off, tsp on) must still spin
-    // up the listener.
-    if config.features.didcomm || config.features.tsp {
-        if let Some(ref mut state) = control_state {
+        // 4b. The control plane's workers — the outbox and its periodic
+        // tasks, less the daemon's skip list. The same function the
+        // standalone control plane starts them with.
+        did_hosting_control::server::spawn_workers(state, &mut sup, &DAEMON_SKIPPED_TASKS);
+
+        // 4c. The messaging service (DIDComm and/or TSP, for VTA integration
+        // via the control plane), retried with backoff while it fails. Stored
+        // in the control state so server_push and handlers can send through
+        // the same connection. TSP-only deployments must still start it.
+        if config.features.didcomm || config.features.tsp {
             info!(
                 server_did = ?state.config.server_did,
                 mediator_did = ?state.config.mediator_did,
                 "starting control plane DIDComm service"
             );
-            match did_hosting_control::server::start_didcomm_service(
-                state,
-                didcomm_shutdown.clone(),
-            )
-            .await
-            {
-                Ok(Some(svc)) => {
-                    info!("DIDComm service started successfully");
-                    let _ = state.didcomm_service.set(svc);
-                }
-                Ok(None) => {
-                    warn!(
-                        "DIDComm service returned None — check server_did and mediator_did config"
-                    );
-                }
-                Err(e) => {
-                    warn!("failed to start DIDComm service: {e}");
-                }
+            tokio::select! {
+                svc = did_hosting_control::server::start_messaging(
+                    state,
+                    sup.signal(Stage::Workers).token(),
+                ) => match svc {
+                    Some(svc) => {
+                        info!("DIDComm service started successfully");
+                        let _ = state.didcomm_service.set(svc);
+                    }
+                    None => warn!(
+                        "no DIDComm service — check server_did and mediator_did config"
+                    ),
+                },
+                _ = &mut signal => interrupted = true,
             }
         } else {
-            warn!("DIDComm enabled but control plane not enabled — skipping");
+            info!("DIDComm disabled in config");
         }
-    } else {
-        info!("DIDComm disabled in config");
-    }
 
-    // 4b'. Post-listener startup shared with the standalone control plane —
-    // notably resuming any old-mediator drain a previous process left running.
-    if let Some(ref state) = control_state {
+        // 4d. Post-listener startup shared with the standalone control plane —
+        // notably resuming any old-mediator drain a previous process left
+        // running.
         did_hosting_control::server::post_listener_startup(state);
+    } else if config.features.didcomm || config.features.tsp {
+        warn!("DIDComm enabled but control plane not enabled — skipping");
     }
 
-    // 4c. Durable outbox worker. Drains the control-side outbound
-    // queue per-target; idle until DIDComm is up, then delivers
-    // every queued mutation. Spawned regardless of whether DIDComm
-    // is enabled — the worker no-ops gracefully without a service
-    // handle, and starting it eagerly avoids racing the first
-    // `notify_one`.
-    let (outbox_shutdown_tx, outbox_shutdown_rx) = watch::channel(false);
-    // 4d. A refreshed GeoIP database is picked up without a restart; stops
-    // on the outbox worker's signal.
-    let geoip_reloader = control_state
-        .as_ref()
-        .and_then(|state| state.oob.geoip().spawn_reloader(outbox_shutdown_rx.clone()));
-    let outbox_handle = if let Some(state) = control_state.as_ref() {
-        let outbox_state = state.clone();
-        let outbox_notify = state.outbox_notify.clone();
-        Some(tokio::spawn(async move {
-            did_hosting_control::outbox::run_outbox_loop(
-                outbox_state,
-                outbox_notify,
-                outbox_shutdown_rx,
-            )
-            .await;
-        }))
+    // Run until the shutdown signal, or until a critical task stops.
+    let outcome = if interrupted {
+        Ok(())
     } else {
-        None
+        sup.run_until(&mut signal).await
     };
 
-    // Wait for HTTP server to complete (shutdown signal received)
-    let _ = http_handle.await;
-    rate_limit_gc.cancel();
-
     // ── Phase 5: Ordered shutdown ─────────────────────────────────────
+    //
+    // Workers, then the messaging service (awaited), then HTTP, then
+    // storage (the last flush and the persist of the main store), each
+    // within `SHUTDOWN_STAGE_DEADLINE` — the control plane's own sequence.
+    let stopped = match control_state {
+        Some(ref state) => did_hosting_control::server::shutdown(state, sup).await,
+        None => sup
+            .finish(SHUTDOWN_STAGE_DEADLINE)
+            .await
+            .map_err(|failures| AppError::Internal(format!("{} task(s) failed", failures.len()))),
+    };
 
-    // 5a. Cancel DIDComm (cancellation token stops the service)
-    didcomm_shutdown.cancel();
-    info!("DIDComm service stopped");
-
-    let _ = outbox_shutdown_tx.send(true);
-    if let Some(handle) = outbox_handle {
-        match handle.await {
-            Ok(()) => info!("outbox worker stopped"),
-            Err(e) => warn!("outbox worker didn't shut down cleanly: {e}"),
-        }
-    }
-    if let Some(handle) = geoip_reloader
-        && let Err(e) = handle.await
-    {
-        warn!("GeoIP reloader didn't shut down cleanly: {e}");
-    }
-
-    // 5b. Stop storage task (includes final flush + persist main_store)
-    let _ = storage_shutdown_tx.send(true);
-    match storage_handle.await {
-        Ok(()) => info!("storage task stopped"),
-        Err(e) => error!("storage task panicked: {e}"),
-    }
-
-    // 5c. Persist witness store (not managed by storage task)
+    // 5b. Persist witness store (not managed by the storage task)
     if let Err(e) = witness_store.persist().await {
         error!("failed to persist witness store: {e}");
     }
 
+    if let Err(failure) = outcome {
+        return Err(AppError::Internal(format!("shut down because {failure}")));
+    }
+    stopped?;
     info!("daemon shut down");
+    Ok(())
 }
 
 // ===========================================================================
 // Unified storage task
 // ===========================================================================
 
+/// What the daemon's storage task works on: the server's storage and the
+/// control plane's, over the one store.
 struct DaemonStorageParams {
     store: Store,
-    sessions_ks: KeyspaceHandle,
-    dids_ks: KeyspaceHandle,
-    stats_ks: KeyspaceHandle,
-    timeseries_ks: KeyspaceHandle,
-    auth_config: did_hosting_common::server::config::AuthConfig,
-    has_auth: bool,
-    collector: Arc<StatsCollector>,
-    /// The statistics flush budget (`[stats_flush]`).
-    stats_flush: did_hosting_control::config::StatsFlushConfig,
-    /// The control plane's state, for the identity sweep.
-    ///
-    /// Daemon parity (CLAUDE.md): periodic work that standalone services spawn
-    /// as their own task lands in this unified storage task instead. `None` when
-    /// the control plane is disabled — nothing owns the identity then.
-    control_state: Option<did_hosting_control::server::AppState>,
-    /// The embedded server's content cache, when it runs: expired entries
-    /// are evicted here, and a purge clears it.
-    content_cache: Option<Arc<did_hosting_server::cache::ContentCache>>,
-    /// Its gate cache, when it keeps one (control plane on): likewise.
-    gate_cache: Option<Arc<did_hosting_server::cache::GateCache>>,
+    edge: did_hosting_server::server::EdgeStorage,
+    control: did_hosting_control::server::ControlStorage,
+}
+
+/// The daemon's storage ticks: the edge's ([`did_hosting_server::server::storage_tasks`])
+/// and the control plane's ([`did_hosting_control::server::storage_tasks`]),
+/// merged — a tick both run (the DID recount) runs once — less the skip list.
+fn daemon_storage_tasks(
+    edge: &did_hosting_server::server::EdgeStorage,
+    control: &did_hosting_control::server::ControlStorage,
+) -> Vec<PeriodicTask> {
+    merge_tasks(
+        [
+            did_hosting_server::server::storage_tasks(edge),
+            did_hosting_control::server::storage_tasks(control),
+        ],
+        &DAEMON_SKIPPED_TASKS,
+    )
 }
 
 /// Delete the statistics of DIDs the empty-slot cleanup or the domain purge
@@ -1522,182 +806,44 @@ struct DaemonStorageParams {
 /// daemon holds them in the same store, and an explicit delete already
 /// clears them (`stats_admin::delete_did_stats`). Runs on the storage task,
 /// between flushes, so no flush is writing these rows meanwhile.
-async fn delete_removed_dids_stats(params: &DaemonStorageParams, mnemonics: &[String]) {
-    for mnemonic in mnemonics {
-        if let Err(e) = did_hosting_common::server::stats_collector::delete_did_stats(
-            &params.collector,
-            &params.stats_ks,
-            &params.timeseries_ks,
-            mnemonic,
-        )
-        .await
-        {
-            warn!(mnemonic, error = %e, "could not delete a removed DID's statistics rows");
-        }
-    }
+fn removed_dids_stats_hook(
+    collector: Arc<StatsCollector>,
+    stats_ks: KeyspaceHandle,
+    timeseries_ks: KeyspaceHandle,
+) -> did_hosting_server::server::RemovedDidsHook {
+    Arc::new(move |mnemonics: Vec<String>| {
+        let (collector, stats_ks, timeseries_ks) =
+            (collector.clone(), stats_ks.clone(), timeseries_ks.clone());
+        Box::pin(async move {
+            for mnemonic in &mnemonics {
+                if let Err(e) = did_hosting_common::server::stats_collector::delete_did_stats(
+                    &collector,
+                    &stats_ks,
+                    &timeseries_ks,
+                    mnemonic,
+                )
+                .await
+                {
+                    warn!(mnemonic, error = %e, "could not delete a removed DID's statistics rows");
+                }
+            }
+        })
+    })
 }
 
-async fn run_daemon_storage_task(
-    params: DaemonStorageParams,
-    mut shutdown_rx: watch::Receiver<bool>,
-) {
+/// The storage ticks until shutdown, then the last statistics flush and the
+/// main store's persist. Storage is the last stage stopped, so both see
+/// every write — the outbox's included.
+async fn run_daemon_storage_task(params: DaemonStorageParams, shutdown: watch::Receiver<bool>) {
     info!("storage task started");
-
-    let session_interval = Duration::from_secs(params.auth_config.session_cleanup_interval);
-    let did_ttl_seconds = params.auth_config.cleanup_ttl_minutes * 60;
-    let did_interval = Duration::from_secs(did_ttl_seconds.max(60));
-    let flush_interval = did_hosting_control::config::STATS_FLUSH_INTERVAL;
-
-    let mut session_timer = tokio::time::interval(session_interval);
-    let mut did_timer = tokio::time::interval(did_interval);
-    let mut flush_timer = tokio::time::interval(flush_interval);
-    // A flush that overruns its interval is followed by a full interval, not
-    // an immediate catch-up flush.
-    flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // The migration to the tiered statistics format, stepped after each flush.
-    let mut stats_maintenance = did_hosting_control::stats_migration::StatsMaintenance::new(
-        params.stats_ks.clone(),
-        params.timeseries_ks.clone(),
-        params.dids_ks.clone(),
-    );
-    // Same recount as the standalone control plane: corrects the count for
-    // paths that do not keep it, such as an offline `remove`.
-    let mut did_count_timer = tokio::time::interval(
-        did_hosting_common::server::stats_collector::DID_COUNT_RECONCILE_INTERVAL,
-    );
-    // T30 background purge sweep — 60s tick, processes ripe pending
-    // entries (unassign-then-wait-grace) by deleting matching DID
-    // records and clearing the pending entry.
-    let mut purge_timer =
-        tokio::time::interval(did_hosting_server::purge_sweep::DEFAULT_SWEEP_INTERVAL);
-    // Identity expiry — local and cheap, so it runs on the tight interval and
-    // retires a superseded key promptly. It also picks up a generation the
-    // offline CLI retired out of band.
-    let mut identity_expiry_timer =
-        tokio::time::interval(did_hosting_control::identity_rotation::SWEEP_INTERVAL);
-    // Identity reload — re-resolves our DID document over the network. Only a
-    // backstop (the publish hook catches a rotation the instant it happens), so
-    // it runs five times slower rather than burning a self-resolve every minute.
-    let mut identity_reload_timer =
-        tokio::time::interval(did_hosting_control::identity_rotation::RELOAD_INTERVAL);
-
-    // Skip first ticks (immediate)
-    session_timer.tick().await;
-    did_timer.tick().await;
-    flush_timer.tick().await;
-    did_count_timer.tick().await;
-    purge_timer.tick().await;
-    identity_expiry_timer.tick().await;
-    identity_reload_timer.tick().await;
-
-    loop {
-        tokio::select! {
-            _ = session_timer.tick(), if params.has_auth => {
-                if let Err(e) = did_hosting_common::server::auth::session::cleanup_expired_sessions(
-                    &params.sessions_ks,
-                    params.auth_config.challenge_ttl,
-                ).await {
-                    warn!("session cleanup error: {e}");
-                }
-            }
-            _ = did_timer.tick() => {
-                // The control plane publishes into slots under its path
-                // locks; the cleanup takes the same lock before deleting one.
-                match did_hosting_server::did_ops::cleanup_empty_dids(
-                    &params.dids_ks,
-                    did_ttl_seconds,
-                    params.control_state.as_ref().map(|s| &s.path_locks),
-                ).await {
-                    Ok(removed) if removed.is_empty() => {}
-                    Ok(removed) => {
-                        info!(count = removed.len(), "cleaned up empty DID records");
-                        params.collector.subtract_total_dids(removed.len() as u64);
-                        delete_removed_dids_stats(&params, &removed).await;
-                    }
-                    Err(e) => warn!("DID cleanup error: {e}"),
-                }
-            }
-            _ = did_count_timer.tick() => {
-                if let Err(e) = did_hosting_common::server::stats_collector::reconcile_total_dids(
-                    &params.collector,
-                    &params.dids_ks,
-                ).await {
-                    warn!("DID count reconcile error: {e}");
-                }
-            }
-            _ = flush_timer.tick() => {
-                // One deadline for the tick: the flush, then the migration in
-                // what is left of it, so the tick keeps its interval.
-                let deadline = tokio::time::Instant::now()
-                    + did_hosting_control::config::STATS_FLUSH_INTERVAL;
-                if let Err(e) = did_hosting_control::server::flush_stats_paced_until(
-                    &params.collector,
-                    &params.stats_ks,
-                    &params.timeseries_ks,
-                    &params.stats_flush,
-                    shutdown_rx.clone(),
-                    deadline,
-                ).await {
-                    warn!("stats flush error: {e}");
-                }
-                // Parity with the control plane: the migration to (and
-                // clean-up after) the tiered statistics format.
-                if let Err(e) = stats_maintenance
-                    .step(&params.collector, &params.stats_flush, shutdown_rx.clone(), deadline)
-                    .await
-                {
-                    warn!("stats migration error: {e}");
-                }
-            }
-            _ = purge_timer.tick() => {
-                // Under the control plane's path locks, as the DID cleanup is.
-                let sweep = did_hosting_server::purge_sweep::run_sweep_once_locked(
-                    &params.store,
-                    params.control_state.as_ref().map(|s| &s.path_locks),
-                ).await;
-                if sweep.entries > 0 {
-                    info!(count = sweep.entries, "purge sweep tick completed");
-                }
-                // A purge deletes DIDs or a domain record without the control
-                // plane's hook hearing of it: drop everything. Otherwise this
-                // one-minute tick evicts what has outlived its TTL.
-                let purged = sweep.entries > 0 || sweep.dids_deleted > 0;
-                if let Some(content) = &params.content_cache {
-                    if purged { content.clear() } else { content.evict_expired() }
-                }
-                if let Some(gate) = &params.gate_cache {
-                    if purged { gate.clear() } else { gate.evict_expired() }
-                }
-                params.collector.subtract_total_dids(sweep.dids_deleted);
-                delete_removed_dids_stats(&params, &sweep.purged_dids).await;
-            }
-            _ = identity_expiry_timer.tick() => {
-                if let Some(state) = params.control_state.as_ref() {
-                    did_hosting_control::identity_rotation::expire_due(state).await;
-                }
-            }
-            _ = identity_reload_timer.tick() => {
-                if let Some(state) = params.control_state.as_ref()
-                    && let Err(e) = did_hosting_control::identity_rotation::reload_now(state).await
-                {
-                    debug!("identity backstop reload failed: {e}");
-                }
-            }
-            _ = shutdown_rx.changed() => {
-                info!("storage task shutting down");
-                break;
-            }
-        }
-    }
-
-    // Final flush before exit
-    did_hosting_control::server::flush_remaining_stats(
-        &params.collector,
-        &params.stats_ks,
-        &params.timeseries_ks,
+    run_periodic(
+        daemon_storage_tasks(&params.edge, &params.control),
+        shutdown,
     )
     .await;
+    info!("storage task shutting down");
 
+    params.control.final_flush().await;
     if let Err(e) = params.store.persist().await {
         error!("failed to persist main store on shutdown: {e}");
     } else {
@@ -1822,10 +968,11 @@ async fn build_watcher(
 
 /// The control plane's Trust Task proof verifier, built exactly as the
 /// standalone control plane builds it (the shared
-/// [`did_hosting_common::server::trust_tasks::build_verifier`]): a deactivated
-/// `did:webvh` signer is refused, an unreachable signer is retryable, and a
-/// proof failing against a cached DID document is retried once, rate-limited,
-/// against a fresh one.
+/// [`did_hosting_common::server::trust_tasks::build_verifier`], called by
+/// `AppState::build`): a deactivated `did:webvh` signer is refused, an
+/// unreachable signer is retryable, and a proof failing against a cached DID
+/// document is retried once, rate-limited, against a fresh one.
+#[cfg(test)]
 fn control_verifier(
     did_resolver: Option<&affinidi_did_resolver_cache_sdk::DIDCacheClient>,
 ) -> Option<Arc<did_hosting_common::server::trust_tasks::TransportBoundVerifier>> {
@@ -1849,18 +996,19 @@ fn resolution_cache_hook(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Build the embedded control plane: its state by `AppState::build` and its
+/// boot steps by `startup`, the standalone control plane's own recipe, with
+/// what the daemon shares across services passed in.
 async fn build_control(
     config: &DaemonConfig,
     secrets: &ServerSecrets,
     store: &Store,
     stats_collector: &Arc<StatsCollector>,
-    http_client: &reqwest::Client,
     identity: Option<Arc<ServiceIdentity>>,
     server: Option<&did_hosting_server::server::AppState>,
     client_ips: &did_hosting_common::server::rate_limit::ClientIps,
 ) -> Result<(Router, did_hosting_control::server::AppState), AppError> {
-    use did_hosting_control::server::AppState;
+    use did_hosting_control::server::{AppState, AppStateOverrides};
 
     // Lets the control plane's own mutations (register, publish, disable,
     // rollback, delete, and domain changes) evict what the embedded server
@@ -1883,106 +1031,23 @@ async fn build_control(
         control_config.server_did.as_deref(),
     )?;
 
-    // Opened here rather than threaded in: `keyspace()` is idempotent and
-    // cheap, and passing them as arguments pushed this past clippy's
-    // too-many-arguments bound for no benefit — the four below were always
-    // opened locally anyway.
-    let sessions_ks = store.keyspace(KS_SESSIONS)?;
-    let acl_ks = store.keyspace(KS_ACL)?;
-    let registry_ks = store.keyspace(KS_REGISTRY)?;
-    // Strongly consistent, as in the standalone control plane; the embedded
-    // server opens its own handle and resolves with ordinary reads.
-    let dids_ks = store.keyspace_consistent(KS_DIDS)?;
-    let stats_ks = store.keyspace(KS_STATS)?;
-    let timeseries_ks = store.keyspace(KS_TIMESERIES)?;
-
-    let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
-    let secrets_resolver = identity.as_ref().map(|i| i.secrets_resolver.clone());
-    let jwt_keys = init::init_jwt_keys(secrets);
-
-    // Initialize WebAuthn for passkeys
-    let webauthn = control_config.public_url.as_ref().and_then(|url| {
-        match did_hosting_common::server::passkey::build_webauthn(url) {
-            Ok(w) => {
-                info!("WebAuthn (passkey) auth enabled for control plane");
-                Some(Arc::new(w))
-            }
-            Err(e) => {
-                warn!("WebAuthn initialization failed: {e} — passkey auth disabled");
-                None
-            }
-        }
-    });
-
-    // Trust Tasks verifier — the control plane's, built by the same shared
-    // constructor (see CLAUDE.md §What the daemon mirrors).
-    let trust_tasks_verifier = control_verifier(did_resolver.as_ref());
-
-    let pending_challenges =
-        did_hosting_control::pending_challenges::PendingChallengeTracker::for_auth_config(
-            &control_config.auth,
-        );
-
-    let state = AppState {
-        store: store.clone(),
-        sessions_ks,
-        acl_ks,
-        registry_ks,
-        dids_ks,
-        config: Arc::new(control_config),
-        did_resolver,
-        secrets_resolver,
+    let state = AppState::build(
+        control_config,
+        store.clone(),
+        Some(secrets),
         identity,
-        trust_tasks_verifier,
-        jwt_keys,
-        webauthn,
-        http_client: http_client.clone(),
-        didcomm_service: Arc::new(std::sync::OnceLock::new()),
-        stats_collector: stats_collector.clone(),
-        stats_ks,
-        timeseries_ks,
-        unlisted_signers: Default::default(),
-        replay_cache: Arc::new(did_hosting_control::replay::ReplayCache::with_config(
-            config.replay.clone(),
-        )?),
-        path_locks: did_hosting_control::path_locks::PathLocks::new(),
-        acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
-        pending_challenges: Arc::new(pending_challenges),
-        outbox_notify: Arc::new(tokio::sync::Notify::new()),
-        client_ips: client_ips.clone(),
-        ip_rate_limiter: Arc::new(did_hosting_control::rate_limit::challenge_limiter()),
-        login_start_rate_limiter: Arc::new(did_hosting_control::rate_limit::login_start_limiter()),
-        redeem_rate_limiter: Arc::new(did_hosting_control::rate_limit::redeem_limiter()),
-        webs_self_register_limiter: Arc::new(
-            did_hosting_control::rate_limit::webs_self_register_limiter(),
-        ),
-        webs_self_register_global_limiter: Arc::new(
-            did_hosting_control::rate_limit::webs_self_register_global_limiter(),
-        ),
-        cache_invalidate,
-        // Wallet sign-in locations from the local GeoIP database, if any
-        // (mirrors `did_hosting_control::server`).
-        oob: Arc::new(did_hosting_control::oob::OobRuntime::with_geoip(
-            did_hosting_control::server::open_geoip(&config.geoip).await?,
-        )),
-        large_document_budget: Arc::new(
-            did_hosting_common::server::trust_tasks::size::LargeDocumentBudget::new(),
-        ),
-    };
+        AppStateOverrides {
+            // The one collector the embedded server records resolutions in.
+            stats_collector: Some(stats_collector.clone()),
+            cache_invalidate,
+            client_ips: Some(client_ips.clone()),
+        },
+    )
+    .await?;
 
-    // Reload challenges issued before a restart, so the caps hold across it.
-    // Mirrors `did_hosting_control::server` (startup initialisation parity).
-    state
-        .pending_challenges
-        .seed_from_sessions_or_warn(&state.sessions_ks)
-        .await;
-
-    // Seed registry from static config
-    did_hosting_control::server::seed_registry(&state).await;
-
-    // Mirrors `did_hosting_control::server`: check in the background that the
-    // daemon's DID lists the services wallet sign-in needs. Never blocks.
-    did_hosting_control::sign_in_readiness::spawn(&state);
+    // Challenges, the badge backfill and DID index, the registry seed and the
+    // sign-in readiness check — the standalone control plane's boot steps.
+    did_hosting_control::server::startup(&state).await?;
 
     // In daemon mode, no outbound ATM is needed — there are no external
     // servers to sync with.  The server_push::notify_servers_* functions
@@ -2072,29 +1137,6 @@ async fn load_secrets(config: &DaemonConfig) -> ServerSecrets {
 // CLI management commands
 // ===========================================================================
 
-async fn run_add_acl(
-    config_path: Option<PathBuf>,
-    did: String,
-    role_str: String,
-    label: Option<String>,
-    witness: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = DaemonConfig::load(config_path)?;
-    let store = if witness {
-        // Only these do anything on a witness.
-        if !matches!(role_str.as_str(), "admin" | "service") {
-            return Err(format!(
-                "a witness ACL entry's role is `admin` or `service`, not '{role_str}'"
-            )
-            .into());
-        }
-        &config.witness_store
-    } else {
-        &config.store
-    };
-    did_hosting_common::server::cli_acl::run_add_acl(store, did, role_str, label, None, None).await
-}
-
 async fn run_reset_witness_kek_claim(
     config_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2114,549 +1156,6 @@ async fn run_reset_witness_kek_claim(
         eprintln!("  No key-encryption-key creation claim was held.");
     }
     eprintln!();
-    Ok(())
-}
-
-async fn run_list_acl(
-    config_path: Option<PathBuf>,
-    witness: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = DaemonConfig::load(config_path)?;
-    let store = if witness {
-        &config.witness_store
-    } else {
-        &config.store
-    };
-    did_hosting_common::server::cli_acl::run_list_acl(store).await
-}
-
-/// Send one signed Trust Task. A thin wrapper over the shared
-/// [`did_hosting_common::server::cli_trust_task::run_send_trust_task`], supplying
-/// this service's own `server_did` and bind address.
-async fn run_send_trust_task(
-    config_path: Option<PathBuf>,
-    key_path: PathBuf,
-    task_type: String,
-    payload: Option<String>,
-    payload_file: Option<PathBuf>,
-    url: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = DaemonConfig::load(config_path)?;
-    let to = config
-        .server_did
-        .clone()
-        .ok_or("server_did is not configured; this service has not completed provisioning")?;
-    did_hosting_common::server::cli_trust_task::run_send_trust_task(
-        &to,
-        key_path.as_path(),
-        url,
-        &config.server.host,
-        config.server.port,
-        &task_type,
-        payload.as_deref(),
-        payload_file.as_deref(),
-    )
-    .await
-}
-
-/// Read the daemon's counters over the authenticated `server/metrics/0.1`
-/// Trust Task and print them as JSON (`[{ "name": …, "value": … }]`).
-///
-/// A thin wrapper over the shared [`did_hosting_common::server::cli_metrics::fetch_metrics`]
-/// — the daemon and standalone control both serve this task and expose the same
-/// command — supplying the daemon's own `server_did` and bind address.
-async fn run_fetch_metrics(
-    config_path: Option<PathBuf>,
-    key_path: PathBuf,
-    url: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = DaemonConfig::load(config_path)?;
-    let to = config
-        .server_did
-        .clone()
-        .ok_or("server_did is not configured; the daemon has not completed provisioning")?;
-    did_hosting_common::server::cli_metrics::fetch_metrics(
-        &to,
-        key_path.as_path(),
-        url,
-        &config.server.host,
-        config.server.port,
-    )
-    .await
-}
-
-async fn run_remove_acl(
-    config_path: Option<PathBuf>,
-    did: String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = DaemonConfig::load(config_path)?;
-    did_hosting_common::server::cli_acl::run_remove_acl(&config.store, did).await
-}
-
-async fn run_invite(
-    config_path: Option<PathBuf>,
-    did: String,
-    role: String,
-    ttl_hours: Option<u64>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = DaemonConfig::load(config_path)?;
-    let control_config = config.control_config();
-
-    let base_url = control_config
-        .public_url
-        .as_deref()
-        .ok_or("public_url must be set in config for enrollment invites")?;
-
-    let enrollment_ttl = match ttl_hours {
-        Some(hours) => hours * 3600,
-        None => control_config.auth.passkey_enrollment_ttl,
-    };
-
-    let store = Store::open(&control_config.store).await?;
-    let sessions_ks = store.keyspace(KS_SESSIONS)?;
-
-    did_hosting_common::server::passkey::run_cli_invite(
-        &sessions_ks,
-        base_url,
-        enrollment_ttl,
-        &did,
-        &role,
-        control_config.auth.claim_code_hash_wait(),
-    )
-    .await?;
-
-    Ok(())
-}
-
-async fn run_bootstrap_did(
-    config_path: Option<PathBuf>,
-    mnemonic: String,
-    did_log: Option<PathBuf>,
-    did_witness: Option<PathBuf>,
-    witness_url: Option<String>,
-    witness_id: Option<String>,
-    witness_did: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use affinidi_tdk::secrets_resolver::secrets::Secret;
-    use did_hosting_server::bootstrap;
-
-    if did_witness.is_some() && did_log.is_none() {
-        return Err("--did-witness requires --did-log".into());
-    }
-
-    let config = DaemonConfig::load(config_path)?;
-    let server_config = config.server_config();
-
-    let public_url = server_config
-        .public_url
-        .as_deref()
-        .ok_or("public_url must be set in config for bootstrap")?;
-
-    let store = Store::open(&config.store).await?;
-    let dids_ks = store.keyspace(KS_DIDS)?;
-
-    let did_key = did_hosting_server::did_ops::did_key(&mnemonic);
-    if dids_ks.contains_key(did_key).await? {
-        eprintln!();
-        eprintln!("  DID at path '{mnemonic}' already exists.");
-        eprintln!("  No action taken.");
-        eprintln!();
-        return Ok(());
-    }
-
-    let result = if let Some(log_path) = did_log {
-        let jsonl = std::fs::read_to_string(&log_path)
-            .map_err(|e| format!("failed to read {}: {e}", log_path.display()))?;
-        let witness_content = match &did_witness {
-            Some(path) => Some(
-                std::fs::read_to_string(path)
-                    .map_err(|e| format!("failed to read {}: {e}", path.display()))?,
-            ),
-            None => None,
-        };
-        bootstrap::import_did_at_path(
-            &store,
-            &dids_ks,
-            &mnemonic,
-            &jsonl,
-            witness_content.as_deref(),
-        )
-        .await?
-    } else {
-        let secret_store = did_hosting_common::server::secret_store::create_secret_store(
-            &config.secrets,
-            &config.config_path,
-        )?;
-        let secrets = secret_store
-            .get()
-            .await?
-            .ok_or("no secrets found — run setup first")?;
-
-        let signing_secret = Secret::from_multibase(&secrets.signing_key, None)
-            .map_err(|e| format!("invalid signing_key: {e}"))?;
-        let ka_secret = Secret::from_multibase(&secrets.key_agreement_key, None).ok();
-
-        let mediator_uri = if let Some(ref vta_did) = config.mediator_did {
-            use did_hosting_common::server::didcomm_profile::resolve_mediator_did;
-            resolve_mediator_did(vta_did, None).await
-        } else {
-            None
-        };
-
-        let result = bootstrap::bootstrap_did(
-            &store,
-            &dids_ks,
-            &signing_secret,
-            ka_secret.as_ref(),
-            mediator_uri.as_deref(),
-            config.features.didcomm,
-            config.features.tsp,
-            public_url,
-            &mnemonic,
-            config.hosting.scid_also_known_as,
-        )
-        .await?;
-
-        // Optional: request witness proof
-        if let (Some(w_url), Some(w_id), Some(w_did)) = (witness_url, witness_id, witness_did) {
-            eprintln!("  Requesting witness proof...");
-            eprintln!("  NOTE: the DID must already be served (by a running server) for the");
-            eprintln!("  witness to resolve it and verify the request.");
-            match bootstrap::request_witness_proof(&w_url, &w_did, &w_id, &result, &signing_secret)
-                .await
-            {
-                Ok(witness_file) => {
-                    dids_ks
-                        .insert_raw(
-                            did_hosting_server::did_ops::content_witness_key(&mnemonic),
-                            witness_file.into_bytes(),
-                        )
-                        .await?;
-                    eprintln!("  Witness proof stored.");
-                }
-                Err(e) => {
-                    eprintln!("  Warning: witness proof request failed: {e}");
-                    eprintln!("  The DID was created but has no witness proof.");
-                }
-            }
-        }
-
-        result
-    };
-
-    store.persist().await?;
-
-    let url_path = if mnemonic == ".well-known" {
-        ".well-known/did.jsonl".to_string()
-    } else {
-        format!("{mnemonic}/did.jsonl")
-    };
-
-    eprintln!();
-    if mnemonic == ".well-known" {
-        eprintln!("  Root DID bootstrapped!");
-    } else {
-        eprintln!("  DID bootstrapped at path '{mnemonic}'!");
-    }
-    eprintln!();
-    eprintln!("  DID:   {}", result.did_id);
-    eprintln!("  SCID:  {}", result.scid);
-    eprintln!("  JSONL: {public_url}/{url_path}");
-    eprintln!();
-
-    Ok(())
-}
-
-async fn run_recreate_did(
-    config_path: Option<PathBuf>,
-    mnemonic: String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use affinidi_tdk::secrets_resolver::secrets::Secret;
-    use did_hosting_server::bootstrap;
-
-    let config = DaemonConfig::load(config_path)?;
-    let config_file = config.config_path.clone();
-    let server_config = config.server_config();
-
-    let public_url = server_config
-        .public_url
-        .as_deref()
-        .ok_or("public_url must be set in config")?;
-
-    let store = Store::open(&config.store).await?;
-    let dids_ks = store.keyspace(KS_DIDS)?;
-
-    // Delete existing DID at this path. Read the record first so we can
-    // remove the correct `owner:{owner}:{mnemonic}` reverse-index entry —
-    // hard-coding `"system"` (the owner string used by the auto-bootstrap
-    // path) would leak the index for any DID that was created with a
-    // different owner.
-    let did_key = did_hosting_server::did_ops::did_key(&mnemonic);
-    if let Some(existing) = dids_ks
-        .get::<did_hosting_common::did_ops::DidRecord>(did_key.clone())
-        .await?
-    {
-        dids_ks.remove(did_key).await?;
-        dids_ks
-            .remove(did_hosting_server::did_ops::content_log_key(&mnemonic))
-            .await?;
-        dids_ks
-            .remove(did_hosting_server::did_ops::content_witness_key(&mnemonic))
-            .await?;
-        dids_ks
-            .remove(did_hosting_server::did_ops::owner_key(
-                &existing.owner,
-                &mnemonic,
-            ))
-            .await?;
-        eprintln!("  Removed existing DID at path '{mnemonic}'");
-    }
-
-    let secret_store = did_hosting_common::server::secret_store::create_secret_store(
-        &config.secrets,
-        &config.config_path,
-    )?;
-    let secrets = secret_store
-        .get()
-        .await?
-        .ok_or("no secrets found — run setup first")?;
-
-    let signing_secret = Secret::from_multibase(&secrets.signing_key, None)
-        .map_err(|e| format!("invalid signing_key: {e}"))?;
-    let ka_secret = Secret::from_multibase(&secrets.key_agreement_key, None).ok();
-
-    let mediator_uri = if let Some(ref vta_did) = config.mediator_did {
-        use did_hosting_common::server::didcomm_profile::resolve_mediator_did;
-        resolve_mediator_did(vta_did, None).await
-    } else {
-        None
-    };
-
-    let result = bootstrap::bootstrap_did(
-        &store,
-        &dids_ks,
-        &signing_secret,
-        ka_secret.as_ref(),
-        mediator_uri.as_deref(),
-        config.features.didcomm,
-        config.features.tsp,
-        public_url,
-        &mnemonic,
-        config.hosting.scid_also_known_as,
-    )
-    .await?;
-
-    store.persist().await?;
-
-    did_hosting_server::setup::update_server_did_in_config(&config_file, &result.did_id)?;
-
-    eprintln!();
-    eprintln!("  DID recreated at path '{mnemonic}'!");
-    eprintln!();
-    eprintln!("  DID:   {}", result.did_id);
-    eprintln!("  SCID:  {}", result.scid);
-    eprintln!("  config.toml updated with new server_did.");
-    eprintln!();
-
-    Ok(())
-}
-
-async fn run_recover_did(
-    config_path: Option<PathBuf>,
-    mnemonic: String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use did_hosting_common::did_ops::DidRecord;
-
-    let config = DaemonConfig::load(config_path)?;
-    let store = Store::open(&config.store).await?;
-    let dids_ks = store.keyspace(KS_DIDS)?;
-
-    let did_key = did_hosting_common::did_ops::did_key(&mnemonic);
-    let mut record: DidRecord = dids_ks
-        .get(did_key.as_str())
-        .await?
-        .ok_or(format!("DID not found at path '{mnemonic}'"))?;
-
-    if record.deleted_at.is_none() {
-        eprintln!("  DID at path '{mnemonic}' is not deleted.");
-        return Ok(());
-    }
-
-    record.deleted_at = None;
-    dids_ks.insert(did_key.as_str(), &record).await?;
-    store.persist().await?;
-
-    eprintln!();
-    eprintln!("  DID recovered at path '{mnemonic}'!");
-    if let Some(ref did_id) = record.did_id {
-        eprintln!("  DID: {did_id}");
-    }
-    eprintln!();
-
-    Ok(())
-}
-
-async fn run_load_did(
-    config_path: Option<PathBuf>,
-    path: String,
-    did_log: PathBuf,
-    did_witness: Option<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = DaemonConfig::load(config_path)?;
-    let store = Store::open(&config.store).await?;
-    let dids_ks = store.keyspace(KS_DIDS)?;
-
-    let jsonl = std::fs::read_to_string(&did_log)
-        .map_err(|e| format!("failed to read {}: {e}", did_log.display()))?;
-
-    let witness_content = match &did_witness {
-        Some(wp) => Some(
-            std::fs::read_to_string(wp)
-                .map_err(|e| format!("failed to read {}: {e}", wp.display()))?,
-        ),
-        None => None,
-    };
-
-    let result = did_hosting_server::bootstrap::import_did_at_path(
-        &store,
-        &dids_ks,
-        &path,
-        &jsonl,
-        witness_content.as_deref(),
-    )
-    .await?;
-
-    store.persist().await?;
-
-    eprintln!();
-    eprintln!("  DID loaded at path '{path}'!");
-    eprintln!();
-    eprintln!("  DID:  {}", result.did_id);
-    eprintln!("  SCID: {}", result.scid);
-    eprintln!("  Path: {path}/did.jsonl");
-    eprintln!();
-
-    Ok(())
-}
-
-async fn run_import_secrets(
-    config_path: Option<PathBuf>,
-    vta_bundle: Option<String>,
-    signing_key: Option<String>,
-    ka_key: Option<String>,
-    jwt_key: Option<String>,
-    vta_credential: Option<String>,
-    force: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use affinidi_tdk::secrets_resolver::secrets::Secret;
-    use did_hosting_common::server::vta_setup::generate_ed25519_multibase;
-    use vta_sdk::did_secrets::DidSecretsBundle;
-    use vta_sdk::keys::KeyType;
-
-    let config = DaemonConfig::load(config_path)?;
-    let secret_store = did_hosting_common::server::secret_store::create_secret_store(
-        &config.secrets,
-        &config.config_path,
-    )?;
-
-    if !force && let Ok(Some(_)) = secret_store.get().await {
-        return Err("secrets already exist — use --force to overwrite".into());
-    }
-
-    let (resolved_signing, resolved_ka, resolved_vta_cred) =
-        if let Some(ref bundle_str) = vta_bundle {
-            // vta-sdk 0.5 dropped DidSecretsBundle::decode — operators still
-            // paste a base64url blob, so deserialize inline:
-            // base64url → JSON → bundle.
-            use base64::Engine;
-            use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
-            let bundle_json = BASE64
-                .decode(bundle_str.as_bytes())
-                .map_err(|e| format!("failed to decode VTA secrets bundle base64: {e}"))?;
-            let bundle: DidSecretsBundle = serde_json::from_slice(&bundle_json)
-                .map_err(|e| format!("failed to decode VTA secrets bundle: {e}"))?;
-
-            let mut signing = None;
-            let mut ka = None;
-
-            for entry in &bundle.secrets {
-                match entry.key_type {
-                    KeyType::Ed25519 if signing.is_none() => {
-                        signing = Some(entry.private_key_multibase.clone());
-                    }
-                    KeyType::X25519 if ka.is_none() => {
-                        ka = Some(entry.private_key_multibase.clone());
-                    }
-                    _ => {}
-                }
-            }
-
-            let signing = signing.ok_or("VTA bundle contains no Ed25519 signing key")?;
-            let ka = ka.ok_or("VTA bundle contains no X25519 key agreement key")?;
-
-            eprintln!("  VTA bundle decoded for DID: {}", bundle.did);
-            eprintln!("  Found {} secret(s)", bundle.secrets.len());
-
-            (signing, ka, vta_credential)
-        } else if let Some(signing) = signing_key {
-            let ka = ka_key.ok_or("--ka-key is required when using --signing-key")?;
-            (signing, ka, vta_credential)
-        } else {
-            return Err("provide either --vta-bundle or --signing-key + --ka-key".into());
-        };
-
-    Secret::from_multibase(&resolved_signing, None)
-        .map_err(|e| format!("invalid signing key: {e}"))?;
-    Secret::from_multibase(&resolved_ka, None)
-        .map_err(|e| format!("invalid key agreement key: {e}"))?;
-
-    let resolved_jwt = match jwt_key {
-        Some(key) => {
-            Secret::from_multibase(&key, None)
-                .map_err(|e| format!("invalid JWT signing key: {e}"))?;
-            key
-        }
-        None => {
-            eprintln!("  Generated JWT signing key.");
-            generate_ed25519_multibase()
-        }
-    };
-
-    // Carry forward any retired key material.
-    //
-    // `retired` holds the keys of identity generations that are superseded but
-    // still inside their grace period — the ones peers with a cached DID document
-    // are still encrypting to. Blanking it here would silently destroy that
-    // overlap: the generation records would survive, their key material would
-    // not, and the service would come back unable to decrypt traffic still
-    // addressed to the old key. The entries are keyed by kid and self-describing,
-    // so keeping them is harmless even when the imported keys are for a wholly
-    // different identity.
-    let retired = match secret_store.get().await {
-        Ok(Some(mut existing)) => std::mem::take(&mut existing.retired),
-        _ => Vec::new(),
-    };
-    if !retired.is_empty() {
-        eprintln!(
-            "  Preserving {} retired key(s) — superseded generations still inside their grace period.",
-            retired.len()
-        );
-    }
-
-    let server_secrets = ServerSecrets {
-        signing_key: resolved_signing,
-        key_agreement_key: resolved_ka,
-        jwt_signing_key: resolved_jwt,
-        vta_credential: resolved_vta_cred,
-        retired,
-    };
-
-    secret_store.set(&server_secrets).await?;
-
-    eprintln!();
-    eprintln!("  Secrets imported successfully!");
-    eprintln!();
-
     Ok(())
 }
 
@@ -2770,11 +1269,28 @@ async fn run_health(
 // Health & banner
 // ===========================================================================
 
-async fn daemon_health() -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({
-        "status": "ok",
-        "service": "did-hosting-daemon",
-    }))
+/// `GET /health`: the daemon's liveness probe, held to the same check as the
+/// standalone services' `/api/health` — healthy only while the daemon's own
+/// DID is served from its store. `503` with `"status": "degraded"` otherwise.
+/// Deliberately generic: no configuration or DID detail.
+async fn daemon_health(
+    dids_ks: &KeyspaceHandle,
+    server_did: Option<&str>,
+) -> (StatusCode, axum::Json<serde_json::Value>) {
+    let ok = did_hosting_common::server::health::own_did_served_locally(dids_ks, server_did).await;
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        axum::Json(serde_json::json!({
+            "status": if ok { "ok" } else { "degraded" },
+            "service": "did-hosting-daemon",
+            "version": env!("CARGO_PKG_VERSION"),
+        })),
+    )
 }
 
 fn print_banner() {
@@ -2796,260 +1312,6 @@ fn print_banner() {
 "#,
         version = env!("CARGO_PKG_VERSION"),
     );
-}
-
-async fn run_list_dids(
-    config_path: Option<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use did_hosting_common::did_ops::DidRecord;
-
-    let config = DaemonConfig::load(config_path)?;
-    let store = did_hosting_common::server::store::Store::open(&config.store).await?;
-    let dids_ks = store.keyspace(KS_DIDS)?;
-
-    let raw = dids_ks.prefix_iter_raw("did:").await?;
-
-    if raw.is_empty() {
-        eprintln!("  No DIDs in store.");
-        return Ok(());
-    }
-
-    eprintln!("  {:<25} {:<15} {:<60}", "PATH", "VERSIONS", "DID ID");
-    eprintln!("  {}", "-".repeat(100));
-
-    for (_key, value) in &raw {
-        if let Ok(record) = serde_json::from_slice::<DidRecord>(value) {
-            let did_id = record.did_id.as_deref().unwrap_or("(unpublished)");
-            let deleted = if record.deleted_at.is_some() {
-                " [deleted]"
-            } else {
-                ""
-            };
-            let disabled = if record.disabled { " [disabled]" } else { "" };
-            eprintln!(
-                "  {:<25} {:<15} {}{}{}",
-                record.mnemonic, record.version_count, did_id, deleted, disabled
-            );
-        }
-    }
-
-    eprintln!();
-    eprintln!("  Total: {} DIDs", raw.len());
-
-    Ok(())
-}
-
-async fn run_remove_did(
-    config_path: Option<PathBuf>,
-    path: String,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use did_hosting_common::did_ops::{
-        DidRecord, content_log_key, content_witness_key, did_key, owner_key,
-    };
-
-    let config = DaemonConfig::load(config_path)?;
-    let store = did_hosting_common::server::store::Store::open(&config.store).await?;
-    let dids_ks = store.keyspace(KS_DIDS)?;
-
-    let record: Option<DidRecord> = dids_ks.get(did_key(&path)).await?;
-    let record = match record {
-        Some(r) => r,
-        None => {
-            eprintln!("  DID not found at path '{path}'");
-            std::process::exit(1);
-        }
-    };
-
-    let did_id = record.did_id.as_deref().unwrap_or("(unpublished)");
-    eprintln!("  Removing DID at path '{path}'");
-    eprintln!("  DID ID: {did_id}");
-    eprintln!("  Owner:  {}", record.owner);
-
-    let mut batch = store.batch();
-    batch.remove(&dids_ks, did_key(&path));
-    batch.remove(&dids_ks, content_log_key(&path));
-    batch.remove(&dids_ks, content_witness_key(&path));
-    batch.remove(&dids_ks, owner_key(&record.owner, &path));
-    // The usage counter and domain index row go with the record (the daemon
-    // is stopped for this command, so nothing else writes them).
-    did_hosting_common::server::did_index::stage_record_change(
-        &mut batch,
-        &dids_ks,
-        None,
-        Some(&record),
-        None,
-    )
-    .await?;
-    batch.commit().await?;
-
-    eprintln!("  DID removed.");
-    Ok(())
-}
-
-/// `identity-list` — show which key material this service still honours.
-async fn run_tsp_relationship_list(
-    config_path: Option<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = DaemonConfig::load(config_path)?;
-    did_hosting_common::server::cli_tsp::run_list(&config.store).await
-}
-
-async fn run_tsp_relationship_reset(
-    config_path: Option<PathBuf>,
-    peer: String,
-    our: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use did_hosting_common::server::cli_tsp::{Target, run_reset};
-    let config = DaemonConfig::load(config_path)?;
-    run_reset(&config.store, Target::Peer { peer, our }).await
-}
-
-async fn run_tsp_relationship_delete(
-    config_path: Option<PathBuf>,
-    peer: Option<String>,
-    our: Option<String>,
-    all: bool,
-    yes: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use did_hosting_common::server::cli_tsp::{Target, run_delete};
-    let config = DaemonConfig::load(config_path)?;
-    let target = match peer {
-        Some(peer) if !all => Target::Peer { peer, our },
-        _ => Target::All,
-    };
-    run_delete(&config.store, target, yes).await
-}
-
-async fn run_identity_list(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
-    let config = DaemonConfig::load(config_path)?;
-    did_hosting_common::server::cli_identity::run_list_generations(&config.store).await
-}
-
-/// `identity-retire-now` — the offline kill switch.
-///
-/// Opens the store directly, so it only works against a *stopped* service. A
-/// live service must be retired through the control plane's REST endpoint (or
-/// the UI button), which drops the key from the running process's secrets
-/// resolver — deleting a record on disk would not.
-async fn run_identity_retire_now(
-    config_path: Option<PathBuf>,
-    generation: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = DaemonConfig::load(config_path)?;
-    did_hosting_common::server::cli_identity::run_retire_generation(
-        &config.store,
-        &config.secrets,
-        &config.config_path,
-        generation,
-    )
-    .await
-}
-
-/// `identity-scid-alias` — list or remove the service DID's did:scid alias, offline.
-async fn run_identity_scid_alias(
-    config_path: Option<PathBuf>,
-    action: String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = DaemonConfig::load(config_path)?;
-    did_hosting_common::server::cli_identity::run_identity_scid_alias(
-        &config.store,
-        &config.secrets,
-        &config.config_path,
-        config.server_did.as_deref(),
-        &action,
-    )
-    .await
-}
-
-/// `identity-rotate-keys` — rotate the service's own keys, offline.
-///
-/// Writes the new DID log entry, the new key material (carrying the outgoing key
-/// into the retired set in the same write), and the generation records. The
-/// service comes back up already holding both key-agreement keys.
-async fn run_identity_rotate_keys(
-    config_path: Option<PathBuf>,
-    keys: String,
-    ka_key: Option<String>,
-    signing_key: Option<String>,
-    grace: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use did_hosting_common::server::identity_rotate::{RotateKeys, rotate_keys};
-    use did_hosting_common::server::secret_store::create_secret_store;
-    use did_hosting_common::server::store::Store;
-
-    let config = DaemonConfig::load(config_path)?;
-    let server_did = config
-        .server_did
-        .as_deref()
-        .ok_or("server_did is not set — this service has no identity to rotate")?;
-
-    let which = RotateKeys::parse(&keys)?;
-    let grace_secs = match grace.as_deref() {
-        Some(s) => did_hosting_common::server::pending_purge::parse_grace_string(s)
-            .map_err(|e| format!("invalid --grace: {e}"))?,
-        None => config.identity.rotation_grace_secs(),
-    };
-
-    let store = Store::open(&config.store).await?;
-    let secret_store = create_secret_store(&config.secrets, &config.config_path)?;
-
-    let report = rotate_keys(
-        &store,
-        secret_store.as_ref(),
-        server_did,
-        which,
-        ka_key.as_deref(),
-        signing_key.as_deref(),
-        grace_secs,
-    )
-    .await?;
-
-    eprintln!();
-    eprintln!("  Rotated keys for {}", report.did);
-
-    if report.which != RotateKeys::Signing {
-        eprintln!("    key agreement (new) : {}", report.new_ka_kid);
-        if grace_secs > 0 {
-            eprintln!(
-                "    key agreement (old) : {}  — honoured for {}m",
-                report.retired_ka_kid,
-                grace_secs / 60
-            );
-        } else {
-            eprintln!(
-                "    key agreement (old) : {}  — RETIRED IMMEDIATELY, no grace period",
-                report.retired_ka_kid
-            );
-        }
-    }
-
-    if report.which != RotateKeys::KeyAgreement {
-        eprintln!("    signing       (new) : {}", report.new_signing_kid);
-        eprintln!("    signing       (old) : {}", report.retired_signing_kid);
-        eprintln!();
-        eprintln!("  The old signing key's authority to publish DID updates is REVOKED as of");
-        eprintln!("  this log entry — it can no longer sign an update the chain will accept.");
-        eprintln!("  There is no grace period for a signing key and there cannot be: peers");
-        eprintln!("  holding a cached DID document will reject signatures made with the new");
-        eprintln!("  key until they re-resolve.");
-    }
-
-    eprintln!();
-    eprintln!(
-        "    generation {} -> {}",
-        report.retired_generation, report.new_generation
-    );
-    eprintln!("    did.jsonl now has {} entries", report.version_count);
-    eprintln!();
-    if grace_secs > 0 && report.which != RotateKeys::Signing {
-        eprintln!("  Start the service. It will honour BOTH key-agreement keys, so peers");
-        eprintln!("  holding a cached DID document can still reach it until the old one expires.");
-    } else {
-        eprintln!("  Start the service.");
-    }
-    eprintln!();
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -3370,4 +1632,152 @@ mod resolution_cache_hook_tests {
 #[cfg(test)]
 mod cli_reference_tests {
     did_hosting_common::cli_reference_test!(super::Cli, "did-hosting-daemon");
+}
+
+#[cfg(test)]
+mod parity_tests {
+    //! Daemon parity (CLAUDE.md): the daemon's subcommands cover the
+    //! standalone binaries', and every background task they run is either run
+    //! here — built by the same functions — or named in the skip list.
+
+    use std::collections::BTreeSet;
+
+    use clap::CommandFactory;
+    use did_hosting_common::server::supervise::names;
+
+    use super::*;
+
+    /// Standalone subcommands the daemon deliberately does not have. Empty:
+    /// every one is a shared group the daemon flattens in, or has a daemon
+    /// counterpart of the same name.
+    const CLI_ALLOWLIST: &[&str] = &[];
+
+    fn subcommands(cmd: clap::Command) -> BTreeSet<String> {
+        cmd.get_subcommands()
+            .map(|s| s.get_name().to_string())
+            .filter(|name| name != "help")
+            .collect()
+    }
+
+    #[test]
+    fn the_daemon_has_every_standalone_subcommand() {
+        let daemon = subcommands(Cli::command());
+        let server = subcommands(did_hosting_server::cli::Cli::command());
+        let control = subcommands(did_hosting_control::cli::Cli::command());
+        let standalone: BTreeSet<_> = server.union(&control).cloned().collect();
+
+        let missing: Vec<_> = standalone
+            .iter()
+            .filter(|name| !daemon.contains(*name) && !CLI_ALLOWLIST.contains(&name.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "did-hosting-daemon lacks {missing:?}: flatten the group into its `Command`, or \
+             allowlist it here with the reason"
+        );
+        for name in CLI_ALLOWLIST {
+            assert!(
+                standalone.contains(*name),
+                "`{name}` is no standalone subcommand"
+            );
+            assert!(
+                !daemon.contains(*name),
+                "`{name}` is allowlisted but present"
+            );
+        }
+        // The shared groups reach the daemon: the ones it used to lack.
+        for name in [
+            "export-sealed",
+            "import-sealed",
+            "vta-request",
+            "vta-open",
+            "dump-did",
+        ] {
+            assert!(daemon.contains(name), "{name}");
+        }
+        assert!(!daemon.contains("migrate-from-webvh-config"));
+    }
+
+    #[tokio::test]
+    async fn the_daemon_runs_or_skips_every_standalone_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: did_hosting_control::config::AppConfig = toml::from_str(&format!(
+            "[store]\ndata_dir = \"{}\"\n",
+            dir.path().display()
+        ))
+        .expect("control config");
+        let store = Store::open(&config.store).await.unwrap();
+        let state = did_hosting_control::server::AppState::build(
+            config,
+            store.clone(),
+            None,
+            None,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let edge = did_hosting_server::server::EdgeStorage {
+            store: store.clone(),
+            dids_ks: state.dids_ks.clone(),
+            did_ttl_seconds: 60,
+            collector: state.stats_collector.clone(),
+            caches: did_hosting_server::cache::ResolutionCaches {
+                content: Arc::new(did_hosting_server::cache::ContentCache::new(
+                    did_hosting_server::cache::RESOLUTION_CACHE_TTL,
+                )),
+                gate: None,
+            },
+            path_locks: Some(state.path_locks.clone()),
+            on_removed: None,
+        };
+        let control = did_hosting_control::server::ControlStorage::of(&state);
+
+        // The task-name constants are what the builders build.
+        use did_hosting_control::server::tasks as control_tasks;
+        use did_hosting_server::server::tasks as server_tasks;
+        assert_eq!(
+            names(&did_hosting_server::server::storage_tasks(&edge)),
+            server_tasks::STORAGE
+        );
+        assert_eq!(
+            names(&did_hosting_control::server::storage_tasks(&control)),
+            control_tasks::STORAGE
+        );
+        assert_eq!(
+            names(&did_hosting_control::server::background_tasks(&state)),
+            control_tasks::PERIODIC
+        );
+
+        // What the daemon runs: its storage task, and the control plane's
+        // background tasks less the skip list (`spawn_workers`).
+        let mut runs: BTreeSet<&str> = names(&daemon_storage_tasks(&edge, &control))
+            .into_iter()
+            .collect();
+        runs.extend(
+            names(&did_hosting_control::server::background_tasks(&state))
+                .into_iter()
+                .filter(|name| !DAEMON_SKIPPED_TASKS.contains(name)),
+        );
+
+        let standalone: BTreeSet<&str> = server_tasks::STORAGE
+            .into_iter()
+            .chain(server_tasks::MESSAGING)
+            .chain(control_tasks::STORAGE)
+            .chain(control_tasks::PERIODIC)
+            .collect();
+        for name in &standalone {
+            let skipped = DAEMON_SKIPPED_TASKS.contains(name);
+            assert!(
+                runs.contains(name) != skipped,
+                "`{name}`: run by the daemon = {}, skipped = {skipped}; exactly one must hold",
+                runs.contains(name)
+            );
+        }
+        for name in DAEMON_SKIPPED_TASKS {
+            assert!(
+                standalone.contains(name),
+                "`{name}` is skipped but no standalone task"
+            );
+        }
+    }
 }

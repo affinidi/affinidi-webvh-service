@@ -864,7 +864,14 @@ async fn first_boot_init_seeds_domain_and_backfills_legacy_records() {
     config.public_url = Some("https://webvh.example.com".into());
     config.hosting.bootstrap_domains = Vec::new();
 
-    did_hosting_server::server::run_first_boot_init(&state.store, &config).await;
+    did_hosting_server::server::run_first_boot_init(
+        &state.store,
+        &config,
+        did_hosting_common::server::migrations::registry(),
+        did_hosting_server::server::FirstBoot::Lenient,
+    )
+    .await
+    .unwrap();
 
     // 1. KS_DOMAINS now has one entry for the public_url host.
     let domains = did_hosting_common::server::domain::list_domains(&state.store)
@@ -894,7 +901,14 @@ async fn first_boot_init_seeds_domain_and_backfills_legacy_records() {
     //    `meta` keyspace short-circuit the migration; existing
     //    KS_DOMAINS / KS_ASSIGNMENTS rows make the seeds report
     //    AlreadySeeded). Just verify no panic / data drift.
-    did_hosting_server::server::run_first_boot_init(&state.store, &config).await;
+    did_hosting_server::server::run_first_boot_init(
+        &state.store,
+        &config,
+        did_hosting_common::server::migrations::registry(),
+        did_hosting_server::server::FirstBoot::Lenient,
+    )
+    .await
+    .unwrap();
     let domains = did_hosting_common::server::domain::list_domains(&state.store)
         .await
         .expect("list domains after replay");

@@ -94,8 +94,9 @@ pub fn resync_server(
     reported: std::collections::HashMap<String, ReportedDid>,
     served_domains: Vec<String>,
 ) {
+    let tracker = state.background.clone();
     let state = state.clone();
-    tokio::spawn(async move {
+    tracker.spawn(async move {
         sync_all_domains_now(&state, &server_did, &served_domains).await;
         sync_all_dids_now(&state, &server_did, reported).await;
     });
@@ -107,8 +108,9 @@ pub fn sync_all_dids_to_server(
     server_did: String,
     reported: std::collections::HashMap<String, ReportedDid>,
 ) {
+    let tracker = state.background.clone();
     let state = state.clone();
-    tokio::spawn(async move {
+    tracker.spawn(async move {
         sync_all_dids_now(&state, &server_did, reported).await;
     });
 }
@@ -535,8 +537,9 @@ pub(crate) async fn stage_did_sync(
 /// the DID operations, which stage their rows transactionally
 /// (`stage_did_sync`). Runs on a task of its own.
 pub fn notify_servers_did(state: &AppState, mnemonic: String) {
+    let tracker = state.background.clone();
     let state = state.clone();
-    tokio::spawn(async move {
+    tracker.spawn(async move {
         let _guard = state.path_locks.guard(&mnemonic).await;
         let log = match state
             .dids_ks
@@ -567,8 +570,9 @@ pub fn notify_servers_did(state: &AppState, mnemonic: String) {
 
 /// [`notify_servers_did`] for a deleted slot.
 pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
+    let tracker = state.background.clone();
     let state = state.clone();
-    tokio::spawn(async move {
+    tracker.spawn(async move {
         let _guard = state.path_locks.guard(&mnemonic).await;
         let mut batch = state.store.batch();
         let staged = stage_did_sync(&state, &mut batch, &mnemonic, DidChange::Deleted).await;

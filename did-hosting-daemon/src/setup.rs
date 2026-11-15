@@ -1695,10 +1695,7 @@ async fn finalize_daemon_setup(
                 .into());
             }
         };
-        did_hosting_server::setup::update_server_did_in_config(
-            &output_path.to_path_buf(),
-            &did_id,
-        )?;
+        did_hosting_server::setup::update_server_did_in_config(output_path, &did_id)?;
         eprintln!("  server_did updated in {}", output_path.display());
     }
 

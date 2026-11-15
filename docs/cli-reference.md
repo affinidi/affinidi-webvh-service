@@ -21,29 +21,29 @@ Commands:
   setup                    Run interactive setup wizard to generate config.toml
   uninstall                Teardown a server install: clears managed secrets from the configured backend, removes the config file (and `.bak`)
   health                   Run health check diagnostics. Exits non-zero when a check fails (or, with --strict, warns), so it can gate a deploy or a container probe
+  backup                   Export server data to a backup file
+  restore                  Restore server data from a backup file
+  setup-offline-prepare    Step 1/2 of the offline (air-gapped VTA) setup wizard
+  setup-offline-complete   Step 2/2 of the offline setup wizard
   identity-list            List the service's own identity generations (key material still honoured)
-  tsp-relationship-list    List this service's established TSP relationships (offline; stop the service first)
-  tsp-relationship-reset   Reset our half of a TSP relationship to `None`, so the next send to the peer re-invites (offline). Keeps the cached peer capability
-  tsp-relationship-delete  Delete TSP relationship records outright (offline)
   identity-rotate-keys     Rotate the service's own key-agreement key
   identity-scid-alias      List or remove the did:scid alias of the service's own DID
   identity-retire-now      Stop honouring a superseded identity generation immediately
-  backup                   Export server data to a backup file
-  restore                  Restore server data from a backup file
-  load-did                 Load a DID at an arbitrary path (e.g., "services/control")
-  recreate-did             Recreate a DID at a given path (deletes existing, creates new, updates config)
+  tsp-relationship-list    List this service's established TSP relationships (offline; stop the service first)
+  tsp-relationship-reset   Reset our half of a TSP relationship to `None`, so the next send to the peer re-invites (offline). Keeps the cached peer capability
+  tsp-relationship-delete  Delete TSP relationship records outright (offline)
   bootstrap-did            Bootstrap a DID for this server (defaults to root .well-known)
+  recreate-did             Recreate a DID at a given path (deletes existing, creates new, updates config)
   recover-did              Recover a soft-deleted DID
+  load-did                 Load a DID at an arbitrary path (e.g., "services/control")
   dump-did                 Dump the DID log (did.jsonl) for a given path
   list-dids                List all DIDs in the store
   remove-did               Remove a DID and all its data from the store
-  export-sealed            Export this server's DID + signing/KA keys as an HPKE-sealed migration bundle
-  import-sealed            Open a sealed `DidSecrets` migration bundle and import the contained keys as this server's identity. Inverse of `export-sealed` on the sending side
   import-secrets           Import secrets from a VTA secrets bundle or individual keys
-  setup-offline-prepare    Step 1/2 of the offline (air-gapped VTA) setup wizard
-  setup-offline-complete   Step 2/2 of the offline setup wizard
+  export-sealed            Export this service's DID + signing/KA keys as an HPKE-sealed migration bundle
+  import-sealed            Open a sealed `DidSecrets` migration bundle and import the contained keys as this service's identity. Inverse of `export-sealed` on the sending side
   vta-request              Write an offline VTA bootstrap request (for air-gapped VTAs)
-  vta-open                 Open a sealed VTA bootstrap response
+  vta-open                 Open a sealed VTA bootstrap response (primitive — prefer `setup-offline-complete` for a full wizard-driven finish)
   help                     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -73,10 +73,10 @@ Options:
           Path to the configuration file
 
       --setup-key-out <SETUP_KEY_OUT>
-          Phase 1: mint an ephemeral did:key, persist to <path>, and print the `pnm contexts create` command + exit
+          Phase 1: mint an ephemeral did:key, persist to `<path>`, and print the `pnm contexts create` command + exit
 
       --setup-key-file <SETUP_KEY_FILE>
-          Phase 2: reuse the setup DID persisted at <path>; skip the interactive "Has the context been created?" confirmation
+          Phase 2: reuse the setup DID persisted at `<path>`; skip the interactive "Has the context been created?" confirmation
 
       --context <CONTEXT>
           Context id for phase 1's PNM command. Defaults to `did-hosting`
@@ -132,6 +132,103 @@ Options:
           Print help
 ```
 
+### `did-hosting-server backup`
+
+```text
+Export server data to a backup file
+
+Usage: did-hosting-server backup [OPTIONS]
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+  -o, --output <OUTPUT>
+          Output file path (use "-" for stdout)
+
+          [default: did-hosting-backup.json]
+
+  -h, --help
+          Print help
+```
+
+### `did-hosting-server restore`
+
+```text
+Restore server data from a backup file.
+
+The backup is checked before anything is written, config.toml included. Each did:webvh (or did:webs) log must verify, match its record, and extend both the backup's own high-water mark and what the store already holds for that DID; otherwise nothing is restored. Restore into an empty store to start from the backup's state. The data goes into the store the backup's config names (after the usual environment overrides). If a restore is interrupted, run it again: it is safe to repeat.
+
+Usage: did-hosting-server restore [OPTIONS] --input <INPUT>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+  -i, --input <INPUT>
+          Input backup file path
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `did-hosting-server setup-offline-prepare`
+
+```text
+Step 1/2 of the offline (air-gapped VTA) setup wizard.
+
+Runs the interactive prompts, writes the bootstrap-request.json + ephemeral seed, and serialises the operator's answers to a state TOML file. After the VTA admin returns a sealed bundle, run `setup-offline-complete`.
+
+Usage: did-hosting-server setup-offline-prepare [OPTIONS]
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --request <REQUEST>
+          Path for the bootstrap-request.json file
+
+          [default: bootstrap-request.json]
+
+      --state <STATE>
+          Path for the pending state file (plain TOML, no secrets).
+
+          The ephemeral bootstrap seed is persisted to the configured secrets backend (keyring / AWS / GCP / plaintext-in-config), not to a file.
+
+          [default: setup-offline-state.toml]
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `did-hosting-server setup-offline-complete`
+
+```text
+Step 2/2 of the offline setup wizard.
+
+Opens the sealed bundle with the seed saved during step 1, then persists the DID + keys + config per the choices captured in the state file, and imports the server's own DID into the local store.
+
+Usage: did-hosting-server setup-offline-complete [OPTIONS] --bundle <BUNDLE> --expect-digest <EXPECT_DIGEST>
+
+Options:
+      --bundle <BUNDLE>
+          Path to the ASCII-armored sealed bundle from the VTA admin
+
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --expect-digest <EXPECT_DIGEST>
+          Expected SHA-256 digest (lowercase hex) of the armored ciphertext; communicated out-of-band
+
+      --state <STATE>
+          Path to the state file written by `setup-offline-prepare`
+
+          [default: setup-offline-state.toml]
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
 ### `did-hosting-server identity-list`
 
 ```text
@@ -142,71 +239,6 @@ Usage: did-hosting-server identity-list [OPTIONS]
 Options:
   -c, --config <CONFIG>
           Path to the configuration file
-
-  -h, --help
-          Print help
-```
-
-### `did-hosting-server tsp-relationship-list`
-
-```text
-List this service's established TSP relationships (offline; stop the service first).
-
-Each endpoint keeps its own half of every relationship; the mediator holds none, so resetting a peer pairing means clearing both ends.
-
-Usage: did-hosting-server tsp-relationship-list [OPTIONS]
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-  -h, --help
-          Print help (see a summary with '-h')
-```
-
-### `did-hosting-server tsp-relationship-reset`
-
-```text
-Reset our half of a TSP relationship to `None`, so the next send to the peer re-invites (offline). Keeps the cached peer capability
-
-Usage: did-hosting-server tsp-relationship-reset [OPTIONS] --peer <PEER>
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-      --peer <PEER>
-          The peer's DID (its TSP VID)
-
-      --our <OUR>
-          This service's VID for the pair. Needed only for a half-formed relationship, which `tsp-relationship-list` cannot show
-
-  -h, --help
-          Print help
-```
-
-### `did-hosting-server tsp-relationship-delete`
-
-```text
-Delete TSP relationship records outright (offline)
-
-Usage: did-hosting-server tsp-relationship-delete [OPTIONS]
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-      --peer <PEER>
-          The peer's DID (its TSP VID)
-
-      --our <OUR>
-          This service's VID for the pair. Needed only for a half-formed relationship, which `tsp-relationship-list` cannot show
-
-      --all
-          Delete every record, established or half-formed
-
-  -y, --yes
-          Confirm `--all`. Without it, only reports what would be deleted
 
   -h, --help
           Print help
@@ -296,89 +328,66 @@ Options:
           Print help (see a summary with '-h')
 ```
 
-### `did-hosting-server backup`
+### `did-hosting-server tsp-relationship-list`
 
 ```text
-Export server data to a backup file
+List this service's established TSP relationships (offline; stop the service first).
 
-Usage: did-hosting-server backup [OPTIONS]
+Each endpoint keeps its own half of every relationship; the mediator holds none, so resetting a peer pairing means clearing both ends.
+
+Usage: did-hosting-server tsp-relationship-list [OPTIONS]
 
 Options:
   -c, --config <CONFIG>
           Path to the configuration file
 
-  -o, --output <OUTPUT>
-          Output file path (use "-" for stdout)
+  -h, --help
+          Print help (see a summary with '-h')
+```
 
-          [default: did-hosting-backup.json]
+### `did-hosting-server tsp-relationship-reset`
+
+```text
+Reset our half of a TSP relationship to `None`, so the next send to the peer re-invites (offline). Keeps the cached peer capability
+
+Usage: did-hosting-server tsp-relationship-reset [OPTIONS] --peer <PEER>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --peer <PEER>
+          The peer's DID (its TSP VID)
+
+      --our <OUR>
+          This service's VID for the pair. Needed only for a half-formed relationship, which `tsp-relationship-list` cannot show
 
   -h, --help
           Print help
 ```
 
-### `did-hosting-server restore`
+### `did-hosting-server tsp-relationship-delete`
 
 ```text
-Restore server data from a backup file.
+Delete TSP relationship records outright (offline)
 
-The backup is checked before anything is written, config.toml included. Each did:webvh (or did:webs) log must verify, match its record, and extend both the backup's own high-water mark and what the store already holds for that DID; otherwise nothing is restored. Restore into an empty store to start from the backup's state. The data goes into the store the backup's config names (after the usual environment overrides). If a restore is interrupted, run it again: it is safe to repeat.
-
-Usage: did-hosting-server restore [OPTIONS] --input <INPUT>
+Usage: did-hosting-server tsp-relationship-delete [OPTIONS]
 
 Options:
   -c, --config <CONFIG>
           Path to the configuration file
 
-  -i, --input <INPUT>
-          Input backup file path
+      --peer <PEER>
+          The peer's DID (its TSP VID)
 
-  -h, --help
-          Print help (see a summary with '-h')
-```
+      --our <OUR>
+          This service's VID for the pair. Needed only for a half-formed relationship, which `tsp-relationship-list` cannot show
 
-### `did-hosting-server load-did`
+      --all
+          Delete every record, established or half-formed
 
-```text
-Load a DID at an arbitrary path (e.g., "services/control").
-
-The log must verify (and its witness proofs, if it is witnessed) and must extend every history this store has served for that DID, including one since removed with `remove-did`.
-
-Usage: did-hosting-server load-did [OPTIONS] --path <PATH> --did-log <DID_LOG>
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-      --path <PATH>
-          Path to store the DID at (e.g., "services/control")
-
-          [alias: --mnemonic]
-
-      --did-log <DID_LOG>
-          Path to the did.jsonl file
-
-      --did-witness <DID_WITNESS>
-          Optional did-witness.json file
-
-  -h, --help
-          Print help (see a summary with '-h')
-```
-
-### `did-hosting-server recreate-did`
-
-```text
-Recreate a DID at a given path (deletes existing, creates new, updates config)
-
-Usage: did-hosting-server recreate-did [OPTIONS] --path <PATH>
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-      --path <PATH>
-          DID path/mnemonic to recreate (e.g. "webvh/server1")
-
-          [alias: --mnemonic]
+  -y, --yes
+          Confirm `--all`. Without it, only reports what would be deleted
 
   -h, --help
           Print help
@@ -420,6 +429,26 @@ Options:
           Print help
 ```
 
+### `did-hosting-server recreate-did`
+
+```text
+Recreate a DID at a given path (deletes existing, creates new, updates config)
+
+Usage: did-hosting-server recreate-did [OPTIONS] --path <PATH>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --path <PATH>
+          DID path/mnemonic to recreate (e.g. "webvh/server1")
+
+          [alias: --mnemonic]
+
+  -h, --help
+          Print help
+```
+
 ### `did-hosting-server recover-did`
 
 ```text
@@ -438,6 +467,34 @@ Options:
 
   -h, --help
           Print help
+```
+
+### `did-hosting-server load-did`
+
+```text
+Load a DID at an arbitrary path (e.g., "services/control").
+
+The log must verify (and its witness proofs, if it is witnessed) and must extend every history this store has served for that DID, including one since removed with `remove-did`.
+
+Usage: did-hosting-server load-did [OPTIONS] --path <PATH> --did-log <DID_LOG>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --path <PATH>
+          Path to store the DID at (e.g., "services/control")
+
+          [alias: --mnemonic]
+
+      --did-log <DID_LOG>
+          Path to the did.jsonl file
+
+      --did-witness <DID_WITNESS>
+          Optional did-witness.json file
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ### `did-hosting-server dump-did`
@@ -498,12 +555,45 @@ Options:
           Print help
 ```
 
+### `did-hosting-server import-secrets`
+
+```text
+Import secrets from a VTA secrets bundle or individual keys
+
+Usage: did-hosting-server import-secrets [OPTIONS]
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --vta-bundle <VTA_BUNDLE>
+          Base64url-encoded VTA secrets bundle (from `vta create-did-webvh`)
+
+      --signing-key <SIGNING_KEY>
+          Ed25519 signing key (multibase-encoded)
+
+      --ka-key <KA_KEY>
+          X25519 key agreement key (multibase-encoded, required with --signing-key)
+
+      --jwt-key <JWT_KEY>
+          Ed25519 JWT signing key (multibase-encoded, generated if omitted)
+
+      --vta-credential <VTA_CREDENTIAL>
+          VTA credential bundle (base64url-encoded, optional)
+
+      --force
+          Overwrite existing secrets without prompting
+
+  -h, --help
+          Print help
+```
+
 ### `did-hosting-server export-sealed`
 
 ```text
-Export this server's DID + signing/KA keys as an HPKE-sealed migration bundle.
+Export this service's DID + signing/KA keys as an HPKE-sealed migration bundle.
 
-Reads the receiver's `bootstrap-request.json` (same shape that `vta-request` or `setup-offline-prepare` produces), loads the existing server identity from the configured secret store, wraps the keys as a `DidSecrets` payload, and seals to the receiver's ephemeral X25519 pubkey. Prints a SHA-256 digest that the receiver MUST verify out-of-band before opening — the current `PinnedOnly` producer assertion has no in-band integrity anchor.
+Reads the receiver's `bootstrap-request.json` (same shape that `vta-request` or `setup-offline-prepare` produces), loads the existing identity from the configured secret store, wraps the keys as a `DidSecrets` payload, and seals to the receiver's ephemeral X25519 pubkey. Prints a SHA-256 digest that the receiver MUST verify out-of-band before opening. The receiver opens it with `import-sealed`.
 
 Usage: did-hosting-server export-sealed [OPTIONS] --request <REQUEST>
 
@@ -529,7 +619,7 @@ Options:
 ### `did-hosting-server import-sealed`
 
 ```text
-Open a sealed `DidSecrets` migration bundle and import the contained keys as this server's identity. Inverse of `export-sealed` on the sending side
+Open a sealed `DidSecrets` migration bundle and import the contained keys as this service's identity. Inverse of `export-sealed` on the sending side
 
 Usage: did-hosting-server import-sealed [OPTIONS] --bundle <BUNDLE> --expect-digest <EXPECT_DIGEST>
 
@@ -549,100 +639,16 @@ Options:
           [default: bootstrap-seed.bin]
 
       --producer-pubkey <PRODUCER_PUBKEY>
-          Optional Ed25519 public key of the producer (multibase- encoded, matches `#key-0` in the producer's DID document). When supplied, the bundle's `DidSigned` assertion is verified against it; omit to fall back to PinnedOnly trust
+          Optional Ed25519 public key of the producer (multibase- encoded, matches `#key-0` in the producer's DID document). When supplied, the bundle's `DidSigned` assertion is verified against it; omit to fall back to digest-only trust
+
+      --jwt-key <JWT_KEY>
+          Ed25519 JWT signing key (multibase-encoded, generated if omitted)
 
       --force
           Overwrite existing secrets without prompting
 
   -h, --help
           Print help
-```
-
-### `did-hosting-server import-secrets`
-
-```text
-Import secrets from a VTA secrets bundle or individual keys
-
-Usage: did-hosting-server import-secrets [OPTIONS]
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-      --vta-bundle <VTA_BUNDLE>
-          Base64url-encoded VTA secrets bundle (from `vta create-did-webvh`)
-
-      --signing-key <SIGNING_KEY>
-          Ed25519 signing key (multibase-encoded)
-
-      --ka-key <KA_KEY>
-          X25519 key agreement key (multibase-encoded, required with --signing-key)
-
-      --vta-credential <VTA_CREDENTIAL>
-          VTA credential bundle (base64url-encoded, optional)
-
-      --force
-          Overwrite existing secrets without prompting
-
-  -h, --help
-          Print help
-```
-
-### `did-hosting-server setup-offline-prepare`
-
-```text
-Step 1/2 of the offline (air-gapped VTA) setup wizard.
-
-Runs the interactive prompts, writes the bootstrap-request.json + ephemeral seed, and serialises the operator's answers to a state TOML file. After the VTA admin returns a sealed bundle, run `setup-offline-complete`.
-
-Usage: did-hosting-server setup-offline-prepare [OPTIONS]
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-      --request <REQUEST>
-          Path for the bootstrap-request.json file
-
-          [default: bootstrap-request.json]
-
-      --state <STATE>
-          Path for the pending state file (plain TOML, no secrets).
-
-          The ephemeral bootstrap seed is persisted to the configured secrets backend (keyring / AWS / GCP / plaintext-in-config), not to a file.
-
-          [default: setup-offline-state.toml]
-
-  -h, --help
-          Print help (see a summary with '-h')
-```
-
-### `did-hosting-server setup-offline-complete`
-
-```text
-Step 2/2 of the offline setup wizard.
-
-Opens the sealed bundle with the seed saved during step 1, then persists the DID + keys + config per the choices captured in the state file, and imports the server's own DID into the local store.
-
-Usage: did-hosting-server setup-offline-complete [OPTIONS] --bundle <BUNDLE> --expect-digest <EXPECT_DIGEST>
-
-Options:
-      --bundle <BUNDLE>
-          Path to the ASCII-armored sealed bundle from the VTA admin
-
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-      --expect-digest <EXPECT_DIGEST>
-          Expected SHA-256 digest (lowercase hex) of the armored ciphertext; communicated out-of-band
-
-      --state <STATE>
-          Path to the state file written by `setup-offline-prepare`
-
-          [default: setup-offline-state.toml]
-
-  -h, --help
-          Print help (see a summary with '-h')
 ```
 
 ### `did-hosting-server vta-request`
@@ -669,12 +675,12 @@ Options:
           [default: bootstrap-seed.bin]
 
       --label <LABEL>
-          Operator-visible label identifying this request
-
-          [default: did-hosting-server]
+          Operator-visible label identifying this request. Defaults to the binary's name
 
       --public-url <PUBLIC_URL>
-          Public URL where this server serves DIDs (e.g. `https://server1.example.com`). It names where the VTA publishes the DID's log and, through its path, the DID path. With `--mediator-did` the DID advertises only its messaging transports (`TSPTransport` / `DIDCommMessaging`), not this URL; only an HTTP-only DID (no mediator) carries a `WebVHHosting` service here
+          Public URL where this service serves its DID (e.g. `https://server1.example.com`). It names where the VTA publishes the DID's log and, through its path, the DID path. With `--mediator-did` the DID advertises only its messaging transports (`TSPTransport` / `DIDCommMessaging`), not this URL; only an HTTP-only DID (no mediator) carries a `WebVHHosting` service here
+
+          [alias: --did-hosting-url]
 
       --context <CONTEXT>
           VTA context the integration will live in. Embedded as `contextHint` in the request so the VTA admin can run `vta bootstrap provision-integration` without `--context`
@@ -682,7 +688,7 @@ Options:
           [default: did-hosting]
 
       --mediator-did <MEDIATOR_DID>
-          DIDComm mediator DID to advertise on this server's DID. When set, the rendered DID exposes a `TSPTransport` and/or `DIDCommMessaging` service at this mediator (per `--transport`), so peers can reach the server over messaging without out-of-band config — matching the interactive setup and the control / daemon deployments. Omit for an HTTP-only DID
+          DIDComm mediator DID to advertise on this service's DID. When set, the rendered DID exposes a `TSPTransport` and/or `DIDCommMessaging` service at this mediator (per `--transport`), so peers can reach the service over messaging without out-of-band config — matching the interactive setup. Omit for an HTTP-only DID
 
       --transport <TRANSPORT>
           Which messaging transport(s) to advertise at `--mediator-did`: `both`, `tsp`, or `didcomm`. Ignored when no mediator is given
@@ -696,9 +702,9 @@ Options:
 ### `did-hosting-server vta-open`
 
 ```text
-Open a sealed VTA bootstrap response.
+Open a sealed VTA bootstrap response (primitive — prefer `setup-offline-complete` for a full wizard-driven finish).
 
-Reads the armored bundle the operator ferried back, verifies the out-of-band digest, opens the HPKE sealed payload with the ephemeral seed, and emits the DID document + signed DID log for import via `did-hosting-server bootstrap-did` / `import-secrets`.
+Reads the armored bundle the operator ferried back, verifies the out-of-band digest, opens the HPKE sealed payload with the ephemeral seed, and emits the DID document + signed DID log, and the minted keys for `import-secrets` (or `setup`).
 
 Usage: did-hosting-server vta-open [OPTIONS] --bundle <BUNDLE> --expect-digest <EXPECT_DIGEST>
 
@@ -718,19 +724,13 @@ Options:
           [default: bootstrap-seed.bin]
 
       --did-doc-out <DID_DOC_OUT>
-          Where to write the rendered DID document as JSON
-
-          [default: server-did.json]
+          Where to write the rendered DID document as JSON. Defaults to `<service>-did.json` (`server`, `control` or `daemon`)
 
       --did-log-out <DID_LOG_OUT>
-          Where to write the signed DID log (JSONL). Omitted when the template didn't emit a WebvhLog output
-
-          [default: server-did.jsonl]
+          Where to write the signed DID log (JSONL). Omitted when the template didn't emit a WebvhLog output. Defaults to `<service>-did.jsonl`
 
       --secrets-out <SECRETS_OUT>
-          Where to save the minted private signing + KA key pair plus VTA trust material (authorization VC, pinned VTA DID) as JSON. Feed the multibase keys into `did-hosting-server import-secrets`
-
-          [default: server-secrets.json]
+          Where to save the minted private signing + KA key pair plus VTA trust material (authorization VC, pinned VTA DID) as JSON. Defaults to `<service>-secrets.json`
 
   -h, --help
           Print help (see a summary with '-h')
@@ -749,28 +749,29 @@ Commands:
   setup                    Run interactive setup wizard to generate config.toml
   uninstall                Teardown a control plane install: clears managed secrets and removes the config file (+ `.bak`, + `control-did.jsonl`)
   health                   Run health check diagnostics. Exits non-zero when a check fails (or, with --strict, warns), so it can gate a deploy or a container probe
+  setup-offline-prepare    Step 1/2 of the offline (air-gapped VTA) setup wizard
+  setup-offline-complete   Step 2/2 of the offline setup wizard
   add-acl                  Add an ACL entry
   list-acl                 List all ACL entries
+  remove-acl               Remove an ACL entry
+  invite                   Create a passkey enrollment invite
+  fetch-metrics            Read this service's counters over the authenticated `server/metrics/0.1` Trust Task and print them as JSON
+  send-trust-task          Send one signed Trust Task to the running service and print the response payload as JSON
   stats-show               Show a DID's statistics resolution, recorded tier and totals (offline; stop the service first)
   stats-set                Set a DID's statistics resolution (offline; stop the service first): `auto` (by traffic), `fine` (always 5-minute detail), `coarse` (never promoted) or `off` (totals only). Applied at the next start
   stats-purge-legacy       Finish the move to tiered statistics and delete the legacy time-series rows now, instead of 30 days after the migration (offline; stop the service first). An older version rolled back to afterwards has no time-series history
   identity-list            List the service's own identity generations (key material still honoured)
-  tsp-relationship-list    List this service's established TSP relationships (offline; stop the service first)
-  tsp-relationship-reset   Reset our half of a TSP relationship to `None`, so the next send to the peer re-invites (offline). Keeps the cached peer capability
-  tsp-relationship-delete  Delete TSP relationship records outright (offline)
   identity-rotate-keys     Rotate the service's own key-agreement key
   identity-scid-alias      List or remove the did:scid alias of the service's own DID
   identity-retire-now      Stop honouring a superseded identity generation immediately
-  remove-acl               Remove an ACL entry
-  invite                   Create a passkey enrollment invite
+  tsp-relationship-list    List this service's established TSP relationships (offline; stop the service first)
+  tsp-relationship-reset   Reset our half of a TSP relationship to `None`, so the next send to the peer re-invites (offline). Keeps the cached peer capability
+  tsp-relationship-delete  Delete TSP relationship records outright (offline)
+  import-secrets           Import secrets from a VTA secrets bundle or individual keys
+  export-sealed            Export this service's DID + signing/KA keys as an HPKE-sealed migration bundle
+  import-sealed            Open a sealed `DidSecrets` migration bundle and import the contained keys as this service's identity. Inverse of `export-sealed` on the sending side
   vta-request              Write an offline VTA bootstrap request (for air-gapped VTAs)
-  setup-offline-prepare    Step 1/2 of the offline (air-gapped VTA) setup wizard
-  setup-offline-complete   Step 2/2 of the offline setup wizard
-  export-sealed            Export this control plane's DID + signing/KA keys as an HPKE-sealed migration bundle. See `did-hosting-server export-sealed` for full semantics; the receiver opens with `import-sealed`
-  import-sealed            Open a sealed `DidSecrets` migration bundle and import the contained keys as this control plane's identity. Inverse of `export-sealed` on the sending side
   vta-open                 Open a sealed VTA bootstrap response (primitive — prefer `setup-offline-complete` for a full wizard-driven finish)
-  send-trust-task          Send one signed Trust Task to the running control plane and print the response payload as JSON
-  fetch-metrics            Scrape this service's counters over the authenticated `server/metrics/0.1` Trust Task and print them as JSON
   help                     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -800,10 +801,10 @@ Options:
           Path to the configuration file
 
       --setup-key-out <SETUP_KEY_OUT>
-          Phase 1: mint an ephemeral did:key, persist to <path>, and print the `pnm contexts create` command + exit
+          Phase 1: mint an ephemeral did:key, persist to `<path>`, and print the `pnm contexts create` command + exit
 
       --setup-key-file <SETUP_KEY_FILE>
-          Phase 2: reuse the setup DID persisted at <path>; skip the interactive "Has the context been created?" confirmation
+          Phase 2: reuse the setup DID persisted at `<path>`; skip the interactive "Has the context been created?" confirmation
 
       --context <CONTEXT>
           Context id for phase 1's PNM command. Defaults to `did-hosting`
@@ -859,6 +860,63 @@ Options:
           Print help
 ```
 
+### `did-hosting-control setup-offline-prepare`
+
+```text
+Step 1/2 of the offline (air-gapped VTA) setup wizard.
+
+Runs the interactive prompts, writes the bootstrap-request.json + ephemeral seed, and serialises the operator's answers to a state TOML file. After the VTA admin returns a sealed bundle, run `setup-offline-complete`.
+
+Usage: did-hosting-control setup-offline-prepare [OPTIONS]
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --request <REQUEST>
+          Path for the bootstrap-request.json file
+
+          [default: bootstrap-request.json]
+
+      --state <STATE>
+          Path for the pending state file (plain TOML, no secrets).
+
+          The ephemeral bootstrap seed is persisted to the configured secrets backend (keyring / AWS / GCP / plaintext-in-config), not to a file.
+
+          [default: setup-offline-state.toml]
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `did-hosting-control setup-offline-complete`
+
+```text
+Step 2/2 of the offline setup wizard.
+
+Opens the sealed bundle with the seed saved during step 1, then persists the DID + keys + config + admin ACL per the choices captured in the state file.
+
+Usage: did-hosting-control setup-offline-complete [OPTIONS] --bundle <BUNDLE> --expect-digest <EXPECT_DIGEST>
+
+Options:
+      --bundle <BUNDLE>
+          Path to the ASCII-armored sealed bundle from the VTA admin
+
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --expect-digest <EXPECT_DIGEST>
+          Expected SHA-256 digest (lowercase hex) of the armored ciphertext; communicated out-of-band
+
+      --state <STATE>
+          Path to the state file written by `setup-offline-prepare`
+
+          [default: setup-offline-state.toml]
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
 ### `did-hosting-control add-acl`
 
 ```text
@@ -881,6 +939,9 @@ Options:
       --label <LABEL>
           Optional label
 
+      --witness
+          did-hosting-daemon only: add the entry to the embedded witness's ACL (`[witness_store]`) instead of the control plane's. The role must then be `admin` or `service` (request witness signatures only). Refused by a binary with no embedded witness
+
   -h, --help
           Print help
 ```
@@ -896,8 +957,112 @@ Options:
   -c, --config <CONFIG>
           Path to the configuration file
 
+      --witness
+          did-hosting-daemon only: list the embedded witness's ACL (`[witness_store]`) instead of the control plane's. Refused by a binary with no embedded witness
+
   -h, --help
           Print help
+```
+
+### `did-hosting-control remove-acl`
+
+```text
+Remove an ACL entry
+
+Usage: did-hosting-control remove-acl [OPTIONS] --did <DID>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --did <DID>
+          DID to remove from the ACL
+
+  -h, --help
+          Print help
+```
+
+### `did-hosting-control invite`
+
+```text
+Create a passkey enrollment invite
+
+Usage: did-hosting-control invite [OPTIONS] --did <DID>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --did <DID>
+          DID to invite
+
+      --role <ROLE>
+          Role (admin or owner)
+
+          [default: owner]
+
+      --ttl-hours <TTL_HOURS>
+          Invite lifetime in hours (default: `auth.passkey_enrollment_ttl`)
+
+  -h, --help
+          Print help
+```
+
+### `did-hosting-control fetch-metrics`
+
+```text
+Read this service's counters over the authenticated `server/metrics/0.1` Trust Task and print them as JSON.
+
+The counters live in the running service's process memory and are reachable only through this signed task — there is no unauthenticated scrape endpoint. Signs with the `--key` did:key (granted `MetricsReader` in the ACL) and POSTs to the running service's `POST /api/trust-tasks`. Only `counters` are returned (gauges require Admin and are omitted). Prints the counters as JSON on stdout, ready to pipe into a monitoring agent.
+
+Counter instrumentation is opt-in: the `webvh_*` counters are populated only in a build with the `metrics` feature; against one without it this prints an empty array `[]`. A genuine refusal (an ungranted or revoked key) is reported as an error rather than an empty array.
+
+Usage: did-hosting-control fetch-metrics [OPTIONS] --key <KEY>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --key <KEY>
+          Path to the signer's did:key JSON file — the MetricsReader key, same format `setup --setup-key-out` writes
+
+      --url <URL>
+          Base URL of the running service. Defaults to `http://<server.host>:<server.port>` from config (a wildcard bind such as `0.0.0.0` / `::` is dialled as loopback)
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `did-hosting-control send-trust-task`
+
+```text
+Send one signed Trust Task to the running service and print the response payload as JSON.
+
+Every management operation is a Trust Task (docs/trust-tasks.md lists them). Signs the request with the `--key` did:key, POSTs it to the running service's `POST /api/trust-tasks`, verifies the reply is the service's own signed response, and prints its payload. The key is authorised like any other client: by its proof and its ACL entry (add it with `add-acl`). A refusal is reported as an error with its code.
+
+Usage: did-hosting-control send-trust-task [OPTIONS] --key <KEY> --type <TYPE>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --key <KEY>
+          Path to the signer's did:key JSON file — same format `setup --setup-key-out` writes
+
+      --type <TYPE>
+          The task: a full Type URI, or `<slug>/<version>` such as `identity/list/0.1` or `did-management/registry/list/0.2`
+
+      --payload <PAYLOAD>
+          The request payload as JSON (default `{}`)
+
+      --payload-file <PAYLOAD_FILE>
+          Read the request payload from a JSON file
+
+      --url <URL>
+          Base URL of the running service. Defaults to `http://<server.host>:<server.port>` from config (a wildcard bind is dialled as loopback)
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ### `did-hosting-control stats-show`
@@ -970,71 +1135,6 @@ Usage: did-hosting-control identity-list [OPTIONS]
 Options:
   -c, --config <CONFIG>
           Path to the configuration file
-
-  -h, --help
-          Print help
-```
-
-### `did-hosting-control tsp-relationship-list`
-
-```text
-List this service's established TSP relationships (offline; stop the service first).
-
-Each endpoint keeps its own half of every relationship; the mediator holds none, so resetting a peer pairing means clearing both ends.
-
-Usage: did-hosting-control tsp-relationship-list [OPTIONS]
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-  -h, --help
-          Print help (see a summary with '-h')
-```
-
-### `did-hosting-control tsp-relationship-reset`
-
-```text
-Reset our half of a TSP relationship to `None`, so the next send to the peer re-invites (offline). Keeps the cached peer capability
-
-Usage: did-hosting-control tsp-relationship-reset [OPTIONS] --peer <PEER>
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-      --peer <PEER>
-          The peer's DID (its TSP VID)
-
-      --our <OUR>
-          This service's VID for the pair. Needed only for a half-formed relationship, which `tsp-relationship-list` cannot show
-
-  -h, --help
-          Print help
-```
-
-### `did-hosting-control tsp-relationship-delete`
-
-```text
-Delete TSP relationship records outright (offline)
-
-Usage: did-hosting-control tsp-relationship-delete [OPTIONS]
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-      --peer <PEER>
-          The peer's DID (its TSP VID)
-
-      --our <OUR>
-          This service's VID for the pair. Needed only for a half-formed relationship, which `tsp-relationship-list` cannot show
-
-      --all
-          Delete every record, established or half-formed
-
-  -y, --yes
-          Confirm `--all`. Without it, only reports what would be deleted
 
   -h, --help
           Print help
@@ -1124,154 +1224,110 @@ Options:
           Print help (see a summary with '-h')
 ```
 
-### `did-hosting-control remove-acl`
+### `did-hosting-control tsp-relationship-list`
 
 ```text
-Remove an ACL entry
+List this service's established TSP relationships (offline; stop the service first).
 
-Usage: did-hosting-control remove-acl [OPTIONS] --did <DID>
+Each endpoint keeps its own half of every relationship; the mediator holds none, so resetting a peer pairing means clearing both ends.
+
+Usage: did-hosting-control tsp-relationship-list [OPTIONS]
 
 Options:
   -c, --config <CONFIG>
           Path to the configuration file
 
-      --did <DID>
-          DID to remove from the ACL
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `did-hosting-control tsp-relationship-reset`
+
+```text
+Reset our half of a TSP relationship to `None`, so the next send to the peer re-invites (offline). Keeps the cached peer capability
+
+Usage: did-hosting-control tsp-relationship-reset [OPTIONS] --peer <PEER>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --peer <PEER>
+          The peer's DID (its TSP VID)
+
+      --our <OUR>
+          This service's VID for the pair. Needed only for a half-formed relationship, which `tsp-relationship-list` cannot show
 
   -h, --help
           Print help
 ```
 
-### `did-hosting-control invite`
+### `did-hosting-control tsp-relationship-delete`
 
 ```text
-Create a passkey enrollment invite
+Delete TSP relationship records outright (offline)
 
-Usage: did-hosting-control invite [OPTIONS] --did <DID>
+Usage: did-hosting-control tsp-relationship-delete [OPTIONS]
 
 Options:
   -c, --config <CONFIG>
           Path to the configuration file
 
-      --did <DID>
-          DID to invite
+      --peer <PEER>
+          The peer's DID (its TSP VID)
 
-      --role <ROLE>
-          Role (admin or owner)
+      --our <OUR>
+          This service's VID for the pair. Needed only for a half-formed relationship, which `tsp-relationship-list` cannot show
 
-          [default: owner]
+      --all
+          Delete every record, established or half-formed
 
-      --ttl-hours <TTL_HOURS>
-          Invite lifetime in hours (default: `auth.passkey_enrollment_ttl`)
+  -y, --yes
+          Confirm `--all`. Without it, only reports what would be deleted
 
   -h, --help
           Print help
 ```
 
-### `did-hosting-control vta-request`
+### `did-hosting-control import-secrets`
 
 ```text
-Write an offline VTA bootstrap request (for air-gapped VTAs).
+Import secrets from a VTA secrets bundle or individual keys
 
-Generates an ephemeral Ed25519 keypair and writes a JSON request the operator ferries to the VTA admin. Keep the companion seed file safe — it's needed to open the sealed response.
-
-Usage: did-hosting-control vta-request [OPTIONS] --did-hosting-url <DID_HOSTING_URL> --mediator-did <MEDIATOR_DID>
+Usage: did-hosting-control import-secrets [OPTIONS]
 
 Options:
   -c, --config <CONFIG>
           Path to the configuration file
 
-      --out <OUT>
-          Path for the bootstrap-request.json file
+      --vta-bundle <VTA_BUNDLE>
+          Base64url-encoded VTA secrets bundle (from `vta create-did-webvh`)
 
-          [default: bootstrap-request.json]
+      --signing-key <SIGNING_KEY>
+          Ed25519 signing key (multibase-encoded)
 
-      --seed <SEED>
-          Path for the ephemeral seed (keep this secret; chmod 0600 on Unix)
+      --ka-key <KA_KEY>
+          X25519 key agreement key (multibase-encoded, required with --signing-key)
 
-          [default: bootstrap-seed.bin]
+      --jwt-key <JWT_KEY>
+          Ed25519 JWT signing key (multibase-encoded, generated if omitted)
 
-      --label <LABEL>
-          Operator-visible label identifying this request
+      --vta-credential <VTA_CREDENTIAL>
+          VTA credential bundle (base64url-encoded, optional)
 
-          [default: did-hosting-control]
-
-      --did-hosting-url <DID_HOSTING_URL>
-          DID hosting URL. Bound to the `did-hosting-control` template's `URL` variable so the rendered DID exposes a `WebVHHosting` service at this URL
-
-      --mediator-did <MEDIATOR_DID>
-          DIDComm mediator DID. Bound to the `did-hosting-control` template's `MEDIATOR_DID` variable so the rendered DID document advertises the right mediator endpoint
-
-      --context <CONTEXT>
-          VTA context the integration will live in. Embedded as `contextHint` in the request so the VTA admin can run `vta bootstrap provision-integration` without `--context`
-
-          [default: did-hosting]
+      --force
+          Overwrite existing secrets without prompting
 
   -h, --help
-          Print help (see a summary with '-h')
-```
-
-### `did-hosting-control setup-offline-prepare`
-
-```text
-Step 1/2 of the offline (air-gapped VTA) setup wizard.
-
-Runs the interactive prompts, writes the bootstrap-request.json + ephemeral seed, and serialises the operator's answers to a state TOML file. After the VTA admin returns a sealed bundle, run `setup-offline-complete`.
-
-Usage: did-hosting-control setup-offline-prepare [OPTIONS]
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-      --request <REQUEST>
-          Path for the bootstrap-request.json file
-
-          [default: bootstrap-request.json]
-
-      --state <STATE>
-          Path for the pending state file (plain TOML, no secrets).
-
-          The ephemeral bootstrap seed is persisted to the configured secrets backend (keyring / AWS / GCP / plaintext-in-config), not to a file.
-
-          [default: setup-offline-state.toml]
-
-  -h, --help
-          Print help (see a summary with '-h')
-```
-
-### `did-hosting-control setup-offline-complete`
-
-```text
-Step 2/2 of the offline setup wizard.
-
-Opens the sealed bundle with the seed saved during step 1, then persists the DID + keys + config + admin ACL per the choices captured in the state file.
-
-Usage: did-hosting-control setup-offline-complete [OPTIONS] --bundle <BUNDLE> --expect-digest <EXPECT_DIGEST>
-
-Options:
-      --bundle <BUNDLE>
-          Path to the ASCII-armored sealed bundle from the VTA admin
-
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-      --expect-digest <EXPECT_DIGEST>
-          Expected SHA-256 digest (lowercase hex) of the armored ciphertext; communicated out-of-band
-
-      --state <STATE>
-          Path to the state file written by `setup-offline-prepare`
-
-          [default: setup-offline-state.toml]
-
-  -h, --help
-          Print help (see a summary with '-h')
+          Print help
 ```
 
 ### `did-hosting-control export-sealed`
 
 ```text
-Export this control plane's DID + signing/KA keys as an HPKE-sealed migration bundle. See `did-hosting-server export-sealed` for full semantics; the receiver opens with `import-sealed`
+Export this service's DID + signing/KA keys as an HPKE-sealed migration bundle.
+
+Reads the receiver's `bootstrap-request.json` (same shape that `vta-request` or `setup-offline-prepare` produces), loads the existing identity from the configured secret store, wraps the keys as a `DidSecrets` payload, and seals to the receiver's ephemeral X25519 pubkey. Prints a SHA-256 digest that the receiver MUST verify out-of-band before opening. The receiver opens it with `import-sealed`.
 
 Usage: did-hosting-control export-sealed [OPTIONS] --request <REQUEST>
 
@@ -1291,13 +1347,13 @@ Options:
           Optional file to write the SHA-256 digest to. Always printed to stderr regardless
 
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ### `did-hosting-control import-sealed`
 
 ```text
-Open a sealed `DidSecrets` migration bundle and import the contained keys as this control plane's identity. Inverse of `export-sealed` on the sending side
+Open a sealed `DidSecrets` migration bundle and import the contained keys as this service's identity. Inverse of `export-sealed` on the sending side
 
 Usage: did-hosting-control import-sealed [OPTIONS] --bundle <BUNDLE> --expect-digest <EXPECT_DIGEST>
 
@@ -1309,7 +1365,7 @@ Options:
           Path to the configuration file
 
       --expect-digest <EXPECT_DIGEST>
-          Expected SHA-256 digest of the armored ciphertext
+          Expected SHA-256 digest of the armored ciphertext (from the operator, out-of-band)
 
       --seed <SEED>
           Path to the ephemeral seed the receiver saved when generating the bootstrap-request.json
@@ -1320,7 +1376,7 @@ Options:
           Optional Ed25519 public key of the producer (multibase- encoded, matches `#key-0` in the producer's DID document). When supplied, the bundle's `DidSigned` assertion is verified against it; omit to fall back to digest-only trust
 
       --jwt-key <JWT_KEY>
-          Optional Ed25519 JWT signing key (multibase-encoded, auto-generated if omitted)
+          Ed25519 JWT signing key (multibase-encoded, generated if omitted)
 
       --force
           Overwrite existing secrets without prompting
@@ -1329,12 +1385,60 @@ Options:
           Print help
 ```
 
+### `did-hosting-control vta-request`
+
+```text
+Write an offline VTA bootstrap request (for air-gapped VTAs).
+
+Generates an ephemeral Ed25519 keypair and writes a JSON request the operator ferries to the VTA admin. Keep the companion seed file safe — it's needed to open the sealed response.
+
+Usage: did-hosting-control vta-request [OPTIONS] --public-url <PUBLIC_URL>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --out <OUT>
+          Path for the bootstrap-request.json file
+
+          [default: bootstrap-request.json]
+
+      --seed <SEED>
+          Path for the ephemeral seed (keep this secret; chmod 0600 on Unix)
+
+          [default: bootstrap-seed.bin]
+
+      --label <LABEL>
+          Operator-visible label identifying this request. Defaults to the binary's name
+
+      --public-url <PUBLIC_URL>
+          Public URL where this service serves its DID (e.g. `https://server1.example.com`). It names where the VTA publishes the DID's log and, through its path, the DID path. With `--mediator-did` the DID advertises only its messaging transports (`TSPTransport` / `DIDCommMessaging`), not this URL; only an HTTP-only DID (no mediator) carries a `WebVHHosting` service here
+
+          [alias: --did-hosting-url]
+
+      --context <CONTEXT>
+          VTA context the integration will live in. Embedded as `contextHint` in the request so the VTA admin can run `vta bootstrap provision-integration` without `--context`
+
+          [default: did-hosting]
+
+      --mediator-did <MEDIATOR_DID>
+          DIDComm mediator DID to advertise on this service's DID. When set, the rendered DID exposes a `TSPTransport` and/or `DIDCommMessaging` service at this mediator (per `--transport`), so peers can reach the service over messaging without out-of-band config — matching the interactive setup. Omit for an HTTP-only DID
+
+      --transport <TRANSPORT>
+          Which messaging transport(s) to advertise at `--mediator-did`: `both`, `tsp`, or `didcomm`. Ignored when no mediator is given
+
+          [default: both]
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
 ### `did-hosting-control vta-open`
 
 ```text
 Open a sealed VTA bootstrap response (primitive — prefer `setup-offline-complete` for a full wizard-driven finish).
 
-Reads the armored bundle the operator ferried back, verifies the out-of-band digest, opens the HPKE sealed payload with the ephemeral seed, and emits the DID document + signed DID log for import via the did-hosting-server bootstrap-did / load-did commands.
+Reads the armored bundle the operator ferried back, verifies the out-of-band digest, opens the HPKE sealed payload with the ephemeral seed, and emits the DID document + signed DID log, and the minted keys for `import-secrets` (or `setup`).
 
 Usage: did-hosting-control vta-open [OPTIONS] --bundle <BUNDLE> --expect-digest <EXPECT_DIGEST>
 
@@ -1354,74 +1458,13 @@ Options:
           [default: bootstrap-seed.bin]
 
       --did-doc-out <DID_DOC_OUT>
-          Where to write the rendered DID document as JSON
-
-          [default: control-did.json]
+          Where to write the rendered DID document as JSON. Defaults to `<service>-did.json` (`server`, `control` or `daemon`)
 
       --did-log-out <DID_LOG_OUT>
-          Where to write the signed DID log (JSONL). Omitted when the template didn't emit a WebvhLog output
-
-          [default: control-did.jsonl]
+          Where to write the signed DID log (JSONL). Omitted when the template didn't emit a WebvhLog output. Defaults to `<service>-did.jsonl`
 
       --secrets-out <SECRETS_OUT>
-          Where to save the minted private signing + KA key pair plus VTA trust material (authorization VC, pinned VTA DID) as JSON. Feed into `did-hosting-control setup` to persist via the configured secret backend
-
-          [default: control-secrets.json]
-
-  -h, --help
-          Print help (see a summary with '-h')
-```
-
-### `did-hosting-control send-trust-task`
-
-```text
-Send one signed Trust Task to the running control plane and print the response payload as JSON.
-
-Every management operation is a Trust Task (docs/trust-tasks.md lists them). Signs the request with the `--key` did:key, POSTs it to the running control plane's `POST /api/trust-tasks`, verifies the reply is the service's own signed response, and prints its payload. The key is authorised like any other client: by its proof and its ACL entry (add it with `add-acl`). A refusal is reported as an error with its code.
-
-Usage: did-hosting-control send-trust-task [OPTIONS] --key <KEY> --type <TYPE>
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-      --key <KEY>
-          Path to the signer's did:key JSON file — same format `setup --setup-key-out` writes
-
-      --type <TYPE>
-          The task: a full Type URI, or `<slug>/<version>` such as `identity/list/0.1` or `did-management/registry/list/0.2`
-
-      --payload <PAYLOAD>
-          The request payload as JSON (default `{}`)
-
-      --payload-file <PAYLOAD_FILE>
-          Read the request payload from a JSON file
-
-      --url <URL>
-          Base URL of the running control plane. Defaults to `http://<server.host>:<server.port>` from config (a wildcard bind is dialled as loopback)
-
-  -h, --help
-          Print help (see a summary with '-h')
-```
-
-### `did-hosting-control fetch-metrics`
-
-```text
-Scrape this service's counters over the authenticated `server/metrics/0.1` Trust Task and print them as JSON.
-
-The counters live in the running service's process memory and are reachable only through this signed task — there is no unauthenticated scrape endpoint. Signs with the `--key` did:key (granted `MetricsReader` in the ACL) and POSTs to the running service's `POST /api/trust-tasks`. Only `counters` are returned (gauges require Admin and are omitted). Prints the counters as JSON on stdout, ready to pipe into a monitoring agent. A genuine refusal (an ungranted/revoked key) is reported as an error rather than an empty array.
-
-Usage: did-hosting-control fetch-metrics [OPTIONS] --key <KEY>
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-      --key <KEY>
-          Path to the signer's did:key JSON file — the MetricsReader key, same format `setup --setup-key-out` writes
-
-      --url <URL>
-          Base URL of the running service. Defaults to `http://<server.host>:<server.port>` from config (a wildcard bind such as `0.0.0.0` / `::` is dialled as loopback)
+          Where to save the minted private signing + KA key pair plus VTA trust material (authorization VC, pinned VTA DID) as JSON. Defaults to `<service>-secrets.json`
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1437,40 +1480,43 @@ DID Hosting Daemon — Unified Service
 Usage: did-hosting-daemon [OPTIONS] [COMMAND]
 
 Commands:
-  setup                      Run interactive setup wizard to generate config.toml
-  uninstall                  Teardown a daemon install: clears managed secrets and removes the config file (+ `.bak`, + companion DID-log files)
-  setup-offline-prepare      Step 1/2 of the offline (air-gapped VTA) setup wizard
-  setup-offline-complete     Step 2/2 of the offline setup wizard
-  health                     Run health check diagnostics. Exits non-zero when a check fails (or, with --strict, warns), so it can gate a deploy or a container probe
-  add-acl                    Add an ACL entry
-  list-acl                   List all ACL entries
-  reset-witness-kek-claim    Clear the embedded witness's key-encryption-key creation claim left by a start that stopped while creating the key (`[witness_store]`). Refused once a key is held or recorded
-  stats-show                 Show a DID's statistics resolution, recorded tier and totals (offline; stop the service first)
-  stats-set                  Set a DID's statistics resolution (offline; stop the service first): `auto` (by traffic), `fine` (always 5-minute detail), `coarse` (never promoted) or `off` (totals only). Applied at the next start
-  stats-purge-legacy         Finish the move to tiered statistics and delete the legacy time-series rows now, instead of 30 days after the migration (offline; stop the service first). An older version rolled back to afterwards has no time-series history
-  send-trust-task            Send one signed Trust Task to the running daemon and print the response payload as JSON
-  fetch-metrics              Read the service's own counters via the authenticated `server/metrics/0.1` Trust Task and print them as JSON
-  identity-list              List the service's own identity generations (key material still honoured)
-  tsp-relationship-list      List this service's established TSP relationships (offline; stop the service first)
-  tsp-relationship-reset     Reset our half of a TSP relationship to `None`, so the next send to the peer re-invites (offline). Keeps the cached peer capability
-  tsp-relationship-delete    Delete TSP relationship records outright (offline)
-  identity-rotate-keys       Rotate the service's own key-agreement key
-  identity-scid-alias        List or remove the did:scid alias of the service's own DID
-  identity-retire-now        Stop honouring a superseded identity generation immediately
-  remove-acl                 Remove an ACL entry
-  invite                     Create a passkey enrollment invite
-  bootstrap-did              Bootstrap a DID for this server
-  recreate-did               Recreate a DID at a given path (deletes existing, creates new, updates config)
-  recover-did                Recover a soft-deleted DID
-  dump-did                   Dump the DID log (did.jsonl) for a given path
-  list-dids                  List all DIDs in the store
-  remove-did                 Remove a DID and all its data from the store
-  load-did                   Load a DID at an arbitrary path (e.g., "services/control")
-  import-secrets             Import secrets from a VTA bundle or individual keys
-  backup                     Export the daemon's data to a backup file: both stores (`[store]`, with the ACL, passkeys, identity generations and outbound queue, and `[witness_store]`) and the configuration file, verbatim
-  restore                    Restore the daemon's data from a `did-hosting-daemon backup` file
-  migrate-from-webvh-config  Migrate a legacy `webvh-*` config file to the new `did-hosting-*` shape (env-var renames, repo-rename pointer updates)
-  help                       Print this message or the help of the given subcommand(s)
+  setup                    Run interactive setup wizard to generate config.toml
+  uninstall                Teardown a daemon install: clears managed secrets and removes the config file (+ `.bak`, + companion DID-log files)
+  setup-offline-prepare    Step 1/2 of the offline (air-gapped VTA) setup wizard
+  setup-offline-complete   Step 2/2 of the offline setup wizard
+  health                   Run health check diagnostics. Exits non-zero when a check fails (or, with --strict, warns), so it can gate a deploy or a container probe
+  reset-witness-kek-claim  Clear the embedded witness's key-encryption-key creation claim left by a start that stopped while creating the key (`[witness_store]`). Refused once a key is held or recorded
+  backup                   Export the daemon's data to a backup file: both stores (`[store]`, with the ACL, passkeys, identity generations and outbound queue, and `[witness_store]`) and the configuration file, verbatim
+  restore                  Restore the daemon's data from a `did-hosting-daemon backup` file
+  add-acl                  Add an ACL entry
+  list-acl                 List all ACL entries
+  remove-acl               Remove an ACL entry
+  invite                   Create a passkey enrollment invite
+  fetch-metrics            Read this service's counters over the authenticated `server/metrics/0.1` Trust Task and print them as JSON
+  send-trust-task          Send one signed Trust Task to the running service and print the response payload as JSON
+  stats-show               Show a DID's statistics resolution, recorded tier and totals (offline; stop the service first)
+  stats-set                Set a DID's statistics resolution (offline; stop the service first): `auto` (by traffic), `fine` (always 5-minute detail), `coarse` (never promoted) or `off` (totals only). Applied at the next start
+  stats-purge-legacy       Finish the move to tiered statistics and delete the legacy time-series rows now, instead of 30 days after the migration (offline; stop the service first). An older version rolled back to afterwards has no time-series history
+  identity-list            List the service's own identity generations (key material still honoured)
+  identity-rotate-keys     Rotate the service's own key-agreement key
+  identity-scid-alias      List or remove the did:scid alias of the service's own DID
+  identity-retire-now      Stop honouring a superseded identity generation immediately
+  tsp-relationship-list    List this service's established TSP relationships (offline; stop the service first)
+  tsp-relationship-reset   Reset our half of a TSP relationship to `None`, so the next send to the peer re-invites (offline). Keeps the cached peer capability
+  tsp-relationship-delete  Delete TSP relationship records outright (offline)
+  bootstrap-did            Bootstrap a DID for this server (defaults to root .well-known)
+  recreate-did             Recreate a DID at a given path (deletes existing, creates new, updates config)
+  recover-did              Recover a soft-deleted DID
+  load-did                 Load a DID at an arbitrary path (e.g., "services/control")
+  dump-did                 Dump the DID log (did.jsonl) for a given path
+  list-dids                List all DIDs in the store
+  remove-did               Remove a DID and all its data from the store
+  import-secrets           Import secrets from a VTA secrets bundle or individual keys
+  export-sealed            Export this service's DID + signing/KA keys as an HPKE-sealed migration bundle
+  import-sealed            Open a sealed `DidSecrets` migration bundle and import the contained keys as this service's identity. Inverse of `export-sealed` on the sending side
+  vta-request              Write an offline VTA bootstrap request (for air-gapped VTAs)
+  vta-open                 Open a sealed VTA bootstrap response (primitive — prefer `setup-offline-complete` for a full wizard-driven finish)
+  help                     Print this message or the help of the given subcommand(s)
 
 Options:
   -c, --config <CONFIG>
@@ -1611,6 +1657,61 @@ Options:
           Print help
 ```
 
+### `did-hosting-daemon reset-witness-kek-claim`
+
+```text
+Clear the embedded witness's key-encryption-key creation claim left by a start that stopped while creating the key (`[witness_store]`). Refused once a key is held or recorded
+
+Usage: did-hosting-daemon reset-witness-kek-claim [OPTIONS]
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+  -h, --help
+          Print help
+```
+
+### `did-hosting-daemon backup`
+
+```text
+Export the daemon's data to a backup file: both stores (`[store]`, with the ACL, passkeys, identity generations and outbound queue, and `[witness_store]`) and the configuration file, verbatim
+
+Usage: did-hosting-daemon backup [OPTIONS]
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+  -o, --output <OUTPUT>
+          Output file path (use "-" for stdout)
+
+          [default: did-hosting-backup.json]
+
+  -h, --help
+          Print help
+```
+
+### `did-hosting-daemon restore`
+
+```text
+Restore the daemon's data from a `did-hosting-daemon backup` file.
+
+The backup is checked before anything is written, config.toml included (it is written back verbatim). Each did:webvh (or did:webs) log must verify, match its record, and extend both the backup's own high-water mark and what the store already holds for that DID; otherwise nothing is restored. Restore into an empty store to start from the backup's state. The data goes into the store the backup's config names (after the usual environment overrides). If a restore is interrupted, run it again: it is safe to repeat.
+
+Usage: did-hosting-daemon restore [OPTIONS] --input <INPUT>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+  -i, --input <INPUT>
+          Input backup file path
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
 ### `did-hosting-daemon add-acl`
 
 ```text
@@ -1634,7 +1735,7 @@ Options:
           Optional label
 
       --witness
-          Add the entry to the embedded witness's ACL (`[witness_store]`) instead of the control plane's. The role must then be `admin` or `service` (request witness signatures only)
+          did-hosting-daemon only: add the entry to the embedded witness's ACL (`[witness_store]`) instead of the control plane's. The role must then be `admin` or `service` (request witness signatures only). Refused by a binary with no embedded witness
 
   -h, --help
           Print help
@@ -1652,25 +1753,111 @@ Options:
           Path to the configuration file
 
       --witness
-          List the embedded witness's ACL (`[witness_store]`) instead of the control plane's
+          did-hosting-daemon only: list the embedded witness's ACL (`[witness_store]`) instead of the control plane's. Refused by a binary with no embedded witness
 
   -h, --help
           Print help
 ```
 
-### `did-hosting-daemon reset-witness-kek-claim`
+### `did-hosting-daemon remove-acl`
 
 ```text
-Clear the embedded witness's key-encryption-key creation claim left by a start that stopped while creating the key (`[witness_store]`). Refused once a key is held or recorded
+Remove an ACL entry
 
-Usage: did-hosting-daemon reset-witness-kek-claim [OPTIONS]
+Usage: did-hosting-daemon remove-acl [OPTIONS] --did <DID>
 
 Options:
   -c, --config <CONFIG>
           Path to the configuration file
 
+      --did <DID>
+          DID to remove from the ACL
+
   -h, --help
           Print help
+```
+
+### `did-hosting-daemon invite`
+
+```text
+Create a passkey enrollment invite
+
+Usage: did-hosting-daemon invite [OPTIONS] --did <DID>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --did <DID>
+          DID to invite
+
+      --role <ROLE>
+          Role (admin or owner)
+
+          [default: owner]
+
+      --ttl-hours <TTL_HOURS>
+          Invite lifetime in hours (default: `auth.passkey_enrollment_ttl`)
+
+  -h, --help
+          Print help
+```
+
+### `did-hosting-daemon fetch-metrics`
+
+```text
+Read this service's counters over the authenticated `server/metrics/0.1` Trust Task and print them as JSON.
+
+The counters live in the running service's process memory and are reachable only through this signed task — there is no unauthenticated scrape endpoint. Signs with the `--key` did:key (granted `MetricsReader` in the ACL) and POSTs to the running service's `POST /api/trust-tasks`. Only `counters` are returned (gauges require Admin and are omitted). Prints the counters as JSON on stdout, ready to pipe into a monitoring agent.
+
+Counter instrumentation is opt-in: the `webvh_*` counters are populated only in a build with the `metrics` feature; against one without it this prints an empty array `[]`. A genuine refusal (an ungranted or revoked key) is reported as an error rather than an empty array.
+
+Usage: did-hosting-daemon fetch-metrics [OPTIONS] --key <KEY>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --key <KEY>
+          Path to the signer's did:key JSON file — the MetricsReader key, same format `setup --setup-key-out` writes
+
+      --url <URL>
+          Base URL of the running service. Defaults to `http://<server.host>:<server.port>` from config (a wildcard bind such as `0.0.0.0` / `::` is dialled as loopback)
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `did-hosting-daemon send-trust-task`
+
+```text
+Send one signed Trust Task to the running service and print the response payload as JSON.
+
+Every management operation is a Trust Task (docs/trust-tasks.md lists them). Signs the request with the `--key` did:key, POSTs it to the running service's `POST /api/trust-tasks`, verifies the reply is the service's own signed response, and prints its payload. The key is authorised like any other client: by its proof and its ACL entry (add it with `add-acl`). A refusal is reported as an error with its code.
+
+Usage: did-hosting-daemon send-trust-task [OPTIONS] --key <KEY> --type <TYPE>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --key <KEY>
+          Path to the signer's did:key JSON file — same format `setup --setup-key-out` writes
+
+      --type <TYPE>
+          The task: a full Type URI, or `<slug>/<version>` such as `identity/list/0.1` or `did-management/registry/list/0.2`
+
+      --payload <PAYLOAD>
+          The request payload as JSON (default `{}`)
+
+      --payload-file <PAYLOAD_FILE>
+          Read the request payload from a JSON file
+
+      --url <URL>
+          Base URL of the running service. Defaults to `http://<server.host>:<server.port>` from config (a wildcard bind is dialled as loopback)
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ### `did-hosting-daemon stats-show`
@@ -1733,63 +1920,6 @@ Options:
           Print help
 ```
 
-### `did-hosting-daemon send-trust-task`
-
-```text
-Send one signed Trust Task to the running daemon and print the response payload as JSON.
-
-Every management operation is a Trust Task (docs/trust-tasks.md lists them). Signs the request with the `--key` did:key, POSTs it to the running daemon's `POST /api/trust-tasks`, verifies the reply is the service's own signed response, and prints its payload. The key is authorised like any other client: by its proof and its ACL entry (add it with `add-acl`). A refusal is reported as an error with its code.
-
-Usage: did-hosting-daemon send-trust-task [OPTIONS] --key <KEY> --type <TYPE>
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-      --key <KEY>
-          Path to the signer's did:key JSON file — same format `setup --setup-key-out` writes
-
-      --type <TYPE>
-          The task: a full Type URI, or `<slug>/<version>` such as `identity/list/0.1` or `did-management/registry/list/0.2`
-
-      --payload <PAYLOAD>
-          The request payload as JSON (default `{}`)
-
-      --payload-file <PAYLOAD_FILE>
-          Read the request payload from a JSON file
-
-      --url <URL>
-          Base URL of the running daemon. Defaults to `http://<server.host>:<server.port>` from config (a wildcard bind is dialled as loopback)
-
-  -h, --help
-          Print help (see a summary with '-h')
-```
-
-### `did-hosting-daemon fetch-metrics`
-
-```text
-Read the service's own counters via the authenticated `server/metrics/0.1` Trust Task and print them as JSON.
-
-The counters live in the running daemon's process memory and are reachable only through this signed localhost task — there is no unauthenticated scrape endpoint. Signs the task with the `--key` did:key (granted `MetricsReader` in the ACL) and POSTs it to the running daemon's `POST /api/trust-tasks`. Only `counters` are returned (gauges require Admin and are omitted). Prints the counters as JSON on stdout, ready to pipe into any monitoring agent or metrics exporter.
-
-Counter instrumentation is opt-in: the `webvh_*` counters are populated only when the daemon is built with the `metrics` feature. Against a daemon built without it this prints an empty array `[]` — a genuine refusal (an ungranted/revoked key) is reported as an error instead.
-
-Usage: did-hosting-daemon fetch-metrics [OPTIONS] --key <KEY>
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-      --key <KEY>
-          Path to the signer's did:key JSON file — the MetricsReader key, same format `setup --setup-key-out` writes
-
-      --url <URL>
-          Base URL of the running daemon. Defaults to `http://<server.host>:<server.port>` from config (host `0.0.0.0` is dialled as `127.0.0.1`)
-
-  -h, --help
-          Print help (see a summary with '-h')
-```
-
 ### `did-hosting-daemon identity-list`
 
 ```text
@@ -1800,71 +1930,6 @@ Usage: did-hosting-daemon identity-list [OPTIONS]
 Options:
   -c, --config <CONFIG>
           Path to the configuration file
-
-  -h, --help
-          Print help
-```
-
-### `did-hosting-daemon tsp-relationship-list`
-
-```text
-List this service's established TSP relationships (offline; stop the service first).
-
-Each endpoint keeps its own half of every relationship; the mediator holds none, so resetting a peer pairing means clearing both ends.
-
-Usage: did-hosting-daemon tsp-relationship-list [OPTIONS]
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-  -h, --help
-          Print help (see a summary with '-h')
-```
-
-### `did-hosting-daemon tsp-relationship-reset`
-
-```text
-Reset our half of a TSP relationship to `None`, so the next send to the peer re-invites (offline). Keeps the cached peer capability
-
-Usage: did-hosting-daemon tsp-relationship-reset [OPTIONS] --peer <PEER>
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-      --peer <PEER>
-          The peer's DID (its TSP VID)
-
-      --our <OUR>
-          This service's VID for the pair. Needed only for a half-formed relationship, which `tsp-relationship-list` cannot show
-
-  -h, --help
-          Print help
-```
-
-### `did-hosting-daemon tsp-relationship-delete`
-
-```text
-Delete TSP relationship records outright (offline)
-
-Usage: did-hosting-daemon tsp-relationship-delete [OPTIONS]
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-      --peer <PEER>
-          The peer's DID (its TSP VID)
-
-      --our <OUR>
-          This service's VID for the pair. Needed only for a half-formed relationship, which `tsp-relationship-list` cannot show
-
-      --all
-          Delete every record, established or half-formed
-
-  -y, --yes
-          Confirm `--all`. Without it, only reports what would be deleted
 
   -h, --help
           Print help
@@ -1954,45 +2019,66 @@ Options:
           Print help (see a summary with '-h')
 ```
 
-### `did-hosting-daemon remove-acl`
+### `did-hosting-daemon tsp-relationship-list`
 
 ```text
-Remove an ACL entry
+List this service's established TSP relationships (offline; stop the service first).
 
-Usage: did-hosting-daemon remove-acl [OPTIONS] --did <DID>
+Each endpoint keeps its own half of every relationship; the mediator holds none, so resetting a peer pairing means clearing both ends.
+
+Usage: did-hosting-daemon tsp-relationship-list [OPTIONS]
 
 Options:
   -c, --config <CONFIG>
           Path to the configuration file
 
-      --did <DID>
-          DID to remove from the ACL
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `did-hosting-daemon tsp-relationship-reset`
+
+```text
+Reset our half of a TSP relationship to `None`, so the next send to the peer re-invites (offline). Keeps the cached peer capability
+
+Usage: did-hosting-daemon tsp-relationship-reset [OPTIONS] --peer <PEER>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --peer <PEER>
+          The peer's DID (its TSP VID)
+
+      --our <OUR>
+          This service's VID for the pair. Needed only for a half-formed relationship, which `tsp-relationship-list` cannot show
 
   -h, --help
           Print help
 ```
 
-### `did-hosting-daemon invite`
+### `did-hosting-daemon tsp-relationship-delete`
 
 ```text
-Create a passkey enrollment invite
+Delete TSP relationship records outright (offline)
 
-Usage: did-hosting-daemon invite [OPTIONS] --did <DID>
+Usage: did-hosting-daemon tsp-relationship-delete [OPTIONS]
 
 Options:
   -c, --config <CONFIG>
           Path to the configuration file
 
-      --did <DID>
-          DID to invite
+      --peer <PEER>
+          The peer's DID (its TSP VID)
 
-      --role <ROLE>
-          Role (admin or owner)
+      --our <OUR>
+          This service's VID for the pair. Needed only for a half-formed relationship, which `tsp-relationship-list` cannot show
 
-          [default: owner]
+      --all
+          Delete every record, established or half-formed
 
-      --ttl-hours <TTL_HOURS>
-          Invite lifetime in hours (default: `auth.passkey_enrollment_ttl`)
+  -y, --yes
+          Confirm `--all`. Without it, only reports what would be deleted
 
   -h, --help
           Print help
@@ -2001,7 +2087,7 @@ Options:
 ### `did-hosting-daemon bootstrap-did`
 
 ```text
-Bootstrap a DID for this server
+Bootstrap a DID for this server (defaults to root .well-known)
 
 Usage: did-hosting-daemon bootstrap-did [OPTIONS]
 
@@ -2010,7 +2096,7 @@ Options:
           Path to the configuration file
 
       --path <PATH>
-          DID path/mnemonic to bootstrap (e.g. "my-org", "services/auth"). Defaults to ".well-known" (the root DID for this server)
+          DID path/mnemonic to bootstrap (e.g. "my-org", "services/auth") Defaults to ".well-known" (the root DID for this server)
 
           [default: .well-known]
           [alias: --mnemonic]
@@ -2022,10 +2108,10 @@ Options:
           Path to an existing did-witness.json file to import (requires --did-log)
 
       --witness-url <WITNESS_URL>
-          Witness service URL for requesting a proof
+          Witness service URL for requesting a proof (auto-bootstrap only)
 
       --witness-id <WITNESS_ID>
-          Witness ID to use when requesting a proof
+          Witness ID to use when requesting a proof (auto-bootstrap only)
 
       --witness-did <WITNESS_DID>
           The witness server's own DID (its `server_did`), required with --witness-url. The sign-in is addressed to it, and the witness server refuses one addressed elsewhere. This is not --witness-id, which names one of the witnesses that server hosts
@@ -2072,6 +2158,34 @@ Options:
 
   -h, --help
           Print help
+```
+
+### `did-hosting-daemon load-did`
+
+```text
+Load a DID at an arbitrary path (e.g., "services/control").
+
+The log must verify (and its witness proofs, if it is witnessed) and must extend every history this store has served for that DID, including one since removed with `remove-did`.
+
+Usage: did-hosting-daemon load-did [OPTIONS] --path <PATH> --did-log <DID_LOG>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --path <PATH>
+          Path to store the DID at (e.g., "services/control")
+
+          [alias: --mnemonic]
+
+      --did-log <DID_LOG>
+          Path to the did.jsonl file
+
+      --did-witness <DID_WITNESS>
+          Optional did-witness.json file
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ### `did-hosting-daemon dump-did`
@@ -2132,38 +2246,10 @@ Options:
           Print help
 ```
 
-### `did-hosting-daemon load-did`
-
-```text
-Load a DID at an arbitrary path (e.g., "services/control").
-
-The log must verify (and its witness proofs, if it is witnessed) and must extend every history this store has served for that DID, including one since removed with `remove-did`.
-
-Usage: did-hosting-daemon load-did [OPTIONS] --path <PATH> --did-log <DID_LOG>
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-      --path <PATH>
-          Path to store the DID at (e.g., "services/control")
-
-          [alias: --mnemonic]
-
-      --did-log <DID_LOG>
-          Path to the did.jsonl file
-
-      --did-witness <DID_WITNESS>
-          Optional did-witness.json file
-
-  -h, --help
-          Print help (see a summary with '-h')
-```
-
 ### `did-hosting-daemon import-secrets`
 
 ```text
-Import secrets from a VTA bundle or individual keys
+Import secrets from a VTA secrets bundle or individual keys
 
 Usage: did-hosting-daemon import-secrets [OPTIONS]
 
@@ -2172,19 +2258,19 @@ Options:
           Path to the configuration file
 
       --vta-bundle <VTA_BUNDLE>
-          Base64url-encoded VTA secrets bundle
+          Base64url-encoded VTA secrets bundle (from `vta create-did-webvh`)
 
       --signing-key <SIGNING_KEY>
           Ed25519 signing key (multibase-encoded)
 
       --ka-key <KA_KEY>
-          X25519 key agreement key (multibase-encoded)
+          X25519 key agreement key (multibase-encoded, required with --signing-key)
 
       --jwt-key <JWT_KEY>
-          Ed25519 JWT signing key (multibase-encoded, auto-generated if omitted)
+          Ed25519 JWT signing key (multibase-encoded, generated if omitted)
 
       --vta-credential <VTA_CREDENTIAL>
-          VTA credential bundle (base64url-encoded)
+          VTA credential bundle (base64url-encoded, optional)
 
       --force
           Overwrite existing secrets without prompting
@@ -2193,67 +2279,149 @@ Options:
           Print help
 ```
 
-### `did-hosting-daemon backup`
+### `did-hosting-daemon export-sealed`
 
 ```text
-Export the daemon's data to a backup file: both stores (`[store]`, with the ACL, passkeys, identity generations and outbound queue, and `[witness_store]`) and the configuration file, verbatim
+Export this service's DID + signing/KA keys as an HPKE-sealed migration bundle.
 
-Usage: did-hosting-daemon backup [OPTIONS]
+Reads the receiver's `bootstrap-request.json` (same shape that `vta-request` or `setup-offline-prepare` produces), loads the existing identity from the configured secret store, wraps the keys as a `DidSecrets` payload, and seals to the receiver's ephemeral X25519 pubkey. Prints a SHA-256 digest that the receiver MUST verify out-of-band before opening. The receiver opens it with `import-sealed`.
+
+Usage: did-hosting-daemon export-sealed [OPTIONS] --request <REQUEST>
 
 Options:
   -c, --config <CONFIG>
           Path to the configuration file
 
-  -o, --output <OUTPUT>
-          Output file path (use "-" for stdout)
+      --request <REQUEST>
+          Path to the receiver's bootstrap-request.json
 
-          [default: did-hosting-backup.json]
+      --out <OUT>
+          Path for the ASCII-armored sealed output
 
-  -h, --help
-          Print help
-```
+          [default: sealed-export.txt]
 
-### `did-hosting-daemon restore`
-
-```text
-Restore the daemon's data from a `did-hosting-daemon backup` file.
-
-The backup is checked before anything is written, config.toml included (it is written back verbatim). Each did:webvh (or did:webs) log must verify, match its record, and extend both the backup's own high-water mark and what the store already holds for that DID; otherwise nothing is restored. Restore into an empty store to start from the backup's state. The data goes into the store the backup's config names (after the usual environment overrides). If a restore is interrupted, run it again: it is safe to repeat.
-
-Usage: did-hosting-daemon restore [OPTIONS] --input <INPUT>
-
-Options:
-  -c, --config <CONFIG>
-          Path to the configuration file
-
-  -i, --input <INPUT>
-          Input backup file path
+      --digest-out <DIGEST_OUT>
+          Optional file to write the SHA-256 digest to. Always printed to stderr regardless
 
   -h, --help
           Print help (see a summary with '-h')
 ```
 
-### `did-hosting-daemon migrate-from-webvh-config`
+### `did-hosting-daemon import-sealed`
 
 ```text
-Migrate a legacy `webvh-*` config file to the new `did-hosting-*` shape (env-var renames, repo-rename pointer updates).
+Open a sealed `DidSecrets` migration bundle and import the contained keys as this service's identity. Inverse of `export-sealed` on the sending side
 
-Stub in v0.7.0: the rewriter is implemented in a follow-up task (the migration runner work in T7/M-02 will share its scaffolding). This subcommand exists so operators have a stable invocation name to script against once the implementation lands.
+Usage: did-hosting-daemon import-sealed [OPTIONS] --bundle <BUNDLE> --expect-digest <EXPECT_DIGEST>
 
-Usage: did-hosting-daemon migrate-from-webvh-config [OPTIONS] --input <FILE>
+Options:
+      --bundle <BUNDLE>
+          Path to the ASCII-armored sealed bundle
+
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --expect-digest <EXPECT_DIGEST>
+          Expected SHA-256 digest of the armored ciphertext (from the operator, out-of-band)
+
+      --seed <SEED>
+          Path to the ephemeral seed the receiver saved when generating the bootstrap-request.json
+
+          [default: bootstrap-seed.bin]
+
+      --producer-pubkey <PRODUCER_PUBKEY>
+          Optional Ed25519 public key of the producer (multibase- encoded, matches `#key-0` in the producer's DID document). When supplied, the bundle's `DidSigned` assertion is verified against it; omit to fall back to digest-only trust
+
+      --jwt-key <JWT_KEY>
+          Ed25519 JWT signing key (multibase-encoded, generated if omitted)
+
+      --force
+          Overwrite existing secrets without prompting
+
+  -h, --help
+          Print help
+```
+
+### `did-hosting-daemon vta-request`
+
+```text
+Write an offline VTA bootstrap request (for air-gapped VTAs).
+
+Generates an ephemeral Ed25519 keypair and writes a JSON request the operator ferries to the VTA admin. Keep the companion seed file safe — it's needed to open the sealed response.
+
+Usage: did-hosting-daemon vta-request [OPTIONS] --public-url <PUBLIC_URL>
 
 Options:
   -c, --config <CONFIG>
           Path to the configuration file
 
-      --input <FILE>
-          Path to the legacy `webvh-*` config file to migrate
+      --out <OUT>
+          Path for the bootstrap-request.json file
 
-      --output <FILE>
-          Path to write the migrated config to. Defaults to `<input>.migrated`
+          [default: bootstrap-request.json]
 
-      --force
-          Overwrite the output file if it already exists
+      --seed <SEED>
+          Path for the ephemeral seed (keep this secret; chmod 0600 on Unix)
+
+          [default: bootstrap-seed.bin]
+
+      --label <LABEL>
+          Operator-visible label identifying this request. Defaults to the binary's name
+
+      --public-url <PUBLIC_URL>
+          Public URL where this service serves its DID (e.g. `https://server1.example.com`). It names where the VTA publishes the DID's log and, through its path, the DID path. With `--mediator-did` the DID advertises only its messaging transports (`TSPTransport` / `DIDCommMessaging`), not this URL; only an HTTP-only DID (no mediator) carries a `WebVHHosting` service here
+
+          [alias: --did-hosting-url]
+
+      --context <CONTEXT>
+          VTA context the integration will live in. Embedded as `contextHint` in the request so the VTA admin can run `vta bootstrap provision-integration` without `--context`
+
+          [default: did-hosting]
+
+      --mediator-did <MEDIATOR_DID>
+          DIDComm mediator DID to advertise on this service's DID. When set, the rendered DID exposes a `TSPTransport` and/or `DIDCommMessaging` service at this mediator (per `--transport`), so peers can reach the service over messaging without out-of-band config — matching the interactive setup. Omit for an HTTP-only DID
+
+      --transport <TRANSPORT>
+          Which messaging transport(s) to advertise at `--mediator-did`: `both`, `tsp`, or `didcomm`. Ignored when no mediator is given
+
+          [default: both]
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `did-hosting-daemon vta-open`
+
+```text
+Open a sealed VTA bootstrap response (primitive — prefer `setup-offline-complete` for a full wizard-driven finish).
+
+Reads the armored bundle the operator ferried back, verifies the out-of-band digest, opens the HPKE sealed payload with the ephemeral seed, and emits the DID document + signed DID log, and the minted keys for `import-secrets` (or `setup`).
+
+Usage: did-hosting-daemon vta-open [OPTIONS] --bundle <BUNDLE> --expect-digest <EXPECT_DIGEST>
+
+Options:
+      --bundle <BUNDLE>
+          Path to the ASCII-armored sealed bundle
+
+  -c, --config <CONFIG>
+          Path to the configuration file
+
+      --expect-digest <EXPECT_DIGEST>
+          Expected SHA-256 digest of the armored ciphertext (from the operator, out-of-band)
+
+      --seed <SEED>
+          Path to the ephemeral seed saved by `vta-request`
+
+          [default: bootstrap-seed.bin]
+
+      --did-doc-out <DID_DOC_OUT>
+          Where to write the rendered DID document as JSON. Defaults to `<service>-did.json` (`server`, `control` or `daemon`)
+
+      --did-log-out <DID_LOG_OUT>
+          Where to write the signed DID log (JSONL). Omitted when the template didn't emit a WebvhLog output. Defaults to `<service>-did.jsonl`
+
+      --secrets-out <SECRETS_OUT>
+          Where to save the minted private signing + KA key pair plus VTA trust material (authorization VC, pinned VTA DID) as JSON. Defaults to `<service>-secrets.json`
 
   -h, --help
           Print help (see a summary with '-h')

@@ -5,7 +5,8 @@
 //!
 //! - [`on_did_published`] — the trigger. Fires from the publish path on every
 //!   publish of a DID, and does real work only when the DID is ours.
-//! - [`run_identity_sweep_loop`] — the reaper. Drops generations whose grace
+//! - [`expire_due`] — the reaper, the `identity-expiry` tick of the control
+//!   plane's background tasks. Drops generations whose grace
 //!   period has elapsed.
 //! - [`reload_now`] — the periodic backstop, for identity changes that never
 //!   went through our publish path (an out-of-band update, or one applied while
@@ -25,7 +26,6 @@ use did_hosting_common::server::identity::{
     mnemonic_from_did,
 };
 use did_hosting_common::server::identity_drain;
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -214,36 +214,6 @@ async fn rebuild_listener(state: &AppState) -> Result<(), AppError> {
     Ok(())
 }
 
-/// The two periodic jobs, on deliberately different cadences.
-///
-/// **Expiry** is local — it compares timestamps and reads the store — so it runs
-/// every 60s and retires generations promptly.
-///
-/// **Reload** re-resolves our DID document over the network. It is only a
-/// *backstop* here (the publish hook already catches a rotation the instant it
-/// happens), so running it as often as the expiry sweep would mean ~1,400
-/// pointless self-resolves a day. It runs every 5 minutes instead — far inside
-/// any sane grace period.
-pub async fn run_identity_sweep_loop(state: AppState, mut shutdown: watch::Receiver<bool>) {
-    let mut expiry = tokio::time::interval(DEFAULT_SWEEP_INTERVAL);
-    let mut reload = tokio::time::interval(DEFAULT_RELOAD_INTERVAL);
-    // Intervals fire immediately; skip that first tick.
-    expiry.tick().await;
-    reload.tick().await;
-
-    loop {
-        tokio::select! {
-            _ = expiry.tick() => expire_due(&state).await,
-            _ = reload.tick() => {
-                if let Err(e) = reload_now(&state).await {
-                    debug!("identity backstop reload failed: {e}");
-                }
-            }
-            _ = shutdown.changed() => break,
-        }
-    }
-}
-
 /// Start draining an old mediator, if this generation left one behind.
 ///
 /// A key rotation on the same mediator needs nothing here — the old secret is
@@ -392,10 +362,11 @@ pub async fn retire_generation_now(state: &AppState, generation_id: u64) -> Resu
     Ok(())
 }
 
-/// How long the expiry sweep waits between passes (local, cheap). Re-exported so
-/// the daemon's unified storage task runs on the same cadence.
+/// How long the expiry sweep waits between passes (local, cheap): the
+/// `identity-expiry` tick ([`crate::server::background_tasks`]).
 pub const SWEEP_INTERVAL: Duration = DEFAULT_SWEEP_INTERVAL;
 
 /// How long between DID-document re-resolves (network). Five times slower than
-/// the expiry sweep — see [`run_identity_sweep_loop`].
+/// the expiry sweep: the publish hook already catches a rotation the instant
+/// it happens, so this is only a backstop.
 pub const RELOAD_INTERVAL: Duration = DEFAULT_RELOAD_INTERVAL;
