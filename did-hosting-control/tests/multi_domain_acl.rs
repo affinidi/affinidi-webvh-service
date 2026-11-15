@@ -240,7 +240,7 @@ async fn allowed_owner_on_authorised_domain_passes_resolve_gate() {
     // The downstream verifier surfaces Validation with a webvh-
     // specific message instead.
     match err {
-        AppError::Validation(msg) => {
+        AppError::Validation { message: msg, .. } => {
             assert!(
                 !msg.contains("caller's ACL scope has no default"),
                 "expected downstream verifier failure, got T34 reject: {msg}"

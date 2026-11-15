@@ -57,8 +57,8 @@ pub async fn challenge(
     Json(req): Json<ChallengeRequest>,
 ) -> Result<Json<ChallengeResponse>, AppError> {
     // Input validation (route-layer concern).
-    if req.did.len() > 512 {
-        return Err(AppError::Validation("DID exceeds maximum length".into()));
+    if req.did.len() > did_hosting_common::server::acl::MAX_DID_LEN {
+        return Err(AppError::invalid("DID exceeds maximum length"));
     }
 
     // IP rate limit (defence in depth before any session-storage I/O).

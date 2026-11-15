@@ -214,7 +214,7 @@ pub struct RequestUriResponse {
     pub did_url: String,
 }
 
-/// Atomic claim-and-publish request — see `MSG_DID_REGISTER` for the
+/// Atomic claim-and-publish request — see `did-management/did/register/0.1` for the
 /// motivation. `path` is required; the DID payload is supplied via
 /// `did_data` (preferred) or `did_log` (legacy, webvh-only alias).
 /// `force` is only honoured when the caller is an admin taking over a
@@ -671,6 +671,81 @@ pub struct StatsSyncPayload {
     pub seq: u64,
     /// Per-DID counter deltas since the last sync.
     pub did_deltas: Vec<DidStatsDelta>,
+}
+
+/// The `server/stats-sync/0.1` payload an edge sends its control plane, as
+/// this service puts it on the wire today. Closed (R3.2): a control plane
+/// refuses a member it does not read rather than dropping it.
+///
+/// Not yet the pinned specification's shape (`instanceId`, `perMnemonic`,
+/// `buckets`): both ends of this workspace read and write this one, and
+/// conforming them is tracked separately.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatsSyncRequest {
+    /// The reporting edge's DID. Must be the document's signer; absent means
+    /// the signer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_did: Option<String>,
+    /// Monotonic per-process sequence number; `0` after a restart.
+    #[serde(default)]
+    pub seq: u64,
+    /// Per-DID counter deltas since the last sync.
+    #[serde(default)]
+    pub did_deltas: Vec<StatsSyncRequestDelta>,
+}
+
+/// One DID's counts in a [`StatsSyncRequest`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatsSyncRequestDelta {
+    pub mnemonic: String,
+    #[serde(default)]
+    pub resolve_delta: u64,
+    #[serde(default)]
+    pub update_delta: u64,
+    #[serde(default)]
+    pub last_resolved_at: Option<u64>,
+    #[serde(default)]
+    pub last_updated_at: Option<u64>,
+}
+
+/// Whether a control plane counted a [`StatsSyncRequest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatsSyncStatus {
+    /// The deltas were counted.
+    Accepted,
+    /// The sequence number was stale (a replay or a reordering): nothing was
+    /// counted.
+    Skipped,
+}
+
+/// A control plane's answer to a [`StatsSyncRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatsSyncAck {
+    pub status: StatsSyncStatus,
+    /// Why a sync was skipped (`stale_seq`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The `server/health/0.1#response` an edge answers a control plane's ping
+/// with, as this service puts it on the wire today (see
+/// [`StatsSyncRequest`] on the pinned specification). Closed: the control
+/// plane marks an instance active only on a pong it reads in full.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthPong {
+    /// `ok` from a healthy edge.
+    pub status: String,
+    /// The edge's package version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// How many DIDs the edge holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did_count: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
