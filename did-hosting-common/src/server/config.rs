@@ -1976,7 +1976,7 @@ pub fn apply_env_overrides(
     );
     let auto_create_var = format!("{prefix}_STORE_DYNAMODB_AUTO_CREATE");
     if let Ok(v) = std::env::var(&auto_create_var) {
-        store.dynamodb_auto_create = Some(v == "1" || v.eq_ignore_ascii_case("true"));
+        store.dynamodb_auto_create = Some(parse_env_bool(&auto_create_var, &v)?);
     }
     env_opt!(
         &format!("{prefix}_STORE_FIRESTORE_PROJECT"),
@@ -2508,6 +2508,59 @@ mod tests {
             assert!(err.contains(key), "{key}: {err}");
             assert!(err.contains("s, m, h or d"), "{key}: {err}");
         }
+    }
+
+    /// Every `[store]` key, the backend ones added for DynamoDB and Cosmos DB
+    /// included, is a known field under the strict parser and round-trips.
+    #[test]
+    fn every_store_key_is_a_known_field_and_round_trips() {
+        let toml_text = r#"
+data_dir = "data/x"
+redis_url = "redis://localhost:6379"
+dynamodb_table_prefix = "tbl"
+dynamodb_region = "eu-west-1"
+dynamodb_billing_mode = "provisioned"
+dynamodb_auto_create = false
+firestore_project = "proj"
+firestore_database = "db"
+cosmosdb_connection_string = "AccountEndpoint=x"
+cosmosdb_database = "webvh"
+cosmosdb_container = "kv2"
+cosmosdb_region = "eastus"
+"#;
+        let store: StoreConfig = toml::from_str(toml_text).expect("every key is known");
+        assert_eq!(store.dynamodb_billing_mode.as_deref(), Some("provisioned"));
+        assert_eq!(store.dynamodb_auto_create, Some(false));
+        assert_eq!(store.cosmosdb_container.as_deref(), Some("kv2"));
+        let again: StoreConfig = toml::from_str(&toml::to_string(&store).unwrap()).unwrap();
+        assert_eq!(again.dynamodb_auto_create, Some(false));
+        assert_eq!(again.cosmosdb_container.as_deref(), Some("kv2"));
+        assert!(toml::from_str::<StoreConfig>("cosmosdb_contianer = \"x\"").is_err());
+        assert!(toml::from_str::<StoreConfig>("dynamodb_auto_create = \"maybe\"").is_err());
+    }
+
+    /// `_STORE_DYNAMODB_AUTO_CREATE` is read as strictly as the other booleans.
+    #[test]
+    fn store_auto_create_env_is_strict() {
+        let apply = |store: &mut StoreConfig| {
+            apply_env_overrides(
+                "AUTOCREATETEST",
+                &mut FeaturesConfig::default(),
+                &mut ServerConfig::default(),
+                &mut LogConfig::default(),
+                store,
+                &mut AuthConfig::default(),
+                &mut SecretsConfig::default(),
+            )
+        };
+        let mut store = StoreConfig::default();
+        // SAFETY: test-only; the name is unique to this test.
+        unsafe { std::env::set_var("AUTOCREATETEST_STORE_DYNAMODB_AUTO_CREATE", "no") };
+        apply(&mut store).unwrap();
+        assert_eq!(store.dynamodb_auto_create, Some(false));
+        unsafe { std::env::set_var("AUTOCREATETEST_STORE_DYNAMODB_AUTO_CREATE", "sometimes") };
+        assert!(apply(&mut store).is_err());
+        unsafe { std::env::remove_var("AUTOCREATETEST_STORE_DYNAMODB_AUTO_CREATE") };
     }
 
     /// A misspelt key in a core section is refused, not silently dropped.

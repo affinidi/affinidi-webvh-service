@@ -378,10 +378,15 @@ mod tests {
         config.features.tsp = true;
         config.hosting.unassigned_purge_grace =
             did_hosting_common::server::config::GracePeriod::parse("45m").unwrap();
+        config.store.dynamodb_billing_mode = Some("provisioned".into());
+        config.store.dynamodb_auto_create = Some(false);
+        config.store.cosmosdb_container = Some("kv2".into());
         std::fs::write(&path, toml::to_string_pretty(&config).unwrap()).unwrap();
         let loaded = AppConfig::load(Some(path.clone())).expect("written config loads");
         assert_eq!(loaded.hosting.unassigned_purge_grace.as_secs(), 45 * 60);
         assert!(loaded.features.didcomm && loaded.features.tsp);
+        assert_eq!(loaded.store.dynamodb_auto_create, Some(false));
+        assert_eq!(loaded.store.cosmosdb_container.as_deref(), Some("kv2"));
 
         std::fs::write(&path, "[limits]\nupload_body_limt = 5\n").unwrap();
         let err = AppConfig::load(Some(path.clone())).unwrap_err().to_string();

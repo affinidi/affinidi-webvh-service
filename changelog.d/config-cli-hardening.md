@@ -15,7 +15,7 @@ two different binaries no longer loads; give each its own.
 
 Boolean environment overrides (`<PREFIX>_FEATURES_DIDCOMM`, `_TSP`,
 `_AGENT_NAMES`, `_HTTP_LISTENER`, `_SECRETS_VAULT_SKIP_VERIFY`,
-`_HOSTING_SCID_ALSO_KNOWN_AS`) accept `1`/`true`/`yes`/`on` and
+`_HOSTING_SCID_ALSO_KNOWN_AS`, `_STORE_DYNAMODB_AUTO_CREATE`) accept `1`/`true`/`yes`/`on` and
 `0`/`false`/`no`/`off` in any case. Anything else is a startup error naming
 the variable; before, `=yes` or `=on` turned the feature off.
 
