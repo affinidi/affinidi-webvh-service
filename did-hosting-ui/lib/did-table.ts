@@ -100,7 +100,7 @@ export function compactDid(did: string): string {
   if (parts[0] !== "did" || parts[1] !== "webvh" || parts.length < 4) {
     return truncateDid(did);
   }
-  const scid = parts[2];
+  const scid = parts[2] ?? "";
   const head = scid.length > 12 ? `${scid.slice(0, 12)}…` : scid;
   return `did:webvh:${head}:${parts[parts.length - 1]}`;
 }

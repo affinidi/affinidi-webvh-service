@@ -39,7 +39,7 @@ function decodeBase58btc(body: string): Uint8Array | null {
     let carry = BASE58BTC_ALPHABET.indexOf(ch);
     if (carry < 0) return null;
     for (let i = 0; i < bytes.length; i++) {
-      carry += bytes[i] * 58;
+      carry += bytes[i]! * 58;
       bytes[i] = carry & 0xff;
       carry >>= 8;
     }

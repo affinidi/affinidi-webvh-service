@@ -40,8 +40,8 @@ async function captureSessionKeypair(): Promise<{
   const spy = vi.spyOn(crypto.subtle, "generateKey");
   const result = await generateSessionKeypair();
   expect(spy).toHaveBeenCalledOnce();
-  const keypair = (await spy.mock.results[0].value) as CryptoKeyPair;
-  return { keypair, extractableArg: spy.mock.calls[0][1], result };
+  const keypair = (await spy.mock.results[0]!.value) as CryptoKeyPair;
+  return { keypair, extractableArg: spy.mock.calls[0]![1], result };
 }
 
 describe("generateSessionKeypair", () => {

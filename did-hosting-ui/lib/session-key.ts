@@ -306,9 +306,9 @@ function base58btcEncode(bytes: Uint8Array): string {
   // Convert from base-256 to base-58 by repeated division.
   const digits: number[] = [];
   for (let i = 0; i < bytes.length; i++) {
-    let carry = bytes[i];
+    let carry = bytes[i]!;
     for (let j = 0; j < digits.length; j++) {
-      carry += digits[j] << 8;
+      carry += digits[j]! << 8;
       digits[j] = carry % 58;
       carry = (carry / 58) | 0;
     }
@@ -320,7 +320,7 @@ function base58btcEncode(bytes: Uint8Array): string {
 
   let result = "";
   for (let i = 0; i < zeros; i++) result += B58_ALPHABET[0];
-  for (let i = digits.length - 1; i >= 0; i--) result += B58_ALPHABET[digits[i]];
+  for (let i = digits.length - 1; i >= 0; i--) result += B58_ALPHABET[digits[i]!];
   return result;
 }
 

@@ -16,7 +16,7 @@ export interface ScidParts {
 /** Split a `did:scid:vh:1` DID or DID URL, or `null` for anything else. */
 export function parseScid(did: string | undefined | null): ScidParts | null {
   if (!did || !did.startsWith(PREFIX)) return null;
-  const rest = did.slice(PREFIX.length).split("#")[0];
+  const rest = did.slice(PREFIX.length).split("#")[0] ?? "";
   const q = rest.indexOf("?");
   const scid = q === -1 ? rest : rest.slice(0, q);
   if (!scid || scid.includes(":") || scid.includes("/")) return null;
