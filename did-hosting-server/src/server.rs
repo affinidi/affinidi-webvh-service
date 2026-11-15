@@ -709,19 +709,18 @@ pub async fn start_didcomm_service(
         listeners: vec![listener],
     };
 
-    let svc = if tsp_enabled {
-        info!("starting messaging service with DIDComm + TSP on the mediator connection");
-        DIDCommService::start_with_tsp(
-            config,
-            router,
-            crate::tsp::ServerTspHandler::new(state.clone()),
-            shutdown,
-        )
-        .await
-    } else {
-        info!("starting DIDComm service with mediator connection");
-        DIDCommService::start(config, router, shutdown).await
-    }
+    // The TSP handler is installed whether or not this listener carries TSP
+    // yet: the service holds one handler for its lifetime and the listener's
+    // `protocols` gate whether TSP frames reach it, so a service started
+    // without one could never dispatch TSP after a rotation rebuilt the
+    // listener with TSP on (`rebuild_own_listener`).
+    let svc = DIDCommService::start_with_tsp(
+        config,
+        router,
+        crate::tsp::ServerTspHandler::new(state.clone()),
+        shutdown,
+    )
+    .await
     .map_err(|e| AppError::Internal(format!("failed to start messaging service: {e}")))?;
 
     info!(
