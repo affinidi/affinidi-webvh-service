@@ -156,6 +156,23 @@ re-resolved — it should be delivered *and answered*, not dropped.
 | `service identity unchanged` | The document's kids/mediator/protocols did not actually change. |
 | `no identity generation recorded — start the service once…` | The service has never resolved its own DID. Start it once, then rotate. |
 
+### When a running node picks up a rotation published elsewhere
+
+`identity-rotate-keys` runs against a stopped service, which then boots on the new
+generation. When a node's DID is instead updated while it runs (a VTA publishing a
+new log entry), each node notices on its own trigger — no restart needed:
+
+| Node | Picks the rotation up |
+|---|---|
+| control plane / daemon | at once, when the new version is registered (`did/register`) |
+| server (edge) | at once, when the control plane's sync of its DID arrives |
+| witness | within 5 minutes — the identity sweep's reload |
+| watcher | within 5 minutes — the identity sweep's reload |
+
+Look for `service identity rotated — rebuilding listener` (or the witness's and
+watcher's equivalents). The rebuilt listener carries the same transports the node
+booted with, including TSP.
+
 ## 2. Restart mid-window — the durability requirement
 
 **This is the requirement the whole design exists for.** Do it while generation 0
