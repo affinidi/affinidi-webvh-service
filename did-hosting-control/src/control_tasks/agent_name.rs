@@ -7,7 +7,6 @@ use tracing::info;
 use super::{Cx, TaskError, at, spec_record, typed};
 use crate::did_ops;
 use crate::error::AppError;
-use crate::server_push;
 
 /// The signed `did.jsonl` a mutating verb carries. The host keeps webvh logs,
 /// which are text; an object-form `didData` names no log this host can store.
@@ -50,8 +49,6 @@ pub(crate) async fn update(
         desired,
     )
     .await?;
-    // Every update publishes a new version, so the edges need it.
-    server_push::notify_servers_did(state, p.mnemonic.to_string());
     info!(did = %auth.did, mnemonic = %p.mnemonic.as_str(), name = %p.name.as_str(), state = ?desired, "agent name updated");
     typed(
         json!({ "record": spec_record::<update::v0_1::DidRecord>(state, &record)? }),
@@ -76,7 +73,6 @@ pub(crate) async fn remove(
         p.domain.as_deref(),
     )
     .await?;
-    server_push::notify_servers_did(state, p.mnemonic.to_string());
     info!(did = %auth.did, mnemonic = %p.mnemonic.as_str(), name = %p.name.as_str(), "agent name removed");
     typed(
         json!({ "record": spec_record::<remove::v0_1::DidRecord>(state, &record)? }),

@@ -15,7 +15,6 @@
 
 use did_hosting_common::did_ops::{self, DidRecord};
 use did_hosting_common::didcomm_types::*;
-use serde_json::json;
 use tracing::{debug, info, warn};
 
 use crate::registry::{self, ServiceType};
@@ -82,177 +81,267 @@ pub fn parse_reported(body: &serde_json::Value) -> std::collections::HashMap<Str
         .unwrap_or_default()
 }
 
-/// Enqueue published DIDs to one server's outbox — only the ones it doesn't
-/// already hold, as the same DID at the current version ([`edge_is_current`]).
+/// Resync a (re-)registering server: its domains first — records, statuses
+/// and unsettled assign/unassign/purge ops ([`sync_all_domains_now`]) — then
+/// the DIDs it does not already hold ([`sync_all_dids_now`]). One task, so
+/// the domain rows always queue ahead of the DID rows for that server.
 ///
-/// `reported` maps mnemonic → what the registering server says it holds (from
-/// the `preloaded_dids` in its register payload). An **empty** map means a full
-/// push — the correct behaviour for a server with an empty store.
-///
-/// Each DID is one outbox row; the worker drains them in enqueue order so the
-/// server applies them deterministically, and a control restart mid-bulk
-/// resumes from the remaining rows. Sending only the delta is what keeps a
-/// reboot from re-pushing every DID (and re-triggering the server's own-DID
-/// identity-rotation check) at thousands-of-DIDs scale.
+/// `served_domains` are the domains the server says it serves and the control
+/// plane assigned it: an acknowledged assign it still reports is not re-sent.
+pub fn resync_server(
+    state: &AppState,
+    server_did: String,
+    reported: std::collections::HashMap<String, ReportedDid>,
+    served_domains: Vec<String>,
+) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        sync_all_domains_now(&state, &server_did, &served_domains).await;
+        sync_all_dids_now(&state, &server_did, reported).await;
+    });
+}
+
+/// [`sync_all_dids_now`] on a task of its own.
 pub fn sync_all_dids_to_server(
     state: &AppState,
     server_did: String,
     reported: std::collections::HashMap<String, ReportedDid>,
 ) {
-    let dids_ks = state.dids_ks.clone();
-    let registry_ks = state.registry_ks.clone();
-    let store = state.store.clone();
-    let notify = state.outbox_notify.clone();
-
+    let state = state.clone();
     tokio::spawn(async move {
-        // Batch this server's sync only if it advertised the capability at
-        // registration (mirrors `sync_batch_capable`). A resync fires one
-        // transport-level TSP reply per inbound frame; batching many DIDs into
-        // one frame keeps that reply from bursting past the mediator's rate
-        // limit. Servers that didn't advertise it get one message per DID.
-        let instance_id = server_did.replace(':', "_");
-        let batch = crate::registry::get_instance(&registry_ks, &instance_id)
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|inst| inst.sync_batch_capable);
+        sync_all_dids_now(&state, &server_did, reported).await;
+    });
+}
 
-        // Iterate all published DIDs
-        let raw = match dids_ks.prefix_iter_raw("did:").await {
-            Ok(raw) => raw,
+/// How many DID records one page of the resync scan reads.
+const RESYNC_PAGE: usize = 500;
+
+/// How a resync groups the slots it queues for a batch-capable server.
+struct BatchBuilder {
+    mnemonics: Vec<String>,
+    /// The slots' content, estimated from their records: what the frame will
+    /// carry.
+    content_bytes: usize,
+    /// The row's own size: its mnemonics.
+    row_bytes: usize,
+    /// The largest row the store takes, less room for the entry around the
+    /// mnemonics.
+    row_cap: usize,
+}
+
+impl BatchBuilder {
+    /// Room left for the fields of the entry around the mnemonic list.
+    const ROW_OVERHEAD: usize = 4 * 1024;
+
+    fn new(store: &crate::store::Store) -> Self {
+        Self {
+            mnemonics: Vec::new(),
+            content_bytes: 0,
+            row_bytes: 0,
+            row_cap: store.max_item_bytes().map_or(usize::MAX, |m| {
+                m.saturating_sub(Self::ROW_OVERHEAD).max(1024)
+            }),
+        }
+    }
+
+    /// Whether `mnemonic` (with `content` bytes) must start a new batch.
+    fn full_before(&self, mnemonic: &str, content: usize) -> bool {
+        !self.mnemonics.is_empty()
+            && (self.mnemonics.len() >= crate::outbox::SYNC_BATCH_MAX_COUNT
+                || self.content_bytes + content > crate::outbox::SYNC_BATCH_MAX_BYTES
+                || self.row_bytes + mnemonic.len() + 3 > self.row_cap)
+    }
+
+    fn push(&mut self, mnemonic: String, content: usize) {
+        self.content_bytes += content;
+        self.row_bytes += mnemonic.len() + 3;
+        self.mnemonics.push(mnemonic);
+    }
+
+    fn take(&mut self) -> Vec<String> {
+        self.content_bytes = 0;
+        self.row_bytes = 0;
+        std::mem::take(&mut self.mnemonics)
+    }
+}
+
+/// The `outbox-ref:` suffix marking the last batch row of a resync, while it
+/// is queued.
+const RESYNC_BATCH_REF: &str = "resync-batch";
+
+/// Queue to one server the published DIDs it does not already hold, as the
+/// same DID at the current version ([`edge_is_current`]), then deletes for
+/// slots it reports that the control plane no longer publishes.
+///
+/// `reported` maps mnemonic → what the registering server says it holds (from
+/// the `preloaded_dids` in its register payload). An **empty** map means a full
+/// push — the correct behaviour for a server with an empty store.
+///
+/// The rows are references ([`crate::outbox::Subject`]): the worker reads each
+/// slot when it sends, and a slot already queued for this server is not queued
+/// again, so a server that registers while its queue is still draining does
+/// not have the same delta appended each time. A batch-capable server gets the
+/// slots in `sync/batch` rows; while one from an earlier resync is still
+/// queued, the next resync leaves the DIDs to it (and to the per-DID rows a
+/// later change adds) and only re-checks once it has drained. The scan pages
+/// through the records rather than reading them all at once.
+pub async fn sync_all_dids_now(
+    state: &AppState,
+    server_did: &str,
+    reported: std::collections::HashMap<String, ReportedDid>,
+) {
+    use crate::outbox::Subject;
+
+    // Batch this server's sync only if it advertised the capability at
+    // registration. A resync fires one transport-level TSP reply per inbound
+    // frame; batching many DIDs into one frame keeps that reply from bursting
+    // past the mediator's rate limit.
+    let batch_capable = crate::registry::get_instance_for_did(&state.registry_ks, server_did)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|inst| inst.sync_batch_capable);
+    if batch_capable {
+        match crate::outbox::resync_batch_queued(&state.store, server_did, RESYNC_BATCH_REF).await {
+            Ok(true) => {
+                info!(
+                    server_did,
+                    "resync: an earlier resync is still queued for this server; leaving the DIDs to it"
+                );
+                return;
+            }
+            Ok(false) => {}
             Err(e) => {
-                warn!(error = %e, "sync_all_dids: failed to iterate DIDs");
+                crate::outbox::note_enqueue_failure(server_did, "resync", &e);
+                return;
+            }
+        }
+    }
+
+    let mut count = 0u64; // DIDs queued
+    let mut frames = 0u64; // outbox rows enqueued
+    // Mnemonics this control plane publishes; whatever the server reports
+    // beyond these it should no longer serve (a delete it missed).
+    let mut published: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut batch = BatchBuilder::new(&state.store);
+    let mut last_batch: Option<Vec<u8>> = None;
+
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let (rows, next) = match state
+            .dids_ks
+            .prefix_page_raw("did:", cursor.take(), RESYNC_PAGE)
+            .await
+        {
+            Ok(Some(page)) => (page.rows, page.next),
+            Ok(None) => match state.dids_ks.prefix_iter_raw("did:").await {
+                Ok(all) => (all, None),
+                Err(e) => {
+                    warn!(error = %e, "sync_all_dids: failed to iterate DIDs");
+                    return;
+                }
+            },
+            Err(e) => {
+                warn!(error = %e, "sync_all_dids: failed to page DIDs");
                 return;
             }
         };
-
-        let mut count = 0u64; // DIDs queued
-        let mut frames = 0u64; // outbox rows (transport frames) enqueued
-        // Mnemonics this control plane publishes; whatever the server reports
-        // beyond these it should no longer serve (a delete it missed).
-        let mut published: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut pending: Vec<serde_json::Value> = Vec::new();
-        let mut pending_bytes = 0usize;
-
-        for (_key, value) in raw {
-            let record: DidRecord = match serde_json::from_slice(&value) {
-                Ok(r) => r,
-                Err(_) => continue,
+        for (_key, value) in rows {
+            let Ok(record) = serde_json::from_slice::<DidRecord>(&value) else {
+                continue;
             };
-
             if record.version_count == 0 {
                 continue;
             }
             published.insert(record.mnemonic.clone());
-
             // Delta: the registering server already has this same DID at this
             // version or newer — nothing to push.
             if edge_is_current(&record, reported.get(&record.mnemonic)) {
                 continue;
             }
-
-            let log_content = match dids_ks
-                .get_raw(did_ops::content_log_key(&record.mnemonic))
+            if !batch_capable {
+                match crate::outbox::enqueue_ref(
+                    state,
+                    server_did,
+                    Subject::Did {
+                        mnemonic: record.mnemonic.clone(),
+                    },
+                )
                 .await
-            {
-                Ok(Some(bytes)) => match String::from_utf8(bytes) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                },
-                _ => continue,
-            };
-
-            let witness_content = match dids_ks
-                .get_raw(did_ops::content_witness_key(&record.mnemonic))
-                .await
-            {
-                Ok(Some(bytes)) => String::from_utf8(bytes).ok(),
-                _ => None,
-            };
-
-            let Some(body) = sync_update_body(&record, log_content, witness_content) else {
-                continue;
-            };
-
-            if !batch {
-                if let Err(e) =
-                    crate::outbox::enqueue(&store, &server_did, MSG_SYNC_UPDATE, body).await
                 {
-                    warn!(server_did = %server_did, mnemonic = %record.mnemonic, error = %e, "sync_all_dids: outbox enqueue failed");
-                } else {
-                    count += 1;
-                    frames += 1;
+                    Ok(true) => {
+                        count += 1;
+                        frames += 1;
+                    }
+                    Ok(false) => {}
+                    Err(e) => crate::outbox::note_enqueue_failure(server_did, "resync", &e),
                 }
                 continue;
             }
-
-            // Batched: flush before this entry would breach the count or byte
-            // cap, so a single DID never lands split across two frames.
-            let sz = body.to_string().len();
-            if !pending.is_empty()
-                && (pending.len() >= SYNC_BATCH_MAX_COUNT
-                    || pending_bytes + sz > SYNC_BATCH_MAX_BYTES)
-            {
-                let payload = json!({ "updates": std::mem::take(&mut pending) });
-                pending_bytes = 0;
-                if let Err(e) =
-                    crate::outbox::enqueue(&store, &server_did, MSG_SYNC_BATCH, payload).await
-                {
-                    warn!(server_did = %server_did, error = %e, "sync_all_dids: outbox batch enqueue failed");
-                } else {
-                    frames += 1;
+            let content = record.content_size as usize;
+            if batch.full_before(&record.mnemonic, content) {
+                match crate::outbox::enqueue_batch(&state.store, server_did, batch.take()).await {
+                    Ok(key) => {
+                        frames += 1;
+                        last_batch = Some(key);
+                    }
+                    Err(e) => crate::outbox::note_enqueue_failure(server_did, "resync batch", &e),
                 }
             }
-            pending_bytes += sz;
-            pending.push(body);
+            batch.push(record.mnemonic.clone(), content);
             count += 1;
         }
-
-        // Flush the trailing batch.
-        if !pending.is_empty() {
-            let payload = json!({ "updates": pending });
-            if let Err(e) =
-                crate::outbox::enqueue(&store, &server_did, MSG_SYNC_BATCH, payload).await
-            {
-                warn!(server_did = %server_did, error = %e, "sync_all_dids: outbox batch enqueue failed");
-            } else {
+        match next {
+            Some(n) => cursor = Some(n),
+            None => break,
+        }
+    }
+    if !batch.mnemonics.is_empty() {
+        match crate::outbox::enqueue_batch(&state.store, server_did, batch.take()).await {
+            Ok(key) => {
                 frames += 1;
+                last_batch = Some(key);
             }
+            Err(e) => crate::outbox::note_enqueue_failure(server_did, "resync batch", &e),
         }
+    }
+    if let Some(key) = last_batch
+        && let Err(e) =
+            crate::outbox::mark_resync_batch(&state.store, server_did, RESYNC_BATCH_REF, key).await
+    {
+        debug!(server_did, error = %e, "resync: failed to mark the resync's last batch");
+    }
 
-        // Deletes the server missed: it reports a DID this control plane no
-        // longer publishes. Queued after the updates, in order.
-        let mut deletes = 0u64;
-        for mnemonic in reported.keys().filter(|m| !published.contains(*m)) {
-            if let Err(e) = crate::outbox::enqueue(
-                &store,
-                &server_did,
-                MSG_SYNC_DELETE,
-                json!({ "mnemonic": mnemonic }),
-            )
-            .await
-            {
-                warn!(server_did = %server_did, %mnemonic, error = %e, "resync: delete enqueue failed");
-            } else {
-                deletes += 1;
-            }
+    // Deletes the server missed: it reports a DID this control plane no
+    // longer publishes. Queued after the updates; each is a reference, so a
+    // slot re-created before it is sent goes out as its new content instead.
+    let mut deletes = 0u64;
+    for mnemonic in reported.keys().filter(|m| !published.contains(*m)) {
+        match crate::outbox::enqueue_ref(
+            state,
+            server_did,
+            Subject::Did {
+                mnemonic: mnemonic.clone(),
+            },
+        )
+        .await
+        {
+            Ok(true) => deletes += 1,
+            Ok(false) => {}
+            Err(e) => crate::outbox::note_enqueue_failure(server_did, "resync delete", &e),
         }
-        if deletes > 0 {
-            notify.notify_one();
-            info!(server_did = %server_did, deletes, "resync: queued deletes the server missed");
-        }
-
-        if count > 0 {
-            notify.notify_one();
-            info!(
-                server_did = %server_did,
-                count,
-                frames,
-                batched = batch,
-                "initial DID sync queued for newly registered server"
-            );
-        }
-    });
+    }
+    if deletes > 0 || count > 0 {
+        state.outbox_notify.notify_one();
+        info!(
+            server_did,
+            count,
+            frames,
+            deletes,
+            batched = batch_capable,
+            "DID resync queued for registering server"
+        );
+    }
 }
 
 /// The `webvh/sync/update/0.2` payload for a stored slot — the same shape each
@@ -289,201 +378,204 @@ pub(crate) fn sync_update_body(
     }
 }
 
-/// Max DIDs per `MSG_SYNC_BATCH`, and max serialized bytes. Bounds message size
-/// (each DID carries a full `did.jsonl`) while collapsing the resync burst.
-const SYNC_BATCH_MAX_COUNT: usize = 50;
-const SYNC_BATCH_MAX_BYTES: usize = 512 * 1024;
+/// How many targets a DID mutation queues inside its own transaction. Each
+/// costs three writes (row, coalescing index, target marker); past this, the
+/// rest are queued right after the commit, still under the slot's lock, so a
+/// fleet larger than a bounded backend's transaction (DynamoDB: 100 writes)
+/// never makes a DID unpublishable.
+const MAX_TRANSACTIONAL_TARGETS: usize = 10;
 
-/// Enqueue a DID update to every active server instance.
+/// What a DID mutation did to its slot, for [`stage_did_sync`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DidChange<'a> {
+    /// New content was committed: `log` is the slot's log as committed.
+    Published { log: &'a str },
+    /// The slot's record changed without new content (disabled state,
+    /// witness proofs).
+    Updated,
+    /// The slot was deleted.
+    Deleted,
+}
+
+/// What [`stage_did_sync`] could not put in the batch, to finish after the
+/// commit.
+#[must_use = "call `finish` after the batch commits"]
+#[derive(Debug, Default)]
+pub(crate) struct StagedSync {
+    mnemonic: String,
+    staged: usize,
+    deferred: Vec<String>,
+}
+
+impl StagedSync {
+    /// After the batch committed, still holding the slot's lock: queue the
+    /// targets past [`MAX_TRANSACTIONAL_TARGETS`] and wake the worker.
+    pub(crate) async fn finish(self, state: &AppState) {
+        for target in &self.deferred {
+            if let Err(e) = crate::outbox::enqueue_ref_locked(
+                state,
+                target,
+                crate::outbox::Subject::Did {
+                    mnemonic: self.mnemonic.clone(),
+                },
+            )
+            .await
+            {
+                crate::outbox::note_enqueue_failure(target, "DID sync", &e);
+            }
+        }
+        if self.staged > 0 || !self.deferred.is_empty() {
+            state.outbox_notify.notify_one();
+        }
+    }
+}
+
+/// Queue the sync of a changed slot to every server and watcher that should
+/// hold it, **in the mutation's own `batch`** — the transactional outbox. The
+/// caller holds the slot's `path_locks` guard from before this call until
+/// after [`StagedSync::finish`]; the rows commit with the mutation or not at
+/// all, and a slot's rows reach each target in commit order.
 ///
-/// Builds the sync body from the current store contents, then writes
-/// one outbox row per active server. The worker handles delivery;
-/// servers that are offline at enqueue time still get the update
-/// when they reconnect.
-pub fn notify_servers_did(state: &AppState, mnemonic: String) {
-    let watcher_peers = state.config.registry.watchers.clone();
-    let registry_ks = state.registry_ks.clone();
-    let dids_ks = state.dids_ks.clone();
-    let store = state.store.clone();
-    let notify = state.outbox_notify.clone();
+/// Targets: every active server, plus — for a publish — the configured
+/// watchers the log names (recorded, so a later delete reaches only them), or
+/// — for a delete — the watchers recorded at its last publish. A row is a
+/// reference ([`crate::outbox::Subject::Did`]): the worker sends whatever the
+/// slot holds when it sends, a delete included. A target with the slot
+/// already queued gets no second row.
+///
+/// Best effort: a failure to read the registry or the queue is logged and
+/// counted, and the mutation commits anyway — the server converges on its
+/// next registration.
+pub(crate) async fn stage_did_sync(
+    state: &AppState,
+    batch: &mut crate::store::WriteBatch,
+    mnemonic: &str,
+    change: DidChange<'_>,
+) -> StagedSync {
+    let mut staged = StagedSync {
+        mnemonic: mnemonic.to_string(),
+        ..StagedSync::default()
+    };
+    let mut targets: Vec<String> = Vec::new();
 
-    tokio::spawn(async move {
-        info!(mnemonic = %mnemonic, "DID changed — queueing sync to servers");
-
-        let record = match dids_ks.get::<DidRecord>(did_ops::did_key(&mnemonic)).await {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                warn!(mnemonic = %mnemonic, "DID sync: record not found in store");
-                return;
+    let watchers = match change {
+        DidChange::Published { log } => {
+            // The watchers the log names, through the configured URL → DID
+            // map. Recorded on every publish (even an empty list) so a later
+            // delete reaches only the watchers it was published to — fanning
+            // a delete out to every configured watcher would tell watchers
+            // that never mirrored the DID that its mnemonic even existed.
+            let named = watcher_dids_for(&state.config.registry.watchers, log);
+            if let Err(e) = batch.insert(&state.dids_ks, notified_watchers_key(mnemonic), &named) {
+                warn!(mnemonic, error = %e, "DID sync: failed to record notified watchers");
             }
-            Err(e) => {
-                warn!(mnemonic = %mnemonic, error = %e, "DID sync: failed to read record");
-                return;
-            }
-        };
+            named
+        }
+        DidChange::Updated => state
+            .dids_ks
+            .get::<Vec<String>>(notified_watchers_key(mnemonic))
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        DidChange::Deleted => {
+            let named = state
+                .dids_ks
+                .get::<Vec<String>>(notified_watchers_key(mnemonic))
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            batch.remove(&state.dids_ks, notified_watchers_key(mnemonic));
+            named
+        }
+    };
+    targets.extend(watchers.iter().cloned());
 
-        let log_content = match dids_ks.get_raw(did_ops::content_log_key(&mnemonic)).await {
-            Ok(Some(bytes)) => match String::from_utf8(bytes) {
-                Ok(s) => s,
-                Err(_) => {
-                    warn!(mnemonic = %mnemonic, "DID sync: invalid UTF-8 in log content");
-                    return;
+    match push_targets(&state.registry_ks).await {
+        PushTargets::Active(servers) => {
+            for (server_did, _) in servers {
+                if !targets.contains(&server_did) {
+                    targets.push(server_did);
                 }
-            },
-            Ok(None) => {
-                warn!(mnemonic = %mnemonic, "DID sync: no log content found");
-                return;
             }
+        }
+        other if watchers.is_empty() => other.log("DID sync", mnemonic),
+        _ => {}
+    }
+
+    for target in targets {
+        if staged.staged >= MAX_TRANSACTIONAL_TARGETS {
+            staged.deferred.push(target);
+            continue;
+        }
+        match crate::outbox::stage_ref(
+            batch,
+            &state.store,
+            &target,
+            crate::outbox::Subject::Did {
+                mnemonic: mnemonic.to_string(),
+            },
+        )
+        .await
+        {
+            Ok(true) => {
+                staged.staged += 1;
+                debug!(target_did = %target, mnemonic, ?change, "DID sync: queued");
+            }
+            Ok(false) => debug!(target_did = %target, mnemonic, "DID sync: already queued"),
+            Err(e) => crate::outbox::note_enqueue_failure(&target, "DID sync", &e),
+        }
+    }
+    staged
+}
+
+/// Queue a DID's current state to every active server (and the watchers its
+/// log names) outside a mutation — for a slot written by something other than
+/// the DID operations, which stage their rows transactionally
+/// ([`stage_did_sync`]). Runs on a task of its own.
+pub fn notify_servers_did(state: &AppState, mnemonic: String) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let _guard = state.path_locks.guard(&mnemonic).await;
+        let log = match state
+            .dids_ks
+            .get_raw(did_ops::content_log_key(&mnemonic))
+            .await
+        {
+            Ok(Some(bytes)) => String::from_utf8(bytes).unwrap_or_default(),
+            Ok(None) => String::new(),
             Err(e) => {
                 warn!(mnemonic = %mnemonic, error = %e, "DID sync: failed to read log");
                 return;
             }
         };
-
-        let witness_content = match dids_ks
-            .get_raw(did_ops::content_witness_key(&mnemonic))
-            .await
-        {
-            Ok(Some(bytes)) => String::from_utf8(bytes).ok(),
-            _ => None,
-        };
-
-        let log_for_watchers = log_content.clone();
-        let Some(body) = sync_update_body(&record, log_content, witness_content) else {
-            return;
-        };
-
-        // The watchers the log names, through the configured URL → DID map.
-        let watchers = watcher_dids_for(&watcher_peers, &log_for_watchers);
-        for watcher_did in &watchers {
-            match crate::outbox::enqueue(&store, watcher_did, MSG_SYNC_UPDATE, body.clone()).await {
-                Ok(_) => info!(watcher_did, mnemonic = %mnemonic, "DID sync: queued for watcher"),
-                Err(e) => warn!(
-                    watcher_did,
-                    mnemonic = %mnemonic,
-                    error = %e,
-                    "DID sync: outbox enqueue failed"
-                ),
-            }
+        let mut batch = state.store.batch();
+        let staged = stage_did_sync(
+            &state,
+            &mut batch,
+            &mnemonic,
+            DidChange::Published { log: &log },
+        )
+        .await;
+        match batch.commit().await {
+            Ok(()) => staged.finish(&state).await,
+            Err(e) => crate::outbox::note_enqueue_failure("*", "DID sync", &e),
         }
-        // Record which watchers this publish named, so a later delete for the
-        // same mnemonic (`notify_servers_delete`) reaches only them — a slot
-        // most watchers never held is not their business, and fanning a
-        // delete out to every configured watcher would tell watchers that
-        // never mirrored the DID that its mnemonic even existed. Written on
-        // every publish (even an empty list) so the record always reflects
-        // the log's current `watchers` parameter, not a stale earlier one.
-        if let Err(e) = dids_ks
-            .insert(notified_watchers_key(&mnemonic), &watchers)
-            .await
-        {
-            warn!(mnemonic = %mnemonic, error = %e, "DID sync: failed to record notified watchers");
-        }
-
-        let servers = match push_targets(&registry_ks).await {
-            PushTargets::Active(s) => s,
-            other => {
-                if watchers.is_empty() {
-                    other.log("DID sync", &mnemonic);
-                } else {
-                    notify.notify_one();
-                }
-                return;
-            }
-        };
-
-        for (server_did, instance_id) in &servers {
-            if let Err(e) =
-                crate::outbox::enqueue(&store, server_did, MSG_SYNC_UPDATE, body.clone()).await
-            {
-                warn!(
-                    server_did,
-                    instance_id,
-                    mnemonic = %mnemonic,
-                    error = %e,
-                    "DID sync: outbox enqueue failed"
-                );
-            } else {
-                info!(
-                    server_did,
-                    instance_id,
-                    mnemonic = %mnemonic,
-                    "DID sync: queued for server"
-                );
-            }
-        }
-        notify.notify_one();
     });
 }
 
-/// Enqueue a DID-delete sync to every active server instance.
+/// [`notify_servers_did`] for a deleted slot.
 pub fn notify_servers_delete(state: &AppState, mnemonic: String) {
-    let registry_ks = state.registry_ks.clone();
-    let dids_ks = state.dids_ks.clone();
-    let store = state.store.clone();
-    let notify = state.outbox_notify.clone();
-
+    let state = state.clone();
     tokio::spawn(async move {
-        info!(mnemonic = %mnemonic, "DID deleted — queueing sync to servers");
-
-        let body = json!({ "mnemonic": mnemonic });
-        // The log is gone, so which watchers it named at publish time is read
-        // back from what `notify_servers_did` recorded there — not every
-        // configured watcher. A watcher this mnemonic was never sent to has
-        // no business learning it ever existed, which fanning the delete out
-        // to the whole registry would do. One of the named watchers that
-        // mirrors nothing for the slot (already deleted, missed the publish)
-        // answers `absent`, same as before.
-        let watcher_dids: Vec<String> = dids_ks
-            .get(notified_watchers_key(&mnemonic))
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        for watcher_did in &watcher_dids {
-            if let Err(e) =
-                crate::outbox::enqueue(&store, watcher_did, MSG_SYNC_DELETE, body.clone()).await
-            {
-                warn!(watcher_did, mnemonic = %mnemonic, error = %e, "DID delete sync: outbox enqueue failed");
-            }
+        let _guard = state.path_locks.guard(&mnemonic).await;
+        let mut batch = state.store.batch();
+        let staged = stage_did_sync(&state, &mut batch, &mnemonic, DidChange::Deleted).await;
+        match batch.commit().await {
+            Ok(()) => staged.finish(&state).await,
+            Err(e) => crate::outbox::note_enqueue_failure("*", "DID delete sync", &e),
         }
-        if let Err(e) = dids_ks.remove(notified_watchers_key(&mnemonic)).await {
-            warn!(mnemonic = %mnemonic, error = %e, "DID delete sync: failed to clear notified-watchers record");
-        }
-
-        let servers = match push_targets(&registry_ks).await {
-            PushTargets::Active(s) => s,
-            other => {
-                if watcher_dids.is_empty() {
-                    other.log("DID delete sync", &mnemonic);
-                } else {
-                    notify.notify_one();
-                }
-                return;
-            }
-        };
-
-        for (server_did, instance_id) in &servers {
-            if let Err(e) =
-                crate::outbox::enqueue(&store, server_did, MSG_SYNC_DELETE, body.clone()).await
-            {
-                warn!(
-                    server_did,
-                    instance_id,
-                    mnemonic = %mnemonic,
-                    error = %e,
-                    "DID delete sync: outbox enqueue failed"
-                );
-            } else {
-                info!(
-                    server_did,
-                    instance_id,
-                    mnemonic = %mnemonic,
-                    "DID delete sync: queued for server"
-                );
-            }
-        }
-        notify.notify_one();
     });
 }
 
@@ -652,7 +744,7 @@ async fn push_targets(registry_ks: &crate::store::KeyspaceHandle) -> PushTargets
 //
 // All control→server pushes route through `crate::outbox` for durable,
 // at-least-once delivery: enqueue first, worker delivers. Returning
-// Ok means the row hit fjall, not that the server has acknowledged
+// Ok means the row is durable, not that the server has acknowledged
 // — that's by design so a transient mediator outage or a temporarily-
 // offline server doesn't drop the mutation. Recipients are
 // idempotent (assign/unassign/purge/upsert all no-op on repeat).
@@ -671,13 +763,19 @@ pub enum DomainOp {
 /// server's assignment of the domain should be. Kept so a server that missed
 /// the op (offline past its outbox budget) is brought back in line when it
 /// next registers ([`resend_domain_intents`]); an unassign or purge is settled
-/// once the server acknowledges it, an assign is kept (it is the desired
-/// state, and re-sending it is a no-op).
+/// once the server acknowledges it. An assign is kept (it is the desired
+/// state, and what a registering server's `served_domains` claim is checked
+/// against) and marked `acked` once the server applies it: it is then re-sent
+/// only to a server that registers without the domain (a wiped edge).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DomainIntent {
     pub domain: String,
     pub op: DomainOp,
     pub at: u64,
+    /// The server acknowledged this op (as applied). Only an assign is kept
+    /// once acknowledged.
+    #[serde(default)]
+    pub acked: bool,
 }
 
 /// `|` cannot occur in a DID, so one server's prefix never matches another's.
@@ -704,6 +802,7 @@ async fn record_domain_intent(
                 domain: domain.to_string(),
                 op,
                 at: crate::auth::session::now_epoch(),
+                acked: false,
             },
         )
         .await
@@ -723,17 +822,38 @@ pub async fn domain_intents(
         .collect())
 }
 
-/// A server acknowledged `op` for `domain`: an unassign or purge is settled —
-/// but only when it is still the latest op, so the ack of an older unassign
-/// cannot erase a newer assign.
-pub async fn settle_domain_intent(state: &AppState, server_did: &str, domain: &str, op: DomainOp) {
-    if op == DomainOp::Assign {
-        return;
-    }
+/// A server acknowledged `op` for `domain`, only while `op` is still the latest
+/// op recorded for it (the ack of an older unassign cannot erase a newer
+/// assign): an unassign or purge is settled (removed); an assign the server
+/// `applied` is marked acknowledged.
+pub async fn settle_domain_intent(
+    state: &AppState,
+    server_did: &str,
+    domain: &str,
+    op: DomainOp,
+    applied: bool,
+) {
     let key = domain_intent_key(server_did, domain);
+    let _guard = state.path_locks.guard(&key).await;
     match state.registry_ks.get::<DomainIntent>(key.clone()).await {
         Ok(Some(intent)) if intent.op == op => {
-            if let Err(e) = state.registry_ks.remove(key).await {
+            let written = match op {
+                DomainOp::Assign if applied && !intent.acked => {
+                    state
+                        .registry_ks
+                        .insert(
+                            key,
+                            &DomainIntent {
+                                acked: true,
+                                ..intent
+                            },
+                        )
+                        .await
+                }
+                DomainOp::Assign => Ok(()),
+                DomainOp::Unassign | DomainOp::Purge => state.registry_ks.remove(key).await,
+            };
+            if let Err(e) = written {
                 warn!(server_did, domain, error = %e, "failed to settle domain intent");
             }
         }
@@ -745,8 +865,22 @@ pub async fn settle_domain_intent(state: &AppState, server_did: &str, domain: &s
 /// Re-send every unsettled domain operation to a (re-)registering server: its
 /// assignments, and any unassign or purge it has not acknowledged. Idempotent
 /// on the server. A purge is preceded by its unassign, so a server that missed
-/// both ends up unassigned and purged.
+/// both ends up unassigned and purged. Every assign is re-sent; see
+/// [`resend_domain_intents_for`] for a server that reported what it serves.
 pub async fn resend_domain_intents(state: &AppState, server_did: &str) {
+    resend_domain_intents_for(state, server_did, None).await;
+}
+
+/// [`resend_domain_intents`], with the domains the server reported serving
+/// at registration: an assign it acknowledged and still serves is not
+/// re-sent. An op already the latest queued for its domain is not queued
+/// again, so a server registering while its queue drains does not collect
+/// copies.
+pub async fn resend_domain_intents_for(
+    state: &AppState,
+    server_did: &str,
+    served: Option<&[String]>,
+) {
     let intents = match domain_intents(state, server_did).await {
         Ok(i) => i,
         Err(e) => {
@@ -756,20 +890,32 @@ pub async fn resend_domain_intents(state: &AppState, server_did: &str) {
     };
     for intent in intents {
         let ops: &[&str] = match intent.op {
+            DomainOp::Assign
+                if intent.acked && served.is_some_and(|s| s.contains(&intent.domain)) =>
+            {
+                continue;
+            }
             DomainOp::Assign => &[MSG_REPLICA_DOMAIN_ASSIGN],
             DomainOp::Unassign => &[MSG_REPLICA_DOMAIN_UNASSIGN],
             DomainOp::Purge => &[MSG_REPLICA_DOMAIN_UNASSIGN, MSG_REPLICA_DOMAIN_PURGE],
         };
+        // The last op of the sequence queued and still pending means the
+        // whole sequence is: nothing to add.
+        let last = ops[ops.len() - 1];
+        match crate::outbox::domain_op_queued(&state.store, server_did, last, &intent.domain).await
+        {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => {
+                crate::outbox::note_enqueue_failure(server_did, "domain resync", &e);
+                continue;
+            }
+        }
         for op in ops {
-            if let Err(e) = crate::outbox::enqueue(
-                &state.store,
-                server_did,
-                op,
-                json!({ "domain": intent.domain }),
-            )
-            .await
+            if let Err(e) =
+                crate::outbox::enqueue_domain_op(&state.store, server_did, op, &intent.domain).await
             {
-                warn!(server_did, domain = %intent.domain, op, error = %e, "domain resync: enqueue failed");
+                crate::outbox::note_enqueue_failure(server_did, "domain resync", &e);
             }
         }
     }
@@ -802,13 +948,9 @@ pub async fn send_domain_assign(
             domain, dropped, "re-assign dropped a purge still queued for this server"
         );
     }
-    crate::outbox::enqueue_and_notify(
-        state,
-        target_did,
-        MSG_REPLICA_DOMAIN_ASSIGN,
-        json!({ "domain": domain }),
-    )
-    .await?;
+    crate::outbox::enqueue_domain_op(&state.store, target_did, MSG_REPLICA_DOMAIN_ASSIGN, domain)
+        .await?;
+    state.outbox_notify.notify_one();
     Ok(())
 }
 
@@ -821,13 +963,9 @@ pub async fn send_domain_purge(
     domain: &str,
 ) -> Result<(), did_hosting_common::server::error::AppError> {
     record_domain_intent(state, target_did, domain, DomainOp::Purge).await?;
-    crate::outbox::enqueue_and_notify(
-        state,
-        target_did,
-        MSG_REPLICA_DOMAIN_PURGE,
-        json!({ "domain": domain }),
-    )
-    .await?;
+    crate::outbox::enqueue_domain_op(&state.store, target_did, MSG_REPLICA_DOMAIN_PURGE, domain)
+        .await?;
+    state.outbox_notify.notify_one();
     Ok(())
 }
 
@@ -839,13 +977,14 @@ pub async fn send_domain_unassign(
     domain: &str,
 ) -> Result<(), did_hosting_common::server::error::AppError> {
     record_domain_intent(state, target_did, domain, DomainOp::Unassign).await?;
-    crate::outbox::enqueue_and_notify(
-        state,
+    crate::outbox::enqueue_domain_op(
+        &state.store,
         target_did,
         MSG_REPLICA_DOMAIN_UNASSIGN,
-        json!({ "domain": domain }),
+        domain,
     )
     .await?;
+    state.outbox_notify.notify_one();
     Ok(())
 }
 
@@ -853,59 +992,60 @@ pub async fn send_domain_unassign(
 // Domain replication push (split-deployment lifecycle)
 // ---------------------------------------------------------------------------
 
-/// Enqueue `replica/domain/upsert { entry }` for one server.
+/// Enqueue `replica/domain/upsert` of `entry`'s domain for one server.
 /// Replicates a control-side create / update / disable / enable so the
-/// server's local store + sweeper stay in sync. Idempotent on the
-/// receiver — re-sending the same row is harmless.
+/// server's local store + sweeper stay in sync. Idempotent on the receiver.
 ///
-/// The entry travels in the shared `DomainEntry` wire shape
-/// ([`did_hosting_common::server::domain::wire`]), already canonical.
+/// The row is a reference: the worker sends the domain's entry as it stands
+/// when it sends (in the shared `DomainEntry` wire shape,
+/// [`did_hosting_common::server::domain::wire`]), and a domain already queued
+/// for this server is not queued again.
 pub async fn send_domain_upsert(
     state: &AppState,
     target_did: &str,
     entry: &did_hosting_common::server::domain::DomainEntry,
 ) -> Result<(), did_hosting_common::server::error::AppError> {
-    let body = json!({ "entry": did_hosting_common::server::domain::wire::to_spec(entry) });
-    crate::outbox::enqueue_and_notify(state, target_did, MSG_REPLICA_DOMAIN_UPSERT, body).await?;
+    crate::outbox::enqueue_ref(
+        state,
+        target_did,
+        crate::outbox::Subject::DomainUpsert {
+            domain: entry.name.clone(),
+        },
+    )
+    .await?;
+    state.outbox_notify.notify_one();
     Ok(())
 }
 
 /// Replicate every control-side `DomainEntry` to one server, then re-send its
-/// unsettled domain assign/unassign/purge ops ([`resend_domain_intents`]) — run
-/// on each (re-)registration so a server that missed any of them while
-/// unreachable converges on the control plane's domain records, statuses and
-/// assignments.
-pub fn sync_all_domains_to_server(state: &AppState, server_did: String) {
-    let state = state.clone();
-    tokio::spawn(async move {
-        sync_all_domains_now(&state, &server_did).await;
-    });
-}
-
-/// The body of [`sync_all_domains_to_server`], awaited (for tests).
-pub async fn sync_all_domains_now(state: &AppState, server_did: &str) {
+/// unsettled domain assign/unassign/purge ops ([`resend_domain_intents_for`])
+/// — run on each (re-)registration (by [`resync_server`]) so a server that
+/// missed any of them while unreachable converges on the control plane's
+/// domain records, statuses and assignments. `served` are the domains the
+/// server reported serving, which the control plane assigned it.
+pub async fn sync_all_domains_now(state: &AppState, server_did: &str, served: &[String]) {
     match did_hosting_common::server::domain::list_domains(&state.store).await {
         Ok(domains) => {
             for entry in &domains {
                 if let Err(e) = send_domain_upsert(state, server_did, entry).await {
-                    warn!(server_did, domain = %entry.name, error = %e, "domain resync: enqueue failed");
+                    crate::outbox::note_enqueue_failure(server_did, "domain resync", &e);
                 }
             }
         }
         Err(e) => warn!(server_did, error = %e, "domain resync: list failed"),
     }
-    resend_domain_intents(state, server_did).await;
+    resend_domain_intents_for(state, server_did, Some(served)).await;
 }
 
 /// Fan an upsert out to every registered server. Used after every
 /// successful control-side domain mutation so each server eventually
 /// applies the change to its local DomainEntry copy + grace timer.
 ///
-/// Enqueues one outbox entry per server; the worker handles delivery
-/// and retry. A registry-list failure is logged and skipped — there are
-/// no rows to enqueue against. Returns `(enqueued, skipped)` for the
-/// caller's log line; `enqueued` is the number of outbox rows
-/// committed, NOT the number of servers that have acked.
+/// Enqueues one outbox entry per server (or finds it already queued); the
+/// worker handles delivery and retry. A registry-list failure is logged and
+/// skipped — there are no rows to enqueue against. Returns
+/// `(enqueued, skipped)` for the caller's log line; `enqueued` is the number
+/// of servers with the upsert queued, NOT the number that have acked.
 pub async fn fanout_domain_upsert(
     state: &AppState,
     entry: &did_hosting_common::server::domain::DomainEntry,
@@ -924,8 +1064,7 @@ pub async fn fanout_domain_upsert(
         let did = match instance.metadata.get("did").and_then(|v| v.as_str()) {
             Some(d) => d.to_string(),
             None => {
-                // Legacy instance without `did` metadata — can't
-                // address. Operator must re-register with a DID.
+                // An instance without `did` metadata — can't address.
                 skipped += 1;
                 continue;
             }
@@ -933,12 +1072,7 @@ pub async fn fanout_domain_upsert(
         match send_domain_upsert(state, &did, entry).await {
             Ok(()) => enqueued += 1,
             Err(e) => {
-                warn!(
-                    target_did = %did,
-                    domain = %entry.name,
-                    error = %e,
-                    "fanout_domain_upsert: enqueue failed"
-                );
+                crate::outbox::note_enqueue_failure(&did, "domain upsert", &e);
                 skipped += 1;
             }
         }
@@ -950,6 +1084,7 @@ pub async fn fanout_domain_upsert(
 mod watcher_tests {
     use super::*;
     use crate::config::WatcherPeer;
+    use serde_json::json;
 
     fn log(params: &[serde_json::Value]) -> String {
         params
@@ -991,6 +1126,7 @@ mod watcher_tests {
 #[cfg(test)]
 mod push_target_tests {
     use super::*;
+    use serde_json::json;
 
     fn instance(
         id: &str,

@@ -171,30 +171,91 @@ pub struct ServiceInstance {
 /// Record an edge's acknowledgement at `now` (best effort: a failure only
 /// leaves the lag metric older than it is).
 pub async fn record_ack(registry_ks: &KeyspaceHandle, did: &str, now: u64) {
-    update_instance(registry_ks, did, |i| i.last_ack_at = Some(now)).await;
+    best_effort(
+        did,
+        update_instance_for_did(registry_ks, did, |i| {
+            i.last_ack_at = Some(now);
+            true
+        })
+        .await,
+    );
 }
 
 /// Record the start of an edge's reconcile at `now` (best effort).
 pub async fn record_reconcile(registry_ks: &KeyspaceHandle, did: &str, now: u64) {
-    update_instance(registry_ks, did, |i| i.last_reconcile_at = Some(now)).await;
+    best_effort(
+        did,
+        update_instance_for_did(registry_ks, did, |i| {
+            i.last_reconcile_at = Some(now);
+            true
+        })
+        .await,
+    );
 }
 
-async fn update_instance(
+fn best_effort<T>(did: &str, result: Result<T, AppError>) {
+    if let Err(e) = result {
+        tracing::warn!(did, error = %e, "failed to record replication progress");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serialised mutation
+// ---------------------------------------------------------------------------
+
+/// One lock per instance id. Every write to an instance record — a
+/// registration, a status sweep, a pong, an ack, a badge refresh — reads and
+/// writes it under this lock, so concurrent writers (the health loop and the
+/// inbound handlers) cannot lose each other's fields.
+static INSTANCE_LOCKS: std::sync::LazyLock<did_hosting_common::server::path_locks::PathLocks> =
+    std::sync::LazyLock::new(did_hosting_common::server::path_locks::PathLocks::new);
+
+/// Read the record under `instance_id`, let `change` produce what to store,
+/// and store it — under the instance's lock. `change` returns `None` to leave
+/// the record as it is (and `Some` of the same record to rewrite it). Returns
+/// what is stored afterwards.
+pub async fn upsert_instance(
+    registry_ks: &KeyspaceHandle,
+    instance_id: &str,
+    change: impl FnOnce(Option<ServiceInstance>) -> Option<ServiceInstance>,
+) -> Result<Option<ServiceInstance>, AppError> {
+    let _guard = INSTANCE_LOCKS.guard(instance_id).await;
+    let current = get_instance(registry_ks, instance_id).await?;
+    match change(current.clone()) {
+        Some(next) => {
+            registry_ks.insert(instance_key(instance_id), &next).await?;
+            Ok(Some(next))
+        }
+        None => Ok(current),
+    }
+}
+
+/// Change an existing instance in place, under its lock. `change` returns
+/// whether it changed anything (nothing is written otherwise). Returns the
+/// instance as stored, or `None` when there is none.
+pub async fn update_instance(
+    registry_ks: &KeyspaceHandle,
+    instance_id: &str,
+    change: impl FnOnce(&mut ServiceInstance) -> bool,
+) -> Result<Option<ServiceInstance>, AppError> {
+    upsert_instance(registry_ks, instance_id, |current| {
+        let mut instance = current?;
+        change(&mut instance).then_some(instance)
+    })
+    .await
+}
+
+/// [`update_instance`] for the instance `did` registered — only if the
+/// record under its id is that DID's ([`get_instance_for_did`]).
+pub async fn update_instance_for_did(
     registry_ks: &KeyspaceHandle,
     did: &str,
-    change: impl FnOnce(&mut ServiceInstance),
-) {
-    let id = instance_id_for(did);
-    match get_instance_for_did(registry_ks, did).await {
-        Ok(Some(mut instance)) => {
-            change(&mut instance);
-            if let Err(e) = register_instance(registry_ks, &instance).await {
-                tracing::warn!(instance_id = %id, error = %e, "failed to record replication progress");
-            }
-        }
-        Ok(None) => {}
-        Err(e) => tracing::warn!(instance_id = %id, error = %e, "failed to read instance"),
-    }
+    change: impl FnOnce(&mut ServiceInstance) -> bool,
+) -> Result<Option<ServiceInstance>, AppError> {
+    update_instance(registry_ks, &instance_id_for(did), |instance| {
+        instance.did() == Some(did) && change(instance)
+    })
+    .await
 }
 
 fn default_enabled_methods() -> Vec<String> {
@@ -217,19 +278,25 @@ fn instance_key(instance_id: &str) -> String {
 // CRUD
 // ---------------------------------------------------------------------------
 
+/// Store `instance` whole, replacing any record under its id (under the
+/// instance's lock). A writer that builds on the stored record uses
+/// [`upsert_instance`] or [`update_instance`] instead.
 pub async fn register_instance(
     registry_ks: &KeyspaceHandle,
     instance: &ServiceInstance,
 ) -> Result<(), AppError> {
-    registry_ks
-        .insert(instance_key(&instance.instance_id), instance)
-        .await
+    upsert_instance(registry_ks, &instance.instance_id, |_| {
+        Some(instance.clone())
+    })
+    .await
+    .map(|_| ())
 }
 
 pub async fn deregister_instance(
     registry_ks: &KeyspaceHandle,
     instance_id: &str,
 ) -> Result<(), AppError> {
+    let _guard = INSTANCE_LOCKS.guard(instance_id).await;
     registry_ks.remove(instance_key(instance_id)).await
 }
 
@@ -317,13 +384,14 @@ pub async fn refresh_advertised_services(
     let Some(resolver) = did_resolver else {
         return Ok(());
     };
-    let Some(mut instance) = get_instance(registry_ks, instance_id).await? else {
+    let Some(instance) = get_instance(registry_ks, instance_id).await? else {
         return Ok(());
     };
     let Some(did) = instance.did().map(str::to_string) else {
         return Ok(());
     };
 
+    // Resolved outside the instance's lock: it can take a network round trip.
     let Some(services) = resolve_service_types(&did, Some(resolver)).await else {
         debug!(
             instance_id = %instance_id,
@@ -339,17 +407,26 @@ pub async fn refresh_advertised_services(
         services = ?services,
         "advertised services refreshed"
     );
-    instance.advertised_services = Some(services);
-    instance.services_checked_at = Some(now);
-    register_instance(registry_ks, &instance).await
+    // Written only if the record is still the same DID's.
+    update_instance(registry_ks, instance_id, |instance| {
+        if instance.did() != Some(did.as_str()) {
+            return false;
+        }
+        instance.advertised_services = Some(services);
+        instance.services_checked_at = Some(now);
+        true
+    })
+    .await
+    .map(|_| ())
 }
 
 /// Record the transport an inbound message from `sender_did` arrived on.
 ///
-/// Looked up by DID rather than instance id, because the caller — a trust-task
-/// or DIDComm handler — knows only the transport-authenticated sender. A DID
-/// that maps to no registered instance is ignored: plenty of peers talk to the
-/// control plane without being servers.
+/// Looked up by the id derived from the DID ([`update_instance_for_did`]),
+/// because the caller — a trust-task or DIDComm handler — knows only the
+/// transport-authenticated sender. A DID that maps to no registered instance
+/// is ignored: plenty of peers talk to the control plane without being
+/// servers.
 ///
 /// Best-effort by design. This is observability; a failed write must never fail
 /// a registration or a health pong.
@@ -359,15 +436,13 @@ pub async fn record_inbound_transport(
     transport: ObservedTransport,
     now: u64,
 ) {
-    let Ok(instances) = list_instances(registry_ks).await else {
-        return;
-    };
-    let Some(mut inst) = instances.into_iter().find(|i| i.did() == Some(sender_did)) else {
-        return;
-    };
-    inst.last_inbound_transport = Some(transport);
-    inst.last_inbound_at = Some(now);
-    if let Err(e) = register_instance(registry_ks, &inst).await {
+    if let Err(e) = update_instance_for_did(registry_ks, sender_did, |inst| {
+        inst.last_inbound_transport = Some(transport);
+        inst.last_inbound_at = Some(now);
+        true
+    })
+    .await
+    {
         debug!(did = sender_did, error = %e, "failed to record inbound transport");
     }
 }
@@ -382,12 +457,13 @@ pub async fn record_outbound_transport(
     transport: ObservedTransport,
     now: u64,
 ) {
-    let Ok(Some(mut inst)) = get_instance(registry_ks, instance_id).await else {
-        return;
-    };
-    inst.last_outbound_transport = Some(transport);
-    inst.last_outbound_at = Some(now);
-    if let Err(e) = register_instance(registry_ks, &inst).await {
+    if let Err(e) = update_instance(registry_ks, instance_id, |inst| {
+        inst.last_outbound_transport = Some(transport);
+        inst.last_outbound_at = Some(now);
+        true
+    })
+    .await
+    {
         debug!(instance_id, error = %e, "failed to record outbound transport");
     }
 }
@@ -399,12 +475,27 @@ pub async fn update_instance_status(
     status: ServiceStatus,
     timestamp: u64,
 ) -> Result<(), AppError> {
-    if let Some(mut instance) = get_instance(registry_ks, instance_id).await? {
+    update_instance(registry_ks, instance_id, |instance| {
         instance.status = status;
         instance.last_health_check = Some(timestamp);
-        register_instance(registry_ks, &instance).await?;
-    }
-    Ok(())
+        true
+    })
+    .await
+    .map(|_| ())
+}
+
+/// The id a `[[registry.instances]]` entry is seeded under: stable across
+/// restarts (a hash of its type and URL), so seeding is an upsert rather than
+/// a new record per boot.
+pub fn seeded_instance_id(service_type: &ServiceType, url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::new()
+        .chain_update(service_type.to_string().as_bytes())
+        .chain_update([0u8])
+        .chain_update(url.trim_end_matches('/').as_bytes())
+        .finalize();
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("seed-{hex}")
 }
 
 /// Determine instance health based on recency of last health-pong.
