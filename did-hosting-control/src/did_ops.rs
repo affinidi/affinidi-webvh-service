@@ -910,8 +910,18 @@ pub async fn register_did_atomic(
     for name in &released {
         batch.remove(&state.dids_ks, agent_name_key(&reg_domain, name));
     }
+    // The sync to every server and watcher commits with the slot
+    // (transactional outbox).
+    let sync = crate::server_push::stage_did_sync(
+        state,
+        &mut batch,
+        path,
+        crate::server_push::DidChange::Published { log: did_log },
+    )
+    .await;
     let usage = stage_index(state, &mut batch, existing.as_ref(), Some(&new_record)).await?;
     batch.commit().await?;
+    sync.finish(state).await;
     // Released before the identity check below, which can reach the network
     // when this is the service's own DID; nothing after this point reads or
     // writes the slot or its names.
@@ -1409,8 +1419,16 @@ pub(crate) async fn publish_did(
     for name in &released {
         batch.remove(&state.dids_ks, agent_name_key(&domain, name));
     }
+    let sync = crate::server_push::stage_did_sync(
+        state,
+        &mut batch,
+        mnemonic,
+        crate::server_push::DidChange::Published { log: did_log },
+    )
+    .await;
     let usage = stage_index(state, &mut batch, previous.as_ref(), Some(&record)).await?;
     batch.commit().await?;
+    sync.finish(state).await;
     // Released before the identity check below, which can reach the network
     // when this is the service's own DID; nothing after this point reads or
     // writes the slot or its names.
@@ -1676,9 +1694,19 @@ async fn apply_agent_name_op(
         IndexWrite::Remove => batch.remove(&state.dids_ks, index_key),
         IndexWrite::Keep => {}
     }
+    // Every update publishes a new version, so the edges need it — queued in
+    // the same commit.
+    let sync = crate::server_push::stage_did_sync(
+        state,
+        &mut batch,
+        mnemonic,
+        crate::server_push::DidChange::Published { log: did_log },
+    )
+    .await;
     let previous: Option<DidRecord> = state.dids_ks.get(did_key(mnemonic)).await?;
     let usage = stage_index(state, &mut batch, previous.as_ref(), Some(&record)).await?;
     batch.commit().await?;
+    sync.finish(state).await;
     // As in `register_did_atomic`: not held across the identity check below.
     drop(name_locks);
     drop(slot_guard);
@@ -1839,10 +1867,21 @@ pub async fn upload_witness(
     let witness_content = serde_json::to_string(&entries)
         .map_err(|e| AppError::Internal(format!("failed to serialise did-witness.json: {e}")))?;
 
-    state
-        .dids_ks
-        .insert_raw(content_witness_key(mnemonic), witness_content.into_bytes())
-        .await?;
+    let mut batch = state.store.batch();
+    batch.insert_raw(
+        &state.dids_ks,
+        content_witness_key(mnemonic),
+        witness_content.into_bytes(),
+    );
+    let sync = crate::server_push::stage_did_sync(
+        state,
+        &mut batch,
+        mnemonic,
+        crate::server_push::DidChange::Updated,
+    )
+    .await;
+    batch.commit().await?;
+    sync.finish(state).await;
     invalidate_cached_content(state, mnemonic);
 
     info!(did = %auth.did, mnemonic = %mnemonic, %version_id, "did-witness.json uploaded on control plane");
@@ -2447,9 +2486,19 @@ pub async fn delete_did(
     batch.remove(&state.sessions_ks, transfer_offer_key(mnemonic));
     batch.remove(&state.dids_ks, content_witness_key(mnemonic));
     batch.remove(&state.dids_ks, owner_key(&record.owner, mnemonic));
+    // The delete reaches every server (and the watchers it was published to)
+    // through rows committed with it.
+    let sync = crate::server_push::stage_did_sync(
+        state,
+        &mut batch,
+        mnemonic,
+        crate::server_push::DidChange::Deleted,
+    )
+    .await;
     let usage = stage_index(state, &mut batch, Some(&record), None).await?;
     batch.commit().await?;
     drop(usage);
+    sync.finish(state).await;
     invalidate_cached_content(state, mnemonic);
 
     // The names go in a write of their own, after the record: a slot can hold
@@ -2849,7 +2898,19 @@ pub async fn set_did_disabled(
         record.disabled_by_admin = false;
     }
     record.disabled = disabled;
-    state.dids_ks.insert(did_key(mnemonic), &record).await?;
+    // The state travels to edges with the slot's content, queued in the same
+    // commit.
+    let mut batch = state.store.batch();
+    batch.insert(&state.dids_ks, did_key(mnemonic), &record)?;
+    let sync = crate::server_push::stage_did_sync(
+        state,
+        &mut batch,
+        mnemonic,
+        crate::server_push::DidChange::Updated,
+    )
+    .await;
+    batch.commit().await?;
+    sync.finish(state).await;
     invalidate_cached_content(state, mnemonic);
     info!(
         did = %auth.did,
@@ -2998,8 +3059,16 @@ pub async fn rollback_did_to(
     for name in &released {
         batch.remove(&state.dids_ks, agent_name_key(&domain, name));
     }
+    let sync = crate::server_push::stage_did_sync(
+        state,
+        &mut batch,
+        mnemonic,
+        crate::server_push::DidChange::Published { log: &truncated },
+    )
+    .await;
     let usage = stage_index(state, &mut batch, previous.as_ref(), Some(&record)).await?;
     batch.commit().await?;
+    sync.finish(state).await;
     drop(name_locks);
     drop(usage);
     invalidate_cached_content(state, mnemonic);

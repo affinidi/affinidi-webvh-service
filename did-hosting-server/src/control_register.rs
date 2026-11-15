@@ -122,44 +122,7 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
         }
     };
 
-    // Report the DIDs we already hold (mnemonic → DID + version) so the control
-    // plane sends only what we're missing or behind on, instead of re-pushing
-    // every DID on every boot. Compact by design — mnemonic + version, not the
-    // logs. A store-iteration failure degrades to an empty list, i.e. a full
-    // sync, which is safe (just not optimal).
-    // Read a page of records at a time: only the summaries are kept.
-    let preloaded_dids: Vec<serde_json::Value> = {
-        let mut out = Vec::new();
-        let mut pages = state.dids_ks.walk("did:", crate::paging::DID_PAGE_ROWS);
-        loop {
-            match pages.next_page().await {
-                Ok(Some(rows)) => out.extend(
-                    rows.into_iter()
-                        .filter_map(|(_k, v)| serde_json::from_slice::<DidRecord>(&v).ok())
-                        .filter(|r| r.version_count > 0)
-                        // `did_id` names *which* DID the slot holds: a DID
-                        // deleted and re-created at the same mnemonic has a
-                        // new identifier, so the control plane re-pushes on an
-                        // identity mismatch even when the version counts
-                        // happen to agree.
-                        .map(|r| {
-                            json!({
-                                "mnemonic": r.mnemonic,
-                                "did_id": r.did_id,
-                                "version_count": r.version_count,
-                                // So a disable this edge missed is re-sent too.
-                                "disabled": r.disabled,
-                            })
-                        }),
-                ),
-                Ok(None) => break out,
-                Err(e) => {
-                    warn!(error = %e, "failed to enumerate local DIDs for registration — control plane will full-sync");
-                    break Vec::new();
-                }
-            }
-        }
-    };
+    let preloaded_dids = preloaded_dids(state).await;
 
     // `did-management/server/register/0.2`. The payload is closed, so this
     // service's own hints ride under `ext`, in its namespace.
@@ -272,6 +235,65 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
     }
 }
 
+/// The slot holding this edge's *own* DID, when it hosts it (a self-hosted
+/// `did:webvh` edge: setup imports the DID into the edge's store at
+/// `mnemonic_from_did(server_did)`).
+///
+/// That slot is local edge state the control plane never published, so it is
+/// kept out of every exchange that reconciles the edge against the control
+/// plane's listing: it is not reported in `preloaded_dids` (the control plane
+/// would queue a `sync/delete` for it), not counted as `extra` by the
+/// reconcile (the edge would be "stale" for ever), and a `sync/delete` of it
+/// is refused (the edge would delete the DID its own signatures verify
+/// against).
+pub fn own_did_mnemonic(state: &AppState) -> Option<String> {
+    state
+        .config
+        .server_did
+        .as_deref()
+        .and_then(did_hosting_common::server::identity::mnemonic_from_did)
+}
+
+/// The DIDs this edge already holds (mnemonic → DID + version), reported at
+/// registration so the control plane sends only what the edge is missing or
+/// behind on, instead of re-pushing every DID on every boot. Compact by
+/// design — mnemonic + version, not the logs. A store-iteration failure
+/// degrades to an empty list, i.e. a full sync, which is safe (just not
+/// optimal). The edge's own DID is never reported ([`own_did_mnemonic`]).
+pub async fn preloaded_dids(state: &AppState) -> Vec<serde_json::Value> {
+    let own = own_did_mnemonic(state);
+    // A page of records at a time: only the compact summaries are kept.
+    let mut out = Vec::new();
+    let mut pages = state.dids_ks.walk("did:", crate::paging::DID_PAGE_ROWS);
+    loop {
+        match pages.next_page().await {
+            Ok(Some(rows)) => out.extend(
+                rows.into_iter()
+                    .filter_map(|(_k, v)| serde_json::from_slice::<DidRecord>(&v).ok())
+                    .filter(|r| r.version_count > 0)
+                    .filter(|r| own.as_deref() != Some(r.mnemonic.as_str()))
+                    // `did_id` names *which* DID the slot holds: a DID deleted
+                    // and re-created at the same mnemonic has a new identifier,
+                    // so the control plane re-pushes on an identity mismatch
+                    // even when the version counts happen to agree.
+                    .map(|r| {
+                        json!({
+                            "mnemonic": r.mnemonic,
+                            "did_id": r.did_id,
+                            "version_count": r.version_count,
+                            // So a disable this edge missed is re-sent too.
+                            "disabled": r.disabled,
+                        })
+                    }),
+            ),
+            Ok(None) => return out,
+            Err(e) => {
+                warn!(error = %e, "failed to enumerate local DIDs for registration — control plane will full-sync");
+                return Vec::new();
+            }
+        }
+    }
+}
 // ---------------------------------------------------------------------------
 // DID sync helpers (used by messaging.rs for sync-update handling)
 // ---------------------------------------------------------------------------
@@ -920,8 +942,18 @@ pub async fn apply_single_update(
     // first, without a lock and without verifying anything: what is held was
     // verified when it was written, and answering `unchanged` writes nothing.
     // (Checked again under the lock below, before writing.)
-    if holds_exactly(dids_ks, update).await? {
-        return Ok(SyncApplied::Unchanged);
+    if holds_exactly(dids_ks, update).await?.is_some() {
+        let _slot_guard = locks.guard(&slot_lock_key(&update.mnemonic)).await;
+        let _identity_guard = locks
+            .guard(&identity_lock_key(&history_identity(
+                &update.did_id,
+                synced_method,
+            )?))
+            .await;
+        if let Some(prev) = holds_exactly(dids_ks, update).await? {
+            reassert_agent_names(dids_ks, store, &prev).await?;
+            return Ok(SyncApplied::Unchanged);
+        }
     }
 
     // The edge verifies what it is asked to serve itself, rather than trusting
@@ -955,7 +987,12 @@ pub async fn apply_single_update(
             synced_method,
         )?))
         .await;
-    if holds_exactly(dids_ks, update).await? {
+    if let Some(prev) = holds_exactly(dids_ks, update).await? {
+        // Nothing to write for the slot itself, but its name-index entries
+        // are re-asserted: an index entry lost to an earlier bug (or any
+        // other way) must be repairable by a re-sync, and a re-sync of an
+        // unchanged log only ever lands here.
+        reassert_agent_names(dids_ks, store, &prev).await?;
         return Ok(SyncApplied::Unchanged);
     }
     let identity = verify_history(
@@ -1054,10 +1091,22 @@ pub async fn apply_single_update(
     let mut batch = store.batch();
     batch.insert(dids_ks, did_key(&update.mnemonic), &record)?;
 
+    // An index entry is retired only while it still names *this* slot: a name
+    // that moved from this DID to another may already point at the new holder
+    // (its update applied first — an outbox retry, or batch ordering), and
+    // removing that would make `/@name` 404 here with nothing to repair it.
     if let Some(prev) = previous.as_ref() {
+        let prev_host = prev
+            .did_id
+            .as_deref()
+            .and_then(|d| extract_did_host(d).ok())
+            .unwrap_or_else(|| did_host.clone());
         for old in &prev.agent_names {
             if !record.agent_names.iter().any(|n| n.name == old.name) {
-                batch.remove(dids_ks, agent_name_key(&did_host, &old.name));
+                let key = agent_name_key(&prev_host, &old.name);
+                if index_names_slot(dids_ks, &key, &update.mnemonic).await? {
+                    batch.remove(dids_ks, key);
+                }
             }
         }
     }
@@ -1113,16 +1162,17 @@ pub async fn apply_single_update(
     Ok(SyncApplied::Applied)
 }
 
-/// Whether this edge already holds exactly `update`'s state for its slot:
-/// the same DID, log, witness proofs and disabled flag.
+/// The record this edge holds for `update`'s slot when it already holds
+/// exactly `update`'s state: the same DID, log, witness proofs and disabled
+/// flag.
 async fn holds_exactly(
     dids_ks: &KeyspaceHandle,
     update: &DidSyncUpdate,
-) -> Result<bool, crate::error::AppError> {
+) -> Result<Option<DidRecord>, crate::error::AppError> {
     let Some(prev) = dids_ks.get::<DidRecord>(did_key(&update.mnemonic)).await? else {
-        return Ok(false);
+        return Ok(None);
     };
-    Ok(prev.did_id.as_deref() == Some(update.did_id.as_str())
+    let exact = prev.did_id.as_deref() == Some(update.did_id.as_str())
         && prev.disabled == update.disabled
         && dids_ks
             .get_raw(content_log_key(&update.mnemonic))
@@ -1132,7 +1182,69 @@ async fn holds_exactly(
             .get_raw(content_witness_key(&update.mnemonic))
             .await?
             .map(|w| String::from_utf8_lossy(&w).into_owned())
-            == update.witness_content)
+            == update.witness_content;
+    Ok(exact.then_some(prev))
+}
+
+/// Whether the agent-name index entry at `key` points at `mnemonic`.
+pub(crate) async fn index_names_slot(
+    dids_ks: &KeyspaceHandle,
+    key: &str,
+    mnemonic: &str,
+) -> Result<bool, crate::error::AppError> {
+    Ok(dids_ks
+        .get_raw(key.to_string())
+        .await?
+        .is_some_and(|held| held == mnemonic.as_bytes()))
+}
+
+/// Write back any of `record`'s own agent-name index entries that have gone
+/// missing, or that point at a slot whose record no longer claims the name
+/// (a leftover). An entry naming another slot that does claim the name is
+/// left alone: two documents claiming one name is the control plane's to
+/// settle, never an edge's.
+async fn reassert_agent_names(
+    dids_ks: &KeyspaceHandle,
+    store: &Store,
+    record: &DidRecord,
+) -> Result<(), crate::error::AppError> {
+    if record.agent_names.is_empty() {
+        return Ok(());
+    }
+    let host = record
+        .did_id
+        .as_deref()
+        .and_then(|d| extract_did_host(d).ok())
+        .unwrap_or_default();
+    let mut batch = store.batch();
+    let mut repaired = Vec::new();
+    for entry in &record.agent_names {
+        let key = agent_name_key(&host, &entry.name);
+        let stale = match dids_ks.get_raw(key.clone()).await? {
+            None => true,
+            Some(held) if held == record.mnemonic.as_bytes() => false,
+            Some(held) => {
+                let other = String::from_utf8_lossy(&held).into_owned();
+                !dids_ks
+                    .get::<DidRecord>(did_key(&other))
+                    .await?
+                    .is_some_and(|r| r.agent_names.iter().any(|n| n.name == entry.name))
+            }
+        };
+        if stale {
+            batch.insert_raw(dids_ks, key, record.mnemonic.as_bytes().to_vec());
+            repaired.push(entry.name.clone());
+        }
+    }
+    if !repaired.is_empty() {
+        batch.commit().await?;
+        warn!(
+            mnemonic = %record.mnemonic,
+            names = ?repaired,
+            "re-asserted agent-name index entries the edge had lost"
+        );
+    }
+    Ok(())
 }
 
 /// What [`apply_single_update`] did.

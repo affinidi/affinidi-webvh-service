@@ -29,7 +29,7 @@ use tracing::{info, warn};
 
 use super::super::did_index::{self, OwnerUsage};
 use super::super::store::{KS_DIDS, Store};
-use super::{Migration, MigrationFuture};
+use super::{Migration, MigrationFuture, MigrationOutcome};
 use crate::did_ops::DidRecord;
 
 /// Public migration ID. Stable wire identifier — never rename.
@@ -125,7 +125,7 @@ impl Migration for M03IndexDidRecords {
             batch.commit_in_parts().await?;
 
             info!(migration_id = ID, indexed, owners, skipped, "M-03 complete");
-            Ok(())
+            Ok(MigrationOutcome::Complete)
         })
     }
 }

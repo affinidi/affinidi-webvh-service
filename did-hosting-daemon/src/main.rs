@@ -1,3 +1,4 @@
+mod backup;
 mod config;
 mod setup;
 mod setup_recipe;
@@ -406,16 +407,19 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Export server data to a backup file
+    /// Export the daemon's data to a backup file: both stores (`[store]`,
+    /// with the ACL, passkeys, identity generations and outbound queue, and
+    /// `[witness_store]`) and the configuration file, verbatim.
     Backup {
         /// Output file path (use "-" for stdout)
         #[arg(short, long, default_value = "did-hosting-backup.json")]
         output: String,
     },
-    /// Restore server data from a backup file.
+    /// Restore the daemon's data from a `did-hosting-daemon backup` file.
     ///
     /// The backup is checked before anything is written, config.toml
-    /// included. Each did:webvh (or did:webs) log must verify, match its
+    /// included (it is written back verbatim). Each did:webvh (or did:webs)
+    /// log must verify, match its
     /// record, and extend both the backup's own high-water mark and what the
     /// store already holds for that DID; otherwise nothing is restored.
     /// Restore into an empty store to start from the backup's state. The
@@ -760,13 +764,13 @@ async fn main() {
             }
         }
         Some(Command::Backup { output }) => {
-            if let Err(e) = did_hosting_server::backup::run_backup(cli.config, output).await {
+            if let Err(e) = backup::run_backup(cli.config, output).await {
                 eprintln!("Backup error: {e}");
                 std::process::exit(1);
             }
         }
         Some(Command::Restore { input }) => {
-            if let Err(e) = did_hosting_server::backup::run_restore(cli.config, input).await {
+            if let Err(e) = backup::run_restore(cli.config, input).await {
                 eprintln!("Restore error: {e}");
                 std::process::exit(1);
             }

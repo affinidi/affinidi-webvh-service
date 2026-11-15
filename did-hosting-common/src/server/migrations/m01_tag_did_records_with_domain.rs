@@ -30,8 +30,19 @@
 //! 3. If no system default is set either, the record is left with
 //!    `domain == ""` and an error counter is incremented. The
 //!    migration succeeds overall; the affected records show up in
-//!    the audit-log count for follow-up by ops. (The next runner
-//!    invocation will retry these once a default exists.)
+//!    the audit-log count for follow-up by ops. The migration then
+//!    reports [`MigrationOutcome::Deferred`], so the runner writes no
+//!    applied marker and the next runner invocation retries these
+//!    (once a default exists they are tagged and the migration completes).
+//!
+//! ## Concurrent writers
+//!
+//! The walk is paged and only selects candidates. Each record is re-read
+//! through a consistent handle just before it is written, only `domain` is
+//! changed, and the write is a compare-and-swap against the bytes read
+//! ([`super::patch_did_record_field`]) — so a publish committed by another
+//! replica during a rolling upgrade is never overwritten with a stale
+//! record.
 //!
 //! Records whose `did_id` parses to a method **other than** `webvh`
 //! are caught by the same path — the dispatcher routes by method
@@ -43,8 +54,10 @@ use tracing::{debug, info, warn};
 
 use super::super::domain::{extract_did_host, get_default_domain};
 use super::super::store::{KS_DIDS, Store};
-use super::{Migration, MigrationFuture};
-use crate::did_ops::{DidRecord, did_key};
+use super::{
+    DidRecordPages, Migration, MigrationFuture, MigrationOutcome, Patched, patch_did_record_field,
+};
+use crate::did_ops::DidRecord;
 
 /// Public migration ID. Stable wire identifier — never rename.
 pub const ID: &str = "m01_tag_did_records_with_domain";
@@ -67,6 +80,9 @@ pub struct M01Counters {
     /// for follow-up. The next runner invocation (after operators
     /// add a default domain) retries these.
     pub deferred_no_default: u64,
+    /// Records concurrent writers kept changing while the migration tried
+    /// to tag them. Retried by the next runner invocation.
+    pub deferred_contended: u64,
 }
 
 pub struct M01TagDidRecordsWithDomain;
@@ -84,25 +100,32 @@ impl Migration for M01TagDidRecordsWithDomain {
         Box::pin(async move {
             let mut counters = M01Counters::default();
             let dids = store.keyspace(KS_DIDS)?;
+            let consistent = store.keyspace_consistent(KS_DIDS)?;
 
             // Cache the system default once — it's the same across the
             // whole walk. A `None` here doesn't fail the migration;
             // we just defer the affected records.
             let system_default = get_default_domain(store).await?;
 
-            // Walk every `did:{mnemonic}` key. Prefix-scan filters out
-            // `content:`, `owner:`, `watcher_sync:` neighbours.
-            let mut walk = dids.walk(b"did:".to_vec(), super::MIGRATION_PAGE_ROWS);
-            while let Some(rows) = walk.next_page().await? {
-                for (key, value) in rows {
-                    let mnemonic = match std::str::from_utf8(&key) {
-                        Ok(k) => k.strip_prefix("did:").unwrap_or(k).to_string(),
-                        Err(_) => {
-                            warn!(migration_id = ID, "skipping non-UTF-8 key in dids keyspace");
-                            continue;
-                        }
-                    };
-                    let mut record: DidRecord = match serde_json::from_slice(&value) {
+            // The new domain for a record, and which tier supplied it.
+            let tag = |record: &DidRecord| -> Option<(String, bool)> {
+                if let Some(host) = record
+                    .did_id
+                    .as_deref()
+                    .and_then(|d| extract_did_host(d).ok())
+                {
+                    return Some((host, true));
+                }
+                system_default.clone().map(|d| (d, false))
+            };
+
+            // Walk every `did:{mnemonic}` key, a page at a time. The scan
+            // only selects candidates: each one is re-read just before it is
+            // written (see `patch_did_record_field`).
+            let mut pages = DidRecordPages::new(&dids);
+            while let Some(page) = pages.next_page(ID).await? {
+                for (mnemonic, value) in page {
+                    let record: DidRecord = match serde_json::from_slice(&value) {
                         Ok(r) => r,
                         Err(e) => {
                             warn!(
@@ -118,49 +141,44 @@ impl Migration for M01TagDidRecordsWithDomain {
                         counters.already_tagged += 1;
                         continue;
                     }
-                    // Tier 1: parse host out of did_id.
-                    let from_did_id = record
-                        .did_id
-                        .as_deref()
-                        .and_then(|d| extract_did_host(d).ok());
-                    let new_domain = match from_did_id {
-                        Some(host) => {
-                            counters.tagged_from_did_id += 1;
-                            host
-                        }
-                        None => {
-                            // Tier 2: system default.
-                            match &system_default {
-                                Some(d) => {
-                                    counters.tagged_from_default += 1;
-                                    d.clone()
-                                }
-                                None => {
-                                    counters.deferred_no_default += 1;
-                                    debug!(
-                                        migration_id = ID,
-                                        mnemonic = %mnemonic,
-                                        "deferred: no did_id host and no system default"
-                                    );
-                                    continue;
-                                }
+                    if tag(&record).is_none() {
+                        counters.deferred_no_default += 1;
+                        debug!(
+                            migration_id = ID,
+                            mnemonic = %mnemonic,
+                            "deferred: no did_id host and no system default"
+                        );
+                        continue;
+                    }
+                    let patched =
+                        patch_did_record_field(&consistent, &mnemonic, "domain", |fresh| {
+                            if !fresh.domain.is_empty() {
+                                return None;
                             }
-                        }
-                    };
-                    let old = record.clone();
-                    record.domain = new_domain;
-                    // The record moves into a domain: its index row goes with it.
-                    let mut batch = store.batch();
-                    batch.insert(&dids, did_key(&mnemonic), &record)?;
-                    crate::server::did_index::stage_record_change(
-                        &mut batch,
-                        &dids,
-                        None,
-                        Some(&old),
-                        Some(&record),
-                    )
-                    .await?;
-                    batch.commit().await?;
+                            tag(fresh).map(|(domain, from_did_id)| {
+                                (serde_json::Value::String(domain), from_did_id)
+                            })
+                        })
+                        .await?;
+                    if matches!(patched, Patched::Written(_))
+                        && let Some((domain, _)) = tag(&record)
+                    {
+                        // The record now has a domain: index it (M-03 indexes the
+                        // rest, but this migration may complete after it).
+                        dids.insert_raw(
+                            crate::server::did_index::domain_index_key(&domain, &mnemonic),
+                            mnemonic.as_bytes().to_vec(),
+                        )
+                        .await?;
+                    }
+                    match patched {
+                        Patched::Written(true) => counters.tagged_from_did_id += 1,
+                        Patched::Written(false) => counters.tagged_from_default += 1,
+                        // Tagged (or removed) by a concurrent writer since the
+                        // scan.
+                        Patched::Unneeded => counters.already_tagged += 1,
+                        Patched::Contended => counters.deferred_contended += 1,
+                    }
                 }
             }
 
@@ -170,14 +188,16 @@ impl Migration for M01TagDidRecordsWithDomain {
                 tagged_from_default = counters.tagged_from_default,
                 already_tagged = counters.already_tagged,
                 deferred_no_default = counters.deferred_no_default,
-                "M-01 complete"
+                deferred_contended = counters.deferred_contended,
+                "M-01 walk complete"
             );
 
-            // The runner records the applied marker for us on Ok(()).
-            // The counters here are surfaced via tracing only — a
-            // future audit-log keyspace consumer would read them off
-            // the structured `tracing` line.
-            Ok(())
+            // Deferred records keep the migration pending: the runner writes
+            // no marker, so the next invocation (after operators add a
+            // default domain) retries them.
+            Ok(MigrationOutcome::from_deferred(
+                counters.deferred_no_default + counters.deferred_contended,
+            ))
         })
     }
 }
@@ -353,20 +373,23 @@ mod tests {
         let rec = legacy_record("user1", None);
         dids.insert(did_key("user1"), &rec).await.unwrap();
 
-        // Migration succeeds overall but leaves the record un-tagged.
-        run_migration(&store).await.unwrap();
+        // The run succeeds but defers the record, so it stays pending.
+        let summary = MigrationRunner::new(vec![Arc::new(M01TagDidRecordsWithDomain)])
+            .run_pending(&store)
+            .await
+            .unwrap();
+        assert_eq!(summary.deferred, vec![ID]);
         assert_eq!(get_rec(&store, "user1").await.domain, "");
 
-        // Re-running after seeding a default catches up.
+        // The next runner invocation, after a default is seeded, catches up
+        // and completes.
         create_domain(&store, &entry("late.example")).await.unwrap();
         set_default_domain(&store, "late.example").await.unwrap();
-
-        // Need to call the migration directly — the runner won't run
-        // an already-applied migration. This is the operator-driven
-        // "fix forward" path; in practice a future M-02 would do
-        // this work, but the bare migration entry point is here for
-        // the test.
-        M01TagDidRecordsWithDomain.run(&store).await.unwrap();
+        let summary = MigrationRunner::new(vec![Arc::new(M01TagDidRecordsWithDomain)])
+            .run_pending(&store)
+            .await
+            .unwrap();
+        assert_eq!(summary.applied, vec![ID]);
         assert_eq!(get_rec(&store, "user1").await.domain, "late.example");
     }
 
@@ -420,6 +443,68 @@ mod tests {
         assert_eq!(get_rec(&store, "a").await.domain, "from-did.example");
         assert_eq!(get_rec(&store, "b").await.domain, "sys.example");
         assert_eq!(get_rec(&store, "c").await.domain, "preset.example");
+    }
+
+    // ---- concurrent writers ----
+
+    /// Only `domain` is written, onto the record as it stands at write time:
+    /// a field this binary does not model, and every other field, survive.
+    #[tokio::test]
+    async fn only_the_domain_field_is_written() {
+        let store = fjall_store().await;
+        let dids = store.keyspace(KS_DIDS).unwrap();
+        let mut value = serde_json::to_value(legacy_record(
+            "user1",
+            Some("did:webvh:Q1:example.com:user1"),
+        ))
+        .unwrap();
+        value["version_count"] = serde_json::json!(7);
+        value["from_a_newer_release"] = serde_json::json!("kept");
+        dids.insert_raw(did_key("user1"), serde_json::to_vec(&value).unwrap())
+            .await
+            .unwrap();
+
+        run_migration(&store).await.unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&dids.get_raw(did_key("user1")).await.unwrap().unwrap())
+                .unwrap();
+        assert_eq!(raw["domain"], "example.com");
+        assert_eq!(raw["version_count"], 7);
+        assert_eq!(raw["from_a_newer_release"], "kept");
+    }
+
+    /// A record changed between the scan and the write is decided on its
+    /// fresh state: here a concurrent writer tagged it, so it is left alone.
+    #[tokio::test]
+    async fn a_record_tagged_since_the_scan_is_not_overwritten() {
+        let store = fjall_store().await;
+        let consistent = store.keyspace_consistent(KS_DIDS).unwrap();
+        let dids = store.keyspace(KS_DIDS).unwrap();
+        dids.insert(
+            did_key("user1"),
+            &legacy_record("user1", Some("did:webvh:Q1:example.com:user1")),
+        )
+        .await
+        .unwrap();
+        // The concurrent write lands after the scan.
+        dids.insert(
+            did_key("user1"),
+            &already_tagged_record("user1", "preset.example"),
+        )
+        .await
+        .unwrap();
+        let patched =
+            super::super::patch_did_record_field(&consistent, "user1", "domain", |fresh| {
+                fresh
+                    .domain
+                    .is_empty()
+                    .then(|| (serde_json::json!("example.com"), ()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(patched, Patched::Unneeded);
+        assert_eq!(get_rec(&store, "user1").await.domain, "preset.example");
     }
 
     // ---- corrupt-data tolerance ----

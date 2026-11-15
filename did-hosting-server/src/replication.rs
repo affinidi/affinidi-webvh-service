@@ -429,6 +429,9 @@ async fn apply_listing(
         );
     }
     let held_names: HashSet<&str> = held.iter().map(|r| r.mnemonic.as_str()).collect();
+    // The edge's own DID is local state the control plane never published:
+    // a listing that lacks it is not a slot to remove.
+    let own = crate::control_register::own_did_mnemonic(state);
 
     for (mnemonic, want) in listed {
         if want.version_count == 0 {
@@ -439,12 +442,17 @@ async fn apply_listing(
         }
     }
     for record in held {
+        let is_own = own.as_deref() == Some(record.mnemonic.as_str());
         let Some(want) = listed.get(&record.mnemonic) else {
-            report.extra.push(record.mnemonic.clone());
+            if !is_own {
+                report.extra.push(record.mnemonic.clone());
+            }
             continue;
         };
         if want.version_count == 0 {
-            report.extra.push(record.mnemonic.clone());
+            if !is_own {
+                report.extra.push(record.mnemonic.clone());
+            }
             continue;
         }
         if want.did_id != record.did_id || want.version_count > record.version_count {

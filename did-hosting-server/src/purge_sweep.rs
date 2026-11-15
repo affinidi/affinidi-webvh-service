@@ -26,7 +26,6 @@
 //! (it's a no-op on already-empty records) and then remove the
 //! pending entry on this second pass.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use did_hosting_common::server::domain::{self, DISABLE_PURGE_REASON};
@@ -34,7 +33,6 @@ use did_hosting_common::server::domain_purge::purge_domain_dids_locked;
 use did_hosting_common::server::pending_purge::{self, PurgeCheck};
 use did_hosting_common::server::stats_collector::StatsCollector;
 use did_hosting_common::server::store::Store;
-use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use did_hosting_common::server::auth::session::now_epoch;
@@ -188,36 +186,41 @@ async fn still_due(store: &Store, entry: &pending_purge::PendingPurge) -> bool {
     }
 }
 
-/// Long-running background task driving [`run_sweep_once`] on a
-/// 60-second tick until `shutdown` flips. The daemon spawns one of
-/// these per process; standalone servers spawn it in their own
-/// startup chain.
-pub async fn run_purge_sweep_loop(
-    store: Store,
-    collector: Arc<StatsCollector>,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    let mut ticker = tokio::time::interval(DEFAULT_SWEEP_INTERVAL);
-    // Skip the immediate first tick — the daemon's startup is busy
-    // enough already, and a fresh boot is unlikely to have ripe
-    // entries that need attention in the first 60s.
-    ticker.tick().await;
-
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {
-                let sweep = run_sweep_once(&store).await;
-                if sweep.entries > 0 {
-                    info!(count = sweep.entries, "purge sweep tick completed");
-                }
-                collector.subtract_total_dids(sweep.dids_deleted);
-            }
-            _ = shutdown.changed() => {
-                info!("purge sweep loop shutting down");
-                return;
-            }
+/// One purge tick on a standalone edge, run by its storage thread every
+/// [`DEFAULT_SWEEP_INTERVAL`] (the daemon runs [`run_sweep_once_locked`]
+/// from its own storage task instead).
+///
+/// An edge writes DID records only from its control plane's directives,
+/// which take no path lock, so the sweep runs unlocked. A purge deletes DIDs
+/// (and, for a disabled domain, its record) behind the resolver's back, so
+/// when anything was purged the caches are dropped whole; otherwise the
+/// content cache just loses what has outlived its TTL. The edge's DID count
+/// is adjusted by what was deleted.
+pub async fn run_edge_sweep_tick(
+    store: &Store,
+    did_cache: &crate::cache::ContentCache,
+    gate_cache: Option<&crate::cache::GateCache>,
+    collector: Option<&StatsCollector>,
+) -> SweepReport {
+    let sweep = run_sweep_once(store).await;
+    if sweep.entries > 0 {
+        info!(count = sweep.entries, "purge sweep tick completed");
+    }
+    if sweep.entries > 0 || sweep.dids_deleted > 0 {
+        did_cache.clear();
+        if let Some(gate) = gate_cache {
+            gate.clear();
+        }
+    } else {
+        did_cache.evict_expired();
+        if let Some(gate) = gate_cache {
+            gate.evict_expired();
         }
     }
+    if let Some(collector) = collector {
+        collector.subtract_total_dids(sweep.dids_deleted);
+    }
+    sweep
 }
 
 #[cfg(test)]

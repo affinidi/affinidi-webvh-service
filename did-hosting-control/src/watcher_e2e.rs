@@ -98,12 +98,20 @@ async fn pair() -> Pair {
 
 impl Pair {
     async fn queued(&self) -> Vec<(String, Value)> {
-        crate::outbox::list_pending_for_target(&self.control.store, &self.watcher_did)
+        let rows = crate::outbox::list_pending_for_target(&self.control.store, &self.watcher_did)
             .await
             .unwrap()
             .into_iter()
-            .map(|(_, e)| (e.msg_type, e.body))
-            .collect()
+            .map(|(_, e)| e)
+            .collect::<Vec<_>>();
+        let mut out = Vec::new();
+        for e in rows {
+            // What each row would be sent as now.
+            if let Some(p) = crate::outbox::prepare(&self.control, &e).await.unwrap() {
+                out.push((p.msg_type, p.body));
+            }
+        }
+        out
     }
 
     /// Wait for the spawned fan-out to queue `n` entries for the watcher.
@@ -129,10 +137,19 @@ impl Pair {
                 .expect("an entry is queued");
         let signer =
             crate::signing::control_signing_secret(&self.control, &self.control_did).unwrap();
-        let doc = crate::outbox::signed_document(&self.control_did, &entry, &signer)
+        let prepared = crate::outbox::prepare(&self.control, &entry)
             .await
-            .unwrap();
-        crate::outbox::record_sent(&self.control.store, key, &entry, &doc.id)
+            .unwrap()
+            .expect("something to send");
+        let doc = crate::outbox::signed_document(
+            &self.control_did,
+            &self.watcher_did,
+            &prepared,
+            &signer,
+        )
+        .await
+        .unwrap();
+        crate::outbox::record_prepared_sent(&self.control.store, key, &prepared, &doc.id)
             .await
             .unwrap();
         let doc = serde_json::to_value(&doc).unwrap();
@@ -194,13 +211,9 @@ impl Pair {
             // does for an edge.
             Via::Https => {
                 assert!(
-                    crate::outbox::acknowledge(
-                        &self.control.store,
-                        &self.watcher_did,
-                        &doc_id(&reply)
-                    )
-                    .await
-                    .unwrap()
+                    crate::outbox::acknowledge(&self.control, &self.watcher_did, &doc_id(&reply))
+                        .await
+                        .unwrap()
                 );
             }
         }
@@ -296,6 +309,14 @@ async fn a_published_did_fans_out_to_the_watchers_its_log_names() {
             "{via:?}: the watcher's signed ack settled the entry"
         );
 
+        // The slot goes, then its delete is queued (as the delete task does,
+        // in one commit): the row is sent as the slot stands — gone.
+        p.control.dids_ks.remove(did_key("alice")).await.unwrap();
+        p.control
+            .dids_ks
+            .remove(content_log_key("alice"))
+            .await
+            .unwrap();
         crate::server_push::notify_servers_delete(&p.control, "alice".into());
         p.wait_for(1).await;
         let reply = p.pump(via).await;
@@ -371,7 +392,7 @@ async fn a_delete_reaches_only_the_watchers_the_did_was_published_to() {
         crate::outbox::record_sent(&control.store, key, &entry, "urn:uuid:settled")
             .await
             .unwrap();
-        crate::outbox::acknowledge(&control.store, &named_watcher_did, "urn:uuid:settled")
+        crate::outbox::acknowledge(&control, &named_watcher_did, "urn:uuid:settled")
             .await
             .unwrap();
     }

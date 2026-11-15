@@ -897,15 +897,18 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
             did_hosting_common::server::stats_collector::DID_COUNT_RECONCILE_INTERVAL,
         );
 
-        // Drop expired content cache entries each minute (they live
-        // `RESOLUTION_CACHE_TTL`), so DIDs nobody asks for again do not stay
-        // in memory.
-        let mut evict_timer = tokio::time::interval(Duration::from_secs(60));
+        // Each minute: run the grace-expired purge sweep (the schedule an
+        // unassign or a domain disable acknowledged to the control plane),
+        // then drop expired content cache entries (they live
+        // `RESOLUTION_CACHE_TTL`) so DIDs nobody asks for again do not stay
+        // in memory — or the whole cache, when the sweep purged something.
+        let mut purge_timer =
+            tokio::time::interval(crate::purge_sweep::DEFAULT_SWEEP_INTERVAL);
 
         // First tick completes immediately; skip so cleanup doesn't run at startup
         did_timer.tick().await;
         did_count_timer.tick().await;
-        evict_timer.tick().await;
+        purge_timer.tick().await;
 
         loop {
             tokio::select! {
@@ -933,11 +936,14 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
                         warn!("DID count reconcile error: {e}");
                     }
                 }
-                _ = evict_timer.tick() => {
-                    caches.content.evict_expired();
-                    if let Some(gate) = &caches.gate {
-                        gate.evict_expired();
-                    }
+                _ = purge_timer.tick() => {
+                    crate::purge_sweep::run_edge_sweep_tick(
+                        &store,
+                        &caches.content,
+                        caches.gate.as_deref(),
+                        Some(&collector),
+                    )
+                    .await;
                 }
                 _ = shutdown_rx.changed() => {
                     info!("storage thread shutting down");

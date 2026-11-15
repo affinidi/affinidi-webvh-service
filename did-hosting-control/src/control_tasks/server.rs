@@ -196,17 +196,11 @@ pub(crate) async fn replication_gauges(state: &AppState) -> Result<Vec<Value>, T
         let Some(edge) = instance.metadata.get("did").and_then(Value::as_str) else {
             continue;
         };
-        let pending = crate::outbox::list_pending_for_target(&state.store, edge).await?;
-        let lag = pending
-            .iter()
-            .map(|(_, e)| now.saturating_sub(e.enqueued_at))
-            .max()
-            .unwrap_or(0);
+        // A count and the head row — not the queue's contents.
+        let (pending, oldest) = crate::outbox::target_backlog(&state.store, edge).await?;
+        let lag = oldest.map_or(0, |at| now.saturating_sub(at));
         let gauge = |name: &str, value: u64| json!({ "name": name, "value": value, "labels": { "edge": edge } });
-        gauges.push(gauge(
-            "did_hosting_replication_pending",
-            pending.len() as u64,
-        ));
+        gauges.push(gauge("did_hosting_replication_pending", pending as u64));
         gauges.push(gauge("did_hosting_replication_lag_seconds", lag));
         if let Some(at) = instance.last_ack_at {
             gauges.push(gauge(

@@ -1431,8 +1431,8 @@ Commands:
   remove-did                 Remove a DID and all its data from the store
   load-did                   Load a DID at an arbitrary path (e.g., "services/control")
   import-secrets             Import secrets from a VTA bundle or individual keys
-  backup                     Export server data to a backup file
-  restore                    Restore server data from a backup file
+  backup                     Export the daemon's data to a backup file: both stores (`[store]`, with the ACL, passkeys, identity generations and outbound queue, and `[witness_store]`) and the configuration file, verbatim
+  restore                    Restore the daemon's data from a `did-hosting-daemon backup` file
   migrate-from-webvh-config  Migrate a legacy `webvh-*` config file to the new `did-hosting-*` shape (env-var renames, repo-rename pointer updates)
   help                       Print this message or the help of the given subcommand(s)
 
@@ -2128,7 +2128,7 @@ Options:
 ### `did-hosting-daemon backup`
 
 ```text
-Export server data to a backup file
+Export the daemon's data to a backup file: both stores (`[store]`, with the ACL, passkeys, identity generations and outbound queue, and `[witness_store]`) and the configuration file, verbatim
 
 Usage: did-hosting-daemon backup [OPTIONS]
 
@@ -2148,9 +2148,9 @@ Options:
 ### `did-hosting-daemon restore`
 
 ```text
-Restore server data from a backup file.
+Restore the daemon's data from a `did-hosting-daemon backup` file.
 
-The backup is checked before anything is written, config.toml included. Each did:webvh (or did:webs) log must verify, match its record, and extend both the backup's own high-water mark and what the store already holds for that DID; otherwise nothing is restored. Restore into an empty store to start from the backup's state. The data goes into the store the backup's config names (after the usual environment overrides). If a restore is interrupted, run it again: it is safe to repeat.
+The backup is checked before anything is written, config.toml included (it is written back verbatim). Each did:webvh (or did:webs) log must verify, match its record, and extend both the backup's own high-water mark and what the store already holds for that DID; otherwise nothing is restored. Restore into an empty store to start from the backup's state. The data goes into the store the backup's config names (after the usual environment overrides). If a restore is interrupted, run it again: it is safe to repeat.
 
 Usage: did-hosting-daemon restore [OPTIONS] --input <INPUT>
 
