@@ -108,7 +108,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
                 did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
             ),
         ),
-        sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+        sync_locks: Default::default(),
         replay_cache: std::sync::Arc::new(did_hosting_common::server::replay::ReplayCache::new()),
     };
     (state, dir)
@@ -609,7 +609,12 @@ async fn concurrent_syncs_for_the_same_slot_are_serialised() {
 
     // Hold the lock as if another sync for this slot were already mid-flight,
     // between its read and its write.
-    let guard = state.sync_lock.clone().lock_owned().await;
+    let guard = state
+        .sync_locks
+        .guard(&did_hosting_server::control_register::slot_lock_key(
+            "frank",
+        ))
+        .await;
 
     let racing_state = state.clone();
     let handle = tokio::spawn(async move { apply(&racing_state, doc).await });
@@ -1065,4 +1070,163 @@ async fn an_unverified_document_gets_no_reply() {
     .expect("the control plane's op is answered");
     assert_eq!(reply["type"], MSG_SYNC_UPDATE_ACK);
     assert!(reply.get("proof").is_some(), "{reply}");
+}
+
+// ---------------------------------------------------------------------------
+// Resolution caches follow every edge write
+// ---------------------------------------------------------------------------
+
+/// `GET {path}` against the edge router, as a resolver on `server.example.com`
+/// would send it, with an optional `If-None-Match`.
+async fn resolve(
+    state: &AppState,
+    path: &str,
+    if_none_match: Option<&str>,
+) -> (axum::http::StatusCode, Option<String>, Vec<u8>) {
+    use tower::ServiceExt;
+    let mut request = axum::http::Request::builder()
+        .uri(path)
+        .header("host", "server.example.com");
+    if let Some(tag) = if_none_match {
+        request = request.header("if-none-match", tag);
+    }
+    let response = did_hosting_server::routes::router(1 << 20)
+        .with_state(state.clone())
+        .oneshot(request.body(axum::body::Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let etag = response
+        .headers()
+        .get("etag")
+        .map(|v| v.to_str().unwrap().to_string());
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, etag, body)
+}
+
+/// With the gate cache on, as a standalone edge runs, a warm resolve reads
+/// nothing from the store — and every write the control plane drives clears
+/// what it changed: a new version, a disable, a domain change and a delete
+/// each show on the very next resolve.
+#[tokio::test]
+async fn every_edge_write_clears_the_resolution_caches() {
+    use axum::http::StatusCode;
+    use did_hosting_common::didcomm_types::MSG_REPLICA_DOMAIN_UPSERT;
+
+    let (mut state, _dir) = make_state().await;
+    state.gate_cache = Some(Arc::new(
+        did_hosting_server::cache::GateCache::new(&state.store, Duration::from_secs(300)).unwrap(),
+    ));
+    let entry = |status: &str| {
+        let mut e = json!({
+            "name": "server.example.com",
+            "status": status,
+            "createdAt": "2026-06-01T10:00:00Z",
+            "ext": { "vnd.affinidi.webvh": { "scheme": "https", "wellKnownEnabled": false } },
+        });
+        if status == "disabled" {
+            e["disabledAt"] = json!("2026-09-27T09:00:00Z");
+            e["purgeAt"] = json!("2099-10-04T09:00:00Z");
+        }
+        e
+    };
+    let upsert = |status: &str| {
+        let body = json!({ "entry": entry(status) });
+        let state = state.clone();
+        async move {
+            let reply = apply(
+                &state,
+                signed_op(MSG_REPLICA_DOMAIN_UPSERT, &control(), body).await,
+            )
+            .await;
+            assert!(!is_error(&reply), "{reply:?}");
+        }
+    };
+    upsert("active").await;
+
+    let (mut webvh, key) = new_log("alice").await;
+    let v1 = jsonl(&webvh);
+    let id = did_id(&v1);
+    apply(
+        &state,
+        signed_op(MSG_SYNC_UPDATE, &control(), update_body("alice", &id, &v1)).await,
+    )
+    .await;
+    let (status, tag1, body) = resolve(&state, "/alice/did.jsonl", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, v1.as_bytes());
+    let tag1 = tag1.expect("an ETag");
+    // Warm: a conditional request for the same version is answered 304.
+    let (status, tag, body) = resolve(&state, "/alice/did.jsonl", Some(&tag1)).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert_eq!(tag.as_deref(), Some(tag1.as_str()));
+    assert!(body.is_empty());
+
+    // A new version: served at once, under a new tag.
+    append(&mut webvh, &key, 1).await;
+    let v2 = jsonl(&webvh);
+    apply(
+        &state,
+        signed_op(MSG_SYNC_UPDATE, &control(), update_body("alice", &id, &v2)).await,
+    )
+    .await;
+    let (status, tag2, body) = resolve(&state, "/alice/did.jsonl", Some(&tag1)).await;
+    assert_eq!(status, StatusCode::OK, "the old tag no longer matches");
+    assert_eq!(body, v2.as_bytes());
+    assert_ne!(tag2.as_deref(), Some(tag1.as_str()));
+
+    // A disable: the cached record said enabled; the next resolve refuses.
+    let mut disabled = update_body("alice", &id, &v2);
+    disabled["disabled"] = json!(true);
+    apply(
+        &state,
+        signed_op(MSG_SYNC_UPDATE, &control(), disabled).await,
+    )
+    .await;
+    let (status, _, _) = resolve(&state, "/alice/did.jsonl", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    apply(
+        &state,
+        signed_op(MSG_SYNC_UPDATE, &control(), update_body("alice", &id, &v2)).await,
+    )
+    .await;
+    let (status, _, _) = resolve(&state, "/alice/did.jsonl", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A domain disabled: the cached domains said active.
+    upsert("disabled").await;
+    let (status, _, _) = resolve(&state, "/alice/did.jsonl", None).await;
+    assert_ne!(status, StatusCode::OK, "a disabled domain stops resolving");
+    upsert("active").await;
+    let (status, _, _) = resolve(&state, "/alice/did.jsonl", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A delete.
+    apply(
+        &state,
+        signed_op(MSG_SYNC_DELETE, &control(), json!({ "mnemonic": "alice" })).await,
+    )
+    .await;
+    let (status, _, _) = resolve(&state, "/alice/did.jsonl", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A sync that re-sends exactly what the edge holds is answered `unchanged`
+/// without re-verifying the log; a different log is still verified in full.
+#[tokio::test]
+async fn an_identical_resend_is_unchanged() {
+    let (state, _dir) = make_state().await;
+    let (did_id, log) = valid_did_log("alice").await;
+    let body = update_body("alice", &did_id, &log);
+    let first = apply(
+        &state,
+        signed_op(MSG_SYNC_UPDATE, &control(), body.clone()).await,
+    )
+    .await;
+    assert_eq!(first.payload["status"], "applied", "{first:?}");
+    let again = apply(&state, signed_op(MSG_SYNC_UPDATE, &control(), body).await).await;
+    assert_eq!(again.payload["status"], "unchanged", "{again:?}");
 }

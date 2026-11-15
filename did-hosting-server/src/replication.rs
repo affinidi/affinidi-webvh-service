@@ -396,6 +396,14 @@ where
     Ok(report)
 }
 
+/// What [`apply_listing`] compares of one held slot.
+struct HeldSlot {
+    mnemonic: String,
+    did_id: Option<String>,
+    version_count: u64,
+    disabled: bool,
+}
+
 /// Compare this edge's slots with the control plane's listing, repairing
 /// `disabled` where the content is otherwise current.
 async fn apply_listing(
@@ -403,15 +411,23 @@ async fn apply_listing(
     listed: &HashMap<String, Listed>,
 ) -> Result<ReconcileReport, String> {
     let mut report = ReconcileReport::default();
-    let held: Vec<DidRecord> = state
-        .dids_ks
-        .prefix_iter_raw("did:")
-        .await
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .filter_map(|(_, v)| serde_json::from_slice::<DidRecord>(&v).ok())
-        .filter(|r| r.version_count > 0 && r.deleted_at.is_none())
-        .collect();
+    // What each held slot needs comparing, read a page of records at a time:
+    // a summary per slot, never every record at once.
+    let mut held: Vec<HeldSlot> = Vec::new();
+    let mut pages = state.dids_ks.walk("did:", crate::paging::DID_PAGE_ROWS);
+    while let Some(rows) = pages.next_page().await.map_err(|e| e.to_string())? {
+        held.extend(
+            rows.into_iter()
+                .filter_map(|(_, v)| serde_json::from_slice::<DidRecord>(&v).ok())
+                .filter(|r| r.version_count > 0 && r.deleted_at.is_none())
+                .map(|r| HeldSlot {
+                    mnemonic: r.mnemonic,
+                    did_id: r.did_id,
+                    version_count: r.version_count,
+                    disabled: r.disabled,
+                }),
+        );
+    }
     let held_names: HashSet<&str> = held.iter().map(|r| r.mnemonic.as_str()).collect();
     // The edge's own DID is local state the control plane never published:
     // a listing that lacks it is not a slot to remove.
@@ -446,12 +462,15 @@ async fn apply_listing(
         }
         if want.disabled != record.disabled {
             // The repair writes the whole record back, so it is made under
-            // `sync_lock` on a fresh read, like every other record writer on
+            // its slot's sync lock on a fresh read, like every other record writer on
             // an edge. The snapshot above may be minutes old by now (the
             // listing is paged over the network); writing it back would
             // revert a `sync/update` applied since, or resurrect a slot a
             // `sync/delete` removed.
-            let _guard = state.sync_lock.lock().await;
+            let _guard = state
+                .sync_locks
+                .guard(&crate::control_register::slot_lock_key(&record.mnemonic))
+                .await;
             let Some(mut current) = state
                 .dids_ks
                 .get::<DidRecord>(did_key(&record.mnemonic))
@@ -469,7 +488,7 @@ async fn apply_listing(
                 .insert(did_key(&record.mnemonic), &current)
                 .await
                 .map_err(|e| e.to_string())?;
-            state.did_cache.invalidate_did(&record.mnemonic);
+            state.resolution_caches().forget_did(&record.mnemonic);
             warn!(
                 mnemonic = %record.mnemonic,
                 disabled = want.disabled,
@@ -571,7 +590,7 @@ mod tests {
     }
 
     /// A reconcile's disabled-state repair must not write back the snapshot
-    /// it listed: a `sync/update` holding `sync_lock` commits version 2 after
+    /// it listed: a `sync/update` holding the slot's sync lock commits version 2 after
     /// the reconcile read version 1. The repair must land on version 2, and
     /// version 2 must survive.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -592,7 +611,10 @@ mod tests {
             },
         )]);
 
-        let sync_guard = state.sync_lock.lock().await;
+        let sync_guard = state
+            .sync_locks
+            .guard(&crate::control_register::slot_lock_key("slot"))
+            .await;
         let reconcile = {
             let state = state.clone();
             tokio::spawn(async move { apply_listing(&state, &listed).await })

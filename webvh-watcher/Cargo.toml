@@ -62,6 +62,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tower-http = { workspace = true, features = ["trace"] }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
@@ -71,5 +72,6 @@ affinidi-secrets-resolver = { workspace = true }
 didwebvh-rs = { workspace = true }
 http-body-util = { workspace = true }
 tempfile = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 trust-tasks-proof = { workspace = true }
 trust-tasks-rs = { workspace = true, features = ["validate"] }

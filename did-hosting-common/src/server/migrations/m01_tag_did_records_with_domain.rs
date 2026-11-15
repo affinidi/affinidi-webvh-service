@@ -160,6 +160,17 @@ impl Migration for M01TagDidRecordsWithDomain {
                             })
                         })
                         .await?;
+                    if matches!(patched, Patched::Written(_))
+                        && let Some((domain, _)) = tag(&record)
+                    {
+                        // The record now has a domain: index it (M-03 indexes the
+                        // rest, but this migration may complete after it).
+                        dids.insert_raw(
+                            crate::server::did_index::domain_index_key(&domain, &mnemonic),
+                            mnemonic.as_bytes().to_vec(),
+                        )
+                        .await?;
+                    }
                     match patched {
                         Patched::Written(true) => counters.tagged_from_did_id += 1,
                         Patched::Written(false) => counters.tagged_from_default += 1,

@@ -33,6 +33,7 @@ use tracing::{info, warn};
 
 use crate::server::AppState;
 use crate::store::{KeyspaceHandle, Store};
+use did_hosting_common::server::path_locks::PathLocks;
 
 /// Tracks whether this server has successfully registered with the control plane.
 static REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -261,29 +262,35 @@ pub fn own_did_mnemonic(state: &AppState) -> Option<String> {
 /// optimal). The edge's own DID is never reported ([`own_did_mnemonic`]).
 pub async fn preloaded_dids(state: &AppState) -> Vec<serde_json::Value> {
     let own = own_did_mnemonic(state);
-    match state.dids_ks.prefix_iter_raw("did:").await {
-        Ok(raw) => raw
-            .into_iter()
-            .filter_map(|(_k, v)| serde_json::from_slice::<DidRecord>(&v).ok())
-            .filter(|r| r.version_count > 0)
-            .filter(|r| own.as_deref() != Some(r.mnemonic.as_str()))
-            // `did_id` names *which* DID the slot holds: a DID deleted and
-            // re-created at the same mnemonic has a new identifier, so the
-            // control plane re-pushes on an identity mismatch even when the
-            // version counts happen to agree.
-            .map(|r| {
-                json!({
-                    "mnemonic": r.mnemonic,
-                    "did_id": r.did_id,
-                    "version_count": r.version_count,
-                    // So a disable this edge missed is re-sent too.
-                    "disabled": r.disabled,
-                })
-            })
-            .collect(),
-        Err(e) => {
-            warn!(error = %e, "failed to enumerate local DIDs for registration — control plane will full-sync");
-            Vec::new()
+    // A page of records at a time: only the compact summaries are kept.
+    let mut out = Vec::new();
+    let mut pages = state.dids_ks.walk("did:", crate::paging::DID_PAGE_ROWS);
+    loop {
+        match pages.next_page().await {
+            Ok(Some(rows)) => out.extend(
+                rows.into_iter()
+                    .filter_map(|(_k, v)| serde_json::from_slice::<DidRecord>(&v).ok())
+                    .filter(|r| r.version_count > 0)
+                    .filter(|r| own.as_deref() != Some(r.mnemonic.as_str()))
+                    // `did_id` names *which* DID the slot holds: a DID deleted
+                    // and re-created at the same mnemonic has a new identifier,
+                    // so the control plane re-pushes on an identity mismatch
+                    // even when the version counts happen to agree.
+                    .map(|r| {
+                        json!({
+                            "mnemonic": r.mnemonic,
+                            "did_id": r.did_id,
+                            "version_count": r.version_count,
+                            // So a disable this edge missed is re-sent too.
+                            "disabled": r.disabled,
+                        })
+                    }),
+            ),
+            Ok(None) => return out,
+            Err(e) => {
+                warn!(error = %e, "failed to enumerate local DIDs for registration — control plane will full-sync");
+                return Vec::new();
+            }
         }
     }
 }
@@ -296,11 +303,13 @@ pub async fn apply_did_updates(
     dids_ks: &KeyspaceHandle,
     store: &Store,
     updates: &[DidSyncUpdate],
-    did_cache: &crate::cache::ContentCache,
+    caches: &crate::cache::ResolutionCaches,
+    locks: &PathLocks,
     public_url: Option<&str>,
 ) {
     for update in updates {
-        if let Err(e) = apply_single_update(dids_ks, store, update, did_cache, public_url).await {
+        if let Err(e) = apply_single_update(dids_ks, store, update, caches, locks, public_url).await
+        {
             warn!(
                 mnemonic = %update.mnemonic,
                 error = %e,
@@ -310,12 +319,21 @@ pub async fn apply_did_updates(
     }
 }
 
-/// What [`verify_update`] established about an update.
-struct VerifiedUpdate {
-    /// The DID's stable identity: the SCID for webvh, the identifier for webs.
-    identity: String,
+/// What [`verify_chain`] established about an update.
+struct VerifiedChain {
     #[cfg(feature = "method-webs")]
     webs_document: Option<serde_json::Value>,
+}
+
+/// The lock key serialising every write to `mnemonic`'s slot on an edge.
+pub fn slot_lock_key(mnemonic: &str) -> String {
+    format!("edge-slot:{mnemonic}")
+}
+
+/// The lock key serialising every write to one DID identity's high-water
+/// mark (two slots can hold logs of the same DID). Taken after the slot's.
+pub fn identity_lock_key(identity: &str) -> String {
+    format!("edge-identity:{identity}")
 }
 
 /// The last DID a slot served. Kept after a delete (see `apply_single_update`).
@@ -349,32 +367,30 @@ pub(crate) fn has_history(method: &str) -> bool {
     method == "webvh" || (method == "webs" && cfg!(feature = "method-webs"))
 }
 
-/// Verify a sync update before it replaces anything:
+/// Verify a sync update before it replaces anything. Three checks, split by
+/// what they need:
 ///
-/// 1. **Binding** — the identifier the push names is the one the log
-///    establishes, and it resolves at exactly this slot on a host this server
-///    serves (its public URL or an assigned domain). A valid log cannot be
-///    filed under another slot or served for another host.
-/// 2. **Chain** — webvh: every entry's hash, proof against the authorised
-///    `updateKeys`, pre-rotation and parameter transition, and the witness
-///    proofs when witnesses are configured; webs: the full key event log.
-/// 3. **History** — the log must strictly extend every history this edge has
-///    ever served for the same DID: the log it holds now, and the high-water
-///    log it kept for that DID's identity, which a delete does not clear. A
-///    rollback, a fork, a resurrected deactivation or a re-created DID that
-///    starts over are all refused. A slot that held a different DID may be
-///    re-used by a new one (a new DID is a new identity with its own history);
-///    a slot never changes method.
-async fn verify_update(
-    dids_ks: &KeyspaceHandle,
-    store: &Store,
+/// 1. **Binding** ([`verify_binding`]) — the identifier the push names is the
+///    one the log establishes, and it resolves at exactly this slot on a host
+///    this server serves (its public URL or an assigned domain). A valid log
+///    cannot be filed under another slot or served for another host.
+/// 2. **Chain** (this function) — webvh: every entry's hash, proof against
+///    the authorised `updateKeys`, pre-rotation and parameter transition, and
+///    the witness proofs when witnesses are configured; webs: the full key
+///    event log. Pure CPU over the update alone, so it runs on a blocking
+///    thread and before any lock is taken: verifying one slot's log never
+///    holds up another slot's sync.
+/// 3. **History** ([`verify_history`]) — under the slot's lock: the log must
+///    strictly extend every history this edge has ever served for the same
+///    DID. A rollback, a fork, a resurrected deactivation or a re-created DID
+///    that starts over are all refused. A slot that held a different DID may
+///    be re-used by a new one (a new DID is a new identity with its own
+///    history); a slot never changes method.
+fn verify_chain(
     update: &DidSyncUpdate,
     synced_method: &str,
-    public_url: Option<&str>,
-) -> Result<VerifiedUpdate, crate::error::AppError> {
+) -> Result<VerifiedChain, crate::error::AppError> {
     use crate::error::AppError;
-
-    verify_binding(store, update, synced_method, public_url).await?;
 
     match synced_method {
         "webvh" => did_hosting_common::did_ops::verify_did_log_and_witness_proofs(
@@ -404,31 +420,38 @@ async fn verify_update(
         None
     };
 
-    let identity = verify_history(
-        dids_ks,
-        &update.mnemonic,
-        &update.did_id,
-        &update.log_content,
-        synced_method,
-    )
-    .await?;
-
-    Ok(VerifiedUpdate {
-        identity,
+    Ok(VerifiedChain {
         #[cfg(feature = "method-webs")]
         webs_document,
     })
 }
 
-/// Step 3 of [`verify_update`], shared with every other path that replaces a
-/// hosted log: the log must
-/// strictly extend every history this edge has served for the same DID — the
-/// log it holds now, and the high-water log kept for the DID's identity, which
-/// a delete does not clear — and a slot never changes method. Returns the DID's
-/// identity (SCID for webvh, the identifier for webs), to be recorded with
+/// The DID identity a log's history is kept under: the SCID for webvh, the
+/// identifier for webs.
+pub(crate) fn history_identity(
+    did_id: &str,
+    method: &str,
+) -> Result<String, crate::error::AppError> {
+    match method {
+        "webvh" => webvh_scid(did_id).ok_or_else(|| {
+            crate::error::AppError::invalid(format!("{did_id} is not a did:webvh identifier"))
+        }),
+        "webs" => Ok(did_id.to_string()),
+        other => Err(cannot_verify(other)),
+    }
+}
+
+/// Step 3 of a sync's verification, shared with every other path that
+/// replaces a hosted log: the log must strictly extend every history this
+/// edge has served for the same DID — the log it holds now, and the
+/// high-water mark kept for the DID's identity, which a delete does not
+/// clear — and a slot never changes method. Returns the DID's identity (SCID
+/// for webvh, the identifier for webs), to be recorded with
 /// [`stage_high_water`] in the same batch that stores the log.
 ///
-/// The log itself must already have been verified (chain, proofs).
+/// The log itself must already have been verified (chain, proofs): the mark
+/// compares version ids, which identify a prefix only of a verified chain.
+/// Callers hold the slot's and the identity's sync locks.
 pub(crate) async fn verify_history(
     dids_ks: &KeyspaceHandle,
     mnemonic: &str,
@@ -438,10 +461,6 @@ pub(crate) async fn verify_history(
 ) -> Result<String, crate::error::AppError> {
     use crate::error::{AppError, ValidationKind};
 
-    let held = dids_ks
-        .get_raw(content_log_key(mnemonic))
-        .await?
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
     let held_record: Option<DidRecord> = dids_ks.get(did_key(mnemonic)).await?;
     let slot_mark: Option<SlotHighWater> = dids_ks.get(high_water_slot_key(mnemonic)).await?;
     for held_method in held_record
@@ -460,29 +479,25 @@ pub(crate) async fn verify_history(
         }
     }
 
-    let identity = match method {
-        "webvh" => webvh_scid(did_id)
-            .ok_or_else(|| AppError::invalid(format!("{did_id} is not a did:webvh identifier")))?,
-        "webs" => did_id.to_string(),
-        other => return Err(cannot_verify(other)),
-    };
+    let identity = history_identity(did_id, method)?;
 
-    // Every history of this same DID the edge has served.
-    let high_water = dids_ks
-        .get_raw(high_water_identity_key(&identity))
-        .await?
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-    let held_identity =
-        held_record
-            .as_ref()
-            .and_then(|r| r.did_id.as_deref())
-            .map(|id| match method {
-                "webvh" => webvh_scid(id).unwrap_or_default(),
-                _ => id.to_string(),
-            });
-    let same_did_held = held.filter(|_| held_identity.as_deref() == Some(identity.as_str()));
-    for previous in [same_did_held, high_water].into_iter().flatten() {
-        verify_extends(method, did_id, &previous, log_content)?;
+    // The furthest history of this same DID the edge has served. Every path
+    // that writes a log stages the mark with it, so the mark covers the log
+    // held now; that log is compared itself only where no mark exists yet (a
+    // store written before marks were kept).
+    match dids_ks.get_raw(high_water_identity_key(&identity)).await? {
+        Some(bytes) => HighWaterMark::parse(method, &bytes)?.admits(method, did_id, log_content)?,
+        None => {
+            let held_identity = held_record
+                .as_ref()
+                .and_then(|r| r.did_id.as_deref())
+                .map(|id| history_identity(id, method).unwrap_or_default());
+            if held_identity.as_deref() == Some(identity.as_str())
+                && let Some(held) = dids_ks.get_raw(content_log_key(mnemonic)).await?
+            {
+                verify_extends(method, did_id, &String::from_utf8_lossy(&held), log_content)?;
+            }
+        }
     }
     Ok(identity)
 }
@@ -533,21 +548,171 @@ fn cannot_verify(method: &str) -> crate::error::AppError {
     crate::error::AppError::invalid(format!("this server cannot verify {method} logs"))
 }
 
-/// For a restore: what to do with a high-water log `incoming` for `identity`
-/// that a backup carries. `true` when it may be written (nothing is held for
-/// that identity, or it extends what is held); `false` when what is held
-/// already extends it, so the held mark is kept. Two marks that diverge are
-/// refused: a restore never moves a mark back or onto another history.
+/// The furthest history an edge has served for one DID identity, kept under
+/// `hw:id:{identity}` after the DID is deleted so a re-publish cannot roll it
+/// back.
+///
+/// For did:webvh it is compact: the version id of every entry served, and
+/// whether one of them deactivated the DID. A version id (`{n}-{hash}`) hashes
+/// its entry together with the previous version id, so in a verified chain
+/// equal ids at a position mean an identical prefix — the comparison a full
+/// copy of the log was kept for, at a few dozen bytes per entry. A did:webs
+/// key event log is compared by its controller's own continuation rules
+/// (`Webs::verify_continuation`), which need the stream, so its mark keeps
+/// the stream.
+///
+/// Rows written before this format held the whole log as bare text; they are
+/// read as the mark that log implies, and rewritten at boot by
+/// [`migrate_high_water_marks`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct HighWaterMark {
+    /// The format, `1`. A legacy row (a bare log) carries no such member,
+    /// which is how the two are told apart.
+    hw_mark: u8,
+    /// did:webvh: every served entry's `versionId`, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    version_ids: Vec<String>,
+    /// did:webvh: an entry served deactivated the DID; nothing may follow.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    deactivated: bool,
+    /// did:webs: the key event log served.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    log: Option<String>,
+}
+
+const HIGH_WATER_MARK_FORMAT: u8 = 1;
+
+/// A webvh log's entries' version ids and whether any entry deactivates.
+fn webvh_history(log: &str) -> Result<(Vec<String>, bool), crate::error::AppError> {
+    let mut ids = Vec::new();
+    let mut deactivated = false;
+    for line in log.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let entry: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| crate::error::AppError::invalid(format!("unreadable log entry: {e}")))?;
+        let id = entry
+            .get("versionId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| crate::error::AppError::invalid("a log entry has no versionId"))?;
+        ids.push(id.to_string());
+        deactivated |= entry
+            .get("parameters")
+            .and_then(|p| p.get("deactivated"))
+            .and_then(|d| d.as_bool())
+            .unwrap_or(false);
+    }
+    Ok((ids, deactivated))
+}
+
+impl HighWaterMark {
+    /// The mark of a verified `log` of `method`.
+    pub(crate) fn of_log(method: &str, log: &str) -> Result<Self, crate::error::AppError> {
+        Ok(match method {
+            "webvh" => {
+                let (version_ids, deactivated) = webvh_history(log)?;
+                Self {
+                    hw_mark: HIGH_WATER_MARK_FORMAT,
+                    version_ids,
+                    deactivated,
+                    log: None,
+                }
+            }
+            _ => Self {
+                hw_mark: HIGH_WATER_MARK_FORMAT,
+                version_ids: Vec::new(),
+                deactivated: false,
+                log: Some(log.to_string()),
+            },
+        })
+    }
+
+    /// A stored row: a mark, or a legacy row holding the log itself.
+    pub(crate) fn parse(method: &str, bytes: &[u8]) -> Result<Self, crate::error::AppError> {
+        match serde_json::from_slice::<Self>(bytes) {
+            Ok(mark) if mark.hw_mark == HIGH_WATER_MARK_FORMAT => Ok(mark),
+            _ => {
+                let log = String::from_utf8_lossy(bytes);
+                // A legacy log this cannot condense is compared as the log.
+                Ok(Self::of_log(method, &log).unwrap_or_else(|_| Self {
+                    hw_mark: HIGH_WATER_MARK_FORMAT,
+                    version_ids: Vec::new(),
+                    deactivated: false,
+                    log: Some(log.into_owned()),
+                }))
+            }
+        }
+    }
+
+    /// Whether `bytes` is a row in this format (not a legacy log).
+    pub(crate) fn is_current(bytes: &[u8]) -> bool {
+        serde_json::from_slice::<Self>(bytes).is_ok_and(|m| m.hw_mark == HIGH_WATER_MARK_FORMAT)
+    }
+
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("a high-water mark serialises")
+    }
+
+    /// Whether `next`, a verified log of the same DID, extends the history
+    /// this mark records: [`verify_extends`]'s rule, on the mark.
+    pub(crate) fn admits(
+        &self,
+        method: &str,
+        did_id: &str,
+        next: &str,
+    ) -> Result<(), crate::error::AppError> {
+        use crate::error::{AppError, ValidationKind};
+        use did_hosting_common::did_ops::LogExtendError;
+        if let Some(log) = &self.log {
+            return verify_extends(method, did_id, log, next);
+        }
+        let (next_ids, _) = webvh_history(next)?;
+        let held = self.version_ids.len();
+        if next_ids.len() < held || next_ids[..held] != self.version_ids[..] {
+            let e = LogExtendError::HistoryRewrite {
+                held,
+                received: next_ids.len(),
+            };
+            return Err(AppError::validation(
+                ValidationKind::HistoryRewrite,
+                e.to_string(),
+            ));
+        }
+        if self.deactivated && next_ids.len() != held {
+            return Err(AppError::validation(
+                ValidationKind::Deactivated,
+                LogExtendError::Deactivated.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether this mark records a history that extends (or equals) `older`'s.
+    fn extends(&self, older: &Self, method: &str, did_id: &str) -> bool {
+        match (&self.log, &older.log) {
+            (Some(this), Some(that)) => verify_extends(method, did_id, that, this).is_ok(),
+            (None, None) => {
+                let held = older.version_ids.len();
+                self.version_ids.len() >= held
+                    && self.version_ids[..held] == older.version_ids[..]
+                    && !(older.deactivated && self.version_ids.len() != held)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// For a restore: what to do with a high-water mark `incoming` (either
+/// format) for `identity` that a backup carries. `true` when it may be
+/// written (nothing is held for that identity, or it extends what is held);
+/// `false` when what is held already extends it, so the held mark is kept.
+/// Two marks that diverge are refused: a restore never moves a mark back or
+/// onto another history.
 pub(crate) async fn high_water_to_restore(
     dids_ks: &KeyspaceHandle,
     identity: &str,
-    incoming: &str,
+    incoming: &[u8],
 ) -> Result<bool, crate::error::AppError> {
-    let Some(held) = dids_ks
-        .get_raw(high_water_identity_key(identity))
-        .await?
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-    else {
+    let Some(held) = dids_ks.get_raw(high_water_identity_key(identity)).await? else {
         return Ok(true);
     };
     // A webs identity is its identifier; a webvh identity is the bare SCID.
@@ -560,22 +725,26 @@ pub(crate) async fn high_water_to_restore(
         // This build cannot compare the two: keep the held one.
         return Ok(false);
     }
-    if verify_extends(method, identity, &held, incoming).is_ok() {
+    let held = HighWaterMark::parse(method, &held)?;
+    let incoming = HighWaterMark::parse(method, incoming)?;
+    if incoming.extends(&held, method, identity) {
         return Ok(true);
     }
-    verify_extends(method, identity, incoming, &held).map_err(|_| {
-        crate::error::AppError::invalid(format!(
-            "the backup's history for {identity} diverges from the one this store has served"
-        ))
-    })?;
-    Ok(false)
+    if held.extends(&incoming, method, identity) {
+        return Ok(false);
+    }
+    Err(crate::error::AppError::invalid(format!(
+        "the backup's history for {identity} diverges from the one this store has served"
+    )))
 }
 
 /// Record, in `batch`, the high-water marks for a log that passed
-/// [`verify_history`]: the furthest history served for the DID's `identity`,
-/// and which DID (and method) the slot last held. Never removed — not by
-/// `sync/delete`, not by a domain purge, not by a local delete — so a delete
-/// followed by a re-publish cannot roll either back.
+/// [`verify_history`]: the furthest history served for the DID's `identity`
+/// (a compact [`HighWaterMark`]), and which DID (and method) the slot last
+/// held. Never removed — not by `sync/delete`, not by a domain purge, not by
+/// a local delete — so a delete followed by a re-publish cannot roll either
+/// back: they are the tombstones that hold a deleted DID's history, a few
+/// hundred bytes each.
 pub(crate) fn stage_high_water(
     batch: &mut crate::store::WriteBatch,
     dids_ks: &KeyspaceHandle,
@@ -588,7 +757,7 @@ pub(crate) fn stage_high_water(
     batch.insert_raw(
         dids_ks,
         high_water_identity_key(identity),
-        log_content.as_bytes().to_vec(),
+        HighWaterMark::of_log(method, log_content)?.to_bytes(),
     );
     batch.insert(
         dids_ks,
@@ -602,6 +771,46 @@ pub(crate) fn stage_high_water(
     Ok(())
 }
 
+/// Rewrite every high-water row still holding a whole log (written before
+/// the compact `HighWaterMark`) as the mark that log implies. Idempotent;
+/// run at boot. Returns how many rows were rewritten.
+pub async fn migrate_high_water_marks(
+    dids_ks: &KeyspaceHandle,
+    store: &Store,
+) -> Result<usize, crate::error::AppError> {
+    let mut rewritten = 0;
+    let mut pages = dids_ks.walk(HIGH_WATER_IDENTITY_PREFIX, 64);
+    while let Some(rows) = pages.next_page().await? {
+        let mut batch = store.batch();
+        let mut staged = 0;
+        for (key, value) in rows {
+            if HighWaterMark::is_current(&value) {
+                continue;
+            }
+            let identity =
+                String::from_utf8_lossy(&key[HIGH_WATER_IDENTITY_PREFIX.len()..]).into_owned();
+            let method = if identity.starts_with("did:webs:") {
+                "webs"
+            } else {
+                "webvh"
+            };
+            match HighWaterMark::of_log(method, &String::from_utf8_lossy(&value)) {
+                Ok(mark) => {
+                    batch.insert_raw(dids_ks, key, mark.to_bytes());
+                    staged += 1;
+                }
+                // Left as it is: still read (and refused against) as a log.
+                Err(e) => warn!(%identity, error = %e, "high-water row not migrated"),
+            }
+        }
+        if staged > 0 {
+            batch.commit_in_parts().await?;
+            rewritten += staged;
+        }
+    }
+    Ok(rewritten)
+}
+
 /// The SCID of a `did:webvh:{scid}:…` identifier.
 fn webvh_scid(did_id: &str) -> Option<String> {
     did_id
@@ -612,7 +821,7 @@ fn webvh_scid(did_id: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Step 1 of [`verify_update`]: the identifier is the log's, and it resolves
+/// Step 1 of a sync's verification (see [`verify_chain`]): the identifier is the log's, and it resolves
 /// at this slot on a host this server serves.
 async fn verify_binding(
     store: &Store,
@@ -692,7 +901,8 @@ pub async fn apply_single_update(
     dids_ks: &KeyspaceHandle,
     store: &Store,
     update: &DidSyncUpdate,
-    did_cache: &crate::cache::ContentCache,
+    caches: &crate::cache::ResolutionCaches,
+    locks: &PathLocks,
     public_url: Option<&str>,
 ) -> Result<SyncApplied, crate::error::AppError> {
     use did_hosting_common::server::auth::session::now_epoch;
@@ -727,38 +937,73 @@ pub async fn apply_single_update(
             }
         };
 
+    // Nothing to write when this edge already holds exactly this state: the
+    // same log, the same witness proofs and the same disabled flag. Checked
+    // first, without a lock and without verifying anything: what is held was
+    // verified when it was written, and answering `unchanged` writes nothing.
+    // (Checked again under the lock below, before writing.)
+    if holds_exactly(dids_ks, update).await?.is_some() {
+        let _slot_guard = locks.guard(&slot_lock_key(&update.mnemonic)).await;
+        let _identity_guard = locks
+            .guard(&identity_lock_key(&history_identity(
+                &update.did_id,
+                synced_method,
+            )?))
+            .await;
+        if let Some(prev) = holds_exactly(dids_ks, update).await? {
+            reassert_agent_names(dids_ks, store, &prev).await?;
+            return Ok(SyncApplied::Unchanged);
+        }
+    }
+
     // The edge verifies what it is asked to serve itself, rather than trusting
     // the control plane to have done so: a compromised or buggy control plane
     // must not be able to make an edge serve a log the DID's own keys never
     // authorised, an old version of one, or one filed under another slot.
-    // See `verify_update` for the full list.
-    let verified = verify_update(dids_ks, store, update, synced_method, public_url).await?;
+    // See `verify_chain` for the full list. Binding and chain first, with no
+    // lock held — the chain (every proof in the log) on a blocking thread —
+    // then the history, under the slot's lock, against what is held.
+    verify_binding(store, update, synced_method, public_url).await?;
+    let chain = {
+        let update = update.clone();
+        let method = synced_method.to_string();
+        tokio::task::spawn_blocking(move || verify_chain(&update, &method))
+            .await
+            .map_err(|e| {
+                crate::error::AppError::Internal(format!("log verification panicked: {e}"))
+            })??
+    };
     #[cfg(feature = "method-webs")]
-    let webs_document = verified.webs_document;
+    let webs_document = chain.webs_document;
+    #[cfg(not(feature = "method-webs"))]
+    let _ = chain;
 
-    // Nothing to write when this edge already holds exactly this state: the
-    // same log, the same witness proofs and the same disabled flag.
-    let previous: Option<DidRecord> = dids_ks.get(did_key(&update.mnemonic)).await.ok().flatten();
-    if let Some(prev) = previous.as_ref()
-        && prev.did_id.as_deref() == Some(update.did_id.as_str())
-        && prev.disabled == update.disabled
-        && dids_ks
-            .get_raw(content_log_key(&update.mnemonic))
-            .await?
-            .is_some_and(|held| held == update.log_content.as_bytes())
-        && dids_ks
-            .get_raw(content_witness_key(&update.mnemonic))
-            .await?
-            .map(|w| String::from_utf8_lossy(&w).into_owned())
-            == update.witness_content
-    {
+    // The slot's lock, then the DID's: everything from here reads what this
+    // edge holds and writes on that basis.
+    let _slot_guard = locks.guard(&slot_lock_key(&update.mnemonic)).await;
+    let _identity_guard = locks
+        .guard(&identity_lock_key(&history_identity(
+            &update.did_id,
+            synced_method,
+        )?))
+        .await;
+    if let Some(prev) = holds_exactly(dids_ks, update).await? {
         // Nothing to write for the slot itself, but its name-index entries
-        // are re-asserted: an index entry lost to an earlier bug (or any other
-        // way) must be repairable by a re-sync, and a re-sync of an unchanged
-        // log only ever lands here.
-        reassert_agent_names(dids_ks, store, prev).await?;
+        // are re-asserted: an index entry lost to an earlier bug (or any
+        // other way) must be repairable by a re-sync, and a re-sync of an
+        // unchanged log only ever lands here.
+        reassert_agent_names(dids_ks, store, &prev).await?;
         return Ok(SyncApplied::Unchanged);
     }
+    let identity = verify_history(
+        dids_ks,
+        &update.mnemonic,
+        &update.did_id,
+        &update.log_content,
+        synced_method,
+    )
+    .await?;
+    let previous: Option<DidRecord> = dids_ks.get(did_key(&update.mnemonic)).await?;
 
     // Services and agent names both come from the current DID document,
     // wherever this method keeps it — the last log entry's `state` for
@@ -897,7 +1142,7 @@ pub async fn apply_single_update(
     stage_high_water(
         &mut batch,
         dids_ks,
-        &verified.identity,
+        &identity,
         &update.mnemonic,
         &update.did_id,
         synced_method,
@@ -905,7 +1150,7 @@ pub async fn apply_single_update(
     )?;
     batch.commit().await?;
 
-    did_cache.invalidate_did(&update.mnemonic);
+    caches.forget_did(&update.mnemonic);
 
     info!(
         mnemonic = %update.mnemonic,
@@ -915,6 +1160,30 @@ pub async fn apply_single_update(
     );
 
     Ok(SyncApplied::Applied)
+}
+
+/// The record this edge holds for `update`'s slot when it already holds
+/// exactly `update`'s state: the same DID, log, witness proofs and disabled
+/// flag.
+async fn holds_exactly(
+    dids_ks: &KeyspaceHandle,
+    update: &DidSyncUpdate,
+) -> Result<Option<DidRecord>, crate::error::AppError> {
+    let Some(prev) = dids_ks.get::<DidRecord>(did_key(&update.mnemonic)).await? else {
+        return Ok(None);
+    };
+    let exact = prev.did_id.as_deref() == Some(update.did_id.as_str())
+        && prev.disabled == update.disabled
+        && dids_ks
+            .get_raw(content_log_key(&update.mnemonic))
+            .await?
+            .is_some_and(|held| held == update.log_content.as_bytes())
+        && dids_ks
+            .get_raw(content_witness_key(&update.mnemonic))
+            .await?
+            .map(|w| String::from_utf8_lossy(&w).into_owned())
+            == update.witness_content;
+    Ok(exact.then_some(prev))
 }
 
 /// Whether the agent-name index entry at `key` points at `mnemonic`.
@@ -985,4 +1254,132 @@ pub enum SyncApplied {
     Applied,
     /// It already held that state; nothing was written.
     Unchanged,
+}
+
+#[cfg(test)]
+mod high_water_tests {
+    use super::*;
+    use crate::bootstrap::test_logs;
+    use crate::error::ValidationKind;
+    use did_hosting_common::server::config::StoreConfig;
+    use did_hosting_common::server::store::KS_DIDS;
+
+    async fn store() -> (tempfile::TempDir, Store, KeyspaceHandle) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open store");
+        let ks = store.keyspace(KS_DIDS).unwrap();
+        (dir, store, ks)
+    }
+
+    #[tokio::test]
+    async fn a_mark_is_compact_and_admits_only_extensions() {
+        let logs = test_logs::versions("example.com", "alice", 3).await;
+        let did = did_hosting_common::did_ops::extract_did_id(&logs[0]).unwrap();
+        let mark = HighWaterMark::of_log("webvh", &logs[1]).unwrap();
+        assert_eq!(mark.version_ids.len(), 2);
+        assert!(mark.log.is_none(), "a webvh mark keeps no copy of the log");
+        assert!(
+            mark.to_bytes().len() * 4 < logs[1].len(),
+            "{} bytes for a {}-byte log",
+            mark.to_bytes().len(),
+            logs[1].len()
+        );
+        // Itself and anything after it; never anything before it.
+        mark.admits("webvh", &did, &logs[1]).unwrap();
+        mark.admits("webvh", &did, &logs[2]).unwrap();
+        let err = mark.admits("webvh", &did, &logs[0]).unwrap_err();
+        assert_eq!(err.validation_kind(), ValidationKind::HistoryRewrite);
+        // Another DID's history at the same length is a fork.
+        let other = test_logs::versions("example.com", "alice", 2).await;
+        let err = mark.admits("webvh", &did, &other[1]).unwrap_err();
+        assert_eq!(err.validation_kind(), ValidationKind::HistoryRewrite);
+        // Round-trips, and is told apart from a legacy row.
+        assert!(HighWaterMark::is_current(&mark.to_bytes()));
+        assert!(!HighWaterMark::is_current(logs[0].as_bytes()));
+        assert_eq!(
+            HighWaterMark::parse("webvh", &mark.to_bytes()).unwrap(),
+            mark
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_full_log_mark_is_honoured_then_migrated() {
+        let (_dir, store, ks) = store().await;
+        let logs = test_logs::versions("example.com", "alice", 3).await;
+        let did = did_hosting_common::did_ops::extract_did_id(&logs[0]).unwrap();
+        let scid = webvh_scid(&did).unwrap();
+        // A row written before compact marks: the whole v2 log.
+        ks.insert_raw(high_water_identity_key(&scid), logs[1].as_bytes().to_vec())
+            .await
+            .unwrap();
+
+        let rollback = |log: String| {
+            let ks = ks.clone();
+            let did = did.clone();
+            async move { verify_history(&ks, "alice", &did, &log, "webvh").await }
+        };
+        assert!(
+            rollback(logs[0].clone()).await.is_err(),
+            "legacy mark refuses a rollback"
+        );
+
+        assert_eq!(migrate_high_water_marks(&ks, &store).await.unwrap(), 1);
+        let row = ks
+            .get_raw(high_water_identity_key(&scid))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(HighWaterMark::is_current(&row));
+        assert_eq!(
+            HighWaterMark::parse("webvh", &row).unwrap(),
+            HighWaterMark::of_log("webvh", &logs[1]).unwrap()
+        );
+        assert!(rollback(logs[0].clone()).await.is_err(), "still refused");
+        assert_eq!(
+            rollback(logs[2].clone()).await.unwrap(),
+            scid,
+            "an extension is accepted"
+        );
+        assert_eq!(
+            migrate_high_water_marks(&ks, &store).await.unwrap(),
+            0,
+            "idempotent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restore_compares_marks_of_either_format() {
+        let (_dir, _store, ks) = store().await;
+        let logs = test_logs::versions("example.com", "alice", 3).await;
+        let did = did_hosting_common::did_ops::extract_did_id(&logs[0]).unwrap();
+        let scid = webvh_scid(&did).unwrap();
+        ks.insert_raw(
+            high_water_identity_key(&scid),
+            HighWaterMark::of_log("webvh", &logs[1]).unwrap().to_bytes(),
+        )
+        .await
+        .unwrap();
+        // A backup's legacy row further on is written; one behind is not.
+        assert!(
+            high_water_to_restore(&ks, &scid, logs[2].as_bytes())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !high_water_to_restore(&ks, &scid, logs[0].as_bytes())
+                .await
+                .unwrap()
+        );
+        let fork = test_logs::versions("example.com", "alice", 2).await;
+        assert!(
+            high_water_to_restore(&ks, &scid, fork[1].as_bytes())
+                .await
+                .is_err()
+        );
+    }
 }

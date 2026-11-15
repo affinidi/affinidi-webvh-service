@@ -33,7 +33,6 @@ aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "did-hosting-comm
 gcp-secrets = [
   "dep:google-cloud-secretmanager-v1",
   "dep:google-cloud-auth",
-  "dep:bytes",
   "did-hosting-common/gcp-secrets",
 ]
 azure-secrets = [
@@ -108,7 +107,8 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 toml = { workspace = true }
 vta-sdk = { workspace = true }
-tower-http = { workspace = true, features = ["trace"] }
+tower-http = { workspace = true, features = ["trace", "compression-gzip", "compression-br"] }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
@@ -119,7 +119,7 @@ aws-config = { version = "1", features = [
 
 google-cloud-secretmanager-v1 = { version = "1", optional = true }
 google-cloud-auth = { version = "1", optional = true }
-bytes = { version = "1", optional = true }
+bytes = "1"
 redis = { version = "1.0", features = ["tokio-comp", "aio"], optional = true }
 aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 firestore = { version = "0.61", optional = true }

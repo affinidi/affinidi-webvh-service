@@ -348,11 +348,22 @@ pub(crate) async fn seed_did(state: &AppState, owner: &str, mnemonic: &str) -> D
         domain: String::new(),
         agent_names: Vec::new(),
     };
-    state
-        .dids_ks
-        .insert(did_key(mnemonic), &record)
-        .await
+    // With the derived rows (usage counter, domain index), as a real write.
+    let old: Option<DidRecord> = state.dids_ks.get(did_key(mnemonic)).await.unwrap();
+    let mut batch = state.store.batch();
+    batch
+        .insert(&state.dids_ks, did_key(mnemonic), &record)
         .unwrap();
+    did_hosting_common::server::did_index::stage_record_change(
+        &mut batch,
+        &state.dids_ks,
+        None,
+        old.as_ref(),
+        Some(&record),
+    )
+    .await
+    .unwrap();
+    batch.commit().await.unwrap();
     state
         .dids_ks
         .insert_raw(owner_key(owner, mnemonic), mnemonic.as_bytes().to_vec())

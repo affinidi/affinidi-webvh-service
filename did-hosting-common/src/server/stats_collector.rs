@@ -9,8 +9,8 @@
 //! A writer that fails to store drained deltas or buckets requeues them.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::DidStatsDelta;
 use crate::server::error::AppError;
@@ -90,6 +90,13 @@ fn now_epoch() -> u64 {
 
 fn bucket_epoch(ts: u64) -> u64 {
     ts / BUCKET_SECS * BUCKET_SECS
+}
+
+/// Lock one of the collector's maps. A panic while a map was held leaves
+/// counts, not invariants, half-updated, so a poisoned lock is taken as it
+/// stands rather than failing every later resolve.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Thread-safe in-memory stats collector.
@@ -217,7 +224,7 @@ impl StatsCollector {
     /// Record a DID resolve event. Nanosecond cost, no I/O.
     pub fn record_resolve(&self, mnemonic: &str) {
         let now = now_epoch();
-        self.add_delta(mnemonic.to_string(), 1, 0, Some(now), None);
+        self.add_delta(mnemonic, 1, 0, Some(now), None);
         self.add_bucket(mnemonic, bucket_epoch(now), 1, 0);
         self.agg_total_resolves.fetch_add(1, Ordering::Relaxed);
         self.agg_last_resolved_at.fetch_max(now, Ordering::Relaxed);
@@ -226,7 +233,7 @@ impl StatsCollector {
     /// Record a DID update/publish event. Nanosecond cost, no I/O.
     pub fn record_update(&self, mnemonic: &str) {
         let now = now_epoch();
-        self.add_delta(mnemonic.to_string(), 0, 1, None, Some(now));
+        self.add_delta(mnemonic, 0, 1, None, Some(now));
         self.add_bucket(mnemonic, bucket_epoch(now), 0, 1);
         self.agg_total_updates.fetch_add(1, Ordering::Relaxed);
         self.agg_last_updated_at.fetch_max(now, Ordering::Relaxed);
@@ -254,7 +261,7 @@ impl StatsCollector {
 
         let now = now_epoch();
         self.add_delta(
-            mnemonic.to_string(),
+            mnemonic,
             resolve_delta,
             update_delta,
             last_resolved_at,
@@ -283,21 +290,28 @@ impl StatsCollector {
 
     /// Add to a DID's pending deltas, unless the map is at
     /// [`MAX_PENDING_DIDS`] and the DID is not already in it. Returns whether
-    /// the deltas were kept.
+    /// the deltas were kept. A DID already pending is updated in place, so
+    /// the hot path allocates its key only for a DID's first event since the
+    /// last drain.
     fn add_delta(
         &self,
-        mnemonic: String,
+        mnemonic: &str,
         resolves: u64,
         updates: u64,
         last_resolved_at: Option<u64>,
         last_updated_at: Option<u64>,
     ) -> bool {
-        let mut deltas = self.deltas.lock().unwrap();
-        if deltas.len() >= MAX_PENDING_DIDS && !deltas.contains_key(&mnemonic) {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-        let entry = deltas.entry(mnemonic).or_default();
+        let mut deltas = lock(&self.deltas);
+        let entry = match deltas.get_mut(mnemonic) {
+            Some(entry) => entry,
+            None => {
+                if deltas.len() >= MAX_PENDING_DIDS {
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                deltas.entry(mnemonic.to_string()).or_default()
+            }
+        };
         entry.resolves = entry.resolves.saturating_add(resolves);
         entry.updates = entry.updates.saturating_add(updates);
         entry.last_resolved_at = entry.last_resolved_at.max(last_resolved_at);
@@ -312,7 +326,7 @@ impl StatsCollector {
         if !self.track_timeseries {
             return;
         }
-        let mut buckets = self.buckets.lock().unwrap();
+        let mut buckets = lock(&self.buckets);
         let key = (mnemonic.to_string(), epoch);
         if buckets.len() < MAX_PENDING_BUCKETS || buckets.contains_key(&key) {
             let b = buckets.entry(key).or_insert((0, 0));
@@ -330,7 +344,7 @@ impl StatsCollector {
 
     /// Drain all accumulated per-DID deltas for sync to the control plane.
     pub fn drain_for_sync(&self) -> Vec<DidStatsDelta> {
-        let mut deltas = self.deltas.lock().unwrap();
+        let mut deltas = lock(&self.deltas);
         deltas
             .drain()
             .map(|(mnemonic, d)| DidStatsDelta {
@@ -346,9 +360,7 @@ impl StatsCollector {
     /// Rows waiting to be written: per-DID deltas, time-series buckets, and
     /// fine-ring writes being retried.
     pub fn pending_rows(&self) -> usize {
-        self.deltas.lock().unwrap().len()
-            + self.buckets.lock().unwrap().len()
-            + self.slot_retry.lock().unwrap().len()
+        lock(&self.deltas).len() + lock(&self.buckets).len() + lock(&self.slot_retry).len()
     }
 
     /// Drain what is due for writing at `now`: every bucket that has closed
@@ -360,7 +372,7 @@ impl StatsCollector {
     pub fn drain_due(&self, now: u64) -> (Vec<DidStatsDelta>, Vec<DrainedBucket>) {
         let open_from = now / BUCKET_SECS * BUCKET_SECS;
         let (due_buckets, open_dids) = {
-            let mut buckets = self.buckets.lock().unwrap();
+            let mut buckets = lock(&self.buckets);
             let closed: Vec<BucketKey> = buckets
                 .keys()
                 .filter(|(_, epoch)| *epoch < open_from)
@@ -384,7 +396,7 @@ impl StatsCollector {
         };
         let closed_dids: std::collections::HashSet<&str> =
             due_buckets.iter().map(|b| b.mnemonic.as_str()).collect();
-        let mut deltas = self.deltas.lock().unwrap();
+        let mut deltas = lock(&self.deltas);
         let due_dids: Vec<String> = deltas
             .keys()
             .filter(|m| closed_dids.contains(m.as_str()) || !open_dids.contains(*m))
@@ -409,7 +421,7 @@ impl StatsCollector {
     /// A DID's counts not yet written, so a reader can add them to the
     /// stored totals and show live numbers whatever the flush cadence.
     pub fn pending_for(&self, mnemonic: &str) -> Option<DidStatsDelta> {
-        let deltas = self.deltas.lock().unwrap();
+        let deltas = lock(&self.deltas);
         deltas.get(mnemonic).map(|d| DidStatsDelta {
             mnemonic: mnemonic.to_string(),
             resolve_delta: d.resolves,
@@ -423,7 +435,7 @@ impl StatsCollector {
     /// their own. Not subject to the bucket cap: there is at most one per
     /// fine DID per bucket, and fine DIDs are capped.
     pub fn requeue_slots(&self, failed: Vec<DrainedBucket>) {
-        let mut slots = self.slot_retry.lock().unwrap();
+        let mut slots = lock(&self.slot_retry);
         for b in failed {
             let entry = slots.entry((b.mnemonic, b.epoch)).or_insert((0, 0));
             entry.0 = entry.0.saturating_add(b.resolves);
@@ -433,9 +445,7 @@ impl StatsCollector {
 
     /// Fine-ring writes to retry.
     pub fn drain_slot_retry(&self) -> Vec<DrainedBucket> {
-        self.slot_retry
-            .lock()
-            .unwrap()
+        lock(&self.slot_retry)
             .drain()
             .map(|((mnemonic, epoch), (r, u))| DrainedBucket {
                 mnemonic,
@@ -452,21 +462,15 @@ impl StatsCollector {
     /// keep what they counted. A flush already writing the DID can still
     /// land one row after this; the caller deletes the rows afterwards.
     pub fn forget_did(&self, mnemonic: &str) {
-        self.deltas.lock().unwrap().remove(mnemonic);
-        self.buckets
-            .lock()
-            .unwrap()
-            .retain(|(m, _), _| m != mnemonic);
-        self.slot_retry
-            .lock()
-            .unwrap()
-            .retain(|(m, _), _| m != mnemonic);
+        lock(&self.deltas).remove(mnemonic);
+        lock(&self.buckets).retain(|(m, _), _| m != mnemonic);
+        lock(&self.slot_retry).retain(|(m, _), _| m != mnemonic);
         self.tiers().forget(mnemonic);
     }
 
     /// The tiering state: policy, overrides, and promoted DIDs.
     pub fn tiers(&self) -> std::sync::MutexGuard<'_, TierState> {
-        self.tiers.lock().unwrap()
+        lock(&self.tiers)
     }
 
     /// A shared handle on the tiering state, for a writer that runs on its
@@ -490,7 +494,7 @@ impl StatsCollector {
             .into_iter()
             .filter(|d| {
                 !self.add_delta(
-                    d.mnemonic.clone(),
+                    &d.mnemonic,
                     d.resolve_delta,
                     d.update_delta,
                     d.last_resolved_at,
@@ -503,7 +507,7 @@ impl StatsCollector {
     /// Return drained time-series buckets that could not be written, so the
     /// next drain carries them again. Subject to the same cap as new events.
     pub fn requeue_buckets(&self, failed: Vec<DrainedBucket>) {
-        let mut buckets = self.buckets.lock().unwrap();
+        let mut buckets = lock(&self.buckets);
         for b in failed {
             let key = (b.mnemonic, b.epoch);
             if buckets.len() >= MAX_PENDING_BUCKETS
@@ -535,7 +539,7 @@ impl StatsCollector {
 
     /// Drain all accumulated time-series bucket deltas.
     pub fn drain_buckets(&self) -> Vec<DrainedBucket> {
-        let mut buckets = self.buckets.lock().unwrap();
+        let mut buckets = lock(&self.buckets);
         buckets
             .drain()
             .map(|((mnemonic, epoch), (r, u))| DrainedBucket {
@@ -574,8 +578,8 @@ impl StatsCollector {
 ///
 /// Creates, deletes, cleanups and purges keep the count current in between;
 /// the recount corrects paths that do not, such as an offline `remove` or a
-/// DID an edge receives by sync. It reads every DID record, so on a metered
-/// store its cost grows with the number of DIDs hosted: keep it rare.
+/// DID an edge receives by sync. It counts the `did:` keys without reading
+/// the records, but on a metered store that is still a scan: keep it rare.
 pub const DID_COUNT_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Recount the hosted DIDs from the store and reset the collector's count.
@@ -586,8 +590,10 @@ pub async fn reconcile_total_dids(
     collector: &StatsCollector,
     dids_ks: &KeyspaceHandle,
 ) -> Result<(), AppError> {
-    let dids = dids_ks.prefix_iter_raw("did:").await?;
-    collector.set_total_dids(dids.len() as u64);
+    let count = dids_ks
+        .prefix_count(crate::server::store::key_prefix::DID)
+        .await?;
+    collector.set_total_dids(count as u64);
     Ok(())
 }
 
@@ -637,10 +643,56 @@ pub async fn seed_from_store(
     stats_ks: &KeyspaceHandle,
     dids_ks: &KeyspaceHandle,
 ) -> StatsAggregate {
+    let mut attempt = 0u32;
+    let (agg, pins) = loop {
+        attempt += 1;
+        match read_seed(stats_ks, dids_ks).await {
+            Ok(seed) => break seed,
+            Err(e) if attempt < SEED_ATTEMPTS => {
+                let wait = SEED_RETRY_BASE * 2u32.pow(attempt - 1);
+                tracing::warn!(
+                    error = %e,
+                    attempt,
+                    retry_in_ms = wait.as_millis() as u64,
+                    "stats seed: store read failed, retrying"
+                );
+                tokio::time::sleep(wait).await;
+            }
+            Err(e) => {
+                // Start from zero rather than not at all: the counters are for
+                // display, the hourly DID recount corrects the count, and the
+                // stored rows are untouched (the flush adds to them).
+                tracing::error!(
+                    error = %e,
+                    attempts = attempt,
+                    "stats seed: store read failed; aggregate starts from zero until restart"
+                );
+                break (StatsAggregate::default(), Vec::new());
+            }
+        }
+    };
+    collector.seed_aggregate(&agg);
+    collector.tiers().load_pins(pins);
+    agg
+}
+
+/// Attempts [`seed_from_store`] makes before giving up.
+const SEED_ATTEMPTS: u32 = 4;
+/// The first retry's wait; each later one doubles it.
+const SEED_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(250);
+/// Rows a page of the seed's `stats` walk reads.
+const SEED_PAGE_ROWS: usize = 512;
+
+/// One attempt at reading [`seed_from_store`]'s inputs, a page at a time.
+async fn read_seed(
+    stats_ks: &KeyspaceHandle,
+    dids_ks: &KeyspaceHandle,
+) -> Result<(StatsAggregate, Vec<(String, StatsResolution)>), AppError> {
     let mut agg = StatsAggregate::default();
     let mut pins = Vec::new();
-    if let Ok(raw) = stats_ks.prefix_iter_raw("stats").await {
-        for (key, value) in raw {
+    let mut walk = stats_ks.walk("stats", SEED_PAGE_ROWS);
+    while let Some(rows) = walk.next_page().await? {
+        for (key, value) in rows {
             if let Some(m) = key.strip_prefix(crate::server::stats_tiers::PIN_PREFIX.as_bytes()) {
                 if let (Ok(m), Ok(pin)) = (
                     std::str::from_utf8(m),
@@ -662,13 +714,9 @@ pub async fn seed_from_store(
         }
     }
     agg.total_dids = dids_ks
-        .prefix_iter_raw("did:")
-        .await
-        .map(|v| v.len())
-        .unwrap_or(0) as u64;
-    collector.seed_aggregate(&agg);
-    collector.tiers().load_pins(pins);
-    agg
+        .prefix_count(crate::server::store::key_prefix::DID)
+        .await? as u64;
+    Ok((agg, pins))
 }
 
 impl Default for StatsCollector {

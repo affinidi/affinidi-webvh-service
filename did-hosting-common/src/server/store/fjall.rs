@@ -196,6 +196,9 @@ struct FjallKeyspace {
 }
 
 impl KeyspaceOps for FjallKeyspace {
+    fn pages_in_key_order(&self) -> bool {
+        true
+    }
     fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
         let ks = self.keyspace.clone();
         Box::pin(async move {
@@ -697,6 +700,73 @@ mod tests {
         let exact = ks.prefix_page_raw("p:", None, 3).await.unwrap().unwrap();
         assert_eq!(keys(&exact), ["p:1", "p:2", "p:3"]);
         assert_eq!(exact.next, None);
+    }
+
+    /// Collect a walk's keys, page by page.
+    async fn walked(mut walk: crate::server::store::PrefixWalk<'_>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(rows) = walk.next_page().await.unwrap() {
+            out.extend(rows.into_iter().map(|(k, _)| String::from_utf8(k).unwrap()));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn walks_cover_the_prefix_on_every_kind_of_backend() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace("test").unwrap();
+        for i in 0..23 {
+            ks.insert_raw(format!("p:{i:02}"), b"v".to_vec())
+                .await
+                .unwrap();
+        }
+        ks.insert_raw("q:0", b"v".to_vec()).await.unwrap();
+        let expected: Vec<String> = (0..23).map(|i| format!("p:{i:02}")).collect();
+
+        assert!(ks.pages_in_key_order());
+        assert_eq!(walked(ks.walk("p:", 5)).await, expected);
+        // Starting after a key skips through it.
+        assert_eq!(
+            walked(ks.walk_after("p:", Some(b"p:19".to_vec()), 2)).await,
+            ["p:20", "p:21", "p:22"]
+        );
+
+        // Hash-ordered pages: every key once, in some order; a walk cannot
+        // start mid-prefix, so `walk_after` starts at the beginning.
+        let hashed = ks.with_hash_ordered_pages();
+        assert!(!hashed.pages_in_key_order());
+        let mut got = walked(hashed.walk("p:", 4)).await;
+        got.sort();
+        assert_eq!(got, expected);
+        let mut got = walked(hashed.walk_after("p:", Some(b"p:19".to_vec()), 4)).await;
+        got.sort();
+        assert_eq!(got, expected);
+
+        // A backend that cannot page: one read of the whole prefix.
+        let unordered = ks.without_ordered_pages();
+        assert_eq!(walked(unordered.walk("p:", 4)).await, expected);
+
+        assert_eq!(ks.approximate_len().await.unwrap(), 24);
+    }
+
+    #[tokio::test]
+    async fn verify_integrity_counts_bad_json_and_skips_raw_rows() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace("test").unwrap();
+        ks.insert_raw("did:a", b"{}".to_vec()).await.unwrap();
+        ks.insert_raw("did:b", b"not json".to_vec()).await.unwrap();
+        ks.insert_raw("content:a:log", b"{\"x\":1}\nraw".to_vec())
+            .await
+            .unwrap();
+        ks.insert_raw("domain:a.example:a", b"a".to_vec())
+            .await
+            .unwrap();
+        for i in 0..300 {
+            ks.insert_raw(format!("usage:{i}"), b"{\"count\":1,\"bytes\":0}".to_vec())
+                .await
+                .unwrap();
+        }
+        assert_eq!(ks.verify_integrity().await.unwrap(), 1);
     }
 
     // =======================================================================

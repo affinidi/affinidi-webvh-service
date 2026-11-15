@@ -47,6 +47,9 @@ use crate::did_ops::{
     DidRecord, content_log_key, content_witness_key, did_key, owner_key, watcher_sync_key,
 };
 
+/// Records a page of the purge walk reads.
+const PURGE_PAGE_ROWS: usize = 256;
+
 /// Summary of a [`purge_domain_dids`] run, returned for audit-log
 /// purposes.
 #[derive(Debug, PartialEq, Eq)]
@@ -96,7 +99,8 @@ pub async fn purge_domain_dids_locked(
     locks: Option<&PathLocks>,
 ) -> Result<PurgeReport, AppError> {
     let ks = store.keyspace(KS_DIDS)?;
-    let raw = ks.prefix_iter_raw(b"did:".to_vec()).await?;
+    // A page at a time: a purge holds one page of records, never the store.
+    let mut walk = ks.walk(b"did:".to_vec(), PURGE_PAGE_ROWS);
 
     let mut deleted = 0u64;
     let mut skipped_no_domain = 0u64;
@@ -104,110 +108,123 @@ pub async fn purge_domain_dids_locked(
     let mut failed = 0u64;
     let mut purged = Vec::new();
 
-    for (_key, value) in raw {
-        let record: DidRecord = match serde_json::from_slice(&value) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "skipping malformed DidRecord during domain purge");
+    while let Some(rows) = walk.next_page().await? {
+        for (_key, value) in rows {
+            let record: DidRecord = match serde_json::from_slice(&value) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(error = %e, "skipping malformed DidRecord during domain purge");
+                    continue;
+                }
+            };
+
+            if record.domain.is_empty() {
+                warn!(
+                    mnemonic = %record.mnemonic,
+                    "DidRecord has no domain field — skipping. M-01 stays pending and tags it on the next start once a default domain is set."
+                );
+                skipped_no_domain += 1;
                 continue;
             }
-        };
 
-        if record.domain.is_empty() {
-            warn!(
-                mnemonic = %record.mnemonic,
-                "DidRecord has no domain field — skipping. M-01 stays pending and tags it on the next start once a default domain is set."
-            );
-            skipped_no_domain += 1;
-            continue;
-        }
+            if record.domain != target_domain {
+                skipped_other_domain += 1;
+                continue;
+            }
 
-        if record.domain != target_domain {
-            skipped_other_domain += 1;
-            continue;
-        }
-
-        // Under the slot's lock the scan is only a snapshot: re-read and
-        // decide again.
-        let _slot_guard = match locks {
-            Some(locks) => Some(locks.guard(&record.mnemonic).await),
-            None => None,
-        };
-        let record = if locks.is_some() {
-            match ks.get::<DidRecord>(did_key(&record.mnemonic)).await {
-                Ok(Some(current)) if current.domain == target_domain => current,
-                Ok(_) => continue,
+            // Under the slot's lock the scan is only a snapshot: re-read and
+            // decide again.
+            let _slot_guard = match locks {
+                Some(locks) => Some(locks.guard(&record.mnemonic).await),
+                None => None,
+            };
+            let record = if locks.is_some() {
+                match ks.get::<DidRecord>(did_key(&record.mnemonic)).await {
+                    Ok(Some(current)) if current.domain == target_domain => current,
+                    Ok(_) => continue,
+                    Err(e) => {
+                        warn!(mnemonic = %record.mnemonic, error = %e, "domain purge: re-read failed; skipping");
+                        failed += 1;
+                        continue;
+                    }
+                }
+            } else {
+                record
+            };
+            let _name_guards = match locks {
+                Some(locks) => {
+                    agent_name_index::lock_names(locks, agent_name_index::index_keys(&record)).await
+                }
+                None => Vec::new(),
+            };
+            // The agent-name index entries that still point at this slot; an
+            // entry another slot has since claimed is left alone.
+            let names = match agent_name_index::owned_keys(&ks, &record).await {
+                Ok(names) => names,
                 Err(e) => {
-                    warn!(mnemonic = %record.mnemonic, error = %e, "domain purge: re-read failed; skipping");
+                    warn!(mnemonic = %record.mnemonic, error = %e, "domain purge: reading the name index failed; skipping");
                     failed += 1;
                     continue;
                 }
-            }
-        } else {
-            record
-        };
-        let _name_guards = match locks {
-            Some(locks) => {
-                agent_name_index::lock_names(locks, agent_name_index::index_keys(&record)).await
-            }
-            None => Vec::new(),
-        };
-        // The agent-name index entries that still point at this slot; an
-        // entry another slot has since claimed is left alone.
-        let names = match agent_name_index::owned_keys(&ks, &record).await {
-            Ok(names) => names,
-            Err(e) => {
-                warn!(mnemonic = %record.mnemonic, error = %e, "domain purge: reading the name index failed; skipping");
-                failed += 1;
-                continue;
-            }
-        };
+            };
 
-        // Batch every key for this DID into a single atomic write.
-        // Other DIDs remain unaffected by failure on this one.
-        let mut batch = store.batch();
-        batch.remove(&ks, did_key(&record.mnemonic));
-        batch.remove(&ks, content_log_key(&record.mnemonic));
-        batch.remove(&ks, content_witness_key(&record.mnemonic));
-        batch.remove(&ks, owner_key(&record.owner, &record.mnemonic));
-        batch.remove(&ks, watcher_sync_key(&record.mnemonic));
-        let committed = batch.commit().await;
-        // The names go after the record, in a write of their own: a slot can
-        // hold more names than one transactional write takes on some
-        // backends. One left behind is harmless — an entry pointing at a slot
-        // that no longer exists does not hold the name.
-        if committed.is_ok() && !names.is_empty() {
-            let mut names_batch = store.batch();
-            for key in names {
-                names_batch.remove(&ks, key);
+            // Batch every key for this DID into a single atomic write.
+            // Other DIDs remain unaffected by failure on this one.
+            let mut batch = store.batch();
+            batch.remove(&ks, did_key(&record.mnemonic));
+            batch.remove(&ks, content_log_key(&record.mnemonic));
+            batch.remove(&ks, content_witness_key(&record.mnemonic));
+            batch.remove(&ks, owner_key(&record.owner, &record.mnemonic));
+            batch.remove(&ks, watcher_sync_key(&record.mnemonic));
+            let committed = match super::did_index::stage_record_change(
+                &mut batch,
+                &ks,
+                locks,
+                Some(&record),
+                None,
+            )
+            .await
+            {
+                Ok(_usage_guards) => batch.commit().await,
+                Err(e) => Err(e),
+            };
+            // The names go after the record, in a write of their own: a slot can
+            // hold more names than one transactional write takes on some
+            // backends. One left behind is harmless — an entry pointing at a slot
+            // that no longer exists does not hold the name.
+            if committed.is_ok() && !names.is_empty() {
+                let mut names_batch = store.batch();
+                for key in names {
+                    names_batch.remove(&ks, key);
+                }
+                if let Err(e) = names_batch.commit_in_parts().await {
+                    warn!(
+                        mnemonic = %record.mnemonic,
+                        error = %e,
+                        "DID purged; some of its agent-name index entries were not removed"
+                    );
+                }
             }
-            if let Err(e) = names_batch.commit_in_parts().await {
-                warn!(
-                    mnemonic = %record.mnemonic,
-                    error = %e,
-                    "DID purged; some of its agent-name index entries were not removed"
-                );
-            }
-        }
-        match committed {
-            Ok(()) => {
-                deleted += 1;
-                info!(
-                    mnemonic = %record.mnemonic,
-                    domain = %target_domain,
-                    owner = %record.owner,
-                    reason,
-                    "DID record purged"
-                );
-                purged.push(record.mnemonic.clone());
-            }
-            Err(e) => {
-                warn!(
-                    mnemonic = %record.mnemonic,
-                    error = %e,
-                    "DID record purge failed mid-batch — leaving in place"
-                );
-                failed += 1;
+            match committed {
+                Ok(()) => {
+                    deleted += 1;
+                    info!(
+                        mnemonic = %record.mnemonic,
+                        domain = %target_domain,
+                        owner = %record.owner,
+                        reason,
+                        "DID record purged"
+                    );
+                    purged.push(record.mnemonic.clone());
+                }
+                Err(e) => {
+                    warn!(
+                        mnemonic = %record.mnemonic,
+                        error = %e,
+                        "DID record purge failed mid-batch — leaving in place"
+                    );
+                    failed += 1;
+                }
             }
         }
     }

@@ -26,11 +26,34 @@
 //! source is released: the next configured source to sync or delete it may,
 //! still held to the DID's high-water log.
 //!
-//! The per-process `sync_lock` serialises the check and the write. The store
+//! The chain is verified before any lock is taken, on a blocking thread, so
+//! syncs of different slots verify in parallel. The read-check-write that
+//! follows runs under the slot's lock and then the DID's (per-process
+//! [`PathLocks`], slot first, then the SCID's high-water key), so two syncs of
+//! one slot or one DID cannot both pass against the same old state. The store
 //! offers no conditional write, so two watcher processes on one shared store
 //! could both pass the check; run one watcher process per store.
+//!
+//! ## The high-water mark
+//!
+//! The furthest log mirrored for a DID is kept as a [`HighWaterMark`] — its
+//! entry count, last `versionId`, a SHA-256 over its entries and whether it
+//! deactivated the DID — not as a second copy of the log. That is all the
+//! history check needs: a successor must hold at least that many entries,
+//! the first of which hash to the mark (so it diverges nowhere in the shared
+//! history), and must add none once the DID is deactivated. A delete keeps the
+//! mark on purpose: it is the tombstone that stops a later sync replaying an
+//! older log at a released slot, and at a few hundred bytes it costs nothing
+//! to keep. Rows written by an earlier release hold the full log; they are
+//! read as their mark and rewritten compact ([`migrate_high_water_marks`]).
 
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+
+use did_hosting_common::server::path_locks::PathLocks;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::config::SyncConfig;
 use crate::error::AppError;
@@ -63,10 +86,212 @@ pub fn content_witness_key(mnemonic: &str) -> String {
     format!("content:{mnemonic}:witness")
 }
 
+/// Prefix of the high-water marks, one per DID SCID.
+pub const HIGH_WATER_PREFIX: &str = "hw:id:";
+
 /// The furthest log this watcher has ever mirrored for a DID, by SCID. Never
-/// removed.
-fn high_water_key(scid: &str) -> String {
-    format!("hw:id:{scid}")
+/// removed: a delete keeps it as the DID's anti-rollback tombstone.
+pub fn high_water_key(scid: &str) -> String {
+    format!("{HIGH_WATER_PREFIX}{scid}")
+}
+
+/// The furthest log mirrored for a DID, without the log itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HighWaterMark {
+    /// How many entries the log held.
+    pub entries: u64,
+    /// The `versionId` of its last entry.
+    pub last_version_id: String,
+    /// Lowercase hex SHA-256 over its entries (each trimmed, joined by `\n`).
+    pub entries_sha256: String,
+    /// Whether any of its entries deactivated the DID.
+    pub deactivated: bool,
+}
+
+/// A log's non-empty entries, trimmed — the unit the history check compares.
+fn log_entries(log: &str) -> Vec<&str> {
+    log.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+fn entries_digest(entries: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for (i, line) in entries.iter().enumerate() {
+        if i > 0 {
+            hasher.update(b"\n");
+        }
+        hasher.update(line.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+impl HighWaterMark {
+    /// The mark of `log`.
+    pub fn of(log: &str) -> Self {
+        let entries = log_entries(log);
+        let parsed = |line: &str| serde_json::from_str::<serde_json::Value>(line).ok();
+        let last_version_id = entries
+            .last()
+            .and_then(|l| parsed(l))
+            .and_then(|v| v.get("versionId")?.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let deactivated = entries.iter().any(|l| {
+            parsed(l)
+                .and_then(|v| v.get("parameters")?.get("deactivated")?.as_bool())
+                .unwrap_or(false)
+        });
+        Self {
+            entries: entries.len() as u64,
+            last_version_id,
+            entries_sha256: entries_digest(&entries),
+            deactivated,
+        }
+    }
+
+    /// Read a stored mark: the compact form, or the full log an earlier
+    /// release stored. Returns the mark and whether the row was the latter.
+    pub fn from_stored(raw: &[u8]) -> (Self, bool) {
+        match serde_json::from_slice::<Self>(raw) {
+            Ok(mark) => (mark, false),
+            Err(_) => (Self::of(&String::from_utf8_lossy(raw)), true),
+        }
+    }
+
+    /// Whether `next` is an acceptable successor of the log this marks — the
+    /// same rule as `did_ops::verify_log_extends`, against the mark.
+    pub fn admits(&self, next: &str) -> Result<(), did_hosting_common::did_ops::LogExtendError> {
+        use did_hosting_common::did_ops::LogExtendError;
+        let new = log_entries(next);
+        let held = self.entries as usize;
+        if new.len() < held || entries_digest(&new[..held]) != self.entries_sha256 {
+            return Err(LogExtendError::HistoryRewrite {
+                held,
+                received: new.len(),
+            });
+        }
+        if self.deactivated && new.len() != held {
+            return Err(LogExtendError::Deactivated);
+        }
+        Ok(())
+    }
+}
+
+/// Rewrite every high-water row an earlier release stored as a full log into
+/// its compact [`HighWaterMark`]. Idempotent; returns how many it rewrote.
+pub async fn migrate_high_water_marks(ks: &KeyspaceHandle) -> Result<usize, AppError> {
+    let mut rewritten = 0;
+    for key in ks.prefix_keys_raw(HIGH_WATER_PREFIX).await? {
+        let Some(raw) = ks.get_raw(key.clone()).await? else {
+            continue;
+        };
+        let (mark, legacy) = HighWaterMark::from_stored(&raw);
+        if legacy {
+            ks.insert(key, &mark).await?;
+            rewritten += 1;
+        }
+    }
+    Ok(rewritten)
+}
+
+/// The slots held as disabled, in memory, so resolution answers from one
+/// store read. Loaded at boot ([`DisabledSlots::load`]) and kept current by
+/// [`apply_sync`] and [`delete_record`] — the only writers of a record, in
+/// the one watcher process a store has.
+///
+/// Until it is loaded it is not *tracked*, and resolution reads the record
+/// as before: the daemon's embedded, resolution-only watcher reads a store
+/// it does not write, so it never loads one.
+#[derive(Debug, Clone, Default)]
+pub struct DisabledSlots(Arc<DisabledInner>);
+
+#[derive(Debug, Default)]
+struct DisabledInner {
+    set: RwLock<HashSet<String>>,
+    tracked: AtomicBool,
+}
+
+impl DisabledSlots {
+    /// Whether `mnemonic` is held as disabled, or `None` while the set is
+    /// not tracked (read the record instead).
+    pub fn is_disabled(&self, mnemonic: &str) -> Option<bool> {
+        self.0.tracked.load(Ordering::Acquire).then(|| {
+            self.0
+                .set
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(mnemonic)
+        })
+    }
+
+    fn set(&self, mnemonic: &str, disabled: bool) {
+        let mut set = self.0.set.write().unwrap_or_else(|p| p.into_inner());
+        if disabled {
+            set.insert(mnemonic.to_string());
+        } else {
+            set.remove(mnemonic);
+        }
+    }
+
+    /// Fill from the stored records, and track from then on. Returns how
+    /// many slots are disabled.
+    pub async fn load(&self, ks: &KeyspaceHandle) -> Result<usize, AppError> {
+        // Only the two members any slot record carries.
+        #[derive(Deserialize)]
+        struct Slot {
+            mnemonic: String,
+            #[serde(default)]
+            disabled: bool,
+        }
+        let disabled_of = |rows: &[(Vec<u8>, Vec<u8>)]| -> Vec<String> {
+            rows.iter()
+                .filter_map(|(_, v)| serde_json::from_slice::<Slot>(v).ok())
+                .filter(|s| s.disabled)
+                .map(|s| s.mnemonic)
+                .collect()
+        };
+        let mut found = Vec::new();
+        let mut cursor = None;
+        loop {
+            match ks.prefix_page_raw("did:", cursor, 500).await? {
+                Some(page) => {
+                    found.extend(disabled_of(&page.rows));
+                    match page.next {
+                        Some(next) => cursor = Some(next),
+                        None => break,
+                    }
+                }
+                None => {
+                    found.extend(disabled_of(&ks.prefix_iter_raw("did:").await?));
+                    break;
+                }
+            }
+        }
+        let n = found.len();
+        self.0
+            .set
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend(found);
+        self.0.tracked.store(true, Ordering::Release);
+        Ok(n)
+    }
+}
+
+/// What a sync runs against: the store and the watcher's in-process state.
+#[derive(Clone, Copy)]
+pub struct Mirror<'a> {
+    pub store: &'a Store,
+    pub ks: &'a KeyspaceHandle,
+    pub sync: &'a SyncConfig,
+    pub locks: &'a PathLocks,
+    pub disabled: &'a DisabledSlots,
 }
 
 pub async fn get_record(
@@ -167,19 +392,52 @@ fn held_by_another(
     true
 }
 
+/// The slot's mirrored log and witness proofs, as stored.
+async fn held_content(
+    ks: &KeyspaceHandle,
+    mnemonic: &str,
+) -> Result<(Option<String>, Option<String>), AppError> {
+    let log = ks
+        .get_raw(content_log_key(mnemonic))
+        .await?
+        .map(|b| String::from_utf8_lossy(&b).into_owned());
+    let witness = ks
+        .get_raw(content_witness_key(mnemonic))
+        .await?
+        .map(|w| String::from_utf8_lossy(&w).into_owned());
+    Ok((log, witness))
+}
+
+/// Verify the chain of `entry`, on a blocking thread: up to
+/// `MAX_LOG_ENTRIES` signature checks must not stall an async worker.
+async fn verify_chain(entry: &SyncEntry) -> Result<(), SyncRefusal> {
+    let log = entry.log_content.clone();
+    let witness = entry.witness_content.clone();
+    tokio::task::spawn_blocking(move || {
+        did_hosting_common::did_ops::verify_did_log_and_witness_proofs(&log, witness.as_deref())
+    })
+    .await
+    .map_err(|e| SyncRefusal::Transient(format!("verification task failed: {e}")))?
+    .map_err(SyncRefusal::InvalidLog)
+}
+
 /// Verify `entry` against everything the watcher has mirrored, and apply it
 /// as one atomic change. `source_did` is the proven source.
+///
+/// The chain is verified first, outside any lock. A re-send of exactly the
+/// log and witness proofs already mirrored is not re-verified: they were
+/// verified when they were stored, and nothing else writes them.
 pub async fn apply_sync(
-    store: &Store,
-    ks: &KeyspaceHandle,
-    sync: &SyncConfig,
+    m: Mirror<'_>,
     source_did: &str,
     entry: &SyncEntry,
 ) -> Result<SyncApplied, SyncRefusal> {
     use did_hosting_common::did_ops::{
-        LogExtendError, extract_did_id, validate_did_id_matches_request,
-        verify_did_log_and_witness_proofs, verify_log_extends,
+        LogExtendError, extract_did_id, validate_did_id_matches_request, verify_log_extends,
     };
+    let Mirror {
+        store, ks, sync, ..
+    } = m;
 
     did_hosting_common::server::mnemonic::validate_mnemonic(&entry.mnemonic)
         .map_err(|e| SyncRefusal::InvalidLog(format!("mnemonic: {e}")))?;
@@ -227,16 +485,29 @@ pub async fn apply_sync(
         )));
     }
 
-    // Chain: every entry's proof, and the witness proofs when witnessed.
-    verify_did_log_and_witness_proofs(&entry.log_content, entry.witness_content.as_deref())
-        .map_err(SyncRefusal::InvalidLog)?;
+    // Chain: every entry's proof, and the witness proofs when witnessed —
+    // before any lock, unless this is exactly what is already mirrored.
+    let is_mirrored = |held: &(Option<String>, Option<String>)| {
+        held.0.as_deref() == Some(entry.log_content.as_str()) && held.1 == entry.witness_content
+    };
+    let mut verified = false;
+    if !is_mirrored(&held_content(ks, &entry.mnemonic).await?) {
+        verify_chain(entry).await?;
+        verified = true;
+    }
 
-    // History: strictly extend every history mirrored for this DID.
+    // Read-check-write under the slot's lock, then the DID's.
+    let _slot = m.locks.guard(&did_key(&entry.mnemonic)).await;
+    let _did = m.locks.guard(&high_water_key(&scid)).await;
+
     let held: Option<WatcherRecord> = ks.get(did_key(&entry.mnemonic)).await?;
-    let held_log = ks
-        .get_raw(content_log_key(&entry.mnemonic))
-        .await?
-        .map(|b| String::from_utf8_lossy(&b).into_owned());
+    let (held_log, held_witness) = held_content(ks, &entry.mnemonic).await?;
+    let mirrored = held_log.as_deref() == Some(entry.log_content.as_str())
+        && held_witness == entry.witness_content;
+    if !mirrored && !verified {
+        // The slot changed between the first read and the lock.
+        verify_chain(entry).await?;
+    }
     // A slot is its holder's: no other source may write to it, not even to
     // re-send the same log, or to flip `disabled`.
     if let Some(prev) = held.as_ref()
@@ -253,32 +524,36 @@ pub async fn apply_sync(
             entry.mnemonic
         )));
     }
-    let same_did_held = held_log.clone().filter(|_| {
+    let extend_refusal = |e: LogExtendError| match e {
+        LogExtendError::Deactivated => SyncRefusal::Deactivated(e.to_string()),
+        LogExtendError::HistoryRewrite { .. } => SyncRefusal::HistoryRewrite(e.to_string()),
+    };
+    // History: strictly extend every history mirrored for this DID — the log
+    // the slot holds (trivially, when it is the same), and the high-water mark.
+    let same_did_held = held_log.as_deref().filter(|_| {
         held.as_ref().and_then(|r| webvh_scid(&r.did_id)).as_deref() == Some(scid.as_str())
     });
-    let high_water = ks
-        .get_raw(high_water_key(&scid))
-        .await?
-        .map(|b| String::from_utf8_lossy(&b).into_owned());
-    for previous in [same_did_held, high_water].into_iter().flatten() {
-        verify_log_extends(Some(&previous), &entry.log_content).map_err(|e| match e {
-            LogExtendError::Deactivated => SyncRefusal::Deactivated(e.to_string()),
-            LogExtendError::HistoryRewrite { .. } => SyncRefusal::HistoryRewrite(e.to_string()),
-        })?;
+    if let Some(previous) = same_did_held
+        && previous != entry.log_content
+    {
+        verify_log_extends(Some(previous), &entry.log_content).map_err(extend_refusal)?;
+    }
+    let high_water = ks.get_raw(high_water_key(&scid)).await?;
+    let mut mark_current = false;
+    if let Some(raw) = high_water.as_deref() {
+        let (mark, legacy) = HighWaterMark::from_stored(raw);
+        mark.admits(&entry.log_content).map_err(extend_refusal)?;
+        mark_current = !legacy && mark.entries == entry.version_count;
     }
 
     // Nothing to write when the watcher already mirrors exactly this state
     // for this source. A released slot is rewritten to record its new holder.
-    let held_witness = ks
-        .get_raw(content_witness_key(&entry.mnemonic))
-        .await?
-        .map(|w| String::from_utf8_lossy(&w).into_owned());
     if let Some(prev) = held.as_ref()
         && prev.source_did == source_did
         && prev.did_id == entry.did_id
         && prev.disabled == entry.disabled
-        && held_log.as_deref() == Some(entry.log_content.as_str())
-        && held_witness == entry.witness_content
+        && mirrored
+        && mark_current
     {
         return Ok(SyncApplied::Unchanged);
     }
@@ -307,12 +582,26 @@ pub async fn apply_sync(
         ),
         None => batch.remove(ks, content_witness_key(&entry.mnemonic)),
     }
-    batch.insert_raw(
+    batch.insert(
         ks,
         high_water_key(&scid),
-        entry.log_content.as_bytes().to_vec(),
-    );
-    batch.commit().await?;
+        &HighWaterMark::of(&entry.log_content),
+    )?;
+    // Hidden before the commit, shown only after it: resolution never serves
+    // a slot the store holds as disabled.
+    if entry.disabled {
+        m.disabled.set(&entry.mnemonic, true);
+    }
+    if let Err(e) = batch.commit().await {
+        let was_disabled = held.as_ref().is_some_and(|r| r.disabled);
+        if entry.disabled && !was_disabled {
+            m.disabled.set(&entry.mnemonic, false);
+        }
+        return Err(e.into());
+    }
+    if !entry.disabled {
+        m.disabled.set(&entry.mnemonic, false);
+    }
     Ok(SyncApplied::Applied)
 }
 
@@ -322,12 +611,14 @@ pub async fn apply_sync(
 /// A slot another configured source holds is left alone and reported as not
 /// held; one whose holder is no longer configured is removed.
 pub async fn delete_record(
-    store: &Store,
-    ks: &KeyspaceHandle,
-    sync: &SyncConfig,
+    m: Mirror<'_>,
     mnemonic: &str,
     source_did: &str,
 ) -> Result<bool, AppError> {
+    let Mirror {
+        store, ks, sync, ..
+    } = m;
+    let _slot = m.locks.guard(&did_key(mnemonic)).await;
     let held: Option<WatcherRecord> = ks.get(did_key(mnemonic)).await?;
     match held {
         None => return Ok(false),
@@ -347,5 +638,6 @@ pub async fn delete_record(
     batch.remove(ks, content_log_key(mnemonic));
     batch.remove(ks, content_witness_key(mnemonic));
     batch.commit().await?;
+    m.disabled.set(mnemonic, false);
     Ok(true)
 }

@@ -1003,7 +1003,7 @@ async fn two_processes_sharing_a_store_never_both_witness_a_fork() {
         sign_ok(&first, &record.witness_id, &left[0]).await;
 
         let mut second = first.clone();
-        second.sign_lock = Arc::new(tokio::sync::Mutex::new(()));
+        second.sign_locks = did_hosting_common::server::path_locks::PathLocks::new();
         // One process asked for the left fork's second entry, the other for
         // the right fork's third: both extend the shared first entry.
         let (a, b) = tokio::join!(
@@ -1016,7 +1016,7 @@ async fn two_processes_sharing_a_store_never_both_witness_a_fork() {
         // A process started later on the same store keeps to the fork
         // already witnessed.
         let mut restarted = first.clone();
-        restarted.sign_lock = Arc::new(tokio::sync::Mutex::new(()));
+        restarted.sign_locks = did_hosting_common::server::path_locks::PathLocks::new();
         let (signed, other) = if a {
             (&left[1], &right[2])
         } else {

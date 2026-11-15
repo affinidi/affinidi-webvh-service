@@ -143,6 +143,30 @@ export interface LogMetadata {
 /** A slot with its log summarised. */
 export interface DidDetailResponse extends DidRecord {
   log: LogMetadata | null;
+  /** The log's entries, as read for `log` (empty when there is none). */
+  entries: LogEntryInfo[];
+}
+
+/** What a `did/list` page is narrowed to (all server-side). */
+export interface DidListQuery {
+  /** Admin only: one owner's slots. */
+  owner?: string;
+  /** Only slots hosted under this domain. */
+  domain?: string;
+  /** Case-insensitive substring of the name, DID or an agent name. */
+  search?: string;
+  /** The slot holding this agent name (no `@`) on `domain`, which it needs. */
+  agentName?: string;
+  limit?: number;
+  /** A previous page's `nextCursor`, for the same filters. */
+  cursor?: string;
+}
+
+/** One `did/list` page. */
+export interface DidListPage {
+  records: DidRecord[];
+  /** Present while more may follow; a short page can still have one. */
+  nextCursor?: string;
 }
 
 /**

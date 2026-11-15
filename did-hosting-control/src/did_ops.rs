@@ -12,6 +12,7 @@ use did_hosting_common::did_ops::{
 use did_hosting_common::method::publication::Publication;
 use did_hosting_common::server::acl::validate_did_format;
 use did_hosting_common::server::agent_name_index;
+use did_hosting_common::server::did_index;
 use did_hosting_common::server::error::{AgentNameError, QuotaKind, ValidationKind};
 use did_hosting_common::server::identity::mnemonic_from_did;
 use did_hosting_common::server::mnemonic::{
@@ -255,27 +256,24 @@ async fn get_authorized_record(
 // `None` ACL max means "no cap" and preserves prior behaviour; a quota only
 // bites once an admin sets one on the caller's ACL entry.
 
-/// The caller's current usage from the `owner:` reverse index: (owned-slot
-/// count, summed `content_size`). O(n) in the caller's slots. Filters the
-/// string-prefix collisions the `owner:` index can return (a DID that is a
-/// prefix of a longer DID), exactly as [`list_dids`] does.
+/// The caller's current usage: (owned-slot count, summed `content_size`),
+/// one read of its `usage:` counter, which every record write keeps current
+/// in the same batch ([`stage_index`]).
 async fn owner_usage(state: &AppState, owner: &str) -> Result<(u64, u64), AppError> {
-    let prefix = format!("owner:{owner}:");
-    let raw = state.dids_ks.prefix_iter_raw(prefix).await?;
-    let mut count: u64 = 0;
-    let mut total_size: u64 = 0;
-    for (_key, value) in raw {
-        let mnemonic = String::from_utf8(value)
-            .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
-        if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
-            if record.owner != owner {
-                continue;
-            }
-            count += 1;
-            total_size = total_size.saturating_add(record.content_size);
-        }
-    }
-    Ok((count, total_size))
+    let usage = did_index::owner_usage(&state.dids_ks, owner).await?;
+    Ok((usage.count, usage.bytes))
+}
+
+/// Stage the derived rows ([`did_index`]: the owner's usage counter and the
+/// domain index) that writing `new` over `old` changes, into `batch`. Call it
+/// last, just before the commit, and hold the returned guards through it.
+async fn stage_index(
+    state: &AppState,
+    batch: &mut did_hosting_common::server::store::WriteBatch,
+    old: Option<&DidRecord>,
+    new: Option<&DidRecord>,
+) -> Result<Vec<did_hosting_common::server::path_locks::PathGuard>, AppError> {
+    did_index::stage_record_change(batch, &state.dids_ks, Some(&state.path_locks), old, new).await
 }
 
 /// The per-owner lock held from a quota check through the commit it
@@ -550,6 +548,7 @@ pub async fn create_did(
         owner_key(&auth.did, &mnemonic),
         mnemonic.as_bytes().to_vec(),
     );
+    let _usage = stage_index(state, &mut batch, replaced.as_ref(), Some(&record)).await?;
     batch.commit().await?;
     if replaced.is_none() {
         state.stats_collector.increment_total_dids();
@@ -920,6 +919,7 @@ pub async fn register_did_atomic(
         crate::server_push::DidChange::Published { log: did_log },
     )
     .await;
+    let usage = stage_index(state, &mut batch, existing.as_ref(), Some(&new_record)).await?;
     batch.commit().await?;
     sync.finish(state).await;
     // Released before the identity check below, which can reach the network
@@ -928,6 +928,7 @@ pub async fn register_did_atomic(
     drop(name_locks);
     drop(path_guard);
     invalidate_cached_content(state, path);
+    drop(usage);
     drop(quota_guard);
     if existing.is_none() {
         state.stats_collector.increment_total_dids();
@@ -1413,6 +1414,8 @@ pub(crate) async fn publish_did(
             mnemonic.as_bytes().to_vec(),
         );
     }
+    // The record as it stands under the slot lock, for the derived rows.
+    let previous: Option<DidRecord> = state.dids_ks.get(did_key(mnemonic)).await?;
     for name in &released {
         batch.remove(&state.dids_ks, agent_name_key(&domain, name));
     }
@@ -1423,12 +1426,14 @@ pub(crate) async fn publish_did(
         crate::server_push::DidChange::Published { log: did_log },
     )
     .await;
+    let usage = stage_index(state, &mut batch, previous.as_ref(), Some(&record)).await?;
     batch.commit().await?;
     sync.finish(state).await;
     // Released before the identity check below, which can reach the network
     // when this is the service's own DID; nothing after this point reads or
     // writes the slot or its names.
     drop(name_locks);
+    drop(usage);
     drop(slot_guard);
     invalidate_cached_content(state, mnemonic);
     drop(quota_guard);
@@ -1698,6 +1703,8 @@ async fn apply_agent_name_op(
         crate::server_push::DidChange::Published { log: did_log },
     )
     .await;
+    let previous: Option<DidRecord> = state.dids_ks.get(did_key(mnemonic)).await?;
+    let usage = stage_index(state, &mut batch, previous.as_ref(), Some(&record)).await?;
     batch.commit().await?;
     sync.finish(state).await;
     // As in `register_did_atomic`: not held across the identity check below.
@@ -1705,6 +1712,7 @@ async fn apply_agent_name_op(
     drop(slot_guard);
     invalidate_cached_content(state, mnemonic);
     drop(quota_guard);
+    drop(usage);
 
     state.stats_collector.record_update(mnemonic);
 
@@ -2069,93 +2077,335 @@ async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> 
     Ok(entries)
 }
 
+/// What a `did/list` page is narrowed to, beyond the caller's own scope.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ListFilter<'a> {
+    /// Admin only: one owner's slots.
+    pub owner: Option<&'a str>,
+    /// Canonical hosting domain: only slots hosted under it.
+    pub domain: Option<&'a str>,
+    /// Case-insensitive substring of the mnemonic, DID or an agent name.
+    pub search: Option<&'a str>,
+    /// An exact agent name, held on `domain` (required with it): answered
+    /// from the name index, so at most one slot.
+    pub agent_name: Option<&'a str>,
+}
+
+/// One page of [`list_dids_page`].
+#[derive(Debug, Default)]
+pub struct ListPage {
+    /// The page's slots in mnemonic order, each with its lifetime resolves.
+    pub records: Vec<(DidRecord, u64)>,
+    /// Where the next page starts (strictly after this), or `None` when the
+    /// listing is complete. Not always the last record's mnemonic: a page
+    /// whose scan budget ran out before it filled ends where the scan did.
+    pub resume_after: Option<String>,
+}
+
+/// The most slots one `did/list` page returns.
+const MAX_LIST_LIMIT: usize = 1000;
+/// Rows one page of a listing's store walk reads.
+const LIST_WALK_ROWS: usize = 256;
+/// Rows a filtered page reads before returning what it has (with a cursor
+/// where the scan stopped), so a selective filter cannot make one request
+/// read the whole store. Only a key-ordered store can resume mid-walk; any
+/// other reads it all (see [`list_dids_page`]).
+const LIST_SCAN_BUDGET: usize = 5000;
+
 /// One page of the slots a caller may see, with each slot's lifetime resolve
-/// count, and whether more slots follow it.
+/// count.
 ///
-/// The scoping rule is [`list_dids`]'s: an admin sees every slot, or one
-/// owner's when `requested_owner` names one; anyone else sees their own.
-/// Refusing a non-admin who names another owner is the caller's job — this
-/// never widens a non-admin's view, whatever it is passed. `domain` (already
-/// canonical) keeps only slots hosted under it. Ordered by mnemonic, and the
-/// page starts strictly after `after` (the last mnemonic of the previous
-/// page), so paging is stable under concurrent writes: a slot added or removed
-/// between pages is seen or not, but no present slot is repeated or skipped.
+/// The scoping rule: an admin sees every slot, or one owner's when
+/// `filter.owner` names one; anyone else sees their own. Refusing a
+/// non-admin who names another owner is the caller's job — this never
+/// widens a non-admin's view, whatever it is passed. `replica` is set when the
+/// caller is a hosting server this control plane drives, reconciling against
+/// the full listing (see `control_tasks::did::list`): with no owner filter it
+/// is shown every slot, as an administrator is.
 ///
-/// `replica` is set when the caller is a hosting server this control plane
-/// drives, reconciling against the full listing (see
-/// `control_tasks::did::list`): with no `owner` filter it is shown every slot,
-/// as an administrator is — the slots it is already sent to serve.
+/// Ordered by mnemonic, and the page starts strictly after `after` (a
+/// previous page's [`ListPage::resume_after`]), so paging is stable under
+/// concurrent writes: a slot added or removed between pages is seen or not,
+/// but no present slot is repeated or skipped.
+///
+/// How the page is read depends on the store:
+///
+/// - **Key-ordered (fjall, Redis).** The walk starts at `after` in the
+///   narrowest source that covers the scope — the `owner:` index, the
+///   `domain:` index ([`did_index`]) or the `did:` records — and stops once
+///   the page is full, so an unfiltered page reads about `limit` rows
+///   whatever the store holds. A `search` reads at most
+///   `LIST_SCAN_BUDGET` rows a page.
+/// - **Hash-ordered (DynamoDB, Cosmos DB, Firestore).** Pages are not in key
+///   order, so the only correct page is a full walk of the records keeping
+///   the `limit` smallest mnemonics after `after` — memory stays at one page,
+///   but each page reads every record. The order and the cursor are the same
+///   as on a key-ordered store.
 pub async fn list_dids_page(
     auth: &AuthClaims,
     replica: bool,
     state: &AppState,
-    requested_owner: Option<&str>,
-    domain: Option<&str>,
+    filter: &ListFilter<'_>,
     limit: Option<usize>,
     after: Option<&str>,
-) -> Result<(Vec<(DidRecord, u64)>, bool), AppError> {
+) -> Result<ListPage, AppError> {
     use crate::acl::Role;
 
-    const MAX_LIST_LIMIT: usize = 1000;
-
-    let mut records: Vec<DidRecord> =
-        if (auth.role == Role::Admin || replica) && requested_owner.is_none() {
-            let raw = state.dids_ks.prefix_iter_raw("did:").await?;
-            raw.into_iter()
-                .filter_map(|(_, value)| serde_json::from_slice::<DidRecord>(&value).ok())
-                .collect()
-        } else {
-            let target_owner = if auth.role == Role::Admin {
-                requested_owner.unwrap_or(&auth.did)
-            } else {
-                &auth.did
-            };
-            let raw = state
-                .dids_ks
-                .prefix_iter_raw(format!("owner:{target_owner}:"))
-                .await?;
-            let mut out = Vec::with_capacity(raw.len());
-            for (_key, value) in raw {
-                let mnemonic = String::from_utf8(value)
-                    .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
-                // The owner index is a string prefix, and DIDs contain colons, so a
-                // DID that prefixes another shares rows with it: re-check the owner.
-                if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await?
-                    && record.owner == target_owner
-                {
-                    out.push(record);
-                }
-            }
-            out
-        };
-    if let Some(domain) = domain {
-        records.retain(|r| {
-            let host = if r.domain.is_empty() {
-                r.did_id
-                    .as_deref()
-                    .and_then(|d| did_hosting_common::server::domain::extract_did_host(d).ok())
-                    .unwrap_or_default()
-            } else {
-                r.domain.clone()
-            };
-            host.eq_ignore_ascii_case(domain)
-        });
-    }
-    records.sort_by(|a, b| a.mnemonic.cmp(&b.mnemonic));
-
-    let total = records.len();
     let limit = limit.unwrap_or(MAX_LIST_LIMIT).clamp(1, MAX_LIST_LIMIT);
-    if let Some(after) = after {
-        records.retain(|r| r.mnemonic.as_str() > after);
-    }
-    let has_more = records.len() > limit;
-    let mut page = Vec::with_capacity(limit.min(records.len()));
-    for record in records.into_iter().take(limit) {
+    let target_owner = if (auth.role == Role::Admin || replica) && filter.owner.is_none() {
+        None
+    } else if auth.role == Role::Admin {
+        Some(filter.owner.unwrap_or(&auth.did))
+    } else {
+        Some(auth.did.as_str())
+    };
+    let domain = filter.domain.map(str::to_ascii_lowercase);
+    let search = filter
+        .search
+        .map(str::to_lowercase)
+        .filter(|s| !s.is_empty());
+    let matches = |record: &DidRecord| -> bool {
+        target_owner.is_none_or(|o| record.owner == o)
+            && domain
+                .as_deref()
+                .is_none_or(|d| did_index::record_domain(record).as_deref() == Some(d))
+            && search
+                .as_deref()
+                .is_none_or(|s| record_matches_search(record, s))
+            && filter
+                .agent_name
+                .is_none_or(|n| record.agent_names.iter().any(|e| e.name == n))
+    };
+
+    let (records, resume_after) = if let Some(name) = filter.agent_name {
+        // The name index names the one slot that can hold it.
+        let Some(domain) = domain.as_deref() else {
+            return Err(AppError::invalid("`agentName` needs a `domain`"));
+        };
+        let holder = state
+            .dids_ks
+            .get_raw(agent_name_key(domain, name))
+            .await?
+            .and_then(|m| String::from_utf8(m).ok())
+            .filter(|m| after.is_none_or(|a| m.as_str() > a));
+        let mut out = Vec::new();
+        if let Some(m) = holder
+            && let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&m)).await?
+            && matches(&record)
+        {
+            out.push(record);
+        }
+        (out, None)
+    } else if state.dids_ks.pages_in_key_order() {
+        list_in_key_order(
+            state,
+            target_owner,
+            domain.as_deref(),
+            &matches,
+            limit,
+            after,
+        )
+        .await?
+    } else {
+        list_by_full_walk(state, &matches, limit, after).await?
+    };
+
+    let mut page = ListPage {
+        records: Vec::with_capacity(records.len()),
+        resume_after,
+    };
+    for record in records {
         let stats = crate::stats_admin::live_did_stats(state, &record.mnemonic).await?;
-        page.push((record, stats.total_resolves));
+        page.records.push((record, stats.total_resolves));
     }
-    info!(did = %auth.did, total, returned = page.len(), has_more, "DID page listed on control plane");
-    Ok((page, has_more))
+    debug!(
+        did = %auth.did,
+        returned = page.records.len(),
+        more = page.resume_after.is_some(),
+        "DID page listed on control plane"
+    );
+    Ok(page)
+}
+
+/// Whether `search` (lowercased) is in the record's mnemonic, DID or one of
+/// its agent names.
+fn record_matches_search(record: &DidRecord, search: &str) -> bool {
+    record.mnemonic.to_lowercase().contains(search)
+        || record
+            .did_id
+            .as_deref()
+            .is_some_and(|d| d.to_lowercase().contains(search))
+        || record
+            .agent_names
+            .iter()
+            .any(|e| e.name.to_lowercase().contains(search))
+}
+
+/// The mnemonics of `owner`'s slots hosted under `domain` (canonical), from
+/// the owner's index: one record read per slot the owner holds, bounded by
+/// its quota rather than by the store.
+pub async fn owner_mnemonics_on_domain(
+    state: &AppState,
+    owner: &str,
+    domain: &str,
+) -> Result<Vec<String>, AppError> {
+    let domain = domain.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut walk = state.dids_ks.walk(owner_key(owner, ""), LIST_WALK_ROWS);
+    while let Some(rows) = walk.next_page().await? {
+        for (key, value) in rows {
+            let Some(m) = did_index::index_row_mnemonic(&key, &value, |m| owner_key(owner, m))
+            else {
+                continue;
+            };
+            if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&m)).await?
+                && record.owner == owner
+                && did_index::record_domain(&record).as_deref() == Some(domain.as_str())
+            {
+                out.push(m);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// [`list_dids_page`] on a key-ordered store: walk the narrowest source from
+/// `after`, stopping once the page has `limit` slots and one more proves
+/// another page follows, or the scan budget is spent.
+async fn list_in_key_order(
+    state: &AppState,
+    owner: Option<&str>,
+    domain: Option<&str>,
+    matches: &(dyn Fn(&DidRecord) -> bool + Sync),
+    limit: usize,
+    after: Option<&str>,
+) -> Result<(Vec<DidRecord>, Option<String>), AppError> {
+    // The source: an index whose rows name a mnemonic (re-checked against
+    // the key, since an index prefix can also hold a longer neighbour's
+    // rows), or the records themselves.
+    enum Source {
+        Index(Box<dyn Fn(&str) -> String + Send + Sync>),
+        Records,
+    }
+    let (prefix, source) = match (owner, domain) {
+        (Some(owner), _) => {
+            let owner = owner.to_string();
+            (
+                owner_key(&owner, ""),
+                Source::Index(Box::new(move |m| owner_key(&owner, m))),
+            )
+        }
+        (None, Some(domain)) => {
+            let domain = domain.to_string();
+            (
+                did_index::domain_index_prefix(&domain),
+                Source::Index(Box::new(move |m| did_index::domain_index_key(&domain, m))),
+            )
+        }
+        (None, None) => ("did:".to_string(), Source::Records),
+    };
+    let start = after.map(|a| format!("{prefix}{a}").into_bytes());
+    let mut walk = state
+        .dids_ks
+        .walk_after(prefix.clone(), start, LIST_WALK_ROWS);
+
+    let mut out: Vec<DidRecord> = Vec::new();
+    let mut scanned = 0usize;
+    // The key suffix of the last row read: where a cut-short page resumes.
+    let mut last_read: Option<String> = None;
+    while let Some(rows) = walk.next_page().await? {
+        for (key, value) in rows {
+            scanned += 1;
+            let suffix = key
+                .get(prefix.len()..)
+                .and_then(|s| std::str::from_utf8(s).ok())
+                .map(str::to_string);
+            let record = match &source {
+                Source::Records => serde_json::from_slice::<DidRecord>(&value).ok(),
+                Source::Index(key_of) => {
+                    match did_index::index_row_mnemonic(&key, &value, key_of) {
+                        Some(m) => state.dids_ks.get::<DidRecord>(did_key(&m)).await?,
+                        None => None,
+                    }
+                }
+            };
+            if let Some(record) = record.filter(|r| matches(r)) {
+                if out.len() == limit {
+                    // One more than the page: another page follows.
+                    let resume = out.last().map(|r| r.mnemonic.clone());
+                    return Ok((out, resume));
+                }
+                out.push(record);
+            }
+            last_read = suffix.or(last_read);
+            if scanned >= LIST_SCAN_BUDGET {
+                // Spent: return what there is, resuming where the scan
+                // stopped. A page can be short, or empty, with more to come.
+                return Ok((out, last_read));
+            }
+        }
+    }
+    Ok((out, None))
+}
+
+/// [`list_dids_page`] on a hash-ordered store: read every record a page at a
+/// time, keeping only the `limit + 1` smallest mnemonics after `after`.
+async fn list_by_full_walk(
+    state: &AppState,
+    matches: &(dyn Fn(&DidRecord) -> bool + Sync),
+    limit: usize,
+    after: Option<&str>,
+) -> Result<(Vec<DidRecord>, Option<String>), AppError> {
+    use std::collections::BinaryHeap;
+
+    // A max-heap on mnemonic holding the smallest `limit + 1` seen.
+    struct ByMnemonic(DidRecord);
+    impl PartialEq for ByMnemonic {
+        fn eq(&self, other: &Self) -> bool {
+            self.0.mnemonic == other.0.mnemonic
+        }
+    }
+    impl Eq for ByMnemonic {}
+    impl PartialOrd for ByMnemonic {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for ByMnemonic {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.0.mnemonic.cmp(&other.0.mnemonic)
+        }
+    }
+
+    let mut best: BinaryHeap<ByMnemonic> = BinaryHeap::with_capacity(limit + 2);
+    let mut walk = state.dids_ks.walk("did:", LIST_WALK_ROWS);
+    while let Some(rows) = walk.next_page().await? {
+        for (_key, value) in rows {
+            let Ok(record) = serde_json::from_slice::<DidRecord>(&value) else {
+                continue;
+            };
+            if after.is_some_and(|a| record.mnemonic.as_str() <= a) || !matches(&record) {
+                continue;
+            }
+            if best.len() <= limit {
+                best.push(ByMnemonic(record));
+            } else if best
+                .peek()
+                .is_some_and(|top| record.mnemonic < top.0.mnemonic)
+            {
+                best.pop();
+                best.push(ByMnemonic(record));
+            }
+        }
+    }
+    let mut out: Vec<DidRecord> = best.into_sorted_vec().into_iter().map(|b| b.0).collect();
+    let resume = if out.len() > limit {
+        out.truncate(limit);
+        out.last().map(|r| r.mnemonic.clone())
+    } else {
+        None
+    };
+    Ok((out, resume))
 }
 
 /// Cross-check a caller's explicit domain against the slot's own domain.
@@ -2245,7 +2495,9 @@ pub async fn delete_did(
         crate::server_push::DidChange::Deleted,
     )
     .await;
+    let usage = stage_index(state, &mut batch, Some(&record), None).await?;
     batch.commit().await?;
+    drop(usage);
     sync.finish(state).await;
     invalidate_cached_content(state, mnemonic);
 
@@ -2579,6 +2831,7 @@ async fn commit_owner_change(
 ) -> Result<String, AppError> {
     use crate::auth::session::now_epoch;
 
+    let previous = record.clone();
     let prev_owner = std::mem::replace(&mut record.owner, new_owner.to_string());
     record.updated_at = now_epoch();
 
@@ -2591,6 +2844,7 @@ async fn commit_owner_change(
         mnemonic.as_bytes().to_vec(),
     );
     batch.remove(&state.sessions_ks, offer_key.to_string());
+    let _usage = stage_index(state, &mut batch, Some(&previous), Some(record)).await?;
     batch.commit().await?;
     Ok(prev_owner)
 }
@@ -2801,6 +3055,7 @@ pub async fn rollback_did_to(
             mnemonic.as_bytes().to_vec(),
         );
     }
+    let previous: Option<DidRecord> = state.dids_ks.get(did_key(mnemonic)).await?;
     for name in &released {
         batch.remove(&state.dids_ks, agent_name_key(&domain, name));
     }
@@ -2811,9 +3066,11 @@ pub async fn rollback_did_to(
         crate::server_push::DidChange::Published { log: &truncated },
     )
     .await;
+    let usage = stage_index(state, &mut batch, previous.as_ref(), Some(&record)).await?;
     batch.commit().await?;
     sync.finish(state).await;
     drop(name_locks);
+    drop(usage);
     invalidate_cached_content(state, mnemonic);
 
     let log_metadata = Some(extract_log_metadata(&truncated));
@@ -7347,6 +7604,339 @@ mod tests_atomic {
             .expect_err("a did:webs DID cannot be built without its domain");
             assert!(matches!(err, AppError::Validation { .. }));
         }
+    }
+
+    // ---- did/list paging, filters and the derived rows (#375) ----
+
+    /// Seed a record as the write paths leave it: record, owner index and the
+    /// derived rows, in one batch.
+    async fn seed_listed(
+        state: &AppState,
+        owner: &str,
+        mnemonic: &str,
+        domain: &str,
+        names: &[&str],
+    ) {
+        let record = DidRecord {
+            owner: owner.into(),
+            mnemonic: mnemonic.into(),
+            created_at: 1,
+            updated_at: 1,
+            version_count: 1,
+            did_id: Some(format!("did:webvh:scid:{domain}:{mnemonic}")),
+            content_size: 10,
+            disabled: false,
+            disabled_by_admin: false,
+            deleted_at: None,
+            method: "webvh".into(),
+            domain: domain.into(),
+            services: None,
+            agent_names: names
+                .iter()
+                .map(|n| AgentNameEntry {
+                    name: (*n).into(),
+                    enabled: true,
+                    created_at: 1,
+                })
+                .collect(),
+        };
+        let mut batch = state.store.batch();
+        batch
+            .insert(&state.dids_ks, did_key(mnemonic), &record)
+            .unwrap();
+        batch.insert_raw(
+            &state.dids_ks,
+            owner_key(owner, mnemonic),
+            mnemonic.as_bytes().to_vec(),
+        );
+        for n in names {
+            batch.insert_raw(
+                &state.dids_ks,
+                agent_name_key(domain, n),
+                mnemonic.as_bytes().to_vec(),
+            );
+        }
+        let _g = stage_index(state, &mut batch, None, Some(&record))
+            .await
+            .unwrap();
+        batch.commit().await.unwrap();
+    }
+
+    /// Every page of a listing, followed to the end; with the size of each.
+    async fn all_pages(
+        state: &AppState,
+        auth: &AuthClaims,
+        filter: &ListFilter<'_>,
+        limit: usize,
+    ) -> (Vec<String>, Vec<usize>) {
+        let (mut seen, mut sizes) = (Vec::new(), Vec::new());
+        let mut after: Option<String> = None;
+        for _ in 0..1000 {
+            let page = list_dids_page(auth, false, state, filter, Some(limit), after.as_deref())
+                .await
+                .unwrap();
+            assert!(page.records.len() <= limit);
+            sizes.push(page.records.len());
+            seen.extend(page.records.into_iter().map(|(r, _)| r.mnemonic));
+            match page.resume_after {
+                Some(next) => after = Some(next),
+                None => return (seen, sizes),
+            }
+        }
+        panic!("the listing never ended");
+    }
+
+    /// 23 slots across two owners and two domains, plus one owner whose DID
+    /// is a string prefix of another's.
+    async fn seed_listing(state: &AppState) -> Vec<String> {
+        let mut all = Vec::new();
+        for i in 0..23 {
+            let m = format!("slot-{i:02}");
+            let owner = if i % 3 == 0 {
+                "did:example:b"
+            } else {
+                "did:example:a"
+            };
+            let domain = if i % 2 == 0 { "a.example" } else { "b.example" };
+            let names: &[&str] = if i == 7 { &["seven"] } else { &[] };
+            seed_listed(state, owner, &m, domain, names).await;
+            all.push(m);
+        }
+        // `did:example:a` is a string prefix of this owner, and `a.example`
+        // of this domain: neither may leak into the other's listing.
+        seed_listed(state, "did:example:a:x", "zz-prefix", "a.example:8443", &[]).await;
+        all.push("zz-prefix".into());
+        all
+    }
+
+    async fn check_listings(state: &AppState) {
+        let all = seed_listing(state).await;
+        let admin = admin_auth("did:example:admin");
+
+        // Everything, in order, exactly once, across pages.
+        let (seen, _) = all_pages(state, &admin, &ListFilter::default(), 4).await;
+        assert_eq!(seen, all);
+
+        // One domain.
+        let filter = ListFilter {
+            domain: Some("a.example"),
+            ..Default::default()
+        };
+        let (seen, _) = all_pages(state, &admin, &filter, 3).await;
+        let expected: Vec<String> = (0..23)
+            .filter(|i| i % 2 == 0)
+            .map(|i| format!("slot-{i:02}"))
+            .collect();
+        assert_eq!(seen, expected, "the :8443 neighbour is not a.example's");
+
+        // An owner's own slots (not the prefix-sharing owner's).
+        let (seen, _) = all_pages(
+            state,
+            &owner_auth("did:example:a"),
+            &ListFilter::default(),
+            5,
+        )
+        .await;
+        let expected: Vec<String> = (0..23)
+            .filter(|i| i % 3 != 0)
+            .map(|i| format!("slot-{i:02}"))
+            .collect();
+        assert_eq!(seen, expected);
+
+        // Owner and domain together.
+        let filter = ListFilter {
+            domain: Some("b.example"),
+            ..Default::default()
+        };
+        let (seen, _) = all_pages(state, &owner_auth("did:example:b"), &filter, 2).await;
+        assert_eq!(seen, ["slot-03", "slot-09", "slot-15", "slot-21"]);
+
+        // Search: mnemonic, DID or agent name, ignoring case.
+        let filter = ListFilter {
+            search: Some("SLOT-1"),
+            ..Default::default()
+        };
+        let (seen, _) = all_pages(state, &admin, &filter, 4).await;
+        let expected: Vec<String> = (10..20).map(|i| format!("slot-{i:02}")).collect();
+        assert_eq!(seen, expected);
+        let filter = ListFilter {
+            search: Some("seve"),
+            ..Default::default()
+        };
+        assert_eq!(all_pages(state, &admin, &filter, 4).await.0, ["slot-07"]);
+
+        // One agent name, from the name index.
+        let filter = ListFilter {
+            domain: Some("b.example"),
+            agent_name: Some("seven"),
+            ..Default::default()
+        };
+        assert_eq!(all_pages(state, &admin, &filter, 4).await.0, ["slot-07"]);
+        // Not on another domain, and not for an owner who does not hold it.
+        let filter = ListFilter {
+            domain: Some("a.example"),
+            agent_name: Some("seven"),
+            ..Default::default()
+        };
+        assert!(all_pages(state, &admin, &filter, 4).await.0.is_empty());
+        let filter = ListFilter {
+            domain: Some("b.example"),
+            agent_name: Some("seven"),
+            ..Default::default()
+        };
+        assert!(
+            all_pages(state, &owner_auth("did:example:b"), &filter, 4)
+                .await
+                .0
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_pages_are_ordered_complete_and_filtered_on_a_key_ordered_store() {
+        let (state, _dir) = test_state().await;
+        assert!(state.dids_ks.pages_in_key_order());
+        check_listings(&state).await;
+    }
+
+    #[tokio::test]
+    async fn listing_pages_are_the_same_on_a_hash_ordered_store() {
+        let (mut state, _dir) = test_state().await;
+        state.dids_ks = state.dids_ks.with_hash_ordered_pages();
+        assert!(!state.dids_ks.pages_in_key_order());
+        check_listings(&state).await;
+    }
+
+    #[tokio::test]
+    async fn a_listing_resumes_after_a_slot_removed_between_pages() {
+        let (state, _dir) = test_state().await;
+        let all = seed_listing(&state).await;
+        let admin = admin_auth("did:example:admin");
+        let first = list_dids_page(&admin, false, &state, &ListFilter::default(), Some(5), None)
+            .await
+            .unwrap();
+        let after = first.resume_after.clone().unwrap();
+        assert_eq!(after, "slot-04");
+        // The slot the cursor names goes; the next page still starts after it.
+        state.dids_ks.remove(did_key("slot-04")).await.unwrap();
+        let next = list_dids_page(
+            &admin,
+            false,
+            &state,
+            &ListFilter::default(),
+            Some(5),
+            Some(&after),
+        )
+        .await
+        .unwrap();
+        let got: Vec<&str> = next
+            .records
+            .iter()
+            .map(|(r, _)| r.mnemonic.as_str())
+            .collect();
+        assert_eq!(got, &all[5..10]);
+    }
+
+    #[tokio::test]
+    async fn a_selective_search_returns_short_pages_within_its_scan_budget() {
+        let (state, _dir) = test_state().await;
+        let mut batch = state.store.batch();
+        let mut records = Vec::new();
+        for i in 0..(LIST_SCAN_BUDGET + 10) {
+            let m = format!("m{i:06}");
+            let record = DidRecord {
+                owner: "did:example:a".into(),
+                mnemonic: m.clone(),
+                created_at: 1,
+                updated_at: 1,
+                version_count: 0,
+                did_id: None,
+                content_size: 0,
+                disabled: false,
+                disabled_by_admin: false,
+                deleted_at: None,
+                method: "webvh".into(),
+                domain: String::new(),
+                services: None,
+                agent_names: Vec::new(),
+            };
+            batch.insert(&state.dids_ks, did_key(&m), &record).unwrap();
+            records.push(record);
+        }
+        batch.commit_in_parts().await.unwrap();
+        // Only the very last slot matches.
+        let needle = format!("m{:06}", LIST_SCAN_BUDGET + 9);
+        let filter = ListFilter {
+            search: Some(&needle),
+            ..Default::default()
+        };
+        let admin = admin_auth("did:example:admin");
+        let first = list_dids_page(&admin, false, &state, &filter, Some(10), None)
+            .await
+            .unwrap();
+        assert!(first.records.is_empty(), "the budget ran out first");
+        assert!(
+            first.resume_after.is_some(),
+            "and the page says where to resume"
+        );
+        let (seen, _) = all_pages(&state, &admin, &filter, 10).await;
+        assert_eq!(seen, [needle]);
+    }
+
+    #[tokio::test]
+    async fn usage_counters_follow_register_transfer_and_delete() {
+        let (state, _dir) = test_state().await;
+        register_owned(&state, "did:example:a", "alpha").await;
+        register_owned(&state, "did:example:a", "beta").await;
+        let size = |state: &AppState, m: &'static str| {
+            let state = state.clone();
+            async move {
+                state
+                    .dids_ks
+                    .get::<DidRecord>(did_key(m))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .content_size
+            }
+        };
+        let (a, b) = (size(&state, "alpha").await, size(&state, "beta").await);
+        assert_eq!(
+            owner_usage(&state, "did:example:a").await.unwrap(),
+            (2, a + b)
+        );
+
+        seed_caller_acl(
+            &state,
+            "did:example:b",
+            Role::Owner,
+            did_hosting_common::server::domain::DomainScope::All,
+        )
+        .await;
+        // An admin moves one slot to another owner.
+        change_did_owner(
+            &admin_auth("did:example:admin"),
+            &state,
+            "beta",
+            "did:example:b",
+            None,
+        )
+        .await
+        .map_err(|e| format!("{e}"))
+        .unwrap();
+        assert_eq!(owner_usage(&state, "did:example:a").await.unwrap(), (1, a));
+        assert_eq!(owner_usage(&state, "did:example:b").await.unwrap(), (1, b));
+
+        delete_did(&owner_auth("did:example:a"), &state, "alpha", None)
+            .await
+            .unwrap();
+        assert_eq!(owner_usage(&state, "did:example:a").await.unwrap(), (0, 0));
+
+        // The domain index followed the slots too.
+        let mnemonics = crate::control_tasks::queries::domain_mnemonics(&state, "control.test")
+            .await
+            .unwrap();
+        assert_eq!(mnemonics, ["beta"]);
     }
 }
 
