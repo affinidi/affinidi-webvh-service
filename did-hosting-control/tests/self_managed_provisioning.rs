@@ -1,9 +1,8 @@
 //! T5-lite: tenant DID provisioning succeeds against a self-managed-style
 //! `AppConfig` (empty `[vta]`, no parent VTA bootstrapping the daemon).
 //!
-//! This test exercises the same `did_ops::create_did` + `did_ops::publish_did`
-//! code path the DIDComm router (`messaging::dispatch_did_op`) dispatches into
-//! for `MSG_DID_REQUEST` / `MSG_DID_PUBLISH`. It bypasses the mediator wire
+//! This test exercises the same `did_ops::create_did` + `did_ops::register_did_atomic`
+//! code path the `did/create` and `did/register` Trust Tasks dispatch into. It bypasses the mediator wire
 //! transport — that path is identical between VTA and self-managed modes per
 //! the runtime audit (see `tasks/runtime-audit-T3.md`) and is not the risk
 //! self-managed mode introduces. The risk this test addresses: a hidden
@@ -30,7 +29,7 @@ use did_hosting_common::server::store::{
 };
 use did_hosting_control::auth::AuthClaims;
 use did_hosting_control::config::{AppConfig, RegistryConfig};
-use did_hosting_control::did_ops::{create_did, publish_did};
+use did_hosting_control::did_ops::{create_did, register_did_atomic};
 use did_hosting_control::server::AppState;
 
 #[tokio::test]
@@ -157,7 +156,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
     );
 
     // 6. Phase 2 — tenant builds a real signed did:webvh log entry locally
-    //    and publishes it (analog to MSG_DID_PUBLISH). Using a real entry
+    //    and publishes it (analog to `did/register`). Using a real entry
     //    so `validate_did_jsonl` accepts it.
     let signing = Secret::generate_ed25519(None, None);
     let signing_pub_mb = signing.get_public_keymultibase().expect("signing pub mb");
@@ -172,9 +171,9 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         .await
         .expect("create log entry");
 
-    publish_did(&auth, &state, &request.mnemonic, &jsonl, None)
+    register_did_atomic(&auth, &state, &request.mnemonic, &jsonl, false, None)
         .await
-        .expect("publish_did");
+        .expect("register_did_atomic");
 
     // 7. The tenant's DID record is in the daemon's local store with
     //    a populated did_id and version_count = 1.

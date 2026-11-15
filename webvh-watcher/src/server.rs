@@ -1,13 +1,9 @@
 use std::sync::{Arc, OnceLock};
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
-use affinidi_messaging_didcomm_service::{
-    DIDCommService, DIDCommServiceConfig, ListenerConfig, Protocols, RestartPolicy, RetryConfig,
-};
+use affinidi_messaging_didcomm_service::{DIDCommService, DIDCommServiceConfig};
 use axum::routing::get;
-use did_hosting_common::server::didcomm_profile::{
-    advertised_protocols, build_tdk_profile_for_identity, reconcile_listener_protocols,
-};
+use did_hosting_common::server::didcomm_profile::build_own_listener;
 use did_hosting_common::server::identity::{self, ServiceIdentity};
 use did_hosting_common::server::init;
 use did_hosting_common::server::replay::ReplayCache;
@@ -176,6 +172,14 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
 
     let _ = rest_ready_rx.await;
 
+    // Now that we are serving HTTP, resolve our *own* DID for the first time.
+    // `load_identity` may have come up on guessed `#key-0`/`#key-1` kids and
+    // persisted nothing; this records the generation with the kids the document
+    // really uses — and must run before the listener is built on the guess.
+    if let Err(e) = crate::identity_rotation::reload_now(&state).await {
+        warn!("failed to establish the service identity from its DID document: {e}");
+    }
+
     // TSP and DIDComm on the mediator connection.
     let messaging_shutdown = CancellationToken::new();
     match start_messaging_service(&state, messaging_shutdown.clone()).await {
@@ -186,7 +190,27 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         Err(e) => warn!("failed to start the messaging service: {e}"),
     }
 
+    // Reconnect to any mediator we rotated away from but whose grace period
+    // has not elapsed — a restart mid-window must not abandon that queue.
+    crate::identity_rotation::resume_mediator_drains(&state);
+
+    // The identity sweep. The watcher's own DID is published elsewhere, so it
+    // never sees it change — this sweep is its *only* way to notice a rotation,
+    // as well as what expires a superseded generation's key material.
+    let (identity_shutdown_tx, identity_shutdown_rx) = watch::channel(false);
+    let identity_state = state.clone();
+    let identity_handle = tokio::spawn(async move {
+        crate::identity_rotation::run_identity_sweep_loop(identity_state, identity_shutdown_rx)
+            .await;
+    });
+
     init::shutdown_signal().await;
+
+    // Ordered shutdown: identity -> messaging -> REST + storage.
+    let _ = identity_shutdown_tx.send(true);
+    if let Err(e) = identity_handle.await {
+        warn!("identity sweep task didn't shut down cleanly: {e}");
+    }
 
     messaging_shutdown.cancel();
     if let Some(svc) = state.didcomm_service.get() {
@@ -233,33 +257,16 @@ async fn start_messaging_service(
         info!("mediator_did not configured — TSP/DIDComm listener disabled");
         return Ok(None);
     };
-    let profile = build_tdk_profile_for_identity("watcher", identity, Some(&mediator_did)).await?;
-
-    let advertised = advertised_protocols(&identity.did, Some(&identity.did_resolver)).await;
-    let transports = reconcile_listener_protocols(identity.protocols(), advertised, &identity.did);
+    // Built by the same function the identity rebuild uses, so a rotation
+    // cannot come back with a different listener.
+    let (listener, transports) = build_own_listener(
+        crate::identity_rotation::LISTENER_ID,
+        identity,
+        &mediator_did,
+        &state.store,
+    )
+    .await?;
     let tsp_enabled = transports.tsp;
-    let protocols = match (transports.didcomm, transports.tsp) {
-        (true, true) => Protocols::BOTH,
-        (false, true) => Protocols::TSP_ONLY,
-        _ => Protocols::DIDCOMM_ONLY,
-    };
-    let mut listener = ListenerConfig {
-        id: "watcher".into(),
-        profile,
-        restart_policy: RestartPolicy::Always {
-            backoff: RetryConfig::default(),
-        },
-        auto_delete: true,
-        protocols,
-        ..Default::default()
-    };
-    if tsp_enabled {
-        listener.relationship_store = Some(
-            did_hosting_common::server::tsp_relationship_store::build_relationship_store(
-                &state.store,
-            )?,
-        );
-    }
     let router = crate::messaging::build_watcher_router(state.clone())
         .map_err(|e| AppError::Internal(format!("failed to build DIDComm router: {e}")))?;
     let config = DIDCommServiceConfig {

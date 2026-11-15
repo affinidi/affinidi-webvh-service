@@ -112,7 +112,7 @@ pub fn extract_did_host(did: &str) -> Result<String, AppError> {
 }
 
 /// One-shot check covering all three steps. The intended entry point
-/// for `did_ops::create_did` / `register_did_atomic` / `publish_did`:
+/// for `did_ops::create_did` / `register_did_atomic` / the agent-name ops:
 /// call this immediately after extracting the embedded DID identifier
 /// and before any storage write.
 ///

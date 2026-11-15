@@ -4,9 +4,9 @@
 //! differences that follow from what a server is:
 //!
 //! - Its listener id is `server`, not `control`.
-//! - Its own DID can change through **two** paths, not one: a direct publish
-//!   (`did_ops::publish_did`), or a sync update pushed from a control plane
-//!   (`MSG_SYNC_UPDATE` → `apply_single_update`). Both funnel into
+//! - An edge has no publish path of its own (no management routes), so its
+//!   own DID changes only through a sync update pushed from a control plane
+//!   (`MSG_SYNC_UPDATE` → `apply_single_update`), which calls
 //!   [`on_did_published`].
 //!
 //! In **daemon mode this module is inert**, and deliberately so: the embedded
@@ -18,10 +18,8 @@
 
 use std::time::Duration;
 
-use affinidi_messaging_didcomm_service::{
-    DIDCommService, ListenerConfig, Protocols, RestartPolicy, RetryConfig,
-};
-use did_hosting_common::server::didcomm_profile::build_tdk_profile_for_identity;
+use affinidi_messaging_didcomm_service::DIDCommService;
+use did_hosting_common::server::didcomm_profile::rebuild_own_listener;
 use did_hosting_common::server::identity::{
     self, DEFAULT_RELOAD_INTERVAL, DEFAULT_SWEEP_INTERVAL, IdentityGeneration, ReloadOutcome,
     mnemonic_from_did,
@@ -39,7 +37,7 @@ use crate::server::AppState;
 /// Must match the listener id `server::start_didcomm_service` registers, or the
 /// rebuild would try to add a *second* listener for the same DID and the
 /// framework would reject it as a duplicate.
-const LISTENER_ID: &str = "server";
+pub(crate) const LISTENER_ID: &str = "server";
 
 /// How long the expiry sweep waits between passes (local, cheap).
 pub const SWEEP_INTERVAL: Duration = DEFAULT_SWEEP_INTERVAL;
@@ -189,45 +187,10 @@ async fn rebuild_listener(state: &AppState) -> Result<(), AppError> {
         return Ok(());
     };
 
-    let profile =
-        build_tdk_profile_for_identity(LISTENER_ID, identity, Some(&mediator_did)).await?;
-
-    // Union across live generations — a generation retiring out of DIDComm
-    // while the current identity is TSP-only still has peers delivering DIDComm
-    // to it until it expires.
-    let transports = identity.protocols();
-    let protocols = match (transports.didcomm, transports.tsp) {
-        (true, true) => Protocols::BOTH,
-        (false, true) => Protocols::TSP_ONLY,
-        _ => Protocols::DIDCOMM_ONLY,
-    };
-
-    // Remove-then-add: the mediator allows one connection per DID, and the
-    // framework rejects a second listener for a DID it already holds. The brief
-    // gap is safe — inbound messages queue at the mediator and are delivered on
-    // reconnect.
-    if let Err(e) = svc.remove_listener(LISTENER_ID).await {
-        warn!("failed to remove the old listener: {e}");
-    }
-
-    svc.add_listener(ListenerConfig {
-        id: LISTENER_ID.into(),
-        profile,
-        restart_policy: RestartPolicy::Always {
-            backoff: RetryConfig::default(),
-        },
-        auto_delete: true,
-        protocols,
-        ..Default::default()
-    })
-    .await
-    .map_err(|e| AppError::Internal(format!("failed to restart the DIDComm listener: {e}")))?;
-
-    info!(
-        didcomm = transports.didcomm,
-        tsp = transports.tsp,
-        "DIDComm listener rebuilt on the new identity"
-    );
+    // The same builder boot uses: union across live generations, reconciled
+    // against what our DID document advertises, with the persistent TSP
+    // relationship store.
+    rebuild_own_listener(svc, LISTENER_ID, identity, &mediator_did, &state.store).await?;
     Ok(())
 }
 
