@@ -414,8 +414,7 @@ async fn apply_listing(
     // What each held slot needs comparing, read a page of records at a time:
     // a summary per slot, never every record at once.
     let mut held: Vec<HeldSlot> = Vec::new();
-    let mut pages =
-        crate::paging::PageWalk::new(&state.dids_ks, "did:", crate::paging::DID_PAGE_ROWS);
+    let mut pages = state.dids_ks.walk("did:", crate::paging::DID_PAGE_ROWS);
     while let Some(rows) = pages.next_page().await.map_err(|e| e.to_string())? {
         held.extend(
             rows.into_iter()

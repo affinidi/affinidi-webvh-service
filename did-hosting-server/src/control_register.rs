@@ -130,8 +130,7 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
     // Read a page of records at a time: only the summaries are kept.
     let preloaded_dids: Vec<serde_json::Value> = {
         let mut out = Vec::new();
-        let mut pages =
-            crate::paging::PageWalk::new(&state.dids_ks, "did:", crate::paging::DID_PAGE_ROWS);
+        let mut pages = state.dids_ks.walk("did:", crate::paging::DID_PAGE_ROWS);
         loop {
             match pages.next_page().await {
                 Ok(Some(rows)) => out.extend(
@@ -758,7 +757,7 @@ pub async fn migrate_high_water_marks(
     store: &Store,
 ) -> Result<usize, crate::error::AppError> {
     let mut rewritten = 0;
-    let mut pages = crate::paging::PageWalk::new(dids_ks, HIGH_WATER_IDENTITY_PREFIX, 64);
+    let mut pages = dids_ks.walk(HIGH_WATER_IDENTITY_PREFIX, 64);
     while let Some(rows) = pages.next_page().await? {
         let mut batch = store.batch();
         let mut staged = 0;

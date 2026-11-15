@@ -58,7 +58,7 @@ pub async fn cleanup_empty_dids(
 
     // The candidates, from a page of records at a time.
     let mut candidates = Vec::new();
-    let mut pages = crate::paging::PageWalk::new(dids_ks, "did:", crate::paging::DID_PAGE_ROWS);
+    let mut pages = dids_ks.walk("did:", crate::paging::DID_PAGE_ROWS);
     while let Some(rows) = pages.next_page().await? {
         candidates.extend(
             rows.into_iter()
