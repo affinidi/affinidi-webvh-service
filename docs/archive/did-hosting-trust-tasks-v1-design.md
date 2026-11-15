@@ -1,6 +1,8 @@
 # Design — fit-for-purpose typed DID-management Trust Tasks (`did-hosting/*/1.0`)
 
-**Status:** proposed. Supersedes the idea of adopting the upstream
+> **Status:** historical — superseded by the typed `control_tasks!` table that shipped; see [the Trust Task catalogue](../trust-tasks.md).
+
+Proposed as an alternative to adopting the upstream
 `trust-tasks-rs` `spec/did-management/*/0.1` payloads directly.
 
 ## Problem

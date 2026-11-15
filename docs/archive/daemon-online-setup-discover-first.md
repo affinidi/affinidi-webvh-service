@@ -1,5 +1,7 @@
 # Daemon online setup — discover-first publication choice
 
+> **Status:** historical — implemented in `did-hosting-daemon/src/setup.rs`; see [bootstrap and startup](../bootstrap_startup.md).
+
 ## Problem
 
 `did-hosting-daemon setup` (online VTA mode) collects the DID path folded into a

@@ -1,6 +1,7 @@
 # Spec: Self-Managed (No-VTA) Operating Mode
 
-Status: Draft — awaiting review
+> **Status:** historical — shipped in 0.6.0 for the daemon (then `webvh-daemon`). Current walk-through: [bootstrap and startup](../bootstrap_startup.md).
+
 Scope: `webvh-daemon` only (v1)
 Author: glenn.gore@gmail.com
 

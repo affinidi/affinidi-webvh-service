@@ -1,20 +1,24 @@
 # Contributing
 
 When contributing to this repository, please first discuss the change you wish to
-make by opening a [GitHub issue](https://github.com/affinidi/did-hosting-service/issues/new).
+make by opening a [GitHub issue](https://github.com/affinidi/affinidi-webvh-service/issues/new).
 
 ## Development requirements
 
-- **Rust toolchain ≥ 1.94.0** (workspace MSRV declared in `Cargo.toml`).
-  The local toolchain is typically a more recent stable; the MSRV is the
-  floor we publish against.
-- **Edition 2024.**
-- **Node ≥ 20** for the `did-hosting-ui` Expo workspace.
+- **Rust:** the workspace MSRV is `rust-version` in the root
+  [`Cargo.toml`](Cargo.toml); CI builds at exactly that version and fails if
+  its pinned `MSRV` and `Cargo.toml` disagree. Your local toolchain is
+  typically a more recent stable. Edition 2024.
+- **Node.js:** `engines.node` in
+  [`did-hosting-ui/package.json`](did-hosting-ui/package.json) — the one
+  place the floor is stated. The default build of `did-hosting-control` and
+  `did-hosting-daemon` includes the `ui` feature and runs npm when the UI
+  bundle is missing or stale; their `build.rs` reads the same floor. Build
+  with `--no-default-features` (see the crate READMEs) to skip the UI.
+- **`cargo-deny`** — CI gates on `cargo deny check` (config in `deny.toml`),
+  so run it before pushing a dependency change.
 
-Optional but useful:
-
-- `cargo-outdated` for dependency hygiene.
-- `cargo-deny` for license/advisory checks (config lives in `deny.toml`).
+Optional but useful: `cargo-outdated` for dependency hygiene.
 
 ## Pre-push workflow
 
@@ -25,15 +29,59 @@ locally before pushing avoids round-trips:
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+python3 scripts/check-docs.py        # docs status lines + retired names
 ```
+
+CI (`.github/workflows/ci.yml`) also runs, among others: `cargo doc
+--no-deps --workspace` with `RUSTDOCFLAGS=-D warnings` (a broken intra-doc
+link fails the build), `cargo package --workspace` (the published tarballs
+build), the MSRV build, per-store and per-method builds, `cargo deny`, the
+fuzz lockfile check (`fuzz/Cargo.lock` must match; refresh it after a
+dependency-requirement bump), and the `docs` job below. The workspace denies
+`unsafe_code`.
+
+Server-side modules of `did-hosting-common` compile only with a store
+backend: `cargo test -p did-hosting-common --features store-fjall`.
 
 For the UI:
 
 ```bash
 cd did-hosting-ui
-node_modules/.bin/tsc --noEmit
-npx --no-install expo export --platform web   # only if you touched the UI build path
+npm ci
+npm run typecheck
+npm run lint
+npm test
+npm run build:web   # writes the bundle the control crate embeds (did-hosting-control/ui-dist)
 ```
+
+### Generated documents
+
+Some files under `docs/` are generated and checked by a drift test; edit the
+source, then regenerate:
+
+| File | Source | Regenerate |
+| ---- | ------ | ---------- |
+| `docs/cli-reference.md` | each binary's clap definition | `UPDATE_CLI_REFERENCE=1 cargo test -p <crate> --bin <binary> cli_reference` |
+| `docs/openapi.json` | `#[utoipa::path]` annotations | `UPDATE_OPENAPI=1 cargo test -p did-hosting-server --features openapi openapi_snapshot` |
+| `docs/trust-tasks.md` | the control plane's Trust Task table | see the header of the file |
+
+### Documentation
+
+Every page under `docs/` starts with a status line (`current`, `historical`
+or `proposal`); superseded designs live in `docs/archive/`. CI checks the
+status lines, relative links (lychee, offline) and that current docs do not
+use retired names (`scripts/check-docs.py`). The index is
+[docs/README.md](docs/README.md).
+
+### Design documents outside this repository
+
+CLAUDE.md cites rules by number (R3.2, R3.6, …) from
+`vti-stack-development-guide.md` and its companions in `../design-docs/`. That
+is an internal Affinidi document set for the wider trust-infrastructure stack,
+checked out beside this repository by maintainers; it is not published.
+Outside contributors do not need it: the rules that bind this repository are
+stated in CLAUDE.md and [docs/architecture.md](docs/architecture.md), and a
+reviewer will point at anything else.
 
 ## Branches and releases
 
@@ -62,11 +110,13 @@ either are rejected, so it's worth getting them right before pushing.
 The remote rejects commit messages whose subject doesn't match:
 
 ```text
-(build|ci|docs|feat|feat!|fix|perf|refactor|style|test|chore|revert)(\(release\))?:\s.{5,}
+(build|ci|docs|feat|fix|perf|refactor|style|test|chore|revert)(\(.*\))?!?:\s.{5,}
 ```
 
-Notable: the only allowed parenthetical scope is `(release)`. A subject
-like `fix(ui): something` will be rejected — use `fix: something` instead.
+Any parenthetical scope is accepted (`fix(store): …`, `feat(ui): …`), and a
+`!` after the type or scope marks a breaking change (`feat!: …`,
+`refactor(control)!: …`). Merge commits must match too — merge `main` into a
+PR branch with a message such as `chore: merge main into <branch>`.
 
 ### DCO sign-off
 
@@ -93,9 +143,10 @@ git config user.email "you@example.com"
    `affinidi-messaging-test-mediator`, etc. Unit tests may stub for
    isolation; integration tests prove the whole thing fits.
 3. **Tests for new code paths.** Every public function should have at
-   least one happy-path test; every dispatch arm in
-   `did-hosting-control/src/messaging.rs` and `did-hosting-control/src/routes/didcomm.rs`
-   should exercise both success and at least one failure mode.
+   least one happy-path test; every Trust Task row in
+   `did-hosting-control/src/control_tasks/mod.rs` (and the gate in
+   `did-hosting-control/src/messaging.rs` that admits it) should exercise
+   both success and at least one failure mode.
 4. **Comments explain WHY, not WHAT.** Identifier names + types should
    carry the WHAT. Reserve `///` and `//` for the non-obvious — a
    subtle invariant, a reason for an unusual ordering, a reference to
@@ -115,10 +166,12 @@ git config user.email "you@example.com"
 
 `did-hosting-daemon` embeds the main features of `did-hosting-server`,
 `webvh-witness`, `webvh-watcher`, and `did-hosting-control` in a single
-binary. CLAUDE.md (workspace root) lists what is mirrored, what is
-intentionally omitted, and a heuristic for deciding which side a new
-capability belongs on. Read that before adding routes, background
-tasks, or CLI subcommands so daemon mode doesn't drift.
+binary. [CLAUDE.md](CLAUDE.md) (workspace root) lists what is mirrored,
+what is intentionally omitted, and a heuristic for deciding which side a
+new capability belongs on. Read that before adding routes, background
+tasks, or CLI subcommands so daemon mode doesn't drift. The same
+architecture, written for operators, is in
+[docs/architecture.md](docs/architecture.md).
 
 ## Code of Conduct
 

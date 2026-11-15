@@ -193,9 +193,9 @@ enum Command {
     /// to that generation's key-agreement key will no longer decrypt.
     ///
     /// The service must be stopped (the store is exclusively locked). For a
-    /// LIVE service use the control plane's
-    /// `POST /api/identity/generations/{id}/retire` or the UI button, which
-    /// drops the key from the running process immediately.
+    /// LIVE service use the control plane's `identity/retire/0.1` Trust Task
+    /// (`send-trust-task`, see docs/sending-trust-tasks.md) or the UI button,
+    /// which drops the key from the running process immediately.
     IdentityRetireNow {
         /// Generation id to retire (see `identity-list`).
         #[arg(long)]
@@ -360,6 +360,36 @@ enum Command {
         #[arg(long, default_value = "control-secrets.json")]
         secrets_out: PathBuf,
     },
+    /// Send one signed Trust Task to the running control plane and print the
+    /// response payload as JSON.
+    ///
+    /// Every management operation is a Trust Task (docs/trust-tasks.md lists
+    /// them). Signs the request with the `--key` did:key, POSTs it to the
+    /// running control plane's `POST /api/trust-tasks`, verifies the reply is the
+    /// service's own signed response, and prints its payload. The key is
+    /// authorised like any other client: by its proof and its ACL entry (add it
+    /// with `add-acl`). A refusal is reported as an error with its code.
+    SendTrustTask {
+        /// Path to the signer's did:key JSON file — same format
+        /// `setup --setup-key-out` writes.
+        #[arg(long)]
+        key: PathBuf,
+        /// The task: a full Type URI, or `<slug>/<version>` such as
+        /// `identity/list/0.1` or `did-management/registry/list/0.2`.
+        #[arg(long = "type", value_name = "TYPE")]
+        task_type: String,
+        /// The request payload as JSON (default `{}`).
+        #[arg(long, conflicts_with = "payload_file")]
+        payload: Option<String>,
+        /// Read the request payload from a JSON file.
+        #[arg(long)]
+        payload_file: Option<PathBuf>,
+        /// Base URL of the running control plane. Defaults to
+        /// `http://<server.host>:<server.port>` from config (a wildcard bind is
+        /// dialled as loopback).
+        #[arg(long)]
+        url: Option<String>,
+    },
     /// Scrape this service's counters over the authenticated
     /// `server/metrics/0.1` Trust Task and print them as JSON.
     ///
@@ -493,6 +523,20 @@ async fn main() {
         }
         Some(Command::ListAcl) => {
             if let Err(e) = run_list_acl(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::SendTrustTask {
+            key,
+            task_type,
+            payload,
+            payload_file,
+            url,
+        }) => {
+            if let Err(e) =
+                run_send_trust_task(cli.config, key, task_type, payload, payload_file, url).await
+            {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -760,6 +804,35 @@ async fn run_add_acl(
 async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load(config_path)?;
     did_hosting_common::server::cli_acl::run_list_acl(&config.store).await
+}
+
+/// Send one signed Trust Task. A thin wrapper over the shared
+/// [`did_hosting_common::server::cli_trust_task::run_send_trust_task`], supplying
+/// this service's own `server_did` and bind address.
+async fn run_send_trust_task(
+    config_path: Option<PathBuf>,
+    key_path: PathBuf,
+    task_type: String,
+    payload: Option<String>,
+    payload_file: Option<PathBuf>,
+    url: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    let to = config
+        .server_did
+        .clone()
+        .ok_or("server_did is not configured; this service has not completed provisioning")?;
+    did_hosting_common::server::cli_trust_task::run_send_trust_task(
+        &to,
+        key_path.as_path(),
+        url,
+        &config.server.host,
+        config.server.port,
+        &task_type,
+        payload.as_deref(),
+        payload_file.as_deref(),
+    )
+    .await
 }
 
 /// Scrape this control plane's counters. A thin wrapper over the shared

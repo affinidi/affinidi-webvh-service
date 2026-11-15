@@ -9,6 +9,7 @@ pub mod cli_acl;
 pub mod cli_dids;
 pub mod cli_identity;
 pub mod cli_metrics;
+pub mod cli_trust_task;
 pub mod cli_tsp;
 pub mod config;
 pub mod did_index;

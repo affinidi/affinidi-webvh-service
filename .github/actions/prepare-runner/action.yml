@@ -35,3 +35,12 @@ runs:
         sudo mkswap "$file" >/dev/null
         sudo swapon "$file"
         free -h
+    # The default build of did-hosting-control / did-hosting-daemon has the
+    # `ui` feature, whose build script builds the management UI with npm when
+    # the bundle is missing (always, on a fresh checkout) and refuses a Node
+    # older than `engines.node` in did-hosting-ui/package.json. The runner
+    # image's Node is older, so install the same major the `ui` job uses.
+    - name: Node.js for the UI build
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      with:
+        node-version: "24"

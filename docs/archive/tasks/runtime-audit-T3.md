@@ -1,6 +1,8 @@
 # T3: Runtime VTA Audit (webvh-daemon)
 
-Spec: [`docs/self-managed-mode-spec.md`](../docs/self-managed-mode-spec.md)
+> **Status:** historical — completed audit for self-managed mode (0.6.0).
+
+Spec: [`docs/self-managed-mode-spec.md`](../self-managed-mode-spec.md)
 Plan: [`tasks/plan.md`](plan.md)
 
 **Question for the audit**: in `IdentityMode::SelfManaged` mode (with an empty `[vta]` table and `vta_credential = None`), does any runtime code path break, panic, or unconditionally call out to a parent VTA?

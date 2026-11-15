@@ -1,5 +1,7 @@
 # Trust Tasks ACL — client migration guide (v0.7.0 → v0.8.0)
 
+> **Status:** historical — a v0.7 → v0.8 client guide. `enforce_proofs = false`, described below, is now refused at startup; see the [Trust Task catalogue](../trust-tasks.md).
+
 > **Now AclEntry 0.2.** The ACL family is served at its latest versions
 > only: `acl/grant`, `acl/revoke`, `acl/change-role` and `acl/show` at
 > **0.2**, `acl/list` at **0.3**, and `trust-task-discovery` at **0.3**.
@@ -231,7 +233,7 @@ Ed25519 session keypair) so admin flows work end-to-end.
 enforce_proofs = true   # default in v0.7.0
 ```
 
-- `true` (default) — [`ProofPolicy::Verify`](../did-hosting-common/src/server/trust_tasks/mod.rs):
+- `true` (default) — [`ProofPolicy::Verify`](../../did-hosting-common/src/server/trust_tasks/mod.rs):
   the maintainer verifies a present `proof` against the configured
   verifier (`affinidi-data-integrity` resolving `did:web` /
   `did:webvh` / `did:key`). Failure → `proof_invalid` on the wire.
@@ -240,7 +242,7 @@ enforce_proofs = true   # default in v0.7.0
   service-to-service) that already sign their envelopes work
   out-of-the-box.
 
-- `false` — [`ProofPolicy::RejectIfPresent`](../did-hosting-common/src/server/trust_tasks/mod.rs):
+- `false` — [`ProofPolicy::RejectIfPresent`](../../did-hosting-common/src/server/trust_tasks/mod.rs):
   proof-bearing documents are rejected with `malformed_request`
   (silently dropping a producer-supplied proof would mislead the
   producer about the integrity guarantees of the exchange). Useful
@@ -420,4 +422,4 @@ wholesale — it has no UI-specific dependencies.
 - [SPEC.md](https://github.com/trustoverip/dtgwg-trust-tasks-tf/blob/main/SPEC.md) — Trust Tasks framework
 - [acl/* registry entries](https://trusttasks.org/registry) — canonical wire shapes
 - [`docs/trust-tasks-registry-gaps.md`](trust-tasks-registry-gaps.md) — webvh ops not yet in the registry
-- [CHANGELOG.md](../CHANGELOG.md) — release notes
+- [CHANGELOG.md](../../CHANGELOG.md) — release notes

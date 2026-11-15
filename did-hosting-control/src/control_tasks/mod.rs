@@ -52,6 +52,8 @@ use crate::server::AppState;
 
 pub(crate) mod agent_name;
 pub(crate) mod auth;
+#[cfg(test)]
+mod catalogue;
 pub(crate) mod did;
 pub(crate) mod domain;
 pub(crate) mod enrol;

@@ -160,9 +160,9 @@ enum Command {
     /// to that generation's key-agreement key will no longer decrypt.
     ///
     /// The service must be stopped (the store is exclusively locked). For a
-    /// LIVE service use the control plane's
-    /// `POST /api/identity/generations/{id}/retire` or the UI button, which
-    /// drops the key from the running process immediately.
+    /// LIVE service use the control plane's `identity/retire/0.1` Trust Task
+    /// (`send-trust-task`, see docs/sending-trust-tasks.md) or the UI button,
+    /// which drops the key from the running process immediately.
     IdentityRetireNow {
         /// Generation id to retire (see `identity-list`).
         #[arg(long)]

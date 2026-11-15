@@ -1,6 +1,7 @@
 # Spec: Multi-Method DID Hosting + Repo Rename
 
-Status: Draft — awaiting review
+> **Status:** historical — shipped in 0.7.0. Current behaviour: [architecture](../architecture.md), [configuration](../configuration.md), [did:webs hosting](../did-webs-hosting.md).
+
 Scope: Repository rename + multi-DID-method support. Ships in the same release tag as `docs/multi-domain-spec.md` and `docs/webvh-client-crate-spec.md`.
 Author: glenn.gore@gmail.com
 

@@ -21,7 +21,8 @@ does, and it applies a sync only when its source signed it.
 
 ### Prerequisites
 
-- Rust 1.94.0+ (2024 Edition)
+- Rust: the workspace MSRV is `rust-version` in the root
+  [`Cargo.toml`](../Cargo.toml) (2024 edition).
 
 ### 1. Build
 
@@ -133,42 +134,23 @@ process per store.
 
 ## Configuration
 
-The watcher is configured via a TOML file. By default it looks
-for `config.toml` in the current directory. You can specify a
-different path with the `--config` flag or the
-`WATCHER_CONFIG_PATH` environment variable.
+The watcher is configured via a TOML file: `config.toml` in the working
+directory unless `--config` or `WATCHER_CONFIG_PATH` names another. Every key
+and variable is in [docs/configuration.md](../docs/configuration.md); unknown
+keys and tables are refused at load. Keep the `[server]` and `[store]`
+tables setup writes (port 8533, `data/webvh-watcher`): a config without them
+falls back to the edge server's defaults.
 
-### Environment Variable Overrides
+### Environment variable overrides
 
-| Variable               | Description         |
-| ---------------------- | ------------------- |
-| `WATCHER_CONFIG_PATH`  | Path to config file |
-| `WATCHER_SERVER_HOST`  | Bind host           |
-| `WATCHER_SERVER_PORT`  | Bind port           |
-| `WATCHER_LOG_LEVEL`    | Log level           |
-| `WATCHER_SERVER_DID`   | The watcher's DID   |
-| `WATCHER_MEDIATOR_DID` | Its mediator        |
-| `WATCHER_SOURCE_DIDS`  | Comma-separated source DIDs |
-| `WATCHER_SERVER_RESOLVE_CACHE_MAX_AGE_SECS` | DID-resolution `max-age` (0 = `no-cache`; default 300) |
-| `WATCHER_SERVER_RESOLVE_CACHE_SHARED_MAX_AGE_SECS` | DID-resolution `s-maxage` (empty clears) |
-| `WATCHER_SERVER_RESOLVE_CACHE_STALE_WHILE_REVALIDATE_SECS` | DID-resolution `stale-while-revalidate` (empty clears) |
-| `WATCHER_REPLAY_MAX_ENTRIES` | Replay cache records, all signers (default 1,000,000, about 32 MB) |
-| `WATCHER_REPLAY_MAX_ENTRIES_PER_SIGNER` | Replay cache records per signer (default 250,000, about 600 signed requests a second) |
-| `WATCHER_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW` | Resolution requests per client address per window (empty clears: no limit) |
-| `WATCHER_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS` | Resolution rate-limit window (default 10; empty restores it) |
-| `WATCHER_SERVER_TRUSTED_PROXIES` | Comma-separated proxy addresses or CIDR ranges whose `X-Forwarded-For` is trusted (empty clears) |
-
-The same settings live in `[server.resolve_cache]` (`max_age_secs`,
-`shared_max_age_secs`, `stale_while_revalidate_secs`).
-
-The replay settings live in `[replay]` (`max_entries`,
-`max_entries_per_signer`). Every sync document is signed by a source control plane, so the
-per-signer bound caps how fast the watcher follows DID changes (about 600 a second at the default). The control plane's README explains the
-bounds ("Replay cache bounds").
-
-The resolution limit lives in `[server.resolve_rate_limit]` (`max_per_window`,
-`window_secs`) and is off by default; the edge server's README explains it
-("Resolution rate limit"), including `server.trusted_proxies`.
+Every setting has a `WATCHER_`-prefixed variable (`WATCHER_SERVER_PORT`,
+`WATCHER_SOURCE_DIDS` as a comma-separated list, `WATCHER_REPLAY_MAX_ENTRIES`,
+…); the full list is in [docs/configuration.md](../docs/configuration.md).
+Every sync document is signed by a source control plane, so the per-signer
+replay bound caps how fast the watcher follows DID changes (about 600 a
+second at the default). The resolution limit
+(`[server.resolve_rate_limit]`, off by default) is explained in the edge
+server's README ("Resolution rate limit").
 
 ### Connection limits and a reverse proxy
 
@@ -206,7 +188,7 @@ webvh-watcher health                           # Diagnostics
 
 | Method | Path                            | Description         |
 | ------ | ------------------------------- | ------------------- |
-| `GET`  | `/api/health`                   | Health check        |
+| `GET`  | `/api/health`                   | Health check (standalone only; the daemon's embedded watcher has none) |
 | `GET`  | `/{mnemonic}/did.jsonl`         | Resolve DID log     |
 | `GET`  | `/{mnemonic}/did-witness.json`  | Resolve witness     |
 | `GET`  | `/.well-known/did.jsonl`        | Root DID log        |
@@ -244,11 +226,11 @@ codebase, you can also create an issue directly in GitHub.
 
 1. Ensure the bug was not already reported by searching on
    GitHub under
-   [Issues](https://github.com/affinidi/did-hosting-service/issues).
+   [Issues](https://github.com/affinidi/affinidi-webvh-service/issues).
 
 2. If you're unable to find an open issue addressing the
    problem,
-   [open a new one](https://github.com/affinidi/did-hosting-service/issues/new).
+   [open a new one](https://github.com/affinidi/affinidi-webvh-service/issues/new).
    Be sure to include a **title and clear description**, as
    much relevant information as possible, and a **code sample**
    or an **executable test case** demonstrating the expected
@@ -257,5 +239,4 @@ codebase, you can also create an issue directly in GitHub.
 ## Contributing
 
 Want to contribute? Head over to our
-[CONTRIBUTING](https://github.com/affinidi/did-hosting-service/blob/main/CONTRIBUTING.md)
-guidelines.
+[CONTRIBUTING](../CONTRIBUTING.md) guidelines.
