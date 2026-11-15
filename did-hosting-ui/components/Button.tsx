@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useState, type ComponentRef, type ReactNode, type Ref } from "react";
 import {
   ActivityIndicator,
   Pressable,
@@ -15,6 +15,9 @@ import { colors, focusRing, fonts, radii, spacing } from "../lib/theme";
 
 export type ButtonVariant = "primary" | "secondary" | "danger" | "ghost";
 export type ButtonSize = "md" | "sm";
+
+/** What `buttonRef` points at: the pressable element (a DOM node on web). */
+export type ButtonHandle = ComponentRef<typeof Pressable>;
 
 export interface ButtonProps {
   /** The visible text. Also the accessible name unless `accessibilityLabel`
@@ -41,6 +44,8 @@ export interface ButtonProps {
   style?: StyleProp<ViewStyle>;
   textStyle?: StyleProp<TextStyle>;
   testID?: string;
+  /** The underlying element, to move focus to it (a dialog focuses Cancel). */
+  buttonRef?: Ref<ButtonHandle>;
 }
 
 /**
@@ -67,6 +72,7 @@ export function Button({
   style,
   textStyle,
   testID,
+  buttonRef,
 }: ButtonProps) {
   const [focused, setFocused] = useState(false);
   const [hovered, setHovered] = useState(false);
@@ -75,6 +81,7 @@ export function Button({
 
   return (
     <Pressable
+      ref={buttonRef}
       role="button"
       aria-label={accessibilityLabel ?? label}
       aria-disabled={inert}

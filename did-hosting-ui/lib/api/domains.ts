@@ -4,6 +4,7 @@ import type * as DomainList from "../trust-tasks/did-management/domain/list/0.1/
 import type * as MeDomains from "../trust-tasks/did-management/me/domains/0.1/payload";
 import type * as DomainCreate from "../trust-tasks/did-management/domain/create/0.1/payload";
 import type * as DomainSetState from "../trust-tasks/did-management/domain/set-state/0.1/payload";
+import type * as DomainUpdate from "../trust-tasks/did-management/domain/update/0.1/payload";
 import type * as DomainSetDefault from "../trust-tasks/did-management/domain/set-default/0.1/payload";
 import type * as DomainPurge from "../trust-tasks/did-management/domain/purge/0.1/payload";
 import { trustTask } from "../trust-task";
@@ -46,6 +47,17 @@ export const domainsApi = {
     });
     return domainFromWire(r.entry);
   },
+
+  /** Change a domain's friendly label. Admin. */
+  updateDomainLabel: async (name: string, label: string): Promise<DomainEntry> =>
+    domainFromWire(
+      (
+        await trustTask<DomainUpdate.Payload, DomainUpdate.Response>(T.domainUpdate, {
+          name,
+          label,
+        })
+      ).entry,
+    ),
 
   disableDomain: async (name: string): Promise<DomainEntry> =>
     domainFromWire(

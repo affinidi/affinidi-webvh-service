@@ -1133,7 +1133,7 @@ describe("step-up (wallet session)", () => {
       vtaWallet: { signTrustTask: vi.fn(), stepUpVta },
     });
     const sent = installControlPlane(() => rejection("stepUpRequired"));
-    await expect(api.deleteDomain("old.example")).rejects.toThrow(/stepped-up session/);
+    await expect(api.deleteDomain("old.example")).rejects.toThrow(/stepped-up sign-in/);
     expect(stepUpVta).not.toHaveBeenCalled();
     expect(tasks(sent)).toHaveLength(1);
   });

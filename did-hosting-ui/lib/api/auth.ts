@@ -19,6 +19,7 @@ import type * as RevokeSession from "../trust-tasks/auth/revoke-session/0.2/payl
 import type * as StepUpStart from "../trust-tasks/auth/step-up/start/0.2/payload";
 import type * as StepUpApprove from "../trust-tasks/auth/step-up/approve-response/0.7/payload";
 import { ApiError } from "../http";
+import { STEP_UP_GUIDANCE } from "../errors";
 import {
   clearToken,
   getAuthMethod,
@@ -149,10 +150,7 @@ export const authApi = {
     const wallet = typeof window !== "undefined" ? window.vtaWallet : undefined;
     const sessionId = getSessionId();
     if (getAuthMethod() !== "wallet" || !wallet?.approveSessionStepUp) {
-      throw new ApiError(
-        403,
-        "This action needs a stepped-up session. Sign in again with a passkey, or with a wallet that supports step-up.",
-      );
+      throw new ApiError(403, STEP_UP_GUIDANCE);
     }
     if (!getToken() || !getRefreshToken() || !sessionId) {
       throw new ApiError(401, "No session to step up — sign in again.");

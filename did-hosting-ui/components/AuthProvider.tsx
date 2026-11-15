@@ -1,4 +1,12 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   api,
   decodeJwtPayload,
@@ -17,6 +25,10 @@ interface AuthState {
   /** The saved session has been looked for, so `isAuthenticated: false`
    *  means signed out rather than not known yet. */
   restored: boolean;
+  /** The session ended under the operator (expired, revoked, key lost) rather
+   *  than by signing out: the screen stays mounted under a sign-in prompt so
+   *  unsaved work is not thrown away. */
+  sessionExpired: boolean;
   login: (token: string) => void;
   logout: () => void;
 }
@@ -35,6 +47,7 @@ const AuthContext = createContext<AuthState>({
   did: null,
   isAuthenticated: false,
   restored: false,
+  sessionExpired: false,
   login: () => {},
   logout: () => {},
 });
@@ -42,6 +55,9 @@ const AuthContext = createContext<AuthState>({
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [token, setTokenState] = useState<string | null>(null);
   const [restored, setRestored] = useState(false);
+  const [sessionExpired, setSessionExpired] = useState(false);
+  // The token as of the last change, for handlers registered once.
+  const tokenRef = useRef<string | null>(null);
 
   useEffect(() => {
     // The token cache lives in memory, restored from IndexedDB — on a fresh
@@ -53,17 +69,32 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       } finally {
         if (!cancelled) {
           const saved = getToken();
-          if (saved) setTokenState(saved);
+          if (saved) {
+            tokenRef.current = saved;
+            setTokenState(saved);
+          }
           setRestored(true);
         }
       }
     })();
 
-    // Clear React state when the API client detects an expired/invalid token
-    const onUnauthorized = () => setTokenState(null);
+    // The API client found the session gone (expired, revoked, key lost).
+    // Only a session that was held can expire; a refused anonymous read says
+    // nothing about one.
+    const onUnauthorized = () => {
+      if (tokenRef.current) setSessionExpired(true);
+      tokenRef.current = null;
+      setTokenState(null);
+    };
     window.addEventListener("webvh:unauthorized", onUnauthorized);
-    // ...and when another tab signs this session out.
-    const stopListening = listenForSignOut(() => setTokenState(null));
+    // Another tab signed this session out: that was deliberate, so this tab
+    // signs out too rather than offering to sign back in.
+    const stopListening = listenForSignOut(() => {
+      tokenRef.current = null;
+      setTokenState(null);
+      setSessionExpired(false);
+      clearQueryCache();
+    });
     return () => {
       cancelled = true;
       window.removeEventListener("webvh:unauthorized", onUnauthorized);
@@ -73,7 +104,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const login = useCallback((t: string) => {
     storeToken(t);
+    tokenRef.current = t;
     setTokenState(t);
+    setSessionExpired(false);
   }, []);
 
   const claims = useMemo(
@@ -81,15 +114,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     [token],
   );
 
-  // Reads are cached per key, not per session: when the signed-in subject
-  // changes (sign-out, or another account), drop what the last one loaded so
-  // it is never painted for the next.
-  useEffect(() => () => clearQueryCache(), [claims.did]);
+  // Reads are cached per key, not per session: when a different subject signs
+  // in, drop what the last one loaded so it is never painted for the next.
+  // Not on expiry — the screen under the sign-in prompt keeps its data until
+  // the same operator is back.
+  const lastSubject = useRef<string | null>(null);
+  useEffect(() => {
+    if (!claims.did) return;
+    if (lastSubject.current && lastSubject.current !== claims.did) clearQueryCache();
+    lastSubject.current = claims.did;
+  }, [claims.did]);
 
   const logout = useCallback(() => {
     // Revoke at the control plane before the session key is dropped: the
     // revoke is signed with it. The screen signs out at once either way.
+    tokenRef.current = null;
     setTokenState(null);
+    setSessionExpired(false);
+    clearQueryCache();
+    lastSubject.current = null;
     void api.logout();
   }, []);
 
@@ -100,6 +143,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         ...claims,
         isAuthenticated: !!token,
         restored,
+        sessionExpired,
         login,
         logout,
       }}

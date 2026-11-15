@@ -12,6 +12,15 @@ export const roleLabel = (r: string): string =>
 
 const option = <R extends Role>(r: R): SegmentOption<R> => ({ value: r, label: roleLabel(r) });
 
+/** What each role may do, in a line — shown under the role picker. */
+export const ROLE_DESCRIPTIONS: Record<Role, string> = {
+  owner: "Creates and manages their own DIDs, within the domains and quotas set here.",
+  admin: "Manages everything: every DID, domain, server and access entry.",
+  service:
+    "A machine account for a hosting server: registers with the control plane and reports its statistics. It cannot manage DIDs or access.",
+  metricsReader: "Reads the service's metrics counters only; cannot see or change DIDs.",
+};
+
 /** Every role an ACL entry can hold, in picker order. */
 export const ENTRY_ROLES: readonly SegmentOption<Role>[] = [
   option("owner"),
