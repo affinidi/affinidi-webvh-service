@@ -203,6 +203,61 @@ describe("management calls (passkey session)", () => {
     expect(second!.doc.payload).toEqual({ limit: 1000, cursor: "page-2" });
   });
 
+  it("listDidPage asks for one page, filtered server-side, and hands back the cursor", async () => {
+    const sent = installControlPlane((req) =>
+      seal(req, {
+        records: [
+          {
+            mnemonic: "alice",
+            owner: SUBJECT,
+            createdAt: "2026-01-02T03:04:05Z",
+            updatedAt: "2026-01-02T03:04:05Z",
+            versionCount: 1,
+          },
+        ],
+        nextCursor: "next",
+      }),
+    );
+
+    const page = await api.listDidPage({
+      domain: "example.com",
+      search: "ali",
+      limit: 50,
+      cursor: "prev",
+    });
+
+    expect(page.records.map((d) => d.mnemonic)).toEqual(["alice"]);
+    expect(page.nextCursor).toBe("next");
+    const [only] = tasks(sent);
+    expect(tasks(sent)).toHaveLength(1);
+    expect(only!.doc.payload).toEqual({
+      domain: "example.com",
+      limit: 50,
+      cursor: "prev",
+      ext: { "vnd.affinidi.webvh": { search: "ali" } },
+    });
+  });
+
+  it("listDidPage sends no ext without a filter, and no cursor on the last page", async () => {
+    const sent = installControlPlane((req) => seal(req, { records: [] }));
+    const page = await api.listDidPage();
+    expect(page).toEqual({ records: [] });
+    expect(tasks(sent)[0]!.doc.payload).toEqual({ limit: 1000 });
+  });
+
+  it("getDomainStats reads one domain's totals with the webvh domain extension", async () => {
+    const sent = installControlPlane((req) =>
+      seal(req, { totalDids: 4, totalResolves: 10, totalUpdates: 2 }),
+    );
+    const stats = await api.getDomainStats("example.com");
+    expect(stats).toMatchObject({ totalDids: 4, totalResolves: 10, totalUpdates: 2 });
+    const [only] = tasks(sent);
+    expect(only!.doc.type).toBe(`${DM}stats/get/0.1`);
+    expect(only!.doc.payload).toEqual({
+      ext: { "vnd.affinidi.webvh": { domain: "example.com" } },
+    });
+  });
+
   it("refuses an unsigned reply to a management call", async () => {
     installControlPlane((req) => {
       const reply = seal(req, { entries: [], truncated: false });
@@ -220,7 +275,7 @@ describe("management calls (passkey session)", () => {
   });
 
   it("getDid reads the record and summarises the log", async () => {
-    installControlPlane((req) => {
+    const sent = installControlPlane((req) => {
       if (req.type === `${DM}did/info/0.1`) {
         return seal(req, {
           record: {
@@ -251,6 +306,9 @@ describe("management calls (passkey session)", () => {
       ttl: 300,
       method: "did:webvh:1.0",
     });
+    // The entries come back too, so the detail page reads `did/log` once.
+    expect(detail.entries.map((e) => e.versionId)).toEqual(["1-a", "2-b"]);
+    expect(tasks(sent).filter((s) => s.doc.type === `${DM}did/log/0.1`)).toHaveLength(1);
   });
 
   it("getDid answers a slot with no published log with log: null", async () => {
@@ -554,6 +612,14 @@ describe("resolveAclSubject / createAcl (agent names)", () => {
 
     const grant = tasks(sent).find((s) => s.doc.type === `${TT}acl/grant/0.2`);
     expect(grant!.doc.payload.entry.subject).toBe(alice);
+    // One did/list request, answered from the name index — not a full listing.
+    const lists = tasks(sent).filter((s) => s.doc.type === `${DM}did/list/0.2`);
+    expect(lists).toHaveLength(1);
+    expect(lists[0]!.doc.payload).toEqual({
+      domain: "example.com",
+      limit: 1,
+      ext: { "vnd.affinidi.webvh": { agentName: "alice" } },
+    });
   });
 
   it("refuses an agent name no hosted DID currently serves — no acl/grant is sent", async () => {

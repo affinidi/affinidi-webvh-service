@@ -162,10 +162,20 @@ pub async fn set_identity_scid_alias(
     let record: Option<DidRecord> = dids_ks.get(did_key(&mnemonic)).await?;
     let mut batch = store.batch();
     if let Some(mut record) = record {
+        let previous = record.clone();
         record.version_count = version_count as u64;
         record.content_size = new_log.len() as u64;
         record.updated_at = now_epoch();
         batch.insert(&dids_ks, did_key(&mnemonic), &record)?;
+        // The service is stopped (see above): nothing else writes the counters.
+        super::did_index::stage_record_change(
+            &mut batch,
+            &dids_ks,
+            None,
+            Some(&previous),
+            Some(&record),
+        )
+        .await?;
     }
     batch.insert_raw(&dids_ks, content_log_key(&mnemonic), new_log.into_bytes());
     batch.commit().await?;

@@ -19,11 +19,11 @@
 //! corresponding route is never registered.
 
 use axum::extract::{Request, State};
-use axum::http::{StatusCode, request::Parts};
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use tracing::debug;
 
-use super::resolve_shared::{assert_gate_allows, content_ks, extract_request_host, gate_record};
+use super::resolve_shared::{Lookup, assert_gate_allows, content_ks, content_response};
 use crate::did_ops;
 use crate::error::AppError;
 use crate::mnemonic::validate_mnemonic;
@@ -33,20 +33,20 @@ use crate::server::AppState;
 /// resolve stats. Runs the disabled/deleted check and the T21
 /// resolve-side safety check before returning bytes.
 async fn serve_content(
-    state: &AppState,
+    lookup: &Lookup<'_>,
     mnemonic: &str,
     key: &str,
     content_type: &str,
     track_stats: bool,
-    request_host: Option<&str>,
 ) -> Result<Response, AppError> {
-    match gate_record(state, mnemonic).await? {
+    let state = lookup.state;
+    match lookup.record(mnemonic).await? {
         Some(record) => {
             if record.disabled || record.deleted_at.is_some() {
                 return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
             }
             if let Some(ref did_id) = record.did_id {
-                assert_gate_allows(state, request_host, did_id).await?;
+                assert_gate_allows(state, lookup.host(), did_id).await?;
             }
         }
         // No record at all — e.g. `did/delete`, which removes the record
@@ -77,6 +77,9 @@ async fn serve_content(
         // for; per did:webvh this truncates the log rather than refusing it
         // outright, so a DID with a satisfied genesis and an unwitnessed
         // republish still resolves to its last witnessed version.
+        //
+        // Up to `MAX_LOG_ENTRIES` signature checks: on a blocking thread, so
+        // a cold resolve of a long log does not stall the resolution workers.
         let data = if content_type == "application/jsonl+json" {
             let log_text = String::from_utf8(data)
                 .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
@@ -84,16 +87,17 @@ async fn serve_content(
                 .get_raw(did_ops::content_witness_key(mnemonic))
                 .await?
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-            did_ops::servable_did_log(&log_text, witness_text.as_deref())
-                .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?
-                .into_bytes()
+            tokio::task::spawn_blocking(move || {
+                did_ops::servable_did_log(&log_text, witness_text.as_deref())
+            })
+            .await
+            .map_err(|e| AppError::Internal(format!("log verification panicked: {e}")))?
+            .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?
+            .into_bytes()
         } else {
             data
         };
-        state
-            .did_cache
-            .insert(generation, key.to_string(), data.clone());
-        std::sync::Arc::new(data)
+        state.did_cache.insert(generation, key.to_string(), data)
     };
 
     if track_stats && let Some(ref collector) = state.stats_collector {
@@ -102,23 +106,11 @@ async fn serve_content(
         did_hosting_common::server::metrics::inc_resolve();
     }
 
-    debug!(mnemonic = %mnemonic, size = content.len(), content_type, "content resolved");
+    debug!(mnemonic = %mnemonic, size = content.bytes.len(), content_type, "content resolved");
 
     // DID logs are content-addressed (the SCID prevents content drift) and
-    // safe to cache. Setting an explicit `Cache-Control` here overrides the
-    // global `no-store` security middleware so CDNs and browsers can serve
-    // hot DIDs without round-tripping the origin. The policy is
-    // `[server.resolve_cache]`.
-    let cache_control = state.config.server.resolve_cache.header_value();
-    Ok((
-        StatusCode::OK,
-        [
-            ("content-type", content_type),
-            ("cache-control", cache_control.as_str()),
-        ],
-        (*content).clone(),
-    )
-        .into_response())
+    // safe to cache; the policy is `[server.resolve_cache]`.
+    Ok(content_response(lookup, content_type, &content))
 }
 
 /// `GET /.well-known/did.jsonl` — root-DID webvh log.
@@ -128,6 +120,7 @@ async fn serve_content(
     tag = "resolve",
     responses(
         (status = 200, description = "Root DID's did:webvh log (JSONL)", content_type = "application/jsonl+json"),
+        (status = 304, description = "The `If-None-Match` tag is current"),
         (status = 404, description = "No root DID hosted on this domain"),
         (status = 429, description = "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`", content_type = "application/json"),
     ),
@@ -137,14 +130,13 @@ pub async fn serve_root_did_log(
     request: Request,
 ) -> Result<Response, AppError> {
     let (parts, _) = request.into_parts();
-    let host = extract_request_host(&parts, &state.trusted_proxy_cidrs);
+    let lookup = Lookup::new(&state, &parts);
     serve_content(
-        &state,
+        &lookup,
         ".well-known",
         "content:.well-known:log",
         "application/jsonl+json",
         true,
-        host.as_deref(),
     )
     .await
 }
@@ -165,14 +157,13 @@ pub async fn serve_root_witness(
     request: Request,
 ) -> Result<Response, AppError> {
     let (parts, _) = request.into_parts();
-    let host = extract_request_host(&parts, &state.trusted_proxy_cidrs);
+    let lookup = Lookup::new(&state, &parts);
     serve_content(
-        &state,
+        &lookup,
         ".well-known",
         "content:.well-known:witness",
         "application/json",
         false,
-        host.as_deref(),
     )
     .await
 }
@@ -182,13 +173,11 @@ pub async fn serve_root_witness(
 /// Returns:
 /// - `Some(response)` when the URL is a webvh artifact path. This is
 ///   terminal — the caller serves whatever's in the response (200 with
-///   bytes, 404 for unknown mnemonic, 503 for disabled-domain, etc.).
+///   bytes, 304, 404 for unknown mnemonic, 503 for disabled-domain, etc.).
 /// - `None` when the URL has no webvh suffix. The caller should try
 ///   the next method's dispatcher (e.g. [`super::resolve_web::dispatch`]).
-pub async fn dispatch(state: &AppState, parts: &Parts) -> Option<Response> {
+pub async fn dispatch(lookup: &Lookup<'_>, parts: &Parts) -> Option<Response> {
     let path = parts.uri.path().trim_start_matches('/');
-    let host = extract_request_host(parts, &state.trusted_proxy_cidrs);
-    let host = host.as_deref();
 
     if let Some(mnemonic) = path.strip_suffix("/did.jsonl")
         && !mnemonic.is_empty()
@@ -198,7 +187,7 @@ pub async fn dispatch(state: &AppState, parts: &Parts) -> Option<Response> {
         }
         let key = format!("content:{mnemonic}:log");
         return Some(
-            serve_content(state, mnemonic, &key, "application/jsonl+json", true, host)
+            serve_content(lookup, mnemonic, &key, "application/jsonl+json", true)
                 .await
                 .unwrap_or_else(|e| e.into_response()),
         );
@@ -212,7 +201,7 @@ pub async fn dispatch(state: &AppState, parts: &Parts) -> Option<Response> {
         }
         let key = format!("content:{mnemonic}:witness");
         return Some(
-            serve_content(state, mnemonic, &key, "application/json", false, host)
+            serve_content(lookup, mnemonic, &key, "application/json", false)
                 .await
                 .unwrap_or_else(|e| e.into_response()),
         );

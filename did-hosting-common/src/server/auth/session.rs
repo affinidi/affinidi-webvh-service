@@ -630,6 +630,9 @@ const LOGIN_CEREMONY_PREFIX: &str = "pk_task_meta:";
 /// `pk_task_meta:` row, `pk_auth:{authId}`.
 const LEGACY_LOGIN_STATE_PREFIX: &str = "pk_auth:";
 
+/// Rows a page of [`cleanup_expired_sessions`]' walks reads.
+const CLEANUP_PAGE_ROWS: usize = 512;
+
 /// Remove expired sessions from the store.
 ///
 /// - `ChallengeSent` sessions expire after `challenge_ttl` seconds from `created_at`.
@@ -638,39 +641,44 @@ pub async fn cleanup_expired_sessions(
     sessions: &KeyspaceHandle,
     challenge_ttl: u64,
 ) -> Result<(), AppError> {
-    let entries = sessions.prefix_iter_raw("session:").await?;
+    // A page at a time: the sweep holds one page of rows, not the table.
+    let mut walk = sessions.walk("session:", CLEANUP_PAGE_ROWS);
     let now = now_epoch();
     let mut removed = 0u64;
     // Each remaining session's stored refresh token, for the index sweep below.
     let mut live_refresh = std::collections::HashMap::new();
 
-    for (key, value) in entries {
-        let session: Session = match serde_json::from_slice(&value) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("skipping malformed session record: {e}");
-                continue;
-            }
-        };
+    while let Some(entries) = walk.next_page().await? {
+        for (key, value) in entries {
+            let session: Session = match serde_json::from_slice(&value) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("skipping malformed session record: {e}");
+                    continue;
+                }
+            };
 
-        let expired = match session.state {
-            SessionState::ChallengeSent => now.saturating_sub(session.created_at) > challenge_ttl,
-            SessionState::Authenticated => session
-                .refresh_expires_at
-                .is_none_or(|expires| now > expires),
-        };
+            let expired = match session.state {
+                SessionState::ChallengeSent => {
+                    now.saturating_sub(session.created_at) > challenge_ttl
+                }
+                SessionState::Authenticated => session
+                    .refresh_expires_at
+                    .is_none_or(|expires| now > expires),
+            };
 
-        if expired {
-            sessions.remove(key).await?;
-            if let Some(ref token) = session.refresh_token {
-                sessions.remove(row_refresh_key(token)).await?;
+            if expired {
+                sessions.remove(key).await?;
+                if let Some(ref token) = session.refresh_token {
+                    sessions.remove(row_refresh_key(token)).await?;
+                }
+                sessions
+                    .remove(session_did_key(&session.did, &session.session_id))
+                    .await?;
+                removed += 1;
+            } else if let Some(token) = session.refresh_token {
+                live_refresh.insert(session.session_id, token);
             }
-            sessions
-                .remove(session_did_key(&session.did, &session.session_id))
-                .await?;
-            removed += 1;
-        } else if let Some(token) = session.refresh_token {
-            live_refresh.insert(session.session_id, token);
         }
     }
 
@@ -680,30 +688,33 @@ pub async fn cleanup_expired_sessions(
     // but nothing else would ever remove them. An entry that disagrees with
     // the scan above is checked against the row again before it goes, since
     // a sign-in may have written both after the scan.
-    for (key, value) in sessions.prefix_iter_raw("refresh:").await? {
-        let Some(indexed) = key
-            .strip_prefix(b"refresh:".as_slice())
-            .and_then(|k| std::str::from_utf8(k).ok())
-        else {
-            continue;
-        };
-        let Ok(session_id) = String::from_utf8(value) else {
-            continue;
-        };
-        if live_refresh
-            .get(&session_id)
-            .is_some_and(|stored| index_matches_row(indexed, stored))
-        {
-            continue;
+    let mut refresh_walk = sessions.walk("refresh:", CLEANUP_PAGE_ROWS);
+    while let Some(rows) = refresh_walk.next_page().await? {
+        for (key, value) in rows {
+            let Some(indexed) = key
+                .strip_prefix(b"refresh:".as_slice())
+                .and_then(|k| std::str::from_utf8(k).ok())
+            else {
+                continue;
+            };
+            let Ok(session_id) = String::from_utf8(value) else {
+                continue;
+            };
+            if live_refresh
+                .get(&session_id)
+                .is_some_and(|stored| index_matches_row(indexed, stored))
+            {
+                continue;
+            }
+            let current = get_session(sessions, &session_id)
+                .await?
+                .and_then(|row| row.refresh_token);
+            if current.is_some_and(|stored| index_matches_row(indexed, &stored)) {
+                continue;
+            }
+            sessions.remove(key.clone()).await?;
+            removed += 1;
         }
-        let current = get_session(sessions, &session_id)
-            .await?
-            .and_then(|row| row.refresh_token);
-        if current.is_some_and(|stored| index_matches_row(indexed, &stored)) {
-            continue;
-        }
-        sessions.remove(key.clone()).await?;
-        removed += 1;
     }
 
     // Expired passkey enrolment invites (`pk_invite:` + their `pk_invite_id:`

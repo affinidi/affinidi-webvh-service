@@ -53,11 +53,21 @@ async fn store() -> (tempfile::TempDir, Store, KeyspaceHandle) {
 }
 
 async fn sync(store: &Store, ks: &KeyspaceHandle, log: &str) -> Result<(), String> {
-    let cache = ContentCache::new(Duration::from_secs(60));
-    apply_single_update(ks, store, &update(log), &cache, Some(PUBLIC_URL))
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    let cache = did_hosting_server::cache::ResolutionCaches {
+        content: std::sync::Arc::new(ContentCache::new(Duration::from_secs(60))),
+        gate: None,
+    };
+    apply_single_update(
+        ks,
+        store,
+        &update(log),
+        &cache,
+        &Default::default(),
+        Some(PUBLIC_URL),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 async fn held(ks: &KeyspaceHandle) -> String {
@@ -123,12 +133,16 @@ async fn a_webs_fork_is_a_history_rewrite() {
     sync(&store, &ks, &fixture("ixn-ixn.keri.cesr"))
         .await
         .expect("first sync");
-    let cache = ContentCache::new(Duration::from_secs(60));
+    let cache = did_hosting_server::cache::ResolutionCaches {
+        content: std::sync::Arc::new(ContentCache::new(Duration::from_secs(60))),
+        gate: None,
+    };
     let err = apply_single_update(
         &ks,
         &store,
         &update(&fixture("other-ixn.keri.cesr")),
         &cache,
+        &Default::default(),
         Some(PUBLIC_URL),
     )
     .await
@@ -147,7 +161,10 @@ async fn a_webs_fork_is_a_history_rewrite() {
 #[tokio::test]
 async fn a_did_web_document_is_not_synced() {
     let (_dir, store, ks) = store().await;
-    let cache = ContentCache::new(Duration::from_secs(60));
+    let cache = did_hosting_server::cache::ResolutionCaches {
+        content: std::sync::Arc::new(ContentCache::new(Duration::from_secs(60))),
+        gate: None,
+    };
     let document = r#"{"id":"did:web:example.com:alice"}"#;
     let update = DidSyncUpdate {
         mnemonic: "alice".into(),
@@ -157,9 +174,16 @@ async fn a_did_web_document_is_not_synced() {
         version_count: 1,
         disabled: false,
     };
-    let err = apply_single_update(&ks, &store, &update, &cache, Some(PUBLIC_URL))
-        .await
-        .expect_err("a did:web document is not synced");
+    let err = apply_single_update(
+        &ks,
+        &store,
+        &update,
+        &cache,
+        &Default::default(),
+        Some(PUBLIC_URL),
+    )
+    .await
+    .expect_err("a did:web document is not synced");
     assert!(err.to_string().contains("cannot verify web"), "{err}");
     assert!(
         ks.get_raw(content_log_key("alice"))

@@ -97,7 +97,7 @@ async fn make_state() -> (AppState, tempfile::TempDir) {
                 did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
             ),
         ),
-        sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+        sync_locks: Default::default(),
         replay_cache: std::sync::Arc::new(did_hosting_common::server::replay::ReplayCache::new()),
     };
     (state, dir)
@@ -359,7 +359,8 @@ async fn a_webs_did_syncs_from_the_control_plane_and_then_serves() {
         &state.dids_ks,
         &state.store,
         &update,
-        &state.did_cache,
+        &state.resolution_caches(),
+        &state.sync_locks,
         state.config.public_url.as_deref(),
     )
     .await
@@ -415,7 +416,8 @@ async fn an_edge_refuses_a_tampered_webs_log_from_the_control_plane() {
         &state.dids_ks,
         &state.store,
         &update,
-        &state.did_cache,
+        &state.resolution_caches(),
+        &state.sync_locks,
         state.config.public_url.as_deref(),
     )
     .await
@@ -442,7 +444,8 @@ async fn an_edge_refuses_to_rewind_a_webs_log_even_after_a_delete() {
                 &state.dids_ks,
                 &state.store,
                 &u,
-                &state.did_cache,
+                &state.resolution_caches(),
+                &state.sync_locks,
                 state.config.public_url.as_deref(),
             )
             .await

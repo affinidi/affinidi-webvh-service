@@ -79,6 +79,9 @@
               "application/jsonl+json": {}
             }
           },
+          "304": {
+            "description": "The `If-None-Match` tag is current"
+          },
           "404": {
             "description": "No root DID hosted on this domain"
           },
@@ -368,6 +371,9 @@
             "content": {
               "application/jsonl+json": {}
             }
+          },
+          "304": {
+            "description": "The `If-None-Match` tag is current"
           },
           "404": {
             "description": "No DID hosted at this path"

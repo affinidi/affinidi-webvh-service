@@ -42,7 +42,7 @@ metrics = ["did-hosting-common/metrics"]
 # operator enables it (`[[hosting.webs_self_register]]`), authenticated by its
 # own key event log — see `src/webs_self_register.rs`.
 method-webs = ["did-hosting-common/method-webs", "dep:affinidi-did-common"]
-ui = ["dep:rust-embed", "dep:mime_guess"]
+ui = ["dep:rust-embed", "dep:mime_guess", "dep:tower"]
 keyring = ["did-hosting-common/keyring"]
 aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "did-hosting-common/aws-secrets"]
 gcp-secrets = [
@@ -162,7 +162,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = "1.0"
 vta-sdk = { workspace = true }
-tower-http = { version = "0.7", features = ["trace"] }
+tower-http = { version = "0.7", features = ["trace", "compression-gzip", "compression-br"] }
+tower = { version = "0.5", features = ["util"], optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }

@@ -363,7 +363,7 @@ impl Topology {
                     did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
                 ),
             ),
-            sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sync_locks: Default::default(),
             replay_cache: std::sync::Arc::new(
                 did_hosting_common::server::replay::ReplayCache::new(),
             ),

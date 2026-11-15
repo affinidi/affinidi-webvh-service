@@ -20,13 +20,13 @@
 //! `data` directly".
 
 use axum::extract::{Request, State};
-use axum::http::{StatusCode, request::Parts};
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use did_hosting_common::did::build_did_web_id;
 use tracing::debug;
 
-use super::resolve_shared::{assert_gate_allows, content_ks, extract_request_host, gate_record};
-use crate::cache::ContentCache;
+use super::resolve_shared::{Lookup, assert_gate_allows, content_ks, content_response};
+use crate::cache::{CachedContent, ContentCache};
 use crate::did_ops;
 use crate::error::AppError;
 use crate::mnemonic::validate_mnemonic;
@@ -34,33 +34,31 @@ use crate::server::AppState;
 
 /// Serve the `did.json` view for `mnemonic`. Used by both the catch-
 /// all dispatcher and the `.well-known` root handler.
-async fn serve_did_web(
-    state: &AppState,
-    mnemonic: &str,
-    request_host: Option<&str>,
-) -> Result<Response, AppError> {
-    let record = gate_record(state, mnemonic).await?;
+async fn serve_did_web(lookup: &Lookup<'_>, mnemonic: &str) -> Result<Response, AppError> {
+    let state = lookup.state;
+    let record = lookup.record(mnemonic).await?;
     if let Some(record) = &record {
         if record.disabled || record.deleted_at.is_some() {
             return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
         }
         if let Some(ref did_id) = record.did_id {
-            assert_gate_allows(state, request_host, did_id).await?;
+            assert_gate_allows(state, lookup.host(), did_id).await?;
         }
     }
 
-    // The extracted document is cached only behind a gate cache (the
-    // daemon), where every change to the DID clears it in-process, and only
-    // for a DID with a record: without one there is no gate to refuse a
-    // deleted DID before the cache would answer. Anywhere else, read the
-    // store as before, so a change made elsewhere shows on the next resolve.
+    // The extracted document is cached only behind a gate cache (an edge, or
+    // a daemon running its control plane), where every change to the DID
+    // clears it in-process, and only for a DID with a record: without one
+    // there is no gate to refuse a deleted DID before the cache would
+    // answer. Anywhere else, read the store as before, so a change made
+    // elsewhere shows on the next resolve.
     let cacheable = state.gate_cache.is_some() && record.is_some();
     let key = ContentCache::did_web_document_key(mnemonic);
     let cached = cacheable.then(|| state.did_cache.get(&key)).flatten();
-    let doc_bytes = if let Some(cached) = cached {
+    let doc = if let Some(cached) = cached {
         #[cfg(feature = "metrics")]
         did_hosting_common::server::metrics::inc_cache_hit();
-        (*cached).clone()
+        cached
     } else {
         #[cfg(feature = "metrics")]
         did_hosting_common::server::metrics::inc_cache_miss();
@@ -80,29 +78,19 @@ async fn serve_did_web(
         let doc_bytes = did_ops::extract_did_web_document(&jsonl, &expected_did_web)
             .ok_or_else(|| AppError::NotFound(format!("no did:web document for: {mnemonic}")))?;
         if cacheable {
-            state.did_cache.insert(generation, key, doc_bytes.clone());
+            state.did_cache.insert(generation, key, doc_bytes)
+        } else {
+            CachedContent::new(doc_bytes)
         }
-        doc_bytes
     };
 
     if let Some(ref collector) = state.stats_collector {
         collector.record_resolve(mnemonic);
     }
 
-    debug!(mnemonic = %mnemonic, size = doc_bytes.len(), "did:web document resolved");
+    debug!(mnemonic = %mnemonic, size = doc.bytes.len(), "did:web document resolved");
 
-    // Without an explicit header the global middleware would stamp
-    // `no-store`, leaving every did:web resolve to hit the origin.
-    let cache_control = state.config.server.resolve_cache.header_value();
-    Ok((
-        StatusCode::OK,
-        [
-            ("content-type", "application/did+json"),
-            ("cache-control", cache_control.as_str()),
-        ],
-        doc_bytes,
-    )
-        .into_response())
+    Ok(content_response(lookup, "application/did+json", &doc))
 }
 
 /// `GET /.well-known/did.json` — root-DID did:web document.
@@ -121,8 +109,8 @@ pub async fn serve_root_did_web(
     request: Request,
 ) -> Result<Response, AppError> {
     let (parts, _) = request.into_parts();
-    let host = extract_request_host(&parts, &state.trusted_proxy_cidrs);
-    serve_did_web(&state, ".well-known", host.as_deref()).await
+    let lookup = Lookup::new(&state, &parts);
+    serve_did_web(&lookup, ".well-known").await
 }
 
 /// Catch-all dispatcher for did:web artifacts.
@@ -130,10 +118,8 @@ pub async fn serve_root_did_web(
 /// Returns:
 /// - `Some(response)` when the URL ends in `/did.json`. Terminal.
 /// - `None` when the URL has no did.json suffix.
-pub async fn dispatch(state: &AppState, parts: &Parts) -> Option<Response> {
+pub async fn dispatch(lookup: &Lookup<'_>, parts: &Parts) -> Option<Response> {
     let path = parts.uri.path().trim_start_matches('/');
-    let host = extract_request_host(parts, &state.trusted_proxy_cidrs);
-    let host = host.as_deref();
 
     if let Some(mnemonic) = path.strip_suffix("/did.json")
         && !mnemonic.is_empty()
@@ -142,7 +128,7 @@ pub async fn dispatch(state: &AppState, parts: &Parts) -> Option<Response> {
             return Some(e.into_response());
         }
         return Some(
-            serve_did_web(state, mnemonic, host)
+            serve_did_web(lookup, mnemonic)
                 .await
                 .unwrap_or_else(|e| e.into_response()),
         );

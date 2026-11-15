@@ -19,16 +19,15 @@
 //! one blob — the CESR stream, under the same `content:{mnemonic}:log`
 //! key webvh uses for its jsonl — and derives the document per request.
 //!
-//! Deriving costs a full key-event-log verification per `did.json` hit,
-//! and that is a deliberate trade. The alternative is a second cache
-//! entry, and a single path that changed the log without dropping it
-//! would serve a document from *before* a key rotation, which is
-//! precisely the attack pre-rotation exists to defeat. (did:web does keep
-//! one, in the daemon only, where every change goes through
-//! `ContentCache::invalidate_did`; its documents rotate no keys.) The CESR bytes themselves
-//! still come from the existing content cache, so the cost is CPU on
-//! already-resident bytes. If it ever shows up in a profile, the safe
-//! fix is a memo keyed by a hash of those bytes, which cannot go stale.
+//! Deriving costs a full key-event-log verification. A second cache entry
+//! keyed by the slot would be wrong: a single path that changed the log
+//! without dropping it would serve a document from *before* a key
+//! rotation, which is precisely the attack pre-rotation exists to defeat.
+//! So the derived document is memoised in memory keyed by the DID and the
+//! SHA-256 of the exact stream it came from
+//! ([`crate::cache::ContentCache::webs_document`]): a changed stream is a
+//! different key, so an entry can only ever be the document its own bytes
+//! imply. It is never stored. A miss derives on a blocking thread.
 //!
 //! ## Sharing `/{*mnemonic}/did.json` with did:web
 //!
@@ -39,13 +38,14 @@
 
 use std::sync::Arc;
 
-use axum::http::{StatusCode, request::Parts};
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use did_hosting_common::method::webs::{CESR_CONTENT_TYPE, Webs};
 use did_hosting_common::server::mnemonic::validate_webs_mnemonic;
 use tracing::{debug, error};
 
-use super::resolve_shared::{assert_gate_allows, content_ks, extract_request_host, gate_record};
+use super::resolve_shared::{Lookup, assert_gate_allows, content_ks, content_response};
+use crate::cache::CachedContent;
 use crate::did_ops::{self, DidRecord};
 use crate::error::AppError;
 use crate::server::AppState;
@@ -58,11 +58,10 @@ use crate::server::AppState;
 /// must 404 rather than quietly hand the URL to did:web, which would
 /// serve content this record says is withdrawn.
 async fn webs_record(
-    state: &AppState,
+    lookup: &Lookup<'_>,
     mnemonic: &str,
-    request_host: Option<&str>,
 ) -> Result<Option<Arc<DidRecord>>, AppError> {
-    let Some(record) = gate_record(state, mnemonic).await? else {
+    let Some(record) = lookup.record(mnemonic).await? else {
         return Ok(None);
     };
     if record.method != "webs" {
@@ -72,18 +71,18 @@ async fn webs_record(
         return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
     }
     if let Some(ref did_id) = record.did_id {
-        assert_gate_allows(state, request_host, did_id).await?;
+        assert_gate_allows(lookup.state, lookup.host(), did_id).await?;
     }
     Ok(Some(record))
 }
 
 /// Read the stored CESR stream for `mnemonic`, via the content cache.
-async fn load_keri_cesr(state: &AppState, mnemonic: &str) -> Result<Vec<u8>, AppError> {
+async fn load_keri_cesr(state: &AppState, mnemonic: &str) -> Result<CachedContent, AppError> {
     let key = did_ops::content_log_key(mnemonic);
     if let Some(cached) = state.did_cache.get(&key) {
         #[cfg(feature = "metrics")]
         did_hosting_common::server::metrics::inc_cache_hit();
-        return Ok((*cached).clone());
+        return Ok(cached);
     }
     #[cfg(feature = "metrics")]
     did_hosting_common::server::metrics::inc_cache_miss();
@@ -92,8 +91,7 @@ async fn load_keri_cesr(state: &AppState, mnemonic: &str) -> Result<Vec<u8>, App
         .get_raw(key.as_str())
         .await?
         .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?;
-    state.did_cache.insert(generation, key, data.clone());
-    Ok(data)
+    Ok(state.did_cache.insert(generation, key, data))
 }
 
 /// Serve `keri.cesr` — the key event log, verbatim.
@@ -101,14 +99,11 @@ async fn load_keri_cesr(state: &AppState, mnemonic: &str) -> Result<Vec<u8>, App
 /// Served as stored rather than re-serialized: the stream's signatures
 /// cover exact bytes, and a resolver that re-derives the document from
 /// a re-encoded copy could reach a different answer than the publisher.
-async fn serve_keri_cesr(
-    state: &AppState,
-    mnemonic: &str,
-    request_host: Option<&str>,
-) -> Result<Response, AppError> {
+async fn serve_keri_cesr(lookup: &Lookup<'_>, mnemonic: &str) -> Result<Response, AppError> {
+    let state = lookup.state;
     // Unlike `did.json`, this suffix belongs to no other method, so a
     // missing or wrong-method record is a 404 rather than a fall-through.
-    if webs_record(state, mnemonic, request_host).await?.is_none() {
+    if webs_record(lookup, mnemonic).await?.is_none() {
         return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
     }
     let content = load_keri_cesr(state, mnemonic).await?;
@@ -119,25 +114,17 @@ async fn serve_keri_cesr(
         did_hosting_common::server::metrics::inc_resolve();
     }
 
-    debug!(mnemonic = %mnemonic, size = content.len(), "keri.cesr resolved");
+    debug!(mnemonic = %mnemonic, size = content.bytes.len(), "keri.cesr resolved");
 
     // Same reasoning as the webvh log: a key event log is append-only and
     // self-verifying, so a stale-but-signed copy cannot be forged into
     // something else. Cache it per `[server.resolve_cache]`.
-    let cache_control = state.config.server.resolve_cache.header_value();
-    Ok((
-        StatusCode::OK,
-        [
-            ("content-type", CESR_CONTENT_TYPE),
-            ("cache-control", cache_control.as_str()),
-        ],
-        content,
-    )
-        .into_response())
+    Ok(content_response(lookup, CESR_CONTENT_TYPE, &content))
 }
 
 /// Serve `did.json` — derived from the verified key event log.
-async fn serve_did_json(state: &AppState, record: &DidRecord) -> Result<Response, AppError> {
+async fn serve_did_json(lookup: &Lookup<'_>, record: &DidRecord) -> Result<Response, AppError> {
+    let state = lookup.state;
     let mnemonic = &record.mnemonic;
     let content = load_keri_cesr(state, mnemonic).await?;
 
@@ -151,7 +138,26 @@ async fn serve_did_json(state: &AppState, record: &DidRecord) -> Result<Response
         ))
     })?;
 
-    let doc = Webs::derive_document(did_id, &content).map_err(|e| {
+    // Memoised on the stream's exact bytes (see the module note): a miss
+    // verifies the whole key event log, on a blocking thread.
+    let doc = match state
+        .did_cache
+        .memoised_webs_document(did_id, &content.bytes)
+    {
+        Some(doc) => Ok(doc),
+        None => {
+            let (did, cesr) = (did_id.to_string(), content.bytes.clone());
+            tokio::task::spawn_blocking(move || Webs::derive_document(&did, &cesr))
+                .await
+                .map_err(|e| AppError::Internal(format!("did:webs derivation panicked: {e}")))?
+                .map(|doc| {
+                    state
+                        .did_cache
+                        .memoise_webs_document(did_id, &content.bytes, doc)
+                })
+        }
+    };
+    let doc = doc.map_err(|e| {
         // Reaching here means bytes that passed `verify_artifacts` on
         // the way in no longer verify — the store is corrupt, or was
         // written by something that bypassed the write path. Serving an
@@ -173,18 +179,9 @@ async fn serve_did_json(state: &AppState, record: &DidRecord) -> Result<Response
         did_hosting_common::server::metrics::inc_resolve();
     }
 
-    debug!(mnemonic = %mnemonic, size = doc.len(), "did:webs document derived");
+    debug!(mnemonic = %mnemonic, size = doc.bytes.len(), "did:webs document derived");
 
-    let cache_control = state.config.server.resolve_cache.header_value();
-    Ok((
-        StatusCode::OK,
-        [
-            ("content-type", "application/did+json"),
-            ("cache-control", cache_control.as_str()),
-        ],
-        doc,
-    )
-        .into_response())
+    Ok(content_response(lookup, "application/did+json", &doc))
 }
 
 /// Catch-all dispatcher for `did:webs` artifacts.
@@ -194,10 +191,8 @@ async fn serve_did_json(state: &AppState, record: &DidRecord) -> Result<Response
 /// - `None` when the URL is not this method's — no matching suffix, or a
 ///   `did.json` whose slot belongs to another method. The caller tries
 ///   the next dispatcher.
-pub async fn dispatch(state: &AppState, parts: &Parts) -> Option<Response> {
+pub async fn dispatch(lookup: &Lookup<'_>, parts: &Parts) -> Option<Response> {
     let path = parts.uri.path().trim_start_matches('/');
-    let host = extract_request_host(parts, &state.trusted_proxy_cidrs);
-    let host = host.as_deref();
 
     if let Some(mnemonic) = path.strip_suffix("/keri.cesr")
         && !mnemonic.is_empty()
@@ -206,7 +201,7 @@ pub async fn dispatch(state: &AppState, parts: &Parts) -> Option<Response> {
             return Some(e.into_response());
         }
         return Some(
-            serve_keri_cesr(state, mnemonic, host)
+            serve_keri_cesr(lookup, mnemonic)
                 .await
                 .unwrap_or_else(|e| e.into_response()),
         );
@@ -221,11 +216,12 @@ pub async fn dispatch(state: &AppState, parts: &Parts) -> Option<Response> {
         if validate_webs_mnemonic(mnemonic).is_err() {
             return None;
         }
-        return match webs_record(state, mnemonic, host).await {
-            // Not a did:webs slot — did:web's bridge handles it.
+        return match webs_record(lookup, mnemonic).await {
+            // Not a did:webs slot — did:web's bridge handles it (and reads
+            // the record this lookup already holds).
             Ok(None) => None,
             Ok(Some(record)) => Some(
-                serve_did_json(state, &record)
+                serve_did_json(lookup, &record)
                     .await
                     .unwrap_or_else(|e| e.into_response()),
             ),

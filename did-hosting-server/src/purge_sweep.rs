@@ -213,6 +213,9 @@ pub async fn run_edge_sweep_tick(
         }
     } else {
         did_cache.evict_expired();
+        if let Some(gate) = gate_cache {
+            gate.evict_expired();
+        }
     }
     if let Some(collector) = collector {
         collector.subtract_total_dids(sweep.dids_deleted);
