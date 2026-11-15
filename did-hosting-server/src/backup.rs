@@ -405,8 +405,8 @@ async fn plan_dids_restore(
     entries: &[KvEntry],
 ) -> Result<DidsRestore, AppError> {
     use crate::control_register::{
-        HIGH_WATER_IDENTITY_PREFIX, HIGH_WATER_SLOT_PREFIX, has_history, high_water_to_restore,
-        verify_extends, verify_history,
+        HIGH_WATER_IDENTITY_PREFIX, HIGH_WATER_SLOT_PREFIX, HighWaterMark, has_history,
+        high_water_to_restore, verify_history,
     };
     use crate::did_ops::{DidRecord, content_witness_key, did_key};
     use std::collections::BTreeMap;
@@ -508,7 +508,9 @@ async fn plan_dids_restore(
         // into: a store an earlier version's CLI wrote to can hold one.
         let mark_key = format!("{HIGH_WATER_IDENTITY_PREFIX}{identity}");
         if let Some(mark) = backup.get(mark_key.as_bytes())
-            && verify_extends(method, &did_id, &text(mark), &log).is_err()
+            && HighWaterMark::parse(method, mark)
+                .and_then(|mark| mark.admits(method, &did_id, &log))
+                .is_err()
         {
             unsound.push(format!(
                 "{mnemonic} ({did_id}): this backup's log is older than a version it has \
@@ -529,7 +531,7 @@ async fn plan_dids_restore(
     for (key, value) in backup {
         if let Some(identity) = key.strip_prefix(HIGH_WATER_IDENTITY_PREFIX.as_bytes()) {
             let identity = text(identity);
-            match high_water_to_restore(ks, &identity, &text(&value)).await {
+            match high_water_to_restore(ks, &identity, &value).await {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
