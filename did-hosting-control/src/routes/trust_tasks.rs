@@ -449,7 +449,7 @@ pub async fn dispatch_trust_task(
             set_retry_after(&mut response, retry_after);
             Ok(response)
         }
-        crate::messaging::RoutedReply::Suppressed => Ok(StatusCode::NO_CONTENT.into_response()),
+        crate::messaging::RoutedReply::Terminal => Ok(StatusCode::NO_CONTENT.into_response()),
         crate::messaging::RoutedReply::Sealed(sealed) => Ok(sealed_response(sealed)),
     }
 }

@@ -37,6 +37,7 @@ import {
   restoreSessionKeypair,
   signEnvelope,
 } from "./session-key";
+import { T } from "./task-types";
 // `trust-task.ts` imports `clearToken`/`getSessionSubjectDid` from this
 // module, so a static top-level import back the other way is a genuine
 // cycle, not one that "resolves fine": `trust-task.ts` declares `class
@@ -235,7 +236,7 @@ export function resetSessionCacheForTests(): void {
   sessionRestoreInFlight = null;
 }
 
-const REFRESH_TASK_URI = "https://trusttasks.org/spec/auth/refresh/0.2";
+const REFRESH_TASK_URI = T.refresh;
 
 /** Seconds since the epoch at which `token` expires, or null if unreadable. */
 function tokenExpiry(token: string): number | null {

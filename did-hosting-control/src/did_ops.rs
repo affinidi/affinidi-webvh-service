@@ -12,7 +12,7 @@ use did_hosting_common::did_ops::{
 use did_hosting_common::method::publication::Publication;
 use did_hosting_common::server::acl::validate_did_format;
 use did_hosting_common::server::agent_name_index;
-use did_hosting_common::server::error::AgentNameError;
+use did_hosting_common::server::error::{AgentNameError, QuotaKind, ValidationKind};
 use did_hosting_common::server::identity::mnemonic_from_did;
 use did_hosting_common::server::mnemonic::{
     validate_agent_name, validate_agent_name_binding, validate_custom_path, validate_mnemonic,
@@ -99,7 +99,7 @@ pub use did_hosting_common::did_ops::{
 // JSONL validation (wraps the common version with AppError)
 // ---------------------------------------------------------------------------
 
-/// Tag a failed publication with `AppError::Validation(InvalidLog)` so the
+/// Tag a failed publication with `AppError::invalid(InvalidLog)` so the
 /// DIDComm dispatcher emits `e.p.did.invalid-log`.
 ///
 /// The tag is wire contract, not cosmetics: clients branch on that code to
@@ -110,7 +110,6 @@ pub use did_hosting_common::did_ops::{
 /// receipts) are the same answer to the caller: the content you published does
 /// not verify.
 fn publication_error(e: did_hosting_common::method::MethodError) -> AppError {
-    use did_hosting_common::server::error::ValidationKind;
     AppError::validation(ValidationKind::InvalidLog, e.to_string())
 }
 
@@ -306,9 +305,10 @@ async fn check_did_count_limit(auth: &AuthClaims, state: &AppState) -> Result<()
     let (count, _) = owner_usage(state, &auth.did).await?;
     if count >= max {
         warn!(did = %auth.did, count, max, "DID count quota exceeded (control)");
-        return Err(AppError::QuotaExceeded(format!(
-            "DID count limit reached ({max})"
-        )));
+        return Err(AppError::quota(
+            QuotaKind::Count,
+            format!("DID count limit reached ({max})"),
+        ));
     }
     Ok(())
 }
@@ -340,9 +340,10 @@ async fn check_total_size_limit(
     let proposed = total.saturating_sub(old_size).saturating_add(new_size);
     if proposed > max {
         warn!(did = %auth.did, proposed, max, "total size quota exceeded (control)");
-        return Err(AppError::QuotaExceeded(format!(
-            "total content size limit reached ({max} bytes)"
-        )));
+        return Err(AppError::quota(
+            QuotaKind::Size,
+            format!("total content size limit reached ({max} bytes)"),
+        ));
     }
     Ok(())
 }
@@ -663,7 +664,7 @@ pub async fn register_did_atomic(
         })?;
 
     let did_id = publication.did_id.clone().ok_or_else(|| {
-        AppError::Validation("did_log's latest entry has no resolvable did:webvh state.id".into())
+        AppError::invalid("did_log's latest entry has no resolvable did:webvh state.id")
     })?;
 
     // T20b: multi-domain safety check. Runs before the legacy
@@ -684,7 +685,7 @@ pub async fn register_did_atomic(
     // `verify_publication` has already enforced it.
     if publication.method != "webs" {
         did_ops::validate_did_id_matches_request(&did_id, path, server_base_url)
-            .map_err(AppError::Validation)?;
+            .map_err(AppError::invalid)?;
     }
 
     // `path_guard`, acquired above, already covers this read: without it,
@@ -961,7 +962,7 @@ async fn prepare_republish(
     if let Some(submitted) = did_hosting_common::method::detect_method(did_log.as_bytes())
         && submitted != record.method
     {
-        return Err(AppError::Validation(format!(
+        return Err(AppError::invalid(format!(
             "slot '{mnemonic}' hosts a did:{} DID; it cannot be republished as did:{submitted}",
             record.method,
         )));
@@ -1022,10 +1023,13 @@ async fn prepare_republish(
     {
         let host = did_hosting_common::server::domain::extract_did_host(did_id)?;
         if !requested.eq_ignore_ascii_case(&host) {
-            return Err(AppError::Validation(format!(
-                "did-management:unknown_domain — requested domain `{requested}` does \
+            return Err(AppError::validation(
+                ValidationKind::UnknownDomain,
+                format!(
+                    "did-management:unknown_domain — requested domain `{requested}` does \
                  not match the DID's host `{host}`",
-            )));
+                ),
+            ));
         }
     }
 
@@ -1687,8 +1691,6 @@ pub async fn upload_witness(
 
     let record = get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
 
-    use did_hosting_common::server::error::ValidationKind;
-
     // did-witness.json is a did:webvh artifact. A did:webs slot's witness
     // receipts travel inside its key event log, and are verified there.
     if record.method == "webs" {
@@ -2107,10 +2109,13 @@ pub(crate) fn ensure_slot_domain_matches(
             .unwrap_or_default()
     };
     if !slot_domain.is_empty() && !requested.eq_ignore_ascii_case(&slot_domain) {
-        return Err(AppError::Validation(format!(
-            "did-management:unknown_domain — requested domain `{requested}` does \
+        return Err(AppError::validation(
+            ValidationKind::UnknownDomain,
+            format!(
+                "did-management:unknown_domain — requested domain `{requested}` does \
              not match the slot's domain `{slot_domain}`",
-        )));
+            ),
+        ));
     }
     Ok(())
 }
@@ -2604,7 +2609,7 @@ pub async fn rollback_did_to(
     // by its controller (a publish may not rewind it either, see
     // `Webs::verify_continuation`).
     if !record.method.is_empty() && record.method != "webvh" {
-        return Err(AppError::Validation(format!(
+        return Err(AppError::invalid(format!(
             "a did:{} slot cannot be rolled back: rollback removes did:webvh log \
              entries, and this method's content is not a did:webvh log",
             record.method
@@ -2629,15 +2634,15 @@ pub async fn rollback_did_to(
     let keep = match target_version {
         None => {
             if lines.len() < 2 {
-                return Err(AppError::Validation(
-                    "cannot rollback: DID log must have at least 2 entries".into(),
+                return Err(AppError::invalid(
+                    "cannot rollback: DID log must have at least 2 entries",
                 ));
             }
             lines.len() - 1
         }
         Some(target) => {
             if target < 1 || target as usize > lines.len() {
-                return Err(AppError::Validation(format!(
+                return Err(AppError::invalid(format!(
                     "invalid target version {target}: the log holds {} entries",
                     lines.len()
                 )));
@@ -2870,10 +2875,10 @@ pub async fn resolve_did_or_agent_name(state: &AppState, input: &str) -> Result<
     // Canonicalise through the shared parser so the authority and local part are
     // split exactly as the resolver and the registry would split them.
     let name = agent_names::AgentName::parse(trimmed)
-        .map_err(|e| AppError::Validation(format!("'{trimmed}' is not a valid agent name: {e}")))?;
+        .map_err(|e| AppError::invalid(format!("'{trimmed}' is not a valid agent name: {e}")))?;
     match resolve_agent_name_to_did(state, name.authority(), name.local_name()).await? {
         Some(did) => Ok(did),
-        None => Err(AppError::Validation(format!(
+        None => Err(AppError::invalid(format!(
             "agent name '{}' does not resolve to a DID hosted here — bind it first, \
              or use the DID directly",
             name.without_scheme()
@@ -2979,7 +2984,7 @@ pub async fn resolve_agent_names(
         return Ok(HashMap::new());
     }
     if dids.len() > MAX_RESOLVE_DIDS {
-        return Err(AppError::Validation(format!(
+        return Err(AppError::invalid(format!(
             "at most {MAX_RESOLVE_DIDS} DIDs per resolve request, got {}",
             dids.len()
         )));
@@ -3896,7 +3901,7 @@ mod tests_atomic {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("path")));
+        assert!(matches!(err, AppError::Validation { message: ref m, .. } if m.contains("path")));
         assert!(
             state
                 .dids_ks
@@ -3923,7 +3928,7 @@ mod tests_atomic {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("host")));
+        assert!(matches!(err, AppError::Validation { message: ref m, .. } if m.contains("host")));
     }
 
     // ---- T20b: multi-domain safety check ----
@@ -4111,7 +4116,7 @@ mod tests_atomic {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)));
+        assert!(matches!(err, AppError::Validation { .. }));
     }
 
     /// A root did:webvh — `did:webvh:{SCID}:<host>`, no path segments,
@@ -4201,7 +4206,7 @@ mod tests_atomic {
         .await
         .unwrap_err();
         assert!(
-            matches!(err, AppError::Validation(_)),
+            matches!(err, AppError::Validation { .. }),
             "dotted non-root path must still be rejected, got {err:?}"
         );
     }
@@ -4386,7 +4391,7 @@ mod tests_atomic {
         .await
         .unwrap_err();
         assert!(
-            matches!(err, AppError::Validation(ref m) if m.contains("unknown_domain")),
+            matches!(err, AppError::Validation { message: ref m, .. } if m.contains("unknown_domain")),
             "mismatched domain must be rejected as unknown_domain, got {err:?}"
         );
     }
@@ -4423,7 +4428,7 @@ mod tests_atomic {
         let err = publish_did(&owner_auth(owner_a), &state, path, "not-jsonl", None)
             .await
             .unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)));
+        assert!(matches!(err, AppError::Validation { .. }));
         assert_eq!(
             state.stats_collector.get_aggregate().total_updates,
             baseline,
@@ -4923,7 +4928,7 @@ mod tests_atomic {
                 .await
                 .expect_err("rollback refused");
             assert!(
-                matches!(&err, AppError::Validation(m) if m.contains("did:web slot")),
+                matches!(&err, AppError::Validation { message: m, .. } if m.contains("did:web slot")),
                 "got {err:?}"
             );
         }
@@ -6851,7 +6856,7 @@ mod tests_atomic {
             .await
             .expect_err("the key event log does not establish this slot's AID");
             assert!(
-                matches!(err, AppError::Validation(_)),
+                matches!(err, AppError::Validation { .. }),
                 "expected a validation refusal, got {err:?}",
             );
         }
@@ -6877,7 +6882,7 @@ mod tests_atomic {
             )
             .await
             .expect_err("a tampered log must never be stored");
-            assert!(matches!(err, AppError::Validation(_)));
+            assert!(matches!(err, AppError::Validation { .. }));
 
             assert!(
                 state
@@ -7040,7 +7045,7 @@ mod tests_atomic {
                 .await
                 .expect_err("rollback refused");
             assert!(
-                matches!(&err, AppError::Validation(m) if m.contains("did:webs")),
+                matches!(&err, AppError::Validation { message: m, .. } if m.contains("did:webs")),
                 "got {err:?}"
             );
             let stored = state
@@ -7082,7 +7087,7 @@ mod tests_atomic {
             let err = get_did_info(&owner_auth(owner), &state, AID)
                 .await
                 .expect_err("no record");
-            assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+            assert!(matches!(err, AppError::Validation { .. }), "got {err:?}");
 
             register_webs(&state, owner).await;
             let mut record = record_for(&state, AID).await;
@@ -7091,7 +7096,7 @@ mod tests_atomic {
             let err = delete_did(&owner_auth(owner), &state, AID, None)
                 .await
                 .expect_err("not a did:webs slot");
-            assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+            assert!(matches!(err, AppError::Validation { .. }), "got {err:?}");
             assert!(
                 state
                     .dids_ks
@@ -7115,7 +7120,7 @@ mod tests_atomic {
             )
             .await
             .expect_err("a did:webs DID cannot be built without its domain");
-            assert!(matches!(err, AppError::Validation(_)));
+            assert!(matches!(err, AppError::Validation { .. }));
         }
     }
 }

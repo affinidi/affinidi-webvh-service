@@ -158,6 +158,13 @@ pub enum MethodError {
     /// reason for diagnostics.
     #[error("validation failed: {0}")]
     Validation(String),
+
+    /// The content verifies on its own but does not continue the history
+    /// already held for the identifier: it rewinds it, or diverges from it.
+    /// Kept apart from [`MethodError::Validation`] so a host can answer
+    /// `historyRewrite` rather than `invalidLog` without reading the reason.
+    #[error("history rewrite refused: {0}")]
+    HistoryRewrite(String),
 }
 
 /// Look up a method impl by its canonical name.
