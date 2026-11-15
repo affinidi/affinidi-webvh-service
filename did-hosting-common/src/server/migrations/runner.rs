@@ -17,11 +17,15 @@ pub struct RunSummary {
     pub applied: Vec<String>,
     /// Migrations skipped because the marker was already present.
     pub skipped: Vec<String>,
+    /// Migrations that ran but deferred records for a later run, so carry no
+    /// marker yet.
+    #[serde(default)]
+    pub deferred: Vec<String>,
 }
 
 impl RunSummary {
     pub fn total(&self) -> usize {
-        self.applied.len() + self.skipped.len()
+        self.applied.len() + self.skipped.len() + self.deferred.len()
     }
 }
 
@@ -38,7 +42,9 @@ impl MigrationRunner {
 
     /// Walk the registered list in order. For each migration:
     ///   1. Skip if `meta:migration:applied:{id}` exists.
-    ///   2. Otherwise call `run`. On `Ok`, write the marker and continue.
+    ///   2. Otherwise call `run`. On `Ok(Complete)`, write the marker and
+    ///      continue. On `Ok(Deferred(n))`, write no marker — the next
+    ///      invocation retries the deferred records — and continue.
     ///   3. On `Err`, return immediately without writing a marker — the
     ///      next boot retries from this migration's top.
     pub async fn run_pending(&self, store: &Store) -> Result<RunSummary, AppError> {
@@ -64,7 +70,15 @@ impl MigrationRunner {
 
             // Fails fast: a migration that returns Err leaves no marker,
             // so the next runner invocation re-attempts it from the top.
-            migration.run(store).await?;
+            if let super::MigrationOutcome::Deferred(records) = migration.run(store).await? {
+                tracing::warn!(
+                    migration_id = id,
+                    deferred = records,
+                    "migration deferred records; it stays pending and re-runs next time"
+                );
+                summary.deferred.push(id.to_string());
+                continue;
+            }
 
             let marker = AppliedMarker::now(migration.description().to_string());
             meta.insert(key.as_bytes().to_vec(), &marker).await?;
@@ -128,7 +142,7 @@ mod tests {
                 if self.should_fail {
                     Err(AppError::Internal("migration intentionally failed".into()))
                 } else {
-                    Ok(())
+                    Ok(MigrationOutcome::Complete)
                 }
             })
         }
@@ -228,6 +242,56 @@ mod tests {
         );
     }
 
+    /// A migration that defers records gets no marker and runs again; once
+    /// it completes, it is marked.
+    #[tokio::test]
+    async fn a_deferring_migration_is_not_marked_and_re_runs() {
+        struct Deferring {
+            runs: Arc<AtomicUsize>,
+        }
+        impl Migration for Deferring {
+            fn id(&self) -> &'static str {
+                "m_test_defer"
+            }
+            fn run<'a>(&'a self, _store: &'a Store) -> MigrationFuture<'a> {
+                Box::pin(async move {
+                    // Defers on its first run only.
+                    let n = self.runs.fetch_add(1, Ordering::SeqCst);
+                    Ok(MigrationOutcome::from_deferred(if n == 0 { 3 } else { 0 }))
+                })
+            }
+        }
+        let store = fjall_store().await;
+        let runs = Arc::new(AtomicUsize::new(0));
+        let migrations: Vec<Arc<dyn Migration>> = vec![Arc::new(Deferring { runs: runs.clone() })];
+
+        let first = MigrationRunner::new(migrations.clone())
+            .run_pending(&store)
+            .await
+            .unwrap();
+        assert_eq!(first.deferred, vec!["m_test_defer"]);
+        assert!(first.applied.is_empty());
+        let meta = meta_keyspace(&store).unwrap();
+        assert!(
+            !meta
+                .contains_key(applied_key("m_test_defer").into_bytes())
+                .await
+                .unwrap()
+        );
+
+        let second = MigrationRunner::new(migrations.clone())
+            .run_pending(&store)
+            .await
+            .unwrap();
+        assert_eq!(second.applied, vec!["m_test_defer"]);
+        let third = MigrationRunner::new(migrations)
+            .run_pending(&store)
+            .await
+            .unwrap();
+        assert_eq!(third.skipped, vec!["m_test_defer"]);
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
     #[tokio::test]
     async fn migrations_run_in_registration_order() {
         let store = fjall_store().await;
@@ -258,7 +322,7 @@ mod tests {
                         }
                     }
                     self.runs.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                    Ok(MigrationOutcome::Complete)
                 })
             }
         }

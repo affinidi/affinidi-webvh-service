@@ -125,3 +125,58 @@ pub const KS_TSP_RELATIONSHIPS: &str = "tsp_relationships";
 /// the service identity's resolver at boot; see
 /// [`crate::server::scid_floors`].
 pub const KS_SCID_FLOORS: &str = "scid_floors";
+
+/// Every keyspace above. A backup declares, for each of these, whether it
+/// carries it or why not (the daemon's `backup` module tests that it does),
+/// and the test below fails when a `KS_*` constant is added here but not to
+/// this list.
+pub const ALL_KEYSPACES: &[&str] = &[
+    KS_DIDS,
+    KS_ACL,
+    KS_SESSIONS,
+    KS_PASSKEY_STEP_UP,
+    KS_STATS,
+    KS_TIMESERIES,
+    KS_REGISTRY,
+    KS_WITNESSES,
+    KS_META,
+    KS_DOMAINS,
+    KS_ASSIGNMENTS,
+    KS_PENDING_PURGES,
+    KS_IDENTITY,
+    KS_OUTBOUND_QUEUE,
+    KS_TSP_RELATIONSHIPS,
+    KS_SCID_FLOORS,
+];
+
+#[cfg(test)]
+mod tests {
+    use super::ALL_KEYSPACES;
+
+    /// Every `pub const KS_*: &str = "…";` in this file is in
+    /// [`ALL_KEYSPACES`], read from the source so a new constant cannot be
+    /// forgotten.
+    #[test]
+    fn every_keyspace_constant_is_listed() {
+        let source = include_str!("keyspaces.rs");
+        let mut declared = Vec::new();
+        for line in source.lines() {
+            let Some(rest) = line.trim().strip_prefix("pub const KS_") else {
+                continue;
+            };
+            let value = rest
+                .split('"')
+                .nth(1)
+                .unwrap_or_else(|| panic!("cannot read the value of `{line}`"));
+            declared.push(value);
+        }
+        assert!(!declared.is_empty());
+        for name in &declared {
+            assert!(
+                ALL_KEYSPACES.contains(name),
+                "keyspace `{name}` is declared but missing from ALL_KEYSPACES"
+            );
+        }
+        assert_eq!(declared.len(), ALL_KEYSPACES.len(), "{declared:?}");
+    }
+}

@@ -916,6 +916,15 @@ async fn do_sync_delete(
     let delete: sync_delete::Payload = payload(body, "sync/delete")?;
     let mnemonic = delete.mnemonic.as_str();
 
+    // The edge's own DID is not the control plane's to delete: it is what
+    // this edge's signatures verify against (see `own_did_mnemonic`).
+    if crate::control_register::own_did_mnemonic(state).as_deref() == Some(mnemonic) {
+        warn!(did = %control.did, mnemonic = %mnemonic, "sync delete refused: the slot holds this edge's own DID");
+        return Err(OpError::Refused(format!(
+            "sync/delete: `{mnemonic}` holds this server's own DID"
+        )));
+    }
+
     // Serialised with `sync/update` and `sync/batch`: a delete reads the
     // slot's record and then removes it, which the same race as
     // `apply_single_update`'s read-check-write can corrupt if it interleaves
@@ -939,11 +948,16 @@ async fn do_sync_delete(
         batch.remove(&state.dids_ks, did_ops::content_witness_key(mnemonic));
         batch.remove(&state.dids_ks, did_ops::owner_key(&record.owner, mnemonic));
         batch.remove(&state.dids_ks, did_ops::watcher_sync_key(mnemonic));
+        // Only the index entries still naming this slot: one a name's new
+        // holder already took over must survive this slot's deletion.
         for name in &record.agent_names {
-            batch.remove(
-                &state.dids_ks,
-                did_hosting_common::did_ops::agent_name_key(&host, &name.name),
-            );
+            let key = did_hosting_common::did_ops::agent_name_key(&host, &name.name);
+            if crate::control_register::index_names_slot(&state.dids_ks, &key, mnemonic)
+                .await
+                .map_err(OpError::from)?
+            {
+                batch.remove(&state.dids_ks, key);
+            }
         }
         batch.commit().await.map_err(OpError::from)?;
         state.did_cache.invalidate_did(mnemonic);

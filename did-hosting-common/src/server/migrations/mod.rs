@@ -16,8 +16,9 @@
 //! Each migration implements the [`Migration`] trait — a stable id and an
 //! async `run`. The runner tracks applied ids in the `meta` keyspace under
 //! `migration:applied:{id}`; a migration whose marker is already present
-//! is skipped. A migration that errors does **not** get marked, so the
-//! next boot re-runs it from the top.
+//! is skipped. A migration that errors, or that reports
+//! [`MigrationOutcome::Deferred`] records, does **not** get marked, so the
+//! next runner invocation re-runs it from the top.
 //!
 //! ## Ordering
 //!
@@ -52,7 +53,32 @@ pub use runner::{MigrationRunner, RunSummary};
 /// Boxed future used by [`Migration::run`] so the trait stays object-safe
 /// without pulling in `async-trait`. Matches the pattern used by the
 /// storage backends in `super::store`.
-pub type MigrationFuture<'a> = Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + 'a>>;
+pub type MigrationFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<MigrationOutcome, AppError>> + Send + 'a>>;
+
+/// How a migration's run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationOutcome {
+    /// Every record it is responsible for is migrated: the runner writes the
+    /// applied marker, and the migration never runs again.
+    Complete,
+    /// It finished its walk but left this many records for a later run
+    /// (they lacked something the migration needs, such as a default
+    /// domain, or lost a race with a concurrent writer). No marker is
+    /// written, so the next runner invocation retries them.
+    Deferred(u64),
+}
+
+impl MigrationOutcome {
+    /// [`Self::Complete`] when nothing was deferred.
+    pub fn from_deferred(deferred: u64) -> Self {
+        if deferred == 0 {
+            Self::Complete
+        } else {
+            Self::Deferred(deferred)
+        }
+    }
+}
 
 /// Key prefix inside the `meta` keyspace for applied-migration markers.
 const APPLIED_KEY_PREFIX: &str = "migration:applied:";
@@ -83,10 +109,132 @@ pub trait Migration: Send + Sync {
         ""
     }
 
-    /// Apply the shape change. Called once, then the marker is written.
-    /// Returns `Err` to abort the whole run — the marker is NOT written
-    /// on error; the next boot retries from the top.
+    /// Apply the shape change. The marker is written only when it returns
+    /// [`MigrationOutcome::Complete`]; a [`MigrationOutcome::Deferred`] run
+    /// is retried by the next runner invocation. Returns `Err` to abort the
+    /// whole run — the marker is NOT written on error; the next boot retries
+    /// from the top.
     fn run<'a>(&'a self, store: &'a Store) -> MigrationFuture<'a>;
+}
+
+/// Records read per page of a migration's walk over `did:` records.
+pub(crate) const DID_PAGE: usize = 500;
+
+/// A paged walk over every `did:{mnemonic}` record in a keyspace, so a
+/// migration never holds the whole keyspace in memory. Falls back to one
+/// whole-prefix read on a backend that cannot page.
+pub(crate) struct DidRecordPages<'a> {
+    ks: &'a KeyspaceHandle,
+    cursor: Option<Vec<u8>>,
+    done: bool,
+}
+
+impl<'a> DidRecordPages<'a> {
+    pub(crate) fn new(ks: &'a KeyspaceHandle) -> Self {
+        Self {
+            ks,
+            cursor: None,
+            done: false,
+        }
+    }
+
+    /// The next page of `(mnemonic, raw record)` pairs, or `None` when the
+    /// walk is complete. Keys that are not UTF-8 are skipped with a warning.
+    pub(crate) async fn next_page(
+        &mut self,
+        migration_id: &str,
+    ) -> Result<Option<Vec<(String, Vec<u8>)>>, AppError> {
+        if self.done {
+            return Ok(None);
+        }
+        let rows = match self
+            .ks
+            .prefix_page_raw(b"did:".to_vec(), self.cursor.take(), DID_PAGE)
+            .await?
+        {
+            Some(page) => {
+                self.cursor = page.next;
+                self.done = self.cursor.is_none();
+                page.rows
+            }
+            None => {
+                self.done = true;
+                self.ks.prefix_iter_raw(b"did:".to_vec()).await?
+            }
+        };
+        Ok(Some(
+            rows.into_iter()
+                .filter_map(|(key, value)| match String::from_utf8(key) {
+                    Ok(k) => Some((k.strip_prefix("did:").unwrap_or(&k).to_string(), value)),
+                    Err(_) => {
+                        tracing::warn!(migration_id, "skipping non-UTF-8 key in dids keyspace");
+                        None
+                    }
+                })
+                .collect(),
+        ))
+    }
+}
+
+/// What [`patch_did_record_field`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Patched<T> {
+    /// The field was written; `T` is what `decide` reported.
+    Written(T),
+    /// The fresh record needs nothing (or is unreadable, or gone).
+    Unneeded,
+    /// Concurrent writers kept changing the record; left for a later run.
+    Contended,
+}
+
+/// Write one field of `did:{mnemonic}`, decided on a fresh read.
+///
+/// The record is re-read through `consistent` (a
+/// [`Store::keyspace_consistent`] handle) immediately before the write, so a
+/// migration's decision is never made on a snapshot a concurrent publish has
+/// since replaced. `decide` sees the fresh record and returns the field's new
+/// JSON value (or `None`: nothing to do). Only that one field is changed in
+/// the stored JSON — every other field, including any this binary does not
+/// model, is written back as it was read — and the write is a
+/// compare-and-swap against the bytes read, so a write that landed in
+/// between is never overwritten: the read and decision are retried instead.
+///
+/// The migration context has no path locks to take (they belong to a running
+/// control plane, and would not cover another replica anyway); the
+/// compare-and-swap is what makes the write safe on a store shared during a
+/// rolling upgrade.
+pub(crate) async fn patch_did_record_field<T>(
+    consistent: &KeyspaceHandle,
+    mnemonic: &str,
+    field: &str,
+    decide: impl Fn(&crate::did_ops::DidRecord) -> Option<(serde_json::Value, T)>,
+) -> Result<Patched<T>, AppError> {
+    const ATTEMPTS: usize = 5;
+    let key = crate::did_ops::did_key(mnemonic);
+    for _ in 0..ATTEMPTS {
+        let Some(raw) = consistent.get_raw(key.clone()).await? else {
+            return Ok(Patched::Unneeded);
+        };
+        let Ok(record) = serde_json::from_slice::<crate::did_ops::DidRecord>(&raw) else {
+            return Ok(Patched::Unneeded);
+        };
+        let Some((value, report)) = decide(&record) else {
+            return Ok(Patched::Unneeded);
+        };
+        let mut object: serde_json::Value = serde_json::from_slice(&raw)?;
+        let Some(map) = object.as_object_mut() else {
+            return Ok(Patched::Unneeded);
+        };
+        map.insert(field.to_string(), value);
+        let new = serde_json::to_vec(&object)?;
+        if consistent
+            .compare_and_swap_raw(key.clone(), Some(raw), new)
+            .await?
+        {
+            return Ok(Patched::Written(report));
+        }
+    }
+    Ok(Patched::Contended)
 }
 
 /// Persisted marker written under `meta:migration:applied:{id}` after a

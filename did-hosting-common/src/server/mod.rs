@@ -4,6 +4,7 @@ pub mod agent_name_index;
 pub mod assignment;
 pub mod assignment_seed;
 pub mod auth;
+pub mod backup;
 pub mod cli_acl;
 pub mod cli_identity;
 pub mod cli_metrics;

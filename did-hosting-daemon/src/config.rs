@@ -207,9 +207,7 @@ pub fn shared_witness_store_refusal() -> String {
 
 impl DaemonConfig {
     pub fn load(config_path: Option<PathBuf>) -> Result<Self, AppError> {
-        let path = config_path
-            .or_else(|| std::env::var("DAEMON_CONFIG_PATH").ok().map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("config.toml"));
+        let path = Self::resolve_path(config_path);
 
         if !path.exists() {
             return Err(AppError::Config(format!(
@@ -219,7 +217,21 @@ impl DaemonConfig {
         }
 
         let contents = std::fs::read_to_string(&path).map_err(AppError::Io)?;
-        let mut config = toml::from_str::<DaemonConfig>(&contents)
+        Self::from_toml(&contents, path)
+    }
+
+    /// Where [`Self::load`] reads the configuration: `config_path`, else
+    /// `DAEMON_CONFIG_PATH`, else `config.toml`.
+    pub fn resolve_path(config_path: Option<PathBuf>) -> PathBuf {
+        config_path
+            .or_else(|| std::env::var("DAEMON_CONFIG_PATH").ok().map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("config.toml"))
+    }
+
+    /// Parse a daemon configuration from its TOML text (as read from `path`)
+    /// and apply the environment overrides, exactly as [`Self::load`] does.
+    pub fn from_toml(contents: &str, path: PathBuf) -> Result<Self, AppError> {
+        let mut config = toml::from_str::<DaemonConfig>(contents)
             .map_err(|e| AppError::Config(format!("failed to parse {}: {e}", path.display())))?;
 
         config.config_path = path;
@@ -254,19 +266,24 @@ impl DaemonConfig {
             };
         }
 
-        if let Ok(v) = std::env::var("DAEMON_SERVER_HOST") {
-            config.server.host = v;
-        }
-        if let Ok(v) = std::env::var("DAEMON_SERVER_PORT") {
-            config.server.port = v
-                .parse()
-                .map_err(|e| AppError::Config(format!("invalid DAEMON_SERVER_PORT: {e}")))?;
-        }
-        if let Ok(v) = std::env::var("DAEMON_LOG_LEVEL") {
-            config.log.level = v;
-        }
-        // DAEMON_SERVER_TRUSTED_PROXIES — load balancer addresses or ranges.
-        config.server.apply_trusted_proxies_env_override("DAEMON")?;
+        // The overrides every binary shares, under `DAEMON_`: features,
+        // server (host, port, trusted proxies), log, store, auth and secrets —
+        // `DAEMON_STORE_REDIS_URL`, `DAEMON_SECRETS_AWS_SECRET_NAME`, … as
+        // `docs/bootstrap_startup.md` documents for every prefix.
+        did_hosting_common::server::config::apply_env_overrides(
+            "DAEMON",
+            &mut config.features,
+            &mut config.server,
+            &mut config.log,
+            &mut config.store,
+            &mut config.auth,
+            &mut config.secrets,
+        )?;
+        // The witness store is the daemon's second store: `DAEMON_WITNESS_STORE_*`.
+        did_hosting_common::server::config::apply_store_env_overrides(
+            "DAEMON_WITNESS_STORE",
+            &mut config.witness_store,
+        );
         // DAEMON_SERVER_RESOLVE_CACHE_* — Cache-Control on DID resolution.
         config.server.resolve_cache.apply_env_overrides("DAEMON")?;
         // DAEMON_REPLAY_* — anti-replay cache bounds. Also validates `[replay]`.
@@ -551,6 +568,54 @@ context_id = "webvh"
             cfg.public_url.as_deref(),
             Some("https://daemon.example.com")
         );
+    }
+
+    /// The shared `DAEMON_*` overrides reach the store, secrets, auth and
+    /// features settings, as they do for every other binary's prefix, and
+    /// `DAEMON_WITNESS_STORE_*` reaches the witness store.
+    ///
+    /// The process environment is shared by every test in this binary, and
+    /// these variables would redirect other tests' stores and secrets, so the
+    /// checks run in a child process: this test re-runs itself with the
+    /// variables set on the child alone.
+    #[test]
+    fn the_shared_env_overrides_apply_under_the_daemon_prefix() {
+        const CHILD: &str = "DAEMON_ENV_OVERRIDE_TEST_CHILD";
+        const NAME: &str = "config::tests::the_shared_env_overrides_apply_under_the_daemon_prefix";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("DAEMON_STORE_DYNAMODB_TABLE_PREFIX", "daemon-main")
+                .env(
+                    "DAEMON_WITNESS_STORE_DYNAMODB_TABLE_PREFIX",
+                    "daemon-witness",
+                )
+                .env("DAEMON_SECRETS_AWS_SECRET_NAME", "daemon-secret")
+                .env("DAEMON_AUTH_CHALLENGE_TTL", "123")
+                .env("DAEMON_FEATURES_AGENT_NAMES", "false")
+                .status()
+                .expect("run the child test");
+            assert!(status.success(), "the child test failed");
+            return;
+        }
+
+        let (_dir, path) = write_temp_config(SELF_MANAGED_TOML);
+        let cfg = DaemonConfig::load(Some(path)).expect("load with overrides");
+        assert_eq!(
+            cfg.store.dynamodb_table_prefix.as_deref(),
+            Some("daemon-main")
+        );
+        assert_eq!(
+            cfg.witness_store.dynamodb_table_prefix.as_deref(),
+            Some("daemon-witness")
+        );
+        assert_eq!(
+            cfg.secrets.aws_secret_name.as_deref(),
+            Some("daemon-secret")
+        );
+        assert_eq!(cfg.auth.challenge_ttl, 123);
+        assert!(!cfg.features.agent_names);
     }
 
     /// `[replay]` reaches the embedded control plane, witness and watcher,

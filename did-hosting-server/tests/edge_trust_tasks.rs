@@ -507,6 +507,107 @@ async fn every_directive_is_served_on_every_transport() {
     }
 }
 
+/// The purge an unassign schedules actually runs on a standalone edge: once
+/// its grace has elapsed, the edge's storage-thread sweep deletes the
+/// domain's DIDs and drops the warm content cache, so the DID stops
+/// resolving.
+#[tokio::test]
+async fn an_unassigned_domain_is_purged_by_the_edge_sweep_once_its_grace_elapses() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use did_hosting_common::server::pending_purge;
+    use tower::ServiceExt;
+
+    let (mut state, _dir) = edge_state().await;
+    let mut config = (*state.config).clone();
+    config.hosting.unassigned_purge_grace = "0s".into();
+    state.config = Arc::new(config);
+    let cp = control();
+
+    let reply = deliver(
+        &state,
+        Via::Tsp,
+        &cp.0,
+        signed(
+            MSG_REPLICA_DOMAIN_ASSIGN,
+            &cp,
+            json!({ "domain": "server.example.com" }),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    answered(&reply, MSG_REPLICA_DOMAIN_ASSIGN);
+    let (did_id, log) = valid_did_log("doomed").await;
+    let reply = deliver(
+        &state,
+        Via::Tsp,
+        &cp.0,
+        signed(
+            MSG_SYNC_UPDATE,
+            &cp,
+            update_body("doomed", &did_id, &log, false),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_UPDATE)["status"], "applied");
+
+    let app = did_hosting_server::routes::router(1024 * 1024).with_state(state.clone());
+    let resolve = || async {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/doomed/did.jsonl")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    };
+    // Resolving warms the content cache the sweep must drop.
+    assert_eq!(resolve().await, StatusCode::OK);
+
+    let reply = deliver(
+        &state,
+        Via::Tsp,
+        &cp.0,
+        signed(
+            MSG_REPLICA_DOMAIN_UNASSIGN,
+            &cp,
+            json!({ "domain": "server.example.com" }),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        answered(&reply, MSG_REPLICA_DOMAIN_UNASSIGN)["status"],
+        "scheduled"
+    );
+
+    let sweep = did_hosting_server::purge_sweep::run_edge_sweep_tick(
+        &state.store,
+        &state.did_cache,
+        state.gate_cache.as_deref(),
+        None,
+    )
+    .await;
+    assert_eq!(sweep.entries, 1, "{sweep:?}");
+    assert_eq!(sweep.purged_dids, vec!["doomed".to_string()]);
+    assert!(stored(&state, "doomed").await.is_none());
+    assert!(
+        pending_purge::get(&state.store, "server.example.com")
+            .await
+            .unwrap()
+            .is_none(),
+        "the schedule is settled"
+    );
+    assert_eq!(resolve().await, StatusCode::NOT_FOUND);
+}
+
 /// A disabled domain record schedules its purge at the carried `purgeAt`;
 /// re-enabling it cancels the schedule.
 #[tokio::test]
@@ -1248,4 +1349,299 @@ async fn an_oversized_body_is_refused_unread() {
     .await
     .into_response();
     assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+// ---------------------------------------------------------------------------
+// Agent-name index integrity (a name moving between DIDs)
+// ---------------------------------------------------------------------------
+
+/// The cumulative `did.jsonl` of `mnemonic` on the edge's host after each of
+/// `versions`, where each version names the agent names its document claims.
+async fn named_did_logs(seed: u8, mnemonic: &str, versions: &[&[&str]]) -> (String, Vec<String>) {
+    let secret = Secret::generate_ed25519(None, Some(&[seed; 32]));
+    let pk_mb = secret.get_public_keymultibase().expect("pubkey multibase");
+    let mut signing = secret.clone();
+    signing.id = format!("did:key:{pk_mb}#{pk_mb}");
+    let base = build_did_document(
+        "server.example.com",
+        mnemonic,
+        &pk_mb,
+        &DidDocumentOptions::default(),
+    );
+    let with_names = |doc: &Value, names: &[&str]| {
+        let mut doc = doc.clone();
+        let aka: Vec<String> = names
+            .iter()
+            .map(|n| format!("https://server.example.com/@{n}"))
+            .collect();
+        doc["alsoKnownAs"] = json!(aka);
+        doc
+    };
+    let params = didwebvh_rs::parameters::Parameters {
+        update_keys: Some(Arc::new(vec![pk_mb.clone().into()])),
+        ..Default::default()
+    };
+    let mut state = didwebvh_rs::DIDWebVHState::default();
+    state
+        .create_log_entry(
+            Some((chrono::Utc::now() - chrono::Duration::hours(1)).fixed_offset()),
+            &with_names(&base, versions[0]),
+            &params,
+            &signing,
+        )
+        .await
+        .expect("create webvh log entry");
+    let scid = state.scid().to_string();
+    let base: Value = serde_json::from_str(
+        &serde_json::to_string(&base)
+            .unwrap()
+            .replace("{SCID}", &scid),
+    )
+    .unwrap();
+    let to_jsonl = |state: &didwebvh_rs::DIDWebVHState| {
+        state
+            .log_entries()
+            .iter()
+            .map(|e| serde_json::to_string(&e.log_entry).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mut logs = vec![to_jsonl(&state)];
+    for names in &versions[1..] {
+        state
+            .update_document(with_names(&base, names), &signing)
+            .await
+            .expect("update webvh log");
+        logs.push(to_jsonl(&state));
+    }
+    let did_id = did_hosting_common::did_ops::extract_did_id(&logs[0]).expect("log has a DID");
+    (did_id, logs)
+}
+
+async fn sync(state: &AppState, mnemonic: &str, did_id: &str, log: &str) -> Value {
+    let cp = control();
+    let reply = deliver(
+        state,
+        Via::Tsp,
+        &cp.0,
+        signed(
+            MSG_SYNC_UPDATE,
+            &cp,
+            update_body(mnemonic, did_id, log, false),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    answered(&reply, MSG_SYNC_UPDATE)
+}
+
+async fn name_index(state: &AppState, name: &str) -> Option<String> {
+    state
+        .dids_ks
+        .get_raw(did_hosting_common::did_ops::agent_name_key(
+            "server.example.com",
+            name,
+        ))
+        .await
+        .unwrap()
+        .map(|v| String::from_utf8(v).unwrap())
+}
+
+/// A name moving from DID A to DID B, with the edge applying B's update
+/// before A's: A's later update (which drops the name) must not delete the
+/// index entry that now points at B, nor must A's deletion. And a re-sync of
+/// B's unchanged log repairs an index entry lost any other way.
+#[tokio::test]
+async fn a_name_moved_between_dids_survives_updates_applied_out_of_order() {
+    let (state, _dir) = edge_state().await;
+    let (a_did, a_logs) = named_did_logs(11, "alpha", &[&["shared"], &[]]).await;
+    let (b_did, b_logs) = named_did_logs(12, "bravo", &[&["shared"]]).await;
+
+    sync(&state, "alpha", &a_did, &a_logs[0]).await;
+    assert_eq!(name_index(&state, "shared").await.as_deref(), Some("alpha"));
+
+    // B's claim lands first …
+    sync(&state, "bravo", &b_did, &b_logs[0]).await;
+    assert_eq!(name_index(&state, "shared").await.as_deref(), Some("bravo"));
+
+    // … then A's release, which must leave B's entry alone.
+    assert_eq!(
+        sync(&state, "alpha", &a_did, &a_logs[1]).await["status"],
+        "applied"
+    );
+    assert_eq!(
+        name_index(&state, "shared").await.as_deref(),
+        Some("bravo"),
+        "A's stale removal must not take B's name"
+    );
+
+    // An entry lost some other way comes back on a re-sync of B's unchanged
+    // log.
+    state
+        .dids_ks
+        .remove(did_hosting_common::did_ops::agent_name_key(
+            "server.example.com",
+            "shared",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        sync(&state, "bravo", &b_did, &b_logs[0]).await["status"],
+        "unchanged"
+    );
+    assert_eq!(name_index(&state, "shared").await.as_deref(), Some("bravo"));
+}
+
+/// The same race resolved by a `sync/delete`: deleting A, whose record still
+/// claims the name, must not delete the entry B has taken over.
+#[tokio::test]
+async fn deleting_a_did_leaves_a_name_its_new_holder_took_over() {
+    let (state, _dir) = edge_state().await;
+    let cp = control();
+    let (a_did, a_logs) = named_did_logs(13, "alpha", &[&["shared"]]).await;
+    let (b_did, b_logs) = named_did_logs(14, "bravo", &[&["shared"]]).await;
+    sync(&state, "alpha", &a_did, &a_logs[0]).await;
+    sync(&state, "bravo", &b_did, &b_logs[0]).await;
+
+    let reply = deliver(
+        &state,
+        Via::Tsp,
+        &cp.0,
+        signed(MSG_SYNC_DELETE, &cp, json!({ "mnemonic": "alpha" })).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_DELETE)["status"], "deleted");
+    assert_eq!(name_index(&state, "shared").await.as_deref(), Some("bravo"));
+
+    // Deleting B, the holder, does release it.
+    let reply = deliver(
+        &state,
+        Via::Tsp,
+        &cp.0,
+        signed(MSG_SYNC_DELETE, &cp, json!({ "mnemonic": "bravo" })).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_DELETE)["status"], "deleted");
+    assert_eq!(name_index(&state, "shared").await, None);
+}
+
+// ---------------------------------------------------------------------------
+// A self-hosted did:webvh edge's own DID
+// ---------------------------------------------------------------------------
+
+/// An edge whose own identifier is a `did:webvh` it hosts itself, imported at
+/// its slot as setup does. Documents from the control plane are addressed to
+/// that DID.
+async fn self_hosted_edge() -> (AppState, tempfile::TempDir, String) {
+    let (state, dir) = edge_state().await;
+    let (own_did, own_log) = valid_did_log("edge").await;
+    did_hosting_server::bootstrap::import_own_did(&state.store, &state.dids_ks, "edge", &own_log)
+        .await
+        .expect("import own DID");
+    let mut config = (*state.config).clone();
+    config.server_did = Some(own_did.clone());
+    // `valid_did_log` signs with the seed-7 key; the edge signs as its DID.
+    let mut key = Secret::generate_ed25519(None, Some(&[7u8; 32]));
+    key.id = format!("{own_did}#key-0");
+    let state = AppState {
+        config: Arc::new(config),
+        identity: Some(
+            ServiceIdentity::from_signing_secret(&own_did, key)
+                .await
+                .unwrap(),
+        ),
+        ..state
+    };
+    (state, dir, own_did)
+}
+
+/// A request to the self-hosted edge, signed by the control plane.
+async fn signed_to(recipient: &str, type_uri: &str, payload: Value) -> Value {
+    let cp = control();
+    let doc = build_request(type_uri, &cp.0, recipient, payload).unwrap();
+    serde_json::to_value(
+        did_hosting_common::server::trust_tasks::sign_document(&doc, &cp.1)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+/// The edge's own DID is local state the control plane never published: it
+/// is not reported at registration, a listing that lacks it leaves the edge
+/// clean rather than stale, and a `sync/delete` of it is refused.
+#[tokio::test]
+async fn a_self_hosted_edge_keeps_its_own_did_out_of_the_control_planes_reach() {
+    use did_hosting_server::replication::reconcile_once;
+
+    let (state, _dir, own_did) = self_hosted_edge().await;
+    assert_eq!(
+        did_hosting_server::control_register::own_did_mnemonic(&state).as_deref(),
+        Some("edge"),
+        "{own_did}"
+    );
+
+    // With nothing else held, a listing that lacks the edge's own DID
+    // reconciles clean: the edge is not "stale" for keeping it.
+    let report = reconcile_once(&state, |request| async move {
+        let reply = request.respond_with(
+            format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            json!({ "records": [] }),
+        );
+        Ok(
+            did_hosting_common::server::trust_tasks::sign_document(&reply, &control().1)
+                .await
+                .unwrap(),
+        )
+    })
+    .await
+    .expect("the control plane's listing reconciles");
+    assert!(report.is_clean(), "{report:?}");
+
+    // A tenant DID alongside it, synced from the control plane.
+    let (did_id, log) = valid_did_log("tenant").await;
+    let reply = deliver(
+        &state,
+        Via::Tsp,
+        &control().0,
+        signed_to(
+            &own_did,
+            MSG_SYNC_UPDATE,
+            update_body("tenant", &did_id, &log, false),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(reply["payload"]["status"], "applied", "{reply}");
+
+    // Registration reports the tenant's slot, not the edge's own.
+    let preloaded = did_hosting_server::control_register::preloaded_dids(&state).await;
+    let reported: Vec<&str> = preloaded
+        .iter()
+        .filter_map(|p| p["mnemonic"].as_str())
+        .collect();
+    assert_eq!(reported, vec!["tenant"]);
+
+    // A sync/delete of the edge's own slot is refused and deletes nothing.
+    let reply = deliver(
+        &state,
+        Via::Tsp,
+        &control().0,
+        signed_to(&own_did, MSG_SYNC_DELETE, json!({ "mnemonic": "edge" })).await,
+    )
+    .await
+    .expect("answered");
+    assert!(
+        reply["type"]
+            .as_str()
+            .is_some_and(|t| t.contains("/trust-task-error/")),
+        "expected a refusal, got {reply}"
+    );
+    assert_eq!(reply["issuer"], own_did, "{reply}");
+    assert_eq!(reply["payload"]["retryable"], false, "{reply}");
+    assert!(stored(&state, "edge").await.is_some());
 }

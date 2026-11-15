@@ -597,14 +597,16 @@ backends you'll use — they each pull a sizable cloud SDK.
 |----------|-------------|
 | `<PREFIX>_STORE_DATA_DIR` | Fjall on-disk path (default backend) |
 | `<PREFIX>_STORE_REDIS_URL` | Redis connection URL |
-| `<PREFIX>_STORE_DYNAMODB_TABLE` | DynamoDB table name |
+| `<PREFIX>_STORE_DYNAMODB_TABLE_PREFIX` | DynamoDB table-name prefix |
 | `<PREFIX>_STORE_DYNAMODB_REGION` | AWS region for DynamoDB |
 | `<PREFIX>_STORE_FIRESTORE_PROJECT` | GCP project ID for Firestore |
 | `<PREFIX>_STORE_FIRESTORE_DATABASE` | Firestore database id |
-| `<PREFIX>_STORE_COSMOSDB_ENDPOINT` | Cosmos DB account endpoint |
+| `<PREFIX>_STORE_COSMOSDB_CONNECTION_STRING` | Cosmos DB connection string |
 | `<PREFIX>_STORE_COSMOSDB_DATABASE` | Cosmos DB database name |
-| `<PREFIX>_STORE_COSMOSDB_CONTAINER` | Cosmos DB container name |
 | `<PREFIX>_STORE_COSMOSDB_REGION` | Azure region (display form `"West US 2"` or normalised `"westus2"`; defaults to `eastus`) |
+
+The daemon's second store, `[witness_store]`, takes the same variables
+under `DAEMON_WITNESS_STORE_` (for example `DAEMON_WITNESS_STORE_REDIS_URL`).
 
 Storage backends are mutually exclusive — exactly one of `store-fjall`,
 `store-redis`, `store-dynamodb`, `store-firestore`, `store-cosmosdb`
