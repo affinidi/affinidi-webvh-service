@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { View, Text, StyleSheet, FlatList, ScrollView, ActivityIndicator } from "react-native";
 import { Link, useLocalSearchParams, useRouter } from "expo-router";
 import { useApi } from "../../components/ApiProvider";
@@ -17,12 +17,11 @@ import { showAlert } from "../../lib/alert";
 import { errorMessage } from "../../lib/errors";
 import { plural } from "../../lib/plural";
 import { invalidateQueries, useTrustTaskQuery } from "../../lib/query";
+import type { DidListPage, DidRecord } from "../../lib/api";
 import { formatDate } from "../../lib/time";
-import { matchesDomain } from "../../lib/domain";
 import { DidQrButton } from "../../components/DidQrButton";
 import { TableRow } from "../../components/TableRow";
 import {
-  matchesSearch,
   nextSort,
   sortDids,
   compactDid,
@@ -62,6 +61,22 @@ type PathStatus = null | "checking" | "available" | "taken" | "error";
  *  invalidates them all. */
 const DIDS_KEY = ["dids"] as const;
 
+/** DIDs a page of the list asks for. */
+const PAGE_SIZE = 50;
+/** How long typing pauses before the search goes to the server. */
+const SEARCH_DEBOUNCE_MS = 300;
+/** The longest search `did/list` takes. */
+const MAX_SEARCH = 200;
+
+/** Pages after the first, fetched with "Load more". Belongs to the first
+ *  page it continues (`base`): a new first page (a filter changed, or a
+ *  refresh) starts over. */
+interface MorePages {
+  base: DidListPage | undefined;
+  records: DidRecord[];
+  cursor?: string;
+}
+
 export default function DidList() {
   return (
     <RequireAuth purpose="manage DIDs">
@@ -76,13 +91,66 @@ function DidListBody() {
   const router = useRouter();
   const { owner } = useLocalSearchParams<{ owner?: string }>();
   const { domains, currentDomain, defaultDomain, loaded: domainsLoaded } = useDomains();
+  // The search box, and the search sent: the box's text once typing pauses.
+  const [search, setSearch] = useState("");
+  const [query, setQuery] = useState("");
+  useEffect(() => {
+    const t = setTimeout(() => setQuery(search.trim().slice(0, MAX_SEARCH)), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  // Paged and filtered by the control plane: the first page here, the rest
+  // on demand. The cursor is bound to the filters, so each filter has its
+  // own first page.
+  const filters = useMemo(
+    () => ({
+      ...(owner ? { owner } : {}),
+      ...(currentDomain ? { domain: currentDomain } : {}),
+      ...(query ? { search: query } : {}),
+    }),
+    [owner, currentDomain, query],
+  );
   const {
-    data,
+    data: firstPage,
     loading,
     error: loadError,
-  } = useTrustTaskQuery([...DIDS_KEY, "list", owner ?? null], () => api.listDids(owner));
-  const dids = data ?? [];
-  const error = loadError ? errorMessage(loadError, "Failed to load DIDs") : null;
+  } = useTrustTaskQuery(
+    [...DIDS_KEY, "page", owner ?? null, currentDomain, query],
+    ({ background }) => api.listDidPage({ ...filters, limit: PAGE_SIZE }, { background }),
+  );
+  const [more, setMore] = useState<MorePages>({ base: undefined, records: [] });
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [moreError, setMoreError] = useState<string | null>(null);
+  const moreValid = more.base !== undefined && more.base === firstPage;
+  const dids = useMemo(
+    () => [...(firstPage?.records ?? []), ...(moreValid ? more.records : [])],
+    [firstPage, moreValid, more.records],
+  );
+  const cursor = moreValid ? more.cursor : firstPage?.nextCursor;
+  // The first page the "Load more" in flight belongs to.
+  const firstPageRef = useRef(firstPage);
+  firstPageRef.current = firstPage;
+  const loadMore = async () => {
+    if (!cursor || loadingMore) return;
+    const base = firstPage;
+    setLoadingMore(true);
+    setMoreError(null);
+    try {
+      const page = await api.listDidPage({ ...filters, limit: PAGE_SIZE, cursor });
+      // A filter changed while it loaded: this page belongs to the old one.
+      if (firstPageRef.current !== base) return;
+      setMore((prev) => ({
+        base,
+        records: [...(prev.base === base ? prev.records : []), ...page.records],
+        cursor: page.nextCursor,
+      }));
+    } catch (e: unknown) {
+      setMoreError(errorMessage(e, "Failed to load more DIDs"));
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+  const error = loadError ? errorMessage(loadError, "Failed to load DIDs") : moreError;
   const refresh = () => void invalidateQueries([...DIDS_KEY]);
   const [creating, setCreating] = useState(false);
 
@@ -91,7 +159,6 @@ function DidListBody() {
   const [showAccept, setShowAccept] = useState(false);
   const [acceptPath, setAcceptPath] = useState("");
   const [accepting, setAccepting] = useState(false);
-  const [search, setSearch] = useState("");
   const [sort, setSort] = useState<DidSort>({ key: "mnemonic", dir: "asc" });
 
   // Inline create form state
@@ -180,65 +247,72 @@ function DidListBody() {
     }
   };
 
+  // `.well-known` sorts before every other name, so an unsearched first page
+  // holds it when it exists.
   const showRootDidButton =
-    role === "admin" && !dids.some((d) => d.mnemonic === ".well-known") && !loading;
+    role === "admin" && !query && !loading && !dids.some((d) => d.mnemonic === ".well-known");
 
-  // Filter the list to the current domain when the switcher has one
-  // pinned. "All domains" (currentDomain === null, admin-only) shows
-  // everything.
-  //
-  // For records that still carry an empty `domain` (legacy slots
-  // pre-M-01, plus the historical bug where the REST `request_uri`
-  // handler dropped the `domain` field on create), fall back to the
-  // host segment of the DID itself: `did:webvh:scid:HOST(:path…)` and
-  // `did:web:HOST(:path…)`. Without this fallback the switcher looks
-  // broken in the brief window between an operator upgrading to the
-  // fix and publish-time backfill tagging each slot. See
-  // `lib/domain.ts` for the shared matchesDomain / extractDidHost
-  // implementation — both this view and the dashboard's per-domain
-  // stat cards consume the same helpers.
-  const hiddenNoDomainCount =
-    currentDomain === null
-      ? 0
-      : dids.filter((d) => !d.domain && !matchesDomain(d, currentDomain)).length;
-  const visibleDids =
-    currentDomain === null ? dids : dids.filter((d) => matchesDomain(d, currentDomain));
-  const rows = sortDids(
-    visibleDids.filter((d) => matchesSearch(d, search)),
-    sort,
-  );
+  // Domain and search are applied by the control plane (a slot with no
+  // recorded domain is matched on its DID's host there); only the sort is
+  // local, over the DIDs loaded so far.
+  const rows = useMemo(() => sortDids(dids, sort), [dids, sort]);
   const showOwnerInfo = role === "admin" && !owner;
   // A badge on every row says nothing. Show the method only when the list
   // mixes methods (otherwise the DID's own prefix says it), and mark owners
   // only when the list mixes them.
-  const showMethod = new Set(visibleDids.map((d) => d.method ?? "")).size > 1;
-  const markOwners = showOwnerInfo && visibleDids.some((d) => d.owner !== myDid);
-  // Sized from the domain's DIDs, not the search results, so the columns
-  // hold still while typing.
-  const nameWidth = nameColumnWidth(
-    visibleDids.map((d) => ({
-      name: d.mnemonic,
-      badges: [
-        ...(showMethod && d.method ? [`did:${d.method}`] : []),
-        ...(markOwners && d.owner === myDid ? ["You"] : []),
-        ...(d.disabled ? ["Suspended"] : []),
-      ],
-      chips: servedNames(d.agentNames).map((n) => `@${n}`),
-    })),
+  const showMethod = useMemo(() => new Set(dids.map((d) => d.method ?? "")).size > 1, [dids]);
+  const markOwners = showOwnerInfo && dids.some((d) => d.owner !== myDid);
+  // Measured over the loaded DIDs once per change to them — not on every
+  // render (a "Copied!" toggle, a keystroke in the search box).
+  const nameWidth = useMemo(
+    () =>
+      nameColumnWidth(
+        dids.map((d) => ({
+          name: d.mnemonic,
+          badges: [
+            ...(showMethod && d.method ? [`did:${d.method}`] : []),
+            ...(markOwners && d.owner === myDid ? ["You"] : []),
+            ...(d.disabled ? ["Suspended"] : []),
+          ],
+          chips: servedNames(d.agentNames).map((n) => `@${n}`),
+        })),
+      ),
+    [dids, showMethod, markOwners, myDid],
   );
-  const didWidth = didTextWidth(visibleDids.map((d) => d.didId));
-  const columnWidth = (key: DidSortKey, fixed?: number) =>
-    key === "mnemonic" ? nameWidth : key === "didId" ? didWidth + DID_ACTIONS_WIDTH : fixed!;
-  /** A column's width. The name fits its longest name; the others are
-   *  minimums that share any spare width equally. */
-  const columnStyle = (key: DidSortKey, fixed?: number) => ({
-    flexGrow: key === "mnemonic" ? 0 : 1,
-    flexShrink: 0,
-    flexBasis: columnWidth(key, fixed),
-  });
-  // Below the columns' sum the table scrolls sideways instead of squeezing.
-  const tableMinWidth =
-    COLUMNS.reduce((w, c) => w + columnWidth(c.key, c.width), 0) + 2 * spacing.sm + 3;
+  const didWidth = useMemo(() => didTextWidth(dids.map((d) => d.didId)), [dids]);
+  const columns = useMemo(() => {
+    const width = (key: DidSortKey, fixed?: number) =>
+      key === "mnemonic" ? nameWidth : key === "didId" ? didWidth + DID_ACTIONS_WIDTH : fixed!;
+    /** A column's width. The name fits its longest name; the others are
+     *  minimums that share any spare width equally. */
+    const style = Object.fromEntries(
+      COLUMNS.map((c) => [
+        c.key,
+        { flexGrow: c.key === "mnemonic" ? 0 : 1, flexShrink: 0, flexBasis: width(c.key, c.width) },
+      ]),
+    ) as Record<DidSortKey, ColumnStyle>;
+    // Below the columns' sum the table scrolls sideways instead of squeezing.
+    const minWidth = COLUMNS.reduce((w, c) => w + width(c.key, c.width), 0) + 2 * spacing.sm + 3;
+    return { style, minWidth };
+  }, [nameWidth, didWidth]);
+  const columnStyle = (key: DidSortKey) => columns.style[key];
+  const tableMinWidth = columns.minWidth;
+  const showDomain = currentDomain === null;
+  const renderItem = useCallback(
+    ({ item, index }: { item: DidRecord; index: number }) => (
+      <DidRow
+        item={item}
+        alt={index % 2 === 1}
+        isOwn={item.owner === myDid}
+        markOwners={markOwners}
+        showMethod={showMethod}
+        showDomain={showDomain}
+        columns={columns.style}
+        didWidth={didWidth}
+      />
+    ),
+    [myDid, markOwners, showMethod, showDomain, columns, didWidth],
+  );
 
   return (
     <View style={styles.container}>
@@ -257,12 +331,7 @@ function DidListBody() {
             {owner ? "Owner DIDs" : role === "admin" ? "All DIDs" : "Your DIDs"}
           </Heading>
           {currentDomain !== null && (
-            <Text style={styles.filterCaption}>
-              Filtered to {currentDomain}
-              {hiddenNoDomainCount > 0
-                ? ` · ${plural(hiddenNoDomainCount, "unassigned DID", "unassigned DIDs")} hidden`
-                : ""}
-            </Text>
+            <Text style={styles.filterCaption}>Filtered to {currentDomain}</Text>
           )}
         </View>
         <View style={styles.headerActions}>
@@ -386,14 +455,14 @@ function DidListBody() {
         </Text>
       )}
 
-      {loading ? (
+      {loading && !search && !query ? (
         <ActivityIndicator
           color={colors.accent}
           size="large"
           aria-label="Loading DIDs"
           style={{ marginTop: spacing.xxl }}
         />
-      ) : visibleDids.length === 0 ? (
+      ) : dids.length === 0 && !query && !search && !cursor ? (
         <Text style={styles.hint}>
           {currentDomain
             ? `No DIDs on ${currentDomain} yet. Create one to get started, or pick a different domain from the switcher.`
@@ -407,16 +476,15 @@ function DidListBody() {
               hideLabel
               style={styles.searchField}
               inputStyle={styles.searchInput}
-              placeholder="Search by name, DID, method or domain"
+              placeholder="Search by name, DID or agent name"
               value={search}
               onChangeText={setSearch}
               autoCapitalize="none"
               autoCorrect={false}
             />
             <Text style={styles.countText} aria-live="polite">
-              {rows.length === visibleDids.length
-                ? plural(visibleDids.length, "DID", "DIDs")
-                : `${rows.length.toLocaleString()} of ${visibleDids.length.toLocaleString()}`}
+              {plural(rows.length, "DID", "DIDs")}
+              {cursor ? " shown · more available" : ""}
             </Text>
           </View>
           <ScrollView horizontal contentContainerStyle={styles.tableScroll}>
@@ -437,7 +505,7 @@ function DidListBody() {
                       })}
                       style={[
                         styles.cell,
-                        columnStyle(c.key, c.width),
+                        columnStyle(c.key),
                         c.align === "right" && styles.cellRight,
                         c.gapAfter && styles.cellGapAfter,
                       ]}
@@ -462,141 +530,166 @@ function DidListBody() {
                 })}
               </View>
               {rows.length === 0 ? (
-                <Text style={styles.hint}>No DIDs match “{search.trim()}”.</Text>
+                <Text style={styles.hint}>
+                  {loading
+                    ? "Searching..."
+                    : cursor
+                      ? "No matches in the DIDs searched so far."
+                      : query
+                        ? `No DIDs match “${query}”.`
+                        : "No DIDs."}
+                </Text>
               ) : (
-                <FlatList
-                  data={rows}
-                  keyExtractor={(item) => item.mnemonic}
-                  renderItem={({ item, index }) => {
-                    const isOwn = item.owner === myDid;
-                    const names = servedNames(item.agentNames);
-                    // The row is not itself a link: the name is, and the copy
-                    // and QR buttons sit beside it rather than inside it.
-                    return (
-                      <TableRow
-                        hoverStyle={styles.rowHover}
-                        style={[
-                          styles.row,
-                          index % 2 === 1 && styles.rowAlt,
-                          markOwners && (isOwn ? styles.rowOwn : styles.rowOther),
-                        ]}
-                      >
-                        <View role="cell" style={[styles.cell, columnStyle("mnemonic")]}>
-                          <View style={styles.nameRow}>
-                            <Link href={`/dids/${item.mnemonic}`} style={styles.mnemonic}>
-                              {item.mnemonic}
-                            </Link>
-                            {showMethod && item.method && (
-                              <View style={styles.methodBadge}>
-                                <Text style={styles.methodBadgeText}>did:{item.method}</Text>
-                              </View>
-                            )}
-                            {markOwners && isOwn && (
-                              <View style={styles.youBadge}>
-                                <Text style={styles.youBadgeText}>You</Text>
-                              </View>
-                            )}
-                            {item.disabled && (
-                              <View style={styles.disabledBadge}>
-                                <Text style={styles.disabledBadgeText}>Suspended</Text>
-                              </View>
-                            )}
-                          </View>
-                          {currentDomain === null && item.domain && (
-                            <Text style={styles.subText} numberOfLines={1}>
-                              {item.domain}
-                            </Text>
-                          )}
-                          {/* Served agent names, under the name: an alias
-                              for the DID, as on the detail page. */}
-                          {names.length > 0 && (
-                            <View style={styles.agentNamesRow}>
-                              <AgentNameChips
-                                names={names}
-                                domain={item.domain}
-                                didId={item.didId}
-                                size="sm"
-                                showHost={false}
-                              />
-                            </View>
-                          )}
-                          {markOwners && !isOwn && (
-                            <Text style={styles.subText} numberOfLines={1}>
-                              Owner: {item.owner}
-                            </Text>
-                          )}
-                        </View>
-                        <View role="cell" style={[styles.cell, columnStyle("didId")]}>
-                          {item.versionCount === 0 ? (
-                            <Text style={styles.statusPending}>Pending upload</Text>
-                          ) : item.didId ? (
-                            <View style={styles.didIdRow}>
-                              <Text
-                                style={[styles.didText, { width: didWidth }]}
-                                numberOfLines={1}
-                                aria-label={item.didId}
-                                // Full DID on hover (web).
-                                {...titleAttr(item.didId)}
-                              >
-                                {compactDid(item.didId)}
-                              </Text>
-                              <CopyButton
-                                value={item.didId}
-                                accessibilityLabel={`Copy DID of ${item.mnemonic}`}
-                              />
-                              <DidQrButton did={item.didId} label={item.mnemonic} />
-                            </View>
-                          ) : (
-                            <Text style={styles.subText}>Uploaded</Text>
-                          )}
-                        </View>
-                        <View
-                          role="cell"
-                          style={[
-                            styles.cell,
-                            styles.cellRight,
-                            styles.cellGapAfter,
-                            columnStyle("versions", 100),
-                          ]}
-                        >
-                          <Text style={styles.numText}>{item.versionCount.toLocaleString()}</Text>
-                        </View>
-                        <View role="cell" style={[styles.cell, columnStyle("created", 150)]}>
-                          <Text style={styles.dateText}>
-                            {formatDate(item.createdAt, { withTime: true })}
-                          </Text>
-                        </View>
-                        <View role="cell" style={[styles.cell, columnStyle("updated", 150)]}>
-                          {/* One version has never been updated: a dash
-                              lets the DIDs that have changed stand out. */}
-                          {item.versionCount <= 1 ? (
-                            <Text style={styles.dateTextMuted} aria-label="Never updated">
-                              —
-                            </Text>
-                          ) : (
-                            <Text style={styles.dateText}>
-                              {formatDate(item.updatedAt, { withTime: true })}
-                            </Text>
-                          )}
-                        </View>
-                        <View
-                          role="cell"
-                          style={[styles.cell, styles.cellRight, columnStyle("resolves", 100)]}
-                        >
-                          <Text style={styles.numText}>{item.totalResolves.toLocaleString()}</Text>
-                        </View>
-                      </TableRow>
-                    );
-                  }}
-                />
+                <FlatList data={rows} keyExtractor={keyOf} renderItem={renderItem} />
               )}
             </View>
           </ScrollView>
+          {cursor && (
+            <View style={styles.loadMoreRow}>
+              <Button
+                label="Load more"
+                variant="secondary"
+                busy={loadingMore}
+                busyLabel="Loading..."
+                onPress={() => void loadMore()}
+              />
+            </View>
+          )}
         </>
       )}
     </View>
   );
 }
+
+const keyOf = (d: DidRecord) => d.mnemonic;
+
+type ColumnStyle = { flexGrow: number; flexShrink: number; flexBasis: number };
+
+/** One DID's row. Memoised: a re-render of the list (a keystroke in the
+ *  search box, a page appended) leaves rows whose props did not change. */
+const DidRow = memo(function DidRow({
+  item,
+  alt,
+  isOwn,
+  markOwners,
+  showMethod,
+  showDomain,
+  columns,
+  didWidth,
+}: {
+  item: DidRecord;
+  alt: boolean;
+  isOwn: boolean;
+  markOwners: boolean;
+  showMethod: boolean;
+  showDomain: boolean;
+  columns: Record<DidSortKey, ColumnStyle>;
+  didWidth: number;
+}) {
+  const names = servedNames(item.agentNames);
+  // The row is not itself a link: the name is, and the copy
+  // and QR buttons sit beside it rather than inside it.
+  return (
+    <TableRow
+      hoverStyle={styles.rowHover}
+      style={[
+        styles.row,
+        alt && styles.rowAlt,
+        markOwners && (isOwn ? styles.rowOwn : styles.rowOther),
+      ]}
+    >
+      <View role="cell" style={[styles.cell, columns.mnemonic]}>
+        <View style={styles.nameRow}>
+          <Link href={`/dids/${item.mnemonic}`} style={styles.mnemonic}>
+            {item.mnemonic}
+          </Link>
+          {showMethod && item.method && (
+            <View style={styles.methodBadge}>
+              <Text style={styles.methodBadgeText}>did:{item.method}</Text>
+            </View>
+          )}
+          {markOwners && isOwn && (
+            <View style={styles.youBadge}>
+              <Text style={styles.youBadgeText}>You</Text>
+            </View>
+          )}
+          {item.disabled && (
+            <View style={styles.disabledBadge}>
+              <Text style={styles.disabledBadgeText}>Suspended</Text>
+            </View>
+          )}
+        </View>
+        {showDomain && item.domain && (
+          <Text style={styles.subText} numberOfLines={1}>
+            {item.domain}
+          </Text>
+        )}
+        {/* Served agent names, under the name: an alias
+            for the DID, as on the detail page. */}
+        {names.length > 0 && (
+          <View style={styles.agentNamesRow}>
+            <AgentNameChips
+              names={names}
+              domain={item.domain}
+              didId={item.didId}
+              size="sm"
+              showHost={false}
+            />
+          </View>
+        )}
+        {markOwners && !isOwn && (
+          <Text style={styles.subText} numberOfLines={1}>
+            Owner: {item.owner}
+          </Text>
+        )}
+      </View>
+      <View role="cell" style={[styles.cell, columns.didId]}>
+        {item.versionCount === 0 ? (
+          <Text style={styles.statusPending}>Pending upload</Text>
+        ) : item.didId ? (
+          <View style={styles.didIdRow}>
+            <Text
+              style={[styles.didText, { width: didWidth }]}
+              numberOfLines={1}
+              aria-label={item.didId}
+              // Full DID on hover (web).
+              {...titleAttr(item.didId)}
+            >
+              {compactDid(item.didId)}
+            </Text>
+            <CopyButton value={item.didId} accessibilityLabel={`Copy DID of ${item.mnemonic}`} />
+            <DidQrButton did={item.didId} label={item.mnemonic} />
+          </View>
+        ) : (
+          <Text style={styles.subText}>Uploaded</Text>
+        )}
+      </View>
+      <View
+        role="cell"
+        style={[styles.cell, styles.cellRight, styles.cellGapAfter, columns.versions]}
+      >
+        <Text style={styles.numText}>{item.versionCount.toLocaleString()}</Text>
+      </View>
+      <View role="cell" style={[styles.cell, columns.created]}>
+        <Text style={styles.dateText}>{formatDate(item.createdAt, { withTime: true })}</Text>
+      </View>
+      <View role="cell" style={[styles.cell, columns.updated]}>
+        {/* One version has never been updated: a dash
+            lets the DIDs that have changed stand out. */}
+        {item.versionCount <= 1 ? (
+          <Text style={styles.dateTextMuted} aria-label="Never updated">
+            —
+          </Text>
+        ) : (
+          <Text style={styles.dateText}>{formatDate(item.updatedAt, { withTime: true })}</Text>
+        )}
+      </View>
+      <View role="cell" style={[styles.cell, styles.cellRight, columns.resolves]}>
+        <Text style={styles.numText}>{item.totalResolves.toLocaleString()}</Text>
+      </View>
+    </TableRow>
+  );
+});
 
 /** The DOM `title` attribute (a hover tooltip on web), which React Native's
  *  `Text` types do not list. */
@@ -673,6 +766,10 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: spacing.md,
     marginTop: spacing.sm,
+  },
+  loadMoreRow: {
+    alignItems: "center",
+    marginTop: spacing.md,
   },
   searchRow: {
     flexDirection: "row",
