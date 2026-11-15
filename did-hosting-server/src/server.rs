@@ -5,7 +5,6 @@ use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_service::{DIDCommService, DIDCommServiceConfig, ListenerEvent};
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use axum::routing::get;
-use did_hosting_common::server::domain::parse_trusted_cidrs;
 use did_hosting_common::server::store::KS_DIDS;
 use ipnetwork::IpNetwork;
 
@@ -99,13 +98,8 @@ impl AppState {
     /// fresh content cache: no identity, no resolver, no messaging service.
     /// The caller — `run`, the daemon, a test — fills in what it has.
     pub fn new(store: Store, config: AppConfig) -> Result<Self, AppError> {
-        let (parsed_cidrs, bad_cidrs) = parse_trusted_cidrs(&config.server.trusted_proxy_cidrs);
-        if !bad_cidrs.is_empty() {
-            warn!(
-                bad_cidrs = ?bad_cidrs,
-                "server.trusted_proxy_cidrs contains unparseable entries; ignoring them"
-            );
-        }
+        // Parsed (and refused when malformed) at config load.
+        let parsed_cidrs = config.server.trusted_proxy_cidrs.clone();
         // The two proxy lists are read separately (client address vs. request
         // host), and a deployment behind a proxy almost always needs both.
         if parsed_cidrs.is_empty() != config.server.trusted_proxies.is_empty() {

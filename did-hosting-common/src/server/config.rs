@@ -210,6 +210,19 @@ pub mod ip_networks {
     }
 }
 
+/// Deserialise `[server] trusted_proxy_cidrs`, naming the key in the error.
+fn deserialize_trusted_proxy_cidrs<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<IpNetwork>, D::Error> {
+    Vec::<String>::deserialize(d)?
+        .iter()
+        .map(|entry| {
+            ip_networks::parse(entry)
+                .map_err(|e| serde::de::Error::custom(format!("[server] trusted_proxy_cidrs: {e}")))
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -256,10 +269,19 @@ pub struct ServerConfig {
     ///
     /// Empty (default) disables `Forwarded` / `X-Forwarded-Host`
     /// trust — appropriate for deployments not behind a reverse
-    /// proxy. CIDRs accept `1.2.3.0/24` or `2001:db8::/32`. Behind a
-    /// proxy, list it here **and** in `trusted_proxies`.
-    #[serde(default)]
-    pub trusted_proxy_cidrs: Vec<String>,
+    /// proxy. Entries are addresses or CIDR ranges (`10.0.0.1`,
+    /// `1.2.3.0/24`, `2001:db8::/32`). Behind a proxy, list it here **and**
+    /// in `trusted_proxies`.
+    ///
+    /// Parsed when the config is loaded: an entry that is neither an address
+    /// nor a CIDR range, or a range covering every address, stops the
+    /// service at startup, naming this key and the entry.
+    #[serde(
+        default,
+        serialize_with = "ip_networks::serialize",
+        deserialize_with = "deserialize_trusted_proxy_cidrs"
+    )]
+    pub trusted_proxy_cidrs: Vec<IpNetwork>,
     /// `Cache-Control` policy for public DID-resolution responses
     /// (`[server.resolve_cache]`). Read only by the binaries that serve
     /// resolution — the server, the watcher and the daemon.
@@ -1486,13 +1508,23 @@ impl<'de> Deserialize<'de> for GracePeriod {
     }
 }
 
+/// Deserialise the grace period `[section] key`, naming the key in the error.
+fn deserialize_grace_in<'de, D: serde::Deserializer<'de>>(
+    section: &str,
+    key: &str,
+    d: D,
+) -> Result<GracePeriod, D::Error> {
+    let text = String::deserialize(d)?;
+    GracePeriod::parse(&text)
+        .map_err(|e| serde::de::Error::custom(format!("[{section}] {key}: {e}")))
+}
+
 /// Deserialise the `[hosting]` grace period `key`, naming the key in the error.
 fn deserialize_grace_for<'de, D: serde::Deserializer<'de>>(
     key: &str,
     d: D,
 ) -> Result<GracePeriod, D::Error> {
-    let text = String::deserialize(d)?;
-    GracePeriod::parse(&text).map_err(|e| serde::de::Error::custom(format!("[hosting] {key}: {e}")))
+    deserialize_grace_in("hosting", key, d)
 }
 
 fn deserialize_unassigned_purge_grace<'de, D: serde::Deserializer<'de>>(
@@ -1765,12 +1797,24 @@ pub struct IdentityConfig {
     /// Setting `"0"` is the right choice for a **compromised** key — you want
     /// the old key to stop being honoured at once and you accept that in-flight
     /// messages addressed to it will fail.
-    #[serde(default = "default_rotation_grace_period")]
-    pub rotation_grace_period: String,
+    ///
+    /// Parsed when the config is loaded: a value that is not a duration
+    /// stops the service at startup, naming this key.
+    #[serde(
+        default = "default_rotation_grace_period",
+        deserialize_with = "deserialize_rotation_grace_period"
+    )]
+    pub rotation_grace_period: GracePeriod,
 }
 
-fn default_rotation_grace_period() -> String {
-    "1h".to_string()
+fn default_rotation_grace_period() -> GracePeriod {
+    GracePeriod::parse("1h").expect("the default grace parses")
+}
+
+fn deserialize_rotation_grace_period<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<GracePeriod, D::Error> {
+    deserialize_grace_in("identity", "rotation_grace_period", d)
 }
 
 impl Default for IdentityConfig {
@@ -1783,23 +1827,10 @@ impl Default for IdentityConfig {
 }
 
 impl IdentityConfig {
-    /// The grace period in seconds.
-    ///
-    /// An unparseable value falls back to the default rather than failing the
-    /// boot: a typo in a duration string should not take the service down, and
-    /// the safe direction is to keep honouring the old key for longer, not
-    /// shorter.
+    /// The grace period in seconds. The value was validated when the config
+    /// was loaded, so there is nothing to fall back from here.
     pub fn rotation_grace_secs(&self) -> u64 {
-        match crate::server::pending_purge::parse_grace_string(&self.rotation_grace_period) {
-            Ok(secs) => secs,
-            Err(e) => {
-                tracing::warn!(
-                    value = %self.rotation_grace_period,
-                    "invalid identity.rotation_grace_period ({e}) — falling back to 1h"
-                );
-                3600
-            }
-        }
+        self.rotation_grace_period.as_secs()
     }
 }
 
@@ -2522,6 +2553,67 @@ mod tests {
                 .to_string();
             assert!(err.contains(key), "{key}: {err}");
             assert!(err.contains("s, m, h or d"), "{key}: {err}");
+        }
+    }
+
+    /// `[identity] rotation_grace_period` is parsed at load like the
+    /// `[hosting]` periods: a bad value is refused naming the key, not
+    /// quietly read as an hour.
+    #[test]
+    fn rotation_grace_period_is_parsed_at_load() {
+        let identity: IdentityConfig = toml::from_str("").unwrap();
+        assert_eq!(identity.rotation_grace_secs(), 3600, "default is 1h");
+
+        let identity: IdentityConfig = toml::from_str("rotation_grace_period = \"30m\"").unwrap();
+        assert_eq!(identity.rotation_grace_secs(), 1800);
+        let written = toml::to_string(&identity).unwrap();
+        assert!(
+            written.contains("rotation_grace_period = \"30m\""),
+            "{written}"
+        );
+        assert_eq!(
+            toml::from_str::<IdentityConfig>(&written).unwrap(),
+            identity
+        );
+
+        let identity: IdentityConfig = toml::from_str("rotation_grace_period = \"0\"").unwrap();
+        assert_eq!(identity.rotation_grace_secs(), 0, "0 retires immediately");
+
+        for value in ["1 fortnight", "soon", ""] {
+            let err =
+                toml::from_str::<IdentityConfig>(&format!("rotation_grace_period = \"{value}\""))
+                    .unwrap_err()
+                    .to_string();
+            assert!(err.contains("[identity] rotation_grace_period"), "{err}");
+            assert!(err.contains("s, m, h or d"), "{err}");
+        }
+    }
+
+    /// `[server] trusted_proxy_cidrs` is parsed at load: an entry that is not
+    /// an address or a CIDR range is refused naming the key and the entry,
+    /// not dropped with a warning.
+    #[test]
+    fn trusted_proxy_cidrs_are_parsed_at_load() {
+        let server: ServerConfig = toml::from_str(
+            "trusted_proxy_cidrs = [\"10.0.0.0/8\", \" 2001:db8::/32 \", \"192.0.2.7\"]",
+        )
+        .unwrap();
+        assert_eq!(server.trusted_proxy_cidrs.len(), 3);
+        let written = toml::to_string(&server).unwrap();
+        let reread: ServerConfig = toml::from_str(&written).unwrap();
+        assert_eq!(reread.trusted_proxy_cidrs, server.trusted_proxy_cidrs);
+
+        for entry in ["10.0.0.0/33", "proxy.internal", "", "0.0.0.0/0"] {
+            let err = toml::from_str::<ServerConfig>(&format!(
+                "trusted_proxy_cidrs = [\"10.0.0.1\", \"{entry}\"]"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("[server] trusted_proxy_cidrs"),
+                "{entry}: {err}"
+            );
+            assert!(err.contains(&format!("`{entry}`")), "{entry}: {err}");
         }
     }
 
