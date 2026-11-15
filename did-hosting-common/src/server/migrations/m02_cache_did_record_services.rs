@@ -93,60 +93,62 @@ impl Migration for M02CacheDidRecordServices {
 
             // Walk every `did:{mnemonic}` key. The prefix-scan filters out
             // the `content:` / `owner:` / `watcher_sync:` neighbours.
-            let raw = dids.prefix_iter_raw(b"did:".to_vec()).await?;
-            for (key, value) in raw {
-                let mnemonic = match std::str::from_utf8(&key) {
-                    Ok(k) => k.strip_prefix("did:").unwrap_or(k).to_string(),
-                    Err(_) => {
-                        warn!(migration_id = ID, "skipping non-UTF-8 key in dids keyspace");
+            let mut walk = dids.walk(b"did:".to_vec(), super::MIGRATION_PAGE_ROWS);
+            while let Some(rows) = walk.next_page().await? {
+                for (key, value) in rows {
+                    let mnemonic = match std::str::from_utf8(&key) {
+                        Ok(k) => k.strip_prefix("did:").unwrap_or(k).to_string(),
+                        Err(_) => {
+                            warn!(migration_id = ID, "skipping non-UTF-8 key in dids keyspace");
+                            continue;
+                        }
+                    };
+                    let mut record: DidRecord = match serde_json::from_slice(&value) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(
+                                migration_id = ID,
+                                mnemonic = %mnemonic,
+                                error = %e,
+                                "skipping unparseable DidRecord"
+                            );
+                            continue;
+                        }
+                    };
+
+                    // `Some(vec![])` is a real answer, not an empty cache.
+                    if record.services.is_some() {
+                        counters.already_cached += 1;
                         continue;
                     }
-                };
-                let mut record: DidRecord = match serde_json::from_slice(&value) {
-                    Ok(r) => r,
-                    Err(e) => {
+
+                    let Some(bytes) = dids.get_raw(content_log_key(&mnemonic)).await? else {
+                        counters.skipped_no_log += 1;
+                        continue;
+                    };
+                    let Ok(content) = String::from_utf8(bytes) else {
+                        counters.deferred_bad_log += 1;
                         warn!(
                             migration_id = ID,
                             mnemonic = %mnemonic,
-                            error = %e,
-                            "skipping unparseable DidRecord"
+                            "deferred: log content is not UTF-8"
                         );
                         continue;
-                    }
-                };
+                    };
+                    let Some(services) = extract_service_types(&content) else {
+                        counters.deferred_bad_log += 1;
+                        debug!(
+                            migration_id = ID,
+                            mnemonic = %mnemonic,
+                            "deferred: log has no parseable entry with a `state`"
+                        );
+                        continue;
+                    };
 
-                // `Some(vec![])` is a real answer, not an empty cache.
-                if record.services.is_some() {
-                    counters.already_cached += 1;
-                    continue;
+                    counters.cached += 1;
+                    record.services = Some(services);
+                    dids.insert(did_key(&mnemonic), &record).await?;
                 }
-
-                let Some(bytes) = dids.get_raw(content_log_key(&mnemonic)).await? else {
-                    counters.skipped_no_log += 1;
-                    continue;
-                };
-                let Ok(content) = String::from_utf8(bytes) else {
-                    counters.deferred_bad_log += 1;
-                    warn!(
-                        migration_id = ID,
-                        mnemonic = %mnemonic,
-                        "deferred: log content is not UTF-8"
-                    );
-                    continue;
-                };
-                let Some(services) = extract_service_types(&content) else {
-                    counters.deferred_bad_log += 1;
-                    debug!(
-                        migration_id = ID,
-                        mnemonic = %mnemonic,
-                        "deferred: log has no parseable entry with a `state`"
-                    );
-                    continue;
-                };
-
-                counters.cached += 1;
-                record.services = Some(services);
-                dids.insert(did_key(&mnemonic), &record).await?;
             }
 
             info!(

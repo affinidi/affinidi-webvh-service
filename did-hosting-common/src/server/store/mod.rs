@@ -149,6 +149,15 @@ pub trait KeyspaceOps: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// Whether [`Self::prefix_page_raw`] walks a prefix in key order with the
+    /// last key of a page as its cursor (fjall, Redis), so a caller may start
+    /// a walk *after any key it names* by passing that key as the cursor. A
+    /// hash-ordered backend (DynamoDB, Cosmos DB, Firestore) answers `false`:
+    /// its cursor is opaque and only a previous page's `next` resumes it.
+    fn pages_in_key_order(&self) -> bool {
+        false
+    }
+
     /// The keys of [`Self::prefix_iter_raw`], without their values, in no
     /// particular order. Backends that can list keys without reading values
     /// (a Redis index, a DynamoDB projection, a Cosmos DB `SELECT c.id`)
@@ -652,39 +661,127 @@ impl KeyspaceHandle {
         self.inner.prefix_count(prefix.into()).await
     }
 
-    /// Returns the approximate number of items in the keyspace.
+    /// Whether this keyspace pages in key order, so a walk may start after
+    /// any named key. See [`KeyspaceOps::pages_in_key_order`].
+    pub fn pages_in_key_order(&self) -> bool {
+        self.inner.pages_in_key_order()
+    }
+
+    /// Walk the pairs under `prefix` a page of about `page_size` keys at a
+    /// time, so a caller never holds more than one page. See [`PrefixWalk`].
+    pub fn walk(&self, prefix: impl Into<Vec<u8>>, page_size: usize) -> PrefixWalk<'_> {
+        PrefixWalk {
+            ks: self,
+            prefix: prefix.into(),
+            cursor: None,
+            page_size,
+            done: false,
+        }
+    }
+
+    /// [`Self::walk`] starting strictly after the key `after`. Only a
+    /// keyspace that [pages in key order](Self::pages_in_key_order) can
+    /// start mid-prefix; any other walks from the start of the prefix, so
+    /// check first when skipping matters.
+    pub fn walk_after(
+        &self,
+        prefix: impl Into<Vec<u8>>,
+        after: Option<Vec<u8>>,
+        page_size: usize,
+    ) -> PrefixWalk<'_> {
+        let mut walk = self.walk(prefix, page_size);
+        if self.pages_in_key_order() {
+            walk.cursor = after;
+        }
+        walk
+    }
+
+    /// The number of keys in the keyspace (counted without reading values
+    /// where the backend allows).
     pub async fn approximate_len(&self) -> Result<usize, AppError> {
-        Ok(self.prefix_iter_raw(b"").await?.len())
+        self.prefix_count(b"".to_vec()).await
     }
 
     /// Verify integrity of all entries in this keyspace.
     ///
-    /// Scans all key-value pairs and attempts to parse each value as JSON.
-    /// Returns the number of corrupted (unparseable) entries found.
-    /// Corrupted entries are logged as warnings.
+    /// Walks the keyspace a page at a time and attempts to parse each JSON
+    /// value. Returns the number of corrupted (unparseable) entries found.
+    /// Corrupted entries are logged as warnings. Memory stays at one page,
+    /// whatever the keyspace holds.
     pub async fn verify_integrity(&self) -> Result<u64, AppError> {
-        let all = self.prefix_iter_raw(b"").await?;
         let mut corrupted = 0u64;
-        for (key, value) in &all {
-            let key_str = String::from_utf8_lossy(key);
-            // Skip entries that store raw bytes, not JSON: logs (`content:`,
-            // the edge's `hw:` high-water JSONL) and reverse indexes whose
-            // value is a bare mnemonic (`owner:`, the agent-name `name:`).
-            if key_str.starts_with("content:")
-                || key_str.starts_with("owner:")
-                || key_str.starts_with("name:")
-                || key_str.starts_with("hw:")
-                || key_str.starts_with("refresh:")
-                || key_str.starts_with("ts:")
-            {
-                continue;
-            }
-            if serde_json::from_slice::<serde_json::Value>(value).is_err() {
-                tracing::warn!(key = %key_str, "integrity check: corrupted entry (invalid JSON)");
-                corrupted += 1;
+        let mut walk = self.walk(b"".to_vec(), INTEGRITY_PAGE_ROWS);
+        while let Some(rows) = walk.next_page().await? {
+            for (key, value) in rows {
+                if !holds_json(&key) {
+                    continue;
+                }
+                if serde_json::from_slice::<serde::de::IgnoredAny>(&value).is_err() {
+                    let key_str = String::from_utf8_lossy(&key);
+                    tracing::warn!(key = %key_str, "integrity check: corrupted entry (invalid JSON)");
+                    corrupted += 1;
+                }
             }
         }
         Ok(corrupted)
+    }
+}
+
+/// Rows a page of [`KeyspaceHandle::verify_integrity`] reads.
+const INTEGRITY_PAGE_ROWS: usize = 256;
+
+/// Whether a row under `key` stores JSON. Raw-byte rows are skipped by the
+/// integrity check: logs (`content:`, the edge's `hw:` high-water marks) and
+/// reverse indexes whose value is a bare mnemonic (`owner:`, the agent-name
+/// `name:`, the `domain:` index), plus the opaque `refresh:` and `ts:` rows.
+fn holds_json(key: &[u8]) -> bool {
+    const RAW: &[&[u8]] = &[
+        b"content:",
+        b"owner:",
+        b"name:",
+        b"hw:",
+        b"refresh:",
+        b"ts:",
+        b"domain:",
+    ];
+    !RAW.iter().any(|p| key.starts_with(p))
+}
+
+/// A page-at-a-time walk over a prefix ([`KeyspaceHandle::walk`]).
+///
+/// Each [`Self::next_page`] reads one [`KeyspaceHandle::prefix_page_raw`]
+/// page; on a backend that cannot page it reads the whole prefix once, as
+/// [`KeyspaceHandle::prefix_iter_raw`] would. A page may be empty while more
+/// follow; the walk ends when `next_page` answers `None`.
+pub struct PrefixWalk<'a> {
+    ks: &'a KeyspaceHandle,
+    prefix: Vec<u8>,
+    cursor: Option<Vec<u8>>,
+    page_size: usize,
+    done: bool,
+}
+
+impl PrefixWalk<'_> {
+    /// The next page's pairs, or `None` once the walk is complete.
+    pub async fn next_page(&mut self) -> Result<Option<Vec<RawKvPair>>, AppError> {
+        if self.done {
+            return Ok(None);
+        }
+        match self
+            .ks
+            .prefix_page_raw(self.prefix.clone(), self.cursor.take(), self.page_size)
+            .await?
+        {
+            Some(page) => {
+                self.cursor = page.next;
+                self.done = self.cursor.is_none();
+                Ok(Some(page.rows))
+            }
+            None => {
+                self.done = true;
+                Ok(Some(self.ks.prefix_iter_raw(self.prefix.clone()).await?))
+            }
+        }
     }
 }
 
@@ -822,6 +919,9 @@ impl FailingWrites {
 
 #[cfg(any(test, feature = "test-support"))]
 impl KeyspaceOps for FailingWrites {
+    fn pages_in_key_order(&self) -> bool {
+        self.inner.pages_in_key_order()
+    }
     fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async move {
             match self.take_write() {
@@ -903,6 +1003,9 @@ impl FailingReads {
 
 #[cfg(any(test, feature = "test-support"))]
 impl KeyspaceOps for FailingReads {
+    fn pages_in_key_order(&self) -> bool {
+        self.inner.pages_in_key_order()
+    }
     fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
         self.inner.insert_raw(key, value)
     }
