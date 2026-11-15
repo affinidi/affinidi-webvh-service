@@ -77,7 +77,7 @@ impl MigrationRunner {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "store-fjall"))]
 mod tests {
     use super::super::*;
     use super::*;

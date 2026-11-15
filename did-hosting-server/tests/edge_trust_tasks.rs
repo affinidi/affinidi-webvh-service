@@ -1106,6 +1106,40 @@ async fn a_strangers_health_ping_is_not_answered() {
     }
 }
 
+/// A ping is answered with the pinned `server/health/0.1` response, naming
+/// this edge's instance; a ping probing another instance, or one this edge
+/// does not read, is not answered. The empty ping a control plane sent before
+/// #449 is still answered (one release).
+#[tokio::test]
+async fn a_health_ping_is_answered_in_the_pinned_shape() {
+    use did_hosting_common::server::trust_tasks::infra;
+    let own = infra::instance_id_for(&edge().0);
+    for via in VIAS {
+        let (state, _dir) = edge_state().await;
+        for body in [infra::health_ping_body(&own).unwrap(), json!({})] {
+            let ping = signed(MSG_HEALTH_PING, &control(), body.clone()).await;
+            let reply = deliver(&state, via, &control().0, ping)
+                .await
+                .unwrap_or_else(|| panic!("{via:?}: {body} is answered"));
+            let pong = &reply["payload"];
+            assert_eq!(pong["instanceId"], json!(own), "{via:?}: {reply}");
+            assert_eq!(pong["ok"], true, "{via:?}: {reply}");
+            let read = infra::read_health_reply(pong).expect("a pinned health response");
+            assert_eq!(read.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        }
+        for body in [
+            infra::health_ping_body("did_example_elsewhere").unwrap(),
+            json!({ "instanceId": own, "extra": true }),
+        ] {
+            let ping = signed(MSG_HEALTH_PING, &control(), body.clone()).await;
+            assert!(
+                deliver(&state, via, &control().0, ping).await.is_none(),
+                "{via:?}: {body} is not answered"
+            );
+        }
+    }
+}
+
 /// The reconcile trusts only its control plane's signed, threaded answer: a
 /// listing signed by anyone else, left unsigned, or threaded to another
 /// request fails the reconcile and leaves the freshness mark where it was —

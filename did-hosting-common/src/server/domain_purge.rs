@@ -230,7 +230,7 @@ pub async fn purge_domain_dids_locked(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "store-fjall"))]
 mod tests {
     use super::*;
     use crate::server::config::StoreConfig;

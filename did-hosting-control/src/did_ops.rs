@@ -2738,10 +2738,13 @@ pub async fn rollback_did_to(
         }
         Some(target) => {
             if target < 1 || target as usize > lines.len() {
-                return Err(AppError::invalid(format!(
-                    "invalid target version {target}: the log holds {} entries",
-                    lines.len()
-                )));
+                return Err(AppError::validation(
+                    ValidationKind::InvalidTargetVersion,
+                    format!(
+                        "invalid target version {target}: the log holds {} entries",
+                        lines.len()
+                    ),
+                ));
             }
             target as usize
         }

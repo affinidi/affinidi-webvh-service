@@ -48,10 +48,11 @@
 //! replay).
 //!
 //! Payloads are typed and closed: registration and the replica acks by their
-//! generated types; stats sync and the health pong by this workspace's own
-//! (`did_hosting_common::{StatsSyncRequest, StatsSyncAck, HealthPong}`),
-//! because the shapes on the wire predate the `server/stats-sync/0.1` and
-//! `server/health/0.1` specifications the lock pins. Conforming them is #449.
+//! generated types; stats sync and the health pong in the pinned
+//! `server/stats-sync/0.1` and `server/health/0.1` shapes, which
+//! `did_hosting_common::server::trust_tasks::infra` builds and reads for
+//! both ends (our extras under `ext`; the pre-#449 shape still read for one
+//! release).
 //! A refusal is a `messaging::InfraRejection`, each kind its own standard
 //! code on the wire.
 
@@ -160,7 +161,6 @@ async fn dispatch_inner(
             let reply_id = uuid::Uuid::new_v4().to_string();
             match crate::messaging::do_stats_sync(state, sender, &doc.payload).await {
                 Ok(ack) => {
-                    let ack = serde_json::to_value(ack).expect("a stats ack serialises");
                     let resp = doc.respond_with(reply_id, ack);
                     debug_assert_eq!(resp.type_uri.to_string(), MSG_STATS_ACK);
                     Some(serde_json::to_value(&resp).expect("ack document serialises"))

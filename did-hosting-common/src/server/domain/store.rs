@@ -337,7 +337,7 @@ pub async fn set_default_domain(store: &Store, name: &str) -> Result<(), AppErro
     batch.commit().await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "store-fjall"))]
 mod tests {
     use super::*;
     use crate::server::config::StoreConfig;

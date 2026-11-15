@@ -403,6 +403,9 @@ impl ResolutionDomains {
 
 #[cfg(test)]
 mod tests {
+    // The tests that open a store are fjall-only (a fresh temp-dir store
+    // each); what only they use is unused on other backends.
+    #![cfg_attr(not(feature = "store-fjall"), allow(unused_imports, dead_code))]
     use super::*;
     use crate::server::acl::AclEntry;
     use crate::server::config::StoreConfig;
@@ -410,6 +413,7 @@ mod tests {
     use crate::server::domain::store::{create_domain, set_default_domain};
     use crate::server::domain::types::{DomainEntry, DomainStatus, DomainUrlScheme};
 
+    #[cfg(feature = "store-fjall")]
     async fn fjall_store() -> Store {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = StoreConfig {
@@ -560,6 +564,7 @@ mod tests {
 
     // ---- assert_host_is_active_domain ----
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn host_must_be_configured_domain() {
         let store = fjall_store().await;
@@ -570,6 +575,7 @@ mod tests {
         assert!(err.to_string().contains("not a configured domain"));
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn host_must_be_active_not_disabled() {
         let store = fjall_store().await;
@@ -583,6 +589,7 @@ mod tests {
         assert!(err.to_string().contains("disabled"));
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn active_domain_passes() {
         let store = fjall_store().await;
@@ -745,6 +752,7 @@ mod tests {
         assert_eq!(percent_decode_to_string("bad%ZZ"), None);
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn resolution_against_disabled_domain_yields_503() {
         let store = fjall_store().await;
@@ -762,6 +770,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn resolution_against_missing_domain_yields_404() {
         let store = fjall_store().await;
@@ -771,6 +780,7 @@ mod tests {
         assert!(matches!(err, AppError::NotFound(_)));
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn resolution_against_active_domain_passes() {
         let store = fjall_store().await;
@@ -786,6 +796,7 @@ mod tests {
 
     // ---- bundle: assert_resolution_allowed ----
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn resolution_allowed_empty_keyspace_is_permissive() {
         let store = fjall_store().await;
@@ -800,6 +811,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn resolution_allowed_happy_path() {
         let store = fjall_store().await;
@@ -817,6 +829,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn resolution_allowed_cross_domain_leakage_rejected() {
         // Hosted: domain-a (active) AND domain-b (active). A request
@@ -839,6 +852,7 @@ mod tests {
         assert!(matches!(err, AppError::NotFound(_)));
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn resolution_allowed_disabled_domain_returns_503() {
         let store = fjall_store().await;
@@ -855,6 +869,7 @@ mod tests {
         assert!(matches!(err, AppError::DomainDisabled { .. }));
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn resolution_allowed_missing_host_rejected_once_domains_exist() {
         let store = fjall_store().await;
@@ -869,6 +884,7 @@ mod tests {
 
     // ---- end-to-end: assert_did_host_allowed ----
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn end_to_end_happy_path() {
         let store = fjall_store().await;
@@ -887,6 +903,7 @@ mod tests {
         assert!(assert_did_host_allowed(&store, &e, did).await.is_ok());
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn end_to_end_did_host_not_configured() {
         let store = fjall_store().await;
@@ -901,6 +918,7 @@ mod tests {
         assert!(matches!(err, AppError::Validation { .. }));
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn end_to_end_acl_rejects() {
         let store = fjall_store().await;
@@ -925,6 +943,7 @@ mod tests {
         assert!(matches!(err, AppError::Forbidden(_)));
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn end_to_end_disabled_domain_rejects_with_400() {
         let store = fjall_store().await;

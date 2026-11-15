@@ -193,9 +193,13 @@ fn host_from_public_url(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    // The tests that open a store are fjall-only (a fresh temp-dir store
+    // each); what only they use is unused on other backends.
+    #![cfg_attr(not(feature = "store-fjall"), allow(unused_imports, dead_code))]
     use super::*;
     use crate::server::config::StoreConfig;
 
+    #[cfg(feature = "store-fjall")]
     async fn fjall_store() -> Store {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = StoreConfig {
@@ -206,6 +210,7 @@ mod tests {
         Store::open(&cfg).await.expect("open fjall")
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn tier_1_seeds_first_as_default_and_rest_as_extra() {
         let store = fjall_store().await;
@@ -233,6 +238,7 @@ mod tests {
         assert!(!secondary.default_domain);
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn tier_1_single_entry() {
         let store = fjall_store().await;
@@ -244,6 +250,7 @@ mod tests {
         assert_eq!(outcome.default.as_deref(), Some("only.example"));
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn tier_2_seeds_from_legacy_public_url() {
         let store = fjall_store().await;
@@ -256,6 +263,7 @@ mod tests {
         assert_eq!(outcome.default.as_deref(), Some("old.example.com"));
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn tier_2_lowercases_host() {
         let store = fjall_store().await;
@@ -266,6 +274,7 @@ mod tests {
         assert_eq!(outcome.default.as_deref(), Some("old.example.com"));
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn tier_3_empty_seed_yields_no_seed() {
         let store = fjall_store().await;
@@ -276,6 +285,7 @@ mod tests {
         assert!(list_domains(&store).await.unwrap().is_empty());
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn already_seeded_short_circuits() {
         let store = fjall_store().await;
@@ -300,6 +310,7 @@ mod tests {
         assert_eq!(listed[0].name, "a.example");
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn rejects_non_canonical_bootstrap_domain() {
         let store = fjall_store().await;
@@ -311,6 +322,7 @@ mod tests {
         assert!(matches!(err, AppError::Validation { .. }));
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn tier_1_preferred_over_tier_2_when_both_set() {
         let store = fjall_store().await;
@@ -329,6 +341,7 @@ mod tests {
         assert_eq!(listed[0].name, "preferred.example");
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn unparseable_legacy_url_falls_through_to_no_seed() {
         let store = fjall_store().await;

@@ -65,7 +65,9 @@ pub async fn dispatch(
                     None => Ok(None),
                 };
             }
-            let pong = do_health_ping(state).await;
+            let Some(pong) = do_health_ping(state, &doc.payload).await else {
+                return Ok(None);
+            };
             debug!(sender, "health ping answered (trust task)");
             Ok(Some(
                 doc.respond_with(uuid::Uuid::new_v4().to_string(), pong),
@@ -96,10 +98,37 @@ pub async fn dispatch(
     }
 }
 
-/// Transport-agnostic core of the health ping: report liveness and DID count.
+/// Transport-agnostic core of the health ping: the `server/health/0.1`
+/// response — this edge's `instanceId`, `ok`, `observedAt`, and its version
+/// and DID count under our `ext` namespace.
+///
+/// `None` — no answer — for a ping this edge does not read (closed, R3.2), or
+/// one probing an instance other than this one: answering it would report
+/// this edge's health as another's. The legacy empty ping (a control plane
+/// before #449) is answered.
 ///
 /// Shared by every transport's trust-task dispatch.
-pub(crate) async fn do_health_ping(state: &AppState) -> Value {
+pub(crate) async fn do_health_ping(state: &AppState, ping: &Value) -> Option<Value> {
+    use did_hosting_common::server::trust_tasks::infra;
+
+    let server_did = state.config.server_did.as_deref()?;
+    let own = infra::instance_id_for(server_did);
+    match infra::read_health_ping(ping) {
+        Ok(None) => {}
+        Ok(Some(probed)) if probed == own => {}
+        Ok(Some(probed)) => {
+            warn!(
+                probed,
+                own, "health ping for another instance; not answered"
+            );
+            return None;
+        }
+        Err(e) => {
+            warn!(error = %e, "health ping not read; not answered");
+            return None;
+        }
+    }
+
     let did_count = state
         .dids_ks
         .prefix_iter_raw("did:")
@@ -107,12 +136,18 @@ pub(crate) async fn do_health_ping(state: &AppState) -> Value {
         .map(|v| v.len() as u64)
         .unwrap_or(0);
 
-    serde_json::to_value(did_hosting_common::HealthPong {
-        status: "ok".into(),
-        version: Some(env!("CARGO_PKG_VERSION").into()),
-        did_count: Some(did_count),
-    })
-    .expect("a health pong serialises")
+    match infra::health_pong_body(
+        &own,
+        chrono::Utc::now(),
+        env!("CARGO_PKG_VERSION"),
+        did_count,
+    ) {
+        Ok(pong) => Some(pong),
+        Err(e) => {
+            warn!(error = %e, "health response not built");
+            None
+        }
+    }
 }
 
 /// Transport-agnostic core of the registration ack — informational only.

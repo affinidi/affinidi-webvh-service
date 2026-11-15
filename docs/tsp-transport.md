@@ -225,6 +225,15 @@ deltas are lost. **Upgrade the control plane before its servers.** Before this,
 stats were the one periodic exchange still hard-coded to DIDComm, so a
 TSP-configured pair showed a DIDComm round-trip every `stats.sync_interval_secs`.
 
+Both payloads follow the pinned specifications (#449): a sync is `instanceId` +
+`perMnemonic`, its `seq` and latest-event times under `ext.vnd.affinidi.webvh`;
+a ping names the `instanceId` it probes and the pong answers `instanceId`, `ok`,
+`observedAt`, with the edge's version and DID count under the same namespace.
+`did_hosting_common::server::trust_tasks::infra` builds and reads them for both
+ends. A 0.12 control plane still reads the pre-0.12 sync and pong; a pre-0.12
+control plane refuses the new ones, so here too: **upgrade the control plane
+before its servers.**
+
 Servers declare `trust_task_capable: true` in their registration body, under
 `ext` in the `com.affinidi.did-hosting` namespace (`server/register/0.2` is a
 closed payload). The

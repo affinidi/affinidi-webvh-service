@@ -13,7 +13,7 @@ pub mod flusher;
 pub mod keyspaces;
 #[cfg(feature = "store-redis")]
 mod redis;
-#[cfg(test)]
+#[cfg(all(test, feature = "store-fjall"))]
 pub(crate) mod test_support;
 
 pub use keyspaces::{

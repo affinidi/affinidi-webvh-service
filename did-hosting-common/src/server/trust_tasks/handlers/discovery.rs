@@ -74,7 +74,7 @@ async fn handle_inner(
     Ok(doc.respond_with(resp_id, response))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "store-fjall"))]
 mod tests {
     use super::*;
     use trust_tasks_rs::{Payload, VerificationError, handlers::InMemoryHandler};

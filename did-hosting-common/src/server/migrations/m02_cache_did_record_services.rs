@@ -163,7 +163,7 @@ impl Migration for M02CacheDidRecordServices {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "store-fjall"))]
 mod tests {
     use super::super::MigrationRunner;
     use super::*;

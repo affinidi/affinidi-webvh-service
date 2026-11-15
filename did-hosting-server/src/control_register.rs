@@ -156,7 +156,7 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
     let body = json!({
         // The control plane keys the registry by the signer's DID with `:`
         // replaced, and refuses any other `instanceId`.
-        "instanceId": server_did.replace(':', "_"),
+        "instanceId": did_hosting_common::server::trust_tasks::infra::instance_id_for(&server_did),
         "did": server_did,
         "publicUrl": public_url,
         "label": "did-hosting-server",
