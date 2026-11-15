@@ -47,11 +47,11 @@ pub enum Command {
     /// 2. Run again with `--setup-key-file <path>` to drive the rest of
     ///    the wizard reusing the persisted setup DID.
     Setup {
-        /// Phase 1: mint an ephemeral did:key, persist to <path>, and
+        /// Phase 1: mint an ephemeral did:key, persist to `<path>`, and
         /// print the `pnm contexts create` command + exit.
         #[arg(long, conflicts_with = "setup_key_file")]
         setup_key_out: Option<PathBuf>,
-        /// Phase 2: reuse the setup DID persisted at <path>; skip the
+        /// Phase 2: reuse the setup DID persisted at `<path>`; skip the
         /// interactive "Has the context been created?" confirmation.
         #[arg(long, conflicts_with = "setup_key_out")]
         setup_key_file: Option<PathBuf>,
