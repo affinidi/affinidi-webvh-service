@@ -732,14 +732,13 @@ pub(crate) async fn rollback(
         did_ops::rollback_did_to(&auth, state, &p.mnemonic, Some(p.target_version.get()))
             .await
             .map_err(|e| match e {
-                AppError::Validation { message, .. }
-                    if message.starts_with("invalid target version") =>
-                {
-                    TaskError::Declared(
-                        rollback::v0_1::error_codes::INVALID_TARGET_VERSION,
-                        message,
-                    )
-                }
+                AppError::Validation {
+                    kind: did_hosting_common::server::error::ValidationKind::InvalidTargetVersion,
+                    message,
+                } => TaskError::Declared(
+                    rollback::v0_1::error_codes::INVALID_TARGET_VERSION,
+                    message,
+                ),
                 other => other.into(),
             })?;
     typed(

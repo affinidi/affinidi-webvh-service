@@ -648,6 +648,9 @@ fn unrouted_error(payload: ErrorPayload) -> ErrorResponse {
 
 #[cfg(test)]
 mod tests {
+    // The tests that open a store are fjall-only (a fresh temp-dir store
+    // each); what only they use is unused on other backends.
+    #![cfg_attr(not(feature = "store-fjall"), allow(unused_imports, dead_code))]
     use super::*;
 
     const DID_REGISTER: &str =
@@ -663,6 +666,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(feature = "store-fjall")]
     async fn acl_with(did: &str) -> crate::server::store::KeyspaceHandle {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = crate::server::config::StoreConfig {
@@ -693,6 +697,7 @@ mod tests {
         acl
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn a_raised_limit_is_granted_only_to_a_known_issuer() {
         let acl = acl_with("did:web:admin.example").await;
@@ -714,6 +719,7 @@ mod tests {
 
     /// A failed ACL read says nothing about the issuer: the large document is
     /// deferred with a retry time, not refused as oversized for a stranger.
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn a_throttled_acl_read_defers_a_large_document() {
         let acl = acl_with("did:web:admin.example").await.throttled_reads();
@@ -734,6 +740,7 @@ mod tests {
     /// Repeated large documents from one address, all naming the same known
     /// (but not yet verified) issuer, are refused once the address's budget
     /// is spent — the DoS amplification the module docs describe.
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn repeated_large_documents_from_one_address_are_refused_past_the_budget() {
         let acl = acl_with("did:web:admin.example").await;
@@ -762,6 +769,7 @@ mod tests {
     /// A verified known issuer, still within its address's budget, is
     /// granted the raised limit and settles for free — no penalty when the
     /// verified issuer is exactly the one it claimed.
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn a_verified_known_issuer_within_its_budget_passes() {
         let acl = acl_with("did:web:admin.example").await;
@@ -967,6 +975,7 @@ mod tests {
     }
 
     /// A claim that verifies halves its address's raised cost.
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn a_verified_claim_relieves_its_address() {
         let acl = acl_with("did:web:admin.example").await;
@@ -987,6 +996,7 @@ mod tests {
 
     /// A `did:scid` issuer that names its `?src=` locator is the identity the
     /// verifier reports without it: not a mismatch, and not penalised.
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn a_did_scid_issuer_with_its_locator_is_not_penalised() {
         let identity = "did:scid:vh:1:QmScidIssuer";
@@ -1060,6 +1070,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn small_documents_are_never_charged() {
         let acl = acl_with("did:web:admin.example").await;

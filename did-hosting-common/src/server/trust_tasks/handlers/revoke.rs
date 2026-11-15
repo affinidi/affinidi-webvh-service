@@ -274,7 +274,7 @@ fn internal<P>(doc: &TrustTask<P>, err: AppError) -> ErrorResponse {
     reject_with(doc, err.failure_reject_reason().into())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "store-fjall"))]
 mod tests {
     use super::*;
     use trust_tasks_rs::{Payload, VerificationError, handlers::InMemoryHandler};

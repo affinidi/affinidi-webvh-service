@@ -695,6 +695,9 @@ fn map_app_error(e: &AppError, codes: &'static [DeclaredErrorCode]) -> Mapped {
                 ValidationKind::InvalidWitness => {
                     pick(&["invalidWitness"], StandardCode::MalformedRequest)
                 }
+                ValidationKind::InvalidTargetVersion => {
+                    pick(&["invalidTargetVersion"], StandardCode::MalformedRequest)
+                }
                 // An edge-side history refusal; on a publish the same check
                 // is reported as an invalid log (`publication_error`).
                 ValidationKind::HistoryRewrite

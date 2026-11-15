@@ -145,15 +145,16 @@ pub(crate) async fn check(
     cx.admin().await?;
     let state = cx.state;
     let code = check::v0_2::error_codes::NOT_FOUND;
-    let instance = registry::get_instance(&state.registry_ks, &p.instance_id)
+    registry::get_instance(&state.registry_ks, &p.instance_id)
         .await?
         .ok_or_else(|| {
             TaskError::Declared(code, format!("no instance `{}`", p.instance_id.as_str()))
         })?;
     let now = crate::auth::session::now_epoch();
     let interval = state.config.registry.health_check_interval.max(10);
-    let status = registry::health_status_from_timestamp(&instance, now, interval);
-    registry::update_instance_status(&state.registry_ks, &p.instance_id, status, now).await?;
+    // Re-derived from the last successful check, which this does not stamp:
+    // asking for a verdict is not a successful check.
+    registry::reevaluate_status(&state.registry_ks, &p.instance_id, now, interval).await?;
     if let Err(e) = registry::refresh_advertised_services(
         &state.registry_ks,
         &p.instance_id,

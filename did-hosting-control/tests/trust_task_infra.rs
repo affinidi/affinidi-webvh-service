@@ -319,7 +319,13 @@ async fn health_pong_trust_task_marks_active_and_is_terminal() {
         MSG_HEALTH_PONG,
         SERVER_DID,
         CONTROL_DID,
-        json!({ "status": "ok", "version": "0.7.0", "did_count": 3 }),
+        did_hosting_common::server::trust_tasks::infra::health_pong_body(
+            &instance_id_for(SERVER_DID),
+            chrono::Utc::now(),
+            "0.7.0",
+            3,
+        )
+        .expect("a health response"),
     )
     .expect("MSG_HEALTH_PONG must parse as a #response TypeUri");
 
@@ -355,7 +361,26 @@ fn owns_only_register_health_pong_and_stats_sync() {
 // Stats sync keys its replay window on a process-wide map, so each test uses
 // its own server DID to stay independent of the others running alongside it.
 
+/// A `server/stats-sync/0.1` payload in the pinned shape, as an edge sends it.
 fn stats_body(server_did: &str, seq: u64, resolves: u64) -> Value {
+    use did_hosting_common::server::trust_tasks::infra;
+    infra::stats_sync_body(
+        &infra::instance_id_for(server_did),
+        seq,
+        &[did_hosting_common::DidStatsDelta {
+            mnemonic: "alice".into(),
+            resolve_delta: resolves,
+            update_delta: 0,
+            last_resolved_at: Some(now_epoch()),
+            last_updated_at: None,
+        }],
+    )
+    .expect("a stats-sync payload")
+}
+
+/// The same sync in the shape edges sent before #449, which a control plane
+/// still reads for one release.
+fn legacy_stats_body(server_did: &str, seq: u64, resolves: u64) -> Value {
     json!({
         "server_did": server_did,
         "seq": seq,
@@ -385,7 +410,7 @@ async fn stats_sync_trust_task_records_deltas_and_acks() {
         .expect("stats sync must produce an ack");
 
     assert_eq!(resp["type"], MSG_STATS_ACK, "got {resp}");
-    assert_eq!(resp["payload"]["status"], "accepted");
+    assert_eq!(resp["payload"]["accepted"], 1, "got {resp}");
     assert_eq!(h.state.stats_collector.get_aggregate().total_resolves, 5);
 
     // A replay of the same sequence is acked but not double-counted.
@@ -394,8 +419,27 @@ async fn stats_sync_trust_task_records_deltas_and_acks() {
     let resp = trust_tasks_infra::dispatch(&h.state, DID, Some(ObservedTransport::Tsp), replay)
         .await
         .expect("ack");
-    assert_eq!(resp["payload"]["status"], "skipped");
+    assert_eq!(resp["payload"]["accepted"], 0);
+    assert_eq!(
+        resp["payload"]["ext"]["vnd.affinidi.webvh"]["skipped"],
+        "stale_seq"
+    );
     assert_eq!(h.state.stats_collector.get_aggregate().total_resolves, 5);
+
+    // An edge not yet upgraded past #449 is still counted (one release).
+    let legacy = build_request(
+        MSG_STATS_SYNC,
+        DID,
+        CONTROL_DID,
+        legacy_stats_body(DID, 2, 3),
+    )
+    .expect("build");
+    let resp = trust_tasks_infra::dispatch(&h.state, DID, Some(ObservedTransport::Tsp), legacy)
+        .await
+        .expect("ack");
+    assert_eq!(resp["type"], MSG_STATS_ACK, "got {resp}");
+    assert_eq!(resp["payload"]["accepted"], 1, "got {resp}");
+    assert_eq!(h.state.stats_collector.get_aggregate().total_resolves, 8);
 }
 
 /// Stats writes are ACL-gated like the REST and DIDComm routes: an Owner-role
@@ -486,6 +530,7 @@ async fn pong_updates_observed_inbound_transport() {
         MSG_HEALTH_PONG,
         SERVER_DID,
         CONTROL_DID,
+        // The pong edges sent before #449, still read for one release.
         json!({ "status": "ok" }),
     )
     .expect("build");

@@ -116,3 +116,36 @@ async fn redis_indexes_rows_written_before_the_index() {
     ks.remove(format!("{ns}:legacy")).await.unwrap();
     assert_eq!(ks.prefix_count(prefix).await.unwrap(), 0);
 }
+
+/// A database none of whose rows belongs to a known keyspace (another app's
+/// keys, or only other namespaces') still opens: no `SCAN` batch has
+/// anything to index, and an empty pipeline must not be sent (#470).
+#[cfg(feature = "store-redis")]
+#[tokio::test]
+async fn redis_opens_a_database_with_no_rows_to_index() {
+    use redis::AsyncCommands;
+
+    let Some(mut config) = configured() else {
+        eprintln!("skipping: WEBVH_TEST_REDIS_URL is not set");
+        return;
+    };
+    // A database of its own (15), so what is in it is known exactly.
+    let mut url = url::Url::parse(config.redis_url.as_deref().unwrap()).unwrap();
+    url.set_path("/15");
+    config.redis_url = Some(url.to_string());
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = redis::cmd("FLUSHDB").query_async(&mut conn).await.unwrap();
+    for n in 0..3 {
+        let _: () = conn.set(format!("other_app:{n}"), "x").await.unwrap();
+    }
+
+    let store = Store::open(&config)
+        .await
+        .expect("a database with nothing to index opens");
+    let marker: Option<String> = conn.get("__index_version__").await.unwrap();
+    assert_eq!(marker.as_deref(), Some("1"));
+    let dids = store.keyspace("dids").unwrap();
+    assert_eq!(dids.prefix_count("").await.unwrap(), 0);
+    let _: () = redis::cmd("FLUSHDB").query_async(&mut conn).await.unwrap();
+}

@@ -213,6 +213,17 @@ A server with `trustTaskCapable: false` is always pinged over DIDComm no matter
 what it advertises; the card says so rather than leaving the operator to wonder
 why a TSP-advertising node never shows TSP.
 
+### Infrastructure payloads
+
+Both payloads follow the pinned specifications (#449): a stats sync is
+`instanceId` + `perMnemonic`, its `seq` and latest-event times under
+`ext.vnd.affinidi.webvh`; a health ping names the `instanceId` it probes and the
+pong answers `instanceId`, `ok`, `observedAt`, with the edge's version and DID
+count under the same namespace. `did_hosting_common::server::trust_tasks::infra`
+builds and reads them for both ends. A 0.12 control plane still reads the
+pre-0.12 sync and pong; a pre-0.12 control plane refuses the new ones, so
+**upgrade the control plane before its servers.**
+
 ## Unified dispatch
 
 All three transports — HTTPS `POST /api/trust-tasks`, the DIDComm trust-task

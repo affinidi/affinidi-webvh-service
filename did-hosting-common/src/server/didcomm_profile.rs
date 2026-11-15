@@ -936,6 +936,7 @@ mod tests {
     /// carries the persistent relationship store (a rebuild that dropped it
     /// would forget every TSP peer).
     #[cfg(feature = "store-fjall")]
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn own_listener_config_carries_the_transports_and_tsp_relationship_store() {
         use affinidi_messaging_didcomm_service::Protocols;

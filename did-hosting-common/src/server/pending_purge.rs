@@ -283,9 +283,13 @@ pub fn parse_grace_string(s: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
+    // The tests that open a store are fjall-only (a fresh temp-dir store
+    // each); what only they use is unused on other backends.
+    #![cfg_attr(not(feature = "store-fjall"), allow(unused_imports, dead_code))]
     use super::*;
     use crate::server::config::StoreConfig;
 
+    #[cfg(feature = "store-fjall")]
     async fn fjall_store() -> Store {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = StoreConfig {
@@ -296,6 +300,7 @@ mod tests {
         Store::open(&cfg).await.expect("open fjall")
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn schedule_then_get() {
         let store = fjall_store().await;
@@ -311,6 +316,7 @@ mod tests {
         assert_eq!(fetched.reason, "grace-expired");
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn schedule_replaces_existing_and_resets_timer() {
         let store = fjall_store().await;
@@ -328,6 +334,7 @@ mod tests {
         assert_eq!(new.grace_seconds, 120);
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn cancel_removes_existing() {
         let store = fjall_store().await;
@@ -341,6 +348,7 @@ mod tests {
         assert!(get(&store, "a.example").await.unwrap().is_none());
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn cancel_missing_is_no_op() {
         let store = fjall_store().await;
@@ -348,6 +356,7 @@ mod tests {
         assert_eq!(outcome, CancelOutcome::Missing);
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn list_yields_every_pending() {
         let store = fjall_store().await;

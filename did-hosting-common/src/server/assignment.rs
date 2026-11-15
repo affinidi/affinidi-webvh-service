@@ -215,7 +215,7 @@ pub async fn list(store: &Store) -> Result<Vec<AssignmentEntry>, AppError> {
     Ok(out)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "store-fjall"))]
 mod tests {
     use super::*;
     use crate::server::config::StoreConfig;

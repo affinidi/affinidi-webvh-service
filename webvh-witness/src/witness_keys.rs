@@ -759,8 +759,13 @@ mod tests {
     }
 
     /// Two processes starting together on one store and one secret store
-    /// make one key: both end with it, it is recorded once, and the claim
-    /// was taken twice.
+    /// make one key: both end with it and it is recorded once.
+    ///
+    /// How many claims were taken depends on the interleaving, and is not
+    /// what is under test (#464): when the second start reads the secret
+    /// store after the first has written its key, it adopts that key without
+    /// claiming, so the counter is 1; when both find the store empty, the
+    /// loser claims too and waits, so it is 2. Either way one key is made.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_starts_at_once_make_one_key() {
         let (store, _dir) = temp_store().await;
@@ -774,8 +779,47 @@ mod tests {
             ks.get::<String>(KEK_PUBLIC_KEY).await.unwrap(),
             Some(a.public_multibase())
         );
-        // The counter is now at 2; one more increment shows it.
-        assert_eq!(ks.incr_raw(KEK_CLAIM_KEY).await.unwrap(), 3);
+        assert_eq!(
+            a_store
+                .get()
+                .await
+                .unwrap()
+                .map(|k| k.get_public_bytes().to_vec()),
+            Some(a.public.to_vec())
+        );
+        // One more increment shows how many claims there were: one or two.
+        let claims = ks.incr_raw(KEK_CLAIM_KEY).await.unwrap() - 1;
+        assert!((1..=2).contains(&claims), "{claims} claims");
+    }
+
+    /// The contended path, made deterministic: a start that finds the claim
+    /// already taken and the secret store empty waits for the claimant's
+    /// key and adopts it, without making one of its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_start_that_loses_the_claim_adopts_the_winners_key() {
+        let (store, _dir) = temp_store().await;
+        let ks = store.keyspace(crate::store::KS_WITNESSES).unwrap();
+        let secrets_dir = tempfile::tempdir().unwrap();
+        let (winner_store, loser_store) = (kek_store(&secrets_dir), kek_store(&secrets_dir));
+        // The winner's claim, taken before the loser looks.
+        assert_eq!(ks.incr_raw(KEK_CLAIM_KEY).await.unwrap(), 1);
+        let loser = tokio::spawn({
+            let ks = ks.clone();
+            async move { load_or_create(&loser_store, &ks).await }
+        });
+        // The winner finishes creating its key while the loser waits.
+        let keys = WitnessKeys::generate().unwrap();
+        winner_store.try_set(&keys.kek).await.ok().unwrap();
+        ks.insert(KEK_PUBLIC_KEY, &keys.public_multibase())
+            .await
+            .unwrap();
+        let adopted = loser.await.unwrap().unwrap();
+        assert_eq!(adopted.public_multibase(), keys.public_multibase());
+        assert_eq!(
+            ks.incr_raw(KEK_CLAIM_KEY).await.unwrap(),
+            3,
+            "the loser claimed too"
+        );
     }
 
     /// A create the secret store refused releases its claim, so the next
