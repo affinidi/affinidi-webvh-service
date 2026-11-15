@@ -102,7 +102,7 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
     eprintln!("  The control plane's DID will be published at <url>/<path>/did.jsonl.");
     eprintln!();
     let did_hosting_url =
-        setup_prompts::prompt_long_value("DID hosting URL (e.g. https://did.example.com)", false)
+        setup_prompts::prompt_url("DID hosting URL (e.g. https://did.example.com)", false)
             .map_err(|e| AppError::Config(format!("input error: {e}")))?;
     let did_hosting_url = did_hosting_url.trim_end_matches('/').to_string();
 
@@ -166,6 +166,7 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
     let public_url: String = Input::new()
         .with_prompt("Public URL")
         .default("http://localhost:8532".into())
+        .validate_with(|v: &String| setup_prompts::validate_url(v).map(|_| ()))
         .interact_text()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
     let public_url = if public_url.is_empty() {
@@ -233,7 +234,7 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         features: FeaturesConfig {
             didcomm,
             tsp,
-            rest_api: true,
+            http_listener: true,
             ..Default::default()
         },
         server_did: Some(outcome.integration_did.clone()),
@@ -313,9 +314,7 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
 
     if admin_idx <= 1 {
         let admin_did = if admin_idx == 0 {
-            let did: String = Input::new()
-                .with_prompt("Admin DID")
-                .interact_text()
+            let did: String = setup_prompts::prompt_did("Admin DID", false)
                 .map_err(|e| AppError::Config(format!("input error: {e}")))?;
             did
         } else {
@@ -453,11 +452,10 @@ async fn run_online_provision(
     eprintln!();
     eprintln!("  Authenticating to the VTA.");
     eprintln!();
-    let vta_did =
-        setup_prompts::prompt_long_value("VTA DID (e.g. did:webvh:vta.example.com)", false)?;
+    let vta_did = setup_prompts::prompt_did("VTA DID (e.g. did:webvh:vta.example.com)", false)?;
     let context_id: String = Input::new()
         .with_prompt("Context ID")
-        .default("webvh".to_string())
+        .default("did-hosting".to_string())
         .interact_text()?;
 
     // The did-hosting-control template needs a MEDIATOR_DID up-front (it
@@ -467,7 +465,7 @@ async fn run_online_provision(
     eprintln!("  The mediator DID is embedded in the control plane's DID document");
     eprintln!("  and reused at runtime for outbound DIDComm.");
     eprintln!();
-    let vta_mediator = vta_setup::resolve_vta_mediator(&vta_did).await;
+    let vta_mediator = vta_setup::discover_vta_mediator(&vta_did).await;
     let mut mediator_options: Vec<String> = Vec::new();
     if let Some(ref did) = vta_mediator {
         mediator_options.push(format!("Use VTA's mediator ({did})"));
@@ -483,7 +481,7 @@ async fn run_online_provision(
             .clone()
             .expect("Use VTA option only present when discovered")
     } else {
-        setup_prompts::prompt_long_value("Mediator DID", false)?
+        setup_prompts::prompt_did("Mediator DID", false)?
     };
 
     let setup_key = match preloaded_setup_key {
@@ -626,7 +624,7 @@ pub async fn run_setup_offline_prepare(
     let config_output = PathBuf::from(output_path);
 
     let did_hosting_url =
-        setup_prompts::prompt_long_value("DID hosting URL (e.g. https://did.example.com)", false)
+        setup_prompts::prompt_url("DID hosting URL (e.g. https://did.example.com)", false)
             .map_err(|e| AppError::Config(format!("input error: {e}")))?;
     let did_hosting_url = did_hosting_url.trim_end_matches('/').to_string();
 
@@ -643,7 +641,7 @@ pub async fn run_setup_offline_prepare(
     eprintln!();
     let context_id: String = Input::new()
         .with_prompt("VTA context ID")
-        .default("webvh".to_string())
+        .default("did-hosting".to_string())
         .interact_text()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
 
@@ -652,7 +650,7 @@ pub async fn run_setup_offline_prepare(
     eprintln!("  In the offline flow we can't auto-discover the VTA's mediator,");
     eprintln!("  so enter the mediator DID manually or skip.");
     eprintln!();
-    let mediator_raw = setup_prompts::prompt_long_value("Mediator DID (leave empty to skip)", true)
+    let mediator_raw = setup_prompts::prompt_did("Mediator DID (leave empty to skip)", true)
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
     let mediator_did = if mediator_raw.trim().is_empty() {
         None
@@ -678,6 +676,7 @@ pub async fn run_setup_offline_prepare(
     let public_url: String = Input::new()
         .with_prompt("Public URL")
         .default("http://localhost:8532".into())
+        .validate_with(|v: &String| setup_prompts::validate_url(v).map(|_| ()))
         .interact_text()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
     let public_url = if public_url.is_empty() {
@@ -737,9 +736,7 @@ pub async fn run_setup_offline_prepare(
 
     let admin = match admin_idx {
         0 => {
-            let did: String = Input::new()
-                .with_prompt("Admin DID")
-                .interact_text()
+            let did: String = setup_prompts::prompt_did("Admin DID", false)
                 .map_err(|e| AppError::Config(format!("input error: {e}")))?;
             AdminChoice::Did(did)
         }
@@ -924,7 +921,7 @@ pub async fn run_setup_offline_complete(
         features: FeaturesConfig {
             didcomm,
             tsp,
-            rest_api: true,
+            http_listener: true,
             ..Default::default()
         },
         server_did: Some(result.did.clone()),

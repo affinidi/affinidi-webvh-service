@@ -218,7 +218,7 @@ pub async fn apply_recipe(
     // is HTTP-only. Applies to both VTA-provisioned and self-managed modes.
     let (didcomm, tsp) = recipe.identity.transport_flags()?;
     let features = did_hosting_common::server::config::FeaturesConfig {
-        rest_api: enable.control || enable.server,
+        http_listener: enable.control || enable.server,
         didcomm,
         tsp,
         ..Default::default()
@@ -357,6 +357,7 @@ pub async fn apply_recipe(
             }
             OwnDidImport::HeldByAnother { existing, minted } => {
                 return Err(AppError::Config(stale_own_did_message(
+                    "did-hosting-daemon",
                     &did_path,
                     existing.as_deref(),
                     &minted,

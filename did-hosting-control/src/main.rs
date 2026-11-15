@@ -39,8 +39,8 @@ enum Command {
         /// interactive "Has the context been created?" confirmation.
         #[arg(long, conflicts_with = "setup_key_out")]
         setup_key_file: Option<PathBuf>,
-        /// Context id for phase 1's PNM command. Defaults to `webvh`.
-        #[arg(long, default_value = "webvh", requires = "setup_key_out")]
+        /// Context id for phase 1's PNM command. Defaults to `did-hosting`.
+        #[arg(long, default_value = "did-hosting", requires = "setup_key_out")]
         context: String,
         /// Path to a declarative setup recipe TOML. Drives the wizard
         /// non-interactively. See `examples/did-hosting-control-build.toml`.
@@ -61,8 +61,14 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Run health check diagnostics
-    Health,
+    /// Run health check diagnostics. Exits non-zero when a check fails (or,
+    /// with --strict, warns), so it can gate a deploy or a container probe.
+    Health {
+        /// Also exit non-zero when a check only warned (a store held by the
+        /// running service, plaintext secrets, a non-2xx reachability probe).
+        #[arg(long)]
+        strict: bool,
+    },
     /// Add an ACL entry
     AddAcl {
         /// DID to add to the ACL
@@ -80,16 +86,16 @@ enum Command {
     /// Show a DID's statistics resolution, recorded tier and totals
     /// (offline; stop the service first).
     StatsShow {
-        /// The DID's path (mnemonic).
-        #[arg(long)]
+        /// The DID's path (mnemonic), e.g. ".well-known" or "my-org".
+        #[arg(long, visible_alias = "path")]
         mnemonic: String,
     },
     /// Set a DID's statistics resolution (offline; stop the service first):
     /// `auto` (by traffic), `fine` (always 5-minute detail), `coarse` (never
     /// promoted) or `off` (totals only). Applied at the next start.
     StatsSet {
-        /// The DID's path (mnemonic).
-        #[arg(long)]
+        /// The DID's path (mnemonic), e.g. ".well-known" or "my-org".
+        #[arg(long, visible_alias = "path")]
         mnemonic: String,
         /// auto, fine, coarse or off.
         #[arg(long, value_parser = ["auto", "fine", "coarse", "off"])]
@@ -241,7 +247,7 @@ enum Command {
         /// VTA context the integration will live in. Embedded as
         /// `contextHint` in the request so the VTA admin can run
         /// `vta bootstrap provision-integration` without `--context`.
-        #[arg(long, default_value = "webvh")]
+        #[arg(long, default_value = "did-hosting")]
         context: String,
     },
     /// Step 1/2 of the offline (air-gapped VTA) setup wizard.
@@ -423,11 +429,12 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::Health) => {
-            if let Err(e) = health::run_health(cli.config).await {
-                eprintln!("Health check error: {e}");
-                std::process::exit(1);
-            }
+        Some(Command::Health { strict }) => {
+            let code = did_hosting_common::server::health::finish(
+                health::run_health(cli.config).await,
+                strict,
+            );
+            std::process::exit(code);
         }
         Some(Command::AddAcl { did, role, label }) => {
             if let Err(e) = run_add_acl(cli.config, did, role, label).await {
@@ -1183,4 +1190,9 @@ async fn run_identity_rotate_keys(
     eprintln!();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_reference_tests {
+    did_hosting_common::cli_reference_test!(super::Cli, "did-hosting-control");
 }

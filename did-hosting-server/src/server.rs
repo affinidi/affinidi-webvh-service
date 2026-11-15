@@ -243,7 +243,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         Err(e) => warn!(error = %e, "high-water mark migration failed; legacy rows are still read"),
     }
     // Auto-bootstrap DIDs if public_url is set and they don't exist yet
-    let config = auto_bootstrap_dids(config, &store, &dids_ks, &secrets).await;
+    let config =
+        auto_bootstrap_dids("did-hosting-server", config, &store, &dids_ks, &secrets).await;
 
     // Load the service's own identity (requires server_did). Resolves the DID
     // document for the *real* verification-method key IDs and seeds the secrets
@@ -1053,7 +1054,11 @@ pub async fn run_first_boot_init(store: &Store, config: &AppConfig) {
 /// The server is a read-only edge node — it does not auto-create DIDs.
 /// The setup wizard or `bootstrap-did` CLI command creates the server's
 /// identity DID. This function only verifies and logs what's present.
+///
+/// `bin` is the binary the operator runs (`did-hosting-server`,
+/// `did-hosting-daemon`); the commands the log suggests are its own.
 pub async fn auto_bootstrap_dids(
+    bin: &str,
     config: AppConfig,
     _store: &Store,
     dids_ks: &KeyspaceHandle,
@@ -1075,7 +1080,7 @@ pub async fn auto_bootstrap_dids(
                 path = %mnemonic,
                 "server DID not found in store — DID resolution will fail"
             );
-            error!("  To create it, run:  did-hosting-server bootstrap-did --path {mnemonic}");
+            error!("  To create it, run:  {bin} bootstrap-did --path {mnemonic}");
             error!("  Then update server_did in config.toml with the new DID");
         }
     }
@@ -1084,7 +1089,7 @@ pub async fn auto_bootstrap_dids(
     // a record. Each one is listed only at debug level.
     match dids_ks.prefix_count("did:").await {
         Ok(0) => {
-            warn!("no DIDs in store — run `did-hosting-server bootstrap-did` to create one")
+            warn!("no DIDs in store — run `{bin} bootstrap-did` to create one")
         }
         Ok(count) => {
             info!(count, "DIDs in store");

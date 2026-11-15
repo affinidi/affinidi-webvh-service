@@ -361,7 +361,7 @@ mod tests {
         let ts = TestServer::start_with(TestServerOptions::default().agent_names(false)).await;
         assert!(!ts.state.config.features.agent_names);
         assert!(!ts.state.config.features.didcomm);
-        assert!(!ts.state.config.features.rest_api);
+        assert!(!ts.state.config.features.http_listener);
     }
 
     /// `seed_did` leaves a slot a publish or agent-name op can find: the record

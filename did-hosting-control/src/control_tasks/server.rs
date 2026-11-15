@@ -9,8 +9,6 @@ use did_hosting_common::tasks::did_management::{
 use serde_json::{Value, json};
 use tracing::warn;
 
-use did_hosting_common::server::pending_purge::parse_grace_string;
-
 use super::{Cx, TaskError, at, typed};
 use crate::did_ops;
 use crate::error::AppError;
@@ -40,9 +38,10 @@ pub(crate) async fn info(
         "serviceNames".into(),
         json!(super::queries::server_agent_names(state).await),
     );
-    if let Ok(grace) = parse_grace_string(&state.config.hosting.disable_purge_grace) {
-        body.insert("domainPurgeGraceSeconds".into(), json!(grace));
-    }
+    body.insert(
+        "domainPurgeGraceSeconds".into(),
+        json!(state.config.hosting.disable_purge_grace.as_secs()),
+    );
     typed(Value::Object(body), "server/info response")
 }
 
@@ -62,11 +61,7 @@ pub(crate) async fn config(
     body.insert("softwareVersion".into(), json!(env!("CARGO_PKG_VERSION")));
     body.insert(
         "deploymentMode".into(),
-        json!(if c.features.deployment_mode.is_empty() {
-            "control".to_string()
-        } else {
-            c.features.deployment_mode.clone()
-        }),
+        json!(c.features.deployment_mode.as_str()),
     );
     if let Some(url) = c.public_url.as_deref().and_then(without_credentials) {
         body.insert("publicUrl".into(), json!(url));
