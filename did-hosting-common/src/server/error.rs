@@ -261,6 +261,9 @@ pub enum ValidationKind {
     /// The request names a domain the caller may not use, or that is not
     /// served (`did-management:unknown_domain`).
     UnknownDomain,
+    /// A version number outside the slot's log (a rollback target below 1 or
+    /// past the last entry).
+    InvalidTargetVersion,
     Other,
 }
 
@@ -488,6 +491,7 @@ impl AppError {
                 ValidationKind::HistoryRewrite
                 | ValidationKind::Deactivated
                 | ValidationKind::UnknownDomain
+                | ValidationKind::InvalidTargetVersion
                 | ValidationKind::Other => "e.p.did.validation-error",
             },
             // Legacy did-management DIDComm codes for agent-name failures. The
@@ -680,6 +684,7 @@ mod response_tests {
             ValidationKind::HistoryRewrite,
             ValidationKind::Deactivated,
             ValidationKind::UnknownDomain,
+            ValidationKind::InvalidTargetVersion,
         ] {
             assert_eq!(
                 AppError::validation(kind, "x").didcomm_code(),

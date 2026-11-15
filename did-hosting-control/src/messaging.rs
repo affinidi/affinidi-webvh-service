@@ -210,8 +210,8 @@ pub(crate) async fn do_stats_sync(
     state: &AppState,
     signer: &str,
     body: &Value,
-) -> Result<did_hosting_common::StatsSyncAck, InfraRejection> {
-    use did_hosting_common::{StatsSyncAck, StatsSyncRequest, StatsSyncStatus};
+) -> Result<Value, InfraRejection> {
+    use did_hosting_common::server::trust_tasks::infra;
 
     // Require Service role — matches REST `/api/control/stats` which is gated
     // on ServiceAuth. An Owner-role DID must not be able to write per-DID
@@ -227,39 +227,49 @@ pub(crate) async fn do_stats_sync(
     }
 
     // The body is typed and closed (R3.2): a member this service does not
-    // read is refused rather than silently dropped.
-    let body: StatsSyncRequest = serde_json::from_value(body.clone()).map_err(|e| {
+    // read is refused rather than silently dropped. The pinned
+    // `server/stats-sync/0.1` shape, or for one release the shape edges
+    // sent before #449 (`infra::read_stats_sync`).
+    let body = infra::read_stats_sync(body).map_err(|e| {
         warn!(did = signer, error = %e, "stats sync rejected: malformed payload");
-        InfraRejection::malformed("not a stats-sync payload this service reads")
+        InfraRejection::malformed(format!("not a stats-sync payload this service reads: {e}"))
     })?;
 
-    // Bind the payload to the transport-proven signer, as the REST handler
-    // binds it to the JWT. `server_did` keys the replay window, so accepting a
-    // foreign one would let one server advance — and so suppress — another's.
-    let server_did = body.server_did.as_deref().unwrap_or(signer);
-    if server_did != signer {
+    // Bind the payload to the proven signer. The sender keys the replay
+    // window, so accepting a foreign one would let one server advance — and
+    // so suppress — another's.
+    if let Err(claimed) = body.identity.check(signer) {
         warn!(
             did = signer,
-            server_did, "stats sync rejected: server_did does not match signer"
+            claimed, "stats sync rejected: instanceId/server_did does not name the signer"
         );
         return Err(InfraRejection::SenderMismatch {
-            claimed: server_did.to_string(),
+            claimed,
             signer: signer.to_string(),
         });
     }
+    let server_did = signer;
+    let instance_id = infra::instance_id_for(signer);
+    let ack = |accepted: u64, skipped: Option<&str>| {
+        infra::stats_sync_ack(&instance_id, accepted, skipped).map_err(|e| {
+            InfraRejection::Failed(Box::new(trust_tasks_rs::RejectReason::TaskFailed {
+                reason: e,
+                details: None,
+            }))
+        })
+    };
 
+    // Ordering: a sync without `seq` is not ordered (its document id is still
+    // replay-checked by the proof gate).
+    if let Some(seq) = body.seq
+        && !accept_seq(server_did, seq)
+    {
+        debug!(server_did, seq, "stats sync: stale sequence");
+        return ack(0, Some("stale_seq"));
+    }
     let seq = body.seq;
 
-    // Idempotency check
-    if !accept_seq(server_did, seq) {
-        debug!(server_did, seq, "stats sync: stale sequence");
-        return Ok(StatsSyncAck {
-            status: StatsSyncStatus::Skipped,
-            reason: Some("stale_seq".into()),
-        });
-    }
-
-    let deltas = body.did_deltas.as_slice();
+    let deltas = body.deltas.as_slice();
     if deltas.len() > did_hosting_common::server::stats_collector::MAX_STATS_SYNC_DELTAS {
         warn!(
             did = signer,
@@ -325,15 +335,12 @@ pub(crate) async fn do_stats_sync(
     }
     debug!(
         server_did,
-        seq,
+        ?seq,
         delta_count = deltas.len(),
         "stats sync accepted"
     );
 
-    Ok(StatsSyncAck {
-        status: StatsSyncStatus::Accepted,
-        reason: None,
-    })
+    ack((deltas.len() - invalid) as u64, None)
 }
 
 /// The largest resolve or update count one delta may carry: far above what
@@ -399,7 +406,9 @@ pub(crate) async fn do_health_pong(state: &AppState, signer: &str, body: &Value)
 
     // Typed and closed (R3.2): a pong this service does not read in full
     // marks nothing active.
-    let pong: did_hosting_common::HealthPong = match serde_json::from_value(body.clone()) {
+    // The pinned `server/health/0.1#response`, or for one release the pong
+    // edges sent before #449.
+    let pong = match did_hosting_common::server::trust_tasks::infra::read_health_reply(body) {
         Ok(pong) => pong,
         Err(e) => {
             warn!(did = signer, error = %e, "health pong ignored: not a pong this service reads");
@@ -407,11 +416,29 @@ pub(crate) async fn do_health_pong(state: &AppState, signer: &str, body: &Value)
         }
     };
     let version = pong.version.as_deref().unwrap_or("unknown");
-    debug!(signer, status = %pong.status, version, "health pong received from server");
+    debug!(signer, ok = pong.ok, version, did_count = ?pong.did_count, "health pong received from server");
 
     // Find the instance the signer registered and mark it active. Another
     // DID whose registry id collides with it is not that instance.
     let instance_id = registry::instance_id_for(signer);
+    if let Some(named) = pong.instance_id.as_deref()
+        && named != instance_id
+    {
+        warn!(
+            did = signer,
+            named, instance_id, "health pong ignored: names another instance"
+        );
+        return;
+    }
+    // Only a successful check improves the status: an edge reporting itself
+    // unhealthy is left to age out like one that did not answer.
+    if !pong.ok {
+        warn!(
+            did = signer,
+            instance_id, "health pong reports the edge unhealthy"
+        );
+        return;
+    }
     let now = crate::auth::session::now_epoch();
     let updated = registry::update_instance_for_did(&state.registry_ks, signer, |instance| {
         instance.status = ServiceStatus::Active;
@@ -4054,29 +4081,124 @@ mod tests {
         assert_eq!(code(rej), StandardCode::MalformedRequest);
     }
 
-    /// A stats sync is answered with the typed acknowledgement.
+    /// A stats sync is answered with the pinned `server/stats-sync/0.1`
+    /// response, whichever shape the sync came in: `accepted` counts what was
+    /// counted, and a stale `seq` is said under our `ext` namespace.
     #[tokio::test]
-    async fn stats_sync_acks_are_typed() {
-        use did_hosting_common::{StatsSyncAck, StatsSyncStatus};
+    async fn stats_sync_acks_are_the_pinned_response() {
+        use did_hosting_common::server::trust_tasks::infra;
         let (state, _dir) = test_state().await;
         let edge = "did:example:stats-ack-edge";
+        let id = infra::instance_id_for(edge);
         seed_role(&state, edge, Role::Service).await;
-        let body = json!({ "server_did": edge, "seq": 5, "did_deltas": [] });
+
+        let deltas = [did_hosting_common::DidStatsDelta {
+            mnemonic: "counted".into(),
+            resolve_delta: 2,
+            update_delta: 0,
+            last_resolved_at: None,
+            last_updated_at: None,
+        }];
+        let body = infra::stats_sync_body(&id, 5, &deltas).unwrap();
         let ack = do_stats_sync(&state, edge, &body).await.unwrap();
-        assert_eq!(ack.status, StatsSyncStatus::Accepted);
+        assert_eq!(ack, json!({ "instanceId": id, "accepted": 1 }));
         let replayed = do_stats_sync(&state, edge, &body).await.unwrap();
         assert_eq!(
             replayed,
-            StatsSyncAck {
-                status: StatsSyncStatus::Skipped,
-                reason: Some("stale_seq".into()),
-            }
+            json!({ "instanceId": id, "accepted": 0,
+                    "ext": { "vnd.affinidi.webvh": { "skipped": "stale_seq" } } })
         );
+        // The legacy shape is answered the same way.
+        let legacy = json!({ "server_did": edge, "seq": 9, "did_deltas": [] });
         assert_eq!(
-            serde_json::to_value(&replayed).unwrap(),
-            json!({ "status": "skipped", "reason": "stale_seq" }),
-            "the wire shape an edge reads is unchanged"
+            do_stats_sync(&state, edge, &legacy).await.unwrap(),
+            json!({ "instanceId": id, "accepted": 0 })
         );
+    }
+
+    /// A conformant sync is counted, with its latest-event times, and one
+    /// whose `instanceId` is not the signer's is refused as a mismatch.
+    #[tokio::test]
+    async fn a_conformant_stats_sync_is_counted_and_bound_to_its_signer() {
+        use did_hosting_common::server::trust_tasks::infra;
+        let (state, _dir) = test_state().await;
+        let edge = "did:example:stats-conformant-edge";
+        seed_role(&state, edge, Role::Service).await;
+        let now = crate::auth::session::now_epoch();
+        let body = json!({
+            "instanceId": infra::instance_id_for(edge),
+            "perMnemonic": [{ "mnemonic": "alice", "resolves": 4, "updates": 1 }],
+            "ext": { "vnd.affinidi.webvh": {
+                "seq": 1,
+                "lastSeen": [{ "mnemonic": "alice", "lastResolvedAt": now }],
+            } },
+        });
+        do_stats_sync(&state, edge, &body).await.unwrap();
+        let counted = state.stats_collector.drain_for_sync();
+        assert_eq!(counted.len(), 1);
+        assert_eq!((counted[0].resolve_delta, counted[0].update_delta), (4, 1));
+        assert_eq!(counted[0].last_resolved_at, Some(now));
+
+        let foreign = json!({
+            "instanceId": infra::instance_id_for("did:example:other-edge"),
+            "perMnemonic": [],
+        });
+        let rej = do_stats_sync(&state, edge, &foreign).await.unwrap_err();
+        assert!(
+            matches!(rej, InfraRejection::SenderMismatch { .. }),
+            "{rej}"
+        );
+
+        let buckets = json!({
+            "instanceId": infra::instance_id_for(edge),
+            "perMnemonic": [],
+            "buckets": [{ "mnemonic": "alice", "epoch": 0, "r": 1, "u": 0 }],
+        });
+        let rej = do_stats_sync(&state, edge, &buckets).await.unwrap_err();
+        assert!(matches!(rej, InfraRejection::Malformed(_)), "{rej}");
+    }
+
+    /// A conformant pong marks its instance active; one that reports the edge
+    /// unhealthy, or names another instance, does not.
+    #[tokio::test]
+    async fn a_conformant_pong_marks_only_a_healthy_instance_active() {
+        use did_hosting_common::server::trust_tasks::infra;
+        let (state, _dir) = test_state().await;
+        let edge = "did:example:pong-edge";
+        seed_service(&state, edge).await;
+        assert!(
+            do_server_register(&state, edge, &register_payload(edge))
+                .await
+                .is_ok()
+        );
+        let held = || async {
+            crate::registry::get_instance_for_did(&state.registry_ks, edge)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_health_check
+        };
+        let before = held().await;
+        let id = infra::instance_id_for(edge);
+        let now = chrono::Utc::now();
+
+        let mut unhealthy = infra::health_pong_body(&id, now, "1.0.0", 1).unwrap();
+        unhealthy["ok"] = json!(false);
+        do_health_pong(&state, edge, &unhealthy).await;
+        assert_eq!(
+            held().await,
+            before,
+            "an unhealthy edge is not a successful check"
+        );
+
+        let other = infra::health_pong_body("did_example_elsewhere", now, "1.0.0", 1).unwrap();
+        do_health_pong(&state, edge, &other).await;
+        assert_eq!(held().await, before, "another instance's pong");
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let pong = infra::health_pong_body(&id, now, "1.0.0", 1).unwrap();
+        do_health_pong(&state, edge, &pong).await;
+        assert_ne!(held().await, before);
     }
 
     /// The infrastructure tasks state their proof rule rather than taking

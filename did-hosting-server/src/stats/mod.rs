@@ -12,7 +12,7 @@ pub use did_hosting_common::server::stats_collector::{StatsAggregate, StatsColle
 
 use affinidi_messaging_didcomm_service::DIDCommService;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Monotonic sequence counter for stats sync idempotency.
 static SYNC_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -67,21 +67,18 @@ pub async fn sync_to_control_messaging(
 
     let seq = SYNC_SEQ.fetch_add(1, Ordering::Relaxed);
 
-    let body = serde_json::to_value(did_hosting_common::StatsSyncRequest {
-        server_did: Some(server_did.to_string()),
-        seq,
-        did_deltas: deltas
-            .iter()
-            .map(|d| did_hosting_common::StatsSyncRequestDelta {
-                mnemonic: d.mnemonic.clone(),
-                resolve_delta: d.resolve_delta,
-                update_delta: d.update_delta,
-                last_resolved_at: d.last_resolved_at,
-                last_updated_at: d.last_updated_at,
-            })
-            .collect(),
-    })
-    .expect("a stats-sync payload serialises");
+    // The pinned `server/stats-sync/0.1` shape: `seq` and each entry's
+    // latest-event times travel in our `ext` namespace.
+    use did_hosting_common::server::trust_tasks::infra;
+    let body = match infra::stats_sync_body(&infra::instance_id_for(server_did), seq, &deltas) {
+        Ok(body) => body,
+        Err(e) => {
+            // Only an entry the schema refuses (an empty path) gets here, and
+            // no tick would ever send it: dropped, not requeued.
+            warn!(error = %e, dropped = deltas.len(), "stats sync: deltas do not fit server/stats-sync/0.1; dropped");
+            return;
+        }
+    };
 
     let fallback = TransportFallback::from_config(
         state.config.mediator_did.as_deref(),

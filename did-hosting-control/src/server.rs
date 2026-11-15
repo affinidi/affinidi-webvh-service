@@ -1370,12 +1370,23 @@ async fn send_health_ping_trust_task(
 ) {
     use did_hosting_common::server::trust_tasks::send::{build_signed_request, send_trust_task};
 
+    // `server/health/0.1`: names the instance probed, which is the one the
+    // edge registered as. An edge before #449 ignores the payload.
+    let ping = match did_hosting_common::server::trust_tasks::infra::health_ping_body(
+        &registry::instance_id_for(server_did),
+    ) {
+        Ok(ping) => ping,
+        Err(e) => {
+            warn!(error = %e, "health ping: not a server/health/0.1 payload");
+            return;
+        }
+    };
     // Signed: an edge answers only a ping its control plane signed.
     let doc = match build_signed_request(
         did_hosting_common::didcomm_types::MSG_HEALTH_PING,
         control_did,
         server_did,
-        serde_json::json!({}),
+        ping,
         signer,
     )
     .await
@@ -1482,29 +1493,23 @@ pub async fn run_health_checks(
     }
 
     // Evaluate status based on last pong timestamp
+    // Only a pong records a successful check; the sweep only re-derives the
+    // status from the last one, so it can degrade an instance but never
+    // revive it.
     for inst in &instances {
-        let new_status = registry::health_status_from_timestamp(inst, now, health_interval_secs);
-        if new_status != inst.status {
+        if registry::health_status_from_timestamp(inst, now, health_interval_secs) == inst.status {
+            continue;
+        }
+        if let Some((old_status, new_status)) =
+            registry::reevaluate_status(registry_ks, &inst.instance_id, now, health_interval_secs)
+                .await?
+        {
             info!(
                 instance_id = %inst.instance_id,
-                old_status = ?inst.status,
-                new_status = ?new_status,
+                ?old_status,
+                ?new_status,
                 "instance status changed"
             );
-            // Re-derived under the instance's lock from the record as it is
-            // now: a pong that landed since the listing above is not undone
-            // by a status computed from the older copy.
-            registry::update_instance(registry_ks, &inst.instance_id, |current| {
-                let status =
-                    registry::health_status_from_timestamp(current, now, health_interval_secs);
-                if status == current.status {
-                    return false;
-                }
-                current.status = status;
-                current.last_health_check = Some(now);
-                true
-            })
-            .await?;
         }
     }
 
@@ -1576,9 +1581,13 @@ mod seed_registry_tests {
             &registry::ServiceType::Server,
             "https://edge-one.example",
         );
-        registry::update_instance_status(&state.registry_ks, &id, ServiceStatus::Degraded, 42)
-            .await
-            .unwrap();
+        registry::update_instance(&state.registry_ks, &id, |instance| {
+            instance.status = ServiceStatus::Degraded;
+            instance.last_health_check = Some(42);
+            true
+        })
+        .await
+        .unwrap();
         seed_registry(&state).await;
         seed_registry(&state).await;
 
@@ -1629,5 +1638,85 @@ mod seed_registry_tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.served_domains.len(), 32);
+    }
+
+    /// The sweep degrades an instance whose last pong is stale and keeps
+    /// degrading it: a status change is not a successful check, so the next
+    /// sweep must not read it as one and revive the instance. Only a pong does.
+    #[tokio::test]
+    async fn the_health_sweep_never_revives_an_instance_without_a_pong() {
+        let (state, _dir) = crate::control_tasks::harness::state().await;
+        let edge = "did:example:edge-sweep";
+        let interval = 60;
+        let now = crate::auth::session::now_epoch();
+        let last_pong = now - interval * 3 / 2;
+        let instance: registry::ServiceInstance = serde_json::from_value(serde_json::json!({
+            "instanceId": registry::instance_id_for(edge),
+            "serviceType": "server",
+            "url": "https://edge.example",
+            "status": "active",
+            "lastHealthCheck": last_pong,
+            "registeredAt": 1,
+            "metadata": { "did": edge },
+        }))
+        .unwrap();
+        registry::register_instance(&state.registry_ks, &instance)
+            .await
+            .unwrap();
+
+        let didcomm = std::sync::OnceLock::new();
+        let fallback = did_hosting_common::server::didcomm_profile::TransportFallback::from_config(
+            None, false,
+        );
+        let sweep = || {
+            run_health_checks(
+                &state.registry_ks,
+                &didcomm,
+                None,
+                interval,
+                &fallback,
+                did_hosting_common::server::trust_tasks::send::Peers::new(None, None),
+                None,
+            )
+        };
+        let held = || async {
+            registry::get_instance(&state.registry_ks, &instance.instance_id)
+                .await
+                .unwrap()
+                .unwrap()
+        };
+
+        for sweep_no in 0..3 {
+            sweep().await.unwrap();
+            let stored = held().await;
+            assert_eq!(stored.status, ServiceStatus::Degraded, "sweep {sweep_no}");
+            assert_eq!(
+                stored.last_health_check,
+                Some(last_pong),
+                "a sweep records no check"
+            );
+        }
+
+        // Old enough, it ages on to Unreachable, and stays there.
+        registry::update_instance(&state.registry_ks, &instance.instance_id, |i| {
+            i.last_health_check = Some(now - interval * 3);
+            true
+        })
+        .await
+        .unwrap();
+        sweep().await.unwrap();
+        sweep().await.unwrap();
+        assert_eq!(held().await.status, ServiceStatus::Unreachable);
+
+        // A pong is a successful check: the next sweep keeps it Active.
+        registry::update_instance(&state.registry_ks, &instance.instance_id, |i| {
+            i.status = ServiceStatus::Active;
+            i.last_health_check = Some(now);
+            true
+        })
+        .await
+        .unwrap();
+        sweep().await.unwrap();
+        assert_eq!(held().await.status, ServiceStatus::Active);
     }
 }

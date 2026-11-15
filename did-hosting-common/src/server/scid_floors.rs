@@ -195,7 +195,7 @@ impl ScidFloorKeeper {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "store-fjall"))]
 mod tests {
     use super::*;
     use crate::server::acl::{AclEntry, Role, store_acl_entry};

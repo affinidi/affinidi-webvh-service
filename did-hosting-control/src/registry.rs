@@ -313,7 +313,7 @@ pub async fn get_instance(
 /// server up by its DID with [`get_instance_for_did`], which checks the
 /// record is that DID's.
 pub fn instance_id_for(did: &str) -> String {
-    did.replace(':', "_")
+    did_hosting_common::server::trust_tasks::infra::instance_id_for(did)
 }
 
 /// The instance `did` registered: the record under [`instance_id_for`],
@@ -468,20 +468,33 @@ pub async fn record_outbound_transport(
     }
 }
 
-/// Update the status and health check timestamp of an instance.
-pub async fn update_instance_status(
+/// Re-derive an instance's status from its last successful health check
+/// ([`health_status_from_timestamp`]), under the instance's lock and from the
+/// record as it is now, so a pong that landed meanwhile is not undone.
+/// Returns the `(old, new)` status when it changed.
+///
+/// Never touches `last_health_check`: only a successful check — a health
+/// pong (`messaging::do_health_pong`) — records one. Stamping it here, as this
+/// once did on every change, made the next sweep read a degraded instance as
+/// freshly checked and flip it back to `Active` with no pong at all.
+pub async fn reevaluate_status(
     registry_ks: &KeyspaceHandle,
     instance_id: &str,
-    status: ServiceStatus,
-    timestamp: u64,
-) -> Result<(), AppError> {
-    update_instance(registry_ks, instance_id, |instance| {
-        instance.status = status;
-        instance.last_health_check = Some(timestamp);
+    now: u64,
+    timeout_secs: u64,
+) -> Result<Option<(ServiceStatus, ServiceStatus)>, AppError> {
+    let mut changed = None;
+    update_instance(registry_ks, instance_id, |current| {
+        let status = health_status_from_timestamp(current, now, timeout_secs);
+        if status == current.status {
+            return false;
+        }
+        changed = Some((current.status.clone(), status.clone()));
+        current.status = status;
         true
     })
-    .await
-    .map(|_| ())
+    .await?;
+    Ok(changed)
 }
 
 /// The id a `[[registry.instances]]` entry is seeded under: stable across

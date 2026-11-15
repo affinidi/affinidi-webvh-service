@@ -164,7 +164,7 @@ fn host_from_public_url(url: &str) -> Option<String> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "store-fjall"))]
 mod tests {
     use super::*;
     use crate::server::config::StoreConfig;

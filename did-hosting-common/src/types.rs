@@ -644,7 +644,7 @@ pub struct DidStats {
 // ---------------------------------------------------------------------------
 
 /// Per-DID counter delta for a single sync interval.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DidStatsDelta {
     pub mnemonic: String,
@@ -673,13 +673,11 @@ pub struct StatsSyncPayload {
     pub did_deltas: Vec<DidStatsDelta>,
 }
 
-/// The `server/stats-sync/0.1` payload an edge sends its control plane, as
-/// this service puts it on the wire today. Closed (R3.2): a control plane
-/// refuses a member it does not read rather than dropping it.
-///
-/// Not yet the pinned specification's shape (`instanceId`, `perMnemonic`,
-/// `buckets`): both ends of this workspace read and write this one, and
-/// conforming them is tracked separately.
+/// The `server/stats-sync/0.1` payload as edges before #449 sent it — not the
+/// pinned specification's shape. A control plane still reads it for one
+/// release so an edge upgraded after it keeps reporting
+/// (`server::trust_tasks::infra::read_stats_sync`); nothing writes it.
+/// Closed (R3.2): a member it does not read refuses it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatsSyncRequest {
@@ -710,31 +708,11 @@ pub struct StatsSyncRequestDelta {
     pub last_updated_at: Option<u64>,
 }
 
-/// Whether a control plane counted a [`StatsSyncRequest`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StatsSyncStatus {
-    /// The deltas were counted.
-    Accepted,
-    /// The sequence number was stale (a replay or a reordering): nothing was
-    /// counted.
-    Skipped,
-}
-
-/// A control plane's answer to a [`StatsSyncRequest`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StatsSyncAck {
-    pub status: StatsSyncStatus,
-    /// Why a sync was skipped (`stale_seq`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-/// The `server/health/0.1#response` an edge answers a control plane's ping
-/// with, as this service puts it on the wire today (see
-/// [`StatsSyncRequest`] on the pinned specification). Closed: the control
-/// plane marks an instance active only on a pong it reads in full.
+/// The `server/health/0.1#response` as edges before #449 sent it — not the
+/// pinned specification's shape. A control plane still reads it for one
+/// release (`server::trust_tasks::infra::read_health_reply`); nothing writes
+/// it. Closed: the control plane marks an instance active only on a pong it
+/// reads in full.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HealthPong {
