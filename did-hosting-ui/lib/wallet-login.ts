@@ -35,11 +35,11 @@
  */
 
 import { clearSessionKeypair, generateSessionKeypair } from "./session-key";
+import { T } from "./task-types";
 import { trustTask } from "./trust-task";
 import type {
   Payload as AuthenticatePayload,
   Response as AuthenticateResponse,
-  TYPE_URI as AUTHENTICATE_URI,
 } from "./trust-tasks/auth/authenticate/0.3/payload";
 
 export interface VtaWalletLoginParams {
@@ -91,8 +91,7 @@ export async function loginBindingSessionKey(
  *  camelCase. */
 export type IdTokenAuthResponse = AuthenticateResponse;
 
-const AUTH_AUTHENTICATE_V0_3: typeof AUTHENTICATE_URI =
-  "https://trusttasks.org/spec/auth/authenticate/0.3";
+const AUTH_AUTHENTICATE_V0_3 = T.authenticate;
 
 /**
  * Wrap a proxy login's `id_token` as an `auth/authenticate/0.3` proxied

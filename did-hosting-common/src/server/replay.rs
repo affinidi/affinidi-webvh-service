@@ -128,16 +128,14 @@ impl ReplayError {
 impl From<ReplayError> for AppError {
     fn from(e: ReplayError) -> Self {
         match e {
-            ReplayError::Duplicate => {
-                AppError::Validation("duplicate message id (replay-detected)".into())
-            }
+            ReplayError::Duplicate => AppError::invalid("duplicate message id (replay-detected)"),
             ReplayError::Full => AppError::RateLimited {
                 limiter: super::error::LIMITER_REPLAY_CACHE,
                 message: "too many signed requests in flight; retry later".into(),
                 retry_after_secs: full_retry_after_secs(),
             },
             ReplayError::Stale => {
-                AppError::Validation("issuedAt is missing or outside the replay window".into())
+                AppError::invalid("issuedAt is missing or outside the replay window")
             }
         }
     }
@@ -393,7 +391,9 @@ mod tests {
         let err = cache
             .check_and_insert("did:example:a", "msg-1", now)
             .unwrap_err();
-        assert!(matches!(err, AppError::Validation(ref m) if m.contains("replay-detected")));
+        assert!(
+            matches!(err, AppError::Validation { message: ref m, .. } if m.contains("replay-detected"))
+        );
     }
 
     #[test]

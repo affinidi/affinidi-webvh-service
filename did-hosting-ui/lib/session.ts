@@ -35,6 +35,7 @@ import {
   hasSessionKeypair,
   restoreSessionKeypair,
 } from "./session-key";
+import { T } from "./task-types";
 import type {
   Payload as RefreshPayload,
   Response as RefreshResponse,
@@ -234,7 +235,7 @@ export function resetSessionCacheForTests(): void {
   sessionRestoreInFlight = null;
 }
 
-const REFRESH_TASK_URI = "https://trusttasks.org/spec/auth/refresh/0.2";
+const REFRESH_TASK_URI = T.refresh;
 
 /**
  * A JWT's payload claims, read without verification — the one decoder the

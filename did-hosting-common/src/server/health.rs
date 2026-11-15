@@ -138,13 +138,12 @@ pub async fn check_store(
             ));
             Some(store)
         }
+        Err(crate::server::error::AppError::StoreLocked(msg)) => {
+            warn_msg(&format!("Store locked (is the server running?): {msg}"));
+            None
+        }
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("lock") || msg.contains("Lock") {
-                warn_msg(&format!("Store locked (is the server running?): {msg}"));
-            } else {
-                fail(&format!("Store open failed: {msg}"));
-            }
+            fail(&format!("Store open failed: {e}"));
             None
         }
     }

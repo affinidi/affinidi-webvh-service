@@ -62,6 +62,13 @@ pub enum AppError {
     #[error("store error: {0}")]
     Store(String),
 
+    /// The store is held by another process (an embedded store's lock file),
+    /// typically a running service. Distinct from [`AppError::Store`] so a
+    /// caller such as the health check can say so without reading the
+    /// backend's wording.
+    #[error("store locked: {0}")]
+    StoreLocked(String),
+
     #[error("secret store error: {0}")]
     SecretStore(String),
 
@@ -95,11 +102,19 @@ pub enum AppError {
     #[error("step-up required: {0}")]
     StepUpRequired(String),
 
-    #[error("validation error: {0}")]
-    Validation(String),
+    /// The request is malformed or refused on its content. `kind` is the
+    /// machine-readable classification wire codes are chosen from; `message`
+    /// is for people and never read for that purpose.
+    #[error("validation error: {message}")]
+    Validation {
+        kind: ValidationKind,
+        message: String,
+    },
 
-    #[error("quota exceeded: {0}")]
-    QuotaExceeded(String),
+    /// A limit on what may be stored was reached. `kind` says which limit;
+    /// `message` is for people and never read for that purpose.
+    #[error("quota exceeded: {message}")]
+    QuotaExceeded { kind: QuotaKind, message: String },
 
     /// One of this service's own rate limiters refused the request, or the
     /// service is over capacity for now (a throttled store, a full replay
@@ -230,18 +245,31 @@ impl AgentNameError {
     }
 }
 
-/// Semantic tags for finer-grained error classification without string matching.
+/// What an [`AppError::Validation`] refused, carried in the variant so wire
+/// codes are chosen without reading the message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationKind {
+    /// The DID data (log, key event log, document) does not verify.
     InvalidLog,
     InvalidPath,
     InvalidWitness,
+    /// A log that does not extend the history already served for its DID: a
+    /// rollback, a fork, or a slot asked to change method.
+    HistoryRewrite,
+    /// A change to a DID whose history already deactivated it.
+    Deactivated,
+    /// The request names a domain the caller may not use, or that is not
+    /// served (`did-management:unknown_domain`).
+    UnknownDomain,
     Other,
 }
 
+/// Which limit an [`AppError::QuotaExceeded`] reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaKind {
+    /// One item is larger than may be stored.
     Size,
+    /// A count limit (DIDs per owner, say) was reached.
     Count,
 }
 
@@ -272,7 +300,7 @@ impl From<vti_common::auth::backend::AuthError> for AppError {
             | A::RefreshTokenExpired
             | A::SessionIdleTimeout
             | A::WrongRecipient { .. } => AppError::Authentication(e.to_string()),
-            A::MissingRecipient => AppError::Validation(e.to_string()),
+            A::MissingRecipient => AppError::invalid(e.to_string()),
             A::AttestationFailed(msg) => AppError::Internal(format!("tee attestation: {msg}")),
             A::Internal(msg) => AppError::Internal(msg),
             // `AuthError` is `#[non_exhaustive]` since vti-common 0.20, so a
@@ -351,45 +379,52 @@ impl AppError {
         }
     }
 
-    /// Create a tagged validation error.
+    /// A validation error of `kind`.
     pub fn validation(kind: ValidationKind, msg: impl Into<String>) -> Self {
-        let mut s = msg.into();
-        // Embed a machine-readable tag prefix for structured matching
-        let tag = match kind {
-            ValidationKind::InvalidLog => "[log]",
-            ValidationKind::InvalidPath => "[path]",
-            ValidationKind::InvalidWitness => "[witness]",
-            ValidationKind::Other => "",
-        };
-        if !tag.is_empty() {
-            s = format!("{tag} {s}");
+        AppError::Validation {
+            kind,
+            message: msg.into(),
         }
-        AppError::Validation(s)
     }
 
-    /// Classify a Validation error's kind by its tag prefix.
+    /// A validation error no more specific kind applies to
+    /// ([`ValidationKind::Other`]).
+    pub fn invalid(msg: impl Into<String>) -> Self {
+        Self::validation(ValidationKind::Other, msg)
+    }
+
+    /// A quota error of `kind`.
+    pub fn quota(kind: QuotaKind, msg: impl Into<String>) -> Self {
+        AppError::QuotaExceeded {
+            kind,
+            message: msg.into(),
+        }
+    }
+
+    /// The kind of a [`AppError::Validation`]; [`ValidationKind::Other`] for
+    /// any other variant.
     pub fn validation_kind(&self) -> ValidationKind {
         match self {
-            AppError::Validation(msg) => {
-                if msg.starts_with("[log]") {
-                    ValidationKind::InvalidLog
-                } else if msg.starts_with("[path]") {
-                    ValidationKind::InvalidPath
-                } else if msg.starts_with("[witness]") {
-                    ValidationKind::InvalidWitness
-                } else {
-                    ValidationKind::Other
-                }
-            }
+            AppError::Validation { kind, .. } => *kind,
             _ => ValidationKind::Other,
         }
     }
 
-    /// Classify a QuotaExceeded error's kind by its content.
+    /// The kind of a [`AppError::QuotaExceeded`]; [`QuotaKind::Count`] for any
+    /// other variant.
     pub fn quota_kind(&self) -> QuotaKind {
         match self {
-            AppError::QuotaExceeded(msg) if msg.contains("size") => QuotaKind::Size,
+            AppError::QuotaExceeded { kind, .. } => *kind,
             _ => QuotaKind::Count,
+        }
+    }
+
+    /// The message of a [`AppError::Validation`], `None` for any other
+    /// variant.
+    pub fn validation_message(&self) -> Option<&str> {
+        match self {
+            AppError::Validation { message, .. } => Some(message),
+            _ => None,
         }
     }
 }
@@ -419,7 +454,7 @@ impl AppError {
     ///
     /// Backed by `ValidationKind` tags rather than substring sniffing on
     /// the `Display` message, so a wording change in any
-    /// `AppError::Validation("...")` literal doesn't silently re-route
+    /// `AppError::invalid("...")` literal doesn't silently re-route
     /// the protocol code. Both DIDComm dispatchers
     /// (`messaging::dispatch_did_op` and `routes/didcomm.rs::dispatch`)
     /// call this so the same error always produces the same wire code
@@ -439,17 +474,21 @@ impl AppError {
     pub fn didcomm_code(&self) -> &'static str {
         match self {
             AppError::Unauthorized(_) | AppError::Forbidden(_) => "e.p.did.unauthorized",
-            AppError::QuotaExceeded(_) => match self.quota_kind() {
+            AppError::QuotaExceeded { kind, .. } => match kind {
                 QuotaKind::Size => "e.p.did.size-exceeded",
                 QuotaKind::Count => "e.p.did.quota-exceeded",
             },
             AppError::Conflict(_) => "e.p.did.path-unavailable",
             AppError::NotFound(_) => "e.p.did.mnemonic-not-found",
-            AppError::Validation(_) => match self.validation_kind() {
+            AppError::Validation { kind, .. } => match kind {
                 ValidationKind::InvalidLog => "e.p.did.invalid-log",
                 ValidationKind::InvalidPath => "e.p.did.path-invalid",
                 ValidationKind::InvalidWitness => "e.p.did.witness-invalid",
-                ValidationKind::Other => "e.p.did.validation-error",
+                // Never tagged before these kinds existed: their code is unchanged.
+                ValidationKind::HistoryRewrite
+                | ValidationKind::Deactivated
+                | ValidationKind::UnknownDomain
+                | ValidationKind::Other => "e.p.did.validation-error",
             },
             // Legacy did-management DIDComm codes for agent-name failures. The
             // dedicated agent-name Trust Tasks (PR 4) carry their own spec
@@ -486,9 +525,9 @@ impl AppError {
             AppError::Unauthorized(_) => "unauthorized".into(),
             AppError::Forbidden(_) => "forbidden".into(),
             AppError::StepUpRequired(_) => "step_up_required".into(),
-            AppError::Validation(msg) => sanitize_user_message(msg),
+            AppError::Validation { message, .. } => sanitize_user_message(message),
             AppError::Conflict(msg) => sanitize_user_message(msg),
-            AppError::QuotaExceeded(msg) => sanitize_user_message(msg),
+            AppError::QuotaExceeded { message, .. } => sanitize_user_message(message),
             AppError::RateLimited { message, .. } => sanitize_user_message(message),
             // Fixed, name-free strings — safe to surface verbatim.
             AppError::AgentName(e) => e.to_string(),
@@ -506,6 +545,7 @@ impl IntoResponse for AppError {
             AppError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::StoreLocked(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::SecretStore(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Serialization(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -515,8 +555,8 @@ impl IntoResponse for AppError {
             AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
             AppError::StepUpRequired(_) => StatusCode::FORBIDDEN,
-            AppError::Validation(_) => StatusCode::BAD_REQUEST,
-            AppError::QuotaExceeded(_) => StatusCode::FORBIDDEN,
+            AppError::Validation { .. } => StatusCode::BAD_REQUEST,
+            AppError::QuotaExceeded { .. } => StatusCode::FORBIDDEN,
             AppError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             AppError::InvalidForwardedFor { .. } => StatusCode::BAD_REQUEST,
             AppError::TrustTaskMissing => StatusCode::BAD_REQUEST,
@@ -613,6 +653,41 @@ impl IntoResponse for AppError {
 mod response_tests {
     use super::*;
 
+    /// The kind is carried, not read back out of the message: a quota message
+    /// that mentions "size" is still a count limit, and the reverse (#367).
+    #[test]
+    fn a_quota_code_follows_its_kind_not_its_wording() {
+        let count = AppError::quota(QuotaKind::Count, "size of the DID count limit reached");
+        assert_eq!(count.didcomm_code(), "e.p.did.quota-exceeded");
+        let size = AppError::quota(QuotaKind::Size, "over the store's limit");
+        assert_eq!(size.didcomm_code(), "e.p.did.size-exceeded");
+    }
+
+    /// A validation kind changes the code and nothing in the message: the
+    /// `[log]`-style tags no longer leak into what a client reads.
+    #[test]
+    fn a_validation_kind_is_not_written_into_the_message() {
+        let err = AppError::validation(ValidationKind::InvalidLog, "the chain does not verify");
+        assert_eq!(err.didcomm_code(), "e.p.did.invalid-log");
+        assert_eq!(err.user_message(), "the chain does not verify");
+        // Text that looks like an old tag is just text.
+        let untagged = AppError::invalid("[log] not a tag");
+        assert_eq!(untagged.validation_kind(), ValidationKind::Other);
+        assert_eq!(untagged.didcomm_code(), "e.p.did.validation-error");
+        // The kinds added for the edge's history check keep the code an
+        // untagged message always had.
+        for kind in [
+            ValidationKind::HistoryRewrite,
+            ValidationKind::Deactivated,
+            ValidationKind::UnknownDomain,
+        ] {
+            assert_eq!(
+                AppError::validation(kind, "x").didcomm_code(),
+                "e.p.did.validation-error"
+            );
+        }
+    }
+
     #[test]
     fn forbidden_always_collapses_to_fixed_string() {
         // Pre-fix behaviour: substring `"ACL"` redacted, but
@@ -628,7 +703,7 @@ mod response_tests {
         // Caller submits `did:web:tenant\nrest` as new_owner; the
         // resulting Validation message would otherwise reflect the
         // newline back into the response body.
-        let err = AppError::Validation("bad input: did:web:t\nrest".into());
+        let err = AppError::invalid("bad input: did:web:t\nrest");
         let msg = err.user_message();
         assert!(!msg.contains('\n'));
         assert!(!msg.contains('\r'));
@@ -637,7 +712,7 @@ mod response_tests {
     #[test]
     fn validation_caps_length() {
         let huge = "x".repeat(MAX_USER_MESSAGE_LEN + 100);
-        let err = AppError::Validation(huge);
+        let err = AppError::invalid(huge);
         let msg = err.user_message();
         assert!(msg.chars().count() <= MAX_USER_MESSAGE_LEN + 1); // +1 for '…'
         assert!(msg.ends_with('…'));
@@ -651,7 +726,7 @@ mod response_tests {
             "x".repeat(MAX_USER_MESSAGE_LEN - 1),
             "y".repeat(50)
         );
-        let msg = AppError::Validation(text).user_message();
+        let msg = AppError::invalid(text).user_message();
         assert_eq!(msg, format!("{}…", "x".repeat(MAX_USER_MESSAGE_LEN - 1)));
         let msg = AppError::Conflict("😀".repeat(200)).user_message();
         assert!(msg.ends_with('…'));
@@ -660,7 +735,7 @@ mod response_tests {
 
     #[test]
     fn validation_preserves_short_messages_unchanged() {
-        let err = AppError::Validation("path 'foo' is already taken".into());
+        let err = AppError::invalid("path 'foo' is already taken");
         assert_eq!(err.user_message(), "path 'foo' is already taken");
     }
 

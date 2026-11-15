@@ -567,13 +567,15 @@ impl BatchOps for DynamoDbBatch {
                     writes = ops.len(),
                     bytes, "batch refused: over one DynamoDB transaction"
                 );
-                // `AppError::quota_kind` keys on the word "size".
-                return Err(AppError::QuotaExceeded(format!(
-                    "a change of {} writes ({bytes} bytes) is over the store's \
+                return Err(AppError::quota(
+                    crate::server::error::QuotaKind::Size,
+                    format!(
+                        "a change of {} writes ({bytes} bytes) is over the store's \
                      size limit for one atomic write: {MAX_TRANSACT_ACTIONS} \
                      writes and {MAX_TRANSACT_BYTES} bytes",
-                    ops.len()
-                )));
+                        ops.len()
+                    ),
+                ));
             }
             send_transaction(&self.client, &ops).await
         })
@@ -902,7 +904,7 @@ mod tests {
         assert_eq!(bodies[0].matches(r#"{"Put":"#).count(), 100);
 
         let err = batch_of(&backend, &ops).commit().await.unwrap_err();
-        assert!(matches!(err, AppError::QuotaExceeded(_)), "{err:?}");
+        assert!(matches!(err, AppError::QuotaExceeded { .. }), "{err:?}");
         assert_eq!(err.quota_kind(), crate::server::error::QuotaKind::Size);
         assert!(capture.0.lock().unwrap().is_empty(), "nothing is sent");
     }
@@ -919,7 +921,7 @@ mod tests {
             .map(|k| (k.as_slice(), Some(390 * 1024)))
             .collect();
         let err = batch_of(&backend, &ops).commit().await.unwrap_err();
-        assert!(matches!(err, AppError::QuotaExceeded(_)), "{err:?}");
+        assert!(matches!(err, AppError::QuotaExceeded { .. }), "{err:?}");
         assert!(capture.0.lock().unwrap().is_empty(), "nothing is sent");
     }
 
@@ -1007,7 +1009,7 @@ mod tests {
 
         let over = vec![b'x'; MAX_ITEM_BYTES - overhead + 1];
         let err = check_item_size(key, &over).unwrap_err();
-        let AppError::QuotaExceeded(message) = &err else {
+        let AppError::QuotaExceeded { message, .. } = &err else {
             panic!("expected a size quota, got {err:?}");
         };
         assert!(

@@ -40,7 +40,7 @@ pub(crate) async fn resolve_agent_name_domain(
         &acl_scope,
         system_default.as_deref(),
     )
-    .map_err(|e| AppError::Validation(e.to_string()))
+    .map_err(|e| AppError::invalid(e.to_string()))
 }
 
 #[derive(Debug, Serialize)]

@@ -416,8 +416,9 @@ mod tests {
     /// stops re-sending it; any other store error stays retryable.
     #[test]
     fn a_store_size_refusal_is_permanent_and_other_store_errors_retry() {
-        let too_large = SyncRefusal::from(AppError::QuotaExceeded(
-            "item size 431916 bytes is over the store's per-item limit of 409600 bytes".into(),
+        let too_large = SyncRefusal::from(AppError::quota(
+            did_hosting_common::server::error::QuotaKind::Size,
+            "item size 431916 bytes is over the store's per-item limit of 409600 bytes",
         ));
         assert_eq!(refusal_code(&too_large), Some("taskFailed"));
         let payload = serde_json::to_value(refusal_payload(too_large)).expect("serialise");

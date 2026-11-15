@@ -26,18 +26,15 @@ import {
   restoreSessionKeypair,
   signEnvelope,
 } from "./session-key";
-import type {
-  Response as ServerInfoResponse,
-  TYPE_URI as SERVER_INFO_URI,
-} from "./trust-tasks/did-management/server/info/0.1/payload";
+import type { Response as ServerInfoResponse } from "./trust-tasks/did-management/server/info/0.1/payload";
+import { T } from "./task-types";
 
 /** The Trust Task endpoint on the control plane. */
 export const TRUST_TASKS_PATH = "/api/trust-tasks";
 
 const TT_RESPONSE_FRAGMENT = "#response";
 
-const SERVER_INFO: typeof SERVER_INFO_URI =
-  "https://trusttasks.org/spec/did-management/server/info/0.1";
+const SERVER_INFO = T.serverInfo;
 
 /**
  * Is this reply document a framework error document, at any `0.x` minor?
@@ -179,31 +176,33 @@ const ALWAYS_RETRY_CODES = new Set<string>(["unavailable"]);
  * * `acl/change-role` — state-checked against `fromRole`, so a re-issue
  *   after success is rejected `acl/change-role:state_mismatch`.
  *
+ * Built from the console's task table (`task-types.ts`), so a version bump
+ * moves an entry with the task rather than leaving it behind and silently
+ * dropping the task out of auto-retry.
+ *
  * Enumerated rather than derived as "not a mutation", so a future
  * proofless *write* cannot silently inherit auto-retry. Adding an entry
  * means answering: if the first attempt already took effect, is a second
  * one a no-op?
  */
 const REISSUE_SAFE_TASK_TYPES = new Set<string>([
-  "https://trusttasks.org/spec/acl/list/0.3",
-  "https://trusttasks.org/spec/acl/show/0.2",
-  "https://trusttasks.org/spec/acl/grant/0.2",
-  "https://trusttasks.org/spec/did-management/did/list/0.2",
-  "https://trusttasks.org/spec/did-management/did/info/0.1",
-  "https://trusttasks.org/spec/did-management/did/log/0.1",
-  "https://trusttasks.org/spec/did-management/agent-name/check/0.1",
-  "https://trusttasks.org/spec/did-management/agent-name/resolve/0.1",
-  "https://trusttasks.org/spec/did-management/domain/list/0.1",
-  "https://trusttasks.org/spec/did-management/me/domains/0.1",
-  "https://trusttasks.org/spec/did-management/registry/list/0.2",
-  "https://trusttasks.org/spec/did-management/registry/get/0.2",
-  "https://trusttasks.org/spec/did-management/stats/get/0.1",
-  "https://trusttasks.org/spec/did-management/stats/timeseries/0.2",
-  "https://trusttasks.org/spec/did-management/server/info/0.1",
-  "https://trusttasks.org/spec/did-management/server/config/0.1",
-  "https://trusttasks.org/spec/did-management/server/metrics/0.1",
-  "https://trusttasks.org/spec/did-management/identity/list/0.1",
-  "https://trusttasks.org/spec/auth/passkey/enroll/invite/list/0.1",
+  T.aclList,
+  T.aclShow,
+  T.aclGrant,
+  T.didList,
+  T.didInfo,
+  T.didLog,
+  T.agentNameCheck,
+  T.agentNameResolve,
+  T.domainList,
+  T.meDomains,
+  T.registryList,
+  T.statsGet,
+  T.statsTimeseries,
+  T.serverInfo,
+  T.serverConfig,
+  T.identityList,
+  T.inviteList,
 ]);
 
 /** Codes that are retryable per the framework but ambiguous about whether
