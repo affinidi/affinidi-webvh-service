@@ -31,3 +31,10 @@ so they can degrade an instance but never revive it.
 The `invalidTargetVersion` code was chosen by matching the start of the error
 message. It now comes from a `ValidationKind::InvalidTargetVersion` error kind,
 so rewording the message can no longer change the code.
+
+### Fixed — a Redis store opens when a scan batch has no rows to index
+
+The one-time index build at open sent an empty pipeline for a `SCAN` batch
+that held no row of a known keyspace, which Redis refuses, so the store
+failed to open on a database holding only other keys (#470). Such a batch is
+now skipped.

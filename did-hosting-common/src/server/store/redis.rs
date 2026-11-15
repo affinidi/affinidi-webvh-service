@@ -95,16 +95,14 @@ async fn rebuild_index(conn: &mut redis::aio::MultiplexedConnection) -> Result<(
             .query_async(conn)
             .await
             .map_err(|e| AppError::Store(format!("redis SCAN: {e}")))?;
-        let mut pipe = redis::pipe();
-        for full in &keys {
-            if let Some((keyspace, key)) = split_row_key(full) {
-                pipe.zadd(index_key(keyspace), key, 0).ignore();
-                indexed += 1;
-            }
+        // A batch with no row of a known keyspace queues nothing, and Redis
+        // refuses an empty pipeline (#470): skip its round trip.
+        if let Some((pipe, queued)) = index_batch(&keys) {
+            pipe.query_async::<()>(conn)
+                .await
+                .map_err(|e| AppError::Store(format!("redis index rebuild: {e}")))?;
+            indexed += queued;
         }
-        pipe.query_async::<()>(conn)
-            .await
-            .map_err(|e| AppError::Store(format!("redis index rebuild: {e}")))?;
         cursor = next;
         if cursor == 0 {
             break;
@@ -115,6 +113,20 @@ async fn rebuild_index(conn: &mut redis::aio::MultiplexedConnection) -> Result<(
         .map_err(|e| AppError::Store(format!("redis SET: {e}")))?;
     info!(indexed, "redis store: index built");
     Ok(())
+}
+
+/// The `ZADD`s that index one `SCAN` batch, and how many there are; `None`
+/// when the batch holds no row of a known keyspace, so nothing is sent.
+fn index_batch(keys: &[Vec<u8>]) -> Option<(redis::Pipeline, usize)> {
+    let mut pipe = redis::pipe();
+    let mut queued = 0usize;
+    for full in keys {
+        if let Some((keyspace, key)) = split_row_key(full) {
+            pipe.zadd(index_key(keyspace), key, 0).ignore();
+            queued += 1;
+        }
+    }
+    (queued > 0).then_some((pipe, queued))
 }
 
 /// `ks:key` as `(ks, key)`, for a known keyspace only.
@@ -588,7 +600,25 @@ impl BatchOps for RedisBatch {
 
 #[cfg(test)]
 mod tests {
-    use super::{lex_max, lex_min, redacted_url, split_row_key};
+    use super::{index_batch, lex_max, lex_min, redacted_url, split_row_key};
+
+    /// A `SCAN` batch with no row of a known keyspace sends nothing: Redis
+    /// refuses an empty pipeline, which failed the open (#470).
+    #[test]
+    fn a_batch_without_known_rows_sends_nothing() {
+        let foreign: Vec<Vec<u8>> = vec![
+            b"__index_version__".to_vec(),
+            b"__index__:dids".to_vec(),
+            b"c0123456789ab_roundtrip:x".to_vec(),
+        ];
+        assert!(index_batch(&[]).is_none());
+        assert!(index_batch(&foreign).is_none());
+        let mut mixed = foreign;
+        mixed.push(b"dids:did:alice".to_vec());
+        let (pipe, queued) = index_batch(&mixed).expect("one row to index");
+        assert_eq!(queued, 1);
+        assert_eq!(pipe.cmd_iter().count(), 1);
+    }
 
     #[test]
     fn lex_bounds_cover_exactly_the_prefix() {
