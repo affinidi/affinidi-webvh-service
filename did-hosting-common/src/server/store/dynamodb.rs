@@ -5,6 +5,7 @@ use std::time::Duration;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::operation::create_table::CreateTableError;
+use aws_sdk_dynamodb::operation::delete_item::DeleteItemError;
 use aws_sdk_dynamodb::operation::describe_table::DescribeTableError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
@@ -459,20 +460,33 @@ impl KeyspaceOps for DynamoDbKeyspace {
     fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
         Box::pin(async move {
             self.tables.ensure(&self.table).await?;
-            // DeleteItem with ReturnValues=ALL_OLD atomically removes the
-            // item and returns the previous attributes — exactly the
-            // get-and-remove primitive we need. DynamoDB serialises the
-            // operation per partition key, so two concurrent callers see
-            // exactly one non-empty response.
-            let response = self
+            // A DeleteItem conditional on the item existing, returning the
+            // old attributes: of any number of callers deleting the same
+            // item, the condition lets exactly one delete through, and only
+            // that one gets the value. An unconditional delete with ALL_OLD
+            // is not enough: concurrent deletes of one item can each be
+            // handed the old attributes (DynamoDB Local does, under the
+            // conformance suite's race).
+            let response = match self
                 .client
                 .delete_item()
                 .table_name(&self.table)
                 .key(PK_ATTR, AttributeValue::B(Blob::new(key)))
+                .condition_expression("attribute_exists(#pk)")
+                .expression_attribute_names("#pk", PK_ATTR)
                 .return_values(ReturnValue::AllOld)
                 .send()
                 .await
-                .map_err(|e| request_error("delete (atomic take)", e))?;
+            {
+                Ok(response) => response,
+                Err(e)
+                    if e.as_service_error()
+                        .is_some_and(DeleteItemError::is_conditional_check_failed_exception) =>
+                {
+                    return Ok(None);
+                }
+                Err(e) => return Err(request_error("delete (atomic take)", e)),
+            };
             Ok(response.attributes.and_then(|attrs| {
                 attrs.get(VAL_ATTR).and_then(|attr| {
                     if let AttributeValue::B(blob) = attr {
