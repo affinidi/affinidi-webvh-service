@@ -520,7 +520,8 @@ async fn an_unassigned_domain_is_purged_by_the_edge_sweep_once_its_grace_elapses
 
     let (mut state, _dir) = edge_state().await;
     let mut config = (*state.config).clone();
-    config.hosting.unassigned_purge_grace = "0s".into();
+    config.hosting.unassigned_purge_grace =
+        did_hosting_common::server::config::GracePeriod::parse("0s").unwrap();
     state.config = Arc::new(config);
     let cp = control();
 

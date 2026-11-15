@@ -65,6 +65,7 @@ vi.mock("../../lib/enrol-flow", () => ({
   startRedemption: (...a: unknown[]) => startRedemption(...a),
   completeRedemption: vi.fn(),
   describePurpose: (p: string) => (p === "session" ? "used to sign in" : "used to step up"),
+  formatClaimCode: (v: string) => v,
 }));
 
 vi.mock("../../lib/address-bar", () => ({
@@ -94,11 +95,11 @@ describe("login", () => {
     await act(async () => {
       render(<Login />);
     });
-    expect(screen.getByRole("heading", { level: 1, name: "Login" })).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 1, name: "Sign in" })).toBeTruthy();
     expect(screen.getByText("wallet sign-in")).toBeTruthy();
     expect(screen.getByText("did:webvh:QmS:control.example.com")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Copy this server's DID" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Login with Passkey" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Copy this service's DID" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Sign in with a passkey" })).toBeTruthy();
     const older = screen.getByRole("button", { name: "Using an older wallet?" });
     expect(older.getAttribute("aria-expanded")).toBe("false");
   });
@@ -109,10 +110,56 @@ describe("login", () => {
       render(<Login />);
     });
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Login with Passkey" }));
+      fireEvent.click(screen.getByRole("button", { name: "Sign in with a passkey" }));
     });
     expect(screen.getByRole("alert").textContent).toBe("Passkeys are not configured here");
     expect(login).not.toHaveBeenCalled();
+  });
+
+  it("says a dismissed passkey prompt was cancelled, not a raw WebAuthn error", async () => {
+    passkeyLoginStart.mockResolvedValue({ authId: "a1", options: {} });
+    getPasskeyCredential.mockRejectedValue(
+      Object.assign(new Error("The operation either timed out or was not allowed."), {
+        name: "NotAllowedError",
+      }),
+    );
+    await act(async () => {
+      render(<Login />);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Sign in with a passkey" }));
+    });
+    expect(screen.getByRole("alert").textContent).toBe(
+      "Passkey prompt was cancelled or timed out.",
+    );
+  });
+
+  it("returns to the page named by ?next= after signing in", async () => {
+    searchParams = { next: "/dids/alice" };
+    passkeyLoginStart.mockResolvedValue({ authId: "a1", options: {} });
+    getPasskeyCredential.mockResolvedValue({ id: "c" });
+    passkeyLoginFinish.mockResolvedValue({ accessToken: "AT", refreshToken: "RT" });
+    await act(async () => {
+      render(<Login />);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Sign in with a passkey" }));
+    });
+    expect(replace).toHaveBeenCalledWith("/dids/alice");
+  });
+
+  it("ignores a ?next= that points off this origin", async () => {
+    searchParams = { next: "//evil.example/steal" };
+    passkeyLoginStart.mockResolvedValue({ authId: "a1", options: {} });
+    getPasskeyCredential.mockResolvedValue({ id: "c" });
+    passkeyLoginFinish.mockResolvedValue({ accessToken: "AT", refreshToken: "RT" });
+    await act(async () => {
+      render(<Login />);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Sign in with a passkey" }));
+    });
+    expect(replace).toHaveBeenCalledWith("/");
   });
 
   it("starts a passkey login from Enter in the DID field", async () => {
@@ -136,10 +183,12 @@ describe("login", () => {
 });
 
 describe("enroll", () => {
-  it("says the link is broken when it carries no token", () => {
+  it("asks for the enrolment link when it carries no token, without calling it a failure", () => {
     render(<Enroll />);
-    expect(screen.getByRole("heading", { name: "Enrollment Failed" })).toBeTruthy();
-    expect(screen.getByRole("alert").textContent).toMatch(/no invite token/);
+    expect(screen.getByRole("heading", { name: "Open your enrolment link" })).toBeTruthy();
+    expect(screen.getByText(/no invite token/)).toBeTruthy();
+    expect(screen.queryByText(/Failed/)).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("asks for the claim code and submits it on Enter", async () => {

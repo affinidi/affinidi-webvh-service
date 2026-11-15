@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeaturesConfig {
     #[serde(default)]
     pub didcomm: bool,
@@ -14,8 +15,21 @@ pub struct FeaturesConfig {
     /// speak both; TSP is preferred when a peer advertises both.
     #[serde(default)]
     pub tsp: bool,
-    #[serde(default)]
-    pub rest_api: bool,
+    /// Run the HTTP listener: the management UI, `POST /api/trust-tasks`
+    /// (the HTTPS binding of the Trust Task dispatch), `/api/health` and,
+    /// on a witness or watcher, its public routes. There is no REST API
+    /// behind it; every management operation is a Trust Task.
+    ///
+    /// Read by the control plane, the witness and the watcher. A control
+    /// plane needs at least one of `http_listener`, `didcomm` and `tsp`. The
+    /// hosting server (edge) always serves HTTP — DID resolution is its
+    /// job — and does not read this flag; the daemon derives it from the
+    /// services it enables.
+    ///
+    /// Formerly `rest_api`, which is still accepted (in the file and as
+    /// `<PREFIX>_FEATURES_REST_API`). Env: `<PREFIX>_FEATURES_HTTP_LISTENER`.
+    #[serde(default, alias = "rest_api")]
+    pub http_listener: bool,
     /// Serve agent-name redirects (`GET /@alice` -> 302 to a DID).
     ///
     /// **On by default.** A name only resolves if the signed DID document
@@ -32,14 +46,37 @@ pub struct FeaturesConfig {
     /// something else.
     #[serde(default = "default_true")]
     pub agent_names: bool,
-    /// Deployment mode: "standalone" for individual services, "daemon" for unified binary.
-    /// Controls UI behavior (e.g., hiding service topology in daemon mode).
-    #[serde(default = "default_deployment_mode")]
-    pub deployment_mode: String,
+    /// Deployment mode: `"standalone"` for individual services, `"daemon"`
+    /// for the unified binary (which sets it itself). Controls UI behaviour
+    /// (e.g., hiding service topology in daemon mode).
+    #[serde(default)]
+    pub deployment_mode: DeploymentMode,
 }
 
-fn default_deployment_mode() -> String {
-    "standalone".to_string()
+/// [`FeaturesConfig::deployment_mode`]: whether the service runs on its own
+/// or inside `did-hosting-daemon`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeploymentMode {
+    #[default]
+    Standalone,
+    Daemon,
+}
+
+impl DeploymentMode {
+    /// The config-file spelling (`"standalone"` / `"daemon"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standalone => "standalone",
+            Self::Daemon => "daemon",
+        }
+    }
+}
+
+impl std::fmt::Display for DeploymentMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 fn default_true() -> bool {
@@ -56,9 +93,9 @@ impl Default for FeaturesConfig {
         Self {
             didcomm: false,
             tsp: false,
-            rest_api: false,
+            http_listener: false,
             agent_names: true,
-            deployment_mode: default_deployment_mode(),
+            deployment_mode: DeploymentMode::default(),
         }
     }
 }
@@ -174,6 +211,7 @@ pub mod ip_networks {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default = "default_host")]
     pub host: String,
@@ -593,6 +631,7 @@ impl ResolveRateLimitConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -601,6 +640,7 @@ pub struct LogConfig {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoreConfig {
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
@@ -704,6 +744,7 @@ impl std::fmt::Debug for StoreConfig {
 /// that fails to parse is refused with a message naming the setting,
 /// never silently ignored or clamped.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FjallTuning {
     /// fjall's shared block cache size, in bytes
     /// (`fjall::Database::builder(..).cache_size(..)`). fjall's own
@@ -992,6 +1033,7 @@ pub fn apply_fjall_env_overrides(config: &mut FjallTuning) -> Result<(), AppErro
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     #[serde(default = "default_access_token_expiry")]
     pub access_token_expiry: u64,
@@ -1261,6 +1303,7 @@ impl Default for ServerConfig {
 /// (when no `domains` keyspace entries exist yet) and how long to
 /// retain unassigned-domain data before purging.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct HostingConfig {
     /// Domain names to seed into the `domains` keyspace on first boot
     /// when the keyspace is empty. Used only when the operator hasn't
@@ -1275,12 +1318,16 @@ pub struct HostingConfig {
 
     /// Grace period before a server-locally-unassigned domain's data
     /// is purged. Per spec §3 retain-then-purge semantics. Format:
-    /// duration string (`"2h"`, `"30m"`, `"7d"`). Default: `"2h"`.
+    /// duration string (`"2h"`, `"30m"`, `"7d"`, `"45s"`, or bare
+    /// seconds). Default: `"2h"`.
     ///
-    /// Parsed by the unassignment-purge sweep in T30; the string
-    /// here is the canonical config-file representation.
-    #[serde(default = "default_unassigned_purge_grace")]
-    pub unassigned_purge_grace: String,
+    /// Parsed when the config is loaded: a value that is not a duration
+    /// stops the service at startup, naming this key.
+    #[serde(
+        default = "default_unassigned_purge_grace",
+        deserialize_with = "deserialize_unassigned_purge_grace"
+    )]
+    pub unassigned_purge_grace: GracePeriod,
 
     /// Grace period before a *disabled* domain (and every DID hosted
     /// under it) is permanently removed. Disable is a soft-delete:
@@ -1288,8 +1335,13 @@ pub struct HostingConfig {
     /// removal. Format matches `unassigned_purge_grace`. Default:
     /// `"30d"` — long enough to recover from an accidental disable,
     /// short enough that abandoned domains don't accumulate forever.
-    #[serde(default = "default_disable_purge_grace")]
-    pub disable_purge_grace: String,
+    ///
+    /// Parsed when the config is loaded, like `unassigned_purge_grace`.
+    #[serde(
+        default = "default_disable_purge_grace",
+        deserialize_with = "deserialize_disable_purge_grace"
+    )]
+    pub disable_purge_grace: GracePeriod,
 
     /// Whether a DID this service creates for itself lists its
     /// `did:scid:vh:1:<scid>?src=…` alias in `alsoKnownAs`, linking its
@@ -1378,12 +1430,89 @@ impl WebsSelfRegistration {
     }
 }
 
-fn default_unassigned_purge_grace() -> String {
-    "2h".to_string()
+/// A `[hosting]` grace period: a duration string (`"2h"`, `"30m"`, `"7d"`,
+/// `"45s"`, or bare seconds), parsed when the config is loaded so no call site
+/// re-parses it or falls back to a default. Serialises back to the text it was
+/// written as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GracePeriod {
+    secs: u64,
+    text: String,
 }
 
-fn default_disable_purge_grace() -> String {
-    "30d".to_string()
+/// The units a [`GracePeriod`] accepts, for error messages.
+pub const GRACE_PERIOD_UNITS: &str =
+    "an integer with an optional unit s, m, h or d (e.g. \"45s\", \"30m\", \"2h\", \"7d\")";
+
+impl GracePeriod {
+    /// Parse a duration string; the error says what was wrong and which
+    /// units are accepted.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        crate::server::pending_purge::parse_grace_string(text)
+            .map(|secs| Self {
+                secs,
+                text: text.trim().to_string(),
+            })
+            .map_err(|e| format!("invalid duration `{text}` ({e}); expected {GRACE_PERIOD_UNITS}"))
+    }
+
+    /// The period in seconds.
+    pub fn as_secs(&self) -> u64 {
+        self.secs
+    }
+
+    /// The text it was written as.
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for GracePeriod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl Serialize for GracePeriod {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.text)
+    }
+}
+
+impl<'de> Deserialize<'de> for GracePeriod {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        Self::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Deserialise the `[hosting]` grace period `key`, naming the key in the error.
+fn deserialize_grace_for<'de, D: serde::Deserializer<'de>>(
+    key: &str,
+    d: D,
+) -> Result<GracePeriod, D::Error> {
+    let text = String::deserialize(d)?;
+    GracePeriod::parse(&text).map_err(|e| serde::de::Error::custom(format!("[hosting] {key}: {e}")))
+}
+
+fn deserialize_unassigned_purge_grace<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<GracePeriod, D::Error> {
+    deserialize_grace_for("unassigned_purge_grace", d)
+}
+
+fn deserialize_disable_purge_grace<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<GracePeriod, D::Error> {
+    deserialize_grace_for("disable_purge_grace", d)
+}
+
+fn default_unassigned_purge_grace() -> GracePeriod {
+    GracePeriod::parse("2h").expect("the default grace parses")
+}
+
+fn default_disable_purge_grace() -> GracePeriod {
+    GracePeriod::parse("30d").expect("the default grace parses")
 }
 
 impl Default for HostingConfig {
@@ -1400,17 +1529,36 @@ impl Default for HostingConfig {
 
 /// Apply environment variable overrides to [`HostingConfig`]. `prefix` is the
 /// same namespace [`apply_env_overrides`] takes.
-pub fn apply_hosting_env_overrides(prefix: &str, hosting: &mut HostingConfig) {
-    hosting.scid_also_known_as = scid_also_known_as_from_env(prefix, hosting.scid_also_known_as);
+pub fn apply_hosting_env_overrides(
+    prefix: &str,
+    hosting: &mut HostingConfig,
+) -> Result<(), AppError> {
+    hosting.scid_also_known_as = scid_also_known_as_from_env(prefix, hosting.scid_also_known_as)?;
+    Ok(())
 }
 
-/// `<PREFIX>_HOSTING_SCID_ALSO_KNOWN_AS` when set (`1`/`true` or anything
-/// else for false), `default` otherwise. For setup paths that mint the
-/// service's DID before any config file exists.
-pub fn scid_also_known_as_from_env(prefix: &str, default: bool) -> bool {
-    match std::env::var(format!("{prefix}_HOSTING_SCID_ALSO_KNOWN_AS")) {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-        Err(_) => default,
+/// `<PREFIX>_HOSTING_SCID_ALSO_KNOWN_AS` when set (see [`parse_env_bool`]),
+/// `default` otherwise. For setup paths that mint the service's DID before
+/// any config file exists. A value that is not a boolean is refused.
+pub fn scid_also_known_as_from_env(prefix: &str, default: bool) -> Result<bool, AppError> {
+    let var = format!("{prefix}_HOSTING_SCID_ALSO_KNOWN_AS");
+    match std::env::var(&var) {
+        Ok(v) => parse_env_bool(&var, &v),
+        Err(_) => Ok(default),
+    }
+}
+
+/// A boolean environment variable: `1`/`true`/`yes`/`on` or
+/// `0`/`false`/`no`/`off` (any case, surrounding whitespace ignored).
+/// Anything else is refused with an error naming `var`, rather than read as
+/// `false`.
+pub fn parse_env_bool(var: &str, value: &str) -> Result<bool, AppError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(AppError::Config(format!(
+            "invalid {var}: `{value}` is not a boolean (use 1/true/yes/on or 0/false/no/off)"
+        ))),
     }
 }
 
@@ -1443,6 +1591,7 @@ impl Default for StoreConfig {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecretsConfig {
     /// Which backend holds the keys (`keyring`, `aws`, `gcp`, `azure`,
     /// `vault`, `kubernetes`, `plaintext`). When unset, the backend whose
@@ -1570,6 +1719,7 @@ impl std::fmt::Debug for SecretsConfig {
 ///
 /// Used by services that integrate with a VTA for key management and DID operations.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct VtaConfig {
     /// VTA REST URL for remote key management
     pub url: Option<String>,
@@ -1596,6 +1746,7 @@ pub enum IdentityMode {
 /// Identity configuration — selects how the service's own keys and DID are
 /// produced, and how long a superseded identity keeps being honoured.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct IdentityConfig {
     #[serde(default)]
     pub mode: IdentityMode,
@@ -1760,8 +1911,9 @@ pub fn apply_env_overrides(
     }
     macro_rules! env_bool {
         ($var:expr, $field:expr) => {
-            if let Ok(v) = std::env::var($var) {
-                $field = v == "1" || v.eq_ignore_ascii_case("true");
+            let var: &str = $var;
+            if let Ok(v) = std::env::var(var) {
+                $field = parse_env_bool(var, &v)?;
             }
         };
     }
@@ -1769,7 +1921,16 @@ pub fn apply_env_overrides(
     // Features
     env_bool!(&format!("{prefix}_FEATURES_DIDCOMM"), features.didcomm);
     env_bool!(&format!("{prefix}_FEATURES_TSP"), features.tsp);
-    env_bool!(&format!("{prefix}_FEATURES_REST_API"), features.rest_api);
+    // `_REST_API` is the flag's former name, read first so the current name
+    // wins when both are set.
+    env_bool!(
+        &format!("{prefix}_FEATURES_REST_API"),
+        features.http_listener
+    );
+    env_bool!(
+        &format!("{prefix}_FEATURES_HTTP_LISTENER"),
+        features.http_listener
+    );
     env_bool!(
         &format!("{prefix}_FEATURES_AGENT_NAMES"),
         features.agent_names
@@ -1796,7 +1957,7 @@ pub fn apply_env_overrides(
     }
 
     // Store
-    apply_store_env_overrides(&format!("{prefix}_STORE"), store);
+    apply_store_env_overrides(&format!("{prefix}_STORE"), store)?;
 
     // Auth
     env_parse!(
@@ -1942,7 +2103,7 @@ pub fn apply_env_overrides(
 /// [`apply_env_overrides`] calls it with `{PREFIX}_STORE`; a binary with a
 /// second store calls it once more with that store's own prefix (the daemon's
 /// `[witness_store]` reads `DAEMON_WITNESS_STORE_*`).
-pub fn apply_store_env_overrides(prefix: &str, store: &mut StoreConfig) {
+pub fn apply_store_env_overrides(prefix: &str, store: &mut StoreConfig) -> Result<(), AppError> {
     macro_rules! env_opt {
         ($var:expr, $field:expr) => {
             if let Ok(v) = std::env::var($var) {
@@ -1966,7 +2127,7 @@ pub fn apply_store_env_overrides(prefix: &str, store: &mut StoreConfig) {
     );
     let auto_create_var = format!("{prefix}_DYNAMODB_AUTO_CREATE");
     if let Ok(v) = std::env::var(&auto_create_var) {
-        store.dynamodb_auto_create = Some(v == "1" || v.eq_ignore_ascii_case("true"));
+        store.dynamodb_auto_create = Some(parse_env_bool(&auto_create_var, &v)?);
     }
     env_opt!(
         &format!("{prefix}_FIRESTORE_PROJECT"),
@@ -1989,6 +2150,7 @@ pub fn apply_store_env_overrides(prefix: &str, store: &mut StoreConfig) {
         store.cosmosdb_container
     );
     env_opt!(&format!("{prefix}_COSMOSDB_REGION"), store.cosmosdb_region);
+    Ok(())
 }
 
 /// Initialize the global tracing subscriber based on config.
@@ -2317,13 +2479,191 @@ mod tests {
         // Sibling flags stay opt-in — this changes one default, not all of them.
         assert!(!cfg.didcomm);
         assert!(!cfg.tsp);
-        assert!(!cfg.rest_api);
+        assert!(!cfg.http_listener);
     }
 
     #[test]
     fn agent_names_can_still_be_switched_off() {
         let cfg: FeaturesConfig = toml::from_str("agent_names = false").unwrap();
         assert!(!cfg.agent_names);
+    }
+
+    /// The `[hosting]` grace periods are parsed at load: a bad one is refused
+    /// naming the key and the accepted units, and a good one round-trips as
+    /// the text it was written as.
+    #[test]
+    fn hosting_grace_periods_are_parsed_at_load() {
+        let hosting: HostingConfig = toml::from_str("").unwrap();
+        assert_eq!(hosting.unassigned_purge_grace.as_secs(), 2 * 3600);
+        assert_eq!(hosting.disable_purge_grace.as_secs(), 30 * 86_400);
+
+        let hosting: HostingConfig =
+            toml::from_str("unassigned_purge_grace = \"90m\"\ndisable_purge_grace = \"7d\"")
+                .unwrap();
+        assert_eq!(hosting.unassigned_purge_grace.as_secs(), 90 * 60);
+        assert_eq!(hosting.disable_purge_grace.as_secs(), 7 * 86_400);
+        let written = toml::to_string(&hosting).unwrap();
+        assert!(
+            written.contains("unassigned_purge_grace = \"90m\""),
+            "{written}"
+        );
+        assert_eq!(toml::from_str::<HostingConfig>(&written).unwrap(), hosting);
+
+        for (key, value) in [
+            ("unassigned_purge_grace", "1w"),
+            ("disable_purge_grace", "soon"),
+            ("disable_purge_grace", ""),
+        ] {
+            let err = toml::from_str::<HostingConfig>(&format!("{key} = \"{value}\""))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(key), "{key}: {err}");
+            assert!(err.contains("s, m, h or d"), "{key}: {err}");
+        }
+    }
+
+    /// Every `[store]` key, the backend ones added for DynamoDB and Cosmos DB
+    /// included, is a known field under the strict parser and round-trips.
+    #[test]
+    fn every_store_key_is_a_known_field_and_round_trips() {
+        let toml_text = r#"
+data_dir = "data/x"
+redis_url = "redis://localhost:6379"
+dynamodb_table_prefix = "tbl"
+dynamodb_region = "eu-west-1"
+dynamodb_billing_mode = "provisioned"
+dynamodb_auto_create = false
+firestore_project = "proj"
+firestore_database = "db"
+cosmosdb_connection_string = "AccountEndpoint=x"
+cosmosdb_database = "webvh"
+cosmosdb_container = "kv2"
+cosmosdb_region = "eastus"
+"#;
+        let store: StoreConfig = toml::from_str(toml_text).expect("every key is known");
+        assert_eq!(store.dynamodb_billing_mode.as_deref(), Some("provisioned"));
+        assert_eq!(store.dynamodb_auto_create, Some(false));
+        assert_eq!(store.cosmosdb_container.as_deref(), Some("kv2"));
+        let again: StoreConfig = toml::from_str(&toml::to_string(&store).unwrap()).unwrap();
+        assert_eq!(again.dynamodb_auto_create, Some(false));
+        assert_eq!(again.cosmosdb_container.as_deref(), Some("kv2"));
+        assert!(toml::from_str::<StoreConfig>("cosmosdb_contianer = \"x\"").is_err());
+        assert!(toml::from_str::<StoreConfig>("dynamodb_auto_create = \"maybe\"").is_err());
+    }
+
+    /// `_STORE_DYNAMODB_AUTO_CREATE` is read as strictly as the other booleans.
+    #[test]
+    fn store_auto_create_env_is_strict() {
+        let apply = |store: &mut StoreConfig| {
+            apply_env_overrides(
+                "AUTOCREATETEST",
+                &mut FeaturesConfig::default(),
+                &mut ServerConfig::default(),
+                &mut LogConfig::default(),
+                store,
+                &mut AuthConfig::default(),
+                &mut SecretsConfig::default(),
+            )
+        };
+        let mut store = StoreConfig::default();
+        // SAFETY: test-only; the name is unique to this test.
+        unsafe { std::env::set_var("AUTOCREATETEST_STORE_DYNAMODB_AUTO_CREATE", "no") };
+        apply(&mut store).unwrap();
+        assert_eq!(store.dynamodb_auto_create, Some(false));
+        unsafe { std::env::set_var("AUTOCREATETEST_STORE_DYNAMODB_AUTO_CREATE", "sometimes") };
+        assert!(apply(&mut store).is_err());
+        unsafe { std::env::remove_var("AUTOCREATETEST_STORE_DYNAMODB_AUTO_CREATE") };
+    }
+
+    /// A misspelt key in a core section is refused, not silently dropped.
+    #[test]
+    fn core_sections_refuse_unknown_keys() {
+        assert!(toml::from_str::<StoreConfig>("redis_ur = \"redis://x\"").is_err());
+        assert!(toml::from_str::<AuthConfig>("acess_token_expiry = 300").is_err());
+        assert!(toml::from_str::<ServerConfig>("prot = 1").is_err());
+        assert!(toml::from_str::<LogConfig>("levle = \"debug\"").is_err());
+        assert!(toml::from_str::<FeaturesConfig>("didcom = true").is_err());
+        assert!(toml::from_str::<HostingConfig>("bootstrap_domain = []").is_err());
+        assert!(toml::from_str::<SecretsConfig>("aws_secret = \"x\"").is_err());
+        assert!(toml::from_str::<IdentityConfig>("mod = \"vta\"").is_err());
+        assert!(toml::from_str::<VtaConfig>("ulr = \"x\"").is_err());
+        assert!(toml::from_str::<FjallTuning>("block_cach = 1").is_err());
+    }
+
+    /// `http_listener` was `rest_api`; the old name still loads.
+    #[test]
+    fn http_listener_accepts_its_former_name() {
+        let cfg: FeaturesConfig = toml::from_str("rest_api = true").unwrap();
+        assert!(cfg.http_listener);
+        let cfg: FeaturesConfig = toml::from_str("http_listener = true").unwrap();
+        assert!(cfg.http_listener);
+        let written = toml::to_string(&cfg).unwrap();
+        assert!(written.contains("http_listener = true"), "{written}");
+    }
+
+    /// `deployment_mode` takes the two values it always had, and nothing else.
+    #[test]
+    fn deployment_mode_is_an_enum_of_the_existing_values() {
+        let cfg: FeaturesConfig = toml::from_str("deployment_mode = \"daemon\"").unwrap();
+        assert_eq!(cfg.deployment_mode, DeploymentMode::Daemon);
+        let cfg: FeaturesConfig = toml::from_str("deployment_mode = \"standalone\"").unwrap();
+        assert_eq!(cfg.deployment_mode, DeploymentMode::Standalone);
+        assert!(toml::from_str::<FeaturesConfig>("deployment_mode = \"cluster\"").is_err());
+        assert_eq!(DeploymentMode::Daemon.as_str(), "daemon");
+    }
+
+    #[test]
+    fn boolean_env_values_are_read_strictly() {
+        for v in ["1", "true", "TRUE", "yes", "On", " on "] {
+            assert!(parse_env_bool("X", v).unwrap(), "{v}");
+        }
+        for v in ["0", "false", "No", "off"] {
+            assert!(!parse_env_bool("X", v).unwrap(), "{v}");
+        }
+        for v in ["", "maybe", "2", "enabled"] {
+            let err = parse_env_bool("X_FEATURES_DIDCOMM", v)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("X_FEATURES_DIDCOMM"), "{err}");
+        }
+    }
+
+    /// An unrecognised boolean stops the load instead of reading as false,
+    /// and `_FEATURES_HTTP_LISTENER` wins over its former name.
+    #[test]
+    fn boolean_env_overrides_refuse_unrecognised_values() {
+        // A prefix no other test uses, so these variables race nothing.
+        let mut features = FeaturesConfig::default();
+        let apply = |features: &mut FeaturesConfig| {
+            apply_env_overrides(
+                "ENVBOOLTEST",
+                features,
+                &mut ServerConfig::default(),
+                &mut LogConfig::default(),
+                &mut StoreConfig::default(),
+                &mut AuthConfig::default(),
+                &mut SecretsConfig::default(),
+            )
+        };
+        // SAFETY: test-only; the names are unique to this test.
+        unsafe {
+            std::env::set_var("ENVBOOLTEST_FEATURES_DIDCOMM", "yes");
+            std::env::set_var("ENVBOOLTEST_FEATURES_REST_API", "on");
+            std::env::set_var("ENVBOOLTEST_FEATURES_HTTP_LISTENER", "off");
+        }
+        apply(&mut features).unwrap();
+        assert!(features.didcomm);
+        assert!(!features.http_listener, "the current name wins");
+
+        unsafe { std::env::set_var("ENVBOOLTEST_FEATURES_DIDCOMM", "maybe") };
+        let err = apply(&mut features).unwrap_err().to_string();
+        assert!(err.contains("ENVBOOLTEST_FEATURES_DIDCOMM"), "{err}");
+
+        unsafe {
+            std::env::remove_var("ENVBOOLTEST_FEATURES_DIDCOMM");
+            std::env::remove_var("ENVBOOLTEST_FEATURES_REST_API");
+            std::env::remove_var("ENVBOOLTEST_FEATURES_HTTP_LISTENER");
+        }
     }
 
     #[test]
@@ -2335,7 +2675,7 @@ mod tests {
         let from_default = FeaturesConfig::default();
         assert_eq!(from_toml.agent_names, from_default.agent_names);
         assert_eq!(from_toml.deployment_mode, from_default.deployment_mode);
-        assert_eq!(from_default.deployment_mode, "standalone");
+        assert_eq!(from_default.deployment_mode, DeploymentMode::Standalone);
     }
 
     #[test]

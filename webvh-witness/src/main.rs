@@ -35,8 +35,8 @@ enum Command {
         /// interactive "Has the context been created?" confirmation.
         #[arg(long, conflicts_with = "setup_key_out")]
         setup_key_file: Option<PathBuf>,
-        /// Context id for phase 1's PNM command. Defaults to `webvh`.
-        #[arg(long, default_value = "webvh", requires = "setup_key_out")]
+        /// Context id for phase 1's PNM command. Defaults to `did-hosting`.
+        #[arg(long, default_value = "did-hosting", requires = "setup_key_out")]
         context: String,
         /// Path to a declarative setup recipe TOML.
         #[arg(long, value_name = "FILE")]
@@ -55,8 +55,14 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Run health check diagnostics
-    Health,
+    /// Run health check diagnostics. Exits non-zero when a check fails (or,
+    /// with --strict, warns), so it can gate a deploy or a container probe.
+    Health {
+        /// Also exit non-zero when a check only warned (a store held by the
+        /// running service, plaintext secrets, a non-2xx reachability probe).
+        #[arg(long)]
+        strict: bool,
+    },
     /// Add an access control entry
     AddAcl {
         /// DID to grant access to
@@ -153,7 +159,7 @@ enum Command {
         /// VTA context the integration will live in. Embedded as
         /// `contextHint` in the request so the VTA admin can run
         /// `vta bootstrap provision-integration` without `--context`.
-        #[arg(long, default_value = "webvh")]
+        #[arg(long, default_value = "did-hosting")]
         context: String,
     },
     /// Export this witness's DID + signing/KA keys as an HPKE-sealed
@@ -275,11 +281,12 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::Health) => {
-            if let Err(e) = health::run_health(cli.config).await {
-                eprintln!("Health check error: {e}");
-                std::process::exit(1);
-            }
+        Some(Command::Health { strict }) => {
+            let code = did_hosting_common::server::health::finish(
+                health::run_health(cli.config).await,
+                strict,
+            );
+            std::process::exit(code);
         }
         Some(Command::AddAcl { did, role }) => {
             if let Err(e) = run_add_acl(cli.config, did, role).await {
@@ -862,4 +869,9 @@ mod tests {
             assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
         }
     }
+}
+
+#[cfg(test)]
+mod cli_reference_tests {
+    did_hosting_common::cli_reference_test!(super::Cli, "webvh-witness");
 }

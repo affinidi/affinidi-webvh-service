@@ -49,6 +49,8 @@ interface Entry {
   error: unknown;
   /** When the data was last written, ms. 0 = never, or invalidated. */
   updatedAt: number;
+  /** When data was last written — kept through invalidation, for display. */
+  lastSuccessAt: number;
   inFlight: Promise<void> | null;
   /** Sequence of the newest fetch; an older one's answer is dropped. */
   seq: number;
@@ -65,6 +67,8 @@ export interface QuerySnapshot<T> {
   loading: boolean;
   /** A fetch is running over data already shown. */
   refreshing: boolean;
+  /** When the data shown was last fetched, ms; `null` before the first. */
+  updatedAt: number | null;
 }
 
 const cache = new Map<string, Entry>();
@@ -74,6 +78,7 @@ const EMPTY: QuerySnapshot<never> = Object.freeze({
   error: null,
   loading: false,
   refreshing: false,
+  updatedAt: null,
 });
 
 function hashKey(key: QueryKey): string {
@@ -90,6 +95,7 @@ function entryFor(key: QueryKey): Entry {
       hasData: false,
       error: null,
       updatedAt: 0,
+      lastSuccessAt: 0,
       inFlight: null,
       seq: 0,
       fetcher: null,
@@ -107,6 +113,7 @@ function publish(e: Entry): void {
     error: e.error,
     loading: !e.hasData && e.inFlight !== null,
     refreshing: e.hasData && e.inFlight !== null,
+    updatedAt: e.hasData ? e.lastSuccessAt : null,
   };
   for (const l of [...e.listeners]) l();
 }
@@ -125,6 +132,7 @@ function run(e: Entry, ctx: FetchContext, force = false): Promise<void> {
       e.hasData = true;
       e.error = null;
       e.updatedAt = Date.now();
+      e.lastSuccessAt = e.updatedAt;
     } catch (err) {
       if (seq !== e.seq) return;
       // Keep the last good data: an error over stale data is still worth
@@ -170,6 +178,7 @@ export function setQueryData<T>(key: QueryKey, update: T | ((prev: T | undefined
   e.hasData = true;
   e.error = null;
   e.updatedAt = Date.now();
+  e.lastSuccessAt = e.updatedAt;
   // A fetch already in flight would overwrite this with an older view.
   e.seq += 1;
   e.inFlight = null;

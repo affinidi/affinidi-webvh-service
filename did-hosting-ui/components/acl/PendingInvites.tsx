@@ -2,7 +2,7 @@ import { useCallback, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 
 import type { InviteListItem, Role } from "../../lib/api";
-import { showAlert, showConfirm } from "../../lib/alert";
+import { confirm, notify } from "../../lib/feedback";
 import { errorMessage } from "../../lib/errors";
 import { invalidateQueries } from "../../lib/query";
 import { colors, fonts, spacing } from "../../lib/theme";
@@ -21,18 +21,23 @@ export function PendingInvites({ invites }: { invites: InviteListItem[] }) {
   const [busyId, setBusyId] = useState<string | null>(null);
 
   const handleRevoke = useCallback(
-    (inviteId: string) => {
-      showConfirm("Revoke invite", "Revoke this enrollment invite?", async () => {
-        setBusyId(inviteId);
-        try {
-          await api.revokeInvite(inviteId);
-          await invalidateQueries(INVITES_KEY);
-        } catch (e: unknown) {
-          showAlert("Error", errorMessage(e, "Failed to revoke"));
-        } finally {
-          setBusyId((prev) => (prev === inviteId ? null : prev));
-        }
+    async (inviteId: string) => {
+      const ok = await confirm({
+        title: "Revoke this invite?",
+        body: "The enrolment link and claim code stop working. You can send a new invite later.",
+        confirmLabel: "Revoke invite",
       });
+      if (!ok) return;
+      setBusyId(inviteId);
+      try {
+        await api.revokeInvite(inviteId);
+        await invalidateQueries(INVITES_KEY);
+        notify("success", "Invite revoked");
+      } catch (e: unknown) {
+        notify("error", "Could not revoke the invite", errorMessage(e, "Failed to revoke"));
+      } finally {
+        setBusyId((prev) => (prev === inviteId ? null : prev));
+      }
     },
     [api],
   );
@@ -46,7 +51,7 @@ export function PendingInvites({ invites }: { invites: InviteListItem[] }) {
       setEditing(null);
       await invalidateQueries(INVITES_KEY);
     } catch (e: unknown) {
-      showAlert("Error", errorMessage(e, "Failed to update invite"));
+      notify("error", "Could not update the invite", errorMessage(e, "Failed to update invite"));
     } finally {
       setBusyId((prev) => (prev === inviteId ? null : prev));
     }

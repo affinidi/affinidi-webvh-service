@@ -6,6 +6,7 @@ pub mod assignment_seed;
 pub mod auth;
 pub mod backup;
 pub mod cli_acl;
+pub mod cli_dids;
 pub mod cli_identity;
 pub mod cli_metrics;
 pub mod cli_tsp;

@@ -1,13 +1,13 @@
-import { useEffect, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 
 import type { LogEntryInfo } from "../../lib/api";
-import { colors, fonts, radii, spacing } from "../../lib/theme";
-import { Button } from "../Button";
+import { spacing } from "../../lib/theme";
 import { Card } from "../Card";
 import { ChipInput } from "../ChipInput";
+import { CopyButton } from "../CopyButton";
 import { alsoKnownAsOf } from "./agent-names";
 import { didStyles } from "./styles";
+import { Term } from "../Term";
 
 /** Witness DIDs out of an unchecked `witness` parameter. */
 function witnessIdsOf(witness: unknown): string[] {
@@ -18,136 +18,90 @@ function witnessIdsOf(witness: unknown): string[] {
     .filter((id: unknown): id is string => typeof id === "string");
 }
 
+function stringsOf(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((w: unknown): w is string => typeof w === "string") : [];
+}
+
 /**
- * The latest entry's parameters, editable as a scratch pad for the next log
- * entry. Informational: nothing here is sent anywhere — the values are for
- * constructing signed JSONL.
+ * The latest log entry's parameters, read-only.
+ *
+ * Parameters change only in a new signed log entry, which the DID's agent
+ * produces; nothing typed here could be sent anywhere. So the card shows them
+ * and offers them as JSON to copy into whatever builds the next entry.
  */
 export function ParametersCard({
   latest,
   knownWatcherUrls,
 }: {
-  /** The newest log entry; the editor resets to it whenever it changes. */
+  /** The newest log entry. */
   latest: LogEntryInfo | undefined;
-  /** Watcher URLs to suggest: the ones this DID's domain is configured with. */
+  /** Watcher URLs this DID's domain is configured with, shown for reference. */
   knownWatcherUrls: string[];
 }) {
-  const [editing, setEditing] = useState(false);
-  const [watchers, setWatchers] = useState<string[]>([]);
-  const [witnesses, setWitnesses] = useState<string[]>([]);
-  const [alsoKnownAs, setAlsoKnownAs] = useState<string[]>([]);
-  const [portable, setPortable] = useState(false);
-  const [ttl, setTtl] = useState("");
-
-  // Sync the editor when the log changes.
-  useEffect(() => {
-    if (!latest) return;
-    const params = latest.parameters;
-    if (params) {
-      setPortable(params.portable === true);
-      setTtl(typeof params.ttl === "number" ? String(params.ttl) : "");
-      setWatchers(
-        Array.isArray(params.watchers)
-          ? params.watchers.filter((w: unknown): w is string => typeof w === "string")
-          : [],
-      );
-      setWitnesses(witnessIdsOf(params.witness));
-    }
-    if (latest.state) setAlsoKnownAs(alsoKnownAsOf(latest.state.alsoKnownAs));
-  }, [latest]);
+  const params = latest?.parameters ?? {};
+  const watchers = stringsOf(params.watchers);
+  const witnesses = witnessIdsOf(params.witness);
+  const alsoKnownAs = latest?.state ? alsoKnownAsOf(latest.state.alsoKnownAs) : [];
+  const portable = params.portable === true;
+  const ttl = typeof params.ttl === "number" ? params.ttl : null;
+  const missingWatchers = knownWatcherUrls.filter((w) => !watchers.includes(w));
 
   return (
     <Card
       title="Parameters"
       style={didStyles.card}
       headerRight={
-        <Button
-          size="sm"
+        <CopyButton
+          value={JSON.stringify(params, null, 2)}
+          label="Copy parameters JSON"
+          accessibilityLabel="Copy the latest entry's parameters as JSON"
           variant="secondary"
-          label={editing ? "Done" : "Edit Parameters"}
-          pressed={editing}
-          onPress={() => setEditing(!editing)}
+          size="sm"
         />
       }
     >
-      {!editing && (
-        <Text style={didStyles.hint}>
-          View and configure parameters for the next log entry. Editing is informational — use these
-          values when constructing signed JSONL.
-        </Text>
-      )}
+      <Text style={didStyles.hint}>
+        The parameters of the latest log entry. They change only when the DID&apos;s agent publishes
+        a new signed entry; copy them as a starting point for it.
+      </Text>
 
       <View style={styles.field}>
-        <Text style={didStyles.caption}>Watchers</Text>
-        <ChipInput
-          label="Watchers"
-          values={watchers}
-          onChange={setWatchers}
-          suggestions={knownWatcherUrls}
-          placeholder="Add watcher URL..."
-          readOnly={!editing}
-        />
+        <Term term="watcher" label="Watchers" style={didStyles.caption} />
+        <ChipInput label="Watchers" values={watchers} onChange={noop} readOnly />
+        {missingWatchers.length > 0 && (
+          <Text style={didStyles.hint}>
+            This DID&apos;s domain also offers: {missingWatchers.join(", ")}
+          </Text>
+        )}
       </View>
 
       <View style={styles.field}>
-        <Text style={didStyles.caption}>Witnesses</Text>
-        <ChipInput
-          label="Witnesses"
-          values={witnesses}
-          onChange={setWitnesses}
-          placeholder="Add witness DID..."
-          readOnly={!editing}
-        />
+        <Term term="witness" label="Witnesses" style={didStyles.caption} />
+        <ChipInput label="Witnesses" values={witnesses} onChange={noop} readOnly />
       </View>
 
       <View style={styles.field}>
-        <Text style={didStyles.caption}>Also Known As</Text>
-        <ChipInput
-          label="Also Known As"
-          values={alsoKnownAs}
-          onChange={setAlsoKnownAs}
-          placeholder="Add alternate identifier..."
-          readOnly={!editing}
-        />
+        <Term term="alsoKnownAs" label="Also Known As" style={didStyles.caption} />
+        <ChipInput label="Also Known As" values={alsoKnownAs} onChange={noop} readOnly />
       </View>
 
       <View style={[styles.field, styles.inline]}>
-        <View style={didStyles.row}>
-          <Text style={didStyles.caption}>Portable</Text>
-          <input
-            type="checkbox"
-            aria-label="Portable"
-            checked={portable}
-            onChange={(e) => setPortable(e.target.checked)}
-            disabled={!editing}
-            style={{ accentColor: colors.accent }}
-          />
-        </View>
-        <View style={didStyles.row}>
-          <Text style={didStyles.caption}>TTL</Text>
-          <input
-            type="number"
-            aria-label="TTL in seconds"
-            value={ttl}
-            onChange={(e) => setTtl(e.target.value)}
-            disabled={!editing}
-            placeholder="seconds"
-            style={{
-              width: 100,
-              backgroundColor: colors.bgPrimary,
-              color: colors.textPrimary,
-              border: `1px solid ${colors.border}`,
-              borderRadius: radii.sm,
-              padding: "4px 8px",
-              fontFamily: fonts.mono,
-              fontSize: 12,
-            }}
-          />
-        </View>
+        <Term
+          term="portable"
+          label={`Portable: ${portable ? "yes" : "no"}`}
+          style={didStyles.caption}
+        />
+        <Term
+          term="ttl"
+          label={`Cache time (TTL): ${ttl === null ? "default" : `${ttl.toLocaleString()} s`}`}
+          style={didStyles.caption}
+        />
       </View>
     </Card>
   );
 }
+
+const noop = () => {};
 
 const styles = StyleSheet.create({
   field: {
@@ -155,6 +109,7 @@ const styles = StyleSheet.create({
   },
   inline: {
     flexDirection: "row",
+    flexWrap: "wrap",
     alignItems: "center",
     gap: spacing.lg,
   },

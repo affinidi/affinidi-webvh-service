@@ -264,6 +264,11 @@ the root fallback, which also serves the UI.
 
 ## CLI Commands
 
+Every subcommand, with its full `--help`, is in
+[`docs/cli-reference.md`](../docs/cli-reference.md), generated from the CLI
+(a test keeps it current). Below is a summary. `health` exits non-zero when a
+check fails (`--strict`: also when one warns).
+
 ```
 did-hosting-daemon                      # Run daemon (default)
 did-hosting-daemon setup                # Interactive config wizard

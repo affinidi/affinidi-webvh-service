@@ -68,8 +68,8 @@ enum Command {
         /// interactive "Has the context been created?" confirmation.
         #[arg(long, conflicts_with = "setup_key_out")]
         setup_key_file: Option<PathBuf>,
-        /// Context id for phase 1's PNM command. Defaults to `webvh`.
-        #[arg(long, default_value = "webvh", requires = "setup_key_out")]
+        /// Context id for phase 1's PNM command. Defaults to `did-hosting`.
+        #[arg(long, default_value = "did-hosting", requires = "setup_key_out")]
         context: String,
         /// Path to a declarative setup recipe TOML. Drives setup
         /// non-interactively. The daemon recipe also supports
@@ -118,8 +118,14 @@ enum Command {
         #[arg(long, default_value = "setup-offline-state.toml")]
         state: PathBuf,
     },
-    /// Run health check diagnostics
-    Health,
+    /// Run health check diagnostics. Exits non-zero when a check fails (or,
+    /// with --strict, warns), so it can gate a deploy or a container probe.
+    Health {
+        /// Also exit non-zero when a check only warned (a store held by the
+        /// running service, plaintext secrets, a non-2xx reachability probe).
+        #[arg(long)]
+        strict: bool,
+    },
     /// Add an ACL entry
     AddAcl {
         /// DID to add to the ACL
@@ -151,16 +157,16 @@ enum Command {
     /// Show a DID's statistics resolution, recorded tier and totals
     /// (offline; stop the service first).
     StatsShow {
-        /// The DID's path (mnemonic).
-        #[arg(long)]
+        /// The DID's path (mnemonic), e.g. ".well-known" or "my-org".
+        #[arg(long, visible_alias = "path")]
         mnemonic: String,
     },
     /// Set a DID's statistics resolution (offline; stop the service first):
     /// `auto` (by traffic), `fine` (always 5-minute detail), `coarse` (never
     /// promoted) or `off` (totals only). Applied at the next start.
     StatsSet {
-        /// The DID's path (mnemonic).
-        #[arg(long)]
+        /// The DID's path (mnemonic), e.g. ".well-known" or "my-org".
+        #[arg(long, visible_alias = "path")]
         mnemonic: String,
         /// auto, fine, coarse or off.
         #[arg(long, value_parser = ["auto", "fine", "coarse", "off"])]
@@ -312,8 +318,9 @@ enum Command {
     },
     /// Bootstrap a DID for this server
     BootstrapDid {
-        /// DID path/mnemonic (defaults to root ".well-known")
-        #[arg(long, default_value = ".well-known")]
+        /// DID path/mnemonic to bootstrap (e.g. "my-org", "services/auth").
+        /// Defaults to ".well-known" (the root DID for this server)
+        #[arg(long, visible_alias = "mnemonic", default_value = ".well-known")]
         path: String,
         /// Path to an existing did.jsonl file to import
         #[arg(long)]
@@ -334,34 +341,43 @@ enum Command {
         #[arg(long)]
         witness_did: Option<String>,
     },
-    /// Recreate a DID at a given path
+    /// Recreate a DID at a given path (deletes existing, creates new, updates config)
     RecreateDid {
-        /// DID path/mnemonic to recreate
-        #[arg(long)]
+        /// DID path/mnemonic to recreate (e.g. "webvh/server1")
+        #[arg(long, visible_alias = "mnemonic")]
         path: String,
     },
     /// Recover a soft-deleted DID
     RecoverDid {
-        /// DID path/mnemonic to recover
-        #[arg(long)]
+        /// DID path/mnemonic to recover (e.g. "webvh/server1")
+        #[arg(long, visible_alias = "mnemonic")]
         path: String,
+    },
+    /// Dump the DID log (did.jsonl) for a given path
+    DumpDid {
+        /// DID path/mnemonic to dump (e.g. ".well-known", "my-org")
+        #[arg(long, visible_alias = "mnemonic")]
+        path: String,
+        /// Also dump the witness proof (did-witness.json)
+        #[arg(long)]
+        witness: bool,
     },
     /// List all DIDs in the store
     ListDids,
     /// Remove a DID and all its data from the store
     RemoveDid {
         /// DID path/mnemonic to remove (e.g. "glenn", ".well-known")
-        #[arg(long)]
+        #[arg(long, visible_alias = "mnemonic")]
         path: String,
     },
-    /// Load a DID from existing files.
+    /// Load a DID at an arbitrary path (e.g., "services/control").
     ///
     /// The log must verify (and its witness proofs, if it is witnessed) and
     /// must extend every history this store has served for that DID,
     /// including one since removed with `remove-did`.
     LoadDid {
-        /// Path to store the DID at
-        #[arg(long)]
+        /// Path to store the DID at (e.g., "services/control")
+        #[arg(long, visible_alias = "mnemonic")]
         path: String,
         /// Path to the did.jsonl file
         #[arg(long)]
@@ -396,7 +412,7 @@ enum Command {
     /// `[witness_store]`) and the configuration file, verbatim.
     Backup {
         /// Output file path (use "-" for stdout)
-        #[arg(short, long, default_value = "webvh-backup.json")]
+        #[arg(short, long, default_value = "did-hosting-backup.json")]
         output: String,
     },
     /// Restore the daemon's data from a `did-hosting-daemon backup` file.
@@ -497,11 +513,10 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::Health) => {
-            if let Err(e) = run_health(cli.config).await {
-                eprintln!("Health check error: {e}");
-                std::process::exit(1);
-            }
+        Some(Command::Health { strict }) => {
+            let code =
+                did_hosting_common::server::health::finish(run_health(cli.config).await, strict);
+            std::process::exit(code);
         }
         Some(Command::AddAcl {
             did,
@@ -682,6 +697,23 @@ async fn main() {
         }
         Some(Command::RecoverDid { path }) => {
             if let Err(e) = run_recover_did(cli.config, path).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::DumpDid { path, witness }) => {
+            let result = match DaemonConfig::load(cli.config) {
+                Ok(config) => {
+                    did_hosting_common::server::cli_dids::run_dump_did(
+                        &config.store,
+                        &path,
+                        witness,
+                    )
+                    .await
+                }
+                Err(e) => Err(e.into()),
+            };
+            if let Err(e) = result {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -965,6 +997,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     if config.enable.server {
         let server_config = config.server_config();
         let bootstrapped = did_hosting_server::server::auto_bootstrap_dids(
+            "did-hosting-daemon",
             server_config,
             &main_store,
             &dids_ks,
@@ -2531,42 +2564,31 @@ async fn run_import_secrets(
 // CLI health check
 // ===========================================================================
 
-async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+/// Run every check and return what they found. A config that does not load
+/// is an error: nothing else can be checked without it.
+async fn run_health(
+    config_path: Option<PathBuf>,
+) -> Result<did_hosting_common::server::health::HealthReport, Box<dyn std::error::Error>> {
     use did_hosting_common::server::health;
 
+    let mut report = health::HealthReport::new();
     health::header("did-hosting-daemon", env!("CARGO_PKG_VERSION"));
 
     // ── Configuration ──────────────────────────────────────────────
-    let config = match DaemonConfig::load(config_path) {
-        Ok(c) => {
-            health::section("Configuration");
-            health::check_config_loaded(&c.config_path);
-            health::check_value("server_did", &c.server_did);
-            health::check_value("public_url", &c.public_url);
-            health::check_value("did_hosting_url", &c.did_hosting_url);
-            health::check_value("mediator_did", &c.mediator_did);
-            Some(c)
-        }
-        Err(e) => {
-            health::section("Configuration");
-            health::fail(&format!("Config load failed: {e}"));
-            None
-        }
-    };
+    health::section("Configuration");
+    let config = DaemonConfig::load(config_path)
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("config load failed: {e}").into() })?;
+    health::check_config_loaded(&config.config_path);
+    health::check_value("server_did", &config.server_did);
+    health::check_value("public_url", &config.public_url);
+    health::check_value("did_hosting_url", &config.did_hosting_url);
+    health::check_value("mediator_did", &config.mediator_did);
 
     // ── Compile Features ───────────────────────────────────────────
     health::section("Compile Features");
     health::print_feature("store-fjall", cfg!(feature = "store-fjall"));
     health::print_feature("keyring", cfg!(feature = "keyring"));
     health::print_feature("ui", cfg!(feature = "ui"));
-
-    let config = match config {
-        Some(c) => c,
-        None => {
-            eprintln!();
-            return Ok(());
-        }
-    };
 
     // ── Enabled Services ───────────────────────────────────────────
     health::section("Enabled Services");
@@ -2579,12 +2601,12 @@ async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::err
 
     // ── Secrets ────────────────────────────────────────────────────
     health::section("Secrets");
-    health::check_secrets(&config.secrets, &config.config_path).await;
+    health::check_secrets(&mut report, &config.secrets, &config.config_path).await;
 
     // ── Per-service Stores ─────────────────────────────────────────
     if config.enable.server {
         health::section("Store (server)");
-        let store = health::check_store(&config.store).await;
+        let store = health::check_store(&mut report, &config.store).await;
 
         if let Some(ref store) = store
             && let Ok(dids_ks) = store.keyspace(KS_DIDS)
@@ -2592,7 +2614,7 @@ async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::err
             health::section("Root DID (.well-known)");
             match did_hosting_server::bootstrap::root_did_exists(&dids_ks).await {
                 Ok(true) => {
-                    health::pass("Root DID exists");
+                    report.pass("Root DID exists");
                     match dids_ks
                         .get::<did_hosting_server::did_ops::DidRecord>(
                             did_hosting_server::did_ops::did_key(".well-known"),
@@ -2606,43 +2628,42 @@ async fn run_health(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::err
                             health::info_msg(&format!("Version count: {}", record.version_count));
                         }
                         Ok(None) => {}
-                        Err(e) => health::warn_msg(&format!("Could not read DID record: {e}")),
+                        Err(e) => report.warn(&format!("Could not read DID record: {e}")),
                     }
                 }
                 Ok(false) => health::skip("Root DID not yet bootstrapped"),
-                Err(e) => health::fail(&format!("Root DID check failed: {e}")),
+                Err(e) => report.fail(&format!("Root DID check failed: {e}")),
             }
         }
     }
 
     if config.enable.witness {
         health::section("Store (witness)");
-        health::check_store(&config.witness_store).await;
+        health::check_store(&mut report, &config.witness_store).await;
     }
 
     if config.enable.watcher {
         health::section("Store (watcher — shared with server)");
-        health::check_store(&config.store).await;
+        health::check_store(&mut report, &config.store).await;
     }
 
     if config.enable.control {
         health::section("Store (control — shared with server)");
-        health::check_store(&config.store).await;
+        health::check_store(&mut report, &config.store).await;
     }
 
     // ── DID Resolution ─────────────────────────────────────────────
     if let Some(ref did) = config.server_did {
         health::section("DID Resolution");
-        health::check_did_resolution("Server DID resolves", did).await;
+        health::check_did_resolution(&mut report, "Server DID resolves", did).await;
     }
 
     if let Some(ref did) = config.mediator_did {
         health::section("Mediator DID Resolution");
-        health::check_did_resolution("Mediator DID resolves", did).await;
+        health::check_did_resolution(&mut report, "Mediator DID resolves", did).await;
     }
 
-    eprintln!();
-    Ok(())
+    Ok(report)
 }
 
 // ===========================================================================
@@ -3234,4 +3255,9 @@ mod resolution_cache_hook_tests {
         hook(CacheChange::Domains);
         assert!(!allowed(&gate.domains().await.unwrap()));
     }
+}
+
+#[cfg(test)]
+mod cli_reference_tests {
+    did_hosting_common::cli_reference_test!(super::Cli, "did-hosting-daemon");
 }

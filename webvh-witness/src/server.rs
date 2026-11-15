@@ -152,7 +152,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     .await;
 
     // Bind TCP listener on the main thread for early port validation
-    let std_listener = if config.features.rest_api {
+    let std_listener = if config.features.http_listener {
         let addr = format!("{}:{}", config.server.host, config.server.port);
         let listener = std::net::TcpListener::bind(&addr).map_err(AppError::Io)?;
         listener.set_nonblocking(true).map_err(AppError::Io)?;
@@ -167,8 +167,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     // Log startup configuration
     info!("--- enabled services ---");
     info!(
-        "  REST API : {}",
-        if state.config.features.rest_api {
+        "  HTTP listener : {}",
+        if state.config.features.http_listener {
             "enabled"
         } else {
             "disabled"

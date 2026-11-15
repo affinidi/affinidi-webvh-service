@@ -46,7 +46,7 @@ mediator_did = "did:webvh:mediator.example.com"
 
 [vta]
 did = "did:webvh:vta.example.com"
-context_id = "webvh"
+context_id = "did-hosting"
 
 # Air-gapped flow — see did-hosting-server-build.toml for the full pattern.
 # Phase 1:  vta_mode = "offline-prepare",   request_path = "..."

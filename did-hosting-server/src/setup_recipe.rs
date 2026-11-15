@@ -242,7 +242,7 @@ pub async fn apply_recipe(
         features: FeaturesConfig {
             didcomm,
             tsp,
-            rest_api: false,
+            http_listener: false,
             ..Default::default()
         },
         server_did: Some(server_did.clone()),
@@ -345,6 +345,7 @@ pub async fn apply_recipe(
                 }
                 crate::bootstrap::OwnDidImport::HeldByAnother { existing, minted } => {
                     return Err(AppError::Config(crate::bootstrap::stale_own_did_message(
+                        "did-hosting-server",
                         &did_path,
                         existing.as_deref(),
                         &minted,

@@ -7,7 +7,12 @@ import { Field } from "../components/Field";
 import { Heading } from "../components/Heading";
 import { readPageParam, setNoReferrer, stripPageParam } from "../lib/address-bar";
 import type { RedeemFinishResponse, RedeemStartResponse } from "../lib/api";
-import { completeRedemption, describePurpose, startRedemption } from "../lib/enrol-flow";
+import {
+  completeRedemption,
+  describePurpose,
+  formatClaimCode,
+  startRedemption,
+} from "../lib/enrol-flow";
 import { errorMessage } from "../lib/errors";
 import { createPasskeyCredential, getPasskeyCredential } from "../lib/passkey";
 import { colors, fonts, radii, spacing } from "../lib/theme";
@@ -78,9 +83,11 @@ export default function Enroll() {
 
         {!token && (
           <>
-            <Heading style={styles.title}>Enrollment Failed</Heading>
-            <Text role="alert" style={[styles.hint, styles.error]}>
-              This link has no invite token. Open the link you were sent.
+            <Heading style={styles.title}>Open your enrolment link</Heading>
+            <Text style={styles.hint}>
+              This page registers a passkey from an invite, and it needs the enrolment link you were
+              sent — this address has no invite token in it. Open that link in this browser. If you
+              don&apos;t have one, ask an administrator for an invite.
             </Text>
           </>
         )}
@@ -89,13 +96,16 @@ export default function Enroll() {
           <>
             <Heading style={styles.title}>Register a Passkey</Heading>
             <Text style={styles.hint}>
-              Enter the claim code you were sent separately from this link.
+              Enter the claim code you were sent separately from this link, then press Enter or
+              Continue.
             </Text>
             <Field
               label="Claim code"
+              hint="12 letters and digits, sent to you separately — for example by chat or phone."
               placeholder="XXXX-XXXX-XXXX"
               value={claimCode}
-              onChangeText={setClaimCode}
+              onChangeText={(v) => setClaimCode(formatClaimCode(v))}
+              maxLength={14}
               onSubmit={handleCheck}
               autoCapitalize="characters"
               autoComplete="off"
@@ -163,13 +173,13 @@ export default function Enroll() {
 
         {state.phase === "success" && (
           <>
-            <Heading style={styles.title}>Enrollment Complete</Heading>
+            <Heading style={styles.title}>Passkey registered</Heading>
             <Text role="status" style={[styles.hint, { color: colors.success }]}>
               Your passkey has been registered for {state.done.subject}.
             </Text>
             {state.done.purpose === "session" ? (
               <Button
-                label="Sign In"
+                label="Sign in"
                 onPress={() => router.replace("/login")}
                 style={styles.button}
               />

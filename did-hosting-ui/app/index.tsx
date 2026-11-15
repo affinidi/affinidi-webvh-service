@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { View, Text, StyleSheet, ActivityIndicator, ScrollView } from "react-native";
-import { Link, Redirect } from "expo-router";
+import { Link } from "expo-router";
 import { useAuth } from "../components/AuthProvider";
 import { useApi } from "../components/ApiProvider";
 import { useDomains } from "../components/DomainProvider";
@@ -11,14 +11,36 @@ import { colors, fonts, radii, spacing } from "../lib/theme";
 import { ACL_KEY } from "../components/acl/keys";
 import { Button } from "../components/Button";
 import { Heading } from "../components/Heading";
-import { errorMessage } from "../lib/errors";
+import { ErrorWithRetry, StaleMarker } from "../components/QueryState";
+import { RequireAuth } from "../components/RequireAuth";
 import { plural } from "../lib/plural";
 import { useTrustTaskQuery } from "../lib/query";
 import { QK } from "../lib/query-keys";
 import { matchesDomain } from "../lib/domain";
+import type { DidRecord } from "../lib/api";
 
 export default function Dashboard() {
-  const { isAuthenticated, restored, role } = useAuth();
+  return (
+    <RequireAuth purpose="the dashboard">
+      <DashboardBody />
+    </RequireAuth>
+  );
+}
+
+/** Per-domain totals over a DID list. */
+function domainTotals(dids: DidRecord[]) {
+  return {
+    totalDids: dids.length,
+    totalResolves: dids.reduce((s, d) => s + d.totalResolves, 0),
+    // versionCount is the length of the current log chain; subtract 1 to
+    // approximate "updates beyond initial creation". DIDs that haven't
+    // uploaded a log yet (versionCount === 0) contribute 0.
+    totalUpdates: dids.reduce((s, d) => s + Math.max(0, d.versionCount - 1), 0),
+  };
+}
+
+function DashboardBody() {
+  const { isAuthenticated, role } = useAuth();
   const api = useApi();
   const { currentDomain, domains } = useDomains();
   const isAdmin = role === "admin";
@@ -29,46 +51,54 @@ export default function Dashboard() {
   // leaves them absent, as before. The keys are shared with the service
   // overview and settings, so the page asks for each once.
   const health = useTrustTaskQuery(QK.health, () => api.health());
-  const { data: config } = useTrustTaskQuery(
+  const configQuery = useTrustTaskQuery(
     QK.serverConfig,
     ({ background }) => api.getConfig({ background }),
     { enabled: isAuthenticated && isAdmin },
   );
-  const { data: serverStats } = useTrustTaskQuery(
+  const config = configQuery.data;
+  const statsQuery = useTrustTaskQuery(
     QK.serverStats,
     ({ background }) => api.getServerStats({ background }),
     { enabled: isAuthenticated && isAdmin },
   );
-  const { data: acl } = useTrustTaskQuery(ACL_KEY, () => api.listAcl(), {
+  const serverStats = statsQuery.data;
+  const aclQuery = useTrustTaskQuery(ACL_KEY, () => api.listAcl(), {
     enabled: isAuthenticated && isAdmin,
   });
-  const aclEntries = acl?.entries ?? null;
-  // Per-domain stats are derived from the DID list. We only fetch it
+  const aclEntries = aclQuery.data?.entries ?? null;
+  // Per-domain stats are derived from the DID list. An admin reads it only
   // when a specific domain is pinned — "All domains" reads the cheap
-  // server-wide aggregate from `stats/get` instead.
-  const { data: dids } = useTrustTaskQuery(QK.allDids, () => api.listDids(), {
-    enabled: isAuthenticated && currentDomain !== null,
+  // server-wide aggregate from `stats/get` instead. An owner has no
+  // aggregate to read, so for them the list (their own DIDs) is the source.
+  const didsQuery = useTrustTaskQuery(QK.allDids, () => api.listDids(), {
+    enabled: isAuthenticated && (!isAdmin || currentDomain !== null),
   });
+  const dids = didsQuery.data;
 
   const isDaemon = config?.deploymentMode === "daemon";
 
   const domainStats = useMemo(() => {
     if (currentDomain === null || !dids) return null;
-    // Legacy slots pre-M-01 (and the historical bug where create
-    // dropped the `domain` field) carry an empty `domain`. The shared
-    // matchesDomain helper in lib/domain.ts falls back to the
-    // did_id's host segment so the per-domain numbers don't read as
-    // zero in the gap between an upgrade and publish-time backfill.
-    const scoped = dids.filter((d) => matchesDomain(d, currentDomain));
-    return {
-      totalDids: scoped.length,
-      totalResolves: scoped.reduce((s, d) => s + d.totalResolves, 0),
-      // versionCount is the length of the current log chain; subtract 1
-      // to approximate "updates beyond initial creation". DIDs that
-      // haven't uploaded a log yet (versionCount === 0) contribute 0.
-      totalUpdates: scoped.reduce((s, d) => s + Math.max(0, d.versionCount - 1), 0),
-    };
+    // Legacy slots carry an empty `domain`; the shared matchesDomain helper
+    // falls back to the DID's host segment so the per-domain numbers don't
+    // read as zero before publish-time backfill tags them.
+    return domainTotals(dids.filter((d) => matchesDomain(d, currentDomain)));
   }, [currentDomain, dids]);
+
+  // An owner's DIDs, one card per domain they host on.
+  const ownerDomains = useMemo(() => {
+    if (isAdmin || !dids) return null;
+    const by = new Map<string, DidRecord[]>();
+    for (const d of dids) {
+      if (currentDomain !== null && !matchesDomain(d, currentDomain)) continue;
+      const key = d.domain || "(no domain)";
+      by.set(key, [...(by.get(key) ?? []), d]);
+    }
+    return [...by.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([domain, list]) => ({ domain, ...domainTotals(list) }));
+  }, [isAdmin, dids, currentDomain]);
 
   // Owners whose scope is unrestricted ("All") are flagged for migration:
   // v0.7 grants new Owners a scoped default, but pre-existing rows keep
@@ -80,19 +110,6 @@ export default function Dashboard() {
     return aclEntries.filter((e) => e.role === "owner" && (!e.domains || e.domains.kind === "all"))
       .length;
   }, [aclEntries]);
-
-  // Signed out: straight to the login page, which shows the sign-in code at
-  // once. Until the saved session has been looked for, show the mark rather
-  // than send a signed-in visitor through the login page.
-  if (!isAuthenticated) {
-    if (restored) return <Redirect href="/login" />;
-    return (
-      <View style={styles.container}>
-        <AffinidiLogo size={48} />
-        <Text style={styles.subtitle}>Decentralized Identity Hosting</Text>
-      </View>
-    );
-  }
 
   return (
     <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent}>
@@ -120,10 +137,12 @@ export default function Dashboard() {
       )}
 
       {health.error && !health.data ? (
-        <View style={[styles.card, styles.errorCard]}>
-          <Text role="alert" style={styles.errorText}>
-            Server unreachable: {errorMessage(health.error)}
-          </Text>
+        <View style={styles.section}>
+          <ErrorWithRetry
+            error={health.error}
+            what="the control plane's status"
+            onRetry={() => void health.refetch()}
+          />
         </View>
       ) : health.data ? (
         <View style={styles.statusRow}>
@@ -172,6 +191,65 @@ export default function Dashboard() {
         </View>
       ) : (
         <ActivityIndicator color={colors.accent} size="large" />
+      )}
+
+      {/* Reads that failed with nothing to show: said, with a retry, rather
+          than leaving the cards they feed silently missing. */}
+      {[
+        { q: statsQuery, what: "the statistics" },
+        { q: didsQuery, what: isAdmin ? "the DIDs on this domain" : "your DIDs" },
+        { q: aclQuery, what: "the access list" },
+      ]
+        .filter(({ q }) => q.error != null && q.data === undefined)
+        .map(({ q, what }) => (
+          <View key={what} style={styles.section}>
+            <ErrorWithRetry error={q.error} what={what} onRetry={() => void q.refetch()} />
+          </View>
+        ))}
+
+      {ownerDomains && (
+        <View style={styles.section}>
+          <View style={styles.sectionHeader}>
+            <Heading level={2} style={styles.sectionTitle}>
+              Your DIDs by domain
+            </Heading>
+            <StaleMarker
+              updatedAt={didsQuery.updatedAt}
+              error={didsQuery.error}
+              onRetry={() => void didsQuery.refetch()}
+            />
+          </View>
+          {ownerDomains.length === 0 ? (
+            <View style={styles.emptyCard}>
+              <Text style={styles.emptyText}>
+                {currentDomain
+                  ? `You have no DIDs on ${currentDomain} yet.`
+                  : "You have no DIDs yet."}
+              </Text>
+              <Link href="/dids" asChild>
+                <Button label="Create a DID" style={styles.migrationButton} />
+              </Link>
+            </View>
+          ) : (
+            <View style={styles.statusRow}>
+              {ownerDomains.map((d) => (
+                <View
+                  key={d.domain}
+                  style={[styles.card, styles.domainCard]}
+                  role="region"
+                  aria-label={d.domain}
+                >
+                  <Text style={styles.cardLabel}>{d.domain}</Text>
+                  <Text style={styles.cardValueAccent}>{d.totalDids.toLocaleString()}</Text>
+                  <Text style={styles.domainMeta}>
+                    {plural(d.totalDids, "DID", "DIDs")} · {d.totalResolves.toLocaleString()}{" "}
+                    resolves · {d.totalUpdates.toLocaleString()} updates
+                  </Text>
+                </View>
+              ))}
+            </View>
+          )}
+        </View>
       )}
 
       {/* Control-plane transports + service topology. Rendered in both
@@ -256,6 +334,38 @@ const styles = StyleSheet.create({
     minWidth: 140,
     flex: 1,
     alignItems: "center",
+  },
+  sectionHeader: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacing.sm,
+    marginBottom: spacing.md,
+  },
+  domainCard: {
+    alignItems: "flex-start",
+    minWidth: 200,
+  },
+  domainMeta: {
+    fontSize: 12,
+    fontFamily: fonts.regular,
+    color: colors.textSecondary,
+    marginTop: spacing.xs,
+  },
+  emptyCard: {
+    backgroundColor: colors.bgSecondary,
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: spacing.lg,
+    alignItems: "flex-start",
+    gap: spacing.md,
+  },
+  emptyText: {
+    fontSize: 14,
+    fontFamily: fonts.regular,
+    color: colors.textSecondary,
   },
   errorCard: {
     backgroundColor: colors.errorBg,
