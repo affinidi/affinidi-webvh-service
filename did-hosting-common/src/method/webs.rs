@@ -335,9 +335,10 @@ impl Webs {
     /// (by `affinidi-did-webs`) but not compared with the stored one.
     ///
     /// # Errors
-    /// [`MethodError::Validation`] if the new stream does not verify, does
-    /// not establish the stored AID, rewinds the log or diverges from it
-    /// other than by superseding recovery. An *existing* stream that cannot
+    /// [`MethodError::Validation`] if the new stream does not verify or does
+    /// not establish the stored AID; [`MethodError::HistoryRewrite`] if it
+    /// rewinds the log or diverges from it other than by superseding
+    /// recovery. An *existing* stream that cannot
     /// be parsed at all is **not** an error: see below.
     pub fn verify_continuation(
         did: &str,
@@ -397,7 +398,7 @@ impl Webs {
             // No divergence: the new log is the stored one, extended, or it
             // stops short of it.
             if next.len() < held.len() {
-                return Err(MethodError::Validation(format!(
+                return Err(MethodError::HistoryRewrite(format!(
                     "update rewinds the key event log: hosted is at sequence {}, update is at {}",
                     held[held.len() - 1].sn,
                     next.last().map(|e| e.sn).unwrap_or_default(),
@@ -419,7 +420,7 @@ impl Webs {
             );
             return Ok(());
         }
-        Err(MethodError::Validation(format!(
+        Err(MethodError::HistoryRewrite(format!(
             "update diverges from the key event log at sequence {}: the hosted event is {} \
              {}, the update's is {} {}. Only interaction events after the last \
              establishment event can be superseded, and only by a rotation",
@@ -852,7 +853,7 @@ mod tests {
 
         let err = Webs::verify_continuation(DID, KERI, truncated)
             .expect_err("an update may not rewind the key event log");
-        assert!(matches!(err, MethodError::Validation(_)));
+        assert!(matches!(err, MethodError::HistoryRewrite(_)));
         assert!(err.to_string().contains("rewinds"));
     }
 }

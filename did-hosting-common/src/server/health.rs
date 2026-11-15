@@ -257,19 +257,16 @@ pub async fn check_store(
             report.pass(&format!("Store opened ({backend_name} @ {locator})"));
             Some(store)
         }
+        Err(crate::server::error::AppError::StoreLocked(msg)) => {
+            report.warn(&format!(
+                "Store locked (is the service running?) ({backend_name} @ {locator}): {msg}"
+            ));
+            None
+        }
         Err(e) => {
-            // The backends report a held lock only as text; there is no typed
-            // error to match on.
-            let msg = e.to_string();
-            if msg.contains("lock") || msg.contains("Lock") {
-                report.warn(&format!(
-                    "Store locked (is the service running?) ({backend_name} @ {locator}): {msg}"
-                ));
-            } else {
-                report.fail(&format!(
-                    "Store open failed ({backend_name} @ {locator}): {msg}"
-                ));
-            }
+            report.fail(&format!(
+                "Store open failed ({backend_name} @ {locator}): {e}"
+            ));
             None
         }
     }

@@ -116,7 +116,7 @@ fn histories() -> Histories {
 
 fn refused(result: Result<(), MethodError>, needle: &str) {
     match result {
-        Err(MethodError::Validation(message)) => {
+        Err(MethodError::HistoryRewrite(message)) => {
             assert!(message.contains(needle), "{message}")
         }
         other => panic!("expected a refusal mentioning {needle:?}, got {other:?}"),
@@ -189,7 +189,7 @@ fn a_publication_is_held_to_the_same_rule() {
     let h = histories();
     let fork = verify_publication(DOMAIN, &h.aid, &h.other_ixn, Some(&h.ours[1]), None);
     assert!(
-        matches!(fork, Err(MethodError::Validation(ref m)) if m.contains("diverges")),
+        matches!(fork, Err(MethodError::HistoryRewrite(ref m)) if m.contains("diverges")),
         "{:?}",
         fork.err()
     );

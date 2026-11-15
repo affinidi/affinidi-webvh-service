@@ -122,7 +122,7 @@ pub enum SyncRefusal {
 impl From<AppError> for SyncRefusal {
     fn from(e: AppError) -> Self {
         match e {
-            AppError::QuotaExceeded(_) => SyncRefusal::TooLarge(e.to_string()),
+            AppError::QuotaExceeded { .. } => SyncRefusal::TooLarge(e.to_string()),
             e => SyncRefusal::Transient(e.to_string()),
         }
     }
@@ -177,8 +177,8 @@ pub async fn apply_sync(
     entry: &SyncEntry,
 ) -> Result<SyncApplied, SyncRefusal> {
     use did_hosting_common::did_ops::{
-        extract_did_id, validate_did_id_matches_request, verify_did_log_and_witness_proofs,
-        verify_log_extends,
+        LogExtendError, extract_did_id, validate_did_id_matches_request,
+        verify_did_log_and_witness_proofs, verify_log_extends,
     };
 
     did_hosting_common::server::mnemonic::validate_mnemonic(&entry.mnemonic)
@@ -261,12 +261,9 @@ pub async fn apply_sync(
         .await?
         .map(|b| String::from_utf8_lossy(&b).into_owned());
     for previous in [same_did_held, high_water].into_iter().flatten() {
-        verify_log_extends(Some(&previous), &entry.log_content).map_err(|e| {
-            if e.contains("deactivated") {
-                SyncRefusal::Deactivated(e)
-            } else {
-                SyncRefusal::HistoryRewrite(e)
-            }
+        verify_log_extends(Some(&previous), &entry.log_content).map_err(|e| match e {
+            LogExtendError::Deactivated => SyncRefusal::Deactivated(e.to_string()),
+            LogExtendError::HistoryRewrite { .. } => SyncRefusal::HistoryRewrite(e.to_string()),
         })?;
     }
 

@@ -187,7 +187,7 @@ pub(crate) async fn set_state(
                     other => other.into(),
                 })?;
         }
-        _ => return Err(AppError::Validation("unsupported domain state".into()).into()),
+        _ => return Err(AppError::invalid("unsupported domain state").into()),
     }
     domains_changed(state);
     let entry = existing(state, &name, unknown).await?;

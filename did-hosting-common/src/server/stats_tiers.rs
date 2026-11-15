@@ -243,7 +243,7 @@ impl std::str::FromStr for StatsResolution {
             "fine" => Ok(Self::Fine),
             "coarse" => Ok(Self::Coarse),
             "off" => Ok(Self::Off),
-            other => Err(AppError::Validation(format!(
+            other => Err(AppError::invalid(format!(
                 "unknown stats resolution `{other}` (auto, fine, coarse, off)"
             ))),
         }
