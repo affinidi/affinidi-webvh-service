@@ -160,12 +160,20 @@ async fn edge_state(
 
 impl Fleet {
     async fn queued(&self) -> Vec<(String, Value)> {
-        crate::outbox::list_pending_for_target(&self.control.store, &self.edge_did)
+        let rows = crate::outbox::list_pending_for_target(&self.control.store, &self.edge_did)
             .await
             .unwrap()
             .into_iter()
-            .map(|(_, e)| (e.msg_type, e.body))
-            .collect()
+            .map(|(_, e)| e)
+            .collect::<Vec<_>>();
+        let mut out = Vec::new();
+        for e in rows {
+            // What each row would be sent as now.
+            if let Some(p) = crate::outbox::prepare(&self.control, &e).await.unwrap() {
+                out.push((p.msg_type, p.body));
+            }
+        }
+        out
     }
 
     /// Deliver the head of the edge's outbox over `via` — signed at send time,
@@ -181,10 +189,15 @@ impl Fleet {
                 .expect("an entry is queued");
         let signer =
             crate::signing::control_signing_secret(&self.control, &self.control_did).unwrap();
-        let doc = crate::outbox::signed_document(&self.control_did, &entry, &signer)
+        let prepared = crate::outbox::prepare(&self.control, &entry)
             .await
-            .unwrap();
-        crate::outbox::record_sent(&self.control.store, key, &entry, &doc.id)
+            .unwrap()
+            .expect("something to send");
+        let doc =
+            crate::outbox::signed_document(&self.control_did, &self.edge_did, &prepared, &signer)
+                .await
+                .unwrap();
+        crate::outbox::record_prepared_sent(&self.control.store, key, &prepared, &doc.id)
             .await
             .unwrap();
         let doc = serde_json::to_value(&doc).unwrap();
@@ -370,6 +383,9 @@ async fn directives_replicate_and_settle_on_every_transport() {
             purge_at: None,
         };
 
+        did_hosting_common::server::domain::create_domain(&f.control.store, &entry)
+            .await
+            .unwrap();
         crate::server_push::send_domain_upsert(&f.control, &f.edge_did, &entry)
             .await
             .unwrap();

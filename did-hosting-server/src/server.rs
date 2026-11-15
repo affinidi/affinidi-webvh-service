@@ -328,6 +328,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let storage_collector = stats_collector.clone();
     let storage_stats_config = stats_config;
     let storage_did_cache = state.did_cache.clone();
+    let storage_gate_cache = state.gate_cache.clone();
     let storage_handle = std::thread::Builder::new()
         .name("webvh-storage".into())
         .spawn(move || {
@@ -339,6 +340,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
                     collector: storage_collector,
                     stats_config: storage_stats_config,
                     did_cache: storage_did_cache,
+                    gate_cache: storage_gate_cache,
                 },
                 &mut storage_shutdown,
             )
@@ -834,6 +836,7 @@ struct StorageThreadParams {
     collector: Arc<stats::StatsCollector>,
     stats_config: crate::config::StatsConfig,
     did_cache: Arc<crate::cache::ContentCache>,
+    gate_cache: Option<Arc<crate::cache::GateCache>>,
 }
 
 fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Receiver<bool>) {
@@ -844,6 +847,7 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
         collector,
         stats_config,
         did_cache,
+        gate_cache,
     } = params;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -866,15 +870,18 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
             did_hosting_common::server::stats_collector::DID_COUNT_RECONCILE_INTERVAL,
         );
 
-        // Drop expired content cache entries each minute (they live
-        // `RESOLUTION_CACHE_TTL`), so DIDs nobody asks for again do not stay
-        // in memory.
-        let mut evict_timer = tokio::time::interval(Duration::from_secs(60));
+        // Each minute: run the grace-expired purge sweep (the schedule an
+        // unassign or a domain disable acknowledged to the control plane),
+        // then drop expired content cache entries (they live
+        // `RESOLUTION_CACHE_TTL`) so DIDs nobody asks for again do not stay
+        // in memory — or the whole cache, when the sweep purged something.
+        let mut purge_timer =
+            tokio::time::interval(crate::purge_sweep::DEFAULT_SWEEP_INTERVAL);
 
         // First tick completes immediately; skip so cleanup doesn't run at startup
         did_timer.tick().await;
         did_count_timer.tick().await;
-        evict_timer.tick().await;
+        purge_timer.tick().await;
 
         loop {
             tokio::select! {
@@ -899,7 +906,15 @@ fn run_storage_thread(params: StorageThreadParams, shutdown_rx: &mut watch::Rece
                         warn!("DID count reconcile error: {e}");
                     }
                 }
-                _ = evict_timer.tick() => did_cache.evict_expired(),
+                _ = purge_timer.tick() => {
+                    crate::purge_sweep::run_edge_sweep_tick(
+                        &store,
+                        &did_cache,
+                        gate_cache.as_deref(),
+                        Some(&collector),
+                    )
+                    .await;
+                }
                 _ = shutdown_rx.changed() => {
                     info!("storage thread shutting down");
                     break;

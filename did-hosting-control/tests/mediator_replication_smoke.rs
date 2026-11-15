@@ -496,6 +496,10 @@ async fn distributed_mode_replicates_over_didcomm_through_the_mediator() {
     wait_connected(&control_svc, "control").await;
     wait_connected(&edge_svc, "server").await;
 
+    // The outbox sends the domain as the control plane holds it.
+    domain::create_domain(&control.store, &domain_entry("edge.example.com"))
+        .await
+        .expect("control holds the domain");
     did_hosting_control::server_push::send_domain_upsert(
         &control,
         &edge_did,
@@ -593,6 +597,10 @@ async fn distributed_mode_replicates_over_https() {
     register_edge(&control, &edge_did).await;
     let https_handle = serve_https_edge(listener, edge.clone());
 
+    // The outbox sends the domain as the control plane holds it.
+    domain::create_domain(&control.store, &domain_entry("edge.example.com"))
+        .await
+        .expect("control holds the domain");
     did_hosting_control::server_push::send_domain_upsert(
         &control,
         &edge_did,
@@ -715,6 +723,10 @@ async fn daemon_mode_replicates_over_didcomm_through_the_mediator() {
     edge.didcomm_service.set(edge_svc.clone()).ok();
     wait_connected(&edge_svc, "server").await;
 
+    // The outbox sends the domain as the control plane holds it.
+    domain::create_domain(&control.store, &domain_entry("edge.example.com"))
+        .await
+        .expect("control holds the domain");
     did_hosting_control::server_push::send_domain_upsert(
         &control,
         &edge_did,
@@ -808,6 +820,10 @@ async fn daemon_mode_replicates_over_https() {
     register_edge(&control, &edge_did).await;
     let https_handle = serve_https_edge(listener, edge.clone());
 
+    // The outbox sends the domain as the control plane holds it.
+    domain::create_domain(&control.store, &domain_entry("edge.example.com"))
+        .await
+        .expect("control holds the domain");
     did_hosting_control::server_push::send_domain_upsert(
         &control,
         &edge_did,

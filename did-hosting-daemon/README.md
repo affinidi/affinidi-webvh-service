@@ -216,6 +216,11 @@ Environment variables use the `DAEMON_` prefix:
 | `DAEMON_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW` | Resolution requests per client address per window (empty clears: no limit) |
 | `DAEMON_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS` | Resolution rate-limit window (default 10; empty restores it) |
 | `DAEMON_SERVER_TRUSTED_PROXIES` | Comma-separated proxy addresses or CIDR ranges whose `X-Forwarded-For` is trusted (empty clears) |
+| `DAEMON_STORE_*` | Main store backend (`_DATA_DIR`, `_REDIS_URL`, `_DYNAMODB_TABLE_PREFIX`, …; see `docs/bootstrap_startup.md`) |
+| `DAEMON_WITNESS_STORE_*` | The same settings for `[witness_store]` |
+| `DAEMON_SECRETS_*` | Secret backend (`_AWS_SECRET_NAME`, `_VAULT_ADDR`, …) |
+| `DAEMON_AUTH_*` | Session and challenge lifetimes (`_ACCESS_EXPIRY`, `_CHALLENGE_TTL`, …) |
+| `DAEMON_FEATURES_*` | Feature flags (`_DIDCOMM`, `_TSP`, `_REST_API`, `_AGENT_NAMES`) |
 
 The same settings live in `[server.resolve_cache]` (`max_age_secs`,
 `shared_max_age_secs`, `stale_while_revalidate_secs`).

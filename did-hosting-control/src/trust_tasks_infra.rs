@@ -236,7 +236,7 @@ pub(crate) async fn acknowledge_outbox(
             }
         }
     }
-    match crate::outbox::acknowledge(&state.store, sender, thread).await {
+    match crate::outbox::acknowledge(state, sender, thread).await {
         Ok(true) => {
             crate::registry::record_ack(
                 &state.registry_ks,

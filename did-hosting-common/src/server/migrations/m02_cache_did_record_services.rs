@@ -47,13 +47,22 @@
 //!
 //! Every publish additionally self-heals a `None` it encounters, so a record
 //! this sweep deferred (unparseable log) still converges on its next publish.
+//! A run that deferred records reports [`MigrationOutcome::Deferred`], so the
+//! migration stays pending and the next runner invocation retries them.
+//!
+//! Like M-01, the walk is paged and each record is re-read and written with a
+//! compare-and-swap that changes `services` alone
+//! (`super::patch_did_record_field`), so a concurrent publish is never
+//! overwritten with a stale record.
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::super::store::{KS_DIDS, Store};
-use super::{Migration, MigrationFuture};
-use crate::did_ops::{DidRecord, content_log_key, did_key, extract_service_types};
+use super::{
+    DidRecordPages, Migration, MigrationFuture, MigrationOutcome, Patched, patch_did_record_field,
+};
+use crate::did_ops::{DidRecord, content_log_key, extract_service_types};
 
 /// Public migration ID. Stable wire identifier — never rename.
 pub const ID: &str = "m02_cache_did_record_services";
@@ -71,8 +80,12 @@ pub struct M02Counters {
     /// Left at `None`; `register_did_atomic` fills them.
     pub skipped_no_log: u64,
     /// Records whose log content was present but unparseable as JSONL with
-    /// a `state`. Left at `None` and counted for follow-up; a re-run retries.
+    /// a `state`. Left at `None` and counted for follow-up; the migration
+    /// stays pending, so the next runner invocation retries.
     pub deferred_bad_log: u64,
+    /// Records concurrent writers kept changing while the migration tried
+    /// to cache them. Retried by the next runner invocation.
+    pub deferred_contended: u64,
 }
 
 pub struct M02CacheDidRecordServices;
@@ -90,63 +103,73 @@ impl Migration for M02CacheDidRecordServices {
         Box::pin(async move {
             let mut counters = M02Counters::default();
             let dids = store.keyspace(KS_DIDS)?;
+            let consistent = store.keyspace_consistent(KS_DIDS)?;
 
-            // Walk every `did:{mnemonic}` key. The prefix-scan filters out
-            // the `content:` / `owner:` / `watcher_sync:` neighbours.
-            let raw = dids.prefix_iter_raw(b"did:".to_vec()).await?;
-            for (key, value) in raw {
-                let mnemonic = match std::str::from_utf8(&key) {
-                    Ok(k) => k.strip_prefix("did:").unwrap_or(k).to_string(),
-                    Err(_) => {
-                        warn!(migration_id = ID, "skipping non-UTF-8 key in dids keyspace");
+            // Walk every `did:{mnemonic}` key, a page at a time. The scan
+            // only selects candidates: each one is re-read just before it is
+            // written (see `patch_did_record_field`).
+            let mut pages = DidRecordPages::new(&dids);
+            while let Some(page) = pages.next_page(ID).await? {
+                for (mnemonic, value) in page {
+                    let record: DidRecord = match serde_json::from_slice(&value) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(
+                                migration_id = ID,
+                                mnemonic = %mnemonic,
+                                error = %e,
+                                "skipping unparseable DidRecord"
+                            );
+                            continue;
+                        }
+                    };
+
+                    // `Some(vec![])` is a real answer, not an empty cache.
+                    if record.services.is_some() {
+                        counters.already_cached += 1;
                         continue;
                     }
-                };
-                let mut record: DidRecord = match serde_json::from_slice(&value) {
-                    Ok(r) => r,
-                    Err(e) => {
+
+                    let Some(bytes) = consistent.get_raw(content_log_key(&mnemonic)).await? else {
+                        counters.skipped_no_log += 1;
+                        continue;
+                    };
+                    let Ok(content) = String::from_utf8(bytes) else {
+                        counters.deferred_bad_log += 1;
                         warn!(
                             migration_id = ID,
                             mnemonic = %mnemonic,
-                            error = %e,
-                            "skipping unparseable DidRecord"
+                            "deferred: log content is not UTF-8"
                         );
                         continue;
+                    };
+                    let Some(services) = extract_service_types(&content) else {
+                        counters.deferred_bad_log += 1;
+                        debug!(
+                            migration_id = ID,
+                            mnemonic = %mnemonic,
+                            "deferred: log has no parseable entry with a `state`"
+                        );
+                        continue;
+                    };
+
+                    // Every publish writes `services` together with the log,
+                    // so a record that still has none when re-read is one no
+                    // publish has touched since the log was read above.
+                    let patched =
+                        patch_did_record_field(&consistent, &mnemonic, "services", |fresh| {
+                            fresh
+                                .services
+                                .is_none()
+                                .then(|| (serde_json::json!(services), ()))
+                        })
+                        .await?;
+                    match patched {
+                        Patched::Written(()) => counters.cached += 1,
+                        Patched::Unneeded => counters.already_cached += 1,
+                        Patched::Contended => counters.deferred_contended += 1,
                     }
-                };
-
-                // `Some(vec![])` is a real answer, not an empty cache.
-                if record.services.is_some() {
-                    counters.already_cached += 1;
-                    continue;
                 }
-
-                let Some(bytes) = dids.get_raw(content_log_key(&mnemonic)).await? else {
-                    counters.skipped_no_log += 1;
-                    continue;
-                };
-                let Ok(content) = String::from_utf8(bytes) else {
-                    counters.deferred_bad_log += 1;
-                    warn!(
-                        migration_id = ID,
-                        mnemonic = %mnemonic,
-                        "deferred: log content is not UTF-8"
-                    );
-                    continue;
-                };
-                let Some(services) = extract_service_types(&content) else {
-                    counters.deferred_bad_log += 1;
-                    debug!(
-                        migration_id = ID,
-                        mnemonic = %mnemonic,
-                        "deferred: log has no parseable entry with a `state`"
-                    );
-                    continue;
-                };
-
-                counters.cached += 1;
-                record.services = Some(services);
-                dids.insert(did_key(&mnemonic), &record).await?;
             }
 
             info!(
@@ -155,18 +178,23 @@ impl Migration for M02CacheDidRecordServices {
                 already_cached = counters.already_cached,
                 skipped_no_log = counters.skipped_no_log,
                 deferred_bad_log = counters.deferred_bad_log,
-                "M-02 complete"
+                deferred_contended = counters.deferred_contended,
+                "M-02 walk complete"
             );
 
-            Ok(())
+            // Deferred records keep the migration pending, so the next runner
+            // invocation retries them.
+            Ok(MigrationOutcome::from_deferred(
+                counters.deferred_bad_log + counters.deferred_contended,
+            ))
         })
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::super::MigrationRunner;
     use super::*;
+    use crate::did_ops::did_key;
     use crate::server::config::StoreConfig;
 
     async fn fjall_store() -> Store {
@@ -294,6 +322,29 @@ mod tests {
         run_m02(&store).await;
 
         assert_eq!(load(&store, "d").await.services, Some(vec![]));
+    }
+
+    /// A record whose log cannot be read is deferred: the migration stays
+    /// pending, and completes once the log is readable.
+    #[tokio::test]
+    async fn a_deferred_record_keeps_the_migration_pending() {
+        let store = fjall_store().await;
+        seed(&store, &record("f", None), Some("not a log")).await;
+        let runner = || MigrationRunner::new(vec![std::sync::Arc::new(M02CacheDidRecordServices)]);
+
+        let summary = runner().run_pending(&store).await.unwrap();
+        assert_eq!(summary.deferred, vec![ID]);
+        assert_eq!(load(&store, "f").await.services, None);
+
+        store
+            .keyspace(KS_DIDS)
+            .unwrap()
+            .insert_raw(content_log_key("f"), log_with_services().into_bytes())
+            .await
+            .unwrap();
+        let summary = runner().run_pending(&store).await.unwrap();
+        assert_eq!(summary.applied, vec![ID]);
+        assert!(load(&store, "f").await.services.is_some());
     }
 
     /// Idempotent: a second sweep over an already-swept store is a no-op.
