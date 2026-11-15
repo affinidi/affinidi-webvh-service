@@ -561,7 +561,17 @@ jobs:
       # else, the same reason the Rust jobs pass `--locked`.
       - run: npm ci
       - run: npm run typecheck
+      # ESLint (react-hooks, jsx-a11y) and Prettier. Warnings fail the step.
+      - run: npm run lint
+      - run: npm run format:check
       - run: npm test
+      # Build the web bundle the control plane embeds, so a change that
+      # type-checks but does not bundle (a Metro resolution failure, a
+      # native-only import on web) fails here rather than at release time.
+      # Exported to the job's own `dist/`, not `did-hosting-control/ui-dist`.
+      - run: npx expo export --platform web --output-dir dist
+        env:
+          CI: "1"
 
   # NB: there is intentionally no `cargo publish --dry-run` job. The
   # did-hosting-* crates are a deployable service, not libraries — none are
