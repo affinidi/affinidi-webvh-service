@@ -602,7 +602,7 @@ export async function trustTask<Req, Resp>(
       }
       const delay = retryDelayMs(typeUri, e.payload, Date.now());
       if (delay === null) throw e;
-      // eslint-disable-next-line no-console
+       
       console.debug(
         `trust task ${typeUri} rejected as ${e.payload.code} (retryable); re-issuing in ${delay}ms`,
       );

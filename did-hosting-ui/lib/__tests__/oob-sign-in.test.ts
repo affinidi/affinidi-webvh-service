@@ -130,7 +130,7 @@ const err = (status: number, code: string, details?: unknown): Reply => ({
 
 /** A service that answers `request`, then each redeem from a script. */
 function service(redeems: Reply[], claimWindowSecs = 120) {
-  const sent: Array<Record<string, unknown>> = [];
+  const sent: Record<string, unknown>[] = [];
   const f = (async (_url: string, init: RequestInit) => {
     const doc = JSON.parse(String(init.body)) as Record<string, unknown>;
     sent.push(doc);

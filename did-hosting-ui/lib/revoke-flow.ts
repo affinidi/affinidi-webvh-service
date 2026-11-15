@@ -19,12 +19,13 @@ import {
   type RevokePasskeyFinishResponse,
   type RevokePasskeyStartResponse,
 } from "./api";
+import type { AssertionJson } from "./passkey";
 import { isRejection } from "./trust-task";
 
 /** `navigator.credentials.get`, over `{ publicKey }` — the one ceremony a
  *  revocation runs (there is nothing to create). */
 export interface WebAuthnAssertion {
-  get: (options: { publicKey: unknown }) => Promise<any>;
+  get: (options: { publicKey: unknown }) => Promise<AssertionJson>;
 }
 
 /** A refusal worded for whoever is revoking, not the operator. */

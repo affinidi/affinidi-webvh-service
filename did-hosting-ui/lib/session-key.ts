@@ -114,7 +114,7 @@ export async function generateSessionKeypair(): Promise<{
   // in again after a reload.
   await idbPut(KEYPAIR_KEY, { keypair, pubkeyMultikey: multikey, didKey }).catch(
     (e) => {
-      // eslint-disable-next-line no-console
+       
       console.warn("session-key: IDB persist failed", e);
     },
   );
@@ -163,7 +163,7 @@ export async function restoreSessionKeypair(): Promise<void> {
         sessionDidKey = persisted.didKey;
       }
     } catch (e) {
-      // eslint-disable-next-line no-console
+       
       console.warn("session-key: IDB restore failed", e);
     } finally {
       restoreInFlight = null;
@@ -180,7 +180,7 @@ export async function restoreSessionKeypair(): Promise<void> {
 export function clearSessionKeypair(): void {
   forgetSessionKeypair();
   void idbDelete(KEYPAIR_KEY).catch((e) => {
-    // eslint-disable-next-line no-console
+     
     console.warn("session-key: IDB clear failed", e);
   });
 }

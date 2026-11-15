@@ -17,12 +17,13 @@
  */
 
 import { api, type RedeemFinishResponse, type RedeemStartResponse } from "./api";
+import type { AssertionJson, AttestationJson } from "./passkey";
 import { isRejection } from "./trust-task";
 
 /** `navigator.credentials.create` / `.get`, over `{ publicKey }`. */
 export interface WebAuthnCeremonies {
-  create: (options: { publicKey: unknown }) => Promise<any>;
-  get: (options: { publicKey: unknown }) => Promise<any>;
+  create: (options: { publicKey: unknown }) => Promise<AttestationJson>;
+  get: (options: { publicKey: unknown }) => Promise<AssertionJson>;
 }
 
 /** A refusal worded for the invitee, not the operator. */

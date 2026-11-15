@@ -159,7 +159,7 @@ function persistSession(): void {
     refreshToken: refreshTokenMem,
     authMethod: authMethodMem,
   }).catch((e) => {
-    // eslint-disable-next-line no-console
+     
     console.warn("session: IDB persist failed", e);
   });
 }
@@ -187,7 +187,7 @@ export async function restoreSession(): Promise<void> {
         authMethodMem = persisted.authMethod;
       }
     } catch (e) {
-      // eslint-disable-next-line no-console
+       
       console.warn("session: IDB restore failed", e);
     } finally {
       sessionRestored = true;
@@ -422,7 +422,7 @@ export function clearToken(): void {
   // `persistSession()`'s put racing `idbDeleteSession()` below.
   sessionRestored = true;
   idbDeleteSession().catch((e) => {
-    // eslint-disable-next-line no-console
+     
     console.warn("session: IDB clear failed", e);
   });
   // Drop the session keypair from both memory and IndexedDB.

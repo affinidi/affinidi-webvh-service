@@ -38,13 +38,13 @@ const UV_OPTIONS = {
 const ATTESTATION = {
   id: "bmV3",
   rawId: "bmV3",
-  type: "public-key",
+  type: "public-key" as const,
   response: { attestationObject: "YQ", clientDataJSON: "Yw" },
 };
 const ASSERTION = {
   id: "b2xk",
   rawId: "b2xk",
-  type: "public-key",
+  type: "public-key" as const,
   response: { authenticatorData: "YQ", clientDataJSON: "Yw", signature: "cw" },
 };
 

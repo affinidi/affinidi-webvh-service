@@ -198,18 +198,20 @@ export default function DidDetail() {
     const state = latest?.state;
 
     if (params) {
-      setParamPortable(params.portable ?? false);
-      setParamTtl(params.ttl != null ? String(params.ttl) : "");
+      setParamPortable(params.portable === true);
+      setParamTtl(typeof params.ttl === "number" ? String(params.ttl) : "");
 
       const watchers: string[] = Array.isArray(params.watchers)
         ? params.watchers.filter((w: unknown) => typeof w === "string")
         : [];
       setParamWatchers(watchers);
 
-      const witnesses: string[] =
-        params.witness?.witnesses
-          ?.map((w: any) => w.id)
-          .filter((id: unknown) => typeof id === "string") ?? [];
+      const witnessParam = params.witness as { witnesses?: unknown } | null | undefined;
+      const witnesses: string[] = Array.isArray(witnessParam?.witnesses)
+        ? witnessParam.witnesses
+            .map((w: unknown) => (w && typeof w === "object" ? (w as { id?: unknown }).id : null))
+            .filter((id: unknown): id is string => typeof id === "string")
+        : [];
       setParamWitnesses(witnesses);
     }
 

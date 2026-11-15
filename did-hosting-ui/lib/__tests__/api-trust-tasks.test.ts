@@ -661,6 +661,80 @@ describe("updateAcl (AclEntry 0.2: a grant never narrows)", () => {
     expect(tasks(sent)[1]!.doc.payload.entry.act).toEqual({ scope: "all" });
   });
 
+  describe("diffed against the loaded entry", () => {
+    const loaded = {
+      did: BOB,
+      role: "owner" as const,
+      label: "Bob",
+      created_at: 0,
+      max_total_size: null,
+      max_did_count: 5,
+      domains: { kind: "allowed" as const, domains: ["a.example"] },
+    };
+
+    it("sends nothing when nothing changed", async () => {
+      const sent = installControlPlane(() => undefined);
+      const entry = await api.updateAcl(
+        BOB,
+        { role: "owner", label: "Bob", maxDidCount: 5, domains: loaded.domains },
+        loaded,
+      );
+      expect(tasks(sent)).toHaveLength(0);
+      expect(entry).toBe(loaded);
+    });
+
+    it("sends one grant for a label edit, with no show first", async () => {
+      const sent = installControlPlane((req) =>
+        req.type === `${TT}acl/grant/0.2` ? seal(req, { entry: req.payload.entry }) : undefined,
+      );
+      const entry = await api.updateAcl(BOB, { role: "owner", label: "Robert" }, loaded);
+      expect(tasks(sent).map((s) => s.doc.type)).toEqual([`${TT}acl/grant/0.2`]);
+      expect(tasks(sent)[0]!.doc.payload.entry).toMatchObject({
+        label: "Robert",
+        act: { scope: "contexts", contexts: ["a.example"] },
+        ext: { "vnd.affinidi.webvh": { quota: { maxDidCount: 5 } } },
+      });
+      expect(entry.label).toBe("Robert");
+    });
+
+    it("sends only change-role for a role change", async () => {
+      const sent = installControlPlane((req) =>
+        req.type === `${TT}acl/change-role/0.2`
+          ? seal(req, {
+              entry: {
+                ...owner({ scope: "contexts", contexts: ["a.example"] }),
+                role: "metricsReader",
+                label: "Bob",
+                ext: { "vnd.affinidi.webvh": { quota: { maxDidCount: 5 } } },
+              },
+            })
+          : undefined,
+      );
+      await api.updateAcl(BOB, { role: "metricsReader", label: "Bob", maxDidCount: 5 }, loaded);
+      expect(tasks(sent).map((s) => s.doc.type)).toEqual([`${TT}acl/change-role/0.2`]);
+      expect(tasks(sent)[0]!.doc.payload).toEqual({
+        subject: BOB,
+        fromRole: "owner",
+        toRole: "metricsReader",
+      });
+    });
+
+    it("names the half-applied state when the grant after a role change fails", async () => {
+      installControlPlane((req) => {
+        if (req.type === `${TT}acl/change-role/0.2`) {
+          return seal(req, {
+            entry: { ...owner({ scope: "contexts", contexts: ["a.example"] }), role: "metricsReader" },
+          });
+        }
+        if (req.type === `${TT}acl/grant/0.2`) return rejection("taskFailed");
+        return undefined;
+      });
+      await expect(
+        api.updateAcl(BOB, { role: "metricsReader", label: "New" }, loaded),
+      ).rejects.toThrow(/after the role change was applied/);
+    });
+  });
+
   it("removes an entry with revocation kind entry", async () => {
     const sent = installControlPlane((req) =>
       req.type === `${TT}acl/revoke/0.2` ? seal(req, { entry: null }) : undefined,

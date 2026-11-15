@@ -63,7 +63,7 @@ export interface ProxyVaultEntry {
   contextId: string;
   secretKind: string;
   principalDid?: string;
-  targets: Array<{ kind: string; [k: string]: unknown }>;
+  targets: { kind: string; [k: string]: unknown }[];
   lastUsedAt?: string;
 }
 interface VaultListWireResult {
@@ -74,7 +74,7 @@ interface ProxyLoginWireResult {
   sessionBlob: {
     sessionId: string;
     expiresAt: string;
-    headers?: Array<{ name: string; value: string }>;
+    headers?: { name: string; value: string }[];
     cookies?: unknown[];
     bindOrigin?: string;
   };
