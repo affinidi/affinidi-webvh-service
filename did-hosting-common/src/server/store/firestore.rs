@@ -15,7 +15,7 @@ use tracing::info;
 use crate::server::config::StoreConfig;
 use crate::server::error::AppError;
 
-use super::{BatchOps, BoxFuture, KeyspaceOps, RawKvPair, StorageBackend};
+use super::{BatchOps, BoxFuture, KeyspaceOps, PrefixPage, RawKvPair, StorageBackend};
 
 /// Document model stored in Firestore.
 #[derive(Debug, Serialize, Deserialize)]
@@ -117,6 +117,35 @@ impl StorageBackend for FirestoreBackend {
         // Firestore is fully managed; no-op.
         Box::pin(async { Ok(()) })
     }
+
+    fn max_item_bytes(&self) -> Option<usize> {
+        Some(max_value_bytes())
+    }
+}
+
+/// The largest value a document holds under the shortest key: anything
+/// larger is refused under every key. The value is stored base64-encoded,
+/// 4 characters for 3 bytes.
+fn max_value_bytes() -> usize {
+    let empty = KvDoc {
+        key: String::new(),
+        data: String::new(),
+    };
+    (MAX_DOCUMENT_BYTES - document_size("", &empty)) * 3 / 4
+}
+
+/// The `key` field range every document whose key starts with `prefix`
+/// falls in: `[start, start + "~")`.
+///
+/// Only whole 3-byte groups of the prefix encode the same in every key that
+/// starts with it (see `encoded_query_prefix` in the Cosmos DB backend), so
+/// `start` encodes those and the rest is checked on the decoded key. `~`
+/// sorts after every base64url character, so the range holds exactly the
+/// encodings that start with `start`.
+fn key_range(prefix: &[u8]) -> (String, String) {
+    let start = BASE64.encode(&prefix[..prefix.len() / 3 * 3]);
+    let end = format!("{start}~");
+    (start, end)
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +423,70 @@ impl KeyspaceOps for FirestoreKeyspace {
             Ok(results)
         })
     }
+
+    /// One query page over the `key` field, in its order, resumed after the
+    /// cursor (the encoded key of the last document the previous page
+    /// evaluated). Encoded order is not key order, so pages are not
+    /// `ordered`; a document matching the encoded range but not the byte
+    /// prefix takes a place in a page, so a page may come back short or
+    /// empty while more follow.
+    fn prefix_page_raw(
+        &self,
+        prefix: Vec<u8>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Option<PrefixPage>, AppError>> {
+        Box::pin(async move {
+            let limit = limit.clamp(1, 10_000);
+            let (start, end) = key_range(&prefix);
+            let after = cursor
+                .map(|c| {
+                    String::from_utf8(c)
+                        .map_err(|_| AppError::Store("firestore page: malformed cursor".into()))
+                })
+                .transpose()?;
+            let docs: Vec<KvDoc> = self
+                .db
+                .fluent()
+                .select()
+                .from(self.collection.as_str())
+                .filter(|q| {
+                    q.for_all([
+                        match &after {
+                            Some(after) => q.field("key").greater_than(after.clone()),
+                            None => q.field("key").greater_than_or_equal(start.clone()),
+                        },
+                        q.field("key").less_than(end.clone()),
+                    ])
+                })
+                .order(|o| o.fields([o.field("key").asc()]))
+                .limit(u32::try_from(limit).unwrap_or(u32::MAX))
+                .obj::<KvDoc>()
+                .query()
+                .await
+                .map_err(|e| AppError::Store(format!("firestore query: {e}")))?;
+            let next = (docs.len() == limit)
+                .then(|| docs.last().map(|d| d.key.clone().into_bytes()))
+                .flatten();
+            let mut rows = Vec::new();
+            for doc in docs {
+                let key = BASE64
+                    .decode(&doc.key)
+                    .map_err(|e| AppError::Store(format!("firestore decode key: {e}")))?;
+                if key.starts_with(&prefix) {
+                    let value = BASE64
+                        .decode(&doc.data)
+                        .map_err(|e| AppError::Store(format!("firestore decode val: {e}")))?;
+                    rows.push((key, value));
+                }
+            }
+            Ok(Some(PrefixPage {
+                rows,
+                next,
+                ordered: false,
+            }))
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +707,49 @@ mod tests {
     /// A batch is one commit: up to 500 writes is accepted, more is refused
     /// as a size quota rather than split into commits that could land
     /// part-way.
+    /// The `key` range holds every encoded key with the byte prefix, at
+    /// every prefix length, and nothing that sorts outside it.
+    #[test]
+    fn the_key_range_holds_every_key_with_the_prefix() {
+        let keys: Vec<Vec<u8>> = (0u8..=255)
+            .flat_map(|b| {
+                (1..=10).map(move |len| {
+                    let mut k = vec![b'k'; len];
+                    k[0] = b;
+                    k[len - 1] = b.wrapping_mul(7);
+                    k
+                })
+            })
+            .collect();
+        for key in &keys {
+            for len in 1..=key.len().min(9) {
+                let (start, end) = key_range(&key[..len]);
+                let encoded = BASE64.encode(key);
+                assert!(
+                    start <= encoded && encoded < end,
+                    "{key:?} at {len}: {encoded} outside [{start}, {end})"
+                );
+            }
+        }
+    }
+
+    /// The figure `max_item_bytes` reports fits a document, one byte more
+    /// of value does not.
+    #[test]
+    fn the_reported_item_limit_fits_one_document() {
+        let max = max_value_bytes();
+        let key = b"did:example";
+        let fits = |value_len: usize| {
+            let doc = KvDoc {
+                key: encode_doc_id(key),
+                data: BASE64.encode(vec![b'x'; value_len]),
+            };
+            check_document_size("dids", &doc).is_ok()
+        };
+        assert!(fits(max - 64));
+        assert!(!fits(max + 1));
+    }
+
     #[test]
     fn an_atomic_batch_over_500_writes_is_refused() {
         let ops: Vec<_> = (0..501).map(|i| insert(i, 10)).collect();

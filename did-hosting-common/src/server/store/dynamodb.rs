@@ -1,14 +1,17 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
+use aws_sdk_dynamodb::operation::create_table::CreateTableError;
+use aws_sdk_dynamodb::operation::describe_table::DescribeTableError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{
-    AttributeValue, Delete, KeySchemaElement, KeyType, ProvisionedThroughput, Put, ReturnValue,
-    ScalarAttributeType, TransactWriteItem,
+    AttributeValue, BillingMode, Delete, KeySchemaElement, KeyType, ProvisionedThroughput, Put,
+    ReturnValue, ScalarAttributeType, Select, TableStatus, TransactWriteItem,
 };
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -86,8 +89,67 @@ fn check_item_size(key: &[u8], value: &[u8]) -> Result<(), AppError> {
 pub struct DynamoDbBackend {
     client: Client,
     table_prefix: String,
-    verified_tables: Arc<RwLock<HashSet<String>>>,
+    tables: Arc<Tables>,
 }
+
+/// How a table this backend creates is billed (`store.dynamodb_billing_mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Billing {
+    /// On demand: no capacity to size, and a full-table scan is not throttled
+    /// at a handful of units.
+    PayPerRequest,
+    Provisioned {
+        read: i64,
+        write: i64,
+    },
+}
+
+impl Billing {
+    /// `pay_per_request` (the default) or `provisioned:<read>:<write>`.
+    fn parse(mode: Option<&str>) -> Result<Self, AppError> {
+        let Some(mode) = mode.map(str::trim).filter(|m| !m.is_empty()) else {
+            return Ok(Self::PayPerRequest);
+        };
+        if mode.eq_ignore_ascii_case("pay_per_request") || mode.eq_ignore_ascii_case("on_demand") {
+            return Ok(Self::PayPerRequest);
+        }
+        let invalid = || {
+            AppError::Config(format!(
+                "invalid store.dynamodb_billing_mode {mode:?}: expected \
+                 \"pay_per_request\" or \"provisioned:<read units>:<write units>\""
+            ))
+        };
+        let mut parts = mode.split(':');
+        if !parts
+            .next()
+            .is_some_and(|p| p.eq_ignore_ascii_case("provisioned"))
+        {
+            return Err(invalid());
+        }
+        let units = |p: Option<&str>| -> Result<i64, AppError> {
+            p.and_then(|p| p.trim().parse::<i64>().ok())
+                .filter(|n| *n > 0)
+                .ok_or_else(invalid)
+        };
+        let (read, write) = (units(parts.next())?, units(parts.next())?);
+        if parts.next().is_some() {
+            return Err(invalid());
+        }
+        Ok(Self::Provisioned { read, write })
+    }
+}
+
+/// The tables this backend has seen ready, and how it makes a missing one.
+/// Shared by every keyspace handle and batch.
+struct Tables {
+    client: Client,
+    billing: Billing,
+    auto_create: bool,
+    ready: RwLock<HashSet<String>>,
+}
+
+/// How long [`Tables::ensure`] waits for a table to become `ACTIVE`.
+const TABLE_ACTIVE_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl DynamoDbBackend {
     pub async fn open(config: &StoreConfig) -> Result<Box<dyn StorageBackend>, AppError> {
@@ -102,13 +164,25 @@ impl DynamoDbBackend {
         }
         let aws_config = aws_config_loader.load().await;
         let client = Client::new(&aws_config);
+        let billing = Billing::parse(config.dynamodb_billing_mode.as_deref())?;
+        let auto_create = config.dynamodb_auto_create.unwrap_or(true);
 
-        info!(table_prefix, "opening dynamodb store");
+        info!(
+            table_prefix,
+            ?billing,
+            auto_create,
+            "opening dynamodb store"
+        );
 
         Ok(Box::new(Self {
+            tables: Arc::new(Tables {
+                client: client.clone(),
+                billing,
+                auto_create,
+                ready: RwLock::new(HashSet::new()),
+            }),
             client,
             table_prefix,
-            verified_tables: Arc::new(RwLock::new(HashSet::new())),
         }))
     }
 
@@ -127,7 +201,7 @@ impl DynamoDbBackend {
             Arc::new(DynamoDbKeyspace {
                 client: self.client.clone(),
                 table: self.table_name(name),
-                verified: self.verified_tables.clone(),
+                tables: self.tables.clone(),
                 consistent_read,
                 consistent_scan,
             }),
@@ -155,6 +229,7 @@ impl StorageBackend for DynamoDbBackend {
         Box::new(DynamoDbBatch {
             client: self.client.clone(),
             table_prefix: self.table_prefix.clone(),
+            tables: self.tables.clone(),
             ops: Vec::new(),
         })
     }
@@ -163,55 +238,130 @@ impl StorageBackend for DynamoDbBackend {
         // DynamoDB is fully managed; no-op.
         Box::pin(async { Ok(()) })
     }
+
+    fn max_item_bytes(&self) -> Option<usize> {
+        Some(MAX_ITEM_BYTES)
+    }
 }
 
-/// Ensure a DynamoDB table exists, creating it if necessary.
-/// Results are cached in `verified` so subsequent calls for the same table are no-ops.
-async fn ensure_table(
-    client: &Client,
-    table: &str,
-    verified: &RwLock<HashSet<String>>,
-) -> Result<(), AppError> {
-    // Fast path: already verified
-    if verified.read().await.contains(table) {
-        return Ok(());
+impl Tables {
+    /// Make sure `table` exists and is usable, once per table per process.
+    ///
+    /// Only a table DynamoDB reports missing (`ResourceNotFoundException`)
+    /// is created, and only with `auto_create`; any other `DescribeTable`
+    /// failure (throttling, `AccessDenied`, the network) is returned as it
+    /// is. A table someone else is creating meanwhile
+    /// (`ResourceInUseException`) counts as created. Either way it is used
+    /// only once it is `ACTIVE`: until then DynamoDB refuses its reads and
+    /// writes as `ResourceNotFoundException`.
+    async fn ensure(&self, table: &str) -> Result<(), AppError> {
+        if self.ready.read().await.contains(table) {
+            return Ok(());
+        }
+        match self.client.describe_table().table_name(table).send().await {
+            Ok(out) => {
+                let status = out.table().and_then(|t| t.table_status());
+                if !is_usable(status) {
+                    self.wait_until_active(table).await?;
+                }
+            }
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(DescribeTableError::is_resource_not_found_exception) =>
+            {
+                if !self.auto_create {
+                    return Err(AppError::Config(format!(
+                        "dynamodb table {table} does not exist, and \
+                         store.dynamodb_auto_create is false"
+                    )));
+                }
+                self.create(table).await?;
+                self.wait_until_active(table).await?;
+            }
+            Err(e) => return Err(request_error("describe table", e)),
+        }
+        self.ready.write().await.insert(table.to_string());
+        Ok(())
     }
 
-    match client.describe_table().table_name(table).send().await {
-        Ok(_) => {}
-        Err(_) => {
-            client
-                .create_table()
-                .table_name(table)
-                .key_schema(
-                    KeySchemaElement::builder()
-                        .attribute_name(PK_ATTR)
-                        .key_type(KeyType::Hash)
-                        .build()
-                        .map_err(|e| AppError::Store(format!("dynamodb schema: {e}")))?,
-                )
-                .attribute_definitions(
-                    aws_sdk_dynamodb::types::AttributeDefinition::builder()
-                        .attribute_name(PK_ATTR)
-                        .attribute_type(ScalarAttributeType::B)
-                        .build()
-                        .map_err(|e| AppError::Store(format!("dynamodb attr def: {e}")))?,
-                )
+    async fn create(&self, table: &str) -> Result<(), AppError> {
+        let mut request = self
+            .client
+            .create_table()
+            .table_name(table)
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name(PK_ATTR)
+                    .key_type(KeyType::Hash)
+                    .build()
+                    .map_err(|e| AppError::Store(format!("dynamodb schema: {e}")))?,
+            )
+            .attribute_definitions(
+                aws_sdk_dynamodb::types::AttributeDefinition::builder()
+                    .attribute_name(PK_ATTR)
+                    .attribute_type(ScalarAttributeType::B)
+                    .build()
+                    .map_err(|e| AppError::Store(format!("dynamodb attr def: {e}")))?,
+            );
+        request = match self.billing {
+            Billing::PayPerRequest => request.billing_mode(BillingMode::PayPerRequest),
+            Billing::Provisioned { read, write } => request
+                .billing_mode(BillingMode::Provisioned)
                 .provisioned_throughput(
                     ProvisionedThroughput::builder()
-                        .read_capacity_units(5)
-                        .write_capacity_units(5)
+                        .read_capacity_units(read)
+                        .write_capacity_units(write)
                         .build()
                         .map_err(|e| AppError::Store(format!("dynamodb throughput: {e}")))?,
-                )
-                .send()
-                .await
-                .map_err(|e| AppError::Store(format!("dynamodb create table: {e}")))?;
+                ),
+        };
+        match request.send().await {
+            Ok(_) => {
+                info!(table, billing = ?self.billing, "dynamodb table created");
+                Ok(())
+            }
+            // Another process (or task) is creating it: wait for it instead.
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(CreateTableError::is_resource_in_use_exception) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(request_error("create table", e)),
         }
     }
 
-    verified.write().await.insert(table.to_string());
-    Ok(())
+    /// Poll `DescribeTable` until `table` is usable, up to
+    /// [`TABLE_ACTIVE_TIMEOUT`]. A table just created may briefly describe
+    /// as missing; that is waited out too.
+    async fn wait_until_active(&self, table: &str) -> Result<(), AppError> {
+        let deadline = tokio::time::Instant::now() + TABLE_ACTIVE_TIMEOUT;
+        let mut delay = Duration::from_millis(100);
+        loop {
+            match self.client.describe_table().table_name(table).send().await {
+                Ok(out) if is_usable(out.table().and_then(|t| t.table_status())) => return Ok(()),
+                Ok(_) => {}
+                Err(e)
+                    if e.as_service_error()
+                        .is_some_and(DescribeTableError::is_resource_not_found_exception) => {}
+                Err(e) => return Err(request_error("describe table", e)),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AppError::Store(format!(
+                    "dynamodb table {table} did not become ACTIVE within {}s",
+                    TABLE_ACTIVE_TIMEOUT.as_secs()
+                )));
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(2));
+        }
+    }
+}
+
+/// Whether a table in `status` takes reads and writes: `ACTIVE`, or
+/// `UPDATING` (a capacity or index change, which keeps serving).
+fn is_usable(status: Option<&TableStatus>) -> bool {
+    matches!(status, Some(TableStatus::Active | TableStatus::Updating))
 }
 
 // ---------------------------------------------------------------------------
@@ -221,7 +371,7 @@ async fn ensure_table(
 struct DynamoDbKeyspace {
     client: Client,
     table: String,
-    verified: Arc<RwLock<HashSet<String>>>,
+    tables: Arc<Tables>,
     /// Send `GetItem` with `ConsistentRead`, so a read sees every write
     /// that committed before it. Off by default: an eventually consistent
     /// read costs half the read units and is fine where a stale answer
@@ -237,7 +387,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
     fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async move {
             check_item_size(&key, &value)?;
-            ensure_table(&self.client, &self.table, &self.verified).await?;
+            self.tables.ensure(&self.table).await?;
             self.client
                 .put_item()
                 .table_name(&self.table)
@@ -252,7 +402,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
 
     fn get_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
         Box::pin(async move {
-            ensure_table(&self.client, &self.table, &self.verified).await?;
+            self.tables.ensure(&self.table).await?;
             let result = self
                 .client
                 .get_item()
@@ -277,7 +427,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
 
     fn remove(&self, key: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async move {
-            ensure_table(&self.client, &self.table, &self.verified).await?;
+            self.tables.ensure(&self.table).await?;
             self.client
                 .delete_item()
                 .table_name(&self.table)
@@ -291,7 +441,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
 
     fn contains_key(&self, key: Vec<u8>) -> BoxFuture<'_, Result<bool, AppError>> {
         Box::pin(async move {
-            ensure_table(&self.client, &self.table, &self.verified).await?;
+            self.tables.ensure(&self.table).await?;
             let result = self
                 .client
                 .get_item()
@@ -308,7 +458,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
 
     fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
         Box::pin(async move {
-            ensure_table(&self.client, &self.table, &self.verified).await?;
+            self.tables.ensure(&self.table).await?;
             // DeleteItem with ReturnValues=ALL_OLD atomically removes the
             // item and returns the previous attributes — exactly the
             // get-and-remove primitive we need. DynamoDB serialises the
@@ -337,7 +487,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
 
     fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
         Box::pin(async move {
-            ensure_table(&self.client, &self.table, &self.verified).await?;
+            self.tables.ensure(&self.table).await?;
             // `ADD` on a Number attribute is DynamoDB's native atomic
             // counter: the read-modify-write happens server-side under the
             // partition key's lock, so two replicas racing this call each
@@ -379,7 +529,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
     ) -> BoxFuture<'_, Result<bool, AppError>> {
         Box::pin(async move {
             check_item_size(&key, &new)?;
-            ensure_table(&self.client, &self.table, &self.verified).await?;
+            self.tables.ensure(&self.table).await?;
             // A conditional `PutItem`: DynamoDB evaluates the condition and
             // writes under the partition key's lock, so of any number of
             // replicas swapping from the same value, one wins and the rest
@@ -417,7 +567,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
 
     fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
         Box::pin(async move {
-            ensure_table(&self.client, &self.table, &self.verified).await?;
+            self.tables.ensure(&self.table).await?;
 
             // Single full-table Scan, filtered client-side. The table has no
             // sort key (`pk` is the only attribute and it's the HASH key), so
@@ -467,7 +617,7 @@ impl KeyspaceOps for DynamoDbKeyspace {
         limit: usize,
     ) -> BoxFuture<'_, Result<Option<PrefixPage>, AppError>> {
         Box::pin(async move {
-            ensure_table(&self.client, &self.table, &self.verified).await?;
+            self.tables.ensure(&self.table).await?;
             let mut req = self
                 .client
                 .scan()
@@ -489,6 +639,70 @@ impl KeyspaceOps for DynamoDbKeyspace {
                     _ => None,
                 });
             Ok(Some(page))
+        })
+    }
+
+    /// A `Scan` projected to the key: the same read units as a full scan,
+    /// but no values sent back.
+    fn prefix_keys_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<Vec<u8>>, AppError>> {
+        Box::pin(async move {
+            self.tables.ensure(&self.table).await?;
+            let mut keys = Vec::new();
+            let mut last_key: Option<HashMap<String, AttributeValue>> = None;
+            loop {
+                let resp = self
+                    .client
+                    .scan()
+                    .table_name(&self.table)
+                    .consistent_read(self.consistent_scan)
+                    .projection_expression("#pk")
+                    .expression_attribute_names("#pk", PK_ATTR)
+                    .set_exclusive_start_key(last_key.take())
+                    .send()
+                    .await
+                    .map_err(|e| request_error("scan", e))?;
+                for item in resp.items.unwrap_or_default() {
+                    if let Some(AttributeValue::B(pk)) = item.get(PK_ATTR)
+                        && pk.as_ref().starts_with(&prefix)
+                    {
+                        keys.push(pk.as_ref().to_vec());
+                    }
+                }
+                last_key = resp.last_evaluated_key;
+                if last_key.is_none() {
+                    return Ok(keys);
+                }
+            }
+        })
+    }
+
+    /// The whole table counts server-side (`Select: COUNT`); a prefix counts
+    /// [`Self::prefix_keys_raw`], since the prefix test is made here.
+    fn prefix_count(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<usize, AppError>> {
+        Box::pin(async move {
+            if !prefix.is_empty() {
+                return Ok(self.prefix_keys_raw(prefix).await?.len());
+            }
+            self.tables.ensure(&self.table).await?;
+            let mut count = 0usize;
+            let mut last_key: Option<HashMap<String, AttributeValue>> = None;
+            loop {
+                let resp = self
+                    .client
+                    .scan()
+                    .table_name(&self.table)
+                    .consistent_read(self.consistent_scan)
+                    .select(Select::Count)
+                    .set_exclusive_start_key(last_key.take())
+                    .send()
+                    .await
+                    .map_err(|e| request_error("scan", e))?;
+                count += usize::try_from(resp.count).unwrap_or_default();
+                last_key = resp.last_evaluated_key;
+                if last_key.is_none() {
+                    return Ok(count);
+                }
+            }
         })
     }
 }
@@ -538,7 +752,19 @@ enum DynamoDbBatchOp {
 struct DynamoDbBatch {
     client: Client,
     table_prefix: String,
+    tables: Arc<Tables>,
     ops: Vec<DynamoDbBatchOp>,
+}
+
+/// Make sure every table `ops` writes exists, as a single-key write would:
+/// a keyspace whose first write is a batch is otherwise missing on a fresh
+/// deployment.
+async fn ensure_tables(tables: &Tables, ops: &[DynamoDbBatchOp]) -> Result<(), AppError> {
+    let names: BTreeSet<&str> = ops.iter().map(|op| op.target().0).collect();
+    for name in names {
+        tables.ensure(name).await?;
+    }
+    Ok(())
 }
 
 impl BatchOps for DynamoDbBatch {
@@ -575,6 +801,7 @@ impl BatchOps for DynamoDbBatch {
                     ops.len()
                 )));
             }
+            ensure_tables(&self.tables, &ops).await?;
             send_transaction(&self.client, &ops).await
         })
     }
@@ -582,6 +809,7 @@ impl BatchOps for DynamoDbBatch {
     fn commit_in_parts(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>> {
         Box::pin(async move {
             let ops = prepare_ops(self.ops)?;
+            ensure_tables(&self.tables, &ops).await?;
             for part in split_transactions(&ops) {
                 send_transaction(&self.client, part).await?;
             }
@@ -787,12 +1015,86 @@ mod tests {
             .endpoint_url("http://127.0.0.1:1")
             .interceptor(capture.clone())
             .build();
+        let client = Client::from_conf(config);
         DynamoDbBackend {
-            client: Client::from_conf(config),
+            tables: Arc::new(Tables {
+                client: client.clone(),
+                billing: Billing::PayPerRequest,
+                auto_create: true,
+                // Marked as present so `Tables::ensure` sends nothing.
+                ready: RwLock::new(HashSet::from(["webvh_dids".to_string()])),
+            }),
+            client,
             table_prefix: "webvh".into(),
-            // Marked as present so `ensure_table` sends nothing.
-            verified_tables: Arc::new(RwLock::new(HashSet::from(["webvh_dids".to_string()]))),
         }
+    }
+
+    /// A `DescribeTable` that fails for any reason but a missing table is
+    /// returned as it is: no `CreateTable` is sent, and the table is not
+    /// marked ready.
+    #[tokio::test]
+    async fn only_a_missing_table_is_created() {
+        let capture = CaptureBodies::default();
+        let backend = offline_backend(&capture);
+        let (_, ops) = backend.keyspace("fresh").unwrap();
+        let err = ops.get_raw(b"k".to_vec()).await.unwrap_err();
+        assert!(err.to_string().contains("describe table"), "{err}");
+        let bodies = std::mem::take(&mut *capture.0.lock().unwrap());
+        assert_eq!(
+            bodies,
+            [r#"{"TableName":"webvh_fresh"}"#],
+            "one DescribeTable"
+        );
+        assert!(!backend.tables.ready.read().await.contains("webvh_fresh"));
+    }
+
+    /// A batch makes sure each table it writes exists before its
+    /// transaction, as a single-key write does.
+    #[tokio::test]
+    async fn a_batch_ensures_every_table_it_writes() {
+        let capture = CaptureBodies::default();
+        let backend = offline_backend(&capture);
+        let mut batch = backend.batch();
+        batch.insert_raw("dids", b"did:a".to_vec(), b"x".to_vec());
+        batch.insert_raw("fresh", b"k".to_vec(), b"x".to_vec());
+        assert!(batch.commit().await.is_err());
+        let bodies = std::mem::take(&mut *capture.0.lock().unwrap());
+        // `webvh_dids` is ready; `webvh_fresh` is described first, and its
+        // failure stops the batch before the transaction is sent.
+        assert_eq!(bodies, [r#"{"TableName":"webvh_fresh"}"#]);
+    }
+
+    #[test]
+    fn billing_mode_defaults_to_on_demand_and_parses_provisioned() {
+        assert_eq!(Billing::parse(None).unwrap(), Billing::PayPerRequest);
+        assert_eq!(Billing::parse(Some("")).unwrap(), Billing::PayPerRequest);
+        assert_eq!(
+            Billing::parse(Some("PAY_PER_REQUEST")).unwrap(),
+            Billing::PayPerRequest
+        );
+        assert_eq!(
+            Billing::parse(Some("provisioned:10:5")).unwrap(),
+            Billing::Provisioned { read: 10, write: 5 }
+        );
+        for bad in [
+            "provisioned",
+            "provisioned:10",
+            "provisioned:0:5",
+            "provisioned:a:b",
+            "provisioned:1:2:3",
+            "burst",
+        ] {
+            let err = Billing::parse(Some(bad)).unwrap_err();
+            assert!(matches!(err, AppError::Config(_)), "{bad}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn only_active_or_updating_tables_are_usable() {
+        assert!(is_usable(Some(&TableStatus::Active)));
+        assert!(is_usable(Some(&TableStatus::Updating)));
+        assert!(!is_usable(Some(&TableStatus::Creating)));
+        assert!(!is_usable(None));
     }
 
     async fn read_requests(ops: Arc<dyn KeyspaceOps>, capture: &CaptureBodies) -> Vec<String> {
