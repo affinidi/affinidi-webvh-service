@@ -33,10 +33,13 @@ pub struct AppState {
     pub trust_tasks_verifier: Option<Arc<TransportBoundVerifier>>,
     /// Syncs already applied, keyed on `(proven source, document id)`.
     pub replay_cache: Arc<ReplayCache>,
-    /// Serialises the syncs: each reads what is mirrored, checks the new log
-    /// extends it, and writes — two at once could each pass against the same
-    /// old state and leave a fork mirrored.
-    pub sync_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serialises the syncs of one slot, and of one DID: each reads what is
+    /// mirrored, checks the new log extends it, and writes — two at once could
+    /// each pass against the same old state and leave a fork mirrored. Syncs of
+    /// different slots run in parallel.
+    pub sync_locks: did_hosting_common::server::path_locks::PathLocks,
+    /// The slots held as disabled, so resolution answers from one store read.
+    pub disabled: crate::watcher_ops::DisabledSlots,
     /// The running messaging service, once started.
     pub didcomm_service: Arc<OnceLock<DIDCommService>>,
     /// Per-address rate limiter for `POST /api/trust-tasks`. Applied before
@@ -72,7 +75,8 @@ impl AppState {
             trust_tasks_verifier: crate::trust_tasks::build_verifier(did_resolver.as_ref()),
             identity,
             replay_cache,
-            sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sync_locks: Default::default(),
+            disabled: Default::default(),
             didcomm_service: Arc::new(OnceLock::new()),
             client_ips,
             body_read_timeout: did_hosting_common::server::listener::BODY_READ_TIMEOUT,
@@ -84,6 +88,29 @@ impl AppState {
                 ),
             ),
         })
+    }
+
+    /// What a sync runs against.
+    pub fn mirror(&self) -> crate::watcher_ops::Mirror<'_> {
+        crate::watcher_ops::Mirror {
+            store: &self.store,
+            ks: &self.dids_ks,
+            sync: &self.config.sync,
+            locks: &self.sync_locks,
+            disabled: &self.disabled,
+        }
+    }
+
+    /// Boot-time preparation of the mirror: rewrite high-water rows an
+    /// earlier release stored as full logs, and load the disabled slots.
+    pub async fn prepare_mirror(&self) -> Result<(), AppError> {
+        let migrated = crate::watcher_ops::migrate_high_water_marks(&self.dids_ks).await?;
+        if migrated > 0 {
+            info!(migrated, "high-water marks rewritten in compact form");
+        }
+        let disabled = self.disabled.load(&self.dids_ks).await?;
+        info!(disabled, "disabled slots loaded");
+        Ok(())
     }
 }
 
@@ -121,6 +148,8 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     };
 
     let state = AppState::new(store.clone(), config, identity)?;
+    // Before the REST thread starts: resolution relies on the disabled set.
+    state.prepare_mirror().await?;
     info!(
         watcher_did = state.config.server_did.as_deref().unwrap_or_default(),
         sources = state.config.sync.source_count(),
