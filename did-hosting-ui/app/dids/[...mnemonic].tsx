@@ -15,7 +15,7 @@ import { useApi } from "../../components/ApiProvider";
 import { useAuth } from "../../components/AuthProvider";
 import { useDomains } from "../../components/DomainProvider";
 import { RequireAuth } from "../../components/RequireAuth";
-import { UsageChart } from "../../components/UsageChart";
+import { LazyUsageChart } from "../../components/LazyUsageChart";
 import { AgentNamesCard } from "../../components/did/AgentNamesCard";
 import { ConsentPanel } from "../../components/did/ConsentPanel";
 import { DangerZone } from "../../components/did/DangerZone";
@@ -382,7 +382,7 @@ function DidDetailScreen() {
 
         {didDetail?.log && <DidDetailsCard detail={didDetail} />}
 
-        <UsageChart mnemonic={mnemonic} />
+        <LazyUsageChart mnemonic={mnemonic} />
 
         {logEntries.length > 0 && (
           <DidDocumentCard

@@ -5,7 +5,7 @@ import { useAuth } from "../components/AuthProvider";
 import { useApi } from "../components/ApiProvider";
 import { useDomains } from "../components/DomainProvider";
 import { AffinidiLogo } from "../components/AffinidiLogo";
-import { UsageChart } from "../components/UsageChart";
+import { LazyUsageChart } from "../components/LazyUsageChart";
 import { ServiceOverviewPanel } from "../components/ServiceOverview";
 import { colors, fonts, radii, spacing } from "../lib/theme";
 import { ACL_KEY } from "../components/acl/keys";
@@ -15,7 +15,6 @@ import { errorMessage } from "../lib/errors";
 import { plural } from "../lib/plural";
 import { useTrustTaskQuery } from "../lib/query";
 import { QK } from "../lib/query-keys";
-import { matchesDomain } from "../lib/domain";
 
 export default function Dashboard() {
   const { isAuthenticated, restored, role } = useAuth();
@@ -43,32 +42,17 @@ export default function Dashboard() {
     enabled: isAuthenticated && isAdmin,
   });
   const aclEntries = acl?.entries ?? null;
-  // Per-domain stats are derived from the DID list. We only fetch it
-  // when a specific domain is pinned — "All domains" reads the cheap
-  // server-wide aggregate from `stats/get` instead.
-  const { data: dids } = useTrustTaskQuery(QK.allDids, () => api.listDids(), {
-    enabled: isAuthenticated && currentDomain !== null,
-  });
+  // A pinned domain's totals: one `stats/get` for that domain, however many
+  // DIDs it holds. "All domains" reads the server-wide aggregate instead.
+  // Under the `stats` prefix, so whatever refreshes the stats refreshes it.
+  const { data: pinnedDomainStats } = useTrustTaskQuery(
+    QK.domainStats(currentDomain),
+    ({ background }) => api.getDomainStats(currentDomain ?? "", { background }),
+    { enabled: isAuthenticated && isAdmin && currentDomain !== null },
+  );
+  const domainStats = currentDomain === null ? null : (pinnedDomainStats ?? null);
 
   const isDaemon = config?.deploymentMode === "daemon";
-
-  const domainStats = useMemo(() => {
-    if (currentDomain === null || !dids) return null;
-    // Legacy slots pre-M-01 (and the historical bug where create
-    // dropped the `domain` field) carry an empty `domain`. The shared
-    // matchesDomain helper in lib/domain.ts falls back to the
-    // did_id's host segment so the per-domain numbers don't read as
-    // zero in the gap between an upgrade and publish-time backfill.
-    const scoped = dids.filter((d) => matchesDomain(d, currentDomain));
-    return {
-      totalDids: scoped.length,
-      totalResolves: scoped.reduce((s, d) => s + d.totalResolves, 0),
-      // versionCount is the length of the current log chain; subtract 1
-      // to approximate "updates beyond initial creation". DIDs that
-      // haven't uploaded a log yet (versionCount === 0) contribute 0.
-      totalUpdates: scoped.reduce((s, d) => s + Math.max(0, d.versionCount - 1), 0),
-    };
-  }, [currentDomain, dids]);
 
   // Owners whose scope is unrestricted ("All") are flagged for migration:
   // v0.7 grants new Owners a scoped default, but pre-existing rows keep
@@ -192,7 +176,7 @@ export default function Dashboard() {
       {/* Usage chart */}
       {serverStats && (
         <View style={styles.section}>
-          <UsageChart />
+          <LazyUsageChart />
         </View>
       )}
     </ScrollView>
