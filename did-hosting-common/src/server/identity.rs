@@ -1658,12 +1658,16 @@ async fn expire_generation(
 
 #[cfg(test)]
 mod tests {
+    // The tests that open a store are fjall-only (a fresh temp-dir store
+    // each); what only they use is unused on other backends.
+    #![cfg_attr(not(feature = "store-fjall"), allow(unused_imports, dead_code))]
     use super::*;
     use crate::server::config::StoreConfig;
     use std::sync::Mutex as StdMutex;
 
     const DID: &str = "did:webvh:example:alpha";
 
+    #[cfg(feature = "store-fjall")]
     async fn fjall_store() -> Store {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = StoreConfig {
@@ -1986,6 +1990,7 @@ mod tests {
         assert_eq!(keys, [gen_key(9), gen_key(10), gen_key(100)]);
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn a_saved_generation_survives_a_restart() {
         // The reason any of this is persisted. `config.toml` describes only the
@@ -2006,6 +2011,7 @@ mod tests {
         assert_eq!(loaded, vec![original]);
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn a_retired_generation_stays_live_until_it_expires() {
         // The overlap window itself: a retired generation must keep coming back
@@ -2094,6 +2100,7 @@ mod tests {
         assert!(secrets_for(&old_gen, &secrets).is_empty());
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn the_sweep_reaps_an_expired_generation_and_stops_honouring_its_key() {
         let store = fjall_store().await;
@@ -2173,6 +2180,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn establishing_generation_zero_re_keys_the_placeholder() {
         // A service that hosts its own DID cannot resolve it at boot — it *is*
@@ -2248,6 +2256,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn the_sweep_drops_a_generation_deleted_out_of_band() {
         // What makes the *offline* kill switch actually work. The CLI runs in a
@@ -2292,6 +2301,7 @@ mod tests {
         assert_eq!(identity.generations(), vec![new_gen]);
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn the_sweep_never_drops_the_current_generation() {
         // The reconciliation above must not be able to disarm the service. A
@@ -2316,6 +2326,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn the_sweep_leaves_a_generation_inside_its_window() {
         let store = fjall_store().await;
@@ -2355,6 +2366,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn retire_now_drops_the_key_immediately() {
         // The compromise response: stop honouring the old key at once, and
@@ -2400,6 +2412,7 @@ mod tests {
         assert!(secret_store.snapshot().retired.is_empty());
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn retire_now_refuses_to_expire_the_current_generation() {
         // Expiring the current generation would drop the key the service is
@@ -2476,6 +2489,7 @@ mod tests {
         assert_eq!(cfg.rotation_grace_secs(), 3600);
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn the_current_generation_sorts_first_even_when_it_is_not_the_newest() {
         // `current()` indexes generations[0], and the listener's mediator and
@@ -2554,6 +2568,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn metadata_update_keeps_retired_generation_and_its_key() {
         // The outage this prevents: a protocols/mediator change was treated as a
@@ -2622,6 +2637,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn the_sweep_never_strips_a_key_a_survivor_still_uses() {
         // Leftover damage from a pre-fix same-`ka_kid` rotation: a retired

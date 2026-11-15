@@ -294,6 +294,9 @@ pub async fn check_acl(acl: &KeyspaceHandle, did: &str) -> Result<Role, AppError
 
 #[cfg(test)]
 mod tests {
+    // The tests that open a store are fjall-only (a fresh temp-dir store
+    // each); what only they use is unused on other backends.
+    #![cfg_attr(not(feature = "store-fjall"), allow(unused_imports, dead_code))]
     use super::*;
     use std::str::FromStr;
 
@@ -549,6 +552,7 @@ mod tests {
     use crate::server::domain::DomainScope;
     use crate::server::store::{KS_ACL, Store};
 
+    #[cfg(feature = "store-fjall")]
     async fn fjall_store() -> Store {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = StoreConfig {
@@ -574,6 +578,7 @@ mod tests {
     /// A did:scid is recorded and found by its identity, the bare DID: an
     /// admin who wrote the locator, or a caller whose issuer carries it, reaches
     /// the same entry (VTI-KEY-160).
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn a_did_scid_entry_is_keyed_on_the_bare_did() {
         let store = fjall_store().await;
@@ -616,6 +621,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn count_all_scoped_owners_counts_only_owner_all() {
         let store = fjall_store().await;
@@ -654,6 +660,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn count_all_scoped_owners_empty_acl_returns_zero() {
         let store = fjall_store().await;
@@ -667,6 +674,7 @@ mod tests {
     /// entry labelled "provisioning VTA", and `check_acl` then passes for
     /// that DID — so the VTA's challenge/authenticate/publish flow is no
     /// longer blocked by `403 DID not in ACL`.
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn seed_provisioning_vta_acl_creates_admin_entry() {
         let store = fjall_store().await;
@@ -691,6 +699,7 @@ mod tests {
     /// Idempotent: a second seed is a no-op that returns `false` and does
     /// not alter the existing entry. Guards the online + offline setup
     /// paths against duplicating or clobbering on re-run.
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn seed_provisioning_vta_acl_is_idempotent() {
         let store = fjall_store().await;
@@ -716,6 +725,7 @@ mod tests {
     /// An operator's deliberate ACL choice for the VTA DID (e.g. a
     /// narrowed role set by hand) is never overridden by the seed. Proves
     /// the seed is additive, not a relaxation/override of existing state.
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn seed_provisioning_vta_acl_respects_existing_operator_entry() {
         let store = fjall_store().await;

@@ -55,6 +55,7 @@ pub mod size;
 // size". Drop the allow if `trust-tasks-rs` ever boxes `ErrorPayload`.
 #[allow(clippy::result_large_err)]
 pub mod handlers;
+pub mod infra;
 pub mod send;
 pub mod transport;
 pub mod verifier;
@@ -513,6 +514,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    // The tests that open a store are fjall-only (a fresh temp-dir store
+    // each); what only they use is unused on other backends.
+    #![cfg_attr(not(feature = "store-fjall"), allow(unused_imports, dead_code))]
     use super::*;
     use trust_tasks_rs::{Payload, handlers::InMemoryHandler};
 
@@ -597,6 +601,7 @@ mod tests {
     /// response. This is the daemon-parity assertion that CLAUDE.md
     /// asks for: any transport that calls `dispatch_inbound` gets the
     /// same behaviour as any other.
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn dispatch_inbound_runs_full_pipeline_end_to_end() {
         // Stand up a real fjall store + ACL keyspace so the grant
@@ -707,6 +712,7 @@ mod tests {
     ///   proof says nothing about who the document is from.
     /// * With `issuer = ADMIN_DID`, and a verifier built with that session key
     ///   as `ADMIN_DID`'s delegate, the grant is authorised and applied.
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn dispatch_inbound_session_key_proof_needs_in_band_issuer_and_delegate() {
         use affinidi_data_integrity::{DataIntegrityProof, DidKeyResolver, SignOptions};
@@ -827,6 +833,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn dispatch_inbound_rejects_unknown_type_uri() {
         let dir = tempfile::tempdir().expect("tempdir");

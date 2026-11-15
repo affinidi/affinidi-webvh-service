@@ -629,6 +629,9 @@ pub async fn open_ceremony(
 
 #[cfg(test)]
 mod tests {
+    // The tests that open a store are fjall-only (a fresh temp-dir store
+    // each); what only they use is unused on other backends.
+    #![cfg_attr(not(feature = "store-fjall"), allow(unused_imports, dead_code))]
     use super::*;
     use crate::server::config::StoreConfig;
     use crate::server::store::{KS_SESSIONS, Store};
@@ -636,6 +639,7 @@ mod tests {
 
     const WAIT: Duration = Duration::from_secs(30);
 
+    #[cfg(feature = "store-fjall")]
     async fn ks() -> (KeyspaceHandle, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&StoreConfig {
@@ -677,6 +681,7 @@ mod tests {
 
     /// Neither the token nor the claim code is anywhere in what is stored —
     /// only a SHA-256 of the one and a salted Argon2id digest of the other.
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn an_invite_is_stored_hashed() {
         let (ks, _dir) = ks().await;
@@ -705,6 +710,7 @@ mod tests {
         assert_ne!(again.digest, stored.claim.digest);
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn both_halves_redeem_and_the_invite_stays_until_taken() {
         let (ks, _dir) = ks().await;
@@ -744,6 +750,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn wrong_codes_lock_the_invite_out() {
         let (ks, _dir) = ks().await;
@@ -789,6 +796,7 @@ mod tests {
     /// The count that matters lives in the store now, not in either
     /// handle's process, so alternating attempts between them still lock
     /// out at exactly [`MAX_WRONG_CODES`].
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn lockout_holds_across_two_app_states_sharing_a_store() {
         let dir = tempfile::tempdir().unwrap();
@@ -850,6 +858,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn concurrent_wrong_codes_are_each_counted() {
         let (ks, _dir) = ks().await;
@@ -877,6 +886,7 @@ mod tests {
 
     /// A wrong code in flight while the invite is consumed must not write the
     /// invite back: once taken, it stays gone.
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn a_taken_invite_is_not_brought_back_by_a_racing_wrong_code() {
         let (ks, _dir) = ks().await;
@@ -908,6 +918,7 @@ mod tests {
 
     /// An administrator's update of an invite that has since been consumed
     /// finds nothing, and writes nothing.
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn an_update_does_not_bring_back_a_taken_invite() {
         let (ks, _dir) = ks().await;
@@ -941,6 +952,7 @@ mod tests {
         out
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn an_expired_invite_redeems_nothing_and_is_swept() {
         let (ks, _dir) = ks().await;
@@ -974,6 +986,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn a_step_up_invite_confers_no_role() {
         let (ks, _dir) = ks().await;
@@ -1064,6 +1077,7 @@ mod tests {
 
     /// A redemption that cannot take its invite's attempt lock within the
     /// wait is refused as busy, not queued.
+    #[cfg(feature = "store-fjall")]
     #[tokio::test]
     async fn a_redemption_waits_a_bounded_time_for_its_invite() {
         let (ks, _dir) = ks().await;

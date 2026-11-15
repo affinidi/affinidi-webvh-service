@@ -262,7 +262,11 @@ async fn https_stats_sync_requires_a_signed_document_from_a_service() {
             "issuer": issuer,
             "recipient": CONTROL,
             "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            "payload": { "server_did": issuer, "seq": 1, "did_deltas": [] },
+            "payload": {
+                "instanceId": issuer.replace(':', "_"),
+                "perMnemonic": [],
+                "ext": { "vnd.affinidi.webvh": { "seq": 1 } },
+            },
         })
     };
 

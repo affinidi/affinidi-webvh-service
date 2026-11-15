@@ -895,6 +895,7 @@ fn sync_refusal(e: crate::error::AppError) -> OpError {
                 | ValidationKind::InvalidPath
                 | ValidationKind::InvalidWitness
                 | ValidationKind::UnknownDomain
+                | ValidationKind::InvalidTargetVersion
                 | ValidationKind::Other => sync_update::error_codes::INVALID_LOG,
             };
             OpError::Declared(code, message)
