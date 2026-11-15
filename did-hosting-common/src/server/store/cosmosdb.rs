@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::server::config::StoreConfig;
-use crate::server::error::AppError;
+use crate::server::error::{AppError, QuotaKind};
 
 use super::{
     ALL_KEYSPACES, BatchOps, BoxFuture, KeyspaceOps, PrefixPage, RawKvPair, StorageBackend,
@@ -852,13 +852,15 @@ fn check_one_batch(ops: &[CosmosDbBatchOp]) -> Result<(), AppError> {
             writes = ops.len(),
             bytes, "batch refused: over one Cosmos DB transactional batch"
         );
-        // `AppError::quota_kind` keys on the word "size".
-        return Err(AppError::QuotaExceeded(format!(
-            "a change of {} writes ({bytes} bytes) is over the store's size \
+        return Err(AppError::quota(
+            QuotaKind::Size,
+            format!(
+                "a change of {} writes ({bytes} bytes) is over the store's size \
              limit for one atomic write: {MAX_BATCH_OPS} writes and \
              {MAX_BATCH_BYTES} bytes",
-            ops.len()
-        )));
+                ops.len()
+            ),
+        ));
     }
     Ok(())
 }
@@ -1049,7 +1051,7 @@ mod tests {
         let many: Vec<_> = (0..101).map(|i| up(&format!("k{i}"))).collect();
         check_one_batch(&many[..100]).unwrap();
         let err = check_one_batch(&many).unwrap_err();
-        assert!(matches!(err, AppError::QuotaExceeded(_)), "{err:?}");
+        assert!(matches!(err, AppError::QuotaExceeded { .. }), "{err:?}");
         let lens: Vec<_> = split_batches(&many).iter().map(|p| p.len()).collect();
         assert_eq!(lens, [100, 1]);
     }
@@ -1060,7 +1062,7 @@ mod tests {
         let id = doc_id("dids", b"k");
         check_doc_size(&value_doc(id.clone(), &vec![b'x'; max - 64])).unwrap();
         let err = check_doc_size(&value_doc(id, &vec![b'x'; max + 1])).unwrap_err();
-        assert!(matches!(err, AppError::QuotaExceeded(_)), "{err:?}");
+        assert!(matches!(err, AppError::QuotaExceeded { .. }), "{err:?}");
     }
 }
 

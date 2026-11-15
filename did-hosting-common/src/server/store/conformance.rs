@@ -377,7 +377,7 @@ pub async fn an_oversized_item_is_refused_and_its_batch_writes_nothing(store: &S
 
     let over = vec![b'o'; max + 1];
     let err = ks.insert_raw("over", over.clone()).await.unwrap_err();
-    assert!(matches!(err, AppError::QuotaExceeded(_)), "{err:?}");
+    assert!(matches!(err, AppError::QuotaExceeded { .. }), "{err:?}");
     assert_eq!(ks.get_raw("over").await.unwrap(), None);
 
     let mut batch = store.batch();
@@ -385,7 +385,7 @@ pub async fn an_oversized_item_is_refused_and_its_batch_writes_nothing(store: &S
     batch.insert_raw(&ks, "over", over);
     batch.remove(&ks, "fits");
     let err = batch.commit().await.unwrap_err();
-    assert!(matches!(err, AppError::QuotaExceeded(_)), "{err:?}");
+    assert!(matches!(err, AppError::QuotaExceeded { .. }), "{err:?}");
     assert_eq!(ks.get_raw("first").await.unwrap(), None);
     assert!(ks.contains_key("fits").await.unwrap());
 }
