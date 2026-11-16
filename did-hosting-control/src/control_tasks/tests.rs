@@ -666,11 +666,12 @@ async fn info_reports_the_did_scid_alias_state_of_the_latest_document() {
 
 const REGISTER: &str = "https://trusttasks.org/spec/did-management/did/register/0.1";
 
-/// The `hyperledger-labs/did-webs-resolver` reference publication: a
-/// `keri.cesr` stream, registered over the Trust Task a VTA publishes with.
+/// A `keri.cesr` stream created for `control.test`, which designates itself
+/// there (`webs_continuation`'s `regenerate_control_fixture`), registered over
+/// the Trust Task a VTA publishes with.
 const WEBS_KERI: &[u8] =
-    include_bytes!("../../../did-hosting-common/tests/fixtures/ENro7uf0.keri.cesr");
-const WEBS_AID: &str = "ENro7uf0ePmiK3jdTo2YCdXLqW7z7xoP6qhhBou6gBLe";
+    include_bytes!("../../../did-hosting-common/tests/fixtures/control-test/keri.cesr");
+const WEBS_AID: &str = "EALTc-6_o3G-p5jx7syeC46vpPAIjk1V58SNR3gyfT3A";
 
 fn webs_register(domain: &str) -> Value {
     json!({

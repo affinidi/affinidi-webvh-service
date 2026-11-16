@@ -503,6 +503,7 @@ mod tests {
 
     use std::sync::Arc;
 
+    use affinidi_did_webs::{CreateConfig, KeyRoles, VerificationKey, create};
     use affinidi_keri::config::InceptionConfig;
     use affinidi_keri::hab::Hab;
     use affinidi_tdk::secrets_resolver::secrets::Secret;
@@ -522,30 +523,115 @@ mod tests {
     /// The hosting domain every test registers under.
     const DOMAIN: &str = "control.test";
 
-    /// A `did:webs` controller: its inception event and current signing key.
+    /// What a role key's seed is varied by, so each differs from the others.
+    const ATTESTATION: u8 = 0xA5;
+    const OPERATIONAL: u8 = 0x5A;
+
+    /// A `did:webs` controller: the salt its identifier is incepted from,
+    /// and the key it signs requests with.
+    ///
+    /// The AID is the digest of the inception event alone, so it is the same
+    /// at every path; the designations are not. Since `affinidi-did-webs`
+    /// 0.13 an identifier is valid only where its own designated aliases name
+    /// it, so the key event stream is built for the slot it is registered at
+    /// ([`Webs::kel_at`]), as a real controller builds it for where it will
+    /// be published.
     struct Webs {
         aid: String,
-        kel: String,
-        /// The key's CESR encoding: its verification method's fragment.
+        salt: u8,
+        /// Separate attestation and operational keys, as a VTA's key-role
+        /// identity has (VTI-KEY-173); `None` signs with the key state's key.
+        key_roles: bool,
+        /// The signing key's CESR encoding: its verification method's
+        /// fragment.
         key_qb64: String,
         seed: Vec<u8>,
+        /// Each slot's stream, built once: designations are salted afresh on
+        /// every build, so a second build is a different log, and a real
+        /// controller resends the one it stored.
+        kels: std::sync::Mutex<std::collections::HashMap<String, String>>,
     }
 
     impl Webs {
-        /// Incept an identifier, deterministically from `salt`.
-        fn incept(salt: u8) -> Self {
-            let config = InceptionConfig {
+        fn inception(salt: u8) -> InceptionConfig {
+            InceptionConfig {
                 salt: Some(vec![salt; 16]),
                 ..InceptionConfig::default()
-            };
-            let (hab, inception) = Hab::incept_event("did:webs", &config).expect("incept");
+            }
+        }
+
+        /// The seed of a role key, distinct from the key state's.
+        fn role_seed(salt: u8, role: u8) -> [u8; 32] {
+            [salt ^ role; 32]
+        }
+
+        fn role_key(salt: u8, role: u8) -> VerificationKey {
+            let seed = Self::role_seed(salt, role);
+            let secret = Secret::generate_ed25519(None, Some(&seed));
+            VerificationKey::Ed25519(secret.get_public_bytes().try_into().expect("Ed25519 key"))
+        }
+
+        /// Incept an identifier, deterministically from `salt`, signing with
+        /// its key state's key.
+        fn incept(salt: u8) -> Self {
+            let (hab, _) = Hab::incept_event("did:webs", &Self::inception(salt)).expect("incept");
             let signer = &hab.signers()[0];
             Webs {
                 aid: hab.prefix().to_string(),
-                kel: String::from_utf8(inception.composed).expect("CESR is text"),
+                salt,
+                key_roles: false,
                 key_qb64: signer.verfer().qb64().expect("key qb64"),
                 seed: signer.raw().to_vec(),
+                kels: Default::default(),
             }
+        }
+
+        /// Incept a key-role identifier, as a VTA's own did:webs is: it signs
+        /// with its designated `operational` key, which the document lists
+        /// under `authentication` in place of the key state's.
+        #[cfg(feature = "method-webs")]
+        fn incept_with_key_roles(salt: u8) -> Self {
+            let (hab, _) = Hab::incept_event("did:webs", &Self::inception(salt)).expect("incept");
+            let operational = Self::role_key(salt, OPERATIONAL);
+            Webs {
+                aid: hab.prefix().to_string(),
+                salt,
+                key_roles: true,
+                key_qb64: operational.to_cesr().expect("key qb64"),
+                seed: Self::role_seed(salt, OPERATIONAL).to_vec(),
+                kels: Default::default(),
+            }
+        }
+
+        /// The key event stream this identifier publishes at `path`.
+        fn kel_at(&self, path: &str) -> String {
+            let mut kels = self.kels.lock().unwrap();
+            kels.entry(path.to_string())
+                .or_insert_with(|| self.build_kel(path))
+                .clone()
+        }
+
+        fn build_kel(&self, path: &str) -> String {
+            let host = if path.is_empty() {
+                DOMAIN.to_string()
+            } else {
+                format!("{DOMAIN}:{}", path.replace('/', ":"))
+            };
+            let mut config = CreateConfig::builder(host).inception(Self::inception(self.salt));
+            if self.key_roles {
+                config = config.key_roles(
+                    KeyRoles::new()
+                        .with_attestation(Self::role_key(self.salt, ATTESTATION))
+                        .with_operational(Self::role_key(self.salt, OPERATIONAL)),
+                );
+            }
+            let created = create(config.build()).expect("create");
+            assert_eq!(
+                created.did(),
+                self.did_at(path),
+                "the slot builds the created DID"
+            );
+            String::from_utf8(created.artifacts().keri_cesr.clone()).expect("CESR is text")
         }
 
         /// The identifier at `path` (`/`-separated, without the AID).
@@ -584,7 +670,7 @@ mod tests {
             json!({
                 "path": self.slot(path),
                 "method": "webs",
-                "didData": self.kel,
+                "didData": self.kel_at(path),
                 "force": false,
                 "domain": DOMAIN,
             })
@@ -658,6 +744,39 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// A VTA's own did:webs is a key-role identity (VTI-KEY-173): it signs
+    /// with its designated `operational` key, not the key state's. That key
+    /// is a verification method only of the document the designations
+    /// derive, so the proof must be checked against that document — the
+    /// regression `affinidi-did-webs` 0.7, which read no designation,
+    /// refused as `proofInvalid`.
+    #[cfg(feature = "method-webs")]
+    #[tokio::test]
+    async fn a_key_role_identity_registers_itself_signing_as_its_operational_key() {
+        let (state, _dir) = enabled(&["nodes"]).await;
+        let webs = Webs::incept_with_key_roles(30);
+        let caller = webs.caller("nodes");
+        let reply = register_as(&state, Via::Https, &caller, webs.payload("nodes")).await;
+        conforms(&reply);
+        assert_eq!(
+            ok(&reply, REGISTER)["record"]["owner"],
+            caller.did,
+            "{reply}"
+        );
+
+        // The key state's own key is not the operational key, and does not
+        // stand in for it: the document lists role keys instead.
+        let state_key = Webs::incept(30);
+        let impostor = Caller {
+            key: state_key.key_for(&caller.did),
+            did: caller.did.clone(),
+            role: Role::Owner,
+        };
+        let (state, _dir) = enabled(&["nodes"]).await;
+        let reply = register_as(&state, Via::Https, &impostor, webs.payload("nodes")).await;
+        assert_eq!(code(&reply), "proofInvalid", "{reply}");
     }
 
     #[cfg(feature = "method-webs")]
@@ -854,8 +973,9 @@ mod tests {
         let webs = Webs::incept(10);
         let caller = webs.caller("");
         let mut payload = webs.payload("");
-        // Flip the last character of the inception event's signature.
-        let kel = webs.kel.trim_end();
+        // Flip the last character of the stream's last signature.
+        let kel = webs.kel_at("");
+        let kel = kel.trim_end();
         let last = kel.chars().last().unwrap();
         let flipped = if last == 'A' { 'B' } else { 'A' };
         payload["didData"] = json!(format!("{}{flipped}", &kel[..kel.len() - 1]));
