@@ -16,6 +16,13 @@
    A line that mentions one on purpose — to say it was removed — carries the
    marker `<!-- retired-name-ok -->`.
 
+3. **Retired names in code.** Every `.rs`, `.ts` and `.tsx` file (outside
+   build output, dependencies and `docs/archive/`) is held to the same list
+   plus code-only names (deleted functions, old thread names, stale version
+   claims), so a comment cannot describe something that is gone. A line that
+   names one on purpose carries `retired-name-ok` in a comment. A match
+   right after `.` is a relative module path (`./api/dids`) and is ignored.
+
 Relative links are checked separately, by lychee (see ci.yml).
 
     python3 scripts/check-docs.py              # check the repository
@@ -51,6 +58,22 @@ RETIRED = [
     "github.com/affinidi/did-hosting-service",
 ]
 ALLOW_MARKER = "<!-- retired-name-ok -->"
+
+# Code (Rust and the UI's TypeScript) is held to the same list plus names
+# that only ever appeared in code: deleted functions, old thread names and
+# version claims. A line that names one on purpose (a test proving a removed
+# route stays removed) carries `retired-name-ok` in a comment.
+CODE_RETIRED = RETIRED + [
+    "bridge_did_management",
+    "run_webvh_dispatch",
+    "webvh-rest",
+    "webvh-storage",
+    "0.6 series",
+    "= \"0.6\"",
+    "v0.7 redesign",
+]
+CODE_ALLOW_MARKER = "retired-name-ok"
+CODE_SUFFIXES = {".rs", ".ts", ".tsx"}
 
 SKIP_DIRS = {"target", "node_modules", ".git", ".claude"}
 
@@ -113,8 +136,48 @@ def check_retired(root: Path) -> list[str]:
     return errors
 
 
+def code_files(root: Path) -> list[Path]:
+    """Every Rust and TypeScript source in the repository, outside build
+    output, dependencies and the historical archive."""
+    found = []
+    for path in sorted(root.rglob("*")):
+        if path.suffix not in CODE_SUFFIXES or not path.is_file():
+            continue
+        parts = path.relative_to(root).parts
+        if any(p in SKIP_DIRS for p in parts) or parts[:2] == ("docs", "archive"):
+            continue
+        found.append(path)
+    return found
+
+
+def retired_in_code(line: str) -> list[str]:
+    """The retired names `line` mentions. A match right after `.` is a
+    relative module path (`./api/dids`), not the route."""
+    hits = []
+    for name in CODE_RETIRED:
+        start = 0
+        while (i := line.find(name, start)) != -1:
+            if i == 0 or line[i - 1] != ".":
+                hits.append(name)
+                break
+            start = i + 1
+    return hits
+
+
+def check_retired_code(root: Path) -> list[str]:
+    errors = []
+    for path in code_files(root):
+        rel = path.relative_to(root)
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if CODE_ALLOW_MARKER in line:
+                continue
+            for name in retired_in_code(line):
+                errors.append(f"{rel}:{n}: retired name `{name}`: {line.strip()[:120]}")
+    return errors
+
+
 def run(root: Path) -> list[str]:
-    return check_status(root) + check_retired(root)
+    return check_status(root) + check_retired(root) + check_retired_code(root)
 
 
 def self_test() -> None:
@@ -142,6 +205,23 @@ def self_test() -> None:
         assert any("crate/README.md:3" in e and "/api/dids" in e for e in errors), errors
         assert not any("/api/control" in e for e in errors), errors
         assert len(errors) == 3, errors
+
+        # Code: a retired name in a comment fails; the marker, a relative
+        # module path and the archive are exempt.
+        (root / "crate" / "src").mkdir()
+        (root / "crate" / "src" / "lib.rs").write_text(
+            "// calls dispatch_did_op\n"
+            "// GET /api/dids is gone  retired-name-ok\n"
+            "fn ok() {}\n"
+        )
+        (root / "crate" / "api.ts").write_text('import * as dids from "./api/dids";\n')
+        (root / "docs" / "archive" / "old.rs").write_text("// webvh-rest\n")
+        (root / "crate" / "target").mkdir()
+        (root / "crate" / "target" / "gen.rs").write_text("// webvh-storage\n")
+        errors = run(root)
+        code = [e for e in errors if e.startswith("crate/src") or e.endswith(".ts")]
+        assert len(code) == 1 and "lib.rs:1" in code[0] and "dispatch_did_op" in code[0], errors
+        assert len(errors) == 4, errors
     print("self-test ok")
 
 
