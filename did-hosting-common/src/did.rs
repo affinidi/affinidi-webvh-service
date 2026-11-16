@@ -1,3 +1,6 @@
+//! Building did:webvh DIDs and their documents: key generation, the service
+//! entries a node advertises, and the first log entry.
+
 use std::sync::Arc;
 
 use affinidi_tdk::dids::{DID, KeyType};
@@ -1046,7 +1049,7 @@ mod tests {
     #[test]
     fn implicit_predicate_matches_url_parsed_service_ids() {
         let base =
-            "did:webvh:QmRUN4vrMp6cS1xqWSH46bCipf9W95VrFDyyFBm8XXcZ1E:webvh.storm.ws:webvh-server1";
+            "did:webvh:QmRUN4vrMp6cS1xqWSH46bCipf9W95VrFDyyFBm8XXcZ1E:webvh.storm.ws:webvh-server1"; // retired-name-ok: a real DID
         for frag in ["whois", "files"] {
             let parsed = url::Url::parse(&format!("{base}#{frag}")).expect("parse service id");
             assert!(

@@ -1,3 +1,5 @@
+//! The Google Cloud Firestore store backend.
+
 use std::sync::Arc;
 
 use base64::Engine;

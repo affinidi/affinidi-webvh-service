@@ -1,6 +1,6 @@
 //! `did:webvh` implementation of [`DidMethod`].
 //!
-//! Per `docs/multi-method-hosting-spec.md` §6.1. Wraps the existing
+//! Per `docs/archive/multi-method-hosting-spec.md` §6.1. Wraps the existing
 //! webvh-specific helpers (`crate::did::encode_host`, the log-validation
 //! chain in `crate::did_ops`) behind the method-agnostic trait so the
 //! dispatcher in `super::method_by_name` can route to webvh through the
@@ -18,17 +18,15 @@
 //!
 //! `did.jsonl` — one JSON object per line. Each line is a signed log
 //! entry recording a change to the DID document. `validate` parses each
-//! line as JSON (the deeper webvh-spec validation lives in
-//! `crate::did_ops::validate_jsonl` and is wired in via the
-//! soon-to-land `did_ops` refactor; T11 ships the parser-level
-//! validation only).
+//! line as JSON only; the deeper webvh-spec validation lives in
+//! [`crate::did_ops::validate_did_jsonl`] and runs on the publish path.
 //!
 //! ## `apply_update`
 //!
 //! Append-only: the new line is concatenated to the existing bytes,
 //! ensuring a `\n` separator. Validation of the chain (signatures,
 //! version IDs) is the caller's responsibility before calling — same
-//! contract the existing publish-handler honours today.
+//! contract the publish path honours.
 
 #![cfg(feature = "method-webvh")]
 
@@ -104,8 +102,8 @@ impl DidMethod for Webvh {
         // Trait-level validation is line-syntactic only: every non-blank
         // line must parse as a JSON object. The deeper webvh-spec chain
         // validation (SCID continuity, version-ID monotonicity, witness
-        // signatures) runs in `crate::did_ops::validate_jsonl` and is
-        // called from the existing publish path. This trait method runs
+        // signatures) runs in `crate::did_ops::validate_did_jsonl` and is
+        // called from the publish path. This trait method runs
         // first and gives a cheap, transport-layer rejection for
         // obviously-malformed payloads.
         let text = std::str::from_utf8(data)

@@ -746,7 +746,7 @@ async fn push_targets(
 }
 
 // ---------------------------------------------------------------------------
-// Domain assignment push (T28)
+// Domain assignment push
 //
 // All control→server pushes route through `crate::outbox` for durable,
 // at-least-once delivery: enqueue first, worker delivers. Returning

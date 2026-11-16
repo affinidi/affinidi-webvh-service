@@ -1,9 +1,9 @@
 //! [`DomainScope`] — per-ACL-entry rule describing which domains an
 //! authenticated caller may operate against.
 //!
-//! Per `docs/multi-domain-spec.md` §3 design table row "ACL domain
-//! scope". Added as a field on `super::super::acl::AclEntry` in T16;
-//! enforced on every create / publish / list operation in T20.
+//! Per `docs/archive/multi-domain-spec.md` §3 design table row "ACL domain
+//! scope". A field on `super::super::acl::AclEntry`, enforced on every
+//! create / publish / list operation.
 //!
 //! ## Variants
 //!
@@ -11,31 +11,30 @@
 //!   and `Service` ACL roles (where role-based access already
 //!   constrains the surface). Pre-rollout `Owner` entries that exist
 //!   in stores at upgrade time also deserialize as `All` for
-//!   backwards-compat — see the migration banner + ACL-lockdown tool
-//!   in T22 / T42.
+//!   backwards-compat.
 //! - [`DomainScope::Allowed`] — explicit whitelist of allowed domain names.
 //!   No implicit default; a missing `domain` on the wire is rejected.
 //! - [`DomainScope::AllowedWithDefault`] — whitelist plus an explicit default
-//!   used when the caller omits `domain`. **The new default for
-//!   freshly-created `Owner` entries** in T22.
+//!   used when the caller omits `domain`. A grant's `act` that names
+//!   contexts including the default domain produces it.
 //!
 //! ## Serialisation
 //!
 //! Tagged-enum form, `tag = "kind"`, value lower-snake-case. The
-//! shape is stable; downstream consumers (audit logs, the admin UI in
-//! T42) match on the tag string.
+//! shape is stable; downstream consumers (audit logs, the admin UI)
+//! match on the tag string.
 
 use serde::{Deserialize, Serialize};
 
 /// Per-ACL-entry rule describing which domains a caller may use.
 ///
-/// Default is [`Self::All`] for backwards-compat with v0.6-vintage
-/// stores (where ACL entries had no scope field at all) — see the
+/// Default is [`Self::All`] for backwards-compat with stores from
+/// before domain scoping (where ACL entries had no scope field at all) — see the
 /// `#[default]` mark below. That choice preserves on-disk
 /// deserialisation: a stored ACL entry without a `domains` field
-/// reads as `All`, matching `docs/multi-domain-spec.md` §3 "ACL
-/// domain scope". T22 flips the default for **newly-created**
-/// `Owner` entries to [`Self::AllowedWithDefault`].
+/// reads as `All`, matching `docs/archive/multi-domain-spec.md` §3 "ACL
+/// domain scope". A newly granted entry's scope comes from its grant's
+/// `act` instead.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DomainScope {
@@ -103,9 +102,8 @@ impl DomainScope {
 }
 
 /// Resolve the effective `domain` for a DID-management request per
-/// spec §3 "Default-domain selection". T34 makes this the single
-/// authoritative resolver so REST and DIDComm handlers can't drift
-/// on the precedence rules.
+/// spec §3 "Default-domain selection" — the single authoritative
+/// resolver, so no Trust Task row can drift on the precedence rules.
 ///
 /// Precedence:
 /// 1. `request_domain` (explicit on the wire) — if set, use it.

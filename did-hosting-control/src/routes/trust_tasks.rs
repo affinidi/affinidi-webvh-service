@@ -1,5 +1,5 @@
-//! `POST /api/trust-tasks` — the Trust Tasks transport endpoint
-//! introduced in v0.7.0.
+//! `POST /api/trust-tasks` — the HTTPS binding of the Trust Task
+//! dispatch.
 //!
 //! Receives a JSON-encoded `TrustTask<serde_json::Value>` document and hands
 //! it to `messaging::dispatch_trust_task_doc` — the same dispatch TSP and

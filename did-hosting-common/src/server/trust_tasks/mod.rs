@@ -321,15 +321,15 @@ where
     // SPEC.md §7.2 items 4 and 11, a required argument since trust-tasks 0.17
     // (`ConsumeChecks`) rather than a default the framework chose for us.
     //
-    // `not_consequential()` is what this shim has always done — 0.9 ran no
-    // duplicate-execution record at all — so taking it here changes no
-    // behaviour with the dependency bump. It is *not* the right long-term
-    // answer for the ACL writes (`acl/grant`, `acl/revoke`,
-    // `acl/change-role`), which are consequential by §2: a mediator redelivery
-    // of one grant document would be executed twice. Fixing that needs a
-    // `ReplayGuard` with storage behind it and a decision about which
-    // processes share a VID (the control plane, the server and the daemon all
-    // consume), which is its own change rather than a dependency bump.
+    // `not_consequential()`: the framework keeps no duplicate-execution record
+    // here because the caller already has. The ACL writes (`acl/grant`,
+    // `acl/revoke`, `acl/change-role`) are consequential by §2, but every
+    // signed document is recorded in the replay cache on `(issuer, id)` —
+    // for as long as the freshness gate would accept it — before it is
+    // dispatched (the control plane's
+    // `dispatch_trust_task_doc`, via `messaging::replay_partition`), so a
+    // mediator redelivery of one grant document is refused as a replay rather
+    // than executed twice.
     let outcome: ConsumeOutcome<R> = consume_inbound(
         transport,
         policy,
@@ -461,13 +461,13 @@ pub(crate) fn reject_with<P>(
 ///    logic.
 ///
 /// `policy` selects how the maintainer handles inbound `proof`
-/// members. The control plane maps `trust_tasks.enforce_proofs` to:
-/// * `true` + verifier configured → [`ProofPolicy::Verify`]
-/// * `false` (default) → [`ProofPolicy::RejectIfPresent`] (a
-///   proof-bearing document is rejected `malformed_request` per the
-///   framework's [`trust_tasks_rs::PROOF_NOT_ACCEPTED_BY_POLICY`]
-///   rule — silently dropping a producer-supplied proof would mislead
-///   the producer about the integrity guarantees of the exchange).
+/// members. The control plane verifies every proof before it gets here
+/// (its sender-bound gate), so it passes [`ProofPolicy::AcceptUnverified`]
+/// for a signed document it has already verified, and
+/// [`ProofPolicy::Verify`] otherwise. [`ProofPolicy::RejectIfPresent`]
+/// (a proof-bearing document is rejected `malformed_request` per the
+/// framework's [`trust_tasks_rs::PROOF_NOT_ACCEPTED_BY_POLICY`] rule) is
+/// not used by any service in this workspace; the tests exercise it.
 ///
 /// Returns a [`DispatchOutcome`] the calling transport (HTTPS or
 /// DIDComm) serialises onto the wire.
@@ -484,8 +484,9 @@ where
     // proof-present case. The framework's wire message is
     // deliberately sanitised (it would otherwise let an unauth probe
     // enumerate which deployments in a fleet lack verifier coverage),
-    // so the verbose form — naming the `enforce_proofs` knob — moves
-    // into the operator's log stream.
+    // so the verbose form moves into the operator's log stream. (No service
+    // passes this policy today; its message still names the retired
+    // `enforce_proofs` setting.)
     if matches!(policy, ProofPolicy::RejectIfPresent) && doc.proof.is_some() {
         tracing::warn!(
             type_uri = %doc.type_uri,

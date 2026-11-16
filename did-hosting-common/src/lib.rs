@@ -1,3 +1,35 @@
+//! Shared library for the DID hosting service: the stable surface every
+//! binary (`did-hosting-server`, `-control`, `-witness`, `-watcher`,
+//! `-daemon`) and external clients build on.
+//!
+//! # Stability
+//!
+//! The wire and data shapes here — request/response types (the private
+//! `types` module, re-exported at the root), DID parsing ([`did`], [`scid`]), the
+//! [`DidMethod`](method::DidMethod) abstraction, the `DidRecord`
+//! ([`did_ops`]) and the generated Trust Task types (`tasks`) — are what
+//! the other crates point consumers at. The `server` module is shared
+//! service plumbing: public so the binaries can compose it, but unstable.
+//!
+//! # Feature flags
+//!
+//! - `method-webvh`, `method-web` (default), `method-webs`,
+//!   `method-webplus` — which DID methods [`method::method_by_name`]
+//!   compiles in. `method-webs` pulls the KERI stack; `method-webplus` is
+//!   a stub.
+//! - `server-core` — the service runtime: `server` (config, store, ACL,
+//!   auth, Trust Task dispatch, DIDComm/TSP transports, identity,
+//!   migrations, stats), the `tasks` types, the `WebVHClient` and
+//!   `WitnessClient` HTTP clients and `outbound_client`.
+//! - `store-fjall`, `store-redis`, `store-dynamodb`, `store-firestore`,
+//!   `store-cosmosdb` — storage backends (each implies `server-core`).
+//! - `keyring`, `aws-secrets`, `gcp-secrets`, `azure-secrets`,
+//!   `vault-secrets`, `k8s-secrets` — secret-store backends.
+//! - `setup-wizard` — interactive setup prompts; `passkey` — WebAuthn
+//!   sign-in; `metrics` — operational counters
+//!   (read through the `server/metrics` Trust Task).
+//! - `test-support`, `cosmosdb-emulator` — test-only seams.
+
 pub mod cli_reference;
 #[cfg(feature = "server-core")]
 mod client;

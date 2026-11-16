@@ -85,9 +85,8 @@ impl TspHandler for WebvhTspHandler {
 /// Compute the response bytes for an inbound TSP trust-task payload.
 ///
 /// Extracted from [`WebvhTspHandler::handle`] so the parse + dispatch +
-/// serialise logic is testable without a live TSP socket — mirrors the
-/// `run_trust_tasks_envelope` / `run_webvh_dispatch` pattern in
-/// [`crate::messaging`]. Returns `Ok(None)` for the SPEC §8.1 routing
+/// serialise logic is testable without a live TSP socket — mirrors
+/// `run_trust_tasks_envelope` in [`crate::messaging`]. Returns `Ok(None)` for the SPEC §8.1 routing
 /// exception (identity-mismatch with no transport sender), which the
 /// TSP socket's authenticated-sender guarantee makes unreachable.
 pub(crate) async fn run_tsp_trust_task(
@@ -155,9 +154,9 @@ pub(crate) async fn run_tsp_trust_task(
 
     // Dispatch through the unified trust-task router shared with the DIDComm
     // and HTTPS transports (`messaging::dispatch_trust_task_doc`). It routes
-    // ACL + discovery ops to the typed framework pipeline and DID-management
-    // ops to `dispatch_did_op`, so every op is reachable over TSP as a Trust
-    // Task document.
+    // DID-management ops to their `control_tasks` rows and ACL + discovery
+    // ops to the typed framework pipeline, so every op is reachable over TSP
+    // as a Trust Task document.
     let transport = TspTransportHandler::new(my_vid.to_string(), sender.to_string());
     // No status codes on this transport, so the reply is the document either
     // way — `into_document` is where that flattening belongs, beside the router
@@ -379,7 +378,7 @@ mod tests {
     }
 
     /// The loop, pinned. An error document used to fall through to
-    /// `bridge_did_management`, be dispatched as a DID op, fail validation, and
+    /// the legacy DID-op table, be dispatched as a DID op, fail validation, and
     /// be answered with a problem report — which the peer answered in kind.
     /// Nothing may go back for one now, whatever it threads to.
     #[tokio::test]
@@ -407,7 +406,7 @@ mod tests {
     }
 
     /// A DID-management op (`did/check-name`) sent over TSP as a Trust Task
-    /// document is bridged to the legacy `dispatch_did_op` table and comes
+    /// document is routed to its `control_tasks` row and comes
     /// back as a Trust Task `#response` document — proving DID-management is
     /// a first-class trust task over TSP, not just the ACL/discovery ops.
     #[tokio::test]
@@ -440,8 +439,7 @@ mod tests {
             "issuer": sender,
             "recipient": SERVICE_DID,
             "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            // A read-only availability probe: params ride in `payload`,
-            // which the bridge maps to the synthesised `Message.body`.
+            // A read-only availability probe: params ride in `payload`.
             "payload": { "path": "alice", "reserve": false }
         });
         let signed = crate::signing::test_util::sign_operational(body, &signer).await;
@@ -452,7 +450,7 @@ mod tests {
             .expect("a response is emitted");
         let doc: Value = serde_json::from_slice(&out).expect("response is JSON");
 
-        // Bridged to dispatch_did_op → check-name `#response`, addressed back
+        // Routed to the check-name row → `#response`, addressed back
         // to the proven signer, threaded to the request.
         assert_eq!(
             doc["type"],

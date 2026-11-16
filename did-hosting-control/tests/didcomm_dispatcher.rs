@@ -1,22 +1,15 @@
 //! Coverage for the DIDComm router and dispatcher in `did-hosting-control`.
 //!
-//! The audit flagged `messaging::build_control_router` and the protocol
-//! error mapper as load-bearing wire-level contracts that had no tests.
-//! These cases lock down the contract:
+//! The audit flagged `messaging::build_control_router` as a load-bearing
+//! wire-level contract that had no tests. This case locks it down:
+//! `build_control_router` constructs successfully — every `route(...)`
+//! call registers without conflict and every handler resolves. A typo in
+//! a `MSG_*` constant or an accidental duplicate route becomes a test
+//! failure rather than a runtime surprise.
 //!
-//! 1. `build_control_router` constructs successfully — every `route(...)`
-//!    call registers without conflict and every handler resolves. A typo
-//!    in a `MSG_*` constant or an accidental duplicate route becomes a
-//!    test failure rather than a runtime surprise.
-//! 2. `dispatch_did_op` returns a clear `Validation` error for unknown
-//!    message types — pins the "unknown type" wire response so the
-//!    DIDComm protocol-error mapping (covered separately by
-//!    `map_app_error_code_pinned_table`) maps it to
-//!    `e.p.did.validation-error`.
-//!
-//! Bigger end-to-end tests of every dispatch arm need fakes for the
-//! mediator and ATM transport; those are tracked separately. This test
-//! is the cheap regression net for the contract surface.
+//! What a routed document *means* is covered by the dispatch tests beside
+//! `messaging::dispatch_trust_task_doc`; this test is the cheap regression
+//! net for the router's construction.
 
 use std::path::PathBuf;
 

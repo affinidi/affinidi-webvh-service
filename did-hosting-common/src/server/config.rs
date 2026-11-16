@@ -1,3 +1,7 @@
+//! Configuration sections shared by every service (`[features]`, `[server]`,
+//! `[log]`, `[store]`, `[auth]`, `[secrets]`, `[vta]`, `[replay]`, …), their
+//! defaults, validation and environment overrides.
+
 use super::error::AppError;
 use ipnetwork::IpNetwork;
 use serde::{Deserialize, Serialize};
@@ -36,7 +40,7 @@ pub struct FeaturesConfig {
     /// already claims it via `alsoKnownAs`, so serving the `/@…` namespace
     /// cannot by itself expose a name the controller has not authorised: with
     /// no names bound, every `/@…` request 404s exactly as it did before.
-    /// Meanwhile the write path (bind/park/resume, over REST and Trust Tasks)
+    /// Meanwhile the write path (bind/park/resume, over Trust Tasks)
     /// and the UI that drives it are *not* gated on this flag — leaving it off
     /// let an owner bind a name that then silently failed to resolve, which is
     /// the worse default.
@@ -261,7 +265,7 @@ pub struct ServerConfig {
     pub client_ipv6_prefix: u8,
     /// Trusted reverse-proxy CIDRs whose `Forwarded` (RFC 7239) and
     /// `X-Forwarded-Host` headers are honoured for **request host /
-    /// domain detection** (multi-domain feature, T19). Distinct from
+    /// domain detection** (multi-domain feature). Distinct from
     /// `trusted_proxies` above: that one is for client-IP
     /// attribution; this one is for which host the request is
     /// claiming to address. Outside this set, the daemon always uses
@@ -1320,7 +1324,7 @@ impl Default for ServerConfig {
 
 /// Settings for the multi-domain hosting feature.
 ///
-/// Per `docs/multi-domain-spec.md` §3: domains are runtime-managed,
+/// Per `docs/archive/multi-domain-spec.md` §3: domains are runtime-managed,
 /// but the daemon needs to know what to seed on a fresh deployment
 /// (when no `domains` keyspace entries exist yet) and how long to
 /// retain unassigned-domain data before purging.
@@ -1329,7 +1333,7 @@ impl Default for ServerConfig {
 pub struct HostingConfig {
     /// Domain names to seed into the `domains` keyspace on first boot
     /// when the keyspace is empty. Used only when the operator hasn't
-    /// already created domains via the admin API. The first entry
+    /// already created domains with the `domain/create` Trust Task. The first entry
     /// becomes the default domain (per spec §3 cold-start fallback
     /// chain — tier 1).
     ///
@@ -1766,7 +1770,7 @@ pub struct VtaConfig {
 /// `Vta` (the default) means a parent VTA provisions and rotates the service's
 /// own keys at setup time. `SelfManaged` means the service generates its own
 /// keys and self-hosts a `did:webvh` identifier with no parent VTA — a
-/// daemon-only mode in v1. See `docs/self-managed-mode-spec.md`.
+/// daemon-only mode in v1. See `docs/archive/self-managed-mode-spec.md`.
 #[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum IdentityMode {

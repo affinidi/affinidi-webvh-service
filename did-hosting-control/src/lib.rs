@@ -5,7 +5,7 @@
 //! Pre-1.0 — the public-module surface is intentionally wide so that
 //! `did-hosting-daemon` can compose this crate as a library. Treat every `pub`
 //! module as **unstable**; breaking changes can land in any minor version.
-//! Pin internal deps with `major.minor` (`= "0.6"`). The semver-stable
+//! Pin internal deps to the release's `major.minor`. The semver-stable
 //! shapes consumers should rely on (request/response types, DID shapes,
 //! auth primitives) live in `did-hosting-common`.
 

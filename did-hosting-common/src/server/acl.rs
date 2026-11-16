@@ -1,3 +1,7 @@
+//! The access-control list: one [`AclEntry`] per DID, carrying its [`Role`],
+//! quotas and domain scope, stored in the `acl` keyspace and checked by every
+//! Trust Task row through [`check_acl`].
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -7,23 +11,22 @@ use tracing::{debug, warn};
 use super::error::AppError;
 use super::store::KeyspaceHandle;
 
-/// Roles that determine endpoint access permissions.
+/// Roles that determine which Trust Tasks a DID may perform.
 ///
-/// The role of a JWT-authenticated request gates which `*Auth`
-/// extractor will accept it:
+/// The role of a JWT-authenticated (session) request also gates which
+/// `*Auth` extractor will accept it:
 /// - `Admin` → `AdminAuth` (and `AuthClaims`).
-/// - `Owner` → `AuthClaims` only; admin-only routes reject.
-/// - `Service` → `ServiceAuth` (and `AuthClaims`); admin-only routes
+/// - `Owner` → `AuthClaims` only; admin-only tasks reject.
+/// - `Service` → `ServiceAuth` (and `AuthClaims`); admin-only tasks
 ///   reject.
 ///
 /// `Service` is for backend service accounts that register with the
-/// control plane and push sync data. As of v0.7 it is required by
-/// `POST /api/control/register-service` (a service registering its
-/// public URL) and `POST /api/control/stats` (a service pushing
-/// stats deltas). A token minted for a `Service`-role DID will
-/// neither be accepted by admin-only routes nor by the public DID-
-/// management routes a tenant would use — service accounts are
-/// deliberately scoped down.
+/// control plane and push sync data. It is required by the
+/// `server/register` Trust Task (a server registering itself) and
+/// `server/stats-sync` (a server pushing stats deltas). A `Service`-role
+/// DID is accepted neither by admin-only tasks nor by the DID-management
+/// tasks a tenant would use — service accounts are deliberately scoped
+/// down.
 ///
 /// `MetricsReader` is the narrowest role: it can read the service's
 /// `webvh_*` counters via `did-management/server/metrics/0.1` and nothing
@@ -37,9 +40,9 @@ pub enum Role {
     Admin,
     Owner,
     /// Service accounts (e.g. did-hosting-server registering with the control plane).
-    /// Can authenticate and use the service-only endpoints
-    /// (`register-service`, `stats`); cannot access admin management
-    /// endpoints or tenant DID-management routes.
+    /// Can use the service-only Trust Tasks (`server/register`,
+    /// `server/stats-sync`); cannot perform admin management or tenant
+    /// DID-management tasks.
     Service,
     /// Read-only metrics role. Can read the `webvh_*` counters via
     /// `server/metrics/0.1` and nothing else.
@@ -83,14 +86,14 @@ pub struct AclEntry {
     #[serde(default)]
     pub max_did_count: Option<u64>,
     /// Which domains this caller is authorised to operate on. Per
-    /// `docs/multi-domain-spec.md` §3, `Admin` and `Service` roles
+    /// `docs/archive/multi-domain-spec.md` §3, `Admin` and `Service` roles
     /// short-circuit this check upstream — `domains` is the per-Owner
     /// authorisation rule.
     ///
-    /// `#[serde(default)]` keeps backwards-compat: v0.6-vintage ACL
-    /// entries lacking this field deserialise as `DomainScope::All`.
-    /// T22 flips the default for **newly-created** Owner entries to
-    /// `AllowedWithDefault([system_default], system_default)`.
+    /// `#[serde(default)]` keeps backwards-compat: ACL entries stored
+    /// before domain scoping lack this field and deserialise as
+    /// `DomainScope::All`. A newly granted entry's scope comes from its
+    /// grant's `act` (`trust_tasks::entry::domains_for_act`).
     #[serde(default)]
     pub domains: super::domain::DomainScope,
 }
@@ -190,14 +193,13 @@ pub async fn list_acl_entries(acl: &KeyspaceHandle) -> Result<Vec<AclEntry>, App
 }
 
 /// Count `Owner` ACL entries whose `domains` field is
-/// [`DomainScope::All`](crate::server::domain::DomainScope::All) (T52).
+/// [`DomainScope::All`](crate::server::domain::DomainScope::All).
 ///
 /// Surfaces the post-migration "how many owners still have
 /// unrestricted scope?" signal that the spec wants on a future
-/// admin dashboard. Pre-T22 deployments deserialise all existing
-/// `Owner` entries with `DomainScope::All` (backwards-compat
-/// default); the ACL-lockdown follow-up tool (planned for T42)
-/// will iterate the same set to migrate them to
+/// admin dashboard. `Owner` entries stored before domain scoping
+/// deserialise with `DomainScope::All` (backwards-compat default); an
+/// ACL-lockdown tool would iterate the same set to migrate them to
 /// `AllowedWithDefault`.
 ///
 /// Excludes `Admin` and `Service` roles — those are implicitly
@@ -312,14 +314,14 @@ mod tests {
         }
     }
 
-    // --- Backwards-compat: v0.6-vintage AclEntry (no `domains` field) ---
+    // --- Backwards-compat: an AclEntry with no `domains` field ---
 
     #[test]
     fn legacy_acl_entry_deserialises_with_domains_default_all() {
-        // A pre-T16 stored entry has no `domains` field. The
-        // `#[serde(default)]` on `AclEntry::domains` must accept it
+        // An entry stored before domain scoping has no `domains` field.
+        // The `#[serde(default)]` on `AclEntry::domains` must accept it
         // and populate `DomainScope::All`. This invariant is load-
-        // bearing — operators with v0.6.0 stores must upgrade without
+        // bearing — operators with older stores must upgrade without
         // their existing ACL entries becoming unreadable.
         let legacy = r#"{
             "did": "did:example:legacy",
@@ -546,7 +548,7 @@ mod tests {
         }
     }
 
-    // ---- T52: count_all_scoped_owners --------------------------------------
+    // ---- count_all_scoped_owners --------------------------------------
 
     use crate::server::config::StoreConfig;
     use crate::server::domain::DomainScope;

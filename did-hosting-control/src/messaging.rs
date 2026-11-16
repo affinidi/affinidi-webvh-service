@@ -44,9 +44,9 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
         // transport's report of the sender alone and have been removed. A peer
         // still sending one gets `handle_fallback`'s problem report naming the
         // type, not a silent timeout.
-        // Trust Tasks envelope (v0.7.0+) — routes the five `acl/*`
-        // ops and `trust-task-discovery` through the same handlers
-        // the HTTPS transport hits at `POST /api/trust-tasks`.
+        // Trust Tasks envelope — routes every Trust Task through the same
+        // `dispatch_trust_task_doc` the HTTPS transport hits at
+        // `POST /api/trust-tasks`.
         .route(
             trust_tasks_didcomm::ENVELOPE_TYPE,
             handler_fn(handle_trust_tasks_envelope),
@@ -148,7 +148,7 @@ pub(crate) fn spec_did_record_json(
     }
     // The agent-name registry, so the four `agent-name/*` verbs are
     // self-describing: without it a client has to follow every `set` or
-    // `disable` with an authenticated `GET /api/dids/{mnemonic}` just to learn
+    // `disable` with a `did-management/did/info` Trust Task just to learn
     // what its own call did. A *parked* name is invisible in the DID document
     // by design, so the response is the only place the caller can see it.
     //
@@ -213,8 +213,7 @@ pub(crate) async fn do_stats_sync(
 ) -> Result<Value, InfraRejection> {
     use did_hosting_common::server::trust_tasks::infra;
 
-    // Require Service role — matches REST `/api/control/stats` which is gated
-    // on ServiceAuth. An Owner-role DID must not be able to write per-DID
+    // Require Service role. An Owner-role DID must not be able to write per-DID
     // stats deltas: doing so would let any tenant tamper with another
     // server's resolved/update counters.
     let service = is_service(state, signer).await.map_err(|e| {
@@ -737,8 +736,7 @@ pub(crate) async fn do_server_register(
     use crate::registry::{self, ServiceInstance, ServiceStatus, ServiceType};
     use did_hosting_common::server::acl::check_acl;
 
-    // Require pre-approved ACL entry with the Service role — matches REST
-    // `/api/control/register-service` which is gated on ServiceAuth. An
+    // Require a pre-approved ACL entry with the Service role. An
     // Owner-role DID must not be able to register as a server: registration
     // triggers `sync_all_dids_to_server`, which would push every tenant's
     // DID log + witness content to the caller's inbox and add them to the
@@ -810,8 +808,7 @@ pub(crate) async fn do_server_register(
         ));
     }
     // This service's hints (`ext`, in its namespace). A server that sends none
-    // gets the conservative defaults: legacy health pings, single sync frames,
-    // and a full sync.
+    // gets the conservative defaults: single sync frames and a full sync.
     let hints = payload
         .ext
         .as_ref()
@@ -823,12 +820,9 @@ pub(crate) async fn do_server_register(
         .unwrap_or(Value::Null);
     let public_url = payload.public_url.as_str();
 
-    // Apply the same URL allowlist that the REST `register_service`
-    // route enforces. Without this gate, an ACL'd Service-role caller
-    // could register an arbitrary URL (cloud-metadata IP, RFC1918,
-    // attacker-controlled host) and then wait for an Admin to hit
-    // `/api/proxy/server/{instance_id}/...` — `proxy_to_service` would
-    // forward the Admin's `Authorization: Bearer ...` to that URL.
+    // Apply the same URL allowlist `registry/admin-register` enforces, so an
+    // ACL'd Service-role caller cannot record an arbitrary URL
+    // (cloud-metadata IP, RFC1918, attacker-controlled host) in the registry.
     if let Err(e) =
         registry::validate_registered_url(public_url, &state.config.registry.url_allowlist)
     {
@@ -842,8 +836,8 @@ pub(crate) async fn do_server_register(
 
     let label = payload.label.as_ref().map(|l| l.to_string());
 
-    // T27: parse capability declaration. Backwards-compat: pre-T27
-    // servers don't send these fields; default to webvh-only.
+    // Parse the capability declaration. Backwards-compat: servers that
+    // predate it don't send these fields; default to webvh-only.
     let enabled_methods: Vec<String> = if payload.enabled_methods.is_empty() {
         vec!["webvh".to_string()]
     } else {
@@ -1115,7 +1109,7 @@ fn require_sender(ctx: &HandlerContext) -> Result<&str, DIDCommServiceError> {
 }
 
 // ---------------------------------------------------------------------------
-// Trust Tasks envelope handler (v0.7.0+)
+// Trust Tasks envelope handler
 // ---------------------------------------------------------------------------
 
 /// DIDComm handler for the Trust Tasks envelope
@@ -1299,23 +1293,6 @@ pub(crate) fn body_parse_error(reason: &str) -> trust_tasks_rs::ErrorResponse {
 // Unified trust-task dispatch (all transports)
 // ---------------------------------------------------------------------------
 
-/// The single dispatch entry for an inbound `TrustTask<Value>` document,
-/// shared by **every** transport that carries trust-task documents — TSP,
-/// the DIDComm trust-task envelope, and (behind its bearer-auth proof
-/// pre-check) HTTPS `POST /api/trust-tasks`.
-///
-/// Routes by Type URI:
-/// - Type URIs the framework dispatcher owns (ACL grant/revoke/change-role/
-///   show/list, discovery) → the typed SPEC §7.2 pipeline via
-///   [`dispatch_inbound`](did_hosting_common::server::trust_tasks::dispatch_inbound).
-/// - Everything else (the legacy DID-management ops) → [`bridge_did_management`],
-///   which reuses the transport-agnostic [`dispatch_did_op`] engine.
-///
-/// Returns the response document as a JSON value (`None` = the SPEC §8.1
-/// identity-mismatch "suppressed" case). Each transport serialises the
-/// value for its own wire (TSP → bytes, DIDComm → envelope body, HTTPS →
-/// JSON response). `transport` is the caller's [`TransportHandler`] so the
-/// framework path resolves identities with the right binding.
 /// What a routed Trust Task produced, before any transport turns it into a
 /// reply.
 ///
@@ -1959,11 +1936,10 @@ async fn route_trust_task_doc(
         let policy: trust_tasks_rs::ProofPolicy<'_, TransportBoundVerifier> =
             trust_tasks_rs::ProofPolicy::Verify(verifier);
 
-        // Auth (`auth/{challenge,authenticate,refresh}/0.1`). Before the framework
-        // check below: the shared `build_dispatcher` does not carry this family —
-        // its context is the ACL keyspace — so an auth document would fall through
-        // to `bridge_did_management`, a table of DID operations that has never
-        // heard of it, and come back a bogus "unknown op".
+        // Auth (`auth/*`). Neither the control table nor the shared
+        // `build_dispatcher` (whose context is the ACL keyspace) carries this
+        // family, so it is claimed here, ahead of both; otherwise it would be
+        // refused below as `unsupportedType`.
         if crate::trust_tasks_auth::owns(&type_uri) {
             return Ok(RoutedReply::Document(
                 crate::trust_tasks_auth::dispatch(state, transport, policy, doc)
@@ -1975,10 +1951,8 @@ async fn route_trust_task_doc(
         }
 
         // Control↔server infrastructure ops (server registration, health pong,
-        // stats, sync and domain acks). Must be checked *before* the
-        // `bridge_did_management` fallthrough below, which would otherwise hand
-        // them to `dispatch_did_op` — a table of DID operations that has never
-        // heard of them — and answer with a bogus "unknown op" problem report.
+        // stats, sync and domain acks). Claimed here for the same reason: neither
+        // the control table nor the framework family below carries them.
         if crate::trust_tasks_infra::owns(&type_uri) {
             // The dispatcher stays transport-agnostic; we only tell it which binding
             // the document came in on so the registry can record what actually moved.
@@ -2466,7 +2440,8 @@ mod tests {
             disabled_by_admin: false,
             deleted_at: None,
 
-            // T12: legacy construction site; T13 migration fills `domain`.
+            // A record from before multi-method hosting: no `domain` yet
+            // (the migration fills it).
             method: "webvh".to_string(),
             domain: String::new(),
             agent_names: Vec::new(),
@@ -2595,7 +2570,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // run_trust_tasks_envelope tests (v0.7.0)
+    // run_trust_tasks_envelope tests
     //
     // The DIDComm-side dispatch was previously uncovered because the
     // outer `handle_trust_tasks_envelope` takes `HandlerContext`, which
@@ -2821,8 +2796,8 @@ mod tests {
         assert_eq!(resp_body["payload"]["code"], "malformedRequest");
     }
 
-    /// A signed DID-management op (`did/check-name`) in the envelope is bridged
-    /// to `dispatch_did_op` and answered to its signer.
+    /// A signed DID-management op (`did/check-name`) in the envelope is routed
+    /// to its `control_tasks` row and answered to its signer.
     #[tokio::test]
     async fn trust_tasks_envelope_bridges_did_management() {
         let (state, _dir) = signing_state().await;

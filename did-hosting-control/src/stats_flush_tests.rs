@@ -1,3 +1,6 @@
+//! Tests for [`super`]: the periodic flush of in-memory counters to the
+//! tiered stats store.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

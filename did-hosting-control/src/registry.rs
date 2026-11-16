@@ -47,19 +47,20 @@ pub struct ServiceInstance {
     #[serde(default)]
     pub metadata: serde_json::Value,
 
-    // ---- Capability declaration (T27) ----
+    // ---- Capability declaration ----
     //
-    // Both fields are `#[serde(default)]` so pre-T27 records persisted
-    // on disk continue to deserialise. `default_enabled_methods`
-    // returns `["webvh"]` — the only method any pre-T27 server could
-    // host — which matches the spec's backwards-compat behaviour.
+    // Both fields are `#[serde(default)]` so records persisted before
+    // servers declared capabilities continue to deserialise.
+    // `default_enabled_methods` returns `["webvh"]` — the only method
+    // such a server could host — which matches the spec's
+    // backwards-compat behaviour.
     //
     // The control plane uses these for:
     // - routing inbound DIDs to a server that supports the method
     //   (`enabled_methods`);
-    // - choosing which servers receive `domain/assign/1.0` Trust
-    //   Tasks (T28) and which the unassignment-purge sweep (T30)
-    //   targets (`served_domains`).
+    // - choosing which servers receive `replica/domain/assign` Trust
+    //   Tasks and which the unassignment-purge sweep targets
+    //   (`served_domains`).
     /// DID methods this server's binary supports. New servers send
     /// the exhaustive enabled-at-compile-time list from
     /// [`did_hosting_common::method::enabled_methods`].
@@ -67,16 +68,17 @@ pub struct ServiceInstance {
     pub enabled_methods: Vec<String>,
 
     /// Domains the server currently hosts. Initially empty after a
-    /// fresh register; control-plane updates via `domain/assign/1.0`
-    /// (T28). Persisted so the registry survives a control-plane
+    /// fresh register; control-plane updates via `replica/domain/assign`.
+    /// Persisted so the registry survives a control-plane
     /// restart.
     #[serde(default)]
     pub served_domains: Vec<String>,
 
     /// Server-register protocol version. Distinct from the Trust-Task
     /// URL's version: the URL tracks the *wire* compatibility, this
-    /// tracks the *capability-set* compatibility (added in T27 to
-    /// detect old daemons that don't speak the assignment protocol).
+    /// tracks the *capability-set* compatibility (added with the
+    /// capability declaration, to detect old daemons that don't speak the
+    /// assignment protocol).
     #[serde(default = "default_protocol_version")]
     pub protocol_version: String,
 
@@ -328,8 +330,9 @@ pub async fn list_instances(
 
 impl ServiceInstance {
     /// The instance's DID, as recorded under `metadata.did` by the
-    /// DIDComm registration path. `None` for REST-registered instances,
-    /// which carry no DID and therefore can never have badges.
+    /// `server/register` and `registry/admin-register` tasks. `None` for
+    /// config-seeded `[[registry.instances]]` entries, which carry no DID
+    /// and therefore can never have badges.
     pub fn did(&self) -> Option<&str> {
         self.metadata.get("did").and_then(|v| v.as_str())
     }
@@ -339,7 +342,7 @@ impl ServiceInstance {
 ///
 /// Called on registration and from the periodic health check, so badges
 /// track a server that adds or drops a transport. A no-op for instances
-/// with no `metadata.did` (the REST registration path records none), and a
+/// with no `metadata.did` (config-seeded instances record none), and a
 /// no-op when no DID resolver is configured — rather than let
 /// `resolve_service_types` build a throwaway `DIDCacheClient` per instance
 /// per health tick.
@@ -485,30 +488,20 @@ pub fn seeded_instance_id(service_type: &ServiceType, url: &str) -> String {
     format!("seed-{hex}")
 }
 
-/// Determine instance health based on recency of last health-pong.
-///
-/// Instances that responded within `timeout_secs` are Active; those that
-/// haven't responded at all (or within 2× the timeout) are Unreachable.
-///
 /// Validate a registered service URL against the operator-configured
-/// allowlist.
+/// allowlist (`registry.url_allowlist`).
 ///
-/// Returns `Ok(())` when the URL's host is allowlisted (case-insensitive
-/// exact match). Returns `Forbidden` when the allowlist is non-empty
-/// and the URL does not match, or when the URL fails to parse / has no
-/// host. Returns `Ok(())` when the allowlist is empty (operator has
-/// opted out of host gating — this is the existing behaviour and is
-/// retained for backwards compatibility, though operators should
-/// configure an allowlist in any deployment that exposes the proxy
-/// route).
+/// Returns `Forbidden` when the URL fails to parse or has no host, or when
+/// its host is a non-routable / internal IP literal (loopback, RFC1918,
+/// link-local, CGNAT, …) that the allowlist does not name explicitly — this
+/// applies even when the allowlist is empty. With an empty allowlist any
+/// other host is accepted; with a non-empty one, only a listed host
+/// (case-insensitive exact match) is.
 ///
-/// Used by both `routes/registry::register_service` (REST) and
-/// `messaging::handle_server_register` (DIDComm) so the gate cannot be
-/// bypassed by choosing the right transport. Without parity, an ACL'd
-/// Service-role caller can register an arbitrary URL via DIDComm and
-/// the proxy at `/api/proxy/server/{instance_id}/{*path}` will then
-/// forward an Admin caller's `Authorization` header to that URL — SSRF
-/// + token exfil in one step.
+/// Used by every registration path — an administrator's
+/// `registry/admin-register` and a server's `server/register`
+/// (`messaging::do_server_register`) — so the gate cannot be bypassed by
+/// choosing a different task or transport.
 pub fn validate_registered_url(url: &str, allowlist: &[String]) -> Result<(), AppError> {
     let parsed = url::Url::parse(url)
         .map_err(|_| AppError::Forbidden("registered URL is malformed".into()))?;
@@ -522,15 +515,12 @@ pub fn validate_registered_url(url: &str, allowlist: &[String]) -> Result<(), Ap
     };
 
     // Default-deny dangerous address classes for a *literal* host, applied
-    // UNCONDITIONALLY — including when the allowlist is empty (SEC-4045 W6).
-    // Previously an empty allowlist (the config default) accepted any URL, so a
-    // Service-role DID could register a metadata / RFC1918 / loopback / CGNAT /
-    // link-local host and the admin proxy would then forward an Admin bearer
-    // token there (SSRF + credential exfil). `is_globally_routable` covers
+    // UNCONDITIONALLY — including when the allowlist is empty (SEC-4045 W6),
+    // so a Service-role DID cannot record a metadata / RFC1918 / loopback /
+    // CGNAT / link-local host in the registry. `is_globally_routable` covers
     // loopback, RFC1918, link-local (incl. 169.254.169.254), CGNAT
     // (100.64/10 — Alibaba/Oracle metadata), ULA, unspecified, and IPv4-mapped
-    // IPv6 forms. A non-literal (DNS) host is not classified here; the proxy's
-    // connect path is the second layer for a name that resolves internal.
+    // IPv6 forms. A non-literal (DNS) host is not classified here.
     //
     // An operator who *explicitly* allowlists an internal host below has opted
     // in and is trusted; this default-deny only bites the unconfigured default.
@@ -547,9 +537,7 @@ pub fn validate_registered_url(url: &str, allowlist: &[String]) -> Result<(), Ap
 
     if allowlist.is_empty() {
         // No host allowlist configured: the address-class default-deny above is
-        // the whole gate. Operators exposing the proxy route should still set an
-        // allowlist; this default is now fail-closed against internal literals
-        // rather than open.
+        // the whole gate.
         return Ok(());
     }
     if allowlist
@@ -564,6 +552,11 @@ pub fn validate_registered_url(url: &str, allowlist: &[String]) -> Result<(), Ap
     }
 }
 
+/// Determine instance health based on recency of the last health pong.
+///
+/// Instances that responded within `timeout_secs` are Active, within 2× the
+/// timeout Degraded, and beyond that Unreachable.
+///
 /// Freshly registered instances (no pong yet) stay Active for one grace
 /// period to allow the first ping/pong roundtrip to complete.
 pub fn health_status_from_timestamp(
@@ -594,12 +587,12 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
-    /// T27 backwards-compat: a pre-T27 `ServiceInstance` (no capability
-    /// fields in the persisted JSON) deserialises with `enabled_methods
-    /// = ["webvh"]`, `served_domains = []`, `protocol_version = "1.0"`.
-    /// Catching this here matters because the persisted records are
-    /// stored as JSON and any deployment upgrading from v0.7 will have
-    /// pre-T27 records on disk.
+    /// Backwards-compat: a `ServiceInstance` persisted before the capability
+    /// declaration (no capability fields in the JSON) deserialises with
+    /// `enabled_methods = ["webvh"]`, `served_domains = []`,
+    /// `protocol_version = "1.0"`. Catching this here matters because the
+    /// persisted records are stored as JSON and an upgraded deployment may
+    /// still have such records on disk.
     #[test]
     fn pre_t27_record_deserialises_with_compat_defaults() {
         let json = r#"{
@@ -618,7 +611,7 @@ mod tests {
         assert_eq!(instance.protocol_version, "1.0");
     }
 
-    /// New T27 records round-trip exactly.
+    /// Records with the capability declaration round-trip exactly.
     #[test]
     fn t27_record_round_trips() {
         let original = ServiceInstance {
@@ -664,7 +657,7 @@ mod tests {
     /// public host (DNS name or globally-routable literal) is still accepted —
     /// the operator opted out of host *allowlisting* — but a non-routable /
     /// metadata literal is refused by the address-class default-deny, so a
-    /// default-config proxy can't be pointed at an internal target.
+    /// default config cannot record an internal target.
     #[test]
     fn empty_allowlist_accepts_public_but_blocks_internal_literals() {
         assert!(validate_registered_url("http://anywhere.example/", &[]).is_ok());

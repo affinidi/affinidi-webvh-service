@@ -1,14 +1,13 @@
-//! Control-plane infrastructure trust tasks: server registration and health
-//! pong, dispatched through `trust_tasks_infra` rather than the legacy `MSG_*`
-//! DIDComm routes.
+//! Control-plane infrastructure trust tasks: server registration, health
+//! pong, stats sync and acks, dispatched through `trust_tasks_infra`.
 //!
 //! These exercise the transport-*agnostic* half of the wiring: the dispatcher
-//! takes a `TrustTask<Value>` and a transport-authenticated sender, and knows
+//! takes a `TrustTask<Value>` and its proven signer, and knows
 //! nothing about whether the document arrived over TSP, a DIDComm envelope, or
 //! HTTPS. Getting a real frame onto a real mediator socket needs a live ATM, so
 //! the transport bindings themselves are covered by unit tests on the payload
-//! shapes (`server/src/tsp.rs`) and the Type-URI pairing
-//! (`common/.../trust_tasks/send.rs`).
+//! shapes (`did-hosting-server/src/tsp.rs`) and the Type-URI pairing
+//! (`did-hosting-common/src/server/trust_tasks/send.rs`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -63,7 +62,7 @@ async fn make_harness() -> Harness {
 
     let jwt_keys = Arc::new(JwtKeys::from_ed25519_bytes(&[7u8; 32]).expect("jwt keys"));
 
-    // Deliberately no resolver — see the module note on `/api/config`.
+    // Deliberately no resolver: the dispatcher under test needs none.
     let mut state =
         did_hosting_control::test_support::bare_state(config, store.clone(), None).await;
     state.jwt_keys = Some(jwt_keys);
@@ -387,7 +386,7 @@ async fn stats_sync_trust_task_records_deltas_and_acks() {
     assert_eq!(h.state.stats_collector.get_aggregate().total_resolves, 8);
 }
 
-/// Stats writes are ACL-gated like the REST and DIDComm routes: an Owner-role
+/// Stats writes are ACL-gated on every transport: an Owner-role
 /// DID must not be able to inflate another server's counters.
 #[tokio::test]
 async fn stats_sync_trust_task_requires_service_role() {
@@ -407,8 +406,8 @@ async fn stats_sync_trust_task_requires_service_role() {
 
 /// `server_did` keys the replay window, so a Service may not report under
 /// another server's DID — it could advance that server's sequence and have
-/// its genuine deltas skipped as stale. The REST route binds it to the JWT;
-/// the messaging routes bind it to the transport-proven sender.
+/// its genuine deltas skipped as stale. It is bound to the
+/// document's proven signer.
 #[tokio::test]
 async fn stats_sync_rejects_a_foreign_server_did() {
     const DID: &str = "did:webvh:QmS:webvh.example.com:stats-spoofer";

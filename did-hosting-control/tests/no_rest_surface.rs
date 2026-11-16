@@ -15,33 +15,33 @@ use tower::ServiceExt;
 /// Every route the REST management tier served, by method.
 const REMOVED: &[(&str, &str)] = &[
     // Registry, domain directives, server registration and stats sync.
-    ("GET", "/api/control/registry"),
-    ("POST", "/api/control/registry"),
-    ("GET", "/api/control/registry/srv-1"),
-    ("DELETE", "/api/control/registry/srv-1"),
-    ("POST", "/api/control/registry/srv-1/health"),
+    ("GET", "/api/control/registry"),          // retired-name-ok
+    ("POST", "/api/control/registry"),         // retired-name-ok
+    ("GET", "/api/control/registry/srv-1"),    // retired-name-ok
+    ("DELETE", "/api/control/registry/srv-1"), // retired-name-ok
+    ("POST", "/api/control/registry/srv-1/health"), // retired-name-ok
     (
         "POST",
-        "/api/control/registry/srv-1/domains/example.com/assign",
+        "/api/control/registry/srv-1/domains/example.com/assign", // retired-name-ok
     ),
     (
         "POST",
-        "/api/control/registry/srv-1/domains/example.com/unassign",
+        "/api/control/registry/srv-1/domains/example.com/unassign", // retired-name-ok
     ),
     (
         "POST",
-        "/api/control/registry/srv-1/domains/example.com/purge",
+        "/api/control/registry/srv-1/domains/example.com/purge", // retired-name-ok
     ),
-    ("POST", "/api/control/register-service"),
-    ("POST", "/api/control/stats"),
+    ("POST", "/api/control/register-service"), // retired-name-ok
+    ("POST", "/api/control/stats"),            // retired-name-ok
     // DID slots.
-    ("POST", "/api/dids/check"),
-    ("POST", "/api/dids"),
-    ("GET", "/api/dids"),
-    ("POST", "/api/dids/register"),
-    ("GET", "/api/dids/alice"),
-    ("PUT", "/api/dids/alice"),
-    ("DELETE", "/api/dids/alice"),
+    ("POST", "/api/dids/check"),    // retired-name-ok
+    ("POST", "/api/dids"),          // retired-name-ok
+    ("GET", "/api/dids"),           // retired-name-ok
+    ("POST", "/api/dids/register"), // retired-name-ok
+    ("GET", "/api/dids/alice"),     // retired-name-ok
+    ("PUT", "/api/dids/alice"),     // retired-name-ok
+    ("DELETE", "/api/dids/alice"),  // retired-name-ok
     ("PUT", "/api/witness/alice"),
     ("GET", "/api/log/alice"),
     ("GET", "/api/raw/alice"),
@@ -77,8 +77,8 @@ const REMOVED: &[(&str, &str)] = &[
     ("GET", "/api/config"),
     ("GET", "/api/server-info"),
     // The service's identity generations.
-    ("GET", "/api/identity/generations"),
-    ("POST", "/api/identity/generations/gen-1/retire"),
+    ("GET", "/api/identity/generations"), // retired-name-ok
+    ("POST", "/api/identity/generations/gen-1/retire"), // retired-name-ok
     // Step-up, wallet consent and the pass-through proxy.
     ("POST", "/api/auth/step-up/vta/start"),
     ("POST", "/api/auth/step-up/vta/finish"),
@@ -90,7 +90,7 @@ const REMOVED: &[(&str, &str)] = &[
     // (`auth/authenticate/0.3`, `auth/refresh/0.2` over
     // `/api/trust-tasks`); only `/api/auth/challenge` stays plain REST.
     ("POST", "/api/auth/"),
-    ("POST", "/api/auth/refresh"),
+    ("POST", "/api/auth/refresh"), // retired-name-ok
 ];
 
 async fn status(app: axum::Router, method: &str, path: &str) -> StatusCode {

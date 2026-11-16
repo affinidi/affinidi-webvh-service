@@ -1,6 +1,6 @@
-//! First-boot seed for the `KS_ASSIGNMENTS` keyspace (T29).
+//! First-boot seed for the `KS_ASSIGNMENTS` keyspace.
 //!
-//! T28 made the control plane the source of truth for which domains
+//! The control plane is the source of truth for which domains
 //! a server hosts. But a freshly-deployed server hasn't received any
 //! `replica/domain/assign` yet, and an offline control plane means it
 //! never will until reconnected. To avoid the new server being
@@ -9,7 +9,7 @@
 //!
 //! ## Fallback chain
 //!
-//! Identical priority to T18's domain seed so operators only have to
+//! Identical priority to the first-boot domain seed so operators only have to
 //! configure one place:
 //!
 //! 1. **`KS_ASSIGNMENTS` already populated** → no-op (prior boot or

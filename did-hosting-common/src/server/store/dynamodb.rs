@@ -1,3 +1,5 @@
+//! The AWS DynamoDB store backend.
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;

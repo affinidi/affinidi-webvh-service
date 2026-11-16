@@ -671,7 +671,7 @@ pub fn build_webvh_provision_ask(
             // is still URL-hosted (the VTA publishes the log at `url`, and the
             // resolution URL is derivable from the identifier), but the HTTP
             // endpoint is unused for discovery — inter-node traffic is
-            // DIDComm/TSP and clients reach the REST API by explicit config —
+            // DIDComm/TSP and clients reach `POST /api/trust-tasks` by explicit config —
             // so advertising it only confused readers. TSP-only → `did-host-tsp`;
             // Both/Didcomm → `did-host-didcomm`; both carry the hosting `URL`
             // var so the VTA knows where to publish the log, though it does not

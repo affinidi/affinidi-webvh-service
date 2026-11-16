@@ -40,32 +40,33 @@ pub struct DidRecord {
     #[serde(default)]
     pub deleted_at: Option<u64>,
 
-    // ---- Multi-method + multi-domain fields (T12) ----
+    // ---- Multi-method + multi-domain fields ----
     //
-    // Both `#[serde(default)]` for backwards-compat — v0.6-vintage
-    // `DidRecord`s lack these fields and deserialise unchanged. T13's
-    // M-01 migration walks the keyspace and populates them
-    // (`method = "webvh"` for every legacy record; `domain` derived
-    // from the legacy `public_url` host that T18's bootstrap_domains
-    // seed surfaced).
+    // Both `#[serde(default)]` for backwards-compat — `DidRecord`s
+    // written before multi-method hosting lack these fields and
+    // deserialise unchanged. The M-01 migration walks the keyspace and
+    // populates them (`method = "webvh"` for every legacy record;
+    // `domain` derived from the legacy `public_url` host that the
+    // first-boot domain seed surfaced).
     //
     // The dual storage model (this record carries metadata; raw
     // content lives at `content_log_key` / `content_witness_key`)
-    // is kept intentionally — see `docs/multi-method-hosting-spec.md`
-    // §3 "Storage" tradeoff note. Inlining `data: Vec<u8>` into the
-    // record made `list_dids` pull content bytes on every scan; the
-    // split keeps metadata reads cheap.
+    // is kept intentionally — see
+    // `docs/archive/multi-method-hosting-spec.md` §3 "Storage" tradeoff
+    // note. Inlining `data: Vec<u8>` into the record made every DID
+    // listing pull content bytes on every scan; the split keeps metadata
+    // reads cheap.
     /// DID method this record was registered under. Always one of the
     /// enabled-at-compile-time methods (`webvh`, `web`); the daemon
     /// rejects any other value on the write path. Legacy records
-    /// (pre-T13 migration) default to `"webvh"` via the `#[serde(default)]`
+    /// (not yet migrated by M-01) default to `"webvh"` via the `#[serde(default)]`
     /// fallback in `Self::default_method`.
     #[serde(default = "default_method")]
     pub method: String,
 
     /// Domain (hostname) this DID is hosted under. Matches the host
     /// segment of the DID identifier (`did:{method}:…:{domain}:…`).
-    /// Legacy records (pre-T13 migration) default to the empty string;
+    /// Legacy records (not yet migrated by M-01) default to the empty string;
     /// the migration fills it with the host derived from the legacy
     /// `public_url`. New records always carry a normalised non-empty
     /// value.
@@ -73,7 +74,7 @@ pub struct DidRecord {
     pub domain: String,
 
     /// Cached `service[].type` values from the latest log entry's DID
-    /// document, in document order. Lets `list_dids` render per-DID
+    /// document, in document order. Lets `did/list` render per-DID
     /// service badges without reading log bytes — the whole reason the
     /// dual storage model exists (see the module note above).
     ///
@@ -1215,13 +1216,13 @@ mod tests {
         );
     }
 
-    // ---- T12: DidRecord new fields backwards-compat ----
+    // ---- DidRecord multi-method fields: backwards-compat ----
 
     #[test]
     fn legacy_did_record_deserialises_with_webvh_default_method() {
-        // A v0.6-vintage stored record lacks `method` + `domain`.
-        // The `#[serde(default)]` fallback on both fields must accept
-        // it: `method = "webvh"`, `domain = ""`. T13's M-01 migration
+        // A record stored before multi-method hosting lacks `method` +
+        // `domain`. The `#[serde(default)]` fallback on both fields must
+        // accept it: `method = "webvh"`, `domain = ""`. The M-01 migration
         // walks the keyspace and fills `domain` with the legacy
         // public_url host.
         let legacy = r#"{

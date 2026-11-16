@@ -1,3 +1,6 @@
+//! Wire types shared by clients and services: auth challenge and session
+//! shapes, DID listings and stats.
+
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -226,11 +229,11 @@ pub struct RequestUriResponse {
 /// admin can't upload arbitrary content under a path they happen to
 /// own.
 ///
-/// ## Multi-method wire shape (T26)
+/// ## Multi-method wire shape
 ///
 /// - `method`: one of `"webvh"`, `"web"`. Optional; if omitted, the
 ///   server attempts to derive it from `did_data.id` and falls back to
-///   `"webvh"` for backwards-compat (matching the pre-T26 wire shape
+///   `"webvh"` for backwards-compat (matching the older wire shape
 ///   that only supports webvh).
 /// - `did_data`: the method-specific payload. For `webvh` this is the
 ///   `did.jsonl` log (either a JSON string carrying the raw text, or a
@@ -241,27 +244,27 @@ pub struct RequestUriResponse {
 ///   §3.
 /// - `did_log`: deprecated legacy field. When set without `did_data`,
 ///   treated as `method = "webvh"` and the string is the jsonl
-///   payload. Setting both `did_data` and `did_log` is a 400 (the
+///   payload. Setting both `did_data` and `did_log` is refused (the
 ///   server can't tell which the caller meant).
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct DidRegisterRequest {
     pub path: String,
 
-    /// Preferred T26 shape.
+    /// Preferred shape (with `did_data`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
     /// The method-specific log payload. The v0.1 Trust Task wire spells
     /// this `didData` (camelCase, like every other did-management field);
-    /// `did_data` is accepted as a snake_case alias for REST/legacy
+    /// `did_data` is accepted as a snake_case alias for legacy
     /// callers. Deserialize-only alias — serialization stays `did_data`.
     #[serde(default, alias = "didData", skip_serializing_if = "Option::is_none")]
     pub did_data: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
 
-    /// Legacy pre-T26 field — webvh-only. Use `did_data` + `method`
-    /// for new clients; this field is accepted unchanged for v0.7
-    /// backwards-compat and will be removed in a future release.
+    /// Legacy field — webvh-only. Use `did_data` + `method` for new
+    /// clients; this field is accepted unchanged for backwards-compat
+    /// and will be removed in a future release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub did_log: Option<String>,
 
@@ -431,7 +434,7 @@ mod did_register_request_tests {
         assert!(r.did_log.is_none());
     }
 
-    /// The snake_case `did_data` alias keeps working for REST/legacy callers.
+    /// The snake_case `did_data` alias keeps working for legacy callers.
     #[test]
     fn snake_case_did_data_alias_still_deserializes() {
         let r: DidRegisterRequest = serde_json::from_value(json!({
@@ -594,11 +597,11 @@ pub struct DidListEntry {
     pub disabled: bool,
     /// DID hosting method (`"webvh"` / `"web"`). Surfaced on the
     /// wire so the UI can render a method badge per row without
-    /// loading the full record. Pre-T12 records that haven't been
+    /// loading the full record. Records from before multi-method hosting that haven't been
     /// migrated yet ship as `None` and the UI hides the badge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
-    /// Hosting domain (T12 / M-01). Same shape contract as
+    /// Hosting domain (filled for older records by migration M-01). Same shape contract as
     /// `method` above — `None` for unmigrated records, populated
     /// for everything M-01 has run over.
     #[serde(default, skip_serializing_if = "Option::is_none")]

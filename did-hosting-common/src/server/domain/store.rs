@@ -1,6 +1,6 @@
 //! CRUD over the `domains` keyspace + default-domain pointer.
 //!
-//! Per `docs/multi-domain-spec.md` §3:
+//! Per `docs/archive/multi-domain-spec.md` §3:
 //!
 //! - One `DomainEntry` per row in `KS_DOMAINS`, keyed by the
 //!   normalised `name`.
@@ -264,7 +264,7 @@ pub async fn apply_replicated_domain(
 }
 
 /// Hard-delete a domain record. Does **not** purge DIDs hosted under
-/// the domain — that's the `domain.purge` admin Trust Task in T30.
+/// the domain — that's the `domain/purge` admin Trust Task.
 /// Refuses if the domain is the current default.
 pub async fn delete_domain_record(store: &Store, name: &str) -> Result<(), AppError> {
     let canonical = normalize_domain_name(name)?;

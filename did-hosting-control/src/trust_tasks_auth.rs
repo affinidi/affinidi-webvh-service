@@ -76,13 +76,14 @@
 //!   key with the session. The session's `acr` is carried unchanged, so
 //!   anything that needs a step-up still does;
 //! - **never where an `assertionMethod` attestation is required.** A step-up
-//!   approval must be signed by the subject's own key, on the Trust Task and
-//!   REST paths alike, and the verifier refuses a delegated approval outright;
+//!   approval must be signed by the subject's own key, on every path, and
+//!   the verifier refuses a delegated approval outright;
 //! - **never to mint or extend a session.** `auth/authenticate` and
 //!   `auth/refresh` refuse a session-key proof (`session_key_may_sign`). A
-//!   refresh is authorised by the refresh token, not by the key. The console's
-//!   REST refresh (`routes::auth::refresh`) does ask for the key's proof, but
-//!   only on top of the refresh token, as proof that the browser presenting
+//!   refresh is authorised by the refresh token, not by the key. A key-bound
+//!   session's refresh does check the key's proof
+//!   (`routes::auth::verify_session_bound_proof`), but only on top of the
+//!   refresh token, as proof that the browser presenting
 //!   the token is the one that logged in: the key alone refreshes nothing.
 //!
 //! A key type this service cannot verify is refused with
@@ -957,11 +958,10 @@ async fn refresh_v2_arm(
             .await
             .map_err(|e| denied(&doc, "refresh/peek", e))?
     {
-        // Carried over from the retired REST `/api/auth/refresh` route,
-        // which was the only refresh path to enforce it: this deployment's
-        // idle-timeout policy, not vti-common's (its `AuthBackend::idle_timeout`
-        // stays `None`, the default). Checked before anything is spent, same
-        // reasoning as the session-key-proof check below.
+        // Enforce this deployment's idle-timeout policy, not vti-common's
+        // (its `AuthBackend::idle_timeout` stays `None`, the default). Checked
+        // before anything is spent, same reasoning as the session-key-proof
+        // check below.
         crate::routes::auth::refuse_if_idle_session(&session, state.config.auth.admin_idle_timeout)
             .map_err(|e| denied(&doc, "refresh/idle", e))?;
 

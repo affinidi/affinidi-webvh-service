@@ -27,15 +27,6 @@ use crate::server::{AppState, CacheChange};
 use did_hosting_common::server::error::AppError;
 use did_hosting_common::server::store::KeyspaceHandle;
 
-/// Run the T20 safety check before any storage write on an inbound
-/// create / publish.
-///
-/// Looks up the caller's `AclEntry` from `state.acl_ks` and delegates
-/// to [`did_hosting_common::server::domain::
-/// assert_did_host_allowed_when_domains_configured`] — which is
-/// permissive when the `domains` keyspace is empty (legacy / test
-/// state) and strict otherwise.
-///
 /// Evict what resolution cached about `mnemonic` (its log, witness file
 /// and record), if this process also serves resolution from the same store
 /// (the unified daemon).
@@ -52,6 +43,15 @@ fn invalidate_cached_content(state: &AppState, mnemonic: &str) {
     }
 }
 
+/// Run the multi-domain safety check before any storage write on an
+/// inbound create / publish.
+///
+/// Looks up the caller's `AclEntry` from `state.acl_ks` and delegates
+/// to [`did_hosting_common::server::domain::
+/// assert_did_host_allowed_when_domains_configured`] — which is
+/// permissive when the `domains` keyspace is empty (legacy / test
+/// state) and strict otherwise.
+///
 /// Pulled out as a helper so `register_did_atomic` and
 /// [`prepare_republish`] can share the call without duplicating the ACL
 /// lookup.
@@ -68,7 +68,7 @@ async fn check_did_host_safety(
     // In unit-test paths that call did_ops directly without seeding
     // the ACL keyspace, the entry is absent; fall back to a synthetic
     // entry with `domains: DomainScope::All` (the role from the JWT
-    // claims). That matches the legacy pre-T20b behaviour where no
+    // claims). That matches the legacy behaviour, before domain scoping, where no
     // domain restriction applied at all — production gates this on
     // the auth path, tests get the legacy permissive shape.
     let acl_entry = match get_acl_entry(&state.acl_ks, &auth.did).await? {
@@ -503,10 +503,10 @@ pub async fn create_did(
         method: "webvh".to_string(),
         // Persist the resolved domain so the per-domain UI filters and
         // the dashboard's per-domain stat cards see the new DID on the
-        // very next list call. Callers that pass `None` (older DIDComm
-        // paths, tests) still produce an empty string and rely on the
-        // M-01 sweep, but the REST `request_uri` handler now always
-        // resolves a concrete value up front.
+        // very next list call. A caller that passes `None` (a
+        // `did/check-name` reservation whose domain could not be resolved,
+        // tests) still produces an empty string, which the first publish
+        // backfills from the DID's host.
         domain: domain.unwrap_or("").to_string(),
 
         // An empty slot — no log, so no document to read services from.
@@ -580,7 +580,7 @@ pub async fn create_did(
 ///
 /// Auth model:
 /// - Slot does not exist → caller becomes owner (same as
-///   `request_uri` for a fresh path).
+///   reserving a fresh path with [`create_did`]).
 /// - Slot exists, caller is current owner → idempotent re-publish.
 ///   Witness is preserved (it's the owner's own).
 /// - Slot exists, caller is admin AND `force == true` AND owner
@@ -696,7 +696,7 @@ pub async fn register_did_atomic(
         AppError::invalid("did_log's latest entry has no resolvable did:webvh state.id")
     })?;
 
-    // T20b: multi-domain safety check. Runs before the legacy
+    // Multi-domain safety check. Runs before the legacy
     // `validate_did_id_matches_request` host equality check. In
     // multi-domain deployments where the embedded DID host is on a
     // configured-but-non-default domain, this is the authoritative
@@ -1059,7 +1059,7 @@ async fn prepare_republish(
     // and holds it through its commit ([`hold_size_quota`]).
     check_total_size_limit(auth, state, record.content_size, new_size).await?;
 
-    // T20b: same safety check as register_did_atomic — the embedded
+    // The same safety check as register_did_atomic — the embedded
     // DID's host must be a configured active domain on this server
     // and allowed by the caller's ACL. This updates an existing slot,
     // but a malicious or buggy client could push a log entry pointing
@@ -1095,8 +1095,8 @@ async fn prepare_republish(
     // publish for records that pre-date the `request_uri` resolver fix
     // (older slots created with the buggy code path that always stored
     // `domain: ""`). Without this the per-domain UI filter would keep
-    // hiding the DID until the M-01 sweep next runs. New DIDs created
-    // through `request_uri` already carry the resolved domain — this
+    // hiding the DID until the M-01 sweep next runs. New DIDs reserved
+    // through `create_did` already carry the resolved domain — this
     // only mutates empty entries, so it's idempotent.
     if record.domain.is_empty()
         && let Some(did_id) = did_id_val.as_deref()
@@ -3083,7 +3083,7 @@ pub const MAX_RESOLVE_DIDS: usize = 64;
 /// So an agent name here is *input convenience*. The binding it creates is to
 /// the DID the name pointed at when the operator pressed the button, and it
 /// stays pointed there. The UI shows the DID's current name by looking it up
-/// (`/api/agent-names/resolve`), so the display stays live without the stored
+/// (the `agent-name/resolve` Trust Task), so the display stays live without the stored
 /// authorization data depending on a mutable label.
 ///
 /// Only names this deployment actually serves resolve — the same gates the
@@ -4111,7 +4111,7 @@ mod tests_atomic {
         assert!(matches!(err, AppError::Validation { message: ref m, .. } if m.contains("host")));
     }
 
-    // ---- T20b: multi-domain safety check ----
+    // ---- multi-domain safety check ----
 
     /// Seed an active domain for tests that exercise the new
     /// multi-domain safety check. Returns the canonical name.
@@ -4392,7 +4392,7 @@ mod tests_atomic {
     }
 
     /// Smoke test: the wire request type round-trips with default `force`
-    /// and the legacy `did_log` field still parses (T26 backwards-compat).
+    /// and the legacy `did_log` field still parses (backwards-compat).
     #[test]
     fn did_register_request_round_trip_defaults_force_false() {
         let raw = r#"{"path":"alpha","did_log":"line"}"#;
@@ -4806,7 +4806,7 @@ mod tests_atomic {
     /// per-domain UI filters / dashboard stats hid the freshly-
     /// created DID until the M-01 backfill sweep next ran. Pinning
     /// the persisted value guards against the next regression in
-    /// `request_uri` / `dispatch_did_op` forgetting to thread the
+    /// `create_did` or its `did/check-name` row forgetting to thread the
     /// resolver output through.
     #[tokio::test]
     async fn create_did_persists_caller_supplied_domain() {
@@ -7076,7 +7076,7 @@ mod tests_atomic {
     // -----------------------------------------------------------------
 
     /// End-to-end registration of a `did:webs` DID through the same
-    /// entry point a REST or DIDComm caller uses.
+    /// entry point every Trust Task transport uses.
     ///
     /// The fixture is the `hyperledger-labs/did-webs-resolver`
     /// reference publication, so what these assert is agreement with

@@ -1,15 +1,14 @@
 //! `m01_tag_did_records_with_domain` — fill `DidRecord.domain` for
 //! every legacy record that's still carrying the empty-string default
-//! from T12.
+//! from before multi-domain hosting.
 //!
-//! Per `tasks/did-hosting-rollout-plan.md` WS-2 / T13 and
-//! `docs/multi-domain-spec.md` §6.5.
+//! Per `docs/archive/multi-domain-spec.md` §6.5.
 //!
 //! ## What gets touched
 //!
 //! Every entry under the `did:{mnemonic}` prefix in `KS_DIDS` whose
 //! `DidRecord.domain` is the empty string. Records with a non-empty
-//! `domain` (T18 seed + new T16-aware writes) are skipped — the
+//! `domain` (seeded, or written by a domain-aware write path) are skipped — the
 //! migration is idempotent and a partial / interrupted run can be
 //! resumed by re-running.
 //!
@@ -18,12 +17,12 @@
 //! Two-tier rule:
 //!
 //! 1. If `did_id` is set on the record, parse it via the webvh
-//!    `DidMethod` (the canonical method for v0.6-vintage records)
+//!    `DidMethod` (the canonical method for records that predate multi-method hosting)
 //!    and use the extracted host. This is the case for every record
 //!    created with the current dispatcher — the host the DID was
 //!    issued under is what we want to retain.
 //! 2. Fall back to the **system default domain** (the
-//!    `meta:default_domain` pointer set by T18's first-boot seed).
+//!    `meta:default_domain` pointer set by the first-boot domain seed).
 //!    Catches edge cases — e.g. a `recreate_did` that hasn't fully
 //!    populated `did_id` yet — and lets the daemon serve them
 //!    rather than reject every subsequent operation.
@@ -46,8 +45,8 @@
 //!
 //! Records whose `did_id` parses to a method **other than** `webvh`
 //! are caught by the same path — the dispatcher routes by method
-//! name, so a v0.6.5 store that happens to contain a `did:web`
-//! record (via the legacy bridge) still gets the right host.
+//! name, so an older store that happens to contain a `did:web`
+//! record still gets the right host.
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};

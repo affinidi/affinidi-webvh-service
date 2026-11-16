@@ -380,7 +380,7 @@ mod tests {
         let token = ts.mint_token(owner, Role::Owner).await;
         assert!(!token.is_empty());
         // The router builds; a full request round-trip is covered by the
-        // agent-name REST suite, which now drives this exact fixture.
+        // agent-name Trust Task tests, which drive this exact fixture.
         let _app = ts.router();
     }
 }

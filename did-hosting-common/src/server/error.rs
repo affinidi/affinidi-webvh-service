@@ -1,3 +1,6 @@
+//! [`AppError`]: the error type every service returns, its HTTP mapping and
+//! the typed validation kinds callers match on.
+
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use tracing::{debug, warn};
@@ -149,11 +152,10 @@ pub enum AppError {
         limiter: &'static str,
     },
 
-    // ---- Trust-Tasks transport errors (REST `Trust-Task:` header) ----
+    // ---- Trust-Tasks `Trust-Task:` header errors ----
     //
-    // Surfaced by `super::trust_task` (router + extractor). The router
-    // enforces exact-match at attach time; the response body for these
-    // variants is structured (`{ "error": "<VariantName>", ... }`) so
+    // From the header-tagged REST binding, which is gone: nothing in this
+    // workspace constructs these variants now. Their response body is structured (`{ "error": "<VariantName>", ... }`) so
     // callers can switch on the discriminant without parsing prose.
     /// `Trust-Task` header was absent on a route that requires it.
     /// Renders to 400 Bad Request with body `{ "error": "TrustTaskMissing" }`.
@@ -178,7 +180,7 @@ pub enum AppError {
     },
 
     /// Resolution attempted against a configured-but-disabled domain.
-    /// Per `docs/multi-domain-spec.md` §3, renders to **503** with the
+    /// Per `docs/archive/multi-domain-spec.md` §3, renders to **503** with the
     /// maintenance-status JSON body `{ "status": "disabled", "domain":
     /// "<name>", "message"?, "eta"? }`. Distinct from `NotFound` —
     /// 404 means "we don't serve this", 503 means "we serve this but
@@ -191,7 +193,7 @@ pub enum AppError {
 
     /// An agent-name operation (`did_ops::set_agent_name` and friends) failed
     /// a name-specific precondition. Carries a typed [`AgentNameError`] so the
-    /// Trust-Task and REST surfaces can map it to a spec error code without
+    /// Trust Task surface can map it to a spec error code without
     /// sniffing message prose — the same discipline `ValidationKind` follows.
     #[error("agent name error: {0}")]
     AgentName(#[from] AgentNameError),
@@ -458,10 +460,8 @@ impl AppError {
     /// Backed by `ValidationKind` tags rather than substring sniffing on
     /// the `Display` message, so a wording change in any
     /// `AppError::invalid("...")` literal doesn't silently re-route
-    /// the protocol code. Both DIDComm dispatchers
-    /// (`messaging::dispatch_did_op` and `routes/didcomm.rs::dispatch`)
-    /// call this so the same error always produces the same wire code
-    /// regardless of transport.
+    /// the protocol code: the same error always produces the same wire
+    /// code.
     ///
     /// The mapping:
     /// - `Unauthorized` / `Forbidden` → `e.p.did.unauthorized`
@@ -626,7 +626,7 @@ impl IntoResponse for AppError {
 
         // Trust-Task variants use a structured body so callers can switch
         // on the discriminant. Match the VTI canonical impl's shape so
-        // the parity harness in T9 can assert byte-equivalent responses.
+        // the two can be compared byte for byte.
         let body = match &self {
             AppError::TrustTaskMissing => serde_json::json!({ "error": "TrustTaskMissing" }),
             AppError::TrustTaskMalformed(received) => serde_json::json!({

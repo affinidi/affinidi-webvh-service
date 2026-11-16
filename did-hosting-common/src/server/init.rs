@@ -1,3 +1,6 @@
+//! Startup helpers: loading the JWT signing keys and waiting for a shutdown
+//! signal.
+
 use std::sync::Arc;
 
 use affinidi_tdk::secrets_resolver::secrets::Secret;

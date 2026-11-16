@@ -1,3 +1,6 @@
+//! `did-hosting-control`: the control plane binary. Parses the CLI and hands
+//! the chosen subcommand to the library ([`did_hosting_control::cli`]).
+
 use clap::Parser;
 use did_hosting_common::server::cli::{Loader, Service, exit_on_error};
 use did_hosting_common::server::store;

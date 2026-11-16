@@ -1,6 +1,6 @@
 //! `did:web` implementation of [`DidMethod`].
 //!
-//! Per `docs/multi-method-hosting-spec.md` §6.1. Second method shipped
+//! Per `docs/archive/multi-method-hosting-spec.md` §6.1. Second method shipped
 //! in this release alongside [`super::webvh`]; both are
 //! default-enabled.
 //!

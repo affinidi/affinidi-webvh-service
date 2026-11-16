@@ -1,3 +1,6 @@
+//! Sessions: the stored session record, its lifecycle (challenge, active,
+//! refresh, idle and absolute expiry) and cleanup.
+
 use uuid::Uuid;
 
 use crate::server::acl::Role;

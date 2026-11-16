@@ -1,10 +1,10 @@
-//! Server-local domain assignment cache (T28 + T29 staging).
+//! Server-local domain assignment cache.
 //!
 //! Each running server keeps a local record of which domains it is
 //! currently authoritative for. The list is populated by inbound
 //! `replica/domain/assign` / `replica/domain/unassign` Trust Tasks from the
-//! control plane (T28) and read on cold start before the control
-//! plane is reachable (T29's fallback chain).
+//! control plane and read on cold start before the control
+//! plane is reachable (the [`super::assignment_seed`] fallback chain).
 //!
 //! ## Storage shape
 //!
@@ -202,7 +202,7 @@ pub async fn get(store: &Store, domain: &str) -> Result<Option<AssignmentEntry>,
 }
 
 /// List every assignment held by this server. Read on cold-start by
-/// T29's fallback chain.
+/// the [`super::assignment_seed`] fallback chain.
 pub async fn list(store: &Store) -> Result<Vec<AssignmentEntry>, AppError> {
     let ks = store.keyspace(KS_ASSIGNMENTS)?;
     let raw = ks.prefix_iter_raw(b"assignments:".to_vec()).await?;

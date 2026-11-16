@@ -1,14 +1,16 @@
-//! T5-lite: tenant DID provisioning succeeds against a self-managed-style
+//! Tenant DID provisioning succeeds against a self-managed-style
 //! `AppConfig` (empty `[vta]`, no parent VTA bootstrapping the daemon).
 //!
-//! This test exercises the same `did_ops::create_did` + `did_ops::register_did_atomic`
-//! code path the `did/create` and `did/register` Trust Tasks dispatch into. It bypasses the mediator wire
-//! transport — that path is identical between VTA and self-managed modes per
-//! the runtime audit (see `tasks/runtime-audit-T3.md`) and is not the risk
+//! This test exercises the same `did_ops::create_did` +
+//! `did_ops::register_did_atomic` code path the `did/check-name` (reserve)
+//! and `did/register` Trust Tasks dispatch into. It bypasses the mediator
+//! wire transport — that path is identical between VTA and self-managed
+//! modes per the runtime audit (see
+//! `docs/archive/tasks/runtime-audit-T3.md`) and is not the risk
 //! self-managed mode introduces. The risk this test addresses: a hidden
 //! VTA-config dependency in the tenant-provisioning code.
 //!
-//! See `docs/self-managed-mode-spec.md` § success criteria #4.
+//! See `docs/archive/self-managed-mode-spec.md` § success criteria #4.
 use std::path::PathBuf;
 
 use affinidi_tdk::secrets_resolver::secrets::Secret;

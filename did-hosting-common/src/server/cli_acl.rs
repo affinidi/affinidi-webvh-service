@@ -1,3 +1,6 @@
+//! The `acl` CLI subcommands every service shares: list, add, update and
+//! remove ACL entries directly in the store.
+
 use std::str::FromStr;
 
 use super::acl::{
