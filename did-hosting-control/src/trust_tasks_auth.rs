@@ -633,7 +633,7 @@ pub(crate) async fn store_auth_proxy_meta(
     session_id: &str,
     actor: Option<String>,
     absolute_expires_at: u64,
-) -> Result<(), crate::error::AppError> {
+) -> Result<(), did_hosting_common::server::error::AppError> {
     state
         .sessions_ks
         .insert(
@@ -650,7 +650,7 @@ pub(crate) async fn store_auth_proxy_meta(
 async fn get_auth_proxy_meta(
     state: &AppState,
     session_id: &str,
-) -> Result<Option<AuthProxyMeta>, crate::error::AppError> {
+) -> Result<Option<AuthProxyMeta>, did_hosting_common::server::error::AppError> {
     state.sessions_ks.get(auth_proxy_meta_key(session_id)).await
 }
 
@@ -664,7 +664,7 @@ async fn get_auth_proxy_meta(
 pub(crate) async fn delete_auth_proxy_meta(
     state: &AppState,
     session_id: &str,
-) -> Result<(), crate::error::AppError> {
+) -> Result<(), did_hosting_common::server::error::AppError> {
     state
         .sessions_ks
         .remove(auth_proxy_meta_key(session_id))
@@ -680,7 +680,10 @@ pub(crate) async fn settle_subject_sessions(
     state: &AppState,
     subject: &str,
     fate: impl Fn(&did_hosting_common::server::auth::session::Session) -> SessionFate,
-) -> Result<did_hosting_common::server::auth::session::SettledSessions, crate::error::AppError> {
+) -> Result<
+    did_hosting_common::server::auth::session::SettledSessions,
+    did_hosting_common::server::error::AppError,
+> {
     let settled = did_hosting_common::server::auth::session::settle_subject_sessions(
         &state.sessions_ks,
         subject,
@@ -860,8 +863,8 @@ async fn bound_session_to_mandate(
     session_id: &str,
     mandate_end: u64,
     value: &mut Value,
-) -> Result<(), crate::error::AppError> {
-    use crate::error::AppError;
+) -> Result<(), did_hosting_common::server::error::AppError> {
+    use did_hosting_common::server::error::AppError;
     let now = now_epoch();
     let left = mandate_end.saturating_sub(now).max(1);
     let mut session = get_session(&state.sessions_ks, session_id)

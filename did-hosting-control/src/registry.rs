@@ -5,8 +5,8 @@ use did_hosting_common::server::didcomm_profile::{ObservedTransport, resolve_ser
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use crate::error::AppError;
-use crate::store::KeyspaceHandle;
+use did_hosting_common::server::error::AppError;
+use did_hosting_common::server::store::KeyspaceHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -105,21 +105,6 @@ pub struct ServiceInstance {
     /// `advertised_services` means we have never had a successful resolve.
     #[serde(default)]
     pub services_checked_at: Option<u64>,
-
-    /// Whether this instance understands infrastructure **trust tasks**
-    /// (`.../server/health/0.1` and friends) as opposed to only the legacy
-    /// `MSG_*` DIDComm messages.
-    ///
-    /// Self-asserted by the server in its registration body. `false` for every
-    /// pre-existing record and for any server that doesn't send the flag, which
-    /// is exactly the older fleet — so the control plane keeps pinging them the
-    /// legacy way and a rolling upgrade never drops a node to `Unreachable`.
-    ///
-    /// When `true`, the health loop sends the ping as a trust task and lets
-    /// `send_trust_task` choose TSP or DIDComm from the server's DID document.
-    /// That is the only path by which a TSP-only server is reachable at all.
-    #[serde(default)]
-    pub trust_task_capable: bool,
 
     /// When `true`, the control plane may coalesce bulk DID sync updates into
     /// `MSG_SYNC_BATCH` messages for this server instead of one frame per DID —
@@ -339,17 +324,6 @@ pub async fn list_instances(
         }
     }
     Ok(instances)
-}
-
-pub async fn list_instances_by_type(
-    registry_ks: &KeyspaceHandle,
-    service_type: &ServiceType,
-) -> Result<Vec<ServiceInstance>, AppError> {
-    let all = list_instances(registry_ks).await?;
-    Ok(all
-        .into_iter()
-        .filter(|i| &i.service_type == service_type)
-        .collect())
 }
 
 impl ServiceInstance {
@@ -661,7 +635,6 @@ mod tests {
             protocol_version: "1.1".into(),
             advertised_services: Some(vec!["WebVHHosting".into(), "TSPTransport".into()]),
             services_checked_at: Some(1234),
-            trust_task_capable: true,
             sync_batch_capable: true,
             last_inbound_transport: Some(ObservedTransport::Tsp),
             last_inbound_at: Some(1111),

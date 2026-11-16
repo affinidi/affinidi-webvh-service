@@ -2950,7 +2950,6 @@ async fn advertised_services_are_reported_and_unknown_is_omitted() {
         protocol_version: "1.0".into(),
         advertised_services: Some(vec!["WebVHHosting".into(), "TSPTransport".into()]),
         services_checked_at: Some(1_700_000_000),
-        trust_task_capable: false,
         sync_batch_capable: false,
         last_inbound_transport: None,
         last_inbound_at: None,

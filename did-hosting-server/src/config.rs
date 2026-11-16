@@ -1,3 +1,6 @@
+//! The edge's `config.toml`: [`AppConfig`] and its replication, limits and
+//! stats sections, loaded from file with environment overrides.
+
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -136,12 +139,15 @@ pub struct LimitsConfig {
     /// Maximum body size (bytes) for did.jsonl / witness uploads. Default: 100KB.
     #[serde(default = "default_upload_body_limit")]
     pub upload_body_limit: usize,
-    /// Default per-account total DID document size (bytes). Default: 1MB.
-    #[serde(default = "default_max_total_size")]
-    pub default_max_total_size: u64,
-    /// Default per-account maximum number of DIDs. Default: 20.
-    #[serde(default = "default_max_did_count")]
-    pub default_max_did_count: u64,
+    /// **Deprecated, read by nothing.** Per-account quotas are enforced by the
+    /// control plane (its ACL entries and `[limits]`), never by an edge.
+    /// Still accepted so an existing config loads; a warning names it at
+    /// startup (see [`AppConfig::ignored_settings`]). Never written back.
+    #[serde(default, skip_serializing)]
+    pub default_max_total_size: Option<u64>,
+    /// **Deprecated, read by nothing**, like `default_max_total_size`.
+    #[serde(default, skip_serializing)]
+    pub default_max_did_count: Option<u64>,
     /// The most bytes of DID content the resolution cache holds. Default:
     /// 256 MiB. Past it, the oldest entries are dropped.
     #[serde(default = "default_content_cache_bytes")]
@@ -170,20 +176,12 @@ fn default_upload_body_limit() -> usize {
     102_400
 }
 
-fn default_max_total_size() -> u64 {
-    1_048_576
-}
-
-fn default_max_did_count() -> u64 {
-    20
-}
-
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             upload_body_limit: default_upload_body_limit(),
-            default_max_total_size: default_max_total_size(),
-            default_max_did_count: default_max_did_count(),
+            default_max_total_size: None,
+            default_max_did_count: None,
             content_cache_bytes: default_content_cache_bytes(),
             http_worker_threads: None,
         }
@@ -220,7 +218,53 @@ impl Default for StatsConfig {
     }
 }
 
+/// Environment overrides an edge used to read into settings nothing uses.
+const IGNORED_ENV: &[&str] = &[
+    "DID_HOSTING_LIMITS_DEFAULT_MAX_TOTAL_SIZE",
+    "DID_HOSTING_LIMITS_DEFAULT_MAX_DID_COUNT",
+];
+
 impl AppConfig {
+    /// Settings this config sets that an edge accepts but never reads — the
+    /// shared `[features]` / `[auth]` sections carry control-plane keys, and
+    /// `[limits]` used to carry per-account quotas. Each is deprecated: still
+    /// accepted so an existing config loads, named here so startup can warn,
+    /// to be refused in a later release.
+    ///
+    /// A key is reported only when it differs from its default, so a config
+    /// the setup wizard wrote (which serialises every `[auth]` default) is
+    /// quiet.
+    pub fn ignored_settings(&self) -> Vec<String> {
+        let mut ignored = Vec::new();
+        if self.features.http_listener {
+            // An edge always binds its HTTP listener.
+            ignored.push("features.http_listener".to_string());
+        }
+        if self.limits.default_max_total_size.is_some() {
+            ignored.push("limits.default_max_total_size".to_string());
+        }
+        if self.limits.default_max_did_count.is_some() {
+            ignored.push("limits.default_max_did_count".to_string());
+        }
+        // `[auth]`: an edge reads `cleanup_ttl_minutes` alone.
+        if let (Ok(serde_json::Value::Object(set)), Ok(serde_json::Value::Object(default))) = (
+            serde_json::to_value(&self.auth),
+            serde_json::to_value(AuthConfig::default()),
+        ) {
+            for (key, value) in &set {
+                if key != "cleanup_ttl_minutes" && default.get(key) != Some(value) {
+                    ignored.push(format!("auth.{key}"));
+                }
+            }
+        }
+        for name in IGNORED_ENV {
+            if std::env::var_os(name).is_some() {
+                ignored.push((*name).to_string());
+            }
+        }
+        ignored
+    }
+
     /// Return the public-facing base URL for this server.
     pub fn public_base_url(&self) -> String {
         self.public_url
@@ -317,14 +361,6 @@ impl AppConfig {
             "DID_HOSTING_LIMITS_UPLOAD_BODY_LIMIT",
             config.limits.upload_body_limit
         );
-        env_parse!(
-            "DID_HOSTING_LIMITS_DEFAULT_MAX_TOTAL_SIZE",
-            config.limits.default_max_total_size
-        );
-        env_parse!(
-            "DID_HOSTING_LIMITS_DEFAULT_MAX_DID_COUNT",
-            config.limits.default_max_did_count
-        );
 
         // Stats
         env_parse!(
@@ -389,6 +425,45 @@ impl AppConfig {
 #[allow(unsafe_code)]
 mod tests {
     use super::*;
+
+    /// The settings an edge accepts but never reads still load, are named by
+    /// `ignored_settings`, and are not written back; a default config names
+    /// none.
+    #[test]
+    fn ignored_edge_settings_load_and_are_named() {
+        let quiet: AppConfig = toml::from_str("").unwrap();
+        assert!(
+            quiet.ignored_settings().is_empty(),
+            "{:?}",
+            quiet.ignored_settings()
+        );
+        // What the wizard writes (every `[auth]` default) is quiet too.
+        let rewritten: AppConfig =
+            toml::from_str(&toml::to_string_pretty(&quiet).unwrap()).unwrap();
+        assert!(rewritten.ignored_settings().is_empty());
+
+        let noisy: AppConfig = toml::from_str(
+            "[features]\nhttp_listener = true\n\
+             [auth]\ncleanup_ttl_minutes = 5\nchallenge_ttl = 7\n\
+             [limits]\ndefault_max_total_size = 10\ndefault_max_did_count = 2\n",
+        )
+        .expect("deprecated keys still load");
+        let named = noisy.ignored_settings();
+        for key in [
+            "features.http_listener",
+            "auth.challenge_ttl",
+            "limits.default_max_total_size",
+            "limits.default_max_did_count",
+        ] {
+            assert!(named.iter().any(|n| n == key), "{key} not in {named:?}");
+        }
+        assert!(
+            !named.iter().any(|n| n == "auth.cleanup_ttl_minutes"),
+            "the edge reads cleanup_ttl_minutes"
+        );
+        let written = toml::to_string_pretty(&noisy).unwrap();
+        assert!(!written.contains("default_max_did_count"), "{written}");
+    }
 
     /// What the setup wizard and recipe write (a serialised `AppConfig`)
     /// loads back under the strict parser; a misspelt key does not.

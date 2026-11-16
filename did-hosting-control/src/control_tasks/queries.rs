@@ -11,8 +11,8 @@ use did_hosting_common::server::domain::{self, DomainEntry, DomainScope};
 use did_hosting_common::server::identity::mnemonic_from_did;
 
 use crate::auth::AuthClaims;
-use crate::error::AppError;
 use crate::server::AppState;
+use did_hosting_common::server::error::AppError;
 
 /// Resolve the domain an agent-name probe is scoped to.
 ///
@@ -52,18 +52,30 @@ pub struct TimeSeriesPoint {
 
 /// Query time-series buckets for a given mnemonic and range.
 ///
-/// Reads from the `timeseries_ks` keyspace (split out from
-/// `stats_ks` in v0.7); the rows have shape
-/// `ts:{mnemonic}:{bucket_epoch} -> {r,u}`. The literal `mnemonic`
-/// `_all` is the server-wide aggregate.
+/// The legacy reader, used until the tiered-stats migration has completed
+/// (see [`crate::stats_query`]). Reads from the `timeseries_ks` keyspace; the
+/// rows have shape `ts:{mnemonic}:{bucket_epoch} -> {r,u}`. The literal
+/// `mnemonic` `_all` is the server-wide aggregate.
 pub(crate) async fn query_timeseries(
     timeseries_ks: &did_hosting_common::server::store::KeyspaceHandle,
     mnemonic: &str,
     range: &str,
 ) -> Result<Vec<TimeSeriesPoint>, AppError> {
-    use serde::Deserialize;
+    legacy_series(timeseries_ks, &[mnemonic], range).await
+}
 
-    #[derive(Deserialize, Default)]
+/// The `ts:` bucket width the legacy rows were written at.
+const LEGACY_BUCKET_SECS: u64 = 300;
+
+/// Sum the legacy `ts:` buckets of every mnemonic in `mnemonics` over
+/// `range` (`1h`, `7d`, `30d`, anything else 24 hours) into display points
+/// of the range's step width.
+async fn legacy_series(
+    timeseries_ks: &did_hosting_common::server::store::KeyspaceHandle,
+    mnemonics: &[&str],
+    range: &str,
+) -> Result<Vec<TimeSeriesPoint>, AppError> {
+    #[derive(serde::Deserialize, Default)]
     struct BucketData {
         r: u64,
         u: u64,
@@ -73,59 +85,58 @@ pub(crate) async fn query_timeseries(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-
     let (duration, step) = match range {
-        "1h" => (3600u64, 300u64),
+        "1h" => (3600u64, LEGACY_BUCKET_SECS),
         "7d" => (7 * 24 * 3600, 3600),
         "30d" => (30 * 24 * 3600, 14400),
         _ => (24 * 3600, 900), // default 24h
     };
-
     let cutoff = now.saturating_sub(duration);
-    let start = cutoff / 300 * 300; // align to 5-min bucket
-    let end = now / 300 * 300;
+    let start = cutoff / LEGACY_BUCKET_SECS * LEGACY_BUCKET_SECS;
+    let end = now / LEGACY_BUCKET_SECS * LEGACY_BUCKET_SECS;
 
-    let prefix = format!("ts:{mnemonic}:");
-    let raw = timeseries_ks.prefix_iter_raw(prefix.as_str()).await?;
-
-    // Collect raw buckets within range
-    let prefix_len = prefix.len();
+    // Raw buckets within range, summed across the mnemonics.
     let mut bucket_map: std::collections::HashMap<u64, (u64, u64)> =
         std::collections::HashMap::new();
-    for (key, value) in &raw {
-        let key_str = std::str::from_utf8(key).unwrap_or_default();
-        if let Some(epoch_str) = key_str.get(prefix_len..)
-            && let Ok(epoch) = epoch_str.parse::<u64>()
-            && epoch >= cutoff
-            && let Ok(data) = serde_json::from_slice::<BucketData>(value)
-        {
-            let entry = bucket_map.entry(epoch).or_insert((0, 0));
-            entry.0 += data.r;
-            entry.1 += data.u;
+    for mnemonic in mnemonics {
+        let prefix = format!("ts:{mnemonic}:");
+        let raw = timeseries_ks.prefix_iter_raw(prefix.as_str()).await?;
+        let prefix_len = prefix.len();
+        for (key, value) in &raw {
+            let key_str = std::str::from_utf8(key).unwrap_or_default();
+            if let Some(epoch_str) = key_str.get(prefix_len..)
+                && let Ok(epoch) = epoch_str.parse::<u64>()
+                && epoch >= cutoff
+                && let Ok(data) = serde_json::from_slice::<BucketData>(value)
+            {
+                let entry = bucket_map.entry(epoch).or_insert((0, 0));
+                entry.0 += data.r;
+                entry.1 += data.u;
+            }
         }
     }
 
-    // Build aggregated display points
+    // Aggregate the buckets into display points of `step` width.
     let mut points = Vec::new();
     let mut ts = start;
     while ts <= end {
         let mut resolves = 0u64;
         let mut updates = 0u64;
-        // Aggregate all 5-min buckets within this step
         let mut bucket_ts = ts;
-        while bucket_ts < ts + step && bucket_ts <= end {
+        let window_end = ts.saturating_add(step);
+        while bucket_ts < window_end && bucket_ts <= end {
             if let Some(&(r, u)) = bucket_map.get(&bucket_ts) {
                 resolves += r;
                 updates += u;
             }
-            bucket_ts += 300;
+            bucket_ts = bucket_ts.saturating_add(LEGACY_BUCKET_SECS);
         }
         points.push(TimeSeriesPoint {
             timestamp: ts,
             resolves,
             updates,
         });
-        ts += step;
+        ts = ts.saturating_add(step);
     }
 
     Ok(points)
@@ -157,89 +168,21 @@ pub(crate) async fn domain_mnemonics(
     Ok(mnemonics)
 }
 
-/// Read-time per-domain timeseries aggregation.
+/// Read-time per-domain timeseries aggregation (the legacy reader).
 ///
-/// Walks the `dids` keyspace, selects every record whose `domain`
-/// matches (with a fallback to the host segment of `did_id` for slots
-/// that haven't been backfilled yet), reads each mnemonic's per-DID
-/// buckets, and sums them at the same step granularity as
-/// `query_timeseries`. Cost is O(N_dids_in_domain × buckets_in_range);
-/// the dashboard chart is not the hot path.
+/// Reads the domain's mnemonics from the domain index, then sums each one's
+/// per-DID `ts:` buckets at the same step granularity as
+/// [`query_timeseries`]. Cost is O(N_dids_in_domain × buckets_in_range); the
+/// dashboard chart is not the hot path. A domain with no DIDs yields the
+/// all-zeros series the chart already renders cleanly.
 pub(crate) async fn query_timeseries_by_domain(
     state: &AppState,
     domain: &str,
     range: &str,
 ) -> Result<Vec<TimeSeriesPoint>, AppError> {
     let mnemonics = domain_mnemonics(state, domain).await?;
-
-    // Fan out per-mnemonic reads and merge the bucket maps. We could in
-    // theory short-circuit when the domain has zero DIDs, but the
-    // empty-result path below produces the same all-zeros series the chart
-    // already renders cleanly, so don't bother special-casing.
-    use std::collections::HashMap;
-
-    #[derive(serde::Deserialize, Default)]
-    struct BucketData {
-        r: u64,
-        u: u64,
-    }
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let (duration, step) = match range {
-        "1h" => (3600u64, 300u64),
-        "7d" => (7 * 24 * 3600, 3600),
-        "30d" => (30 * 24 * 3600, 14400),
-        _ => (24 * 3600, 900),
-    };
-    let cutoff = now.saturating_sub(duration);
-    let start = cutoff / 300 * 300;
-    let end = now / 300 * 300;
-
-    let mut bucket_map: HashMap<u64, (u64, u64)> = HashMap::new();
-    for mnemonic in &mnemonics {
-        let prefix = format!("ts:{mnemonic}:");
-        let raw = state.timeseries_ks.prefix_iter_raw(prefix.as_str()).await?;
-        let prefix_len = prefix.len();
-        for (key, value) in &raw {
-            let key_str = std::str::from_utf8(key).unwrap_or_default();
-            if let Some(epoch_str) = key_str.get(prefix_len..)
-                && let Ok(epoch) = epoch_str.parse::<u64>()
-                && epoch >= cutoff
-                && let Ok(data) = serde_json::from_slice::<BucketData>(value)
-            {
-                let entry = bucket_map.entry(epoch).or_insert((0, 0));
-                entry.0 += data.r;
-                entry.1 += data.u;
-            }
-        }
-    }
-
-    let mut points = Vec::new();
-    let mut ts = start;
-    while ts <= end {
-        let mut resolves = 0u64;
-        let mut updates = 0u64;
-        let mut bucket_ts = ts;
-        let bucket_window_end = ts.saturating_add(step);
-        while bucket_ts < bucket_window_end && bucket_ts <= end {
-            if let Some(&(r, u)) = bucket_map.get(&bucket_ts) {
-                resolves += r;
-                updates += u;
-            }
-            bucket_ts = bucket_ts.saturating_add(300);
-        }
-        points.push(TimeSeriesPoint {
-            timestamp: ts,
-            resolves,
-            updates,
-        });
-        ts = ts.saturating_add(step);
-    }
-
-    Ok(points)
+    let mnemonics: Vec<&str> = mnemonics.iter().map(String::as_str).collect();
+    legacy_series(&state.timeseries_ks, &mnemonics, range).await
 }
 
 /// Resolve what the control plane's own DID document advertises.
@@ -296,7 +239,8 @@ pub(crate) async fn fetch_me_domains_for_caller(
     // with the auth-extractor's gating elsewhere.)
     let role_overrides_scope = matches!(
         auth.role,
-        crate::acl::Role::Admin | crate::acl::Role::Service
+        did_hosting_common::server::acl::Role::Admin
+            | did_hosting_common::server::acl::Role::Service
     );
 
     let mut domains: Vec<DomainEntry> = if role_overrides_scope {

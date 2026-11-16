@@ -9,13 +9,11 @@
 //! shapes consumers should rely on (request/response types, DID shapes,
 //! auth primitives) live in `did-hosting-common`.
 
-pub mod acl;
 pub mod auth;
 pub mod cli;
 pub mod config;
 pub(crate) mod control_tasks;
 pub mod did_ops;
-pub mod error;
 #[cfg(feature = "ui")]
 pub mod frontend;
 pub mod geoip;
@@ -24,12 +22,10 @@ pub mod identity_rotation;
 pub mod messaging;
 pub mod oob;
 pub mod outbox;
-pub mod path_locks;
 pub mod pending_challenges;
 pub mod purge_sweep;
 pub mod rate_limit;
 pub mod registry;
-pub mod replay;
 #[cfg(test)]
 mod replication_e2e;
 pub mod routes;
@@ -45,7 +41,6 @@ pub mod stats_cli;
 pub mod stats_flush;
 pub mod stats_migration;
 pub mod stats_query;
-pub mod store;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod trust_tasks_auth;

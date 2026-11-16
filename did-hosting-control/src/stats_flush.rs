@@ -31,8 +31,8 @@ use tokio::sync::watch;
 use tracing::{debug, error, warn};
 
 use crate::config::STATS_FLUSH_INTERVAL;
-use crate::error::AppError;
-use crate::store::KeyspaceHandle;
+use did_hosting_common::server::error::AppError;
+use did_hosting_common::server::store::KeyspaceHandle;
 
 /// Rows a flush writes at once. The rows are independent keys, so writing
 /// several together takes the same store capacity in a fraction of the

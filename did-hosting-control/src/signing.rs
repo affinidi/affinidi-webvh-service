@@ -29,8 +29,8 @@ use affinidi_tdk::secrets_resolver::secrets::Secret;
 use serde_json::Value;
 use trust_tasks_proof::affinidi::{CryptoSuite, SignOptions, sign_trust_task};
 
-use crate::error::AppError;
 use crate::server::AppState;
+use did_hosting_common::server::error::AppError;
 
 /// Load the control DID's operational (`authentication`) key as a signing [`Secret`].
 ///

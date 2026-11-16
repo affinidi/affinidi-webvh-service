@@ -1,3 +1,7 @@
+//! The daemon's `config.toml` ([`DaemonConfig`]): which services to enable,
+//! and the per-service configs derived from it for the embedded server,
+//! control plane, witness and watcher.
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

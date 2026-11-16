@@ -1,3 +1,6 @@
+//! `did-hosting-server` binary: parses the CLI ([`did_hosting_server::cli`])
+//! and runs the edge or one of its admin subcommands.
+
 use clap::Parser;
 use did_hosting_common::server::cli::{Loader, Service, exit_on_error};
 use did_hosting_server::cli::{Cli, Command};
@@ -109,6 +112,12 @@ async fn run_server(config_path: Option<PathBuf>) {
     };
 
     did_hosting_common::server::config::init_tracing(&config.log);
+    for setting in config.ignored_settings() {
+        tracing::warn!(
+            setting = %setting,
+            "deprecated: did-hosting-server reads nothing from this setting; remove it (a later release will refuse it)"
+        );
+    }
 
     // Load secrets from the configured backend
     let secret_store = match secret_store::create_secret_store(&config) {

@@ -94,8 +94,8 @@ use did_hosting_common::server::auth::session::{Session, SessionState, now_epoch
 use did_hosting_common::server::config::AuthConfig;
 use tracing::{info, warn};
 
-use crate::error::{AppError, LIMITER_PENDING_CHALLENGES_PER_DID};
-use crate::store::KeyspaceHandle;
+use did_hosting_common::server::error::{AppError, LIMITER_PENDING_CHALLENGES_PER_DID};
+use did_hosting_common::server::store::KeyspaceHandle;
 
 /// The `limiter` a refusal on the global cap names in its 429 body. The
 /// per-DID refusal shares [`LIMITER_PENDING_CHALLENGES_PER_DID`] with the

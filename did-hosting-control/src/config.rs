@@ -1,4 +1,4 @@
-use crate::error::AppError;
+use did_hosting_common::server::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

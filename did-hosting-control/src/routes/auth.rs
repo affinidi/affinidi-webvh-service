@@ -15,8 +15,8 @@ use tracing::warn;
 
 use did_hosting_common::{ChallengeRequest, ChallengeResponse};
 
-use crate::error::AppError;
 use crate::server::AppState;
+use did_hosting_common::server::error::AppError;
 
 /// Default maximum concurrent pending challenges per DID. Combined with the
 /// global cap on the `pending_challenges` tracker on `AppState`, this

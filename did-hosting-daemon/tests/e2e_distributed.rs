@@ -254,7 +254,6 @@ impl Topology {
                 protocol_version: "1.0".into(),
                 advertised_services: None,
                 services_checked_at: None,
-                trust_task_capable: true,
                 sync_batch_capable: false,
                 last_inbound_transport: None,
                 last_inbound_at: None,

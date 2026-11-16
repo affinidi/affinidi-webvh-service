@@ -764,12 +764,9 @@ fn secrets_for(generation: &IdentityGeneration, secrets: &ServerSecrets) -> Vec<
 /// Load the service's own identity: resolve its DID, reconcile against the
 /// persisted generations, and seed the resolvers.
 ///
-/// Replaces `init::init_didcomm_auth`, which seeded the secrets resolver under
-/// hardcoded `#key-0` / `#key-1` kids while the listener keyed its profile on
-/// the *resolved* verification-method ids. Those agree only for a DID whose
-/// document happens to use those fragments; for any other, the REST DIDComm
-/// auth path and the listener disagreed. Here there is one source of truth for
-/// kids — the document — and both are seeded from it.
+/// The secret kids are the *resolved* verification-method ids, never
+/// hard-coded fragments: the document is the one source of truth for kids, so
+/// the secrets resolver and the listener's profile always agree.
 ///
 /// Returns `None` when the service has no DID configured, or when the DID
 /// resolver cannot be constructed. Both leave DIDComm disabled, as before.

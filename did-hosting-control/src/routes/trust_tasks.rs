@@ -39,8 +39,8 @@ use uuid::Uuid;
 use did_hosting_common::server::trust_tasks::DispatchOutcome;
 
 use crate::auth::AuthClaims;
-use crate::error::AppError;
 use crate::server::AppState;
+use did_hosting_common::server::error::AppError;
 
 /// The mounted `POST /api/trust-tasks` route: reads the body, at most
 /// [`crate::routes::trust_tasks_body_limit_bytes`] and within

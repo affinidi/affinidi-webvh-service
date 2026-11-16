@@ -15,8 +15,8 @@ use did_hosting_common::server::stats_tiers::{
 };
 
 use crate::control_tasks::queries::TimeSeriesPoint;
-use crate::error::AppError;
-use crate::store::KeyspaceHandle;
+use did_hosting_common::server::error::AppError;
+use did_hosting_common::server::store::KeyspaceHandle;
 
 /// A chart window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,7 +264,7 @@ mod tests {
     use did_hosting_common::server::stats_tiers::SeriesKind;
 
     use super::*;
-    use crate::store::Store;
+    use did_hosting_common::server::store::Store;
 
     async fn keyspaces() -> (tempfile::TempDir, KeyspaceHandle, KeyspaceHandle) {
         let dir = tempfile::tempdir().expect("tempdir");

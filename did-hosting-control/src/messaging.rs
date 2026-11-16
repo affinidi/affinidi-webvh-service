@@ -20,9 +20,9 @@ use did_hosting_common::server::trust_tasks::ProofRule;
 use serde_json::{Value, json};
 use tracing::{debug, error, info, warn};
 
-use crate::acl::check_acl;
 use crate::server::AppState;
 use crate::server_push;
+use did_hosting_common::server::acl::check_acl;
 
 // ---------------------------------------------------------------------------
 // Inbound router (framework-managed)
@@ -542,12 +542,12 @@ pub(crate) async fn do_domain_ack(state: &AppState, signer: &str, type_uri: &str
     );
 
     match check_acl(&state.acl_ks, signer).await {
-        Ok(crate::acl::Role::Service) => {}
+        Ok(did_hosting_common::server::acl::Role::Service) => {}
         Ok(other) => {
             warn!(did = signer, role = %other, domain, op, "domain ack rejected: Service role required");
             return;
         }
-        Err(e) if crate::acl::is_acl_refusal(&e) => {
+        Err(e) if did_hosting_common::server::acl::is_acl_refusal(&e) => {
             warn!(
                 did = signer,
                 domain, op, "domain ack rejected: DID not in ACL"
@@ -653,7 +653,7 @@ impl InfraRejection {
     /// The sender's role could not be read (a throttled store, say). That is
     /// no answer about the sender, so it is not refused as unauthorised: it
     /// is told to retry, or that the failure was ours.
-    fn lookup_failed(e: &crate::error::AppError) -> Self {
+    fn lookup_failed(e: &did_hosting_common::server::error::AppError) -> Self {
         Self::Failed(Box::new(e.failure_reject_reason()))
     }
 
@@ -704,10 +704,13 @@ impl std::fmt::Display for InfraRejection {
 /// The sender's role, for the edge-facing tasks that require Service:
 /// `Ok(true)` for Service, `Ok(false)` for any other answer from the ACL,
 /// `Err` when the ACL could not be read.
-async fn is_service(state: &AppState, signer: &str) -> Result<bool, crate::error::AppError> {
+async fn is_service(
+    state: &AppState,
+    signer: &str,
+) -> Result<bool, did_hosting_common::server::error::AppError> {
     match check_acl(&state.acl_ks, signer).await {
-        Ok(role) => Ok(role == crate::acl::Role::Service),
-        Err(e) if crate::acl::is_acl_refusal(&e) => Ok(false),
+        Ok(role) => Ok(role == did_hosting_common::server::acl::Role::Service),
+        Err(e) if did_hosting_common::server::acl::is_acl_refusal(&e) => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -731,8 +734,8 @@ pub(crate) async fn do_server_register(
     did_hosting_common::tasks::did_management::server::register::v0_2::Response,
     InfraRejection,
 > {
-    use crate::acl::check_acl;
     use crate::registry::{self, ServiceInstance, ServiceStatus, ServiceType};
+    use did_hosting_common::server::acl::check_acl;
 
     // Require pre-approved ACL entry with the Service role — matches REST
     // `/api/control/register-service` which is gated on ServiceAuth. An
@@ -742,7 +745,9 @@ pub(crate) async fn do_server_register(
     // active-server registry so future `notify_servers_did` updates also
     // reach them.
     let role = match check_acl(&state.acl_ks, signer).await {
-        Ok(crate::acl::Role::Service) => crate::acl::Role::Service,
+        Ok(did_hosting_common::server::acl::Role::Service) => {
+            did_hosting_common::server::acl::Role::Service
+        }
         Ok(other) => {
             warn!(
                 did = signer,
@@ -753,7 +758,7 @@ pub(crate) async fn do_server_register(
                 "service role required to register as a server",
             ));
         }
-        Err(e) if !crate::acl::is_acl_refusal(&e) => {
+        Err(e) if !did_hosting_common::server::acl::is_acl_refusal(&e) => {
             warn!(did = signer, error = %e, "server registration deferred: ACL lookup failed");
             return Err(InfraRejection::lookup_failed(&e));
         }
@@ -912,14 +917,6 @@ pub(crate) async fn do_server_register(
         .as_ref()
         .map_or_else(|| "1.0".to_string(), |v| v.to_string());
 
-    // Self-asserted: only a server that ships the trust-task dispatcher sends
-    // this. Absent (older fleet) → false → the health loop keeps sending the
-    // legacy `MSG_HEALTH_PING`, so upgrading the control plane first never
-    // strands a server as Unreachable.
-    let trust_task_capable = hints
-        .get("trust_task_capable")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
     let sync_batch_capable = hints
         .get("sync_batch")
         .and_then(|v| v.as_bool())
@@ -948,7 +945,6 @@ pub(crate) async fn do_server_register(
             .as_ref()
             .and_then(|p| p.advertised_services.clone()),
         services_checked_at: previous.as_ref().and_then(|p| p.services_checked_at),
-        trust_task_capable,
         sync_batch_capable,
         // `register_instance` overwrites the whole record, so the observed-link
         // history has to survive a re-register exactly as the badge cache does.
@@ -1931,7 +1927,7 @@ async fn route_trust_task_doc(
             .filter(|other| !std::ptr::eq(*other, cache))
             .any(|other| other.contains(&principal, &doc.id, doc.issued_at));
         let refusal = if replayed {
-            Some(crate::replay::ReplayError::Duplicate.reject_reason())
+            Some(did_hosting_common::server::replay::ReplayError::Duplicate.reject_reason())
         } else if std::ptr::eq(cache, &state.unlisted_signers.sign_in)
             && let Err(reason) = state.unlisted_signers.charge_sign_in(match https {
                 Some(h) => h.ip.map_or_else(
@@ -2041,7 +2037,7 @@ async fn route_trust_task_doc(
             && crate::control_tasks::session_needs_step_up(bearer, &principal)
             && matches!(
                 did_hosting_common::server::acl::check_acl(&state.acl_ks, &principal).await,
-                Ok(crate::acl::Role::Admin)
+                Ok(did_hosting_common::server::acl::Role::Admin)
             )
         {
             return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
@@ -2051,7 +2047,8 @@ async fn route_trust_task_doc(
                         trust_tasks_rs::StandardCode::PermissionDenied,
                     )
                     .with_message(
-                        crate::error::AppError::StepUpRequired(String::new()).user_message(),
+                        did_hosting_common::server::error::AppError::StepUpRequired(String::new())
+                            .user_message(),
                     ),
                 ),
             ))));
@@ -2177,8 +2174,11 @@ fn raises_to_privileged_role(doc: &trust_tasks_rs::TrustTask<Value>) -> bool {
     };
     matches!(
         role.and_then(Value::as_str)
-            .and_then(|r| r.parse::<crate::acl::Role>().ok()),
-        Some(crate::acl::Role::Admin | crate::acl::Role::Service)
+            .and_then(|r| r.parse::<did_hosting_common::server::acl::Role>().ok()),
+        Some(
+            did_hosting_common::server::acl::Role::Admin
+                | did_hosting_common::server::acl::Role::Service
+        )
     )
 }
 
@@ -2193,7 +2193,7 @@ async fn may_remove_entry(state: &AppState, issuer: &str, subject: &str) -> bool
     did_hosting_common::scid::same_reference(issuer, subject)
         || matches!(
             did_hosting_common::server::acl::check_acl(&state.acl_ks, issuer).await,
-            Ok(crate::acl::Role::Admin)
+            Ok(did_hosting_common::server::acl::Role::Admin)
         )
 }
 
@@ -2516,7 +2516,10 @@ mod tests {
         let err = check_acl(&state.acl_ks, "did:example:stranger")
             .await
             .unwrap_err();
-        assert!(matches!(err, crate::error::AppError::Forbidden(_)));
+        assert!(matches!(
+            err,
+            did_hosting_common::server::error::AppError::Forbidden(_)
+        ));
     }
 
     /// An unrouted type is answered, not dropped. Dropping it is what made the
@@ -3144,7 +3147,7 @@ mod tests {
             "publicUrl": "https://edge.example",
             "label": "edge",
             "servedDomains": [],
-            "ext": { (REGISTER_EXT_NAMESPACE): { "trust_task_capable": true } },
+            "ext": { (REGISTER_EXT_NAMESPACE): {} },
         })
     }
 
@@ -3220,7 +3223,6 @@ mod tests {
                 protocol_version: "1.0".into(),
                 advertised_services: None,
                 services_checked_at: None,
-                trust_task_capable: true,
                 sync_batch_capable: false,
                 last_inbound_transport: None,
                 last_inbound_at: None,
@@ -4337,7 +4339,9 @@ mod tests {
     /// failure, never as the edge being unauthorised.
     #[test]
     fn a_failed_store_is_not_reported_as_permission_denied() {
-        let rej = InfraRejection::lookup_failed(&crate::error::AppError::Internal("x".into()));
+        let rej = InfraRejection::lookup_failed(
+            &did_hosting_common::server::error::AppError::Internal("x".into()),
+        );
         assert_eq!(
             rej.reject_reason().code(),
             trust_tasks_rs::StandardCode::InternalError

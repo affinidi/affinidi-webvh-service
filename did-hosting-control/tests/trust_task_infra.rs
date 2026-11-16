@@ -101,7 +101,7 @@ const SERVER_DID: &str = "did:webvh:QmS:webvh.example.com:server1";
 
 /// A `server/register/0.2` payload from [`SERVER_DID`], with this service's
 /// hints under `ext`.
-fn register_body(trust_task_capable: bool) -> Value {
+fn register_body() -> Value {
     json!({
         "instanceId": instance_id_for(SERVER_DID),
         "did": SERVER_DID,
@@ -112,7 +112,6 @@ fn register_body(trust_task_capable: bool) -> Value {
         "protocolVersion": "1.0",
         "ext": {
             (did_hosting_common::didcomm_types::REGISTER_EXT_NAMESPACE): {
-                "trust_task_capable": trust_task_capable,
             }
         },
     })
@@ -134,7 +133,7 @@ async fn register_trust_task_creates_instance_and_acks() {
         MSG_SERVER_REGISTER,
         SERVER_DID,
         CONTROL_DID,
-        register_body(true),
+        register_body(),
     )
     .expect("build register doc");
     let resp = trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
@@ -151,21 +150,15 @@ async fn register_trust_task_creates_instance_and_acks() {
         .expect("registry read")
         .expect("instance registered");
     assert_eq!(inst.url, "https://webvh.example.com/server1");
-    assert!(
-        inst.trust_task_capable,
-        "a server that registers over a trust task declares itself capable"
-    );
 }
 
-/// The capability flag is what gates the health loop away from legacy pings.
-/// An older server omits it; it must default to `false` so the control plane
-/// keeps speaking `MSG_HEALTH_PING` to it and never strands it Unreachable.
+/// The `ext` hints are optional: a register that carries none still registers.
 #[tokio::test]
-async fn register_without_capability_flag_defaults_to_legacy() {
+async fn register_without_ext_hints_registers() {
     let h = make_harness().await;
     add_acl(&h.state, SERVER_DID, Role::Service).await;
 
-    let mut body = register_body(false);
+    let mut body = register_body();
     body.as_object_mut().unwrap().remove("ext");
 
     let doc = build_request(MSG_SERVER_REGISTER, SERVER_DID, CONTROL_DID, body).expect("build");
@@ -177,7 +170,7 @@ async fn register_without_capability_flag_defaults_to_legacy() {
         .await
         .unwrap()
         .unwrap();
-    assert!(!inst.trust_task_capable);
+    assert_eq!(inst.url, "https://webvh.example.com/server1");
 }
 
 /// The payload is `server/register/0.2`, closed: 0.1's snake_case members, or
@@ -193,9 +186,9 @@ async fn register_refuses_a_payload_that_is_not_0_2_for_the_signer() {
         "served_domains": [],
         "trust_task_capable": true,
     });
-    let mut other_did = register_body(true);
+    let mut other_did = register_body();
     other_did["did"] = json!("did:webvh:QmS:webvh.example.com:server2");
-    let mut other_id = register_body(true);
+    let mut other_id = register_body();
     other_id["instanceId"] = json!("someone-else");
     for body in [snake, other_did, other_id] {
         let doc = build_request(MSG_SERVER_REGISTER, SERVER_DID, CONTROL_DID, body).expect("build");
@@ -225,7 +218,7 @@ async fn register_trust_task_requires_service_role() {
         MSG_SERVER_REGISTER,
         SERVER_DID,
         CONTROL_DID,
-        register_body(true),
+        register_body(),
     )
     .expect("build");
     let resp = trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
@@ -256,7 +249,7 @@ async fn health_pong_trust_task_marks_active_and_is_terminal() {
         MSG_SERVER_REGISTER,
         SERVER_DID,
         CONTROL_DID,
-        register_body(true),
+        register_body(),
     )
     .expect("build");
     trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), reg).await;
@@ -447,7 +440,7 @@ async fn register_records_the_transport_it_arrived_on() {
         MSG_SERVER_REGISTER,
         SERVER_DID,
         CONTROL_DID,
-        register_body(true),
+        register_body(),
     )
     .expect("build");
     trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
@@ -473,7 +466,7 @@ async fn pong_updates_observed_inbound_transport() {
         MSG_SERVER_REGISTER,
         SERVER_DID,
         CONTROL_DID,
-        register_body(true),
+        register_body(),
     )
     .expect("build");
     trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Didcomm), reg).await;
@@ -505,7 +498,7 @@ async fn unknown_binding_records_no_transport() {
         MSG_SERVER_REGISTER,
         SERVER_DID,
         CONTROL_DID,
-        register_body(true),
+        register_body(),
     )
     .expect("build");
     trust_tasks_infra::dispatch(&h.state, SERVER_DID, None, doc)

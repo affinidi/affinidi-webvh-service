@@ -255,13 +255,13 @@ impl OobEnv for AppEnv<'_> {
     async fn is_allowed(&self, did: &str) -> bool {
         did.len() <= 512
             && matches!(
-                crate::acl::get_acl_entry(&self.state.acl_ks, did).await,
+                did_hosting_common::server::acl::get_acl_entry(&self.state.acl_ks, did).await,
                 Ok(Some(_))
             )
     }
 
     async fn display_name(&self, did: &str) -> Option<String> {
-        crate::acl::get_acl_entry(&self.state.acl_ks, did)
+        did_hosting_common::server::acl::get_acl_entry(&self.state.acl_ks, did)
             .await
             .ok()
             .flatten()
@@ -465,7 +465,7 @@ fn raw(doc: &TrustTask<Value>) -> Value {
 /// login's response would not. The session is bound to `K_b`, so a refresh
 /// needs a proof by that key (`auth/refresh:sessionKeyProofRequired`).
 async fn create_session(state: &AppState, session: &ApprovedSession) -> Result<Value, String> {
-    let role = crate::acl::check_acl(&state.acl_ks, &session.subject)
+    let role = did_hosting_common::server::acl::check_acl(&state.acl_ks, &session.subject)
         .await
         .map_err(|e| e.to_string())?;
     let jwt_keys = state.jwt_keys.as_ref().ok_or("JWT keys not configured")?;

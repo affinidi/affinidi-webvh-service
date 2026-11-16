@@ -225,11 +225,11 @@ pub(crate) async fn acknowledge_outbox(
     // watcher (see `server_push::is_configured_watcher`). The outbox only ever
     // settles an entry on its own target's signature either way.
     if !crate::server_push::is_configured_watcher(state, sender) {
-        match crate::acl::check_acl(&state.acl_ks, sender).await {
-            Ok(crate::acl::Role::Service) => {}
+        match did_hosting_common::server::acl::check_acl(&state.acl_ks, sender).await {
+            Ok(did_hosting_common::server::acl::Role::Service) => {}
             // Not settled either way: a failed lookup is no answer about the
             // sender, and the entry stays queued to be acknowledged again.
-            Err(e) if !crate::acl::is_acl_refusal(&e) => {
+            Err(e) if !did_hosting_common::server::acl::is_acl_refusal(&e) => {
                 warn!(sender, error = %e, "acknowledgement ignored: ACL lookup failed");
                 return;
             }

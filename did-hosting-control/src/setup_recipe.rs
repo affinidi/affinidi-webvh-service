@@ -17,15 +17,15 @@ use did_hosting_common::server::store::KS_ACL;
 use did_hosting_common::server::vta_setup;
 use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages};
 
-use crate::acl::{AclEntry, Role, store_acl_entry};
 use crate::auth::session::now_epoch;
 use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, HostingConfig, LogConfig, LogFormat, RegistryConfig,
     ServerConfig, StoreConfig, VtaConfig,
 };
-use crate::error::AppError;
 use crate::secret_store::{ServerSecrets, create_secret_store};
-use crate::store::Store;
+use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};
+use did_hosting_common::server::error::AppError;
+use did_hosting_common::server::store::Store;
 
 /// Entry point: load + validate + apply.
 pub async fn run_from_recipe(

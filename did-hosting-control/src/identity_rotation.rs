@@ -29,10 +29,10 @@ use did_hosting_common::server::identity_drain;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::error::AppError;
 use crate::messaging;
 use crate::secret_store::create_secret_store;
 use crate::server::AppState;
+use did_hosting_common::server::error::AppError;
 
 /// The listener id the control plane registers its DID under. Must match
 /// `server::start_didcomm_service`, or the rebuild would add a second listener

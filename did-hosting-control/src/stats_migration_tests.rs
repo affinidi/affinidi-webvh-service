@@ -2,7 +2,7 @@ use did_hosting_common::server::config::StoreConfig;
 use did_hosting_common::server::stats_tiers::{FineSlot, fine_key};
 
 use super::*;
-use crate::store::Store;
+use did_hosting_common::server::store::Store;
 
 struct Fixture {
     _dir: tempfile::TempDir,

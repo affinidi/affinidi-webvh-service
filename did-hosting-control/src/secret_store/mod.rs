@@ -2,7 +2,7 @@
 pub use did_hosting_common::server::secret_store::*;
 
 use crate::config::AppConfig;
-use crate::error::AppError;
+use did_hosting_common::server::error::AppError;
 
 /// Create a secret store backend based on the application configuration.
 ///

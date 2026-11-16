@@ -135,7 +135,7 @@ impl BatchBuilder {
     /// Room left for the fields of the entry around the mnemonic list.
     const ROW_OVERHEAD: usize = 4 * 1024;
 
-    fn new(store: &crate::store::Store) -> Self {
+    fn new(store: &did_hosting_common::server::store::Store) -> Self {
         Self {
             mnemonics: Vec::new(),
             content_bytes: 0,
@@ -450,7 +450,7 @@ impl StagedSync {
 /// next registration.
 pub(crate) async fn stage_did_sync(
     state: &AppState,
-    batch: &mut crate::store::WriteBatch,
+    batch: &mut did_hosting_common::server::store::WriteBatch,
     mnemonic: &str,
     change: DidChange<'_>,
 ) -> StagedSync {
@@ -733,7 +733,9 @@ impl PushTargets {
 }
 
 /// The registry's push targets for a DID change.
-async fn push_targets(registry_ks: &crate::store::KeyspaceHandle) -> PushTargets {
+async fn push_targets(
+    registry_ks: &did_hosting_common::server::store::KeyspaceHandle,
+) -> PushTargets {
     match registry::list_instances(registry_ks).await {
         Ok(instances) => PushTargets::from_instances(instances),
         Err(e) => {

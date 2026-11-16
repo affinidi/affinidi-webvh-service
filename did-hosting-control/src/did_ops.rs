@@ -5,8 +5,9 @@
 //! from `did-hosting-common::did_ops`.
 
 use bip39::Language;
+use did_hosting_common::CheckNameResponse;
 use did_hosting_common::did_ops::{
-    self, AgentNameEntry, DidRecord, LogEntryInfo, LogMetadata, agent_name_key, content_log_key,
+    self, AgentNameEntry, DidRecord, LogMetadata, agent_name_key, content_log_key,
     content_witness_key, did_key, owner_key,
 };
 use did_hosting_common::method::publication::Publication;
@@ -18,14 +19,13 @@ use did_hosting_common::server::identity::mnemonic_from_did;
 use did_hosting_common::server::mnemonic::{
     validate_agent_name, validate_agent_name_binding, validate_custom_path, validate_mnemonic,
 };
-use did_hosting_common::{CheckNameResponse, DidListEntry};
 use rand::random_range;
 use tracing::{debug, info, warn};
 
 use crate::auth::AuthClaims;
-use crate::error::AppError;
 use crate::server::{AppState, CacheChange};
-use crate::store::KeyspaceHandle;
+use did_hosting_common::server::error::AppError;
+use did_hosting_common::server::store::KeyspaceHandle;
 
 /// Run the T20 safety check before any storage write on an inbound
 /// create / publish.
@@ -227,7 +227,7 @@ async fn get_authorized_record(
     mnemonic: &str,
     auth: &AuthClaims,
 ) -> Result<DidRecord, AppError> {
-    use crate::acl::Role;
+    use did_hosting_common::server::acl::Role;
 
     let record: DidRecord = dids_ks
         .get(did_key(mnemonic))
@@ -317,7 +317,7 @@ async fn hold_size_quota(
 /// Enforce the caller's per-account `max_did_count` before adding a new slot.
 /// Admin-exempt. `None` ACL max (or no ACL entry) means no cap.
 async fn check_did_count_limit(auth: &AuthClaims, state: &AppState) -> Result<(), AppError> {
-    use crate::acl::Role;
+    use did_hosting_common::server::acl::Role;
     if auth.role == Role::Admin {
         return Ok(());
     }
@@ -351,7 +351,7 @@ async fn check_total_size_limit(
     old_size: u64,
     new_size: u64,
 ) -> Result<(), AppError> {
-    use crate::acl::Role;
+    use did_hosting_common::server::acl::Role;
     if auth.role == Role::Admin {
         return Ok(());
     }
@@ -396,7 +396,7 @@ async fn resolve_path_for_create(
     force: bool,
     conflict_msg: &str,
 ) -> Result<Option<DidRecord>, AppError> {
-    use crate::acl::Role;
+    use did_hosting_common::server::acl::Role;
 
     let Some(existing) = state.dids_ks.get::<DidRecord>(did_key(custom_path)).await? else {
         return Ok(None);
@@ -443,8 +443,8 @@ pub async fn create_did(
     force: bool,
     domain: Option<&str>,
 ) -> Result<DidRecord, AppError> {
-    use crate::acl::Role;
     use crate::auth::session::now_epoch;
+    use did_hosting_common::server::acl::Role;
 
     // Every branch returns holding the slot's per-path write lock — the same
     // one `register_did_atomic` and the agent-name ops take — so the availability
@@ -605,8 +605,8 @@ pub async fn register_did_atomic(
     force: bool,
     domain: Option<&str>,
 ) -> Result<DidRecord, AppError> {
-    use crate::acl::Role;
     use crate::auth::session::now_epoch;
+    use did_hosting_common::server::acl::Role;
 
     // 1. Cheap validations first — bail out before any storage I/O.
     //    Proof verification subsumes structural validation; a single
@@ -1928,27 +1928,6 @@ pub async fn get_did_info(
     Ok((record, log_metadata))
 }
 
-/// Get parsed log entries for a DID.
-pub async fn get_did_log(
-    auth: &AuthClaims,
-    state: &AppState,
-    mnemonic: &str,
-) -> Result<Vec<LogEntryInfo>, AppError> {
-    validate_slot_mnemonic(&state.dids_ks, mnemonic).await?;
-    get_authorized_record(&state.dids_ks, mnemonic, auth).await?;
-
-    let bytes = state
-        .dids_ks
-        .get_raw(content_log_key(mnemonic))
-        .await?
-        .ok_or_else(|| AppError::NotFound("no log content for this DID".into()))?;
-
-    let content = String::from_utf8(bytes)
-        .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
-
-    Ok(did_ops::parse_log_entries(&content))
-}
-
 /// Get the raw JSONL content for a DID log as a plain string.
 pub async fn get_raw_log(
     auth: &AuthClaims,
@@ -1965,116 +1944,6 @@ pub async fn get_raw_log(
         .ok_or_else(|| AppError::NotFound("no log content for this DID".into()))?;
 
     String::from_utf8(bytes).map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))
-}
-
-/// List DIDs owned by the caller (or by a specific owner if admin).
-/// When the caller is admin and no `requested_owner` is provided, returns all DIDs.
-pub async fn list_dids(
-    auth: &AuthClaims,
-    state: &AppState,
-    requested_owner: Option<&str>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-) -> Result<Vec<DidListEntry>, AppError> {
-    use crate::acl::Role;
-
-    if auth.role == Role::Admin && requested_owner.is_none() {
-        return list_all_dids(state).await;
-    }
-
-    let target_owner = if auth.role == Role::Admin {
-        requested_owner.unwrap_or(&auth.did)
-    } else {
-        &auth.did
-    };
-
-    let prefix = format!("owner:{target_owner}:");
-    let raw = state.dids_ks.prefix_iter_raw(prefix).await?;
-
-    let mut entries = Vec::with_capacity(raw.len());
-    for (_key, value) in raw {
-        let mnemonic = String::from_utf8(value)
-            .map_err(|e| AppError::Internal(format!("invalid mnemonic bytes: {e}")))?;
-        if let Some(record) = state.dids_ks.get::<DidRecord>(did_key(&mnemonic)).await? {
-            // Owner-index keys are `owner:{did}:{mnemonic}`. DIDs naturally
-            // contain colons (e.g. `did:webvh:scid:host:path`), so a DID
-            // that is a string-prefix of another (e.g. `did:web:tenant`
-            // vs `did:web:tenant:server`) shares the prefix and the
-            // iterator returns rows belonging to the longer DID. Re-check
-            // the record's owner to filter those out — without this, a
-            // tenant whose DID is a prefix of another would see the
-            // other tenant's mnemonics in their dashboard.
-            if record.owner != target_owner {
-                continue;
-            }
-            let did_stats = crate::stats_admin::live_did_stats(state, &mnemonic).await?;
-            let agent_names = record.agent_names.clone();
-            entries.push(DidListEntry {
-                mnemonic: record.mnemonic,
-                owner: record.owner,
-                created_at: record.created_at,
-                updated_at: record.updated_at,
-                version_count: record.version_count,
-                did_id: record.did_id,
-                total_resolves: did_stats.total_resolves,
-                disabled: record.disabled,
-                method: (!record.method.is_empty()).then(|| record.method.clone()),
-                domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
-                agent_names,
-                services: record.services,
-            });
-        }
-    }
-
-    // Apply pagination. Cap the caller-supplied limit so a single request can't
-    // ask for an unbounded page. The per-owner scan is already bounded by the
-    // account's `max_did_count` quota; this additionally bounds the response
-    // size (and the allocation) regardless of what the client passes.
-    const MAX_LIST_LIMIT: usize = 1000;
-    let offset = offset.unwrap_or(0);
-    let limit = limit.unwrap_or(MAX_LIST_LIMIT).min(MAX_LIST_LIMIT);
-    let total = entries.len();
-    let entries: Vec<_> = entries.into_iter().skip(offset).take(limit).collect();
-
-    info!(did = %auth.did, owner = %target_owner, total, returned = entries.len(), "DIDs listed on control plane");
-
-    Ok(entries)
-}
-
-/// List all DIDs in the store (admin only).
-async fn list_all_dids(state: &AppState) -> Result<Vec<DidListEntry>, AppError> {
-    let raw = state.dids_ks.prefix_iter_raw("did:").await?;
-
-    let mut entries = Vec::with_capacity(raw.len());
-    for (_key, value) in raw {
-        let record: DidRecord = match serde_json::from_slice(&value) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let did_stats = crate::stats_admin::live_did_stats(state, &record.mnemonic).await?;
-        let agent_names = record.agent_names.clone();
-        entries.push(DidListEntry {
-            mnemonic: record.mnemonic,
-            owner: record.owner,
-            created_at: record.created_at,
-            updated_at: record.updated_at,
-            version_count: record.version_count,
-            did_id: record.did_id,
-            total_resolves: did_stats.total_resolves,
-            disabled: record.disabled,
-            method: (!record.method.is_empty()).then(|| record.method.clone()),
-            domain: (!record.domain.is_empty()).then(|| record.domain.clone()),
-            agent_names,
-            services: record.services,
-        });
-    }
-
-    info!(
-        count = entries.len(),
-        "all DIDs listed (admin) on control plane"
-    );
-
-    Ok(entries)
 }
 
 /// What a `did/list` page is narrowed to, beyond the caller's own scope.
@@ -2149,7 +2018,7 @@ pub async fn list_dids_page(
     limit: Option<usize>,
     after: Option<&str>,
 ) -> Result<ListPage, AppError> {
-    use crate::acl::Role;
+    use did_hosting_common::server::acl::Role;
 
     let limit = limit.unwrap_or(MAX_LIST_LIMIT).clamp(1, MAX_LIST_LIMIT);
     let target_owner = if (auth.role == Role::Admin || replica) && filter.owner.is_none() {
@@ -2596,7 +2465,7 @@ async fn check_recipient_may_hold(
     record: &DidRecord,
     recipient: &str,
 ) -> Result<(), OwnerChangeError> {
-    use crate::acl::Role;
+    use did_hosting_common::server::acl::Role;
     use did_hosting_common::server::acl::get_acl_entry;
     use did_hosting_common::server::domain::{
         assert_acl_allows_host, assert_did_host_allowed_when_domains_configured,
@@ -2682,7 +2551,7 @@ pub async fn change_did_owner(
     new_owner: &str,
     request_domain: Option<&str>,
 ) -> Result<OwnerChange, OwnerChangeError> {
-    use crate::acl::Role;
+    use did_hosting_common::server::acl::Role;
 
     use crate::auth::session::now_epoch;
 
@@ -2857,7 +2726,7 @@ fn refuse_lifting_admin_suspension(
     mnemonic: &str,
     action: &str,
 ) -> Result<(), AppError> {
-    if record.disabled_by_admin && auth.role != crate::acl::Role::Admin {
+    if record.disabled_by_admin && auth.role != did_hosting_common::server::acl::Role::Admin {
         warn!(
             caller = %auth.did,
             mnemonic = %mnemonic,
@@ -2888,7 +2757,7 @@ pub async fn set_did_disabled(
     if let Some(did_id) = record.did_id.as_deref() {
         check_did_host_safety(state, auth, did_id).await?;
     }
-    let is_admin = auth.role == crate::acl::Role::Admin;
+    let is_admin = auth.role == did_hosting_common::server::acl::Role::Admin;
     if disabled {
         // An admin's suspension is recorded as such, so the owner cannot
         // lift it; an owner suspending an admin-suspended slot changes nothing.
@@ -2920,16 +2789,6 @@ pub async fn set_did_disabled(
     );
     // The record as written, so the caller need not read it back.
     Ok(record)
-}
-
-/// Roll back (remove) the last log entry from a DID's JSONL content.
-pub async fn rollback_did(
-    auth: &AuthClaims,
-    state: &AppState,
-    mnemonic: &str,
-) -> Result<(DidRecord, Option<LogMetadata>), AppError> {
-    let (record, metadata, _) = rollback_did_to(auth, state, mnemonic, None).await?;
-    Ok((record, metadata))
 }
 
 /// Discard every log entry after `target_version` (1-based), or — with no
@@ -3379,7 +3238,8 @@ pub async fn resolve_agent_names(
         {
             continue;
         }
-        if reader.role != crate::acl::Role::Admin && record.owner != reader.did {
+        if reader.role != did_hosting_common::server::acl::Role::Admin && record.owner != reader.did
+        {
             continue;
         }
         let names: Vec<String> = record
@@ -3415,9 +3275,9 @@ mod tests_atomic {
 
     use did_hosting_common::server::store::Store;
 
-    use crate::acl::Role;
     use crate::config::{AppConfig, RegistryConfig};
     use crate::server::AppState;
+    use did_hosting_common::server::acl::Role;
 
     /// Build a real signed did:webvh log entry for testing.
     ///
@@ -4286,8 +4146,8 @@ mod tests_atomic {
         role: Role,
         scope: did_hosting_common::server::domain::DomainScope,
     ) {
-        use crate::acl::store_acl_entry;
         use did_hosting_common::server::acl::AclEntry;
+        use did_hosting_common::server::acl::store_acl_entry;
         let entry = AclEntry {
             did: did.into(),
             role,
@@ -5200,8 +5060,8 @@ mod tests_atomic {
         );
     }
 
-    /// The cached services reach the wire type the DID list renders from,
-    /// without `list_dids` reading any log bytes.
+    /// The cached services reach the records a `did/list` page renders from,
+    /// without the listing reading any log bytes.
     #[tokio::test]
     async fn list_dids_surfaces_cached_services() {
         let (state, _dir) = test_state().await;
@@ -5216,12 +5076,20 @@ mod tests_atomic {
             .await
             .unwrap();
 
-        let entries = list_dids(&owner_auth(owner), &state, None, None, None)
-            .await
-            .expect("list_dids");
-        let entry = entries
+        let page = list_dids_page(
+            &owner_auth(owner),
+            false,
+            &state,
+            &ListFilter::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("list_dids_page");
+        let (entry, _) = page
+            .records
             .iter()
-            .find(|e| e.mnemonic == path)
+            .find(|(r, _)| r.mnemonic == path)
             .expect("published DID in list");
         assert_eq!(
             entry.services,

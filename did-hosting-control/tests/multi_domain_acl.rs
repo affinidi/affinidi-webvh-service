@@ -33,10 +33,10 @@ use did_hosting_common::server::config::{
 use did_hosting_common::server::domain::{
     DomainEntry, DomainScope, DomainStatus, DomainUrlScheme, create_domain, set_default_domain,
 };
+use did_hosting_common::server::error::AppError;
 use did_hosting_common::server::store::Store;
 use did_hosting_control::auth::AuthClaims;
 use did_hosting_control::config::{AppConfig, RegistryConfig};
-use did_hosting_control::error::AppError;
 use did_hosting_control::server::AppState;
 
 async fn make_state() -> (AppState, tempfile::TempDir) {

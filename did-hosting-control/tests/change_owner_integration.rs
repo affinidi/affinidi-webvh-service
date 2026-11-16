@@ -34,13 +34,24 @@ use did_hosting_common::server::store::Store;
 use did_hosting_control::auth::AuthClaims;
 use did_hosting_control::config::{AppConfig, RegistryConfig};
 use did_hosting_control::did_ops::{
-    OwnerChangeError, change_did_owner, create_did, delete_did, get_did_info, list_dids,
+    ListFilter, OwnerChangeError, change_did_owner, create_did, delete_did, get_did_info,
+    list_dids_page,
 };
 use did_hosting_control::server::AppState;
 
 // ---------------------------------------------------------------------------
 // Test harness
 // ---------------------------------------------------------------------------
+
+/// The slots `auth` sees in an unfiltered `did/list` (its own, or every slot
+/// for an admin), as a single page.
+async fn list_owned(
+    auth: &AuthClaims,
+    state: &AppState,
+) -> Result<Vec<DidRecord>, did_hosting_common::server::error::AppError> {
+    let page = list_dids_page(auth, false, state, &ListFilter::default(), None, None).await?;
+    Ok(page.records.into_iter().map(|(record, _)| record).collect())
+}
 
 /// Build a minimal `AppState` rooted in a tempdir-backed fjall store.
 async fn make_state() -> (AppState, tempfile::TempDir) {
@@ -139,13 +150,11 @@ async fn owner_can_transfer_did_and_listing_index_swaps() {
     assert_eq!(create.mnemonic, "tenant/owner-a");
 
     // Pre-transfer sanity — owner sees one entry, new owner sees none.
-    let owner_list = list_dids(&owner_auth, &state, None, None, None)
-        .await
-        .expect("owner list");
+    let owner_list = list_owned(&owner_auth, &state).await.expect("owner list");
     assert_eq!(owner_list.len(), 1);
 
     let new_owner_auth = auth_for(&new_owner, Role::Owner);
-    let new_owner_list = list_dids(&new_owner_auth, &state, None, None, None)
+    let new_owner_list = list_owned(&new_owner_auth, &state)
         .await
         .expect("new owner list");
     assert!(new_owner_list.is_empty());
@@ -187,7 +196,7 @@ async fn owner_can_transfer_did_and_listing_index_swaps() {
     assert_eq!(new_idx.len(), 1);
 
     // 4. List operations follow the index swap.
-    let owner_list = list_dids(&owner_auth, &state, None, None, None)
+    let owner_list = list_owned(&owner_auth, &state)
         .await
         .expect("owner list after transfer");
     assert!(
@@ -195,7 +204,7 @@ async fn owner_can_transfer_did_and_listing_index_swaps() {
         "old owner should no longer see the DID"
     );
 
-    let new_owner_list = list_dids(&new_owner_auth, &state, None, None, None)
+    let new_owner_list = list_owned(&new_owner_auth, &state)
         .await
         .expect("new owner list after transfer");
     assert_eq!(new_owner_list.len(), 1);
@@ -207,7 +216,10 @@ async fn owner_can_transfer_did_and_listing_index_swaps() {
         .await
         .expect_err("old owner must lose access");
     assert!(
-        matches!(info_err, did_hosting_control::error::AppError::Forbidden(_)),
+        matches!(
+            info_err,
+            did_hosting_common::server::error::AppError::Forbidden(_)
+        ),
         "expected Forbidden, got {info_err:?}"
     );
 
@@ -253,9 +265,7 @@ async fn admin_can_transfer_did_owned_by_someone_else() {
     assert_eq!(updated.record.owner, target);
 
     let target_auth = auth_for(&target, Role::Owner);
-    let target_list = list_dids(&target_auth, &state, None, None, None)
-        .await
-        .unwrap();
+    let target_list = list_owned(&target_auth, &state).await.unwrap();
     assert_eq!(target_list.len(), 1);
 
     mediator.shutdown();
@@ -294,7 +304,7 @@ async fn stranger_cannot_change_owner_of_someone_elses_did() {
         .expect_err("stranger must be forbidden");
     assert!(matches!(
         err,
-        OwnerChangeError::Failed(did_hosting_control::error::AppError::Forbidden(_))
+        OwnerChangeError::Failed(did_hosting_common::server::error::AppError::Forbidden(_))
     ));
 
     mediator.shutdown();
@@ -493,7 +503,7 @@ async fn force_replace_forbidden_for_non_owner() {
     .expect_err("non-owner force replace must fail");
     assert!(matches!(
         err,
-        did_hosting_control::error::AppError::Forbidden(_)
+        did_hosting_common::server::error::AppError::Forbidden(_)
     ));
 
     // Original owner record still intact.

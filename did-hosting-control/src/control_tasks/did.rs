@@ -16,8 +16,8 @@ use did_hosting_common::server::trust_tasks::ext::WEBVH_EXT_KEY;
 
 use super::{Cx, TaskError, at, spec_record, typed};
 use crate::did_ops;
-use crate::error::AppError;
 use crate::server::AppState;
+use did_hosting_common::server::error::AppError;
 
 /// `did/check-name/0.1`: an availability probe, or (`reserve: true`) an atomic
 /// claim of a slot — auto-assigned when `path` is absent.
@@ -240,7 +240,7 @@ pub(crate) async fn list(
     cx: &Cx<'_>,
     p: list::v0_2::Payload,
 ) -> Result<list::v0_2::Response, TaskError> {
-    use crate::acl::Role;
+    use did_hosting_common::server::acl::Role;
 
     let auth = cx.auth().await?;
     let state = cx.state;
@@ -411,7 +411,9 @@ mod list_cursor {
     /// the caller starts its listing again.
     pub(super) type Key = [u8; 32];
 
-    pub(super) async fn key(state: &AppState) -> Result<Key, crate::error::AppError> {
+    pub(super) async fn key(
+        state: &AppState,
+    ) -> Result<Key, did_hosting_common::server::error::AppError> {
         let ks = state.store.keyspace(KS_META)?;
         if let Some(k) = ks
             .get_raw(KEY_NAME)

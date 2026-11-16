@@ -23,12 +23,12 @@ use webauthn_rs::prelude::Webauthn;
 use crate::auth::jwt::JwtKeys;
 use crate::auth::session::cleanup_expired_sessions;
 use crate::config::{AppConfig, AuthConfig};
-use crate::error::AppError;
 use crate::messaging;
 use crate::registry::{self, ServiceStatus};
 use crate::routes;
 use crate::secret_store::ServerSecrets;
-use crate::store::{KeyspaceHandle, Store};
+use did_hosting_common::server::error::AppError;
+use did_hosting_common::server::store::{KeyspaceHandle, Store};
 use tokio::sync::{oneshot, watch};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, debug, info, warn};
@@ -114,7 +114,7 @@ pub struct AppState {
     /// Anti-replay cache for inbound DIDComm `(sender, msg.id)` pairs.
     /// Both transports gate through it before dispatch to reject
     /// captured-and-resubmitted envelopes within the freshness window.
-    pub replay_cache: Arc<crate::replay::ReplayCache>,
+    pub replay_cache: Arc<did_hosting_common::server::replay::ReplayCache>,
     /// What signed documents from signers the ACL does not list may
     /// consume: their own replay cache and bounded DID resolution. See
     /// [`crate::unlisted_signers`].
@@ -124,7 +124,7 @@ pub struct AppState {
     /// the duration of its read + build + commit window so two
     /// concurrent calls on the same path can't both observe
     /// `existing == None` and both commit.
-    pub path_locks: crate::path_locks::PathLocks,
+    pub path_locks: did_hosting_common::server::path_locks::PathLocks,
     /// Per-key write lock for Trust Tasks ACL mutations. Separate
     /// from `path_locks` so DID-mnemonic locking and ACL-write locking
     /// don't share a keyspace — the `grant` / `change-role` /
@@ -327,7 +327,8 @@ impl AppState {
         let geoip = open_geoip(&config.geoip).await?;
         let pending_challenges =
             crate::pending_challenges::PendingChallengeTracker::for_auth_config(&config.auth);
-        let replay_cache = crate::replay::ReplayCache::with_config(config.replay.clone())?;
+        let replay_cache =
+            did_hosting_common::server::replay::ReplayCache::with_config(config.replay.clone())?;
 
         Ok(Self {
             store,
@@ -349,7 +350,7 @@ impl AppState {
             timeseries_ks,
             unlisted_signers: Default::default(),
             replay_cache: Arc::new(replay_cache),
-            path_locks: crate::path_locks::PathLocks::new(),
+            path_locks: did_hosting_common::server::path_locks::PathLocks::new(),
             acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
             pending_challenges: Arc::new(pending_challenges),
             client_ips,
@@ -1213,7 +1214,6 @@ pub async fn seed_registry(state: &AppState) {
                     // Null), so there is no document to read badges from.
                     advertised_services: None,
                     services_checked_at: None,
-                    trust_task_capable: false,
                     sync_batch_capable: false,
                     last_inbound_transport: None,
                     last_inbound_at: None,
