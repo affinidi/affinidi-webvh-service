@@ -1,3 +1,6 @@
+//! Witness identities and proofs: create, list and delete identities, sign a
+//! log entry, and track each identity's per-DID witnessed high-water mark.
+
 use affinidi_data_integrity::DataIntegrityProof;
 use affinidi_tdk::secrets_resolver::secrets::Secret;
 use serde::{Deserialize, Serialize};

@@ -1,3 +1,6 @@
+//! `webvh-witness` binary: setup, the service itself, and local admin
+//! subcommands (ACL, witness identities, VTA and sealed-key operations).
+
 use clap::{Parser, Subcommand};
 use did_hosting_common::server::store::KS_WITNESSES;
 use std::path::PathBuf;

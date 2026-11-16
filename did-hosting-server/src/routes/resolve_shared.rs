@@ -1,12 +1,14 @@
 //! Shared helpers for per-method resolve handlers (T25).
 //!
-//! Shared between methods: the trusted-CIDR-gated request-host extractor
-//! (T19), and the gate every method checks before serving (the DID's
-//! record and the domain). The cached-content reader (`serve_content`)
-//! is webvh-only — did:web has its own custom did.json extraction —
-//! so it lives in `resolve_webvh` directly. Adding a method that
-//! reuses the cached jsonl/witness shape (e.g. did:webs) would lift
-//! `serve_content` back up here.
+//! Shared by every method (did:webvh, did:webs, did:web and the agent-name
+//! route): the trusted-CIDR-gated request-host extractor (T19), the gate
+//! every method checks before serving (the DID's record and the domain),
+//! the per-request [`Lookup`] (host, `If-None-Match` and the slot's record,
+//! read once however many dispatchers look at it), and [`content_response`]
+//! (`ETag` / `304` and `Cache-Control` for resolved content). Each method
+//! reads its own content: webvh's cached-log reader (`serve_content`) lives
+//! in `resolve_webvh`, and `resolve_webs` derives did:webs' `did.json`
+//! from the stored `keri.cesr` (memoised in memory, never stored).
 
 use std::net::SocketAddr;
 use std::sync::Arc;

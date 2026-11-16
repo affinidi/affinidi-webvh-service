@@ -1,3 +1,7 @@
+//! The edge's HTTP routers: public DID resolution (per-method dispatch,
+//! `.well-known`, agent-name redirects) and the HTTPS binding of its Trust
+//! Task listener, `POST /api/trust-tasks`. There are no management routes.
+
 pub mod did_public;
 pub mod health;
 pub mod resolve_agent_name;

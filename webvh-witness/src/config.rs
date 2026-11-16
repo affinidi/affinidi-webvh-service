@@ -1,3 +1,6 @@
+//! The witness's `config.toml` ([`AppConfig`]), loaded from file with
+//! environment overrides.
+
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

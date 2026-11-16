@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "DID Hosting Manager",
-    "slug": "webvh-ui",
+    "slug": "did-hosting-ui",
     "version": "1.0.0",
     "platforms": ["web"],
     "icon": "./assets/icon.png",

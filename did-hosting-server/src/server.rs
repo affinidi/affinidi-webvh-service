@@ -1,3 +1,7 @@
+//! The edge's runtime: [`AppState`], startup ([`run`]), the messaging
+//! listener and control-plane registration, and the HTTP and storage threads
+//! (also reused by the daemon through [`EdgeStorage`] and [`storage_tasks`]).
+
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -608,7 +612,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     //    server's own DID needs to be resolvable for mediator auth). Critical:
     //    it owns the listening socket, and an edge without HTTP serves nothing.
     let rest_state = state.clone();
-    sup.spawn_thread(Stage::Listeners, "webvh-rest", move |sd| {
+    sup.spawn_thread(Stage::Listeners, "server-rest", move |sd| {
         run_rest_thread(
             std_listener,
             rest_state,
@@ -630,7 +634,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         path_locks: None,
         on_removed: None,
     };
-    sup.spawn_thread(Stage::Storage, "webvh-storage", move |sd| {
+    sup.spawn_thread(Stage::Storage, "server-storage", move |sd| {
         run_storage_thread(storage, sd.watch())
     })
     .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;

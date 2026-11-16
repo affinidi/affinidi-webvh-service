@@ -1,3 +1,6 @@
+//! Slot paths ("mnemonics"): random two-word BIP-39 names, availability
+//! checks, and the shared path validators re-exported from common.
+
 use crate::error::AppError;
 use crate::store::KeyspaceHandle;
 use bip39::Language;

@@ -1,3 +1,6 @@
+//! The watcher's HTTP routers: public resolution of mirrored DIDs and the
+//! HTTPS binding of its Trust Task listener, `POST /api/trust-tasks`.
+
 mod did_public;
 pub mod health;
 pub mod trust_tasks;

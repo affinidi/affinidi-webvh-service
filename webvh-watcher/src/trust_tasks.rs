@@ -15,10 +15,14 @@
 //!   sender that agrees with the proof. One that does not verify gets **no
 //!   reply at all** — a signed refusal would settle a sync its source never
 //!   sent (HTTPS answers `403` with an unsigned, detail-free body).
-//! - A verified document whose issuer is not a configured source is refused
-//!   with the task's signed `notAuthorized`, and **nothing is recorded** for
-//!   it: the replay cache only ever holds a source's documents, so a stranger
-//!   minting DIDs cannot fill it and defer a real sync.
+//! - A document whose *claimed* issuer is not a configured source is dropped
+//!   with **no reply** before its proof is checked (no DID resolution is
+//!   spent on it), the same silence an invalid proof gets. The verified
+//!   principal is checked again after the proof; that signed `notAuthorized`
+//!   is a defensive backstop the pre-check normally makes unreachable.
+//! - Either way **nothing is recorded** for a non-source: the replay cache
+//!   only ever holds a source's documents, so a stranger minting DIDs cannot
+//!   fill it and defer a real sync.
 //! - A replay of a document already applied gets no reply.
 //!
 //! Every reply to a verified document is signed by the watcher.

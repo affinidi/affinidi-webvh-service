@@ -293,7 +293,7 @@ function extractBearer(headerValue: string): string | null {
 }
 
 /** Enumerate proxy-login candidates for this RP via the wallet's
- *  page-world `vaultList`. Filters to `did-self-issued` entries pinned
+ *  page-world `vaultList`. Filters to `didSelfIssued` entries pinned
  *  to the RP's DID. Used by the login UI to populate the entry picker. *
  * @deprecated Contract C7: SIOPv2 / extension login is legacy. Use wallet
  * sign-in with a trigger link (`oob-sign-in.ts`); kept, behind "Using an
