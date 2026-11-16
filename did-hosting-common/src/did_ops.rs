@@ -227,17 +227,39 @@ pub const MAX_LOG_ENTRIES: usize = 10_000;
 /// targets a different DID method.
 ///
 /// Returns an error string on failure (caller wraps in their own error type).
+/// This is [`parse_log`] with the parsed entries discarded; a caller that goes
+/// on to verify the log should call the verifier alone, which parses once.
 pub fn validate_did_jsonl(content: &str) -> Result<(), String> {
+    parse_log(content).map(|_| ())
+}
+
+/// Parse a `did.jsonl` into unverified log entries — the one parse every
+/// did:webvh read path shares ([`validate_did_jsonl`], the chain verifiers,
+/// [`servable_did_log`] and [`verify_log_for_witnessing`]), so a structural
+/// rule lands in all of them at once.
+///
+/// Refuses: empty content; more than [`MAX_LOG_ENTRIES`] entries (counted
+/// before any per-entry work); a line that is not a log entry (each line is
+/// parsed under the method version of the entry before it, as the chain
+/// itself is); an entry whose `versionId` is malformed; and a log whose last
+/// entry's `state.id` is not a `did:webvh:` identifier, which stops a
+/// leaked-push-token republish of arbitrary JSON that merely deserialises
+/// into the entry shape. Blank lines are skipped; line numbers in errors
+/// count them.
+///
+/// Nothing is verified: every entry comes back `NotValidated` with default
+/// parameters, for the caller's own verifier to walk.
+pub fn parse_log(content: &str) -> Result<DIDWebVHState, String> {
     if content.is_empty() {
         return Err("did.jsonl content cannot be empty".into());
     }
 
     // Bound the entry count up front, before any O(n) per-entry work (the
-    // deserialize loop here, and the per-entry Ed25519 proof verification in
-    // `verify_did_log_proofs`). The 10 MB request limit alone would still admit
-    // thousands of versions and let a slot owner amplify CPU by republishing a
-    // max-length multi-version log. `MAX_LOG_ENTRIES` is far above any realistic
-    // webvh history, so it only ever refuses a degenerate/abusive chain.
+    // deserialize loop below, and every verifier's per-entry Ed25519 proof
+    // check). The 10 MB request limit alone would still admit thousands of
+    // versions and let a slot owner amplify CPU by republishing a max-length
+    // multi-version log. `MAX_LOG_ENTRIES` is far above any realistic webvh
+    // history, so it only ever refuses a degenerate/abusive chain.
     let entry_count = content.lines().filter(|l| !l.trim().is_empty()).count();
     if entry_count == 0 {
         return Err("did.jsonl content has no entries".into());
@@ -248,24 +270,61 @@ pub fn validate_did_jsonl(content: &str) -> Result<(), String> {
         ));
     }
 
+    let mut state = DIDWebVHState::default();
+    let mut version = None;
     for (idx, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        LogEntry::deserialize_string(line, None)
+        let entry = LogEntry::deserialize_string(line, version)
             .map_err(|e| format!("invalid log entry at line {}: {e}", idx + 1))?;
+        version = Some(entry.get_webvh_version());
+        let version_number = entry
+            .get_version_id_fields()
+            .map_err(|e| format!("invalid versionId at line {}: {e}", idx + 1))?
+            .0;
+        state.log_entries_mut().push(LogEntryState {
+            log_entry: entry,
+            version_number,
+            validation_status: LogEntryValidationStatus::NotValidated,
+            validated_parameters: Parameters::default(),
+        });
     }
 
     // Must encode a did:webvh identifier on the latest entry.
-    match extract_did_id(content) {
-        Some(id) if id.starts_with("did:webvh:") => Ok(()),
-        Some(other) => Err(format!(
-            "did.jsonl latest entry must encode a did:webvh identifier (got {other})",
-        )),
-        None => Err("did.jsonl latest entry has no resolvable state.id".into()),
+    let is_webvh = state.log_entries().last().is_some_and(|last| {
+        last.log_entry
+            .get_state()
+            .get("id")
+            .and_then(|id| id.as_str())
+            .is_some_and(|id| id.starts_with("did:webvh:"))
+    });
+    if !is_webvh {
+        return Err("did.jsonl latest entry has no resolvable state.id".into());
     }
+    Ok(state)
 }
+
+// The did:webvh verifiers. All of them start from [`parse_log`]; where they
+// differ, they differ on purpose:
+//
+// - [`verify_did_log_proofs`] / [`verify_did_log_and_witness_proofs`]
+//   (via `verify_did_log_chain`): the upstream `DIDWebVHState::validate` plus
+//   `assert_complete`, witness threshold included — a log served as-is must be
+//   whole. Used where a node accepts a log it did not author.
+// - [`verify_did_log_for_publish`] and [`verify_witness_proof_for_version`]
+//   (via `parse_and_verify_chain`): per-entry `verify_log_entry`, then the
+//   witness threshold only for entries already published, because a new
+//   version's witness proofs arrive after it is registered.
+// - [`servable_did_log`]: the same per-entry walk, but it fails open — content
+//   it cannot parse or whose chain does not verify is served verbatim (the
+//   write paths gate on those), and an unmet witness threshold truncates
+//   rather than refuses.
+// - [`verify_log_for_witnessing`]: verifies only through the entry that first
+//   deactivates the DID, so it can name the more specific `deactivated`
+//   refusal, and never checks the entry's own witness proofs (it is producing
+//   them).
 
 /// Verify the cryptographic proofs on every log entry in a `did.jsonl`
 /// chain.
@@ -324,29 +383,7 @@ pub fn verify_did_log_and_witness_proofs(
 /// their own check on top, using each entry's now-populated
 /// `validated_parameters.active_witness`.
 fn parse_and_verify_chain(content: &str) -> Result<DIDWebVHState, String> {
-    validate_did_jsonl(content)?;
-
-    let mut state = DIDWebVHState::default();
-    let mut version = None;
-    for (idx, line) in content.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let entry = LogEntry::deserialize_string(line, version)
-            .map_err(|e| format!("invalid log entry at line {}: {e}", idx + 1))?;
-        version = Some(entry.get_webvh_version());
-        let version_number = entry
-            .get_version_id_fields()
-            .map_err(|e| format!("invalid versionId at line {}: {e}", idx + 1))?
-            .0;
-        state.log_entries_mut().push(LogEntryState {
-            log_entry: entry,
-            version_number,
-            validation_status: LogEntryValidationStatus::NotValidated,
-            validated_parameters: Parameters::default(),
-        });
-    }
+    let mut state = parse_log(content)?;
 
     {
         let entries = state.log_entries_mut();
@@ -560,34 +597,10 @@ pub fn verify_did_log_for_publish(
 /// entry — nothing at all is servable then; `Some(jsonl)` otherwise (either
 /// `content` verbatim, or its servable prefix, verbatim by entry).
 pub fn servable_did_log(content: &str, witness_content: Option<&str>) -> Option<String> {
-    if validate_did_jsonl(content).is_err() {
+    // Not a did:webvh log this function can read: served verbatim (see above).
+    let Ok(mut state) = parse_log(content) else {
         return Some(content.to_string());
-    }
-
-    let mut state = DIDWebVHState::default();
-    let mut version = None;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(entry) = LogEntry::deserialize_string(line, version) else {
-            return Some(content.to_string());
-        };
-        version = Some(entry.get_webvh_version());
-        let Ok((version_number, _)) = entry.get_version_id_fields() else {
-            return Some(content.to_string());
-        };
-        state.log_entries_mut().push(LogEntryState {
-            log_entry: entry,
-            version_number,
-            validation_status: LogEntryValidationStatus::NotValidated,
-            validated_parameters: Parameters::default(),
-        });
-    }
-    if state.log_entries().is_empty() {
-        return Some(content.to_string());
-    }
+    };
 
     let highest_version_number = state
         .log_entries()
@@ -649,31 +662,7 @@ pub fn servable_did_log(content: &str, witness_content: Option<&str>) -> Option<
 /// Walk and validate the chain; returns whether the (current) parameters
 /// configure witnesses.
 fn verify_did_log_chain(content: &str, witness_content: Option<&str>) -> Result<bool, String> {
-    // Re-run the structural parse so callers can use this function
-    // as a single gate. Cheap relative to the proof-verification cost.
-    validate_did_jsonl(content)?;
-
-    let mut state = DIDWebVHState::default();
-    let mut version = None;
-    for (idx, line) in content.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let entry = LogEntry::deserialize_string(line, version)
-            .map_err(|e| format!("invalid log entry at line {}: {e}", idx + 1))?;
-        version = Some(entry.get_webvh_version());
-        let version_number = entry
-            .get_version_id_fields()
-            .map_err(|e| format!("invalid versionId at line {}: {e}", idx + 1))?
-            .0;
-        state.log_entries_mut().push(LogEntryState {
-            log_entry: entry,
-            version_number,
-            validation_status: LogEntryValidationStatus::NotValidated,
-            validated_parameters: Parameters::default(),
-        });
-    }
+    let mut state = parse_log(content)?;
 
     if let Some(raw) = witness_content.filter(|w| !w.trim().is_empty()) {
         let proofs = DIDWebVHState::parse_witness_proofs(raw)
@@ -757,32 +746,8 @@ pub fn verify_log_for_witnessing(
     version_id: &str,
     witness_did: &str,
 ) -> Result<WitnessedLog, WitnessLogRefusal> {
-    validate_did_jsonl(content).map_err(WitnessLogRefusal::InvalidLog)?;
-
-    let mut entries: Vec<LogEntryState> = Vec::new();
-    let mut version = None;
-    for (idx, line) in content.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let entry = LogEntry::deserialize_string(line, version).map_err(|e| {
-            WitnessLogRefusal::InvalidLog(format!("invalid log entry at line {}: {e}", idx + 1))
-        })?;
-        version = Some(entry.get_webvh_version());
-        let version_number = entry
-            .get_version_id_fields()
-            .map_err(|e| {
-                WitnessLogRefusal::InvalidLog(format!("invalid versionId at line {}: {e}", idx + 1))
-            })?
-            .0;
-        entries.push(LogEntryState {
-            log_entry: entry,
-            version_number,
-            validation_status: LogEntryValidationStatus::NotValidated,
-            validated_parameters: Parameters::default(),
-        });
-    }
+    let mut state = parse_log(content).map_err(WitnessLogRefusal::InvalidLog)?;
+    let entries = state.log_entries_mut();
 
     // did:webvh deactivation is itself a log entry, and did:webvh does not
     // exempt it from witnessing (see this function's doc comment) — so the
@@ -1543,7 +1508,9 @@ mod verify_for_publish_tests {
     use didwebvh_rs::witness::{Witness, Witnesses};
     use serde_json::json;
 
-    use super::verify_did_log_for_publish;
+    use super::{
+        LogEntryValidationStatus, parse_log, validate_did_jsonl, verify_did_log_for_publish,
+    };
     use didwebvh_rs::{DIDWebVHState, parameters::Parameters};
 
     /// A `versionTime` comfortably in the past, so a second entry built at
@@ -1749,6 +1716,57 @@ mod verify_for_publish_tests {
             .await
             .expect("second entry");
         verify_did_log_for_publish(&to_jsonl(&state), None, 1).expect("plain republish");
+    }
+
+    /// `parse_log` returns every entry unverified, in order, with its version
+    /// number — and refuses a log whose last entry is not a did:webvh DID.
+    #[tokio::test]
+    async fn parse_log_returns_unverified_entries_and_requires_webvh() {
+        let key = signing_key();
+        let params = Parameters {
+            update_keys: Some(Arc::new(vec![Multibase::new(
+                key.get_public_keymultibase().unwrap(),
+            )])),
+            portable: Some(false),
+            ..Default::default()
+        };
+        let doc = doc_with_key("did:webvh:{SCID}:example.com", &key);
+        let mut state = DIDWebVHState::default();
+        state
+            .create_log_entry(Some(base_time()), &doc, &params, &key)
+            .await
+            .expect("genesis entry");
+        let genesis_doc = state.log_entries().last().unwrap().get_state().clone();
+        state
+            .create_log_entry(
+                Some(base_time() + Duration::seconds(1)),
+                &genesis_doc,
+                &Parameters::default(),
+                &key,
+            )
+            .await
+            .expect("second entry");
+        // A blank line between entries is skipped.
+        let jsonl = to_jsonl(&state).replacen('\n', "\n\n", 1);
+
+        let parsed = parse_log(&jsonl).expect("parses");
+        let entries = parsed.log_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries.iter().map(|e| e.version_number).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|e| matches!(e.validation_status, LogEntryValidationStatus::NotValidated))
+        );
+        assert!(validate_did_jsonl(&jsonl).is_ok());
+
+        // The same log, its last DID rewritten to another method, is refused.
+        let not_webvh = jsonl.replace("did:webvh:", "did:web:");
+        let err = parse_log(&not_webvh).unwrap_err();
+        assert!(err.contains("state.id"), "{err}");
     }
 
     /// A tampered chain is still refused regardless of `previously_published`
