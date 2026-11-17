@@ -73,14 +73,14 @@ pub fn did_key_signer(seed: u8) -> (String, Secret) {
     (did, s)
 }
 
-/// A `DIDCommMessaging` service entry — see `mediator_replication_smoke.rs`'s
-/// `didcomm_service()` for why the endpoint is a placeholder rather than the
-/// mediator's own DID.
-fn didcomm_service_entry() -> PeerService {
+/// A `DIDCommMessaging` service entry naming the mediator by its URL — see
+/// `mediator_replication_smoke.rs`'s `didcomm_service()` for why the URL
+/// rather than the mediator's own DID, and why it must name this mediator.
+fn didcomm_service_entry(mediator_url: &str) -> PeerService {
     PeerService {
         type_: "DIDCommMessaging".into(),
         endpoint: PeerServiceEndpoint::Long(OneOrMany::One(PeerServiceEndpointLong {
-            uri: "urn:mediator:placeholder".into(),
+            uri: mediator_url.into(),
             accept: vec!["didcomm/v2".into()],
             routing_keys: vec![],
         })),
@@ -108,7 +108,7 @@ pub async fn mint_mediator_peer(mediator: &TestMediatorHandle) -> (String, Secre
             (PeerKeyRole::Verification, KeyType::Ed25519),
             (PeerKeyRole::Encryption, KeyType::X25519),
         ],
-        Some(vec![didcomm_service_entry()]),
+        Some(vec![didcomm_service_entry(mediator.endpoint().as_str())]),
     )
     .expect("generate did:peer");
     let mut secrets = secrets.into_iter();

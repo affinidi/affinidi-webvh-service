@@ -613,8 +613,15 @@ impl TransportBoundVerifier {
 
     /// [`Self::with_did_cache`] for a client built with `host_policy` — pass
     /// the same policy given to its `DIDCacheConfigBuilder::with_host_policy`.
+    ///
+    /// The key-decoding resolver screens a signer's host itself (since
+    /// `trust-tasks-proof` 0.38), independently of the client's policy, so it
+    /// is given the same one: under [`HostPolicy::AllowPrivate`] a signer on a
+    /// loopback or private host would otherwise resolve and then be refused
+    /// at decode.
     pub fn with_did_cache_and_host_policy(client: DIDCacheClient, host_policy: HostPolicy) -> Self {
-        let decode = CachedDidResolver::new(Arc::new(client.clone()));
+        let decode = CachedDidResolver::new(Arc::new(client.clone()))
+            .allow_private_hosts(matches!(host_policy, HostPolicy::AllowPrivate));
         let deactivation = Arc::new(DeactivationCache {
             host_policy,
             ..DeactivationCache::default()

@@ -902,7 +902,9 @@ async fn an_uncached_deactivated_webvh_signer_is_refused_as_final() {
     .unwrap();
     let signers = SignerKeyResolver {
         client: client.clone(),
-        decode: CachedDidResolver::new(Arc::new(client)),
+        // Built as `with_did_cache_and_host_policy` builds it for
+        // `AllowPrivate`: the decode step screens hosts on its own.
+        decode: CachedDidResolver::new(Arc::new(client)).allow_private_hosts(true),
         deactivation: Some(Arc::new(DeactivationCache {
             host_policy: HostPolicy::AllowPrivate,
             ..DeactivationCache::default()

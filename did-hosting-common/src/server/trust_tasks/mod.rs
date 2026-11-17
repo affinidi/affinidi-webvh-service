@@ -102,7 +102,7 @@ pub enum TypedInbound {
     ChangeRole(TrustTask<change_role::v0_2::Payload>),
     Show(TrustTask<show::v0_2::Payload>),
     List(TrustTask<list::v0_3::Payload>),
-    Discovery(TrustTask<discovery::v0_3::Payload>),
+    Discovery(TrustTask<discovery::v0_4::Payload>),
 }
 
 /// Every Type URI [`build_dispatcher`] routes — the ACL family this
@@ -117,7 +117,7 @@ pub const ACL_TASK_URIS: &[&str] = &[
     <change_role::v0_2::Payload as Payload>::TYPE_URI,
     <show::v0_2::Payload as Payload>::TYPE_URI,
     <list::v0_3::Payload as Payload>::TYPE_URI,
-    <discovery::v0_3::Payload as Payload>::TYPE_URI,
+    <discovery::v0_4::Payload as Payload>::TYPE_URI,
 ];
 
 /// Build the shared [`Dispatcher`] keyed on each registered Type URI.
@@ -134,7 +134,7 @@ pub fn build_dispatcher() -> Dispatcher<TypedInbound> {
         .on::<change_role::v0_2::Payload, _>(TypedInbound::ChangeRole)
         .on::<show::v0_2::Payload, _>(TypedInbound::Show)
         .on::<list::v0_3::Payload, _>(TypedInbound::List)
-        .on::<discovery::v0_3::Payload, _>(TypedInbound::Discovery)
+        .on::<discovery::v0_4::Payload, _>(TypedInbound::Discovery)
 }
 
 /// What a served Trust Task requires of its proof before its handler runs.
@@ -571,7 +571,7 @@ mod tests {
             change_role::v0_2::Payload::TYPE_URI,
             show::v0_2::Payload::TYPE_URI,
             list::v0_3::Payload::TYPE_URI,
-            discovery::v0_3::Payload::TYPE_URI,
+            discovery::v0_4::Payload::TYPE_URI,
         ] {
             assert!(
                 registered.contains(uri),
@@ -585,6 +585,7 @@ mod tests {
             "acl/list/0.1",
             "acl/list/0.2",
             "trust-task-discovery/0.1",
+            "trust-task-discovery/0.3",
         ] {
             let uri = format!("https://trusttasks.org/spec/{old}");
             assert!(
