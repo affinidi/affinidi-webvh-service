@@ -281,6 +281,67 @@ async fn unlisted_resolutions_time_out() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
+/// The ACL pre-filter runs before any proof work: a stranger's operational
+/// request is refused for the cost of a key lookup, on every transport —
+/// nothing is resolved and no replay cache records it.
+#[tokio::test]
+async fn a_strangers_operational_request_is_refused_before_any_proof_work() {
+    let (mut state, _dir) = state().await;
+    let calls = counting(&mut state, false, default_limits());
+    let web = web_caller("prefiltered", 85);
+    for via in VIAS {
+        let reply = send_signed(&state, via, &web, "did-management/server/config/0.1").await;
+        assert_eq!(code(&reply), "permissionDenied", "{via:?}: {reply}");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(state.replay_cache.is_empty());
+    assert!(state.unlisted_signers.sign_in.is_empty());
+    assert!(state.unlisted_signers.other.is_empty());
+}
+
+/// A session ceremony (`ProofRule::SessionKey`) whose proof is by anything
+/// but a `did:key` is refused by name before its proof is verified — even
+/// from an ACL member — and so before any resolution or replay record.
+#[tokio::test]
+async fn a_session_ceremony_not_signed_by_a_did_key_is_refused_before_verification() {
+    use did_hosting_common::tasks::auth::passkey::login::finish::v0_2 as finish;
+    use trust_tasks_rs::Payload as _;
+
+    let (mut state, _dir) = state().await;
+    let calls = counting(&mut state, false, default_limits());
+    let web = web_caller("ceremony", 86);
+    did_hosting_common::server::acl::store_acl_entry(
+        &state.acl_ks,
+        &did_hosting_common::server::acl::AclEntry {
+            did: web.did.clone(),
+            role: Role::Admin,
+            label: None,
+            created_at: 1_700_000_000,
+            max_total_size: None,
+            max_did_count: None,
+            domains: did_hosting_common::server::domain::DomainScope::All,
+        },
+    )
+    .await
+    .unwrap();
+    let doc = signed(
+        request(finish::Payload::TYPE_URI, &web.did, json!({})),
+        &web.key,
+    )
+    .await;
+    let reply = send(&state, Via::Tsp, &web, doc).await;
+    assert_eq!(code(&reply), "permissionDenied", "{reply}");
+    assert!(
+        reply["payload"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("did:key its session will be bound to")),
+        "{reply}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(state.replay_cache.is_empty());
+    assert!(state.unlisted_signers.sign_in.is_empty());
+}
+
 /// A proxied `auth/authenticate/0.3` from `delegate` for `principal`,
 /// carrying a mandate `mandate_signer` signed naming `named_delegate`.
 async fn proxied(

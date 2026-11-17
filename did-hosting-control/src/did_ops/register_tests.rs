@@ -1417,3 +1417,120 @@ async fn list_dids_surfaces_cached_services() {
         ])
     );
 }
+
+/// Seed `did` as an owner with the given per-account caps.
+async fn seed_capped_owner(
+    state: &AppState,
+    did: &str,
+    max_did_count: Option<u64>,
+    max_total_size: Option<u64>,
+) {
+    use did_hosting_common::server::acl::{AclEntry, store_acl_entry};
+    store_acl_entry(
+        &state.acl_ks,
+        &AclEntry {
+            did: did.into(),
+            role: Role::Owner,
+            label: None,
+            created_at: 0,
+            max_total_size,
+            max_did_count,
+            domains: did_hosting_common::server::domain::DomainScope::All,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// The DID-count quota counts only a fresh slot: at its cap, an owner may
+/// re-register a slot it holds but not claim another, and the refused
+/// register writes nothing — no record, no log, no agent-name index.
+#[tokio::test]
+async fn register_at_the_did_count_cap_refuses_only_a_fresh_slot() {
+    let (state, _dir) = test_state().await;
+    let owner = "did:example:capped";
+    seed_capped_owner(&state, owner, Some(1), None).await;
+
+    let held = build_test_did_log("scid", "control.test", "held").await;
+    register_did_atomic(&owner_auth(owner), &state, "held", &held, false, None)
+        .await
+        .expect("first slot is under the cap");
+    register_did_atomic(&owner_auth(owner), &state, "held", &held, false, None)
+        .await
+        .expect("re-registering a held slot is not a new DID");
+
+    let fresh = build_test_did_log_with_names("control.test", "fresh", &["capped"]).await;
+    let err = register_did_atomic(&owner_auth(owner), &state, "fresh", &fresh, false, None)
+        .await
+        .expect_err("a second slot is over the cap");
+    assert!(
+        matches!(
+            err,
+            AppError::QuotaExceeded {
+                kind: did_hosting_common::server::error::QuotaKind::Count,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        state
+            .dids_ks
+            .get::<DidRecord>(did_key("fresh"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        state
+            .dids_ks
+            .get_raw(content_log_key("fresh"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(index_target(&state, "control.test", "capped").await, None);
+}
+
+/// The size quota counts what the slot will hold, net of what it already
+/// does: a re-register is charged the difference, and a log past the cap
+/// is refused with nothing written.
+#[tokio::test]
+async fn register_charges_the_size_quota_net_of_the_slot() {
+    let (state, _dir) = test_state().await;
+    let owner = "did:example:sized";
+    let log = build_test_did_log("scid", "control.test", "sized").await;
+    let size = log.len() as u64;
+    // Room for this log once, not twice.
+    seed_capped_owner(&state, owner, None, Some(size + size / 2)).await;
+
+    register_did_atomic(&owner_auth(owner), &state, "sized", &log, false, None)
+        .await
+        .expect("under the cap");
+    register_did_atomic(&owner_auth(owner), &state, "sized", &log, false, None)
+        .await
+        .expect("a same-size re-register adds nothing");
+
+    let other = build_test_did_log("scid", "control.test", "other").await;
+    let err = register_did_atomic(&owner_auth(owner), &state, "other", &other, false, None)
+        .await
+        .expect_err("a second log is over the cap");
+    assert!(
+        matches!(
+            err,
+            AppError::QuotaExceeded {
+                kind: did_hosting_common::server::error::QuotaKind::Size,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        state
+            .dids_ks
+            .get::<DidRecord>(did_key("other"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

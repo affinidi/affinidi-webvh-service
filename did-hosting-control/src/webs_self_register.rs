@@ -746,6 +746,26 @@ mod tests {
         }
     }
 
+    /// A self-registration skips the ACL pre-filter but not the replay gate:
+    /// its record goes to the cache for other unlisted signers, never the
+    /// shared one or the sign-in one.
+    #[cfg(feature = "method-webs")]
+    #[tokio::test]
+    async fn a_self_registration_is_recorded_apart_from_members() {
+        let (state, _dir) = enabled(&[]).await;
+        let webs = Webs::incept(40);
+        let caller = webs.caller("");
+        let doc = signed(
+            request(REGISTER, &caller.did, webs.payload("")),
+            &caller.key,
+        )
+        .await;
+        ok(&send(&state, Via::Tsp, &caller, doc).await, REGISTER);
+        assert!(state.replay_cache.is_empty());
+        assert!(state.unlisted_signers.sign_in.is_empty());
+        assert_eq!(state.unlisted_signers.other.len(), 1);
+    }
+
     /// A VTA's own did:webs is a key-role identity (VTI-KEY-173): it signs
     /// with its designated `operational` key, not the key state's. That key
     /// is a verification method only of the document the designations
