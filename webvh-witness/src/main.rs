@@ -245,6 +245,7 @@ async fn main() {
 
     print_banner();
 
+    let config = cli.config;
     match cli.command {
         Some(Command::Setup {
             setup_key_out,
@@ -254,111 +255,65 @@ async fn main() {
             force_reprovision,
             non_interactive: _,
         }) => {
-            if let Some(path) = setup_key_out {
-                if let Err(e) = setup::run_setup_phase1(&path, &context).await {
-                    eprintln!("Setup error: {e}");
-                    std::process::exit(1);
-                }
-            } else if let Some(recipe_path) = from {
-                match setup_recipe::run_from_recipe(&recipe_path, setup_key_file, force_reprovision)
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(e) => {
-                        eprintln!("Setup error: {e}");
-                        std::process::exit(setup_recipe::map_exit_code(&e));
-                    }
-                }
-            } else if let Err(e) = setup::run_wizard(cli.config, setup_key_file).await {
-                eprintln!("Setup error: {e}");
-                std::process::exit(1);
-            }
+            run_setup_command(
+                config,
+                setup_key_out,
+                setup_key_file,
+                &context,
+                from,
+                force_reprovision,
+            )
+            .await
         }
         Some(Command::Uninstall { yes }) => {
-            let config_path = cli
-                .config
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("config.toml"));
-            if let Err(e) = setup_recipe::run_uninstall(&config_path, yes).await {
-                eprintln!("Uninstall error: {e}");
-                std::process::exit(1);
-            }
+            let config_path = config.unwrap_or_else(|| PathBuf::from("config.toml"));
+            or_exit(
+                "Uninstall error",
+                setup_recipe::run_uninstall(&config_path, yes).await,
+            );
         }
         Some(Command::Health { strict }) => {
             let code = did_hosting_common::server::health::finish(
-                health::run_health(cli.config).await,
+                health::run_health(config).await,
                 strict,
             );
             std::process::exit(code);
         }
         Some(Command::AddAcl { did, role }) => {
-            if let Err(e) = run_add_acl(cli.config, did, role).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+            or_exit("Error", run_add_acl(config, did, role).await);
         }
-        Some(Command::ListAcl) => {
-            if let Err(e) = run_list_acl(cli.config).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::RemoveAcl { did }) => {
-            if let Err(e) = run_remove_acl(cli.config, did).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
+        Some(Command::ListAcl) => or_exit("Error", run_list_acl(config).await),
+        Some(Command::RemoveAcl { did }) => or_exit("Error", run_remove_acl(config, did).await),
         Some(Command::CreateWitness { label }) => {
-            if let Err(e) = run_create_witness(cli.config, label).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+            or_exit("Error", run_create_witness(config, label).await);
         }
-        Some(Command::ListWitnesses) => {
-            if let Err(e) = run_list_witnesses(cli.config).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
+        Some(Command::ListWitnesses) => or_exit("Error", run_list_witnesses(config).await),
         Some(Command::DeleteWitness { id }) => {
-            if let Err(e) = run_delete_witness(cli.config, id).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+            or_exit("Error", run_delete_witness(config, id).await);
         }
         Some(Command::ResetWitnessKekClaim) => {
-            if let Err(e) = run_reset_witness_kek_claim(cli.config).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+            or_exit("Error", run_reset_witness_kek_claim(config).await);
         }
-        Some(Command::SetupOfflinePrepare { request, state }) => {
-            if let Err(e) = setup::run_setup_offline_prepare(cli.config, request, state).await {
-                eprintln!("Setup error: {e}");
-                std::process::exit(1);
-            }
-        }
+        Some(Command::SetupOfflinePrepare { request, state }) => or_exit(
+            "Setup error",
+            setup::run_setup_offline_prepare(config, request, state).await,
+        ),
         Some(Command::SetupOfflineComplete {
             bundle,
             expect_digest,
             state,
-        }) => {
-            if let Err(e) = setup::run_setup_offline_complete(bundle, expect_digest, state).await {
-                eprintln!("Setup error: {e}");
-                std::process::exit(1);
-            }
-        }
+        }) => or_exit(
+            "Setup error",
+            setup::run_setup_offline_complete(bundle, expect_digest, state).await,
+        ),
         Some(Command::ExportSealed {
             request,
             out,
             digest_out,
-        }) => {
-            if let Err(e) = run_export_sealed(cli.config, request, out, digest_out).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
+        }) => or_exit(
+            "Error",
+            run_export_sealed(config, request, out, digest_out).await,
+        ),
         Some(Command::ImportSealed {
             bundle,
             expect_digest,
@@ -366,9 +321,10 @@ async fn main() {
             producer_pubkey,
             jwt_key,
             force,
-        }) => {
-            if let Err(e) = run_import_sealed(
-                cli.config,
+        }) => or_exit(
+            "Error",
+            run_import_sealed(
+                config,
                 bundle,
                 expect_digest,
                 seed,
@@ -376,41 +332,18 @@ async fn main() {
                 jwt_key,
                 force,
             )
-            .await
-            {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
+            .await,
+        ),
         Some(Command::VtaRequest {
             out,
             seed,
             label,
             mediator_did,
             context,
-        }) => {
-            // The witness DID is DIDComm-only (`did-hosting-server` template,
-            // MEDIATOR_DID only — no hosting URL).
-            let shape = did_hosting_common::server::vta_setup::WebvhDidShape::DidcommOnly {
-                mediator_did: mediator_did.as_str(),
-            };
-            let ask = did_hosting_common::server::vta_setup::build_webvh_provision_ask(
-                &context,
-                &shape,
-                Some(&label),
-            );
-            if let Err(e) = did_hosting_common::server::vta_setup::run_offline_request_cli(
-                &out,
-                &seed,
-                "webvh-witness",
-                &ask,
-            )
-            .await
-            {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
+        }) => or_exit(
+            "Error",
+            run_vta_request(&out, &seed, &label, &mediator_did, &context).await,
+        ),
         Some(Command::VtaOpen {
             bundle,
             expect_digest,
@@ -418,8 +351,9 @@ async fn main() {
             did_doc_out,
             did_log_out,
             secrets_out,
-        }) => {
-            if let Err(e) = did_hosting_common::server::vta_setup::run_offline_open_cli(
+        }) => or_exit(
+            "Error",
+            did_hosting_common::server::vta_setup::run_offline_open_cli(
                 &bundle,
                 &expect_digest,
                 &seed,
@@ -429,13 +363,64 @@ async fn main() {
                 did_hosting_common::server::vta_setup::OfflineOpenNextStep::Setup {
                     binary: "webvh-witness",
                 },
-            ) {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        None => run_server(cli.config).await,
+            ),
+        ),
+        None => run_server(config).await,
     }
+}
+
+/// Print `{context}: {error}` and exit non-zero when `result` failed.
+fn or_exit<E: std::fmt::Display>(context: &str, result: Result<(), E>) {
+    if let Err(e) = result {
+        eprintln!("{context}: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// `setup`: headless phase 1 (`--setup-key-out`), a recipe (`--from`, whose
+/// failure picks the exit code), or the interactive wizard.
+async fn run_setup_command(
+    config: Option<PathBuf>,
+    setup_key_out: Option<PathBuf>,
+    setup_key_file: Option<PathBuf>,
+    context: &str,
+    from: Option<PathBuf>,
+    force_reprovision: bool,
+) {
+    if let Some(path) = setup_key_out {
+        or_exit("Setup error", setup::run_setup_phase1(&path, context).await);
+    } else if let Some(recipe_path) = from {
+        if let Err(e) =
+            setup_recipe::run_from_recipe(&recipe_path, setup_key_file, force_reprovision).await
+        {
+            eprintln!("Setup error: {e}");
+            std::process::exit(setup_recipe::map_exit_code(&e));
+        }
+    } else {
+        or_exit(
+            "Setup error",
+            setup::run_wizard(config, setup_key_file).await,
+        );
+    }
+}
+
+/// `vta-request`: the witness DID is DIDComm-only (`did-hosting-server`
+/// template, MEDIATOR_DID only — no hosting URL).
+async fn run_vta_request(
+    out: &std::path::Path,
+    seed: &std::path::Path,
+    label: &str,
+    mediator_did: &str,
+    context: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shape = did_hosting_common::server::vta_setup::WebvhDidShape::DidcommOnly { mediator_did };
+    let ask = did_hosting_common::server::vta_setup::build_webvh_provision_ask(
+        context,
+        &shape,
+        Some(label),
+    );
+    did_hosting_common::server::vta_setup::run_offline_request_cli(out, seed, "webvh-witness", &ask)
+        .await
 }
 
 async fn run_add_acl(
