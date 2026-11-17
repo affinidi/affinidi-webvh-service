@@ -194,6 +194,9 @@ async fn claim_evicted(
 /// A session whose `last_seen` predates the field (`0`) falls back to
 /// `created_at`, so rows written before idle tracking existed are judged
 /// from when they began rather than being refused outright.
+///
+/// Logged here at `info`, once, and the caller adds no line of its own: a
+/// session idling out is the policy working, not a suspicious request.
 pub(crate) fn refuse_if_idle_session(
     session: &did_hosting_common::server::auth::session::Session,
     idle_ttl: u64,
@@ -207,7 +210,7 @@ pub(crate) fn refuse_if_idle_session(
     };
     let idle_for = now_epoch().saturating_sub(last_activity);
     if idle_for > idle_ttl {
-        warn!(
+        tracing::info!(
             session_id = %session.session_id,
             did = %session.did,
             idle_for,

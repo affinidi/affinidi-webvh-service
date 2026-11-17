@@ -843,6 +843,43 @@ async fn refresh_past_the_absolute_lifetime_is_refused() {
     );
 }
 
+/// A session idle past `auth.admin_idle_timeout` refuses refresh with a
+/// non-retryable `permissionDenied` — the signal a browser reads as "this
+/// session is over, stop renewing" — and keeps refusing it: re-issuing the
+/// same renewal never succeeds.
+#[tokio::test]
+async fn refresh_of_an_idle_session_is_refused_terminally() {
+    let h = harness().await;
+    let (principal, delegate, session_key) = (key(30), key(31), key(32));
+
+    let (refresh_token, _, session_id) =
+        proxied_login_binding_session_key(&h, &principal, &delegate, &session_key).await;
+
+    let idle_ttl = h.state.config.auth.admin_idle_timeout;
+    let mut session =
+        did_hosting_common::server::auth::session::get_session(&h.state.sessions_ks, &session_id)
+            .await
+            .expect("read session")
+            .expect("session exists");
+    session.last_seen = now_secs() - idle_ttl - 60;
+    did_hosting_common::server::auth::session::store_session(&h.state.sessions_ks, &session)
+        .await
+        .expect("store session");
+
+    for _ in 0..2 {
+        let d = sign(
+            refresh_doc(&refresh_token, &session_key.did),
+            &session_key,
+            "authentication",
+        )
+        .await;
+        let (status, body) = post(&h, &d).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(code(&body), "permissionDenied", "{body}");
+        assert_eq!(body["payload"]["retryable"], json!(false), "{body}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Logout (`auth/revoke-session/0.2`) on a proxied session
 // ---------------------------------------------------------------------------
