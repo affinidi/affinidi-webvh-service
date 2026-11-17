@@ -5,7 +5,6 @@
  * with the same API, so the page can switch to the package once a version
  * with the `./browser` entry is published (0.2.0 on npm has none). Swap by
  * replacing this import; nothing else in the page should change.
- * TODO: replace with `@openvtc/rp-sdk/browser` once published.
  *
  * Differences from the reference that are deliberate, because contract C9 and
  * the `auth/oob/*` schemas fixed them after it was written:

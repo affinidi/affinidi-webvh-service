@@ -1,3 +1,9 @@
+//! Shared service plumbing for every DID hosting binary: configuration,
+//! storage, the ACL and auth, Trust Task dispatch and its transports
+//! (HTTPS, DIDComm, TSP), the service's own identity, domains, migrations,
+//! stats and the CLI subcommands the binaries share. Only compiled with the
+//! `server-core` feature; unstable, public so the binaries can compose it.
+
 pub mod acl;
 pub mod acl_removal;
 pub mod agent_name_index;
@@ -52,10 +58,8 @@ pub mod store;
 // Background work as data, and the supervisor that runs and stops it.
 #[cfg(feature = "server-core")]
 pub mod supervise;
-// New trust-tasks framework integration (SPEC.md 0.1). Gated behind
-// `server-core` because the dispatcher only runs on the server side;
-// the client crate (no trust-tasks admin surface yet) doesn't compile
-// it in.
+// The Trust Tasks framework integration: dispatch, proof verification,
+// the sender-bound gate and outbound sends.
 #[cfg(feature = "server-core")]
 pub mod trust_tasks;
 // The Trust Tasks TSP binding envelope: reading whichever dialect a frame
@@ -157,8 +161,9 @@ pub async fn security_headers(
 /// safe methods are allowed.
 ///
 /// This is deliberately permissive but safe: credentials are never reflected
-/// (wildcard origin forbids `Access-Control-Allow-Credentials: true`), and the
-/// management API authenticates with bearer JWTs rather than cookies — so a
+/// (wildcard origin forbids `Access-Control-Allow-Credentials: true`), and
+/// management (`POST /api/trust-tasks`) authenticates with signed documents
+/// and bearer JWTs rather than cookies — so a
 /// wildcard origin grants a cross-origin page nothing it could not already
 /// fetch server-to-server, while still blocking it from reading authenticated
 /// responses it has no token for.

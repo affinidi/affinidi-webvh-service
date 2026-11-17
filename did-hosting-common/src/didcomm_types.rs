@@ -25,8 +25,7 @@ pub const MSG_SERVER_REGISTER: &str =
 pub const MSG_SERVER_REGISTER_ACK: &str =
     "https://trusttasks.org/spec/did-management/server/register/0.2#response";
 /// The `ext` namespace (SPEC §4.5.1) a server's register payload carries this
-/// service's hints under: `trust_task_capable`, `sync_batch` and
-/// `preloaded_dids`. A control plane that does not know a hint ignores it.
+/// service's hints under: `sync_batch` and `preloaded_dids`. A control plane that does not know a hint ignores it.
 pub const REGISTER_EXT_NAMESPACE: &str = "com.affinidi.did-hosting";
 
 // ---------------------------------------------------------------------------

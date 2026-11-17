@@ -1,7 +1,7 @@
 //! DID method abstraction — one contract every supported `did:*`
 //! method implements.
 //!
-//! Per `docs/multi-method-hosting-spec.md` §6. The hosting service was
+//! Per `docs/archive/multi-method-hosting-spec.md` §6. The hosting service was
 //! historically webvh-only; this module makes it method-agnostic so
 //! `did:web`, `did:webvh`, and future HTTPS-delivered methods can be
 //! served from the same infrastructure.
@@ -27,7 +27,7 @@
 //! [`method_by_name`] resolves the per-method `&'static dyn DidMethod`
 //! at compile time via `#[cfg(feature = "method-...")]`. Disabling a
 //! method's feature removes its arm from the dispatcher (and its
-//! resolution route from the router — see T25). The default workspace
+//! resolution route from the router). The default workspace
 //! build enables `method-webvh` + `method-web`. `method-webs` is
 //! implemented but **off by default**: it pulls the KERI stack, which
 //! an operator hosting no `did:webs` DIDs should not carry.
@@ -36,7 +36,7 @@
 //! ## Picking a method for an incoming publication
 //!
 //! [`method_by_name`] answers "is this method compiled in", which is
-//! what a request naming a method needs. The management API's request
+//! what a request naming a method needs. The `did/register` request
 //! body carries content rather than a method name, so it uses
 //! [`detect_method`] instead — the payload's own shape decides, and a
 //! caller cannot mislabel a payload into the wrong verifier.
@@ -62,7 +62,7 @@ pub use parse::parse_did_method;
 /// associated functions at the call site.
 ///
 /// Required behaviour per impl is documented in
-/// `docs/multi-method-hosting-spec.md` §6.1.
+/// `docs/archive/multi-method-hosting-spec.md` §6.1.
 pub trait DidMethod: Send + Sync + 'static {
     /// Canonical method name as it appears in `did:{name}:...`.
     /// E.g. `"webvh"`, `"web"`. Lowercase, no punctuation.
@@ -118,7 +118,7 @@ pub struct ParsedDid {
     pub scid: Option<String>,
 
     /// Hostname portion of the DID. Normalised: lowercase + IDNA
-    /// per T15 (multi-domain).
+    /// (`crate::server::domain::normalize`).
     pub domain: String,
 
     /// Path portion of the DID. Multi-segment paths are joined with
@@ -173,10 +173,7 @@ pub enum MethodError {
 /// compiled into the binary (gated by `#[cfg(feature = "method-...")]`).
 /// Returns `None` for unknown names AND for known methods whose feature
 /// is disabled — callers can't tell the difference and shouldn't need
-/// to. Both cases route to the same 400 response upstream.
-///
-/// In T10 this dispatcher is intentionally empty. T11 adds the webvh
-/// arm; T24 adds the web arm.
+/// to. Both cases get the same validation refusal upstream.
 #[allow(clippy::needless_return)] // future arms make this expression-form
 pub fn method_by_name(name: &str) -> Option<&'static dyn DidMethod> {
     // Static refs to zero-size unit-struct impls. `dyn DidMethod`
@@ -201,7 +198,8 @@ pub fn method_by_name(name: &str) -> Option<&'static dyn DidMethod> {
 }
 
 /// Enabled methods, in declaration order. Used by the daemon's startup
-/// log, by `/api/config`, and by the UI's method-selector dropdown
+/// log, by the `server/config` Trust Task, by a server's registration,
+/// and by the UI's method-selector dropdown
 /// (which renders the same order).
 ///
 /// Compile-time-constructed via const-fn-style match arms — disabling a
@@ -223,7 +221,7 @@ pub fn enabled_methods() -> &'static [&'static str] {
 /// Infer which method a submitted publication belongs to, from the
 /// bytes alone.
 ///
-/// The management API's request body carries the content, not the
+/// The `did/register` request body carries the content, not the
 /// method, and the method has to be known before anything can verify
 /// it. Rather than trust a caller-supplied label — which could name one
 /// method for a payload that is really another, and so pick a verifier
@@ -287,7 +285,7 @@ mod tests {
 
     /// A test-only no-op impl proves the trait is object-safe — i.e.
     /// you can construct a `&'static dyn DidMethod` from a zero-size
-    /// unit struct. The real impls (`Web`, `Webvh`) ship in T11/T24.
+    /// unit struct, independent of which real impls are compiled in.
     struct NoopMethod;
     impl DidMethod for NoopMethod {
         fn name(&self) -> &'static str {

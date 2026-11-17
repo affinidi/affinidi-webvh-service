@@ -763,9 +763,9 @@ async fn the_edge_router_serves_resolution_and_no_management_surface() {
     for (method, uri) in [
         ("POST", "/api/auth/challenge"),
         ("POST", "/api/auth/"),
-        ("GET", "/api/dids"),
-        ("PUT", "/api/dids/mediator"),
-        ("DELETE", "/api/dids/mediator"),
+        ("GET", "/api/dids"),             // retired-name-ok
+        ("PUT", "/api/dids/mediator"),    // retired-name-ok
+        ("DELETE", "/api/dids/mediator"), // retired-name-ok
         ("PUT", "/api/witness/mediator"),
         ("GET", "/api/log/mediator"),
         ("GET", "/api/raw/mediator"),

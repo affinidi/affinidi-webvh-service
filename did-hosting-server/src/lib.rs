@@ -5,10 +5,11 @@
 //! Every module below is `pub` because `did-hosting-daemon` (and `did-hosting-server`'s
 //! own binary) consume them as if this crate were an internal library.
 //! Treat the public surface as **unstable** while the workspace is pre-1.0:
-//! breaking changes can land in any minor version. Pin internal deps with a
-//! `major.minor` constraint (`= "0.6"`) so a `0.7` cycle that narrows the
-//! API doesn't surprise you. The thin, semver-stable consumer-facing
-//! surface lives in `did-hosting-common` (DID types, request/response
+//! breaking changes can land in any minor version. Pin internal deps to the
+//! release's `major.minor` (a plain `"<major>.<minor>"` requirement, which
+//! for a pre-1.0 crate admits only that minor's patches) so the next minor
+//! cycle narrowing the API doesn't surprise you. The thin, semver-stable
+//! consumer-facing surface lives in `did-hosting-common` (DID types, request/response
 //! shapes, shared auth primitives).
 
 pub mod backup;

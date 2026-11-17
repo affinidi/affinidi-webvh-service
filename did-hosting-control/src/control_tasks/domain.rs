@@ -15,8 +15,8 @@ use did_hosting_common::server::pending_purge;
 use trust_tasks_rs::DeclaredErrorCode;
 
 use super::{Cx, TaskError, typed};
-use crate::error::AppError;
 use crate::server::{AppState, CacheChange};
+use did_hosting_common::server::error::AppError;
 
 /// Tell a cache of domain state in this process (the daemon's resolution
 /// gate) that a domain changed. Call after every commit that writes a

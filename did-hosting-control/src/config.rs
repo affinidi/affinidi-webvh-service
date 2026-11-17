@@ -1,4 +1,7 @@
-use crate::error::AppError;
+//! The control plane's `config.toml`: [`AppConfig`] and its registry, limits
+//! and stats sections, loaded from file with environment overrides.
+
+use did_hosting_common::server::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -45,7 +48,7 @@ pub struct AppConfig {
     /// deployments where one fjall directory backs both processes).
     #[serde(default)]
     pub hosting: HostingConfig,
-    /// Trust Tasks (v0.7.0+) configuration.
+    /// Trust Tasks configuration.
     #[serde(default)]
     pub trust_tasks: TrustTasksConfig,
     /// How the service's own identity is produced, and how long a superseded

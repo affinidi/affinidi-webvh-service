@@ -451,14 +451,14 @@ mod tests {
         r.secrets.vault_addr = Some("https://vault.example.com:8200".into());
         r.secrets.vault_k8s_role = Some("did-hosting-server".into());
         // vault_secret_path omitted → defaults to the secret name.
-        let cfg = resolve_secrets_config(&r, "webvh-server-secrets", "webvh");
+        let cfg = resolve_secrets_config(&r, "webvh-server-secrets", "webvh"); // retired-name-ok: a test secret name
         assert_eq!(
             cfg.vault_addr.as_deref(),
             Some("https://vault.example.com:8200")
         );
         assert_eq!(
             cfg.vault_secret_path.as_deref(),
-            Some("webvh-server-secrets")
+            Some("webvh-server-secrets") // retired-name-ok: a test secret name
         );
         assert_eq!(cfg.vault_k8s_role.as_deref(), Some("did-hosting-server"));
         // Untouched fields keep their SecretsConfig defaults.
@@ -471,8 +471,8 @@ mod tests {
         let mut r = fixture(ServiceKind::Server);
         r.secrets.backend = Some(SecretsBackend::K8s);
         r.secrets.k8s_namespace = Some("webvh".into());
-        let cfg = resolve_secrets_config(&r, "webvh-server-secrets", "webvh");
-        assert_eq!(cfg.k8s_secret_name.as_deref(), Some("webvh-server-secrets"));
+        let cfg = resolve_secrets_config(&r, "webvh-server-secrets", "webvh"); // retired-name-ok: a test secret name
+        assert_eq!(cfg.k8s_secret_name.as_deref(), Some("webvh-server-secrets")); // retired-name-ok: a test secret name
         assert_eq!(cfg.k8s_namespace.as_deref(), Some("webvh"));
         assert_eq!(cfg.k8s_secret_key, "seed");
     }

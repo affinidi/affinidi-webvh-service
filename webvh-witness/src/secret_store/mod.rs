@@ -1,4 +1,6 @@
-// Re-export from did-hosting-common shared server infrastructure
+//! Secret storage: the shared backends from
+//! `did_hosting_common::server::secret_store`, built from this crate's config.
+
 pub use did_hosting_common::server::secret_store::*;
 
 use crate::config::AppConfig;

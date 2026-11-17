@@ -1,4 +1,4 @@
-//! Server-side domain DID purge (T30 pass 2).
+//! Server-side domain DID purge.
 //!
 //! Removes every DID record whose `record.domain == target_domain`
 //! from the local store. Used by two callers:
@@ -6,7 +6,8 @@
 //! 1. The background grace-expired sweep (60s tick) consumes ripe
 //!    entries from [`super::pending_purge`] and calls this function
 //!    with `reason = "grace-expired"`.
-//! 2. The admin "Purge now" Trust Task (`domain/purge/1.0`) bypasses
+//! 2. The control plane's immediate purge (`replica/domain/purge/0.1`,
+//!    sent for an admin's `registry/purge-domain` or `domain/purge`) bypasses
 //!    the grace and calls this function directly with
 //!    `reason = "admin-immediate"`.
 //!
@@ -14,8 +15,8 @@
 //!
 //! Only DID records tagged with the *exact* `target_domain` are
 //! deleted. Records on other domains are untouched. The match is
-//! against the `domain` field set by T12's record-shape extension +
-//! T13's M-01 migration; records without a `domain` (legacy or
+//! against the `DidRecord.domain` field (filled for older records by
+//! the M-01 migration); records without a `domain` (legacy or
 //! unmigrated) are skipped with a warn-log — operators should run
 //! the M-01 migration before relying on this function for full
 //! coverage.

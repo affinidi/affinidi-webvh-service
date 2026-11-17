@@ -1,3 +1,6 @@
+//! `backup` / `restore`: dump the edge's keyspaces (and its config) to a
+//! versioned JSON file, and load one back, older backup versions included.
+
 use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::store::{RawKvPair, Store};

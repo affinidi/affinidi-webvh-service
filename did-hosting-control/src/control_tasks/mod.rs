@@ -45,10 +45,10 @@ use did_hosting_common::did_ops::DidRecord;
 use did_hosting_common::server::error::{AgentNameError, ValidationKind};
 use did_hosting_common::server::trust_tasks::{DispatchOutcome, ProofRule, run_pipeline};
 
-use crate::acl::check_acl;
 use crate::auth::AuthClaims;
-use crate::error::AppError;
 use crate::server::AppState;
+use did_hosting_common::server::acl::check_acl;
+use did_hosting_common::server::error::AppError;
 
 pub(crate) mod agent_name;
 pub(crate) mod auth;
@@ -385,7 +385,6 @@ where
                         == crate::webs_self_register::SELF_REGISTER_TYPE_URI
                 }),
                 proof_vm: doc.proof.as_ref().map(|p| p.verification_method.clone()),
-                proof_created: doc.proof.as_ref().map(|p| p.created),
                 via: did_hosting_common::server::didcomm_profile::ObservedTransport::from_binding_uri(
                     transport.binding_uri(),
                 ),
@@ -416,17 +415,12 @@ pub(crate) struct Cx<'a> {
     pub self_certified: Option<&'a crate::webs_self_register::SelfCertifiedWebs>,
     /// The request proof's `verificationMethod`, when it carried a proof.
     pub proof_vm: Option<String>,
-    /// The request proof's `created`, when it carried a proof.
-    #[allow(dead_code)]
-    pub proof_created: Option<chrono::DateTime<chrono::Utc>>,
     /// The transport the request arrived on, when it is one this service knows.
-    #[allow(dead_code)]
     pub via: Option<did_hosting_common::server::didcomm_profile::ObservedTransport>,
 }
 
 impl Cx<'_> {
     /// The proven caller, or `permissionDenied` when there is none.
-    #[allow(dead_code)] // the next stage's public reads use it
     pub fn caller(&self) -> Result<&str, TaskError> {
         self.caller.as_deref().ok_or_else(|| {
             TaskError::Standard(
@@ -468,7 +462,7 @@ impl Cx<'_> {
     /// administrator.
     pub async fn admin(&self) -> Result<AuthClaims, TaskError> {
         let auth = self.auth().await?;
-        if auth.role != crate::acl::Role::Admin {
+        if auth.role != did_hosting_common::server::acl::Role::Admin {
             return Err(TaskError::Standard(
                 StandardCode::PermissionDenied,
                 "this task requires administrator standing".into(),
@@ -487,7 +481,7 @@ impl Cx<'_> {
     /// general task surface ([`Cx::auth`]) rejects it — so it reads the claims
     /// via the unrestricted [`Cx::authenticated_claims`] rather than `auth`.
     pub async fn metrics_read(&self) -> Result<AuthClaims, TaskError> {
-        use crate::acl::Role;
+        use did_hosting_common::server::acl::Role;
         let auth = self.authenticated_claims().await?;
         if !matches!(auth.role, Role::Admin | Role::MetricsReader) {
             return Err(TaskError::Standard(
@@ -510,7 +504,7 @@ impl Cx<'_> {
     /// every authenticated task, and not in the store.
     pub async fn auth(&self) -> Result<AuthClaims, TaskError> {
         let auth = self.authenticated_claims().await?;
-        if auth.role == crate::acl::Role::MetricsReader {
+        if auth.role == did_hosting_common::server::acl::Role::MetricsReader {
             return Err(TaskError::Standard(
                 StandardCode::PermissionDenied,
                 "a metrics-reader credential is not valid for this task".into(),

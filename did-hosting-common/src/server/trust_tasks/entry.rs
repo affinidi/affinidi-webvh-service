@@ -245,7 +245,7 @@ impl SpecAclEntry {
     /// Project a local [`AclEntry`](crate::server::acl::AclEntry) onto the AclEntry 0.2 wire shape.
     ///
     /// `created_at` is converted from epoch seconds to RFC3339; `0` — the
-    /// legacy "no timestamp" sentinel some pre-v0.7 entries carry — surfaces
+    /// legacy "no timestamp" sentinel some older entries carry — surfaces
     /// as `None` rather than the Unix epoch.
     pub fn from_local(entry: &LocalAclEntry, signing_oracle: bool) -> Self {
         let default_domain = match &entry.domains {

@@ -1,8 +1,8 @@
 //! Combined public-DID fallback that walks each compiled-in method's
 //! resolver in priority order (T25).
 //!
-//! At compile time the daemon may have `method-webvh`, `method-web`,
-//! both, or (in the future) neither. Each enabled method's
+//! At compile time any subset of `method-webvh`, `method-webs` and
+//! `method-web` may be on. Each enabled method's
 //! `dispatch(state, parts)` is called in turn; the first method that
 //! recognises the URL returns its response, and we stop there. If no
 //! method matches, the fallback returns 404 (or, in the daemon's
@@ -76,9 +76,10 @@ pub async fn serve_public(State(state): State<AppState>, request: Request) -> Re
     // here and shared by every dispatcher below.
     let lookup = super::resolve_shared::Lookup::new(&state, &parts);
 
-    // Order matters when methods share suffixes; today they don't, but
-    // the iteration is encoded explicitly anyway so the priority is
-    // visible at the call site rather than buried in router config.
+    // Order matters: did:webs and did:web both serve `/did.json` (see the
+    // module docs), so the iteration is encoded explicitly and the
+    // priority is visible at the call site rather than buried in router
+    // config.
 
     #[cfg(feature = "method-webvh")]
     {
@@ -103,9 +104,8 @@ pub async fn serve_public(State(state): State<AppState>, request: Request) -> Re
         }
     }
 
-    // Silence the unused-binding warning when no method features are
-    // on. The build with both features off is rejected at the crate
-    // level by `compile_error!` in `lib.rs` (added below).
+    // Silence the unused-binding warning when no method feature is on
+    // (every URL then falls through to the 404 below).
     let _ = &lookup;
     let _ = &parts;
 

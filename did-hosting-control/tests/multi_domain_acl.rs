@@ -1,7 +1,6 @@
-//! T35: domain + method end-to-end integration test.
+//! Domain + method end-to-end integration test.
 //!
-//! Pins the spec §3 cross-cutting invariants the rollout has been
-//! building toward:
+//! Pins the multi-domain spec §3 cross-cutting invariants:
 //!
 //! 1. An `Owner` with `Allowed([a])` (no default) registering on
 //!    domain-b is rejected — 403 from the ACL-domain safety check.
@@ -15,11 +14,9 @@
 //!    step has completed correctly — the failure mode tells us we
 //!    got past the gate.
 //!
-//! Full webvh + did:web round-trip with real proof signing is the
-//! domain of the broader integration suite tracked in
-//! `did-hosting-server/tests/multi_method_multi_domain.rs` (still
-//! pending — needs a working in-process mediator fixture). The
-//! tests here exercise the new T34 resolution gate without that
+//! A full webvh + did:web round-trip with real proof signing needs
+//! a working in-process mediator fixture. The tests here exercise the
+//! domain-resolution gate (`resolve_request_domain`) without that
 //! transport dependency.
 
 use std::path::PathBuf;
@@ -33,10 +30,10 @@ use did_hosting_common::server::config::{
 use did_hosting_common::server::domain::{
     DomainEntry, DomainScope, DomainStatus, DomainUrlScheme, create_domain, set_default_domain,
 };
+use did_hosting_common::server::error::AppError;
 use did_hosting_common::server::store::Store;
 use did_hosting_control::auth::AuthClaims;
 use did_hosting_control::config::{AppConfig, RegistryConfig};
-use did_hosting_control::error::AppError;
 use did_hosting_control::server::AppState;
 
 async fn make_state() -> (AppState, tempfile::TempDir) {
@@ -138,7 +135,7 @@ fn auth(did: &str) -> AuthClaims {
 /// and reaches the host-equality safety check, but won't pass the
 /// downstream verifier. That's enough to observe whether the
 /// resolve-domain step succeeded: a 400 from `resolve_request_domain`
-/// (T34) returns before the verifier; a Validation from elsewhere
+/// returns before the verifier; a Validation from elsewhere
 /// (e.g. malformed jsonl) means we got past it.
 fn req(path: &str, domain_field: Option<&str>) -> DidRegisterRequest {
     DidRegisterRequest {
@@ -189,15 +186,15 @@ async fn allowed_owner_on_authorised_domain_passes_resolve_gate() {
     .await
     .expect_err("the payload is intentionally malformed → must fail downstream");
 
-    // Failure must NOT be the T34 domain-resolution rejection
-    // (which would have happened earlier, in the REST handler).
+    // Failure must NOT be the domain-resolution rejection
+    // (which would have happened earlier, in the Trust Task row).
     // The downstream verifier surfaces Validation with a webvh-
     // specific message instead.
     match err {
         AppError::Validation { message: msg, .. } => {
             assert!(
                 !msg.contains("caller's ACL scope has no default"),
-                "expected downstream verifier failure, got T34 reject: {msg}"
+                "expected downstream verifier failure, got the domain-resolution reject: {msg}"
             );
         }
         other => {
@@ -212,7 +209,7 @@ async fn allowed_owner_on_authorised_domain_passes_resolve_gate() {
 /// `Allowed([a.example])` Owner posting to b.example via the
 /// safety check primitive directly. The DID's embedded host is
 /// b.example but the caller's ACL only allows a.example — the
-/// `assert_acl_allows_host` primitive (T20b) returns 403.
+/// `assert_acl_allows_host` primitive returns 403.
 ///
 /// The full end-to-end via `register_did_atomic` would also hit
 /// this — but the verifier validates the webvh proof chain before
@@ -255,7 +252,7 @@ async fn allowed_owner_on_unauthorised_domain_returns_403() {
 }
 
 /// `AllowedWithDefault([a,b], default=a)` Owner with no explicit
-/// `domain` field in the request. T34's resolver returns the ACL
+/// `domain` field in the request. The resolver returns the ACL
 /// default. Beyond the resolver, the payload's embedded host must
 /// match the resolved domain; the resolver's job ends here.
 #[tokio::test]
@@ -285,7 +282,7 @@ async fn allowed_with_default_owner_resolves_to_acl_default() {
     assert_eq!(err, DomainResolveError::NoDefault);
 }
 
-/// Cross-method isolation: T21's resolve-side check rejects a
+/// Cross-method isolation: the resolve-side check rejects a
 /// request for `did:web:b.example:alpha` arriving on a.example,
 /// and vice versa. Pins that the safety check doesn't accidentally
 /// match across DID methods on the same host.

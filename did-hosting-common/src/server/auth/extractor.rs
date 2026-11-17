@@ -1,3 +1,6 @@
+//! Axum extractors for an authenticated request ([`AuthClaims`] and the
+//! role-gated wrappers), backed by the bearer session.
+
 use std::sync::Arc;
 
 use axum::extract::FromRequestParts;

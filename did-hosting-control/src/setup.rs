@@ -5,19 +5,19 @@
 //! the air-gapped case where the VTA is reachable only by ferrying
 //! a sealed bootstrap bundle.
 
-use crate::acl::{AclEntry, Role};
 use crate::auth::session::now_epoch;
 use crate::config::{
     AppConfig, AuthConfig, FeaturesConfig, HostingConfig, LogConfig, LogFormat, RegistryConfig,
     SecretsConfig, ServerConfig, StoreConfig, TransportSelection, VtaConfig,
 };
-use crate::error::AppError;
 use crate::secret_store::{ServerSecrets, create_secret_store};
-use crate::store::Store;
 use dialoguer::{Confirm, Input, Select};
+use did_hosting_common::server::acl::{AclEntry, Role};
+use did_hosting_common::server::error::AppError;
 use did_hosting_common::server::operator_messages::WebvhControlMessages;
 use did_hosting_common::server::setup_prompts;
 use did_hosting_common::server::store::KS_ACL;
+use did_hosting_common::server::store::Store;
 use did_hosting_common::server::vta_setup;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -328,7 +328,7 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
             domains: did_hosting_common::server::domain::DomainScope::All,
         };
 
-        crate::acl::store_acl_entry(&acl_ks, &entry).await?;
+        did_hosting_common::server::acl::store_acl_entry(&acl_ks, &entry).await?;
         store.persist().await?;
 
         eprintln!("  Admin ACL entry added for {admin_did}");
@@ -994,7 +994,7 @@ pub async fn run_setup_offline_complete(
 
             domains: did_hosting_common::server::domain::DomainScope::All,
         };
-        crate::acl::store_acl_entry(&acl_ks, &entry).await?;
+        did_hosting_common::server::acl::store_acl_entry(&acl_ks, &entry).await?;
         store.persist().await?;
         eprintln!("  Admin ACL entry added for {admin_did}");
     }
@@ -1047,21 +1047,5 @@ fn cleanup_offline_artifacts(state_path: &Path) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The wizard grants an edge the role `server/register` requires
-    /// (`service`), never `admin`, which registration refuses.
-    #[test]
-    fn acl_guidance_grants_edges_the_service_role() {
-        let grant = format!("add-acl --did <edge-did> --role {}", Role::Service);
-        assert!(
-            ACL_BOOTSTRAP_GUIDANCE.contains(&grant),
-            "{ACL_BOOTSTRAP_GUIDANCE}"
-        );
-        assert!(
-            !ACL_BOOTSTRAP_GUIDANCE.contains("--role admin"),
-            "{ACL_BOOTSTRAP_GUIDANCE}"
-        );
-    }
-}
+#[path = "setup_tests.rs"]
+mod tests;

@@ -1,3 +1,9 @@
+//! `did-hosting-daemon`: the server, control plane, witness and watcher in
+//! one process, sharing one store (the witness keeps its own), one storage
+//! task and one HTTP listener.
+//! See the "did-hosting-daemon" section of the repository's `CLAUDE.md` for
+//! what it mirrors from the standalone services and what it omits.
+
 mod backup;
 mod config;
 mod setup;
@@ -859,9 +865,10 @@ type ServiceResult = Result<Router, AppError>;
 
 /// Build the server — returns both the router and the AppState.
 ///
-/// In daemon mode the server only exposes public DID-serving routes
-/// (`.well-known`). All `/api/…` management routes come from the
-/// control plane, which is merged at root.
+/// In daemon mode the server only exposes public DID resolution. There are
+/// no management routes: every management operation is a Trust Task served
+/// by the control plane's listener (`POST /api/trust-tasks`, DIDComm,
+/// TSP), merged at root with `/api/health` and the UI.
 async fn build_server(
     config: &DaemonConfig,
     store: &Store,
@@ -1049,9 +1056,10 @@ async fn build_control(
     // sign-in readiness check — the standalone control plane's boot steps.
     did_hosting_control::server::startup(&state).await?;
 
-    // In daemon mode, no outbound ATM is needed — there are no external
-    // servers to sync with.  The server_push::notify_servers_* functions
-    // gracefully no-op when state.atm is None.
+    // In daemon mode there are no external edges to sync with: the registry
+    // is empty by default, so `server_push::notify_servers_*` finds no
+    // targets. It is not skipped, so a registered remote instance still
+    // gets pushes.
 
     // Build router without UI fallback — daemon adds its own combined fallback
     let router = did_hosting_control::routes::router_without_fallback().with_state(state.clone());

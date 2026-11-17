@@ -1,3 +1,5 @@
+//! Tests for [`super`]: per-DID and server-wide stats reads.
+
 use did_hosting_common::server::stats_tiers::{CoarseSeries, FineSlot, SeriesKind, fine_key};
 
 use super::*;

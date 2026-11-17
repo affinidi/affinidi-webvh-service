@@ -1,3 +1,7 @@
+//! The control plane's [`AppState`], its HTTP router and the process run loop:
+//! opening the store, starting the DIDComm/TSP listener and the background
+//! tasks, and serving until shutdown.
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,12 +27,12 @@ use webauthn_rs::prelude::Webauthn;
 use crate::auth::jwt::JwtKeys;
 use crate::auth::session::cleanup_expired_sessions;
 use crate::config::{AppConfig, AuthConfig};
-use crate::error::AppError;
 use crate::messaging;
 use crate::registry::{self, ServiceStatus};
 use crate::routes;
 use crate::secret_store::ServerSecrets;
-use crate::store::{KeyspaceHandle, Store};
+use did_hosting_common::server::error::AppError;
+use did_hosting_common::server::store::{KeyspaceHandle, Store};
 use tokio::sync::{oneshot, watch};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, debug, info, warn};
@@ -71,19 +75,16 @@ pub struct AppState {
     /// Trust Tasks proof verifier — backed by the
     /// `affinidi-data-integrity` crate, sharing the same
     /// [`DIDCacheClient`] as `did_resolver` for verificationMethod
-    /// lookups. `None` when `did_resolver` is unconfigured (e.g. a
-    /// non-DIDComm deployment); in that case the trust-tasks pipeline
-    /// runs in proof-optional mode — a present proof is ignored, a
-    /// REQUIRED proof on the spec is not enforced. v0.7.0 ships this
-    /// way for backwards compat; v0.8.0 makes the verifier mandatory
-    /// for the strict-proof specs (`acl/grant`, `acl/revoke`,
-    /// `acl/change-role`).
+    /// lookups. `None` when `did_resolver` is unconfigured; every trust-task
+    /// path then refuses rather than accept a document unverified
+    /// (`messaging::require_verifier`) — proofs are verified on every path.
+    ///
     /// `TransportBoundVerifier`, not the stock `affinidi::Verifier`: it
-    /// enforces the in-band issuer↔`verificationMethod` binding only when an
-    /// `issuer` is asserted, and verifies the signature alone when it is
-    /// absent. That absent case is the passkey delegation path (the
-    /// ephemeral session key signs; the JWT carries the responsible DID),
-    /// which the stock verifier rejects. See `TransportBoundVerifier` docs.
+    /// requires an in-band `issuer` and enforces the
+    /// issuer↔`verificationMethod` binding. The passkey delegation path (an
+    /// ephemeral session key signing for the JWT's subject) is admitted only
+    /// by a per-request copy built with `with_session_delegate`, never by
+    /// this shared instance. See `TransportBoundVerifier` docs.
     pub trust_tasks_verifier:
         Option<Arc<did_hosting_common::server::trust_tasks::TransportBoundVerifier>>,
     pub jwt_keys: Option<Arc<JwtKeys>>,
@@ -95,26 +96,24 @@ pub struct AppState {
     pub background: TaskTracker,
     /// DIDComm service for inbound/outbound mediator messaging.
     /// Wrapped in `OnceLock` so cloned states see it once it's initialized
-    /// (the service starts after REST + DIDComm router are already cloned).
+    /// (the service starts after the HTTP + DIDComm routers are already cloned).
     pub didcomm_service: Arc<std::sync::OnceLock<DIDCommService>>,
     /// In-memory stats collector — accumulates per-DID deltas from servers,
     /// flushed periodically to the stats keyspace.
     pub stats_collector: Arc<did_hosting_common::server::stats_collector::StatsCollector>,
-    /// Stats keyspace for persistent per-DID **aggregate** stats —
-    /// `stats:{mnemonic}` rows. Schema is `DidStats` (totals +
-    /// last_resolved_at + last_updated_at).
+    /// Stats keyspace — `stats:{mnemonic}` rows (a DID's totals plus its
+    /// coarse hourly and daily series) and `statspin:{mnemonic}` tier
+    /// overrides. See `did_hosting_common::server::stats_tiers` and
+    /// `docs/stats-tiers.md`.
     pub stats_ks: KeyspaceHandle,
-    /// Time-series keyspace for 5-minute aggregate buckets —
-    /// `ts:{mnemonic}:{bucket_epoch}` rows for per-DID buckets and
-    /// `ts:_all:{bucket_epoch}` for server-wide. Schema is
-    /// `{r: u64, u: u64}`. Split out from `stats_ks` in v0.7 so a
-    /// future `prefix_iter_raw("")` over either keyspace returns
-    /// homogeneous-shaped values rather than two different schemas.
+    /// Time-series keyspace — the fine 5-minute ring
+    /// (`t5:{mnemonic}:{slot}`, and `t5:_all:{slot}` server-wide) and the
+    /// server-wide coarse series (`c:_all`). See `stats_tiers`.
     pub timeseries_ks: KeyspaceHandle,
     /// Anti-replay cache for inbound DIDComm `(sender, msg.id)` pairs.
     /// Both transports gate through it before dispatch to reject
     /// captured-and-resubmitted envelopes within the freshness window.
-    pub replay_cache: Arc<crate::replay::ReplayCache>,
+    pub replay_cache: Arc<did_hosting_common::server::replay::ReplayCache>,
     /// What signed documents from signers the ACL does not list may
     /// consume: their own replay cache and bounded DID resolution. See
     /// [`crate::unlisted_signers`].
@@ -124,7 +123,7 @@ pub struct AppState {
     /// the duration of its read + build + commit window so two
     /// concurrent calls on the same path can't both observe
     /// `existing == None` and both commit.
-    pub path_locks: crate::path_locks::PathLocks,
+    pub path_locks: did_hosting_common::server::path_locks::PathLocks,
     /// Per-key write lock for Trust Tasks ACL mutations. Separate
     /// from `path_locks` so DID-mnemonic locking and ACL-write locking
     /// don't share a keyspace — the `grant` / `change-role` /
@@ -209,9 +208,9 @@ impl AppState {
     /// `shutdown` fires.
     ///
     /// Call it on a runtime that lives as long as the process serves
-    /// requests on *any* transport, not on the REST thread's: invite
+    /// requests on *any* transport, not on the HTTP thread's: invite
     /// redemption and the large-document budget are charged over DIDComm and
-    /// TSP too, so a sweep tied to the REST runtime would stop (or never
+    /// TSP too, so a sweep tied to the HTTP runtime would stop (or never
     /// start) when the HTTP listener is off. The sweep only touches the limiters'
     /// shared maps, so which runtime runs it does not matter otherwise.
     pub fn spawn_rate_limit_gc(&self, shutdown: &CancellationToken) {
@@ -271,8 +270,8 @@ impl AppState {
         // missed a just-committed write could hand one owner's slot to another.
         let dids_ks = store.keyspace_consistent(KS_DIDS)?;
         let stats_ks = store.keyspace(KS_STATS)?;
-        // Time-series buckets live in their own keyspace from v0.7 — see
-        // the `timeseries_ks` field doc.
+        // Time-series rows live in their own keyspace — see the
+        // `timeseries_ks` field doc.
         let timeseries_ks = store.keyspace(KS_TIMESERIES)?;
 
         let did_resolver = identity.as_ref().map(|i| i.did_resolver.clone());
@@ -327,7 +326,8 @@ impl AppState {
         let geoip = open_geoip(&config.geoip).await?;
         let pending_challenges =
             crate::pending_challenges::PendingChallengeTracker::for_auth_config(&config.auth);
-        let replay_cache = crate::replay::ReplayCache::with_config(config.replay.clone())?;
+        let replay_cache =
+            did_hosting_common::server::replay::ReplayCache::with_config(config.replay.clone())?;
 
         Ok(Self {
             store,
@@ -349,7 +349,7 @@ impl AppState {
             timeseries_ks,
             unlisted_signers: Default::default(),
             replay_cache: Arc::new(replay_cache),
-            path_locks: crate::path_locks::PathLocks::new(),
+            path_locks: did_hosting_common::server::path_locks::PathLocks::new(),
             acl_locks: did_hosting_common::server::path_locks::PathLocks::new(),
             pending_challenges: Arc::new(pending_challenges),
             client_ips,
@@ -906,11 +906,11 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     let mut signal = std::pin::pin!(init::shutdown_signal());
 
     // Sweep idle clients out of the rate limiters on this runtime, not the
-    // REST thread's: invite redemption is charged over DIDComm and TSP too,
+    // HTTP thread's: invite redemption is charged over DIDComm and TSP too,
     // so the sweep runs whether or not the HTTP listener is on.
     state.spawn_rate_limit_gc(&sup.signal(Stage::Workers).token());
 
-    // 1. The REST thread. Critical: it owns the listening socket.
+    // 1. The HTTP listener thread. Critical: it owns the listening socket.
     let (rest_ready_tx, rest_ready_rx) = oneshot::channel::<()>();
     if let Some(listener) = std_listener {
         let rest_state = state.clone();
@@ -931,7 +931,7 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
     })
     .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
 
-    // Wait for REST to be ready before starting DIDComm
+    // Wait for the HTTP listener to be ready before starting DIDComm
     let _ = rest_ready_rx.await;
 
     // 2b. Now that we are serving HTTP, resolve our *own* DID for the first time.
@@ -1203,7 +1203,7 @@ pub async fn seed_registry(state: &AppState) {
                     last_health_check: None,
                     registered_at: crate::auth::session::now_epoch(),
                     metadata: serde_json::Value::Null,
-                    // Config-seeded instances pre-date T27's capability
+                    // Config-seeded instances carry no capability
                     // declaration; assume webvh-only until the instance
                     // re-registers and reports its compile-time methods.
                     enabled_methods: vec!["webvh".to_string()],
@@ -1213,7 +1213,6 @@ pub async fn seed_registry(state: &AppState) {
                     // Null), so there is no document to read badges from.
                     advertised_services: None,
                     services_checked_at: None,
-                    trust_task_capable: false,
                     sync_batch_capable: false,
                     last_inbound_transport: None,
                     last_inbound_at: None,
@@ -1262,7 +1261,7 @@ pub async fn seed_registry(state: &AppState) {
 }
 
 // ---------------------------------------------------------------------------
-// REST thread
+// HTTP listener thread (`POST /api/trust-tasks`, health, sign-in, UI)
 // ---------------------------------------------------------------------------
 
 fn run_rest_thread(

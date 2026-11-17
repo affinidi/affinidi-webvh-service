@@ -129,7 +129,6 @@ fn build_ui() {
         "package-lock.json",
         "tsconfig.json",
         "app.json",
-        "App.tsx",
         "index.ts",
     ] {
         let path = ui_dir.join(file);

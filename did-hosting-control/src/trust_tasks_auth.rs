@@ -18,7 +18,7 @@
 //!
 //! So a wallet connected over TSP could not log in, and a wallet over DIDComm
 //! logged in by a different rule than one over HTTPS. This module gives the
-//! family one identity on every wire, exactly as [`crate::trust_tasks_infra`]
+//! family one identity on every wire, exactly as [`crate::messaging::infra`]
 //! did for server registration and health — see its module doc for the same
 //! argument made about a different family.
 //!
@@ -76,13 +76,14 @@
 //!   key with the session. The session's `acr` is carried unchanged, so
 //!   anything that needs a step-up still does;
 //! - **never where an `assertionMethod` attestation is required.** A step-up
-//!   approval must be signed by the subject's own key, on the Trust Task and
-//!   REST paths alike, and the verifier refuses a delegated approval outright;
+//!   approval must be signed by the subject's own key, on every path, and
+//!   the verifier refuses a delegated approval outright;
 //! - **never to mint or extend a session.** `auth/authenticate` and
 //!   `auth/refresh` refuse a session-key proof (`session_key_may_sign`). A
-//!   refresh is authorised by the refresh token, not by the key. The console's
-//!   REST refresh (`routes::auth::refresh`) does ask for the key's proof, but
-//!   only on top of the refresh token, as proof that the browser presenting
+//!   refresh is authorised by the refresh token, not by the key. A key-bound
+//!   session's refresh does check the key's proof
+//!   (`routes::auth::verify_session_bound_proof`), but only on top of the
+//!   refresh token, as proof that the browser presenting
 //!   the token is the one that logged in: the key alone refreshes nothing.
 //!
 //! A key type this service cannot verify is refused with
@@ -633,7 +634,7 @@ pub(crate) async fn store_auth_proxy_meta(
     session_id: &str,
     actor: Option<String>,
     absolute_expires_at: u64,
-) -> Result<(), crate::error::AppError> {
+) -> Result<(), did_hosting_common::server::error::AppError> {
     state
         .sessions_ks
         .insert(
@@ -650,7 +651,7 @@ pub(crate) async fn store_auth_proxy_meta(
 async fn get_auth_proxy_meta(
     state: &AppState,
     session_id: &str,
-) -> Result<Option<AuthProxyMeta>, crate::error::AppError> {
+) -> Result<Option<AuthProxyMeta>, did_hosting_common::server::error::AppError> {
     state.sessions_ks.get(auth_proxy_meta_key(session_id)).await
 }
 
@@ -664,7 +665,7 @@ async fn get_auth_proxy_meta(
 pub(crate) async fn delete_auth_proxy_meta(
     state: &AppState,
     session_id: &str,
-) -> Result<(), crate::error::AppError> {
+) -> Result<(), did_hosting_common::server::error::AppError> {
     state
         .sessions_ks
         .remove(auth_proxy_meta_key(session_id))
@@ -680,7 +681,10 @@ pub(crate) async fn settle_subject_sessions(
     state: &AppState,
     subject: &str,
     fate: impl Fn(&did_hosting_common::server::auth::session::Session) -> SessionFate,
-) -> Result<did_hosting_common::server::auth::session::SettledSessions, crate::error::AppError> {
+) -> Result<
+    did_hosting_common::server::auth::session::SettledSessions,
+    did_hosting_common::server::error::AppError,
+> {
     let settled = did_hosting_common::server::auth::session::settle_subject_sessions(
         &state.sessions_ks,
         subject,
@@ -860,8 +864,8 @@ async fn bound_session_to_mandate(
     session_id: &str,
     mandate_end: u64,
     value: &mut Value,
-) -> Result<(), crate::error::AppError> {
-    use crate::error::AppError;
+) -> Result<(), did_hosting_common::server::error::AppError> {
+    use did_hosting_common::server::error::AppError;
     let now = now_epoch();
     let left = mandate_end.saturating_sub(now).max(1);
     let mut session = get_session(&state.sessions_ks, session_id)
@@ -954,11 +958,10 @@ async fn refresh_v2_arm(
             .await
             .map_err(|e| denied(&doc, "refresh/peek", e))?
     {
-        // Carried over from the retired REST `/api/auth/refresh` route,
-        // which was the only refresh path to enforce it: this deployment's
-        // idle-timeout policy, not vti-common's (its `AuthBackend::idle_timeout`
-        // stays `None`, the default). Checked before anything is spent, same
-        // reasoning as the session-key-proof check below.
+        // Enforce this deployment's idle-timeout policy, not vti-common's
+        // (its `AuthBackend::idle_timeout` stays `None`, the default). Checked
+        // before anything is spent, same reasoning as the session-key-proof
+        // check below.
         crate::routes::auth::refuse_if_idle_session(&session, state.config.auth.admin_idle_timeout)
             .map_err(|e| denied(&doc, "refresh/idle", e))?;
 
@@ -1099,193 +1102,5 @@ async fn refresh_v2_arm(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    // Only the tests read the spec constants; importing it at module scope
-    // would be dead weight in a non-test build.
-    use trust_tasks_rs::Payload as PayloadSpec;
-
-    /// `owns` must claim exactly the three request URIs — and in particular
-    /// not the `#response` forms, which are documents *we* emit and must
-    /// never route back into ourselves.
-    #[test]
-    fn owns_the_three_request_uris_and_not_their_responses() {
-        for uri in [
-            <challenge::Payload as PayloadSpec>::TYPE_URI,
-            <authenticate::Payload as PayloadSpec>::TYPE_URI,
-            <refresh::Payload as PayloadSpec>::TYPE_URI,
-        ] {
-            assert!(owns(uri), "{uri} must be owned");
-            assert!(
-                !owns(&format!("{uri}#response")),
-                "{uri}#response must NOT be owned",
-            );
-        }
-    }
-
-    #[test]
-    fn owns_nothing_outside_the_family() {
-        assert!(!owns("https://trusttasks.org/spec/acl/list/0.1"));
-        assert!(!owns("https://trusttasks.org/spec/auth/whoami/0.1"));
-        // Superseded versions are no longer served.
-        assert!(!owns("https://trusttasks.org/spec/auth/authenticate/0.2"));
-        assert!(!owns("https://trusttasks.org/spec/auth/refresh/0.1"));
-        assert!(!owns("not a uri"));
-    }
-
-    /// The validity window a mandate must carry, checked at a fixed instant.
-    #[test]
-    fn a_mandate_must_name_a_bounded_validity_window() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let hour = chrono::Duration::hours(1);
-        let mandate = |issued: Option<chrono::DateTime<chrono::Utc>>,
-                       expires: Option<chrono::DateTime<chrono::Utc>>| {
-            let mut doc = serde_json::json!({
-                "id": "urn:uuid:00000000-0000-4000-8000-000000000000",
-                "type": MANDATE_EVIDENCE_TYPE_URI,
-                "payload": { "delegate": "did:example:delegate" },
-            });
-            if let Some(t) = issued {
-                doc["issuedAt"] = serde_json::json!(t.to_rfc3339());
-            }
-            if let Some(t) = expires {
-                doc["expiresAt"] = serde_json::json!(t.to_rfc3339());
-            }
-            serde_json::from_value::<TrustTask<Value>>(doc).unwrap()
-        };
-        let max = chrono::Duration::seconds(MAX_MANDATE_LIFETIME_SECS);
-
-        assert_eq!(
-            mandate_validity(&mandate(Some(now - hour), Some(now + hour)), now),
-            Ok(u64::try_from((now + hour).timestamp()).unwrap())
-        );
-        assert!(mandate_validity(&mandate(Some(now), Some(now + max)), now).is_ok());
-
-        for (case, issued, expires) in [
-            ("no expiresAt", Some(now), None),
-            ("no issuedAt", None, Some(now + hour)),
-            ("expired", Some(now - hour - hour), Some(now - hour)),
-            ("expires at issue", Some(now), Some(now)),
-            (
-                "issued in the future",
-                Some(now + hour),
-                Some(now + hour + hour),
-            ),
-            (
-                "valid too long",
-                Some(now),
-                Some(now + max + chrono::Duration::seconds(1)),
-            ),
-        ] {
-            assert!(
-                mandate_validity(&mandate(issued, expires), now).is_err(),
-                "{case} was accepted"
-            );
-        }
-    }
-
-    /// A mandate is checked as a decision: from a principal whose `did:webvh`
-    /// is deactivated it is refused, though the same mandate from a live one
-    /// verifies; and an `assertionMethod` proof by a key the principal lists
-    /// only under `authentication` is refused.
-    #[tokio::test]
-    async fn a_mandate_is_checked_as_the_principals_decision() {
-        use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
-        use affinidi_tdk::did_common::Document;
-        use affinidi_tdk::secrets_resolver::secrets::Secret;
-        use trust_tasks_proof::affinidi::{CryptoSuite, SignOptions, sign_trust_task};
-
-        let (mut state, _dir) = crate::control_tasks::harness::state().await;
-        let delegate = "did:key:z6MkDelegate";
-        let key = |seed: u8, did: &str| {
-            let mut secret = Secret::generate_ed25519(None, Some(&[seed; 32]));
-            secret.id = format!("{did}#key-1");
-            secret
-        };
-        let document = |did: &str, signer: &Secret, assertion: bool| -> Document {
-            let mut doc = serde_json::json!({
-                "id": did,
-                "verificationMethod": [{
-                    "id": format!("{did}#key-1"),
-                    "type": "Multikey",
-                    "controller": did,
-                    "publicKeyMultibase": signer.get_public_keymultibase().unwrap(),
-                }],
-                "authentication": [format!("{did}#key-1")],
-            });
-            if assertion {
-                doc["assertionMethod"] = serde_json::json!([format!("{did}#key-1")]);
-            }
-            serde_json::from_value(doc).unwrap()
-        };
-        let live = "did:webvh:QmLive:live.example";
-        let dead = "did:webvh:QmDead:dead.example";
-        let auth_only = "did:webvh:QmAuth:auth-only.example";
-        let (live_key, dead_key, auth_key) = (key(1, live), key(2, dead), key(3, auth_only));
-        let mut client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
-            .await
-            .unwrap();
-        client
-            .add_did_document(live, document(live, &live_key, true))
-            .await;
-        client
-            .add_did_document(dead, document(dead, &dead_key, true))
-            .await;
-        client
-            .add_did_document(auth_only, document(auth_only, &auth_key, false))
-            .await;
-        let verifier =
-            did_hosting_common::server::trust_tasks::build_verifier(Some(&client)).unwrap();
-        for did in [live, auth_only] {
-            verifier.record_deactivation_verdict(did, false);
-        }
-        verifier.record_deactivation_verdict(dead, true);
-        state.trust_tasks_verifier = Some(verifier);
-
-        let evidence = |principal: String, signer: Secret| async move {
-            let now = chrono::Utc::now();
-            let mandate = serde_json::json!({
-                "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-                "type": MANDATE_EVIDENCE_TYPE_URI,
-                "issuer": principal,
-                "recipient": crate::control_tasks::harness::CONTROL,
-                "issuedAt": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                "expiresAt": (now + chrono::Duration::hours(1))
-                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                "payload": { "delegate": delegate },
-            });
-            let signed = sign_trust_task(
-                &mandate,
-                &signer,
-                SignOptions::new()
-                    .with_proof_purpose("assertionMethod")
-                    .with_cryptosuite(CryptoSuite::EddsaJcs2022),
-            )
-            .await
-            .unwrap();
-            serde_json::from_value::<authenticate::PayloadDelegationEvidence>(serde_json::json!({
-                "kind": MANDATE_EVIDENCE_KIND,
-                "credential": signed,
-            }))
-            .unwrap()
-        };
-
-        let ok = evidence(live.to_string(), live_key).await;
-        verify_delegation_evidence(&state, live, delegate, "challenge", &ok)
-            .await
-            .expect("a live principal's mandate verifies");
-
-        let refused = evidence(dead.to_string(), dead_key).await;
-        let err = verify_delegation_evidence(&state, dead, delegate, "challenge", &refused)
-            .await
-            .unwrap_err();
-        assert!(err.contains("deactivated"), "{err}");
-
-        let refused = evidence(auth_only.to_string(), auth_key).await;
-        verify_delegation_evidence(&state, auth_only, delegate, "challenge", &refused)
-            .await
-            .expect_err("an authentication-only key made a decision");
-    }
-}
+#[path = "trust_tasks_auth_tests.rs"]
+mod tests;

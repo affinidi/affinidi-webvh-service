@@ -36,9 +36,9 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::config::StatsFlushConfig;
-use crate::error::AppError;
 use crate::stats_flush::{Pace, write_fine_slot, write_stats_row};
-use crate::store::KeyspaceHandle;
+use did_hosting_common::server::error::AppError;
+use did_hosting_common::server::store::KeyspaceHandle;
 use did_hosting_common::server::store::RawKvPair;
 
 /// How often the maintenance step looks again when there is nothing to do.

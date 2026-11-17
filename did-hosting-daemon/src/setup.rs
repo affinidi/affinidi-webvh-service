@@ -468,7 +468,7 @@ async fn run_online_provision(
     };
 
     // Resolve the VTA's transports up front. The mediator picker sources
-    // its discovered mediator here, and the webvh-server picker connects
+    // its discovered mediator here, and the hosting-server picker connects
     // with the resolved transport. A resolution failure is non-fatal: we
     // fall back to a `None` resolved (mediator prompt degrades to manual
     // entry; the server picker degrades to serverless).
@@ -1561,9 +1561,10 @@ fn prompt_enable_and_features() -> Result<(EnableConfig, FeaturesConfig), Box<dy
     };
 
     let features = FeaturesConfig {
-        // If control is on, REST is on (admin UI depends on it). If only
-        // the server is enabled, REST is still useful for health / stats
-        // endpoints, so default it on.
+        // If control is on, the HTTP listener is on (the admin UI and
+        // `POST /api/trust-tasks` depend on it). If only the server is
+        // enabled, it still serves DID resolution and `/api/health`, so
+        // default it on.
         http_listener: enable.control || enable.server,
         // The caller flips this to true once a mediator has been chosen.
         didcomm: false,

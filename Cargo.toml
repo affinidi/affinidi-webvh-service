@@ -13,10 +13,8 @@ exclude = ["fuzz"]
 resolver = "3"
 
 [workspace.package]
-description = "Affinidi DID Hosting Service. Collection of services to operate WebVH DID in production"
 edition = "2024"
 authors = ["Glenn Gore <glenn@affinidi.com>"]
-readme = "README.md"
 homepage = "https://affinidi.com/"
 license = "Apache-2.0"
 keywords = ["ssi", "affinidi", "webvh"]
@@ -639,16 +637,9 @@ trust-tasks-rs = { version = "0.36.1", default-features = false }
 trust-tasks-https = { version = "0.36", default-features = false, features = ["server", "client", "jwt"] }
 trust-tasks-didcomm = { version = "0.36", default-features = false }
 trust-tasks-proof = { version = "0.36", default-features = false, features = ["affinidi"] }
-# TSP (Trust Spanning Protocol, ToIP) transport binding for the Trust
-# Tasks framework — the sibling of `trust-tasks-didcomm`, built on
-# `affinidi-tsp`. Provides the `TransportHandler` impl + pack/unpack for
-# TSP-delivered trust-task documents. Moves in lockstep with the rest of
-# the `trust-tasks-*` family.
 trust-tasks-build = "0.1.2"
-trust-tasks-tsp = { version = "0.36", default-features = false }
 # Trust Spanning Protocol implementation for the Affinidi TDK. Consumed
-# directly for the outbound TSP send path and VID/envelope helpers; also
-# the crate `trust-tasks-tsp` is built on. `messaging-core` pulls the
+# directly for the outbound TSP send path and VID/envelope helpers. `messaging-core` pulls the
 # protocol-agnostic `affinidi-messaging-core` traits shared with DIDComm.
 affinidi-tsp = { version = "0.3", features = ["messaging-core"] }
 # Affinidi Messaging SDK — named directly only for the durable TSP relationship

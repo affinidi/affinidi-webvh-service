@@ -2,7 +2,7 @@
 //! component value types.
 //!
 //! Every field's role is documented inline against
-//! `docs/multi-domain-spec.md` §3 — the design table there is the
+//! `docs/archive/multi-domain-spec.md` §3 — the design table there is the
 //! source of truth, this file is the typed shape.
 
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// and DIDComm payloads without the keyspace context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainEntry {
-    /// Lower-cased + IDNA-normalised hostname (T15 normaliser). Acts
+    /// Lower-cased + IDNA-normalised hostname (see [`super::normalize`]). Acts
     /// as the storage key; **immutable** after creation per spec §3.
     /// Path-prefix forms supported (e.g. `example.com/webvh-a`).
     pub name: String,
@@ -42,7 +42,7 @@ pub struct DomainEntry {
     /// Set on exactly one domain at a time. The `meta:default_domain`
     /// pointer in the `meta` keyspace is the canonical source — this
     /// field is derived for response convenience. Setting it via the
-    /// CRUD layer (T15) updates the pointer, not this field directly.
+    /// CRUD layer ([`super::store`]) updates the pointer, not this field directly.
     #[serde(default)]
     pub default_domain: bool,
 
@@ -109,7 +109,7 @@ pub enum DomainUrlScheme {
 ///
 /// Disabled domains retain their data; the state purely gates the
 /// public resolution + management surfaces. Removing data requires an
-/// explicit admin action (T30's `domain.purge`).
+/// explicit admin action (the `domain/purge` Trust Task).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DomainStatus {
@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn legacy_entries_deserialize_with_defaults() {
-        // A v0.6.0 future-shape preview: a stored entry without the
+        // An older stored entry without the
         // optional fields must continue to load. Forward-compatibility
         // is enforced by `#[serde(default)]` on the bool fields and
         // `Option<_>` defaults to None.

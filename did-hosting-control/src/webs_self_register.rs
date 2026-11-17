@@ -81,8 +81,8 @@ use did_hosting_common::server::domain::DomainScope;
 use did_hosting_common::tasks::did_management::did::register;
 
 use crate::auth::AuthClaims;
-use crate::error::AppError;
 use crate::server::AppState;
+use did_hosting_common::server::error::AppError;
 
 /// The one Type URI this path serves.
 pub(crate) const SELF_REGISTER_TYPE_URI: &str = register::v0_1::Payload::TYPE_URI;

@@ -1,6 +1,6 @@
 //! `did:webs` implementation of [`DidMethod`].
 //!
-//! Per `docs/multi-method-hosting-spec.md` §6.1. Third method in the
+//! Per `docs/archive/multi-method-hosting-spec.md` §6.1. Third method in the
 //! registry, alongside [`super::webvh`] and [`super::web`], and the
 //! first one that is **off by default** — it pulls the KERI stack, and
 //! an operator hosting no `did:webs` DIDs should not carry it.

@@ -6,7 +6,7 @@ use tracing::info;
 
 use super::{Cx, TaskError, at, spec_record, typed};
 use crate::did_ops;
-use crate::error::AppError;
+use did_hosting_common::server::error::AppError;
 
 /// The signed `did.jsonl` a mutating verb carries. The host keeps webvh logs,
 /// which are text; an object-form `didData` names no log this host can store.

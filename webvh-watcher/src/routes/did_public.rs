@@ -1,3 +1,6 @@
+//! Public resolution of mirrored DIDs: `did.jsonl` and `did-witness.json`,
+//! at `.well-known` and under each slot path, with strong `ETag`s.
+
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};

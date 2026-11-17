@@ -15,8 +15,8 @@ use tracing::warn;
 
 use did_hosting_common::{ChallengeRequest, ChallengeResponse};
 
-use crate::error::AppError;
 use crate::server::AppState;
+use did_hosting_common::server::error::AppError;
 
 /// Default maximum concurrent pending challenges per DID. Combined with the
 /// global cap on the `pending_challenges` tracker on `AppState`, this
@@ -78,8 +78,8 @@ pub async fn challenge(
 
 /// Reserve a pending-challenge slot for `did`, run the canonical challenge
 /// handler, and bind the slot to the session it minted — the one issuance path
-/// for every binding (REST here, DIDComm/TSP/HTTPS-trust-task in
-/// `trust_tasks_auth`).
+/// for every binding (the plain `/api/auth/challenge` route here, the
+/// `auth/challenge` Trust Task on every transport in `trust_tasks_auth`).
 ///
 /// The canonical handler's own per-DID limit is disabled in this backend; the
 /// tracker is the single source of truth. The slot is taken whether or not the
@@ -183,8 +183,7 @@ async fn claim_evicted(
 
 /// Refuse a renewal for a session that has gone quiet longer than
 /// `auth.admin_idle_timeout`. Shared by `trust_tasks_auth`'s
-/// `auth/refresh/0.2` arm — the only surviving refresh path since the REST
-/// `/api/auth/refresh` route was retired.
+/// `auth/refresh/0.2` arm, the only refresh path.
 ///
 /// Checked separately from — and before — the shared `handle_refresh`, so
 /// the policy is ours and needs no vti-common release to change, and so an

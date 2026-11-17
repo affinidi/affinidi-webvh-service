@@ -11,8 +11,8 @@ use tracing::warn;
 
 use super::{Cx, TaskError, at, typed};
 use crate::did_ops;
-use crate::error::AppError;
 use crate::server::AppState;
+use did_hosting_common::server::error::AppError;
 
 /// `server/info/0.1`: the one public read. Accepted with no proof; answers
 /// only what the service already publishes, and the reply — signed by the DID
@@ -157,7 +157,7 @@ pub(crate) async fn metrics(
     let counters: Vec<Value> = Vec::new();
     // Gauges are internal replication-health, not customer-facing: only an
     // `Admin` sees them; a `MetricsReader` gets an empty list.
-    let gauges = if auth.role == crate::acl::Role::Admin {
+    let gauges = if auth.role == did_hosting_common::server::acl::Role::Admin {
         replication_gauges(cx.state).await?
     } else {
         Vec::new()
@@ -354,7 +354,7 @@ async fn stats_get_domain(
     state: &AppState,
     domain: &str,
 ) -> Result<stats_get::v0_1::Response, TaskError> {
-    use crate::acl::Role;
+    use did_hosting_common::server::acl::Role;
 
     let not_found = || {
         TaskError::Declared(
@@ -413,7 +413,7 @@ pub(crate) async fn timeseries(
     cx: &Cx<'_>,
     p: timeseries::v0_2::Payload,
 ) -> Result<timeseries::v0_2::Response, TaskError> {
-    use crate::acl::Role;
+    use did_hosting_common::server::acl::Role;
     use timeseries::v0_2::{PayloadRange, error_codes};
 
     let auth = cx.auth().await?;

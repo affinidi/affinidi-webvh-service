@@ -1,8 +1,10 @@
-// Re-export from did-hosting-common shared server infrastructure
+//! The control plane's secret store: the shared backends, opened from this
+//! service's config.
+
 pub use did_hosting_common::server::secret_store::*;
 
 use crate::config::AppConfig;
-use crate::error::AppError;
+use did_hosting_common::server::error::AppError;
 
 /// Create a secret store backend based on the application configuration.
 ///

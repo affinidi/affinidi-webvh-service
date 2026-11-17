@@ -34,7 +34,7 @@ frame, authenticates the sender VID, and routes it to
 
 A node's DID document is the source of truth for how to reach it. Every
 setup path mints it through `build_webvh_provision_ask`
-(`did-hosting-common/src/server/vta_setup.rs`), and a node with a mediator
+(`did-hosting-common/src/server/vta_setup/`), and a node with a mediator
 advertises its messaging transports only — **no `WebVHHosting` service**:
 
 ```json
@@ -229,7 +229,7 @@ pre-0.12 sync and pong; a pre-0.12 control plane refuses the new ones, so
 All three transports — HTTPS `POST /api/trust-tasks`, the DIDComm trust-task
 envelope and TSP — open their own binding, establish their own authenticated
 sender, and then hand the document to one entry point,
-`messaging::dispatch_trust_task_doc` (`did-hosting-control/src/messaging.rs`).
+`messaging::dispatch_trust_task_doc` (`did-hosting-control/src/messaging/gate.rs`).
 What a document *means* is decided once; the source-level test
 `did-hosting-control/tests/one_inbound_router.rs` fails if a transport grows a
 router of its own.
@@ -242,7 +242,7 @@ Type URI to:
   domains, the registry, identity, stats and the sign-in families;
 - the ACL and discovery family (`did_hosting_common::server::trust_tasks`,
   the typed SPEC §7.2 pipeline);
-- the infrastructure family (`trust_tasks_infra`) — registration, health,
+- the infrastructure family (`messaging::infra`) — registration, health,
   stats sync, and the edges' acknowledgements.
 
 HTTPS differs only in how a refusal is reported (an HTTP status as well as the

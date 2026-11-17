@@ -1,6 +1,6 @@
-/** Plain HTTP to the control plane: the error type, and the one helper the
- *  remaining non-Trust-Task routes (health, passkey enrolment, the REST token
- *  refresh) and the Trust Task binding itself go through. */
+/** Plain HTTP to the control plane: the error type, and the one helper both
+ *  `GET /api/health` and the Trust Task binding (`POST /api/trust-tasks`) go
+ *  through. */
 
 import { clearToken, getToken, renewIfNeeded, restoreSession } from "./session";
 
@@ -43,13 +43,13 @@ export interface RequestOptions extends RequestInit {
 
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   // Renew ahead of expiry, so an operator who is using the console is not
-  // signed out mid-task. Skipped for the renewal call itself, which would
-  // otherwise recurse.
+  // signed out mid-task. Skipped for an anonymous request — which the
+  // renewal itself is (`auth/refresh` is sent anonymous), so it cannot recurse.
   // The token cache lives in memory, restored from IndexedDB lazily — a
   // fresh page load has not populated it yet. No-op after the first call.
   await restoreSession();
   const { anonymous = false, background = false, ...init } = options;
-  if (!anonymous && path !== "/api/auth/refresh") {
+  if (!anonymous) {
     await renewIfNeeded();
   }
   const token = anonymous ? null : getToken();

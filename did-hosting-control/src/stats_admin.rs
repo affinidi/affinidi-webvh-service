@@ -15,10 +15,10 @@ use did_hosting_common::server::stats_tiers::{
 };
 use tracing::{info, warn};
 
-use crate::acl::Role;
 use crate::auth::AuthClaims;
-use crate::error::AppError;
 use crate::server::AppState;
+use did_hosting_common::server::acl::Role;
+use did_hosting_common::server::error::AppError;
 
 /// A DID's statistics tier as the control plane sees it now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

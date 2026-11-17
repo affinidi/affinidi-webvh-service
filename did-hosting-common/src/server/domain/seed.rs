@@ -1,13 +1,14 @@
 //! Cold-start domain-seed logic.
 //!
-//! Per `docs/multi-domain-spec.md` §3 row "Cold-start bootstrap":
+//! Per `docs/archive/multi-domain-spec.md` §3 row "Cold-start bootstrap":
 //! three-tier fallback when the `domains` keyspace is empty:
 //!
 //!   1. `bootstrap_domains` from `config.toml` (operator-seeded)
-//!   2. Legacy `public_url` host (upgrade path from a v0.6-vintage
+//!   2. Legacy `public_url` host (upgrade path from an older
 //!      single-domain deployment)
 //!   3. Empty — daemon boots but won't accept create-DID requests
-//!      until the operator adds a domain via the admin API.
+//!      until the operator adds a domain with the `domain/create` Trust
+//!      Task.
 //!
 //! Loud `warn!` log if tier 2 or 3 is reached so operators see the
 //! drop-through in the boot output and aren't surprised by `403 no
@@ -37,7 +38,7 @@ pub enum SeedTier {
     /// Tier 1: seeded from `config.bootstrap_domains`.
     FromBootstrapDomains,
     /// Tier 2: seeded from the legacy `public_url`'s host (upgrade
-    /// path). Warn-logged because operators with a v0.6-vintage
+    /// path). Warn-logged because operators with an older single-domain
     /// config should consider moving the value to `bootstrap_domains`
     /// for explicit intent.
     FromLegacyPublicUrl,

@@ -29,8 +29,8 @@ use did_hosting_common::server::passkey::store::{self as pk, PasskeyUser, cred_i
 
 use super::enrol::{credential_store, require_webauthn, uv_options};
 use super::{Cx, TaskError, at, typed};
-use crate::error::AppError;
 use crate::server::AppState;
+use did_hosting_common::server::error::AppError;
 
 /// How long a revocation's user-verification ceremony stays open.
 const CEREMONY_TTL_SECS: u64 = 300;

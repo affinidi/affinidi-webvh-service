@@ -1,12 +1,12 @@
-//! Grace-period scheduling for domain unassignment purges (T30).
+//! Grace-period scheduling for domain unassignment purges.
 //!
 //! When `replica/domain/unassign` arrives, the server immediately stops
-//! resolving the domain (the T21 safety check rejects on
-//! disabled / missing) but does NOT delete the underlying DID
-//! records right away. Operators may re-assign the same domain
-//! within a grace window (default: 2h) — typical scenarios are a
-//! brief migration between servers or an operator typo on the
-//! control plane.
+//! resolving the domain (the resolve-side safety check in
+//! `domain::safety` rejects on disabled / missing) but does NOT
+//! delete the underlying DID records right away. Operators may
+//! re-assign the same domain within a grace window (default: 2h) —
+//! typical scenarios are a brief migration between servers or an
+//! operator typo on the control plane.
 //!
 //! This module stores **pending purge** entries in `KS_PENDING_PURGES`
 //! per (domain) row. The background sweep — which lives in
@@ -23,8 +23,7 @@
 //!
 //! ## Why per-domain rather than per-(server, domain)?
 //!
-//! The keyspace const docstring mentions `pending_purges:<server>:<domain>`
-//! but each running server only knows about itself — there is no
+//! Each running server only knows about itself — there is no
 //! cross-server enumeration on this side of the protocol. The
 //! per-(server, domain) shape only matters if a control plane
 //! ever stores pending purges itself, which is a separate concern.

@@ -1,6 +1,6 @@
 //! Safety checks at the boundary between an inbound write and storage.
 //!
-//! Per `docs/multi-domain-spec.md` §3 row "Safety check on create /
+//! Per `docs/archive/multi-domain-spec.md` §3 row "Safety check on create /
 //! publish": every create / publish must, **before any storage write**:
 //!
 //! 1. Parse the DID identifier embedded in the caller's payload (the
@@ -133,14 +133,14 @@ pub async fn assert_did_host_allowed(
 }
 
 // ---------------------------------------------------------------------------
-// Resolve-side safety (T21)
+// Resolve-side safety
 // ---------------------------------------------------------------------------
 
 /// Resolve-side check: the request's `Host` header (already
-/// normalised + resolved through trusted-CIDR gating in T19) must
+/// normalised + resolved through trusted-CIDR gating) must
 /// match the DID identifier's embedded host.
 ///
-/// Per `docs/multi-domain-spec.md` §3 safety-check-on-resolution:
+/// Per `docs/archive/multi-domain-spec.md` §3 safety-check-on-resolution:
 /// mismatch returns **404** (not 403) to avoid confirming the DID
 /// exists elsewhere. Same shape as `NotFound`; callers shouldn't
 /// need to distinguish "wrong domain" from "really gone".
@@ -242,11 +242,11 @@ fn domain_active_for_resolution(host: &str, entry: Option<DomainEntry>) -> Resul
 ///   strict check runs and the same error semantics apply
 ///   (400 / 403).
 /// - If the keyspace is **empty**, the check is **skipped** with a
-///   warn-log. This is the legacy state — pre-T18 deployments, test
+///   warn-log. This is the legacy state — deployments that predate the domain seed, test
 ///   fixtures that haven't seeded a domain — and is the only
 ///   ergonomically-tolerable behaviour for the transition window.
 ///
-/// Production daemons run T18's first-boot seed before serving
+/// Production daemons run the first-boot domain seed before serving
 /// requests, so the empty-keyspace path is unreachable in practice
 /// once the daemon is up. The warn-log makes the legacy state
 /// visible to operators if they hit it.
@@ -272,7 +272,7 @@ pub async fn assert_did_host_allowed_when_domains_configured(
             did = %did,
             "domains keyspace is empty — skipping host-vs-domain safety check. \
              Configure `[hosting] bootstrap_domains` or create a domain via the \
-             admin API to enable enforcement."
+             `domain/create` Trust Task to enable enforcement."
         );
         return Ok(());
     }
@@ -285,7 +285,7 @@ pub async fn assert_did_host_allowed_when_domains_configured(
 /// [`assert_domain_active_for_resolution`] with the same
 /// "permissive when [`KS_DOMAINS`] is empty" pattern used by
 /// [`assert_did_host_allowed_when_domains_configured`] on the write
-/// path. The legacy state (pre-T18 seed, fresh test fixtures) keeps
+/// path. The legacy state (no domain seeded, fresh test fixtures) keeps
 /// resolving its DIDs; the moment a domain exists, enforcement turns
 /// on automatically.
 ///
@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn extract_host_webvh_with_port_encoded_localhost() {
-        // Regression for the live 400 on `PUT /api/dids/{mnemonic}`:
+        // Regression for a live publish refused as `400`:
         // a did:webvh log published by a VTA carries the daemon's own
         // host as `localhost%3A8534`; it must decode to `localhost:8534`
         // to match the seeded domain entry.
@@ -664,7 +664,7 @@ mod tests {
         assert!(!s.contains("secret-tenant.example"));
     }
 
-    // ---- T21: resolve-side checks ----
+    // ---- resolve-side checks ----
 
     #[test]
     fn request_host_matches_did_happy_path() {

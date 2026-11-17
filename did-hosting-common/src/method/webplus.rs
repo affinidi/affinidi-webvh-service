@@ -1,6 +1,6 @@
 //! `did:webplus` — **NOT IMPLEMENTED IN THIS RELEASE**.
 //!
-//! Per `docs/multi-method-hosting-spec.md` §1 and §2, `did:webplus` is
+//! Per `docs/archive/multi-method-hosting-spec.md` §1 and §2, `did:webplus` is
 //! a scaffolded compile-time target — the feature flag exists so the
 //! `DidMethod` trait surface can be exercised against a future
 //! method without restructuring, but no impl ships in this release.

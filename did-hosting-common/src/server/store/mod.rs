@@ -1,3 +1,7 @@
+//! The storage abstraction: [`Store`], keyspace handles, batches and paged
+//! walks over one of the configured backends (fjall, Redis, DynamoDB,
+//! Firestore, Cosmos DB).
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod conformance;
 #[cfg(feature = "store-cosmosdb")]
@@ -43,10 +47,10 @@ use super::error::AppError;
 // content:<m>:witness  — raw witness JSON content
 // owner:<did>:<m>      — reverse index: owner DID → mnemonic
 // watcher_sync:<m>     — per-DID watcher sync status
-// passkey:<handle>     — WebAuthn credential record
+// pk_user:/pk_did:/pk_cred: — WebAuthn passkey records (`server::passkey`)
 // acl:<did>            — ACL entry
-// stats:<mnemonic>     — per-DID resolve/update counters
-// ts:<mnemonic>:<epoch> — time-series bucket
+// stats:<mnemonic>     — per-DID counters and coarse series (`stats_tiers`)
+// t5:<mnemonic>:<slot> — fine time-series ring slot (`stats_tiers`)
 // ---------------------------------------------------------------------------
 pub mod key_prefix {
     pub const SESSION: &str = "session:";

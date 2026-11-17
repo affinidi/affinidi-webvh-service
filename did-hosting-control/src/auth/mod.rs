@@ -1,4 +1,6 @@
-// Re-export from did-hosting-common shared server infrastructure
+//! Authentication for the control plane: the shared JWT, session and
+//! extractor modules re-exported, plus this service's auth backend.
+
 pub mod backend;
 pub mod jwt {
     pub use did_hosting_common::server::auth::jwt::*;

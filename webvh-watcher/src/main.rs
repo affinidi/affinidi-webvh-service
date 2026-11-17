@@ -1,3 +1,5 @@
+//! `webvh-watcher` binary: `setup`, `health`, and running the mirror.
+
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use webvh_watcher::config::AppConfig;

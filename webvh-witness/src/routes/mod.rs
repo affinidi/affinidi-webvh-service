@@ -1,3 +1,6 @@
+//! The witness's HTTP router: the HTTPS binding of its Trust Task listener,
+//! `POST /api/trust-tasks`.
+
 pub mod health;
 pub mod trust_tasks;
 

@@ -24,7 +24,7 @@ default = ["method-webvh", "method-web"]
 # Each `method-*` feature gates a single `DidMethod` impl in
 # `src/method/`. The dispatcher (`method_by_name`) is compile-time —
 # disabling a feature removes its arm from the dispatcher AND its
-# resolution-endpoint route from the router (T25). The default build
+# resolution-endpoint route from the router. The default build
 # enables `webvh` + `web`. `method-webs` is implemented but off by
 # default — it pulls the KERI stack, and an operator who hosts no
 # did:webs DIDs should not carry it. `webplus` is still a scaffolded

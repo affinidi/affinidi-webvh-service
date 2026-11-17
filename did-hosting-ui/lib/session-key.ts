@@ -1,7 +1,7 @@
 /**
  * Browser-side ephemeral session-key infrastructure for Data Integrity
- * proofs on REQUIRED-spec trust-task envelopes (acl/grant, acl/revoke,
- * acl/change-role).
+ * proofs on the Trust Task documents a signed-in session sends (see the
+ * `Signer` kinds in `trust-task.ts`).
  *
  * Lifecycle:
  *  1. `generateSessionKeypair()` on login — fresh Ed25519 keypair per
@@ -10,16 +10,15 @@
  *     document as its own `did:key`, and the server binds the new
  *     session to it. The keypair is mirrored to IndexedDB so it
  *     survives full page reloads while the JWT is still valid.
- *  2. `signEnvelope()` on every REQUIRED-spec request — implements the
+ *  2. `signEnvelope()` on every session-signed request — implements the
  *     `eddsa-jcs-2022` cryptosuite (W3C VC Data Integrity ed25519):
  *     JCS-canonicalize doc and proof config, SHA-256 each, concat, sign
  *     with the session private key, base58btc-encode signature into
  *     `proof.proofValue`. Lazily restores from IndexedDB if the
  *     module-scope cache is empty (page reload after login).
- *  3. Server-side `dispatch_trust_task` reads the bound pubkey from
- *     AuthClaims, checks that `proof.verificationMethod` matches the
- *     session-bound `did:key`, and lets the AffinidiVerifier verify
- *     the signature.
+ *  3. The control plane's `dispatch_trust_task` (the HTTPS binding)
+ *     checks that `proof.verificationMethod` is the session-bound
+ *     `did:key` before the proof itself is verified.
  *
  * The private key is generated non-extractable (`generateKey(…, false,
  * …)`) — IndexedDB stores the opaque wrapper, not the raw bytes, and
@@ -31,8 +30,8 @@
  * lets `generateSessionKeypair()` read the raw 32 public bytes out.
  *
  * Storage scope: per-origin (the standard IndexedDB scope). Multiple
- * tabs on the same origin share the same persisted keypair, which
- * matches the shared JWT typically stored in localStorage. Logout
+ * tabs on the same origin share the same persisted keypair, as they
+ * share the session tokens `session.ts` mirrors to IndexedDB. Logout
  * (`clearSessionKeypair()`) wipes the IDB entry; clearing site data
  * via the browser's settings does the same.
  */
@@ -227,8 +226,8 @@ export async function signEnvelope<T extends SignableEnvelope>(envelope: T): Pro
 
   // Build the proof object minus proofValue. `verificationMethod` is
   // the session-bound did:key fragment; server-side
-  // `dispatch_trust_task` verifies this matches the JWT-bound session
-  // pubkey before the framework's AffinidiVerifier resolves it.
+  // `dispatch_trust_task` checks this is the session-bound key before
+  // the proof itself is verified.
   //
   // `created` is backdated by CREATED_BACKDATE_MS: it is stamped from
   // *this browser's* clock but checked against the *server's*, and a
