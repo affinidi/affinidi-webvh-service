@@ -8,7 +8,7 @@ use axum::http::request::Parts;
 use axum_extra::TypedHeader;
 use axum_extra::headers::Authorization;
 use axum_extra::headers::authorization::Bearer;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::server::acl::Role;
 use crate::server::auth::jwt::JwtKeys;
@@ -119,7 +119,8 @@ impl<S: AuthState> FromRequestParts<S> for AuthClaims {
         // A session issued under a bound (`not_after`, e.g. the mandate a
         // proxied login rests on) ends there, whatever its token still says.
         if session.past_end(now_epoch()) {
-            warn!(session_id = %claims.session_id, "auth rejected: session past its absolute end");
+            // Expected: the session lived its full span. Not a warning.
+            info!(session_id = %claims.session_id, "auth rejected: session past its absolute end");
             return Err(AppError::Unauthorized("session has ended".into()));
         }
 

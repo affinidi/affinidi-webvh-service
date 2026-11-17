@@ -233,6 +233,9 @@ export function resetSessionCacheForTests(): void {
   authMethodMem = null;
   sessionRestored = true;
   sessionRestoreInFlight = null;
+  renewInFlight = null;
+  lastRenewAttemptMs = 0;
+  transientRenewFailures = 0;
 }
 
 const REFRESH_TASK_URI = T.refresh;
@@ -272,11 +275,79 @@ function tokenExpiry(token: string): number | null {
 
 /** Renew when the access token has this long or less to live. */
 const RENEW_WITHIN_SECS = 60;
-/** Floor between renewal attempts, so a failing one cannot spin. */
+/** Floor between renewal attempts, so a failing one cannot spin. Doubled
+ *  after each consecutive transient failure, up to {@link MAX_RETRY_GAP_MS}. */
 const MIN_RETRY_GAP_MS = 5_000;
+/** Ceiling on the backoff between renewals that keep failing transiently. */
+const MAX_RETRY_GAP_MS = 60_000;
 
 let renewInFlight: Promise<void> | null = null;
 let lastRenewAttemptMs = 0;
+/** Renewals in a row that failed for a reason worth trying again (network,
+ *  a 5xx, `unavailable`); reset by a success. Drives the backoff. */
+let transientRenewFailures = 0;
+
+/** How long to wait after the last attempt before the next one. */
+function renewRetryGapMs(): number {
+  if (transientRenewFailures === 0) return MIN_RETRY_GAP_MS;
+  return Math.min(MIN_RETRY_GAP_MS * 2 ** (transientRenewFailures - 1), MAX_RETRY_GAP_MS);
+}
+
+/**
+ * The control plane refused a renewal for good: the session reached its
+ * absolute lifetime, idled out, was revoked or is unknown, or this browser
+ * lost the key it is bound to. Nothing a retry can change — only a fresh
+ * sign-in. Thrown by the renewal, after the session has been ended here.
+ */
+export class SessionEndedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SessionEndedError";
+  }
+}
+
+/**
+ * Is `e`, thrown by a renewal, a refusal no retry can change?
+ *
+ * A Trust Task rejection says so itself: the control plane marks every
+ * terminal refusal of `auth/refresh` non-retryable (`permissionDenied` for an
+ * idled-out, revoked or unknown session; `auth/refresh:sessionLifetimeExceeded`
+ * and the other `auth/refresh:*` codes) and a failure of its own
+ * `unavailable`, which is retryable. A 401 is the session key gone from this
+ * browser. Anything else — a network error, a proxy's 5xx page, a reply that
+ * failed its checks — says nothing about the session, so it is transient.
+ *
+ * Read by shape, not `instanceof`: `trust-task.ts` and `http.ts` import this
+ * module, and a static import back would be the cycle the note at the top
+ * of this file describes.
+ */
+function isTerminalRefusal(e: unknown): boolean {
+  if (e instanceof SessionEndedError) return true;
+  if (!(e instanceof Error)) return false;
+  const err = e as Error & { status?: unknown; payload?: { retryable?: unknown } };
+  if (e.name === "TrustTaskRejection" && err.payload) {
+    return err.payload.retryable !== true;
+  }
+  return e.name === "ApiError" && err.status === 401;
+}
+
+/**
+ * End the session after the control plane refused to renew it for good —
+ * once: the tokens are gone after this, so no later renewal starts. Clears
+ * the tokens and the session key here, tells the other tabs holding the
+ * session (`clearToken`'s broadcast) so they stop renewing it too, and raises
+ * the "session expired — sign in again" prompt (`webvh:unauthorized`).
+ *
+ * Only while `refused` is still the refresh token held: a sign-in that landed
+ * while the renewal was in flight is a different session, and stays.
+ */
+function endSessionAfterRefusal(refused: string): void {
+  if (refreshTokenMem !== refused) return;
+  clearToken();
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new Event("webvh:unauthorized"));
+  }
+}
 
 /**
  * Renew the session if the access token is nearly out.
@@ -292,9 +363,12 @@ let lastRenewAttemptMs = 0;
  * (its own policy layered in front of the shared handler, unrelated to the
  * Trust Task spec), which is what stops this timer from keeping a tab
  * signed in forever, and once the session has reached its
- * `absoluteExpiresAt` — that one only a fresh sign-in can lift. Never
- * throws: a failed renewal leaves the session alone and the caller's own
- * request reports the failure.
+ * `absoluteExpiresAt` — that one only a fresh sign-in can lift.
+ *
+ * Never throws. A refusal no retry can change ends the session here, once,
+ * in every tab (see {@link endSessionAfterRefusal}), so nothing sends the
+ * refused token again. Any other failure leaves the session alone, backs the
+ * next attempt off, and lets the caller's own request report it.
  */
 export async function renewIfNeeded(): Promise<void> {
   // After a reload the cache is empty until this restores it — same reason
@@ -310,14 +384,15 @@ export async function renewIfNeeded(): Promise<void> {
   if (now < exp - RENEW_WITHIN_SECS) return;
 
   if (renewInFlight) return renewInFlight;
-  if (Date.now() - lastRenewAttemptMs < MIN_RETRY_GAP_MS) return;
+  if (Date.now() - lastRenewAttemptMs < renewRetryGapMs()) return;
   lastRenewAttemptMs = Date.now();
 
   renewInFlight = (async () => {
     try {
       await refreshWithSessionKey(refresh);
     } catch {
-      // Swallowed by design — see the doc comment.
+      // Swallowed by design — see the doc comment. A terminal refusal has
+      // already ended the session inside `refreshWithSessionKey`.
     } finally {
       renewInFlight = null;
     }
@@ -360,8 +435,30 @@ export async function renewSessionNow(): Promise<void> {
 /**
  * Send one `auth/refresh/0.2`, signed by the session key, and keep the tokens
  * it returns. Throws on any failure; the callers decide whether that matters.
+ *
+ * A terminal refusal ({@link isTerminalRefusal}) ends the session before it
+ * is thrown, as a {@link SessionEndedError}, whichever caller asked; a
+ * transient failure is rethrown as it is and counted towards the backoff.
  */
 async function refreshWithSessionKey(refresh: string): Promise<void> {
+  try {
+    await sendRefresh(refresh);
+    transientRenewFailures = 0;
+  } catch (e) {
+    if (isTerminalRefusal(e)) {
+      endSessionAfterRefusal(refresh);
+      throw e instanceof SessionEndedError
+        ? e
+        : new SessionEndedError(
+            e instanceof Error ? e.message : "The session ended — sign in again.",
+          );
+    }
+    transientRenewFailures += 1;
+    throw e;
+  }
+}
+
+async function sendRefresh(refresh: string): Promise<void> {
   // After a reload the key is only in IndexedDB. Without restoring it
   // first, the refresh would go out unsigned and be refused — every
   // login this UI offers binds one, so in practice this always signs.
@@ -369,7 +466,7 @@ async function refreshWithSessionKey(refresh: string): Promise<void> {
     await restoreSessionKeypair();
   }
   if (!hasSessionKeypair()) {
-    throw new Error("This browser no longer holds the session key — sign in again.");
+    throw new SessionEndedError("This browser no longer holds the session key — sign in again.");
   }
 
   // Through the one Trust Task client, so the reply is checked like every

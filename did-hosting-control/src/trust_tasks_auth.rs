@@ -94,7 +94,7 @@ use did_hosting_common::tasks::auth::{
     authenticate::v0_3 as authenticate, challenge::v0_1 as challenge, refresh::v0_2 as refresh,
 };
 use serde_json::Value;
-use tracing::warn;
+use tracing::{info, warn};
 use trust_tasks_rs::{
     Dispatcher, ErrorPayload, ErrorResponse, ProofPolicy, ProofVerifier, ResolvedParties,
     StandardCode, TransportHandler, TrustTask,
@@ -255,6 +255,34 @@ fn denied<P>(doc: &TrustTask<P>, what: &str, err: impl std::fmt::Display) -> Err
     doc.reject_with(
         format!("urn:uuid:{}", uuid::Uuid::new_v4()),
         ErrorPayload::new(StandardCode::PermissionDenied).with_message("authentication refused"),
+    )
+}
+
+/// A refresh this deployment's policy ended: the session idled out. Expected
+/// behaviour, not a suspicious request, so nothing is logged here — the check
+/// that refused it already said so, once, at `info`.
+///
+/// Still `permissionDenied`, the code an idled-out refresh has always carried
+/// on the wire, and still non-retryable: a client must tell this apart from a
+/// transient failure ([`unavailable`]) and stop renewing, not try again.
+fn session_ended<P>(doc: &TrustTask<P>, message: &str) -> ErrorResponse {
+    doc.reject_with(
+        format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        ErrorPayload::new(StandardCode::PermissionDenied).with_message(message),
+    )
+}
+
+/// A refresh this service could not judge because its own store failed —
+/// before anything was spent, so re-issuing it is safe. Answered
+/// `unavailable` (retryable), not [`denied`]: a non-retryable refusal tells
+/// the browser its session is over, and a store hiccup is no reason to sign
+/// anyone out.
+fn unavailable<P>(doc: &TrustTask<P>, what: &str, err: impl std::fmt::Display) -> ErrorResponse {
+    warn!(error = %err, op = what, "auth trust task could not be served");
+    doc.reject_with(
+        format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        ErrorPayload::new(StandardCode::Unavailable)
+            .with_message("the authentication service is temporarily unavailable"),
     )
 }
 
@@ -953,17 +981,23 @@ async fn refresh_v2_arm(
     let mut bound_key_verified = false;
     if let Some(session_id) = get_session_by_refresh(&state.sessions_ks, &refresh_token)
         .await
-        .map_err(|e| denied(&doc, "refresh/peek", e))?
+        .map_err(|e| unavailable(&doc, "refresh/peek", e))?
         && let Some(session) = get_session(&state.sessions_ks, &session_id)
             .await
-            .map_err(|e| denied(&doc, "refresh/peek", e))?
+            .map_err(|e| unavailable(&doc, "refresh/peek", e))?
     {
         // Enforce this deployment's idle-timeout policy, not vti-common's
         // (its `AuthBackend::idle_timeout` stays `None`, the default). Checked
         // before anything is spent, same reasoning as the session-key-proof
-        // check below.
+        // check below. The check logs the refusal itself, at `info`.
         crate::routes::auth::refuse_if_idle_session(&session, state.config.auth.admin_idle_timeout)
-            .map_err(|e| denied(&doc, "refresh/idle", e))?;
+            .map_err(|_| {
+                session_ended(
+                    &doc,
+                    "the session was signed out after a period of inactivity; \
+                     re-authenticate via auth/authenticate",
+                )
+            })?;
 
         crate::routes::auth::verify_session_bound_proof(&proof_probe(&doc), &session)
             .await
@@ -981,12 +1015,13 @@ async fn refresh_v2_arm(
 
         if let Some(meta) = get_auth_proxy_meta(state, &session_id)
             .await
-            .map_err(|e| denied(&doc, "refresh/meta", e))?
+            .map_err(|e| unavailable(&doc, "refresh/meta", e))?
             && session
                 .refresh_expires_at
                 .is_some_and(|expires| expires >= meta.absolute_expires_at)
         {
-            warn!(session_id = %session_id, "refresh refused: absolute session lifetime reached");
+            // The session lived its full span: expected, so `info`.
+            info!(session_id = %session_id, "refresh refused: absolute session lifetime reached");
             return Err(doc.reject_with(
                 format!("urn:uuid:{}", uuid::Uuid::new_v4()),
                 ErrorPayload::from(refresh::error_codes::SESSION_LIFETIME_EXCEEDED).with_message(
