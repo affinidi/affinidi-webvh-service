@@ -204,7 +204,20 @@ anyhow = "1"
 agent-names = "0.1.3"
 # 0.7 because `affinidi-did-resolver-cache-sdk` 0.8.39 (pulled by affinidi-tdk
 # 0.21) is on it; staying on 0.6 put two copies in the shipped graph.
-didwebvh-rs = "0.8.2"
+#
+# Pinned EXACTLY to 0.8.2 for now. 0.8.3 widened its own requirements to
+# `affinidi-data-integrity >=0.8, <0.10` and `affinidi-secrets-resolver >=0.5,
+# <0.7`, so an unlocked resolve (`cargo update`, `cargo install`) picks the 0.9
+# / 0.6 generation for didwebvh-rs while everything else here stays on 0.8 /
+# 0.5: its `Signer` is then implemented for the other generation's `Secret`
+# and the workspace does not compile (the Upstream drift job, E0277 x21). The
+# real fix is moving the whole family to that generation (affinidi-tdk 0.49,
+# affinidi-data-integrity 0.9, affinidi-secrets-resolver 0.6,
+# affinidi-messaging-sdk 0.50, trust-tasks 0.40, ...), which is blocked on
+# vta-sdk / vti-common: their latest releases (0.90 / 0.66) still require
+# affinidi-tdk 0.45, affinidi-data-integrity 0.8 and secrets-resolver 0.5,
+# and their types cross ours. Drop the `=` when that move lands (#486).
+didwebvh-rs = "=0.8.2"
 # DID URL helpers, including the `src` locator of a did:scid (`scid`).
 affinidi-did-common = "0.4.7"
 
