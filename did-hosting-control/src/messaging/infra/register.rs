@@ -121,6 +121,12 @@ pub(in crate::messaging) async fn is_service(
 /// `signer` is the registration document's proven issuer — the DID whose key
 /// signed it — so a server is registered, and synced every tenant's DIDs, only
 /// on its own signature. Returns the ack body on success.
+///
+/// The stages, in order: the signer's role ([`require_service_role`]), the
+/// payload ([`parse_registration`]), the registry id
+/// ([`previous_registration`]), the URL allowlist, the served domains
+/// ([`assigned_served_domains`]), the record ([`upsert_registration`]), then
+/// the badge refresh and resync ([`after_server_registration`]).
 pub(crate) async fn do_server_register(
     state: &AppState,
     signer: &str,
@@ -130,79 +136,10 @@ pub(crate) async fn do_server_register(
     InfraRejection,
 > {
     use crate::registry::{self, ServiceInstance, ServiceStatus, ServiceType};
-    use did_hosting_common::server::acl::check_acl;
 
-    // Require a pre-approved ACL entry with the Service role. An
-    // Owner-role DID must not be able to register as a server: registration
-    // triggers `sync_all_dids_to_server`, which would push every tenant's
-    // DID log + witness content to the caller's inbox and add them to the
-    // active-server registry so future `notify_servers_did` updates also
-    // reach them.
-    let role = match check_acl(&state.acl_ks, signer).await {
-        Ok(did_hosting_common::server::acl::Role::Service) => {
-            did_hosting_common::server::acl::Role::Service
-        }
-        Ok(other) => {
-            warn!(
-                did = signer,
-                role = %other,
-                "server registration rejected: Service role required"
-            );
-            return Err(InfraRejection::not_authorised(
-                "service role required to register as a server",
-            ));
-        }
-        Err(e) if !did_hosting_common::server::acl::is_acl_refusal(&e) => {
-            warn!(did = signer, error = %e, "server registration deferred: ACL lookup failed");
-            return Err(InfraRejection::lookup_failed(&e));
-        }
-        Err(_) => {
-            warn!(
-                did = signer,
-                "server registration rejected: DID not in ACL (requires pre-approval)"
-            );
-            return Err(InfraRejection::not_authorised(
-                "server DID must be pre-approved in the ACL before registering",
-            ));
-        }
-    };
-
-    let payload: did_hosting_common::tasks::did_management::server::register::v0_2::Payload =
-        serde_json::from_value(body.clone()).map_err(|e| {
-            warn!(did = signer, error = %e, "server registration rejected: malformed payload");
-            InfraRejection::malformed(format!("not a server/register/0.2 payload: {e}"))
-        })?;
-    // Use the signer DID as a stable instance ID (one registration per DID).
-    let instance_id = registry::instance_id_for(signer);
-    if payload.did.as_str() != signer || payload.instance_id.as_str() != instance_id {
-        warn!(
-            did = signer,
-            "server registration rejected: did/instanceId do not name the signer"
-        );
-        return Err(InfraRejection::malformed(format!(
-            "`did` must be the signer and `instanceId` must be `{instance_id}`"
-        )));
-    }
-    // The registry id is not one-to-one with DIDs (`instance_id_for`): a
-    // record under this id that another DID registered stays that DID's.
-    let previous = match registry::get_instance(&state.registry_ks, &instance_id).await {
-        Ok(previous) => previous,
-        Err(e) => {
-            warn!(did = signer, error = %e, "server registration deferred: registry lookup failed");
-            return Err(InfraRejection::lookup_failed(&e));
-        }
-    };
-    if let Some(holder) = previous.as_ref().and_then(|p| p.did())
-        && holder != signer
-    {
-        warn!(
-            did = signer,
-            holder, instance_id, "server registration rejected: instance id held by another DID"
-        );
-        return Err(InfraRejection::conflict(
-            "another server's registration holds this instance id",
-        ));
-    }
+    let role = require_service_role(state, signer).await?;
+    let (payload, instance_id) = parse_registration(signer, body)?;
+    let previous = previous_registration(state, signer, &instance_id).await?;
     // This service's hints (`ext`, in its namespace). A server that sends none
     // gets the conservative defaults: single sync frames and a full sync.
     let hints = payload
@@ -243,65 +180,13 @@ pub(crate) async fn do_server_register(
             .map(|m| m.to_string())
             .collect()
     };
-    let claimed_served_domains: Vec<String> = payload.served_domains.clone();
-    // A server's claim to serve a domain is kept only if the control plane
-    // assigned it the domain: its latest recorded domain operation for this
-    // server is an assign (`server_push::DomainIntent`). A claim to a domain
-    // the control plane has no record of, or assigned to another server only,
-    // is dropped, so it cannot block `registry/purge-domain` with
-    // `STILL_ASSIGNED` or mislead the purge fan-out.
-    //
-    // A server with no recorded domain operation at all was assigned its
-    // domains before they were recorded: it keeps a claim the registry
-    // already listed for it, and nothing new.
-    let served_domains: Vec<String> = if claimed_served_domains.is_empty() {
-        Vec::new()
-    } else {
-        let intents = match crate::server_push::domain_intents(state, signer).await {
-            Ok(intents) => intents,
-            Err(e) => {
-                warn!(did = signer, error = %e, "server registration deferred: domain intents lookup failed");
-                return Err(InfraRejection::lookup_failed(&e));
-            }
-        };
-        let assigned = |name: &str| {
-            if intents.is_empty() {
-                previous
-                    .as_ref()
-                    .is_some_and(|p| p.served_domains.iter().any(|d| d == name))
-            } else {
-                intents
-                    .iter()
-                    .any(|i| i.domain == name && i.op == crate::server_push::DomainOp::Assign)
-            }
-        };
-        let mut keep = Vec::with_capacity(claimed_served_domains.len());
-        for name in claimed_served_domains {
-            if !assigned(&name) {
-                warn!(
-                    did = signer,
-                    domain = %name,
-                    "register: dropping served_domains entry — this server was not assigned the domain"
-                );
-                continue;
-            }
-            match did_hosting_common::server::domain::get_domain(&state.store, &name).await {
-                Ok(Some(_)) => keep.push(name),
-                Ok(None) => warn!(
-                    did = signer,
-                    domain = %name,
-                    "register: dropping served_domains entry — control plane has no DomainEntry for this name"
-                ),
-                Err(e) => warn!(
-                    did = signer,
-                    domain = %name,
-                    error = %e,
-                    "register: failed to look up DomainEntry during served_domains validation — dropping entry"
-                ),
-            }
-        }
-        keep
-    };
+    let served_domains = assigned_served_domains(
+        state,
+        signer,
+        payload.served_domains.clone(),
+        previous.as_ref(),
+    )
+    .await?;
     let protocol_version = payload
         .protocol_version
         .as_ref()
@@ -348,17 +233,217 @@ pub(crate) async fn do_server_register(
         last_ack_at: previous.as_ref().and_then(|p| p.last_ack_at),
         last_reconcile_at: previous.as_ref().and_then(|p| p.last_reconcile_at),
     };
+    upsert_registration(state, signer, &instance_id, build).await?;
 
-    // Built from the record as it stands under the instance's lock, so a pong
-    // or ack recorded since `previous` was read above is carried forward too.
-    // A record another DID took meanwhile is left alone.
-    let written = registry::upsert_instance(&state.registry_ks, &instance_id, |current| {
-        match current.as_ref().and_then(|c| c.did()) {
+    info!(
+        did = signer,
+        instance_id = %instance_id,
+        public_url = public_url,
+        role = %role,
+        "server registered"
+    );
+
+    after_server_registration(state, signer, &instance_id, &hints, resync_domains).await;
+
+    Ok(
+        did_hosting_common::tasks::did_management::server::register::v0_2::Response::builder()
+            .accepted(true)
+            .instance_id(instance_id)
+            .last_seen_at(chrono::SubsecRound::trunc_subsecs(chrono::Utc::now(), 0))
+            .try_into()
+            .expect("a register ack is well formed"),
+    )
+}
+
+/// Require a pre-approved ACL entry with the Service role. An Owner-role DID
+/// must not be able to register as a server: registration triggers
+/// `sync_all_dids_to_server`, which would push every tenant's DID log +
+/// witness content to the caller's inbox and add them to the active-server
+/// registry so future `notify_servers_did` updates also reach them.
+///
+/// Decided before the payload is read, so a signer without the role learns
+/// nothing about what a registration must carry.
+async fn require_service_role(
+    state: &AppState,
+    signer: &str,
+) -> Result<did_hosting_common::server::acl::Role, InfraRejection> {
+    use did_hosting_common::server::acl::check_acl;
+
+    match check_acl(&state.acl_ks, signer).await {
+        Ok(did_hosting_common::server::acl::Role::Service) => {
+            Ok(did_hosting_common::server::acl::Role::Service)
+        }
+        Ok(other) => {
+            warn!(
+                did = signer,
+                role = %other,
+                "server registration rejected: Service role required"
+            );
+            Err(InfraRejection::not_authorised(
+                "service role required to register as a server",
+            ))
+        }
+        Err(e) if !did_hosting_common::server::acl::is_acl_refusal(&e) => {
+            warn!(did = signer, error = %e, "server registration deferred: ACL lookup failed");
+            Err(InfraRejection::lookup_failed(&e))
+        }
+        Err(_) => {
+            warn!(
+                did = signer,
+                "server registration rejected: DID not in ACL (requires pre-approval)"
+            );
+            Err(InfraRejection::not_authorised(
+                "server DID must be pre-approved in the ACL before registering",
+            ))
+        }
+    }
+}
+
+/// The registration payload, which must name its signer: `did` is the
+/// signer and `instanceId` the signer's registry key (one registration per
+/// DID). Returns the payload and that registry key.
+fn parse_registration(
+    signer: &str,
+    body: &Value,
+) -> Result<
+    (
+        did_hosting_common::tasks::did_management::server::register::v0_2::Payload,
+        String,
+    ),
+    InfraRejection,
+> {
+    let payload: did_hosting_common::tasks::did_management::server::register::v0_2::Payload =
+        serde_json::from_value(body.clone()).map_err(|e| {
+            warn!(did = signer, error = %e, "server registration rejected: malformed payload");
+            InfraRejection::malformed(format!("not a server/register/0.2 payload: {e}"))
+        })?;
+    // Use the signer DID as a stable instance ID (one registration per DID).
+    let instance_id = crate::registry::instance_id_for(signer);
+    if payload.did.as_str() != signer || payload.instance_id.as_str() != instance_id {
+        warn!(
+            did = signer,
+            "server registration rejected: did/instanceId do not name the signer"
+        );
+        return Err(InfraRejection::malformed(format!(
+            "`did` must be the signer and `instanceId` must be `{instance_id}`"
+        )));
+    }
+    Ok((payload, instance_id))
+}
+
+/// The record already under `instance_id`, if it is `signer`'s own. The
+/// registry id is not one-to-one with DIDs (`instance_id_for`): a record
+/// under this id that another DID registered stays that DID's.
+async fn previous_registration(
+    state: &AppState,
+    signer: &str,
+    instance_id: &str,
+) -> Result<Option<crate::registry::ServiceInstance>, InfraRejection> {
+    let previous = match crate::registry::get_instance(&state.registry_ks, instance_id).await {
+        Ok(previous) => previous,
+        Err(e) => {
+            warn!(did = signer, error = %e, "server registration deferred: registry lookup failed");
+            return Err(InfraRejection::lookup_failed(&e));
+        }
+    };
+    if let Some(holder) = previous.as_ref().and_then(|p| p.did())
+        && holder != signer
+    {
+        warn!(
+            did = signer,
+            holder, instance_id, "server registration rejected: instance id held by another DID"
+        );
+        return Err(InfraRejection::conflict(
+            "another server's registration holds this instance id",
+        ));
+    }
+    Ok(previous)
+}
+
+/// The domains of `claimed` the server is kept as serving.
+///
+/// A server's claim to serve a domain is kept only if the control plane
+/// assigned it the domain: its latest recorded domain operation for this
+/// server is an assign (`server_push::DomainIntent`). A claim to a domain
+/// the control plane has no record of, or assigned to another server only,
+/// is dropped, so it cannot block `registry/purge-domain` with
+/// `STILL_ASSIGNED` or mislead the purge fan-out.
+///
+/// A server with no recorded domain operation at all was assigned its
+/// domains before they were recorded: it keeps a claim the registry
+/// already listed for it, and nothing new.
+async fn assigned_served_domains(
+    state: &AppState,
+    signer: &str,
+    claimed: Vec<String>,
+    previous: Option<&crate::registry::ServiceInstance>,
+) -> Result<Vec<String>, InfraRejection> {
+    if claimed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let intents = match crate::server_push::domain_intents(state, signer).await {
+        Ok(intents) => intents,
+        Err(e) => {
+            warn!(did = signer, error = %e, "server registration deferred: domain intents lookup failed");
+            return Err(InfraRejection::lookup_failed(&e));
+        }
+    };
+    let assigned = |name: &str| {
+        if intents.is_empty() {
+            previous.is_some_and(|p| p.served_domains.iter().any(|d| d == name))
+        } else {
+            intents
+                .iter()
+                .any(|i| i.domain == name && i.op == crate::server_push::DomainOp::Assign)
+        }
+    };
+    let mut keep = Vec::with_capacity(claimed.len());
+    for name in claimed {
+        if !assigned(&name) {
+            warn!(
+                did = signer,
+                domain = %name,
+                "register: dropping served_domains entry — this server was not assigned the domain"
+            );
+            continue;
+        }
+        match did_hosting_common::server::domain::get_domain(&state.store, &name).await {
+            Ok(Some(_)) => keep.push(name),
+            Ok(None) => warn!(
+                did = signer,
+                domain = %name,
+                "register: dropping served_domains entry — control plane has no DomainEntry for this name"
+            ),
+            Err(e) => warn!(
+                did = signer,
+                domain = %name,
+                error = %e,
+                "register: failed to look up DomainEntry during served_domains validation — dropping entry"
+            ),
+        }
+    }
+    Ok(keep)
+}
+
+/// Write the registration `build` makes from the record as it stands under
+/// the instance's lock, so a pong or ack recorded since the previous record
+/// was read is carried forward too. A record another DID took meanwhile is
+/// left alone, and refused as a conflict.
+async fn upsert_registration(
+    state: &AppState,
+    signer: &str,
+    instance_id: &str,
+    build: impl FnOnce(Option<crate::registry::ServiceInstance>) -> crate::registry::ServiceInstance,
+) -> Result<(), InfraRejection> {
+    let written =
+        crate::registry::upsert_instance(&state.registry_ks, instance_id, |current| match current
+            .as_ref()
+            .and_then(|c| c.did())
+        {
             Some(holder) if holder != signer => None,
             _ => Some(build(current)),
-        }
-    })
-    .await;
+        })
+        .await;
     let written = match written {
         Ok(Some(instance)) if instance.did() == Some(signer) => Ok(()),
         Ok(_) => {
@@ -378,21 +463,23 @@ pub(crate) async fn do_server_register(
         // not the request.
         return Err(InfraRejection::Failed(Box::new(e.failure_reject_reason())));
     }
+    Ok(())
+}
 
-    info!(
-        did = signer,
-        instance_id = %instance_id,
-        public_url = public_url,
-        role = %role,
-        "server registered"
-    );
-
+/// What follows a written registration: the badge cache, then the resync.
+async fn after_server_registration(
+    state: &AppState,
+    signer: &str,
+    instance_id: &str,
+    hints: &Value,
+    resync_domains: Vec<String>,
+) {
     // Cache what the registering server's DID document advertises, so the
     // Servers list can badge it. Best-effort: a registration must not fail
     // because the DID momentarily won't resolve.
-    if let Err(e) = registry::refresh_advertised_services(
+    if let Err(e) = crate::registry::refresh_advertised_services(
         &state.registry_ks,
-        &instance_id,
+        instance_id,
         state.did_resolver.as_ref(),
         crate::auth::session::now_epoch(),
     )
@@ -413,15 +500,6 @@ pub(crate) async fn do_server_register(
     //
     // Domains first, then DIDs, in one task: the order their rows queue in
     // for this server is then deterministic.
-    let reported = server_push::parse_reported(&hints);
+    let reported = server_push::parse_reported(hints);
     server_push::resync_server(state, signer.to_string(), reported, resync_domains);
-
-    Ok(
-        did_hosting_common::tasks::did_management::server::register::v0_2::Response::builder()
-            .accepted(true)
-            .instance_id(instance_id)
-            .last_seen_at(chrono::SubsecRound::trunc_subsecs(chrono::Utc::now(), 0))
-            .try_into()
-            .expect("a register ack is well formed"),
-    )
 }

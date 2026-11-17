@@ -472,6 +472,29 @@ async fn bound_key_rows_do_not_touch_the_shared_replay_cache() {
     );
 }
 
+/// A bound-key row is not behind the ACL pre-filter: its parties are keys
+/// the ACL never lists, so neither a stranger's key nor an ACL store that
+/// cannot be read stops the document reaching its row.
+#[tokio::test]
+async fn bound_key_rows_skip_the_acl_pre_filter() {
+    let (mut state, _dir) = state().await;
+    let starter = stranger(69);
+    let doc = redeem_doc(&starter, NO_SUCH_REQUEST, "authentication").await;
+    assert_eq!(
+        code(&https(&state, None, doc).await),
+        "auth/oob:requestNotFound"
+    );
+    state.acl_ks = state.acl_ks.failing_reads_after(
+        0,
+        did_hosting_common::server::error::AppError::store_throttled,
+    );
+    let doc = redeem_doc(&starter, NO_SUCH_REQUEST, "authentication").await;
+    assert_eq!(
+        code(&https(&state, None, doc).await),
+        "auth/oob:requestNotFound"
+    );
+}
+
 /// A bound-key row's admission runs before the gate does any proof work: past
 /// its per-address limit, a document is refused as rate limited whether or
 /// not its proof would verify.

@@ -617,6 +617,39 @@ async fn trust_tasks_envelope_replay_is_refused() {
     assert_eq!(replayed["payload"]["code"], "idConflict", "{replayed}");
 }
 
+/// The replay gate sits in front of routing: a replayed document is refused
+/// before its task runs, so a re-created DID is not deleted by a captured
+/// delete. A replay check made after routing would refuse the same document
+/// but act on it first.
+#[tokio::test]
+async fn a_replay_is_refused_before_its_task_runs_again() {
+    let (state, _dir) = signing_state().await;
+    let (admin, admin_key) = crate::signing::test_util::did_key_signer(&[24u8; 32]);
+    seed_role(&state, &admin, Role::Admin).await;
+    seed_did(&state, &admin, "recreated").await;
+
+    let doc = sign(
+        request_doc(DELETE, Some(&admin), json!({ "mnemonic": "recreated" })),
+        &admin_key,
+    )
+    .await;
+    let first = dispatch_envelope(&state, &admin, doc.clone()).await;
+    assert_eq!(first["type"], DELETE_RESPONSE, "{first}");
+
+    // Re-created after the delete: the replay must not reach it.
+    state.dids_ks.remove(did_key("recreated")).await.unwrap();
+    seed_did(&state, &admin, "recreated").await;
+    let replayed = dispatch_envelope(&state, &admin, doc).await;
+    assert_eq!(replayed["payload"]["code"], "idConflict", "{replayed}");
+    let held: DidRecord = state
+        .dids_ks
+        .get(did_key("recreated"))
+        .await
+        .unwrap()
+        .expect("the re-created DID is untouched");
+    assert!(held.deleted_at.is_none(), "{held:?}");
+}
+
 /// Over the DIDComm envelope too, a non-error reply is signed by the
 /// control plane for the requester; error documents are not.
 #[tokio::test]
@@ -1578,6 +1611,76 @@ async fn a_registry_id_another_did_holds_is_not_taken_over() {
     );
     do_health_pong(&state, first, &json!({ "status": "ok" })).await;
     assert!(held(&state, first).await.last_health_check.is_some());
+}
+
+/// The order of a registration's checks, by what each refusal is: the
+/// signer's role is decided before its payload is read, the payload before
+/// its URL, and nothing refused leaves a registry record. A re-register
+/// carries the instance's observed history forward.
+#[tokio::test]
+async fn server_registration_checks_role_then_payload_then_url() {
+    let (state, _dir) = test_state().await;
+
+    // An Owner is refused on its role, whatever its payload says.
+    let owner = "did:example:not-a-server";
+    seed_role(&state, owner, Role::Owner).await;
+    let Err(rej) = do_server_register(&state, owner, &json!({ "not": "a payload" })).await else {
+        panic!("an Owner must not register");
+    };
+    assert!(matches!(rej, InfraRejection::NotAuthorised(_)), "{rej}");
+    let Err(rej) = do_server_register(&state, "did:example:unlisted", &json!({})).await else {
+        panic!("an unlisted DID must not register");
+    };
+    assert!(matches!(rej, InfraRejection::NotAuthorised(_)), "{rej}");
+
+    // A Service whose payload names another server is malformed.
+    let edge = "did:example:edge-order";
+    seed_service(&state, edge).await;
+    let Err(rej) =
+        do_server_register(&state, edge, &register_payload("did:example:someone-else")).await
+    else {
+        panic!("a payload naming another server must be refused");
+    };
+    assert!(matches!(rej, InfraRejection::Malformed(_)), "{rej}");
+
+    // A well-formed payload whose URL is internal is not authorised.
+    let mut internal = register_payload(edge);
+    internal["publicUrl"] = json!("https://127.0.0.1");
+    let Err(rej) = do_server_register(&state, edge, &internal).await else {
+        panic!("an internal URL must be refused");
+    };
+    assert!(matches!(rej, InfraRejection::NotAuthorised(_)), "{rej}");
+    let id = crate::registry::instance_id_for(edge);
+    assert!(
+        crate::registry::get_instance(&state.registry_ks, &id)
+            .await
+            .unwrap()
+            .is_none(),
+        "no refused registration was recorded"
+    );
+
+    // Registered; an ack is observed; a re-register keeps it.
+    let ack = do_server_register(&state, edge, &register_payload(edge))
+        .await
+        .expect("registered");
+    assert!(ack.accepted);
+    crate::registry::upsert_instance(&state.registry_ks, &id, |current| {
+        current.map(|mut i| {
+            i.last_ack_at = Some(42);
+            i
+        })
+    })
+    .await
+    .unwrap();
+    do_server_register(&state, edge, &register_payload(edge))
+        .await
+        .expect("re-registered");
+    let held = crate::registry::get_instance(&state.registry_ks, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.last_ack_at, Some(42));
+    assert_eq!(held.did(), Some(edge));
 }
 
 /// A server's `servedDomains` claim is kept only for a domain the control
