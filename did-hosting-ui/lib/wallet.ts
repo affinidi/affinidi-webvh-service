@@ -20,6 +20,7 @@ import { Platform } from "react-native";
 import { getApiBase } from "./api-base";
 import { clearSessionKeypair } from "./session-key";
 import { getServiceInfo } from "./trust-task";
+import { WEBS_DIDS_UPDATE_0_1 } from "./webs-edit";
 import {
   authenticateIdTokenBindingSessionKey,
   loginBindingSessionKey,
@@ -497,6 +498,31 @@ export async function requestDidUpdate(args: {
       document: args.document,
       ...(args.expectedVersionId ? { expectedVersionId: args.expectedVersionId } : {}),
     },
+  })) as Record<string, unknown>;
+
+  return readOutcome(reply);
+}
+
+/**
+ * Ask the user's VTA to replace a did:webs DID's further aliases
+ * (`vta/webs/dids/update/0.1`). See `webs-edit.ts` for why a did:webs edit
+ * cannot go through {@link requestDidUpdate}.
+ *
+ * No `expectedVersionId`: the task pins a key event (`<sn>:<said>`), and the
+ * version ids this page reads from the host are not in that form. The VTA
+ * still refuses an update that would change nothing.
+ */
+export async function requestWebsAliasUpdate(args: {
+  did: string;
+  alsoKnownAs: string[];
+}): Promise<RequestTaskOutcome> {
+  const wallet = window.vtaWallet;
+  if (!wallet?.requestTask) {
+    throw new Error("This wallet does not support delegated task execution.");
+  }
+  const reply = (await wallet.requestTask({
+    type: WEBS_DIDS_UPDATE_0_1,
+    payload: { did: args.did, alsoKnownAs: args.alsoKnownAs },
   })) as Record<string, unknown>;
 
   return readOutcome(reply);
