@@ -89,6 +89,95 @@ pub struct ClaimHash {
     digest: String,
 }
 
+/// How an operator-issued invite's issuer is stored. Not a DID, so no
+/// administrator's issuer can be read back as it (see [`Issuer`]).
+const OPERATOR_CLI_ISSUER: &str = "operator (CLI)";
+
+/// Who issued an invite, and so whose authority it carries.
+///
+/// Either the operator, through the `invite` subcommand (whose authority is
+/// store access, which no ACL change takes away), or an administrator, named
+/// by DID (whose authority is their ACL entry, so the invite is honoured only
+/// while they still hold administrator standing). The two cannot be confused:
+/// an administrator is always a DID, and the operator's stored form is not
+/// one, so the only way to make an operator issuer is [`Issuer::operator`].
+///
+/// Stored as a string — the administrator's DID, or `operator (CLI)` — the
+/// form every invite already on disk has.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Issuer(IssuerKind);
+
+#[derive(Clone, PartialEq, Eq)]
+enum IssuerKind {
+    Operator,
+    Administrator(String),
+}
+
+impl Issuer {
+    /// The operator, issuing from the command line with store access.
+    pub fn operator() -> Self {
+        Self(IssuerKind::Operator)
+    }
+
+    /// An administrator, by DID. Anything that is not a DID is refused, so
+    /// no caller-supplied string can stand for the operator.
+    pub fn administrator(did: impl Into<String>) -> Result<Self, AppError> {
+        let did = did.into();
+        if !did.starts_with("did:") {
+            return Err(AppError::invalid(format!(
+                "an invite's administrator issuer must be a DID, not `{did}`"
+            )));
+        }
+        Ok(Self(IssuerKind::Administrator(did)))
+    }
+
+    /// Whether this is the operator.
+    pub fn is_operator(&self) -> bool {
+        matches!(self.0, IssuerKind::Operator)
+    }
+
+    /// The administrator's DID; `None` for the operator.
+    pub fn administrator_did(&self) -> Option<&str> {
+        match &self.0 {
+            IssuerKind::Operator => None,
+            IssuerKind::Administrator(did) => Some(did),
+        }
+    }
+
+    /// The stored and logged form.
+    pub fn as_str(&self) -> &str {
+        self.administrator_did().unwrap_or(OPERATOR_CLI_ISSUER)
+    }
+}
+
+impl std::fmt::Display for Issuer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Debug for Issuer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for Issuer {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Issuer {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        if s == OPERATOR_CLI_ISSUER {
+            return Ok(Self::operator());
+        }
+        Self::administrator(s).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A stored invite. Holds no secret: only hashes of the token and the code.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Invite {
@@ -105,8 +194,14 @@ pub struct Invite {
     pub role: Option<String>,
     /// The inviter's suggested credential label.
     pub device_label: Option<String>,
-    /// Who issued it: the administrator's VID, or `operator (CLI)`.
-    pub issued_by: String,
+    /// Who issued it.
+    pub issued_by: Issuer,
+    /// The administrators who changed its role or expiry since it was issued
+    /// (`auth/passkey/enroll/invite/update`), each once. The invite carries
+    /// their authority too: it is honoured only while every one of them is
+    /// still an administrator, and withdrawn with any one's ACL entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub amended_by: Vec<String>,
     pub created_at: u64,
     pub expires_at: u64,
     /// Wrong claim codes presented so far.
@@ -124,6 +219,7 @@ impl std::fmt::Debug for Invite {
             .field("purpose", &self.purpose)
             .field("role", &self.role)
             .field("issued_by", &self.issued_by)
+            .field("amended_by", &self.amended_by)
             .field("created_at", &self.created_at)
             .field("expires_at", &self.expires_at)
             .field("wrong_codes", &self.wrong_codes)
@@ -135,6 +231,26 @@ impl Invite {
     /// Whether the invite can no longer be redeemed.
     pub fn is_expired(&self, now: u64) -> bool {
         now >= self.expires_at
+    }
+
+    /// The administrators whose standing the invite rests on: its issuer,
+    /// when that is an administrator, and every administrator who amended it.
+    /// An operator-issued invite nobody amended rests on none.
+    pub fn administrators(&self) -> impl Iterator<Item = &str> {
+        self.issued_by
+            .administrator_did()
+            .into_iter()
+            .chain(self.amended_by.iter().map(String::as_str))
+    }
+
+    /// Record that administrator `did` changed the invite.
+    pub fn record_amendment(&mut self, did: &str) {
+        if !self
+            .administrators()
+            .any(|a| crate::scid::same_reference(a, did))
+        {
+            self.amended_by.push(did.to_string());
+        }
     }
 }
 
@@ -162,7 +278,7 @@ pub struct InviteRequest {
     pub purpose: Purpose,
     pub role: Option<String>,
     pub device_label: Option<String>,
-    pub issued_by: String,
+    pub issued_by: Issuer,
     pub ttl_secs: u64,
 }
 
@@ -398,6 +514,7 @@ pub async fn issue(
         role: req.role,
         device_label: req.device_label,
         issued_by: req.issued_by,
+        amended_by: Vec::new(),
         created_at: now,
         expires_at: now.saturating_add(req.ttl_secs.max(1)),
         wrong_codes: 0,

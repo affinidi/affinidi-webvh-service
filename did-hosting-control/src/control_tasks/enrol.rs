@@ -567,7 +567,7 @@ pub(crate) async fn invite(
             purpose,
             role,
             device_label: p.device_label.as_deref().cloned(),
-            issued_by: auth.did.clone(),
+            issued_by: invite::Issuer::administrator(auth.did.clone())?,
             ttl_secs: ttl,
         },
         state.config.auth.claim_code_hash_wait(),
@@ -635,6 +635,15 @@ pub(crate) async fn redeem_start(
             ));
         }
     };
+    // Refused here, before the invitee makes a credential, what the finish
+    // would refuse anyway: an invite whose authority has lapsed, or one that
+    // would pair a passkey with a metrics reader. The invite is left as it
+    // is (an administrator restored meanwhile makes it good again); the
+    // finish checks both again, against the invite it consumes.
+    refuse_metrics_reader(state, &invite).await?;
+    if !invite_authority_stands(state, &invite).await? {
+        return Err(lapsed_authority(&invite, &invite.subject));
+    }
     let opened = open(
         state,
         &invite.subject,
@@ -687,6 +696,65 @@ async fn is_metrics_reader(state: &AppState, subject: &str) -> Result<bool, AppE
         .is_some_and(|e| e.role == Role::MetricsReader))
 }
 
+/// Refuse an invite that would pair a passkey with a metrics reader: one that
+/// confers the role, or whose subject has been granted it since. Invite
+/// create and update already refuse the role, but a passkey must never land
+/// for it whatever happened meanwhile.
+async fn refuse_metrics_reader(state: &AppState, invite: &invite::Invite) -> Result<(), TaskError> {
+    let confers_metrics_reader = invite
+        .role
+        .as_deref()
+        .is_some_and(|r| matches!(r.parse::<Role>(), Ok(Role::MetricsReader)));
+    if confers_metrics_reader || is_metrics_reader(state, &invite.subject).await? {
+        return Err(TaskError::Standard(
+            trust_tasks_rs::StandardCode::PermissionDenied,
+            "a metrics-reader credential cannot be enrolled via invite".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether the authority an invite carries still stands.
+///
+/// An invite carries the authority of whoever issued or changed it, so it is
+/// honoured only while each of them still holds it: every administrator in
+/// [`invite::Invite::administrators`] must still be one. An administrator
+/// removed or demoted since enrols no one through it — including through an
+/// operator's invite they amended. The operator's own authority is store
+/// access, which no ACL change takes away, so an operator-issued invite that
+/// no administrator amended rests on nothing here; the operator withdraws
+/// one with `remove-acl --did <subject>`, an administrator with
+/// `auth/passkey/enroll/invite/revoke`.
+async fn invite_authority_stands(
+    state: &AppState,
+    invite: &invite::Invite,
+) -> Result<bool, AppError> {
+    for did in invite.administrators() {
+        match acl::check_acl(&state.acl_ks, did).await {
+            Ok(Role::Admin) => {}
+            Ok(_) => return Ok(false),
+            Err(e) if acl::is_acl_refusal(&e) => return Ok(false),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+
+/// The refusal of an invite whose authority has lapsed, logged.
+fn lapsed_authority(invite: &invite::Invite, subject: &str) -> TaskError {
+    warn!(
+        invite_id = %invite.invite_id,
+        issued_by = %invite.issued_by,
+        amended_by = ?invite.amended_by,
+        subject = %subject,
+        "invite redemption refused: an administrator it rests on no longer holds that standing"
+    );
+    TaskError::Standard(
+        trust_tasks_rs::StandardCode::PermissionDenied,
+        "an administrator who issued or changed this invite no longer holds that standing".into(),
+    )
+}
+
 /// `auth/passkey/enroll/redeem/finish/0.1`: bind the credential to the
 /// invite's subject with the invite's purpose, and consume the invite.
 pub(crate) async fn redeem_finish(
@@ -707,11 +775,13 @@ pub(crate) async fn redeem_finish(
     let ceremony = pk::take_ceremony(&state.sessions_ks, &p.enrollment_id)
         .await?
         .ok_or_else(not_found)?;
+    // The origin's `role` and `issued_by` are what the invite said when the
+    // ceremony opened; an administrator may have changed it since, so what is
+    // granted and on whose authority is read from the invite itself.
     let CeremonyOrigin::Invite {
         token_hash,
         invite_id,
-        role,
-        issued_by,
+        ..
     } = ceremony.origin.clone()
     else {
         return Err(not_found());
@@ -726,22 +796,10 @@ pub(crate) async fn redeem_finish(
     let live = invite::by_token_hash(&state.sessions_ks, &token_hash)
         .await?
         .filter(|i| !i.is_expired(now_epoch()))
-        .is_some_and(|i| i.ceremony.as_deref() == Some(ceremony.enrollment_id.as_str()));
-    if !live {
-        return Err(not_found());
-    }
-    // Refused before the invite is consumed. Invite create and update already
-    // refuse `MetricsReader`, but the subject may have been granted the role
-    // since the invite was issued, and a passkey must never land for it.
-    let confers_metrics_reader = role
-        .as_deref()
-        .is_some_and(|r| matches!(r.parse::<Role>(), Ok(Role::MetricsReader)));
-    if confers_metrics_reader || is_metrics_reader(state, &ceremony.subject).await? {
-        return Err(TaskError::Standard(
-            trust_tasks_rs::StandardCode::PermissionDenied,
-            "a metrics-reader credential cannot be enrolled via invite".into(),
-        ));
-    }
+        .filter(|i| i.ceremony.as_deref() == Some(ceremony.enrollment_id.as_str()))
+        .ok_or_else(not_found)?;
+    // Refused before the invite is consumed.
+    refuse_metrics_reader(state, &live).await?;
 
     let store = credential_store(state, ceremony.purpose)?;
     // Held from this read through `persist`, so a concurrent revoke can't be
@@ -793,41 +851,26 @@ pub(crate) async fn redeem_finish(
         .await;
 
     // Consume the invite. Exactly one finish wins this; the loser binds
-    // nothing. An invite withdrawn by a removal is gone by now.
-    if invite::take(&state.sessions_ks, &token_hash)
-        .await?
-        .is_none()
-    {
+    // nothing. An invite withdrawn by a removal is gone by now. What is taken
+    // is the invite as it stands now, under the guard every update takes.
+    let Some(taken) = invite::take(&state.sessions_ks, &token_hash).await? else {
         return Err(not_found());
-    }
-    // An invite carries its issuer's authority, so it is honoured only while
-    // the issuer still holds it: an administrator removed or demoted since
-    // issuing it no longer enrols anyone. Checked after the take, so the
-    // invite is spent either way.
-    let issuer_standing = match acl::check_acl(&state.acl_ks, &issued_by).await {
-        Ok(role) => role == Role::Admin,
-        Err(e) if acl::is_acl_refusal(&e) => false,
-        Err(e) => return Err(e.into()),
     };
-    if !issuer_standing {
-        warn!(
-            invite_id = %invite_id,
-            issued_by = %issued_by,
-            subject = %ceremony.subject,
-            "invite redemption refused: its issuer no longer holds administrator standing"
-        );
-        return Err(TaskError::Standard(
-            trust_tasks_rs::StandardCode::PermissionDenied,
-            "the administrator who issued this invite no longer holds that standing".into(),
-        ));
+    // Checked again, under the ACL locks, against the invite consumed:
+    // `redeem/start` checked an earlier read. Checked after the take, so the
+    // invite is spent either way.
+    refuse_metrics_reader(state, &taken).await?;
+    if !invite_authority_stands(state, &taken).await? {
+        return Err(lapsed_authority(&taken, &ceremony.subject));
     }
-    let acl_entry = match (ceremony.purpose, role) {
+    let issued_by = &taken.issued_by;
+    let acl_entry = match (ceremony.purpose, taken.role.clone()) {
         (Purpose::Session, Some(role)) => {
             match acl::get_acl_entry(&state.acl_ks, &ceremony.subject).await? {
                 Some(_) => None,
                 None => Some(AclEntry {
                     did: ceremony.subject.clone(),
-                    // `MetricsReader` was refused above, before the take.
+                    // `MetricsReader` was refused above.
                     role: role.parse::<Role>()?,
                     label: Some("enrolled via passkey invite".into()),
                     created_at: now_epoch(),
@@ -1220,6 +1263,10 @@ pub(crate) async fn invite_update(
             (None, Some(s)) => existing.expires_at = now.saturating_add(s.get()).min(max),
             (None, None) => {}
         }
+        // The change carries this administrator's authority: the invite is
+        // honoured from now on only while they remain one, and withdrawn
+        // with their ACL entry.
+        existing.record_amendment(&auth.did);
         Ok(())
     })
     .await?

@@ -208,7 +208,11 @@ pub enum AdminCommand {
         #[arg(long)]
         witness: bool,
     },
-    /// Remove an ACL entry
+    /// Remove an ACL entry and withdraw its DID's invites
+    ///
+    /// Withdraws the enrolment invites issued for the DID, or issued or
+    /// changed by it. With no ACL entry, only withdraws the invites issued
+    /// for the DID, which is how an operator takes back a CLI invite.
     RemoveAcl {
         /// DID to remove from the ACL
         #[arg(long)]

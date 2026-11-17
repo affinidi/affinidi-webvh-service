@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use webauthn_rs::prelude::*;
 
-use super::invite::Purpose;
+use super::invite::{Issuer, Purpose};
 use crate::server::error::AppError;
 use crate::server::store::{KeyspaceHandle, WriteBatch};
 
@@ -68,7 +68,7 @@ pub enum CeremonyOrigin {
         token_hash: String,
         invite_id: String,
         role: Option<String>,
-        issued_by: String,
+        issued_by: Issuer,
     },
     /// `auth/passkey/enroll/start/0.2`: the subject's own signed request, and
     /// the bearer session it arrived with, when there was one.

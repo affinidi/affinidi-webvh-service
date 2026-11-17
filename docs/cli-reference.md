@@ -753,7 +753,7 @@ Commands:
   setup-offline-complete   Step 2/2 of the offline setup wizard
   add-acl                  Add an ACL entry
   list-acl                 List all ACL entries
-  remove-acl               Remove an ACL entry
+  remove-acl               Remove an ACL entry and withdraw its DID's invites
   invite                   Create a passkey enrollment invite
   fetch-metrics            Read this service's counters over the authenticated `server/metrics/0.1` Trust Task and print them as JSON
   send-trust-task          Send one signed Trust Task to the running service and print the response payload as JSON
@@ -967,7 +967,9 @@ Options:
 ### `did-hosting-control remove-acl`
 
 ```text
-Remove an ACL entry
+Remove an ACL entry and withdraw its DID's invites
+
+Withdraws the enrolment invites issued for the DID, or issued or changed by it. With no ACL entry, only withdraws the invites issued for the DID, which is how an operator takes back a CLI invite.
 
 Usage: did-hosting-control remove-acl [OPTIONS] --did <DID>
 
@@ -979,7 +981,7 @@ Options:
           DID to remove from the ACL
 
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ### `did-hosting-control invite`
@@ -1490,7 +1492,7 @@ Commands:
   restore                  Restore the daemon's data from a `did-hosting-daemon backup` file
   add-acl                  Add an ACL entry
   list-acl                 List all ACL entries
-  remove-acl               Remove an ACL entry
+  remove-acl               Remove an ACL entry and withdraw its DID's invites
   invite                   Create a passkey enrollment invite
   fetch-metrics            Read this service's counters over the authenticated `server/metrics/0.1` Trust Task and print them as JSON
   send-trust-task          Send one signed Trust Task to the running service and print the response payload as JSON
@@ -1762,7 +1764,9 @@ Options:
 ### `did-hosting-daemon remove-acl`
 
 ```text
-Remove an ACL entry
+Remove an ACL entry and withdraw its DID's invites
+
+Withdraws the enrolment invites issued for the DID, or issued or changed by it. With no ACL entry, only withdraws the invites issued for the DID, which is how an operator takes back a CLI invite.
 
 Usage: did-hosting-daemon remove-acl [OPTIONS] --did <DID>
 
@@ -1774,7 +1778,7 @@ Options:
           DID to remove from the ACL
 
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ### `did-hosting-daemon invite`
