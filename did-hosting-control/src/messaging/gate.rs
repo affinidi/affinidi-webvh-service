@@ -92,6 +92,26 @@ pub(crate) async fn dispatch_trust_task_doc(
 
 /// The routing half of [`dispatch_trust_task_doc`]; replies are signed by the
 /// caller.
+///
+/// A pipeline of stages, each a method of [`Gate`] that either hands the next
+/// stage what it established or ends the exchange with the refusal it carries:
+///
+/// 1. a peer's `trust-task-error` is terminal ([`settle_peer_error`]), before
+///    anything else;
+/// 2. [`Gate::admit`]: the bound-key row's transport and admission, a
+///    `did:webs` self-registration's admission, a session ceremony's key kind
+///    — all before any proof work;
+/// 3. [`Gate::prefilter`]: the ACL pre-filter, and whether the signer is
+///    listed;
+/// 4. [`Gate::verify`]: the proof, which names the `principal` everything
+///    after authorises on, and settles any large-document charge;
+/// 5. [`Gate::check_replay`]: the replay gate, in the partition
+///    [`replay_partition`] picks;
+/// 6. [`Gate::route`]: the auth family, the infrastructure family, the
+///    control table, then the framework family.
+///
+/// The order is load bearing and each stage's doc says why it sits where it
+/// does; they are not interchangeable.
 // One argument per thing a binding knows; a struct here would only rename them.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn route_trust_task_doc(
@@ -104,11 +124,6 @@ pub(super) async fn route_trust_task_doc(
     verifier: &did_hosting_common::server::trust_tasks::TransportBoundVerifier,
     large_doc_charge: Option<did_hosting_common::server::trust_tasks::size::LargeDocumentCharge>,
 ) -> Result<RoutedReply, DIDCommServiceError> {
-    use did_hosting_common::server::trust_tasks::{
-        DispatchOutcome, TransportBoundVerifier, TrustTaskContext, dispatch_inbound,
-        verify_bound_key, verify_sender_bound, verify_sender_bound_approval,
-    };
-
     let my_vid = state
         .config
         .server_did
@@ -125,170 +140,323 @@ pub(super) async fn route_trust_task_doc(
     // once already, and it stopped only when the mediator started
     // rate-limiting.
     //
-    // The reason is logged, not just the fact: a peer's error is often the only
-    // account of what went wrong anywhere in the exchange.
-    //
     // The prefix comes from `vta_sdk::inbound`, not a literal here: which URIs
     // are terminal errors is a fact about the *document*, the same for whoever
     // reads one, and a local copy is a second place for it to drift from.
     if type_uri.starts_with(vta_sdk::inbound::TRUST_TASK_ERROR_PREFIX) {
-        let code = doc
-            .payload
-            .get("code")
-            .and_then(Value::as_str)
-            .unwrap_or("?");
-        let message = doc
-            .payload
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        warn!(
-            sender,
-            %code,
-            %message,
-            "inbound trust-task error from a peer — terminal, not answered"
-        );
-        // A server's *signed*, non-retryable refusal of an op this control
-        // plane sent settles that outbox entry: the target has said it will not
-        // apply it, so re-sending would only stall its queue. An unsigned error
-        // settles nothing — anyone could send one.
-        let retryable = doc
-            .payload
-            .get("retryable")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if doc.proof.is_some()
-            && !retryable
-            && (crate::server_push::is_configured_watcher(state, sender)
-                || matches!(
-                    did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, sender).await,
-                    Ok(Some(_))
-                ))
-            && let Ok(signer) =
-                verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await
-        {
-            crate::messaging::infra::acknowledge_outbox(state, &signer, &doc).await;
-        }
+        settle_peer_error(state, sender, my_vid, verifier, &doc).await;
         return Ok(RoutedReply::Terminal);
     }
 
-    // ── The proof gate. Every document that asks this control plane to *do*
-    //    something — change state, disclose a record, mint a session — must be
-    //    signed by its issuer, addressed here, and fresh; and the issuer must be
-    //    the DID the transport reported (`verify_sender_bound`). From here on
-    //    `principal` — the proven signer — is the only identity anything below
-    //    authorises on. The transport's `sender` is a routing hint, and a
-    //    document whose proof disagrees with it is refused rather than resolved
-    //    in either's favour.
-    //
-    //    Each task's `ProofRule` says what its proof must be:
-    //    - `Optional`: capability discovery, the public `server/info`,
-    //      opening a passkey login, and the whole `auth/challenge` /
-    //      `auth/authenticate` / `auth/refresh` family — not because a proof
-    //      is optional there (several of these require one), but because the
-    //      ACL pre-filter below is the wrong question for a family whose own
-    //      handlers already decide who may act, on a signer the ACL may
-    //      legitimately never list (a proxied login's delegate) or has not
-    //      listed yet (a first login);
-    //    - `Authentication`: an operational request, `proofPurpose:
-    //      authentication` under the signer's `authentication` relationship;
-    //    - `AssertionMethod`: a human approver's decision, an attestation under
-    //      the approver's `assertionMethod` relationship;
-    //    - `SessionKey`: a ceremony that mints a session for a key the caller
-    //      has just generated, signed by that `did:key` — which has no ACL entry
-    //      of its own; the ceremony names the subject;
-    //    - `BoundKey(purposes)`: a step of an exchange whose parties are fresh
-    //      Ed25519 `did:key`s the exchange binds (wallet sign-in). HTTPS only.
-    //      The row's admission runs first — its size cap, rate limits and, for
-    //      a browser's step, the origin — before any proof work. Then a proof
-    //      by exactly the issuer's own key, for one of the row's purposes,
-    //      verified locally (`verify_bound_key`); no ACL pre-filter (the key is
-    //      never in the ACL) and no shared replay cache (the row keeps its own,
-    //      which a stranger cannot fill; see `ProofRule::BoundKey`). The row
-    //      then checks that the key is the one the exchange recorded.
-    //
-    //    Before any signature work — which can mean resolving a DID over the
-    //    network — the reported sender must at least *have* an ACL entry: every
-    //    privileged op requires one, so a stranger is turned away for the cost
-    //    of a key lookup, and never reaches the resolver or the replay cache.
-    //    This is a cheap pre-filter, not the authorisation; the proof still has
-    //    to bind the document to that same DID below.
-    //
-    //    A document that carries a proof it was not required to carry is held
-    //    to the same rule: a proof that is present is verified, never ignored.
-    let rule = proof_rule(&type_uri);
-    if let ProofRule::BoundKey(_) = rule {
-        let Some(https) = https else {
-            warn!(sender, %type_uri, "trust task refused: a bound-key exchange is served over HTTPS only");
-            return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
-                doc.reject_with(
-                    format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+    let gate = Gate {
+        state,
+        sender,
+        https,
+        verifier,
+        my_vid,
+        rule: proof_rule(&type_uri),
+        type_uri,
+    };
+    let admitted = match gate.admit(&doc).await {
+        Ok(admitted) => admitted,
+        Err(refused) => return Ok(refused),
+    };
+    let listed_signer = match gate.prefilter(&doc, &admitted).await {
+        Ok(listed_signer) => listed_signer,
+        Err(refused) => return Ok(refused),
+    };
+    let signed = admitted.signed;
+    let self_registering = admitted.self_registering;
+    let verified = match gate
+        .verify(&doc, admitted, listed_signer, large_doc_charge.as_ref())
+        .await
+    {
+        Ok(verified) => verified,
+        Err(refused) => return Ok(refused),
+    };
+    let replay_cache = match gate.check_replay(
+        &doc,
+        signed,
+        listed_signer,
+        self_registering,
+        &verified.principal,
+    ) {
+        Ok(replay_cache) => replay_cache,
+        Err(refused) => return Ok(refused),
+    };
+    let recorded =
+        replay_cache.map(|_| (verified.principal.clone(), doc.id.clone(), doc.issued_at));
+
+    let (reply, wrote) = did_hosting_common::server::store::track_writes(Box::pin(
+        gate.route(bearer, transport, signed, &verified, doc),
+    ))
+    .await;
+
+    // A task refused as `unavailable` (over capacity) before it wrote
+    // anything did not run, and a refused document can be sent again as a
+    // retry: forget its record, or the resend would be refused as a replay.
+    // One that attempted a write may have applied part of it, so its record
+    // stays and a retry must be a new document.
+    if let Some((signer, id, issued_at)) = &recorded
+        && let Some(replay_cache) = replay_cache
+        && !wrote
+        && matches!(&reply, Ok(r) if r.is_unavailable())
+    {
+        replay_cache.release(signer, id, *issued_at);
+    }
+    reply
+}
+
+/// The refusal of `doc` with `reason`, as the framework answers it.
+fn rejected(
+    doc: &trust_tasks_rs::TrustTask<Value>,
+    reason: impl Into<trust_tasks_rs::ErrorPayload>,
+) -> RoutedReply {
+    RoutedReply::Framework(Box::new(
+        did_hosting_common::server::trust_tasks::DispatchOutcome::Rejected(
+            doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
+        ),
+    ))
+}
+
+/// A peer's `trust-task-error`, which is never answered.
+///
+/// The reason is logged, not just the fact: a peer's error is often the only
+/// account of what went wrong anywhere in the exchange.
+///
+/// A server's *signed*, non-retryable refusal of an op this control plane sent
+/// settles that outbox entry: the target has said it will not apply it, so
+/// re-sending would only stall its queue. An unsigned error settles nothing —
+/// anyone could send one.
+async fn settle_peer_error(
+    state: &AppState,
+    sender: &str,
+    my_vid: &str,
+    verifier: &did_hosting_common::server::trust_tasks::TransportBoundVerifier,
+    doc: &trust_tasks_rs::TrustTask<Value>,
+) {
+    use did_hosting_common::server::trust_tasks::verify_sender_bound;
+
+    let code = doc
+        .payload
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let message = doc
+        .payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    warn!(
+        sender,
+        %code,
+        %message,
+        "inbound trust-task error from a peer — terminal, not answered"
+    );
+    let retryable = doc
+        .payload
+        .get("retryable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if doc.proof.is_some()
+        && !retryable
+        && (crate::server_push::is_configured_watcher(state, sender)
+            || matches!(
+                did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, sender).await,
+                Ok(Some(_))
+            ))
+        && let Ok(signer) = verify_sender_bound(doc, None, Some(sender), my_vid, verifier).await
+    {
+        crate::messaging::infra::acknowledge_outbox(state, &signer, doc).await;
+    }
+}
+
+/// The proof gate. Every document that asks this control plane to *do*
+/// something — change state, disclose a record, mint a session — must be
+/// signed by its issuer, addressed here, and fresh; and the issuer must be
+/// the DID the transport reported (`verify_sender_bound`). From
+/// [`Gate::verify`] on, `principal` — the proven signer — is the only
+/// identity anything authorises on. The transport's `sender` is a routing
+/// hint, and a document whose proof disagrees with it is refused rather
+/// than resolved in either's favour.
+///
+/// Each task's `ProofRule` says what its proof must be:
+/// - `Optional`: capability discovery, the public `server/info`,
+///   opening a passkey login, and the whole `auth/challenge` /
+///   `auth/authenticate` / `auth/refresh` family — not because a proof
+///   is optional there (several of these require one), but because the
+///   ACL pre-filter is the wrong question for a family whose own
+///   handlers already decide who may act, on a signer the ACL may
+///   legitimately never list (a proxied login's delegate) or has not
+///   listed yet (a first login);
+/// - `Authentication`: an operational request, `proofPurpose:
+///   authentication` under the signer's `authentication` relationship;
+/// - `AssertionMethod`: a human approver's decision, an attestation under
+///   the approver's `assertionMethod` relationship;
+/// - `SessionKey`: a ceremony that mints a session for a key the caller
+///   has just generated, signed by that `did:key` — which has no ACL entry
+///   of its own; the ceremony names the subject;
+/// - `BoundKey(purposes)`: a step of an exchange whose parties are fresh
+///   Ed25519 `did:key`s the exchange binds (wallet sign-in). HTTPS only.
+///   The row's admission runs first — its size cap, rate limits and, for
+///   a browser's step, the origin — before any proof work. Then a proof
+///   by exactly the issuer's own key, for one of the row's purposes,
+///   verified locally (`verify_bound_key`); no ACL pre-filter (the key is
+///   never in the ACL) and no shared replay cache (the row keeps its own,
+///   which a stranger cannot fill; see `ProofRule::BoundKey`). The row
+///   then checks that the key is the one the exchange recorded.
+///
+/// A document that carries a proof it was not required to carry is held
+/// to the same rule: a proof that is present is verified, never ignored.
+///
+/// Each stage reads what the binding reported and the document's type and
+/// [`ProofRule`] from here, fixed once.
+struct Gate<'a, 'h> {
+    state: &'a AppState,
+    sender: &'a str,
+    https: Option<&'a HttpsFacts<'h>>,
+    verifier: &'a did_hosting_common::server::trust_tasks::TransportBoundVerifier,
+    my_vid: &'a str,
+    type_uri: String,
+    rule: ProofRule,
+}
+
+/// What [`Gate::admit`] established about a document it let through.
+struct Admission {
+    /// Whether its proof is verified: it is required to carry one, or it
+    /// carries one anyway.
+    signed: bool,
+    /// Whether it is held to the ACL pre-filter.
+    needs_acl: bool,
+    /// Whether it is a `did:webs` self-registration.
+    self_registering: bool,
+    /// The self-registration whose proof [`Gate::verify`] checks.
+    #[cfg(feature = "method-webs")]
+    webs_candidate: Option<crate::webs_self_register::Candidate>,
+}
+
+/// What [`Gate::verify`] proved.
+struct Verified {
+    /// The proven signer (the transport's sender for an unsigned document).
+    principal: String,
+    /// A self-registration's identifier, which the register row runs as.
+    self_certified: Option<crate::webs_self_register::SelfCertifiedWebs>,
+}
+
+impl Gate<'_, '_> {
+    /// Admission: everything decided before the ACL is read or a proof is
+    /// looked at.
+    ///
+    /// - A bound-key row is served over HTTPS only, and its own admission
+    ///   (size cap, rate limits, origin) runs here, before any proof work.
+    /// - A `did/register/0.1` from a `did:webs` the ACL does not list, on a
+    ///   domain whose operator enabled it (`crate::webs_self_register`), is
+    ///   authenticated by the key event log it submits instead of by an ACL
+    ///   entry: checked here — before the ACL pre-filter it is exempt from,
+    ///   and before any proof work — and its proof is then verified against
+    ///   that log's key state in [`Gate::verify`]. Anything else (`None`)
+    ///   goes through this gate unchanged.
+    /// - A session ceremony is signed by a `did:key` the caller holds: as the
+    ///   issuer itself, or — for a session that already exists — as that
+    ///   session's delegate key.
+    async fn admit(
+        &self,
+        doc: &trust_tasks_rs::TrustTask<Value>,
+    ) -> Result<Admission, RoutedReply> {
+        let (sender, type_uri, rule) = (self.sender, self.type_uri.as_str(), self.rule);
+        if let ProofRule::BoundKey(_) = rule {
+            let Some(https) = self.https else {
+                warn!(sender, %type_uri, "trust task refused: a bound-key exchange is served over HTTPS only");
+                return Err(rejected(
+                    doc,
                     trust_tasks_rs::RejectReason::PermissionDenied {
                         reason: "this task is served over HTTPS only".into(),
                     },
-                ),
-            ))));
-        };
-        if let Err(refused) = crate::control_tasks::admit_bound(state, https, &doc).await {
-            return Ok(RoutedReply::Sealed(refused));
-        }
-    }
-    // ── did:webs self-registration (`crate::webs_self_register`). A
-    //    `did/register/0.1` from a `did:webs` the ACL does not list, on a
-    //    domain whose operator enabled it, is authenticated by the key event
-    //    log it submits instead of by an ACL entry: checked here — before the
-    //    ACL pre-filter it is exempt from, and before any proof work — and its
-    //    proof is then verified against that log's key state below. Anything
-    //    else (`None`) goes through this gate unchanged.
-    #[cfg(feature = "method-webs")]
-    let webs_candidate =
-        match crate::webs_self_register::admit(state, sender, https, &type_uri, &doc).await {
-            Ok(candidate) => candidate,
-            Err(reason) => {
-                return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
-                    doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
-                ))));
+                ));
+            };
+            if let Err(refused) = crate::control_tasks::admit_bound(self.state, https, doc).await {
+                return Err(RoutedReply::Sealed(refused));
             }
-        };
-    #[cfg(feature = "method-webs")]
-    let self_registering = webs_candidate.is_some();
-    #[cfg(not(feature = "method-webs"))]
-    let self_registering = false;
+        }
+        #[cfg(feature = "method-webs")]
+        let webs_candidate =
+            match crate::webs_self_register::admit(self.state, sender, self.https, type_uri, doc)
+                .await
+            {
+                Ok(candidate) => candidate,
+                Err(reason) => return Err(rejected(doc, reason)),
+            };
+        #[cfg(feature = "method-webs")]
+        let self_registering = webs_candidate.is_some();
+        #[cfg(not(feature = "method-webs"))]
+        let self_registering = false;
 
-    let signed = rule != ProofRule::Optional || doc.proof.is_some();
-    let needs_acl =
-        matches!(rule, ProofRule::Authentication | ProofRule::AssertionMethod) && !self_registering;
-    // A session ceremony is signed by a `did:key` the caller holds: as the
-    // issuer itself, or — for a session that already exists — as that
-    // session's delegate key.
-    if rule == ProofRule::SessionKey
-        && doc
-            .proof
-            .as_ref()
-            .is_some_and(|p| !p.verification_method.starts_with("did:key:"))
-    {
-        warn!(sender, %type_uri, "trust task refused: a session ceremony must be signed by a did:key");
-        return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
-            doc.reject_with(
-                format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        let signed = rule != ProofRule::Optional || doc.proof.is_some();
+        let needs_acl = matches!(rule, ProofRule::Authentication | ProofRule::AssertionMethod)
+            && !self_registering;
+        if rule == ProofRule::SessionKey
+            && doc
+                .proof
+                .as_ref()
+                .is_some_and(|p| !p.verification_method.starts_with("did:key:"))
+        {
+            warn!(sender, %type_uri, "trust task refused: a session ceremony must be signed by a did:key");
+            return Err(rejected(
+                doc,
                 trust_tasks_rs::RejectReason::PermissionDenied {
                     reason:
                         "this ceremony must be signed by the did:key its session will be bound to"
                             .into(),
                 },
-            ),
-        ))));
+            ));
+        }
+        Ok(Admission {
+            signed,
+            needs_acl,
+            self_registering,
+            #[cfg(feature = "method-webs")]
+            webs_candidate,
+        })
     }
-    // A configured watcher has no ACL entry: its only standing here is
-    // acknowledging the syncs it was sent, so that — and nothing else — gets
-    // past this pre-filter on its DID.
-    let watcher_ack = matches!(
-        type_uri.as_str(),
-        MSG_SYNC_UPDATE_ACK | MSG_SYNC_DELETE_ACK | MSG_SYNC_BATCH_ACK
-    ) && crate::server_push::is_configured_watcher(state, sender);
-    if needs_acl && !watcher_ack {
-        let refusal =
-            match did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, sender).await {
+
+    /// The ACL pre-filter, and whether the signer is listed.
+    ///
+    /// Before any signature work — which can mean resolving a DID over the
+    /// network — the reported sender must at least *have* an ACL entry: every
+    /// privileged op requires one, so a stranger is turned away for the cost
+    /// of a key lookup, and never reaches the resolver or the replay cache.
+    /// This is a cheap pre-filter, not the authorisation; the proof still has
+    /// to bind the document to that same DID in [`Gate::verify`].
+    ///
+    /// A configured watcher has no ACL entry: its only standing here is
+    /// acknowledging the syncs it was sent, so that — and nothing else — gets
+    /// past this pre-filter on its DID.
+    ///
+    /// Returns whether the signer is one this service has a standing
+    /// relationship with: past the pre-filter, or — for a rule without one —
+    /// listed in the ACL. The proof binds the proven signer to `sender`, so by
+    /// the time the replay cache is chosen this describes the proven signer.
+    /// An unlisted signer's proof is verified under the bounds of
+    /// `crate::unlisted_signers`, and its record goes into that module's own
+    /// replay cache, never the shared one. A failed lookup counts as
+    /// unlisted: the stricter of the two.
+    async fn prefilter(
+        &self,
+        doc: &trust_tasks_rs::TrustTask<Value>,
+        admitted: &Admission,
+    ) -> Result<bool, RoutedReply> {
+        let (state, sender, type_uri) = (self.state, self.sender, self.type_uri.as_str());
+        let watcher_ack = matches!(
+            type_uri,
+            MSG_SYNC_UPDATE_ACK | MSG_SYNC_DELETE_ACK | MSG_SYNC_BATCH_ACK
+        ) && crate::server_push::is_configured_watcher(state, sender);
+        if admitted.needs_acl && !watcher_ack {
+            let refusal = match did_hosting_common::server::acl::get_acl_entry(
+                &state.acl_ks,
+                sender,
+            )
+            .await
+            {
                 Ok(Some(_)) => None,
                 Ok(None) => {
                     warn!(sender, %type_uri, "trust task refused: sender has no ACL entry");
@@ -303,184 +471,229 @@ pub(super) async fn route_trust_task_doc(
                     Some(e.failure_reject_reason())
                 }
             };
-        if let Some(reason) = refusal {
-            return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
-                doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
-            ))));
+            if let Some(reason) = refusal {
+                return Err(rejected(doc, reason));
+            }
         }
+        Ok(admitted.needs_acl
+            || (admitted.signed
+                && matches!(
+                    did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, sender).await,
+                    Ok(Some(_))
+                )))
     }
-    // Whether the signer is one this service has a standing relationship
-    // with: past the pre-filter above, or — for a rule without one — listed
-    // in the ACL. The proof below binds the proven signer to `sender`, so by
-    // the time the replay cache is chosen this describes the proven signer.
-    // An unlisted signer's proof is verified under the bounds of
-    // `crate::unlisted_signers`, and its record goes into that module's own
-    // replay cache, never the shared one. A failed lookup counts as
-    // unlisted: the stricter of the two.
-    let listed_signer = needs_acl
-        || (signed
-            && matches!(
-                did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, sender).await,
-                Ok(Some(_))
-            ));
-    // A self-registration's proof, verified against the key state its own
-    // key event log establishes (never a resolved document): the identifier
-    // it proves, and the `SelfCertifiedWebs` the register row runs as.
-    #[cfg(feature = "method-webs")]
-    let (self_certified, self_bound) = match webs_candidate {
-        Some(candidate) => match candidate.verify(&doc, sender, my_vid).await {
-            Ok(webs) => {
-                let did = webs.did().to_string();
-                (Some(webs), Some(Ok(did)))
-            }
-            Err(e) => (None, Some(Err(e))),
-        },
-        None => (None, None),
-    };
-    #[cfg(not(feature = "method-webs"))]
-    let (self_certified, self_bound): (
-        Option<crate::webs_self_register::SelfCertifiedWebs>,
-        Option<Result<String, did_hosting_common::server::trust_tasks::BoundError>>,
-    ) = (None, None);
 
-    let principal = if signed {
-        let bound = match rule {
+    /// The proof: the `principal` it proves, which is the only identity
+    /// anything after this authorises on.
+    ///
+    /// - A self-registration's proof is verified against the key state its
+    ///   own key event log establishes (never a resolved document).
+    /// - An approver's decision is held to `assertionMethod`.
+    /// - A bound-key row's proof is by the issuer's own key, verified locally.
+    /// - A listed signer, or the delegate of a proxied login whose principal,
+    ///   an ACL member, signed the evidence naming it, is verified as members
+    ///   are; any other signer under `crate::unlisted_signers`' bounds.
+    ///
+    /// Any large-document charge is settled against this verification's own
+    /// outcome — before a refusal, so a claimed issuer that failed to verify
+    /// is penalised exactly as one that verified to someone else. See
+    /// `size`'s module docs.
+    async fn verify(
+        &self,
+        doc: &trust_tasks_rs::TrustTask<Value>,
+        admitted: Admission,
+        listed_signer: bool,
+        large_doc_charge: Option<
+            &did_hosting_common::server::trust_tasks::size::LargeDocumentCharge,
+        >,
+    ) -> Result<Verified, RoutedReply> {
+        use did_hosting_common::server::trust_tasks::size::settle_large_document_charge;
+        use did_hosting_common::server::trust_tasks::{
+            verify_bound_key, verify_sender_bound, verify_sender_bound_approval,
+        };
+
+        let (state, sender, my_vid, verifier) =
+            (self.state, self.sender, self.my_vid, self.verifier);
+        let type_uri = self.type_uri.as_str();
+
+        #[cfg(feature = "method-webs")]
+        let (self_certified, self_bound) = match admitted.webs_candidate {
+            Some(candidate) => match candidate.verify(doc, sender, my_vid).await {
+                Ok(webs) => {
+                    let did = webs.did().to_string();
+                    (Some(webs), Some(Ok(did)))
+                }
+                Err(e) => (None, Some(Err(e))),
+            },
+            None => (None, None),
+        };
+        #[cfg(not(feature = "method-webs"))]
+        let (self_certified, self_bound): (
+            Option<crate::webs_self_register::SelfCertifiedWebs>,
+            Option<Result<String, did_hosting_common::server::trust_tasks::BoundError>>,
+        ) = (None, None);
+
+        if !admitted.signed {
+            return Ok(Verified {
+                principal: sender.to_string(),
+                self_certified,
+            });
+        }
+        let bound = match self.rule {
             ProofRule::AssertionMethod => {
-                verify_sender_bound_approval(&doc, Some(sender), my_vid, verifier).await
+                verify_sender_bound_approval(doc, Some(sender), my_vid, verifier).await
             }
-            ProofRule::BoundKey(purposes) => match verify_bound_key(&doc, purposes).await {
+            ProofRule::BoundKey(purposes) => match verify_bound_key(doc, purposes).await {
                 Ok(issuer) => Ok(issuer),
                 Err(e) => {
-                    did_hosting_common::server::trust_tasks::size::settle_large_document_charge(
+                    settle_large_document_charge(
                         &state.large_document_budget,
-                        large_doc_charge.as_ref(),
+                        large_doc_charge,
                         None,
                     );
                     // Not `sender`: here it is the document's own, unverified
                     // issuer, as long as the caller cares to make it.
                     warn!(%type_uri, error = %e, "trust task refused: not signed by its bound key");
-                    return Ok(RoutedReply::Sealed(crate::control_tasks::refuse_bound(
-                        state, &doc, &e,
+                    return Err(RoutedReply::Sealed(crate::control_tasks::refuse_bound(
+                        state, doc, &e,
                     )));
                 }
             },
             _ => match self_bound {
                 Some(bound) => bound,
                 None if listed_signer => {
-                    verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await
+                    verify_sender_bound(doc, None, Some(sender), my_vid, verifier).await
                 }
                 // The delegate of a proxied login whose principal, an ACL
                 // member, signed the evidence naming it: verified as the
                 // member's own requests are.
-                None if crate::trust_tasks_auth::vouched_delegate(state, &doc).await => {
-                    verify_sender_bound(&doc, None, Some(sender), my_vid, verifier).await
+                None if crate::trust_tasks_auth::vouched_delegate(state, doc).await => {
+                    verify_sender_bound(doc, None, Some(sender), my_vid, verifier).await
                 }
                 None => match state
                     .unlisted_signers
-                    .verify(&doc, sender, my_vid, verifier)
+                    .verify(doc, sender, my_vid, verifier)
                     .await
                 {
                     Ok(principal) => Ok(principal),
                     Err(Err(e)) => Err(e),
                     Err(Ok(reason)) => {
-                        did_hosting_common::server::trust_tasks::size::settle_large_document_charge(
+                        settle_large_document_charge(
                             &state.large_document_budget,
-                            large_doc_charge.as_ref(),
+                            large_doc_charge,
                             None,
                         );
                         warn!(sender, %type_uri, "trust task deferred: unlisted signer over its verification bounds");
-                        return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
-                            doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
-                        ))));
+                        return Err(rejected(doc, reason));
                     }
                 },
             },
         };
-        // Settle any large-document charge against this verification's own
-        // outcome — before the early return below, so a claimed issuer that
-        // failed to verify is penalised exactly as one that verified to
-        // someone else. See `size`'s module docs.
-        did_hosting_common::server::trust_tasks::size::settle_large_document_charge(
+        settle_large_document_charge(
             &state.large_document_budget,
-            large_doc_charge.as_ref(),
+            large_doc_charge,
             bound.as_ref().ok().map(String::as_str),
         );
         match bound {
-            Ok(principal) => principal,
+            Ok(principal) => Ok(Verified {
+                principal,
+                self_certified,
+            }),
             Err(e) => {
                 warn!(sender, %type_uri, error = %e, "trust task refused: not bound to its sender");
-                let reason = e.reject_reason();
-                return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
-                    doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
-                ))));
+                Err(rejected(doc, e.reject_reason()))
             }
         }
-    } else {
-        sender.to_string()
-    };
+    }
 
-    // Replay gate, keyed on what the proof covers: the proven issuer and the
-    // document id. A captured document re-submitted inside the freshness window
-    // — on any transport, in any framing — is refused as an id conflict.
-    // At its bounds the cache refuses (retryable) rather than forgetting.
-    // Which cache, if any, is `replay_partition`'s choice: ACL members' go to
-    // the shared one, and nothing a signer the ACL does not list sends can
-    // fill it (see `crate::unlisted_signers`). A record already in another
-    // cache — the signer's ACL entry changed inside the window — is a replay
-    // too.
-    let replay_cache = if signed {
-        state.unlisted_signers.cache(
-            replay_partition(&type_uri, rule, listed_signer, self_registering),
-            &state.replay_cache,
-        )
-    } else {
-        None
-    };
-    if let Some(cache) = replay_cache {
+    /// The replay gate, keyed on what the proof covers: the proven issuer and
+    /// the document id. A captured document re-submitted inside the freshness
+    /// window — on any transport, in any framing — is refused as an id
+    /// conflict. At its bounds the cache refuses (retryable) rather than
+    /// forgetting.
+    ///
+    /// Which cache, if any, is [`replay_partition`]'s choice: ACL members' go
+    /// to the shared one, and nothing a signer the ACL does not list sends can
+    /// fill it (see `crate::unlisted_signers`). A record already in another
+    /// cache — the signer's ACL entry changed inside the window — is a replay
+    /// too. Returns the cache the document was recorded in, if any.
+    fn check_replay(
+        &self,
+        doc: &trust_tasks_rs::TrustTask<Value>,
+        signed: bool,
+        listed_signer: bool,
+        self_registering: bool,
+        principal: &str,
+    ) -> Result<Option<&did_hosting_common::server::replay::ReplayCache>, RoutedReply> {
+        let state = self.state;
+        let replay_cache = if signed {
+            state.unlisted_signers.cache(
+                replay_partition(&self.type_uri, self.rule, listed_signer, self_registering),
+                &state.replay_cache,
+            )
+        } else {
+            None
+        };
+        let Some(cache) = replay_cache else {
+            return Ok(None);
+        };
         let replayed = state
             .unlisted_signers
             .all(&state.replay_cache)
             .into_iter()
             .filter(|other| !std::ptr::eq(*other, cache))
-            .any(|other| other.contains(&principal, &doc.id, doc.issued_at));
+            .any(|other| other.contains(principal, &doc.id, doc.issued_at));
         let refusal = if replayed {
             Some(did_hosting_common::server::replay::ReplayError::Duplicate.reject_reason())
         } else if std::ptr::eq(cache, &state.unlisted_signers.sign_in)
-            && let Err(reason) = state.unlisted_signers.charge_sign_in(match https {
+            && let Err(reason) = state.unlisted_signers.charge_sign_in(match self.https {
                 Some(h) => h.ip.map_or_else(
                     || "ip:unknown".to_string(),
                     |ip| format!("ip:{}", state.client_ips.key_of(ip)),
                 ),
-                None => format!("vid:{sender}"),
+                None => format!("vid:{}", self.sender),
             })
         {
             Some(reason)
         } else {
             cache
-                .check(&principal, &doc.id, doc.issued_at)
+                .check(principal, &doc.id, doc.issued_at)
                 .err()
                 .map(|e| e.reject_reason())
         };
         if let Some(reason) = refusal {
-            warn!(did = %principal, doc_id = %doc.id, %type_uri, ?reason, "trust task refused: replay cache");
-            return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
-                doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), reason),
-            ))));
+            warn!(did = %principal, doc_id = %doc.id, type_uri = %self.type_uri, ?reason, "trust task refused: replay cache");
+            return Err(rejected(doc, reason));
         }
+        Ok(Some(cache))
     }
-    let recorded = replay_cache.map(|_| (principal.clone(), doc.id.clone(), doc.issued_at));
 
-    let (reply, wrote) = did_hosting_common::server::store::track_writes(Box::pin(async {
+    /// Routing a document that passed every check above: the auth family, the
+    /// infrastructure family, the control plane's own table, and what is left
+    /// to the shared framework family (ACL, discovery).
+    async fn route(
+        &self,
+        bearer: Option<&crate::auth::AuthClaims>,
+        transport: &(impl trust_tasks_rs::TransportHandler + Sync),
+        signed: bool,
+        verified: &Verified,
+        doc: trust_tasks_rs::TrustTask<Value>,
+    ) -> Result<RoutedReply, DIDCommServiceError> {
+        use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
+
+        let (state, type_uri) = (self.state, self.type_uri.as_str());
+        let principal = verified.principal.as_str();
+
         // Proofs are verified on every path — there is no configuration under
         // which a proof-bearing document is accepted unverified.
         let policy: trust_tasks_rs::ProofPolicy<'_, TransportBoundVerifier> =
-            trust_tasks_rs::ProofPolicy::Verify(verifier);
+            trust_tasks_rs::ProofPolicy::Verify(self.verifier);
 
         // Auth (`auth/*`). Neither the control table nor the shared
         // `build_dispatcher` (whose context is the ACL keyspace) carries this
         // family, so it is claimed here, ahead of both; otherwise it would be
         // refused below as `unsupportedType`.
-        if crate::trust_tasks_auth::owns(&type_uri) {
+        if crate::trust_tasks_auth::owns(type_uri) {
             return Ok(RoutedReply::Document(
                 crate::trust_tasks_auth::dispatch(state, transport, policy, doc)
                     .await
@@ -493,7 +706,7 @@ pub(super) async fn route_trust_task_doc(
         // Control↔server infrastructure ops (server registration, health pong,
         // stats, sync and domain acks). Claimed here for the same reason: neither
         // the control table nor the framework family below carries them.
-        if crate::messaging::infra::owns(&type_uri) {
+        if crate::messaging::infra::owns(type_uri) {
             // The dispatcher stays transport-agnostic; we only tell it which binding
             // the document came in on so the registry can record what actually moved.
             let via =
@@ -501,7 +714,7 @@ pub(super) async fn route_trust_task_doc(
                     transport.binding_uri(),
                 );
             return Ok(
-                match crate::messaging::infra::dispatch(state, &principal, via, doc).await {
+                match crate::messaging::infra::dispatch(state, principal, via, doc).await {
                     Some(value) => RoutedReply::Document(value),
                     None => RoutedReply::Terminal,
                 },
@@ -519,8 +732,8 @@ pub(super) async fn route_trust_task_doc(
         let doc = match crate::control_tasks::route(
             state,
             bearer,
-            self_certified.as_ref(),
-            https,
+            verified.self_certified.as_ref(),
+            self.https,
             transport,
             trust_tasks_rs::ProofPolicy::<TransportBoundVerifier>::AcceptUnverified,
             doc,
@@ -531,12 +744,38 @@ pub(super) async fn route_trust_task_doc(
             Err(unclaimed) => *unclaimed,
         };
 
-        // What is left is the shared framework family (ACL, discovery); a Type URI
-        // nobody serves is refused there as `unsupportedType`.
+        self.route_framework(bearer, transport, signed, principal, policy, doc)
+            .await
+    }
+
+    /// What is left after the gate's own families: the shared framework
+    /// family (ACL, discovery). A Type URI nobody serves is refused there as
+    /// `unsupportedType`.
+    ///
+    /// The framework path is the only one whose outcome carries a reject code
+    /// — so it is handed back whole rather than serialised here, and HTTPS
+    /// maps it to a status.
+    async fn route_framework(
+        &self,
+        bearer: Option<&crate::auth::AuthClaims>,
+        transport: &(impl trust_tasks_rs::TransportHandler + Sync),
+        signed: bool,
+        principal: &str,
+        policy: trust_tasks_rs::ProofPolicy<
+            '_,
+            did_hosting_common::server::trust_tasks::TransportBoundVerifier,
+        >,
+        doc: trust_tasks_rs::TrustTask<Value>,
+    ) -> Result<RoutedReply, DIDCommServiceError> {
+        use did_hosting_common::server::trust_tasks::{
+            DispatchOutcome, TransportBoundVerifier, TrustTaskContext, dispatch_inbound,
+        };
+
+        let state = self.state;
         let ctx = TrustTaskContext {
             acl_ks: &state.acl_ks,
             acl_locks: &state.acl_locks,
-            my_vid,
+            my_vid: self.my_vid,
             signing_oracle: false,
         };
 
@@ -548,24 +787,20 @@ pub(super) async fn route_trust_task_doc(
         // refusal rather than a step-up that could not help them.
         if signed
             && raises_to_privileged_role(&doc)
-            && crate::control_tasks::session_needs_step_up(bearer, &principal)
+            && crate::control_tasks::session_needs_step_up(bearer, principal)
             && matches!(
-                did_hosting_common::server::acl::check_acl(&state.acl_ks, &principal).await,
+                did_hosting_common::server::acl::check_acl(&state.acl_ks, principal).await,
                 Ok(did_hosting_common::server::acl::Role::Admin)
             )
         {
-            return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
-                doc.reject_with(
-                    format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-                    trust_tasks_rs::ErrorPayload::new(
-                        trust_tasks_rs::StandardCode::PermissionDenied,
-                    )
+            return Ok(rejected(
+                &doc,
+                trust_tasks_rs::ErrorPayload::new(trust_tasks_rs::StandardCode::PermissionDenied)
                     .with_message(
                         did_hosting_common::server::error::AppError::StepUpRequired(String::new())
                             .user_message(),
                     ),
-                ),
-            ))));
+            ));
         }
 
         // A removed ACL entry takes what it authorised with it. The removal
@@ -577,7 +812,7 @@ pub(super) async fn route_trust_task_doc(
         // already verified the proof, so the handler is not asked to verify it
         // again (no DID resolution while the lock is held).
         let removal = match acl_entry_removal_subject(&doc) {
-            Some(subject) if signed && may_remove_entry(state, &principal, &subject).await => {
+            Some(subject) if signed && may_remove_entry(state, principal, &subject).await => {
                 Some(subject)
             }
             _ => None,
@@ -592,16 +827,14 @@ pub(super) async fn route_trust_task_doc(
                 )
                 .await
                 else {
-                    warn!(%type_uri, "acl/revoke deferred: the ACL removal lock is busy");
-                    return Ok(RoutedReply::Framework(Box::new(DispatchOutcome::Rejected(
-                        doc.reject_with(
-                            format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-                            trust_tasks_rs::ErrorPayload::new(
-                                trust_tasks_rs::StandardCode::Unavailable,
-                            )
-                            .with_message("another ACL change is in progress; retry"),
-                        ),
-                    ))));
+                    warn!(type_uri = %self.type_uri, "acl/revoke deferred: the ACL removal lock is busy");
+                    return Ok(rejected(
+                        &doc,
+                        trust_tasks_rs::ErrorPayload::new(
+                            trust_tasks_rs::StandardCode::Unavailable,
+                        )
+                        .with_message("another ACL change is in progress; retry"),
+                    ));
                 };
                 (
                     Some(guard),
@@ -621,9 +854,6 @@ pub(super) async fn route_trust_task_doc(
         };
         let removes_entry = removal;
 
-        // The framework path, and the only one whose outcome carries a reject code
-        // — so it is handed back whole rather than serialised here, and HTTPS maps
-        // it to a status.
         let outcome =
             dispatch_inbound::<TransportBoundVerifier>(&ctx, transport, policy, doc).await;
         if let Some(subject) = removes_entry
@@ -632,22 +862,7 @@ pub(super) async fn route_trust_task_doc(
             withdraw_removed_member(state, &subject).await;
         }
         Ok(RoutedReply::Framework(Box::new(outcome)))
-    }))
-    .await;
-
-    // A task refused as `unavailable` (over capacity) before it wrote
-    // anything did not run, and a refused document can be sent again as a
-    // retry: forget its record, or the resend would be refused as a replay.
-    // One that attempted a write may have applied part of it, so its record
-    // stays and a retry must be a new document.
-    if let Some((signer, id, issued_at)) = &recorded
-        && let Some(replay_cache) = replay_cache
-        && !wrote
-        && matches!(&reply, Ok(r) if r.is_unavailable())
-    {
-        replay_cache.release(signer, id, *issued_at);
     }
-    reply
 }
 
 /// The subject of `doc` when it is an `acl/revoke` that removes the subject's
