@@ -50,14 +50,18 @@ jobs:
           # The release bot app: `branch rules` accepts a prep PR only from it
           # (or a maintainer), and one GITHUB_TOKEN opened would run no CI.
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
           BASE: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           target=$(cat RELEASE)
           head="release-prep/${BASE#release/}/$target"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Committed as the release bot, which pushes it and opens the PR.
+          bot="${APP_SLUG}[bot]"
+          bot_id=$(gh api "users/${bot}" --jq .id)
+          git config user.name "$bot"
+          git config user.email "${bot_id}+${bot}@users.noreply.github.com"
           git switch -c "$head"
           git add -A
           git commit -s -m "chore(release): v$target"

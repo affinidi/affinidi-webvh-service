@@ -1,49 +1,56 @@
 #!/usr/bin/env python3
-"""Enforce where a PR may go and what it may change (RELEASES.md).
+"""The branch rules pipeline-rust's shared check cannot hold here (RELEASES.md).
 
-Run by `.github/workflows/branch-rules.yml` on every PR into `main` or
-`release/**`, against the PR's merge commit (HEAD^1 = base, HEAD = merged).
+Run by `.github/workflows/branch-rules.yml` after pipeline-rust's
+`release-branch-rules` action, on every PR into `main` or `release/**`,
+against the PR's merge commit (HEAD^1 = base, HEAD = merged). The shared
+action already decides where a PR may go (backport, prep or `release-direct`
+into `release/**`) and that no PR adds `RELEASE` to main. This script adds:
 
-Into `release/<major.minor>`:
-  1. Only a bot backport (`backport-<pr>-to-release/<name>`, opened by
-     backport.yml), a prep PR (`release-prep/<name>/<version>`), or a PR
-     labelled `release-direct` by a maintainer. A fix lands on main first.
-  2. Only a prep PR changes a crate's `version` or `RELEASE`.
+  1. Versions. The shared check reads the workspace version from the root
+     `[workspace.package] version`, which this repository does not set: every
+     crate carries its own literal `version`. It then treats every PR as the
+     workspace's bootstrap and skips its version rules. So here: into
+     `release/<name>`, only a prep PR changes a crate's `version`; into `main`,
+     only a cut PR does.
+  2. CHANGELOG.md. Only the release tooling (cut and prep PRs) changes it.
+     Everyone else adds a `changelog.d/` fragment (changelog.d/README.md), so
+     open PRs never conflict over `## Unreleased`. The one change anyone may
+     make is moving entries out: a CHANGELOG.md that differs from the base only
+     in `## Unreleased`, which is left holding nothing but the pointer line.
 
-Into `main`:
-  3. Only a cut PR (`release-cut/<name>`, from cut-release.py) changes a
-     crate's `version`: main carries the next release's version, set at the cut.
-  4. No PR adds a `RELEASE` file: it marks a release branch.
+A cut or prep PR is recognised as the shared check recognises it, never by its
+branch name alone: a `release-cut/…` or `release-prep/<name>/…` branch of this
+repository, opened by the release bot (known by its account ID, which unlike a
+login is never reused) or, with MAINTAINER_RELEASES=true (set while cuts and
+preps still run by hand, as the shared action's `maintainer-releases` input),
+by a person with the admin or maintain role. A backport carries neither a version change nor
+a CHANGELOG.md change (backport.yml keeps the release branch's copy), so it has
+no exemption here.
 
-Either way:
-  5. A head branch whose name the rules above treat specially (`backport-…`,
-     `release-prep/…`, `release-cut/…`) must live in this repository. A fork
-     can name a branch anything, so only a branch pushed here carries the
-     meaning of its name.
-  6. Only the release tooling's branches (those same names, in this
-     repository) change CHANGELOG.md. Everyone else adds a `changelog.d/`
-     fragment (changelog.d/README.md), so open PRs never conflict over
-     `## Unreleased`. The one change anyone may make is moving entries out:
-     a CHANGELOG.md that differs from the base only in `## Unreleased`, which
-     is left holding nothing but the pointer line.
-
-Environment: BASE_REF, HEAD_REF, LABELS (JSON list of label names), REPO
-(this repository, `owner/name`) and HEAD_REPO (the repository the head branch
-lives in). Without REPO (a local run), rule 5 is not checked; with REPO set,
-an empty HEAD_REPO (a head repository that has since been deleted) counts as
-another repository.
+Environment: BASE_REF, HEAD_REF, REPO (this repository, `owner/name`),
+HEAD_REPO (the repository the head branch lives in), AUTHOR and AUTHOR_ID (the
+PR author's login and account ID), MAINTAINER_RELEASES, and GITHUB_TOKEN to read the author's role
+(GITHUB_API_URL, default `https://api.github.com`). The role is read only for a
+cut or prep branch whose author is not the release bot.
 """
 
 import json
 import os
-import re
 import subprocess
 import sys
 import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from changelog_fragments import unreleased_is_pointer_only  # noqa: E402
 from release_lib import unreleased_split  # noqa: E402
+
+# affinidi-semantic-release[bot], the account the release bot app acts as; the
+# same ID pipeline-rust's check-branch-rules.py trusts.
+RELEASE_BOT_ID = 169678785
 
 
 def git(*args):
@@ -73,12 +80,52 @@ def only_empties_unreleased():
     return bool(a and b and unreleased_is_pointer_only(a[1]) and (a[0], a[2]) == (b[0], b[2]))
 
 
+def is_maintainer(repo, login):
+    """Whether `login` holds the admin or maintain role on `repo`."""
+    api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+    req = urllib.request.Request(
+        f"{api}/repos/{repo}/collaborators/{urllib.parse.quote(login, safe='')}/permission",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            role = json.load(resp).get("role_name")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:  # not a collaborator
+            return False
+        raise SystemExit(f"could not read {login}'s role on {repo}: HTTP {e.code}")
+    return role in ("admin", "maintain")
+
+
 def main():
     base = os.environ["BASE_REF"]
     head = os.environ["HEAD_REF"]
-    labels = set(json.loads(os.environ.get("LABELS") or "[]"))
-    repo = os.environ.get("REPO") or ""
-    head_repo = os.environ.get("HEAD_REPO") or ""
+    repo = os.environ["REPO"]
+    same_repo = os.environ.get("HEAD_REPO") == repo
+    author = os.environ.get("AUTHOR") or ""
+    by_bot = os.environ.get("AUTHOR_ID") == str(RELEASE_BOT_ID)
+    manual = os.environ.get("MAINTAINER_RELEASES") == "true"
+
+    def released_by(branch_matches):
+        # The role is read only for a cut or prep branch, so other PRs make no API call.
+        return (
+            branch_matches
+            and same_repo
+            and (by_bot or (manual and bool(author) and is_maintainer(repo, author)))
+        )
+
+    if base.startswith("release/"):
+        name = base.removeprefix("release/")
+        tooling = released_by(head.startswith(f"release-prep/{name}/"))
+    elif base == "main":
+        tooling = released_by(head.startswith("release-cut/"))
+    else:
+        tooling = False
+
     changed = git("diff", "--name-only", "HEAD^1", "HEAD").split()
 
     versions = []
@@ -87,49 +134,20 @@ def main():
             before, after = package_version("HEAD^1", path), package_version("HEAD", path)
             if before and after and before != after:
                 versions.append(f"{path}: {before} -> {after}")
-    release_file = "RELEASE" in changed
 
     problems = []
-    tooling_name = re.match(r"(backport-\d+-to-release/|release-prep/|release-cut/)", head)
-    if tooling_name and repo and head_repo != repo:
-        where = head_repo or "a repository that no longer exists"
-        problems.append(
-            f"`{head}` is a release-tooling branch name, but this branch is in {where}, "
-            f"not {repo}. Those names are only honoured on branches in {repo}; rename the "
-            "branch."
-        )
-        # Judge the rest as an ordinary branch.
-        head = f"{head_repo or 'unknown'}:{head}"
-
-    if base.startswith("release/"):
-        name = base.removeprefix("release/")
-        backport = re.fullmatch(rf"backport-\d+-to-release/{re.escape(name)}", head)
-        prep = head.startswith(f"release-prep/{name}/")
-        if not (backport or prep or "release-direct" in labels):
+    if versions and not tooling:
+        if base.startswith("release/"):
             problems.append(
-                f"A change reaches {base} by backport, not directly. Open this PR against main "
-                f"instead; once it merges, label it `backport {base}` and backport.yml opens the "
-                f"cherry-pick here. If the code no longer exists on main, a maintainer adds the "
-                f"`release-direct` label, and the description says why."
+                f"Only the *Prepare a release* workflow changes versions on {base}. "
+                "Revert: " + "; ".join(versions)
             )
-        if not prep and (versions or release_file):
-            what = versions + (["RELEASE"] if release_file else [])
-            problems.append(
-                f"Only the *Prepare a release* workflow changes versions or RELEASE on {base}. "
-                "Revert: " + "; ".join(what)
-            )
-    elif base == "main":
-        if versions and not head.startswith("release-cut/"):
+        else:
             problems.append(
                 "A PR never edits a crate's `version =`: main carries the next release's "
                 "version, set when a release is cut (RELEASES.md). Revert: " + "; ".join(versions)
             )
-        if release_file:
-            problems.append("RELEASE marks a release branch; it never belongs on main. Remove it.")
 
-    # `head` is already demoted to `<fork>:<name>` above when a fork borrows a
-    # tooling name, so this match means a release-tooling branch in this repo.
-    tooling = re.match(r"(backport-\d+-to-release/|release-prep/|release-cut/)", head)
     if "CHANGELOG.md" in changed and not tooling and not only_empties_unreleased():
         problems.append(
             "Only the release tooling edits CHANGELOG.md. Revert it, and record the change as a "
@@ -142,7 +160,7 @@ def main():
         for p in problems:
             print(f"  - {p}\n", file=sys.stderr)
         return 1
-    print(f"{head} -> {base}: branch rules hold")
+    print(f"{head} -> {base}: local branch rules hold")
     return 0
 
 

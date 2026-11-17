@@ -12,8 +12,11 @@ name: Backport
 #
 # Any other conflict fails the push — the action commits
 # it as `BACKPORT-CONFLICT`, which the commit-message rule rejects — and the
-# action comments on the source PR; backport it by hand on a branch named
-# `backport-<pr>-to-release/<name>`.
+# action comments on the source PR. Backport it by hand: cherry-pick onto a
+# branch of this repository, open the PR against the release branch, and have
+# a maintainer add the `release-direct` label, its description naming the
+# source PR. `branch rules` counts a backport branch only when the release bot
+# opened it, so a hand-made one goes in as `release-direct` (RELEASES.md).
 #
 # pull_request_target, so it runs with this repository's secrets even for a PR
 # from a fork. It checks out no PR code to run: the action only cherry-picks
@@ -30,9 +33,15 @@ permissions:
 jobs:
   backport:
     name: Backport
+    # Only a merged PR that carries a backport label: the job enters the
+    # `release` environment and mints a bot token, so it must not run for
+    # every merge.
     if: >-
       github.event.pull_request.merged == true &&
-      (github.event.action == 'closed' || startsWith(github.event.label.name, 'backport '))
+      (github.event.action == 'closed'
+        && contains(join(github.event.pull_request.labels.*.name, '|'), 'backport release/')
+       || github.event.action == 'labeled'
+        && startsWith(github.event.label.name, 'backport release/'))
     runs-on: ubuntu-latest
     # RELEASE_BOT_PRIVATE_KEY is a secret of this environment.
     environment: release
