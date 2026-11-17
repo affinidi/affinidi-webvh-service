@@ -282,16 +282,16 @@ pub async fn create_did(
 /// owner quota, agent names, index usage), the order every other writer of
 /// a slot takes them in:
 ///
-/// 1. [`validate_register_path`]: no storage I/O;
+/// 1. `validate_register_path`: no storage I/O;
 /// 2. the slot's path lock, held through the commit;
-/// 3. [`verify_registration`]: the publication, and the host and domain
+/// 3. `verify_registration`: the publication, and the host and domain
 ///    checks;
-/// 4. [`authorize_slot`]: who may write the slot;
-/// 5. [`hold_register_quota`]: the owner's quota lock and its caps;
-/// 6. [`registered_record`], then `reconcile_agent_names` (the per-name
+/// 4. `authorize_slot`: who may write the slot;
+/// 5. `hold_register_quota`: the owner's quota lock and its caps;
+/// 6. `registered_record`, then `reconcile_agent_names` (the per-name
 ///    locks): the record as it will be written;
-/// 7. [`commit_registration`]: one batch, with the outbox and index;
-/// 8. the locks released, then [`after_registration`]: stats, the log line,
+/// 7. `commit_registration`: one batch, with the outbox and index;
+/// 8. the locks released, then `after_registration`: stats, the log line,
 ///    and the service's own identity check.
 pub async fn register_did_atomic(
     auth: &AuthClaims,
