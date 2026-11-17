@@ -47,6 +47,9 @@ pub async fn run_setup_phase1(out_path: &Path, context_id: &str) -> Result<(), A
     Ok(())
 }
 
+/// The online setup wizard (or, unless `preloaded_setup_key_file` is given,
+/// whichever mode the operator picks). Each step is its own function, run in
+/// the order the prompts appear.
 pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), AppError> {
     eprintln!();
     eprintln!("  DID Hosting Control Plane — Setup Wizard");
@@ -71,15 +74,7 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
     }
 
     // 1. Output path
-    eprintln!("  The configuration file stores all settings for the control plane.");
-    eprintln!("  You can edit it later or re-run setup to regenerate it.");
-    eprintln!();
-    let output_path: String = Input::new()
-        .with_prompt("Config file output path")
-        .default("config.toml".into())
-        .interact_text()
-        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-    let output_path = PathBuf::from(output_path);
+    let output_path = prompt_config_output_path()?;
 
     // 2. VTA online provision: mint ephemeral did:key, print PNM
     //    `contexts create` command, drive run_provision with the
@@ -94,9 +89,106 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         None => None,
     };
 
-    // DID hosting URL must be collected BEFORE the VTA round-trip because
-    // upstream `ProvisionAsk::did_host_http_didcomm` embeds it as the
-    // `WebVHHosting` service endpoint in the resulting DID document.
+    let did_shape = prompt_did_shape()?;
+    let (mediator_did, outcome) = run_online_provision(
+        messages,
+        preloaded_setup_key,
+        &did_shape.hosting_url,
+        &did_shape.path,
+        did_shape.transport,
+    )
+    .await
+    .map_err(|e| AppError::Config(format!("VTA provision-integration failed: {e}")))?;
+
+    // 5. Persist DID log entry (if the template emitted one) so the
+    //    operator can publish it on the webvh hosting server.
+    if let Some(ref log_entry) = outcome.did_log_entry {
+        write_did_log_entry(log_entry)?;
+    }
+
+    // 7–10. Public URL, listener, logging, data directory.
+    let runtime = prompt_runtime_settings()?;
+
+    // 11. Secrets backend
+    eprintln!();
+    let secrets_config = did_hosting_common::server::secret_store::wizard::prompt_secrets_backend(
+        "did-hosting-control-secrets",
+        "webvh",
+    )
+    .await
+    .map_err(|e| AppError::Config(e.to_string()))?;
+
+    // 12. JWT signing key (always generated)
+    let jwt_signing_key = vta_setup::generate_ed25519_multibase();
+    eprintln!("  Generated JWT signing key.");
+
+    // 13. Store secrets
+    let server_secrets = ServerSecrets {
+        signing_key: outcome.integration_signing_key_mb.clone(),
+        key_agreement_key: outcome.integration_ka_key_mb.clone(),
+        jwt_signing_key,
+        vta_credential: Some(outcome.vta_credential_b64.clone()),
+        retired: Vec::new(),
+    };
+
+    // 15. Build and write config
+    let config = online_config(
+        &outcome,
+        mediator_did,
+        &did_shape,
+        runtime,
+        secrets_config,
+        &output_path,
+    );
+    write_config_and_secrets(&config, &output_path, &server_secrets).await?;
+
+    // 15. Admin ACL bootstrap
+    bootstrap_admin_acl(&config).await?;
+
+    // 16. Summary
+    print_setup_summary(&outcome, &did_shape.path, &output_path);
+
+    Ok(())
+}
+
+/// Where the wizard writes the config file.
+fn prompt_config_output_path() -> Result<PathBuf, AppError> {
+    eprintln!("  The configuration file stores all settings for the control plane.");
+    eprintln!("  You can edit it later or re-run setup to regenerate it.");
+    eprintln!();
+    let output_path: String = Input::new()
+        .with_prompt("Config file output path")
+        .default("config.toml".into())
+        .interact_text()
+        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+    Ok(PathBuf::from(output_path))
+}
+
+/// What the control plane's DID is minted with, collected before the VTA
+/// round-trip.
+struct DidShapeAnswers {
+    /// Where the DID is hosted, without a trailing `/`.
+    hosting_url: String,
+    /// The DID's path on the hosting server.
+    path: String,
+    /// The messaging transports its document advertises.
+    transport: TransportSelection,
+}
+
+/// The DID hosting URL, path and transport, all collected BEFORE the VTA
+/// round-trip.
+///
+/// - The hosting URL: upstream `ProvisionAsk::did_host_http_didcomm` embeds
+///   it as the `WebVHHosting` service endpoint in the resulting DID document.
+/// - The path: the VTA derives the minted DID's path segment from the hosting
+///   URL it receives, so the path is folded into that URL (by
+///   `build_webvh_provision_ask`) before the DID is minted. Collected after,
+///   it could not affect the already-minted DID and the DID would fall back
+///   to the `.well-known` root.
+/// - The transport: it selects the DID template (TSP-only advertises only
+///   `TSPTransport`), so it has to be known when the DID is minted. Control
+///   always has a mediator, so the prompt is unconditional.
+fn prompt_did_shape() -> Result<DidShapeAnswers, AppError> {
     eprintln!();
     eprintln!("  The DID hosting URL is where your did-hosting-server serves DID documents.");
     eprintln!("  The control plane's DID will be published at <url>/<path>/did.jsonl.");
@@ -106,58 +198,58 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
             .map_err(|e| AppError::Config(format!("input error: {e}")))?;
     let did_hosting_url = did_hosting_url.trim_end_matches('/').to_string();
 
-    // DID path must be collected BEFORE the VTA round-trip: the VTA derives
-    // the minted DID's path segment from the hosting URL it receives, so the
-    // path is folded into that URL (by `build_webvh_provision_ask`) before
-    // the DID is minted. Collected after, it could not affect the
-    // already-minted DID and the DID would fall back to the `.well-known` root.
     let did_path: String = Input::new()
         .with_prompt("DID path on the server")
         .default("services/control".into())
         .interact_text()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
 
-    // Transport selection must be collected BEFORE the VTA round-trip: it
-    // selects the DID template (TSP-only advertises only `TSPTransport`), so
-    // it has to be known when the DID is minted. Control always has a
-    // mediator, so the prompt is unconditional.
     let transport = setup_prompts::prompt_transport_selection()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
-    let (didcomm, tsp) = transport.as_flags();
-
-    let (mediator_did, outcome) = run_online_provision(
-        messages,
-        preloaded_setup_key,
-        &did_hosting_url,
-        &did_path,
+    Ok(DidShapeAnswers {
+        hosting_url: did_hosting_url,
+        path: did_path,
         transport,
-    )
-    .await
-    .map_err(|e| AppError::Config(format!("VTA provision-integration failed: {e}")))?;
+    })
+}
 
-    // 5. Persist DID log entry (if the template emitted one) so the
-    //    operator can publish it on the webvh hosting server.
-    if let Some(ref log_entry) = outcome.did_log_entry {
-        let log_file = PathBuf::from("control-did.jsonl");
-        let default_log_path = log_file.display().to_string();
-        let log_path: String = Input::new()
-            .with_prompt("DID log entry output file")
-            .default(default_log_path)
-            .interact_text()
-            .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+/// Write the DID log entry the VTA minted to the file the operator names,
+/// and show it.
+fn write_did_log_entry(log_entry: &str) -> Result<(), AppError> {
+    let log_file = PathBuf::from("control-did.jsonl");
+    let default_log_path = log_file.display().to_string();
+    let log_path: String = Input::new()
+        .with_prompt("DID log entry output file")
+        .default(default_log_path)
+        .interact_text()
+        .map_err(|e| AppError::Config(format!("input error: {e}")))?;
 
-        vta_setup::write_log_entry_file(log_entry, &PathBuf::from(&log_path))?;
-        eprintln!("  DID log entry written to {log_path}");
+    vta_setup::write_log_entry_file(log_entry, &PathBuf::from(&log_path))?;
+    eprintln!("  DID log entry written to {log_path}");
 
-        eprintln!();
-        eprintln!("  DID Log Entry:");
-        eprintln!("  ---");
-        for line in log_entry.lines() {
-            eprintln!("  {line}");
-        }
-        eprintln!("  ---");
+    eprintln!();
+    eprintln!("  DID Log Entry:");
+    eprintln!("  ---");
+    for line in log_entry.lines() {
+        eprintln!("  {line}");
     }
+    eprintln!("  ---");
+    Ok(())
+}
 
+/// The runtime settings the online wizard asks for once the DID is minted.
+struct RuntimeAnswers {
+    public_url: Option<String>,
+    host: String,
+    port: u16,
+    log_level: String,
+    log_format: LogFormat,
+    data_dir: String,
+}
+
+/// The public URL (for WebAuthn/passkey), the listen host and port, the log
+/// level and format, and the data directory, in that order.
+fn prompt_runtime_settings() -> Result<RuntimeAnswers, AppError> {
     // 7. Public URL (for WebAuthn/passkey)
     eprintln!();
     eprintln!("  The public URL is used for WebAuthn/passkey authentication.");
@@ -203,34 +295,31 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         .default("data/did-hosting-control".into())
         .interact_text()
         .map_err(|e| AppError::Config(format!("input error: {e}")))?;
+    Ok(RuntimeAnswers {
+        public_url,
+        host,
+        port,
+        log_level,
+        log_format,
+        data_dir,
+    })
+}
 
-    // 11. Secrets backend
-    eprintln!();
-    let secrets_config = did_hosting_common::server::secret_store::wizard::prompt_secrets_backend(
-        "did-hosting-control-secrets",
-        "webvh",
-    )
-    .await
-    .map_err(|e| AppError::Config(e.to_string()))?;
-
-    // 12. JWT signing key (always generated)
-    let jwt_signing_key = vta_setup::generate_ed25519_multibase();
-    eprintln!("  Generated JWT signing key.");
-
-    // 13. Store secrets
-    let server_secrets = ServerSecrets {
-        signing_key: outcome.integration_signing_key_mb.clone(),
-        key_agreement_key: outcome.integration_ka_key_mb.clone(),
-        jwt_signing_key,
-        vta_credential: Some(outcome.vta_credential_b64.clone()),
-        retired: Vec::new(),
-    };
-
-    // Transport selection was collected before the VTA round-trip (it
-    // selects the DID template); `didcomm` / `tsp` here are that choice's
-    // flags, gating which listener protocols run.
-    // 15. Build and write config
-    let config = AppConfig {
+/// The config the online wizard writes.
+///
+/// Transport selection was collected before the VTA round-trip (it selects
+/// the DID template); `didcomm` / `tsp` here are that choice's flags, gating
+/// which listener protocols run.
+fn online_config(
+    outcome: &vta_setup::OnlineProvisionOutcome,
+    mediator_did: Option<String>,
+    did_shape: &DidShapeAnswers,
+    runtime: RuntimeAnswers,
+    secrets: SecretsConfig,
+    output_path: &Path,
+) -> AppConfig {
+    let (didcomm, tsp) = did_shape.transport.as_flags();
+    AppConfig {
         features: FeaturesConfig {
             didcomm,
             tsp,
@@ -239,11 +328,11 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         },
         server_did: Some(outcome.integration_did.clone()),
         mediator_did,
-        public_url,
-        did_hosting_url: Some(did_hosting_url),
+        public_url: runtime.public_url,
+        did_hosting_url: Some(did_shape.hosting_url.clone()),
         server: ServerConfig {
-            host,
-            port,
+            host: runtime.host,
+            port: runtime.port,
             trusted_proxies: Vec::new(),
             client_ipv6_prefix: did_hosting_common::server::config::default_client_ipv6_prefix(),
             trusted_proxy_cidrs: Vec::new(),
@@ -251,16 +340,16 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
             resolve_rate_limit: Default::default(),
         },
         log: LogConfig {
-            level: log_level,
-            format: log_format,
+            level: runtime.log_level,
+            format: runtime.log_format,
         },
         store: StoreConfig {
-            data_dir: PathBuf::from(&data_dir),
+            data_dir: PathBuf::from(&runtime.data_dir),
             ..StoreConfig::default()
         },
         fjall: Default::default(),
         auth: AuthConfig::default(),
-        secrets: secrets_config,
+        secrets,
         vta: VtaConfig {
             url: outcome.vta_url.clone(),
             did: Some(outcome.vta_did.clone()),
@@ -274,19 +363,31 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         geoip: Default::default(),
         stats_flush: Default::default(),
         stats: Default::default(),
-        config_path: output_path.clone(),
-    };
+        config_path: output_path.to_path_buf(),
+    }
+}
 
-    let toml_str = toml::to_string_pretty(&config)
+/// Write `config` to `output_path`, then store `secrets` in the backend it
+/// names.
+async fn write_config_and_secrets(
+    config: &AppConfig,
+    output_path: &Path,
+    secrets: &ServerSecrets,
+) -> Result<(), AppError> {
+    let toml_str = toml::to_string_pretty(config)
         .map_err(|e| AppError::Config(format!("failed to serialize config: {e}")))?;
-    std::fs::write(&output_path, &toml_str)?;
+    std::fs::write(output_path, &toml_str)?;
     eprintln!("  Configuration written to {}", output_path.display());
 
-    let secret_store = create_secret_store(&config)?;
-    secret_store.set(&server_secrets).await?;
+    let secret_store = create_secret_store(config)?;
+    secret_store.set(secrets).await?;
     eprintln!("  Secrets stored.");
+    Ok(())
+}
 
-    // 15. Admin ACL bootstrap
+/// The admin ACL step: an operator DID the operator enters, a generated
+/// `did:key`, or nothing.
+async fn bootstrap_admin_acl(config: &AppConfig) -> Result<(), AppError> {
     eprintln!();
     eprint!("{ACL_BOOTSTRAP_GUIDANCE}");
     eprintln!();
@@ -333,8 +434,15 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
 
         eprintln!("  Admin ACL entry added for {admin_did}");
     }
+    Ok(())
+}
 
-    // 16. Summary
+/// What the online wizard set up, and what the operator does next.
+fn print_setup_summary(
+    outcome: &vta_setup::OnlineProvisionOutcome,
+    did_path: &str,
+    output_path: &Path,
+) {
     eprintln!();
     eprintln!("  Setup complete!");
     eprintln!();
@@ -354,8 +462,6 @@ pub async fn run_setup(preloaded_setup_key_file: Option<PathBuf>) -> Result<(), 
         output_path.display()
     );
     eprintln!();
-
-    Ok(())
 }
 
 /// What the wizard tells the operator before its admin ACL step. The entry it
