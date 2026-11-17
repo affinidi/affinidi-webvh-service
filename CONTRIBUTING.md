@@ -145,7 +145,7 @@ git config user.email "you@example.com"
 3. **Tests for new code paths.** Every public function should have at
    least one happy-path test; every Trust Task row in
    `did-hosting-control/src/control_tasks/mod.rs` (and the gate in
-   `did-hosting-control/src/messaging.rs` that admits it) should exercise
+   `did-hosting-control/src/messaging/gate.rs` that admits it) should exercise
    both success and at least one failure mode.
 4. **Comments explain WHY, not WHAT.** Identifier names + types should
    carry the WHAT. Reserve `///` and `//` for the non-obvious — a

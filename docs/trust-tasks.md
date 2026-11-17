@@ -113,7 +113,7 @@ The challenge / response sign-in the management UI uses (`did-hosting-control/sr
 
 ## Infrastructure (from edges and watchers)
 
-What an edge or watcher sends the control plane (`did-hosting-control/src/trust_tasks_infra.rs`): its registration, health and stats, and the signed acknowledgements that settle the control plane's outbox rows. Operators never send these.
+What an edge or watcher sends the control plane (`did-hosting-control/src/messaging/infra/mod.rs`): its registration, health and stats, and the signed acknowledgements that settle the control plane's outbox rows. Operators never send these.
 
 | Task | Version | Proof rule | Standing |
 | ---- | ------- | ---------- | -------- |
