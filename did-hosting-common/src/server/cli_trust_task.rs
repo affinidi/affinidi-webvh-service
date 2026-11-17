@@ -40,7 +40,7 @@ pub fn known_type_uris() -> Vec<String> {
         .map(|v| v.trim().trim_matches('"').to_owned())
         .collect();
     uris.push(
-        <trust_tasks_rs::specs::trust_task_discovery::v0_3::Payload as trust_tasks_rs::Payload>::TYPE_URI
+        <trust_tasks_rs::specs::trust_task_discovery::v0_4::Payload as trust_tasks_rs::Payload>::TYPE_URI
             .to_owned(),
     );
     uris

@@ -1459,10 +1459,16 @@ mod https {
             HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) Firefox/131.0"),
         );
         let body = serde_json::to_vec(doc).unwrap();
-        let resp =
-            crate::oob::http::maybe_handle(state, "198.51.100.4".parse().unwrap(), &headers, &body)
-                .await
-                .expect("an auth/oob document is handled here");
+        // Boxed, as the harness boxes its dispatch: a test awaiting several in
+        // a row otherwise overflows a debug-build test thread's stack.
+        let resp = Box::pin(crate::oob::http::maybe_handle(
+            state,
+            "198.51.100.4".parse().unwrap(),
+            &headers,
+            &body,
+        ))
+        .await
+        .expect("an auth/oob document is handled here");
         let status = resp.status().as_u16();
         let h = resp.headers().clone();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();

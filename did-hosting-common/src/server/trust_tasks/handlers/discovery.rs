@@ -1,4 +1,4 @@
-//! `trust-task-discovery/0.3` handler — advertise the set of Type URIs
+//! `trust-task-discovery/0.4` handler — advertise the set of Type URIs
 //! this maintainer routes for.
 //!
 //! Nothing is advertised as `requiredExt`: with AclEntry 0.2 an entry's
@@ -6,11 +6,13 @@
 //! carries only optional members (quota, default domain), so a producer
 //! that omits it is accepted.
 //!
-//! Only 0.3 is served: the service speaks the latest version of each task
-//! it serves. A discoverer that asks in 0.1 or 0.2 is refused
-//! `unsupportedType` and may retry in 0.3.
+//! Only 0.4 is served: the service speaks the latest version of each task
+//! it serves. A discoverer that asks in 0.1, 0.2 or 0.3 is refused
+//! `unsupportedType` and may retry in 0.4. No `acceptanceWindow` is
+//! advertised: it is optional, and stating one the pipeline does not
+//! enforce exactly would be worse than stating none.
 //!
-//! ## Why we use `DiscoveryRegistry::respond_to_v0_3`
+//! ## Why we use `DiscoveryRegistry::respond_to_v0_4`
 //!
 //! The trust-tasks-rs `DiscoveryRegistry` already encodes the
 //! slug-glob matcher and lexicographic ordering. Wrapping it in our
@@ -20,7 +22,7 @@
 
 use trust_tasks_rs::{
     ErrorResponse, ProofPolicy, ProofVerifier, TransportHandler, TrustTask,
-    discovery::DiscoveryRegistry, specs::trust_task_discovery::v0_3 as discovery,
+    discovery::DiscoveryRegistry, specs::trust_task_discovery::v0_4 as discovery,
 };
 
 use crate::server::trust_tasks::{DispatchOutcome, TrustTaskContext, run_pipeline};
@@ -69,7 +71,7 @@ async fn handle_inner(
     // §11 + the spec's Privacy considerations note that a maintainer
     // MAY return a filtered subset (or no response) for unknown
     // discoverers; we publish the full set.
-    let response = registry().respond_to_v0_3(&doc.payload);
+    let response = registry().respond_to_v0_4(&doc.payload);
     let resp_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
     Ok(doc.respond_with(resp_id, response))
 }

@@ -99,7 +99,7 @@ Served by the shared framework pipeline (`did_hosting_common::server::trust_task
 | `acl/change-role` | 0.2 | `Authentication` | admin |
 | `acl/show` | 0.2 | `Authentication` | admin, or the subject looking itself up |
 | `acl/list` | 0.3 | `Authentication` | admin |
-| `trust-task-discovery` | 0.3 | `Optional` | anyone (unsigned allowed) |
+| `trust-task-discovery` | 0.4 | `Optional` | anyone (unsigned allowed) |
 
 ## Console sign-in
 

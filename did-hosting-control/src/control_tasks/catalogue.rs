@@ -185,7 +185,7 @@ const STANDING: &[(&str, &str)] = &[
     ("acl/change-role/0.2", "admin"),
     ("acl/show/0.2", "admin, or the subject looking itself up"),
     ("acl/list/0.3", "admin"),
-    ("trust-task-discovery/0.3", "anyone (unsigned allowed)"),
+    ("trust-task-discovery/0.4", "anyone (unsigned allowed)"),
     // Console sign-in (SIOPv2-style challenge / response).
     ("auth/challenge/0.1", "anyone (unsigned allowed)"),
     (
