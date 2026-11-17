@@ -874,15 +874,8 @@ async fn a_metrics_reader_is_never_paired_with_a_passkey() {
     let later = stranger(123);
     let issued = issue(&state, &admin, &later.did, "session").await;
     member(&state, 123, Role::MetricsReader).await;
-    let reply = redeem(
-        &state,
-        Via::Tsp,
-        &invitee,
-        &issued,
-        &mut SoftPasskey::new(),
-        None,
-    )
-    .await;
+    // Refused at the start, before the invitee makes a credential.
+    let reply = redeem_start(&state, Via::Tsp, &invitee, &issued.token, &issued.code).await;
     assert_eq!(code(&reply), "permissionDenied", "{reply}");
     assert!(
         pk::get_passkey_user_by_did(&state.sessions_ks, &later.did)
@@ -892,8 +885,13 @@ async fn a_metrics_reader_is_never_paired_with_a_passkey() {
         "no login passkey landed"
     );
     // Refused before the take: the invite is still live.
-    let reply = redeem_start(&state, Via::Tsp, &invitee, &issued.token, &issued.code).await;
-    ok(&reply, &t(REDEEM_START));
+    assert!(
+        invite::by_token_hash(&state.sessions_ks, &invite::hash_token(&issued.token))
+            .await
+            .unwrap()
+            .is_some(),
+        "the refusal spent the invite"
+    );
 }
 
 /// Over HTTPS the source is the client IP, counted before dispatch, and the
@@ -2873,19 +2871,9 @@ async fn a_revocation_keeps_the_passkey_session_it_was_made_from() {
     );
 }
 
-/// An invite is honoured only while its issuer is still an administrator: one
-/// whose issuer was demoted meanwhile enrols nothing and grants no entry.
-#[tokio::test]
-async fn an_invite_from_a_former_administrator_enrols_nothing() {
-    let (state, _dir) = state().await;
-    let issuer = member(&state, 198, Role::Admin).await;
-    let _other_admin = member(&state, 199, Role::Admin).await;
-    let newcomer = stranger(200);
-    let invitee = stranger(201);
-
-    let issued = issue(&state, &issuer, &newcomer.did, "session").await;
-    // The issuer stops being an administrator before the redemption finishes.
-    let mut entry = get_acl_entry(&state.acl_ks, &issuer.did)
+/// Demote `admin` to `Owner`, in place.
+async fn demote(state: &AppState, admin: &Caller) {
+    let mut entry = get_acl_entry(&state.acl_ks, &admin.did)
         .await
         .unwrap()
         .unwrap();
@@ -2893,12 +2881,12 @@ async fn an_invite_from_a_former_administrator_enrols_nothing() {
     did_hosting_common::server::acl::store_acl_entry(&state.acl_ks, &entry)
         .await
         .unwrap();
+}
 
-    let mut passkey = SoftPasskey::new();
-    let reply = redeem(&state, Via::Https, &invitee, &issued, &mut passkey, None).await;
-    assert_eq!(code(&reply), "permissionDenied", "{reply}");
+/// Whether `subject` got neither an ACL entry nor `passkey`.
+async fn enrolled_nothing(state: &AppState, subject: &str, passkey: &SoftPasskey) {
     assert!(
-        get_acl_entry(&state.acl_ks, &newcomer.did)
+        get_acl_entry(&state.acl_ks, subject)
             .await
             .unwrap()
             .is_none(),
@@ -2913,36 +2901,110 @@ async fn an_invite_from_a_former_administrator_enrols_nothing() {
     );
 }
 
-/// The operator's CLI invite is the bootstrap for the first administrator: it
-/// redeems with no administrator in the ACL, and grants the role it carries.
+/// Finish the redemption `start` opened, with `passkey`.
+async fn redeem_finish(
+    state: &AppState,
+    via: Via,
+    from: &Caller,
+    start: &Value,
+    passkey: &mut SoftPasskey,
+) -> Value {
+    let payload = json!({
+        "enrollmentId": start["enrollmentId"],
+        "credential": passkey.attest(&start["options"]),
+    });
+    unsigned(state, via, from, REDEEM_FINISH, payload).await
+}
+
+/// The operator's CLI invite, as the `invite` subcommand issues it.
+async fn cli_invite(state: &AppState, subject: &str, role: &str) -> invite::IssuedInvite {
+    did_hosting_common::server::passkey::issue_cli_invite(
+        &state.sessions_ks,
+        600,
+        subject,
+        role,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .unwrap()
+}
+
+fn issued(made: &invite::IssuedInvite) -> Issued {
+    Issued {
+        token: made.token.clone(),
+        code: made.claim_code.clone(),
+        body: Value::Null,
+    }
+}
+
+/// An invite is honoured only while its issuer is still an administrator. One
+/// whose issuer is demoted before the redemption starts is refused at the
+/// start, before the invitee makes a credential, and is not spent by it; one
+/// whose issuer is demoted after the start is refused at the finish. Neither
+/// enrols anything or grants an entry.
+#[tokio::test]
+async fn an_invite_from_a_former_administrator_enrols_nothing() {
+    let (state, _dir) = state().await;
+    let issuer = member(&state, 198, Role::Admin).await;
+    let _other_admin = member(&state, 199, Role::Admin).await;
+    let newcomer = stranger(200);
+    let invitee = stranger(201);
+
+    // Demoted before the start.
+    let early = issue(&state, &issuer, &newcomer.did, "session").await;
+    demote(&state, &issuer).await;
+    let reply = redeem_start(&state, Via::Https, &invitee, &early.token, &early.code).await;
+    assert_eq!(code(&reply), "permissionDenied", "{reply}");
+    let token_hash = invite::hash_token(&early.token);
+    assert!(
+        invite::by_token_hash(&state.sessions_ks, &token_hash)
+            .await
+            .unwrap()
+            .is_some(),
+        "a refused start spent the invite"
+    );
+
+    // Demoted between the start and the finish.
+    let mut entry = get_acl_entry(&state.acl_ks, &issuer.did)
+        .await
+        .unwrap()
+        .unwrap();
+    entry.role = Role::Admin;
+    did_hosting_common::server::acl::store_acl_entry(&state.acl_ks, &entry)
+        .await
+        .unwrap();
+    let late = issue(&state, &issuer, &newcomer.did, "session").await;
+    let reply = redeem_start(&state, Via::Https, &invitee, &late.token, &late.code).await;
+    let start = ok(&reply, &t(REDEEM_START));
+    demote(&state, &issuer).await;
+    let mut passkey = SoftPasskey::new();
+    let reply = redeem_finish(&state, Via::Https, &invitee, &start, &mut passkey).await;
+    assert_eq!(code(&reply), "permissionDenied", "{reply}");
+    enrolled_nothing(&state, &newcomer.did, &passkey).await;
+}
+
+/// The operator's CLI invite is how the first administrator enrols: issued
+/// through the `invite` subcommand's own path, it redeems with no
+/// administrator in the ACL, and grants the role it carries.
 #[tokio::test]
 async fn an_operator_cli_invite_enrols_the_first_administrator() {
     let (state, _dir) = state().await;
     let newcomer = stranger(210);
     let invitee = stranger(211);
 
-    let made = invite::issue(
-        &state.sessions_ks,
-        invite::InviteRequest {
-            subject: newcomer.did.clone(),
-            purpose: invite::Purpose::Session,
-            role: Some("admin".into()),
-            device_label: None,
-            issued_by: invite::OPERATOR_CLI_ISSUER.into(),
-            ttl_secs: 600,
-        },
-        std::time::Duration::from_secs(30),
-    )
-    .await
-    .unwrap();
-    let issued = Issued {
-        token: made.token.clone(),
-        code: made.claim_code.clone(),
-        body: Value::Null,
-    };
+    let made = cli_invite(&state, &newcomer.did, "admin").await;
+    assert!(made.invite.issued_by.is_operator());
 
     let mut passkey = SoftPasskey::new();
-    let reply = redeem(&state, Via::Https, &invitee, &issued, &mut passkey, None).await;
+    let reply = redeem(
+        &state,
+        Via::Https,
+        &invitee,
+        &issued(&made),
+        &mut passkey,
+        None,
+    )
+    .await;
     ok(&reply, &t(REDEEM_FINISH));
     assert_eq!(
         get_acl_entry(&state.acl_ks, &newcomer.did)
@@ -2959,6 +3021,116 @@ async fn an_operator_cli_invite_enrols_the_first_administrator() {
             .is_some(),
         "the invite enrolled no passkey"
     );
+}
+
+/// The `invite` subcommand refuses a role no invite can enrol, as
+/// `auth/passkey/enroll/invite` does, rather than issue one that could only
+/// be refused at the finish.
+#[tokio::test]
+async fn an_operator_cli_invite_refuses_a_role_no_invite_enrols() {
+    let (state, _dir) = state().await;
+    let newcomer = stranger(212);
+    for role in ["metricsReader", "nobody"] {
+        assert!(
+            did_hosting_common::server::passkey::issue_cli_invite(
+                &state.sessions_ks,
+                600,
+                &newcomer.did,
+                role,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .is_err(),
+            "the CLI issued a `{role}` invite"
+        );
+    }
+    assert!(
+        invite::list(&state.sessions_ks).await.unwrap().is_empty(),
+        "a refused CLI invite was stored"
+    );
+}
+
+/// An administrator who changes an invite lends it their authority: the
+/// operator's CLI invite they amended is honoured only while they remain an
+/// administrator, and withdrawn with their ACL entry.
+#[tokio::test]
+async fn an_invite_an_administrator_amended_rests_on_their_standing() {
+    const UPDATE: &str = "auth/passkey/enroll/invite/update/0.1";
+    let (state, _dir) = state().await;
+    let admin = member(&state, 213, Role::Admin).await;
+    let other_admin = member(&state, 214, Role::Admin).await;
+    let remover = member(&state, 219, Role::Admin).await;
+    let invitee = stranger(215);
+
+    // Demoted after amending: the amended invite is refused.
+    let newcomer = stranger(216);
+    let made = cli_invite(&state, &newcomer.did, "owner").await;
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t(UPDATE),
+        json!({ "inviteId": made.invite.invite_id, "role": "admin" }),
+    )
+    .await;
+    ok(&reply, &t(UPDATE));
+    let stored = invite::by_id(&state.sessions_ks, &made.invite.invite_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.issued_by.is_operator());
+    assert_eq!(stored.amended_by, std::slice::from_ref(&admin.did));
+    demote(&state, &admin).await;
+    let reply = redeem_start(&state, Via::Https, &invitee, &made.token, &made.claim_code).await;
+    assert_eq!(code(&reply), "permissionDenied", "{reply}");
+
+    // Removed after amending: the amended invite is withdrawn.
+    let newcomer = stranger(217);
+    let made = cli_invite(&state, &newcomer.did, "owner").await;
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &other_admin,
+        &t(UPDATE),
+        json!({ "inviteId": made.invite.invite_id, "extendBy": 60 }),
+    )
+    .await;
+    ok(&reply, &t(UPDATE));
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &remover,
+        &t("acl/revoke/0.2"),
+        json!({ "subject": other_admin.did, "revocation": { "kind": "entry" } }),
+    )
+    .await;
+    assert!(
+        reply["type"]
+            .as_str()
+            .is_some_and(|ty| ty.ends_with("#response")),
+        "{reply}"
+    );
+    let reply = redeem_start(&state, Via::Https, &invitee, &made.token, &made.claim_code).await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/redeem/start:inviteInvalid",
+        "{reply}"
+    );
+
+    // Unamended, the operator's invite still enrols with no administrator.
+    let newcomer = stranger(218);
+    let made = cli_invite(&state, &newcomer.did, "owner").await;
+    let mut passkey = SoftPasskey::new();
+    let reply = redeem(
+        &state,
+        Via::Https,
+        &invitee,
+        &issued(&made),
+        &mut passkey,
+        None,
+    )
+    .await;
+    ok(&reply, &t(REDEEM_FINISH));
 }
 
 /// A redemption of a role-conferring invite racing an `acl/revoke` of its

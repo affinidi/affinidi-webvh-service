@@ -28,7 +28,7 @@ fn request(purpose: Purpose) -> InviteRequest {
         purpose,
         role: (purpose == Purpose::Session).then(|| "owner".into()),
         device_label: None,
-        issued_by: "did:example:admin".into(),
+        issued_by: Issuer::administrator("did:example:admin").unwrap(),
         ttl_secs: 3600,
     }
 }
@@ -477,4 +477,71 @@ async fn a_redemption_waits_a_bounded_time_for_its_invite() {
             .unwrap(),
         Redemption::Valid(_)
     ));
+}
+
+/// An issuer is stored as the string every invite already on disk has, and
+/// read back as what it was: the operator's marker only ever as the operator,
+/// and no administrator issuer that is not a DID.
+#[test]
+fn an_issuer_round_trips_and_cannot_be_forged() {
+    let operator = Issuer::operator();
+    let admin = Issuer::administrator("did:example:admin").unwrap();
+    for issuer in [&operator, &admin] {
+        let stored = serde_json::to_string(issuer).unwrap();
+        assert_eq!(&serde_json::from_str::<Issuer>(&stored).unwrap(), issuer);
+    }
+    assert_eq!(
+        serde_json::to_string(&operator).unwrap(),
+        "\"operator (CLI)\""
+    );
+    assert!(operator.is_operator() && operator.administrator_did().is_none());
+    assert_eq!(admin.administrator_did(), Some("did:example:admin"));
+
+    // The operator's marker is not a DID, so no administrator can carry it.
+    assert!(Issuer::administrator("operator (CLI)").is_err());
+    assert!(Issuer::administrator("").is_err());
+    assert!(serde_json::from_str::<Issuer>("\"not a did\"").is_err());
+}
+
+/// An invite stored before amendments were recorded reads as unamended, and
+/// an amendment is recorded once per administrator, never for the issuer.
+#[test]
+fn amendments_are_recorded_once_and_read_from_older_invites() {
+    let issued = Invite {
+        invite_id: "id".into(),
+        token_hash: hash_token("t"),
+        claim: hash_claim_code("ABCDEFGHJKMN").unwrap(),
+        subject: "did:example:carol".into(),
+        purpose: Purpose::Session,
+        role: Some("owner".into()),
+        device_label: None,
+        issued_by: Issuer::operator(),
+        amended_by: Vec::new(),
+        created_at: 0,
+        expires_at: 1,
+        wrong_codes: 0,
+        ceremony: None,
+    };
+    let mut stored = serde_json::to_value(&issued).unwrap();
+    assert!(stored.get("amendedBy").is_none() && stored.get("amended_by").is_none());
+    stored.as_object_mut().unwrap().remove("amended_by");
+    let mut invite: Invite = serde_json::from_value(stored).unwrap();
+    assert_eq!(invite.administrators().count(), 0);
+
+    invite.record_amendment("did:example:admin");
+    invite.record_amendment("did:example:admin");
+    invite.record_amendment("did:example:other");
+    assert_eq!(
+        invite.administrators().collect::<Vec<_>>(),
+        ["did:example:admin", "did:example:other"]
+    );
+
+    let mut by_admin = invite.clone();
+    by_admin.issued_by = Issuer::administrator("did:example:issuer").unwrap();
+    by_admin.amended_by.clear();
+    by_admin.record_amendment("did:example:issuer");
+    assert_eq!(
+        by_admin.administrators().collect::<Vec<_>>(),
+        ["did:example:issuer"]
+    );
 }

@@ -122,8 +122,17 @@ pub async fn run_remove_acl(
 
     let existing = get_acl_entry(&acl_ks, &did).await?;
     if existing.is_none() {
+        // No entry, but there may be an enrolment invite for the DID — the
+        // operator's own (`invite`), which no ACL change otherwise withdraws.
+        // Withdrawing it is how an operator takes one back.
+        let sessions_ks = store.keyspace(crate::server::store::KS_SESSIONS)?;
+        let withdrawn = super::acl_removal::withdraw_invites_for(&sessions_ks, &did).await?;
+        if withdrawn > 0 {
+            store.persist().await?;
+        }
         eprintln!();
         eprintln!("  No ACL entry found for {did}");
+        eprintln!("  Invites withdrawn: {withdrawn}");
         eprintln!();
         return Ok(());
     }

@@ -22,8 +22,8 @@ pub async fn withdraw_removed_member(
     Ok((settled, withdrawn))
 }
 
-/// Withdraw every enrolment invite issued for `subject`, or by it. Returns
-/// how many were withdrawn.
+/// Withdraw every enrolment invite issued for `subject`, or issued or amended
+/// by it. Returns how many were withdrawn.
 #[cfg(feature = "passkey")]
 pub async fn withdraw_invites_for(
     sessions: &KeyspaceHandle,
@@ -33,7 +33,7 @@ pub async fn withdraw_invites_for(
     let same = |did: &str| crate::scid::same_reference(did, subject);
     let mut withdrawn = 0;
     for pending in invite::list(sessions).await? {
-        if (same(&pending.subject) || same(&pending.issued_by))
+        if (same(&pending.subject) || pending.administrators().any(same))
             && invite::revoke(sessions, &pending.invite_id, "acl/revoke").await?
         {
             withdrawn += 1;
