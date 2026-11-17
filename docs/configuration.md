@@ -228,7 +228,7 @@ Read by the control plane, the edge and the daemon.
 | `unassigned_purge_grace` | `"2h"` | — | How long an edge keeps a domain's data after it is unassigned before the purge sweep removes it. |
 | `disable_purge_grace` | `"30d"` | — | How long a disabled domain (and its DIDs) is kept before permanent removal. |
 | `scid_also_known_as` | `true` | `<P>_HOSTING_SCID_ALSO_KNOWN_AS` | A DID the service creates for itself lists its `did:scid` alias in `alsoKnownAs`. |
-| `[[hosting.webs_self_register]]` | none | — | Domains on which a `did:webs` may register itself (`domain`, `path_prefixes`, `max_registrations` default 100). `method-webs` builds only; see [did-webs-hosting.md](did-webs-hosting.md). |
+| `[[hosting.webs_self_register]]` | none | — | Domains on which a `did:webs` may register itself (`domain`, `path_prefixes`, `max_registrations` default 100, `max_dids_per_identifier` default 1). `method-webs` builds only; see [did-webs-hosting.md](did-webs-hosting.md). |
 
 Grace periods are an integer with an optional unit `s`, `m`, `h` or `d`
 (bare seconds otherwise), parsed at load: a value that is not a duration

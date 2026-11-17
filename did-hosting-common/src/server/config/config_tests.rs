@@ -62,6 +62,23 @@ fn webs_self_register_is_off_by_default_and_matches_whole_segments() {
         toml::from_str("[[webs_self_register]]\ndomain = \"a\"\nmax_registrations = 3").unwrap();
     assert_eq!(hosting.webs_self_register[0].max_registrations, 3);
 
+    // Each self-registered identifier holds its own slot only by default; the
+    // operator may let it hold more, never none.
+    assert_eq!(any.max_dids_per_identifier.get(), 1);
+    let hosting: HostingConfig =
+        toml::from_str("[[webs_self_register]]\ndomain = \"a\"\nmax_dids_per_identifier = 50")
+            .unwrap();
+    assert_eq!(
+        hosting.webs_self_register[0].max_dids_per_identifier.get(),
+        50
+    );
+    assert!(
+        toml::from_str::<HostingConfig>(
+            "[[webs_self_register]]\ndomain = \"a\"\nmax_dids_per_identifier = 0"
+        )
+        .is_err()
+    );
+
     // An unknown member is refused, not ignored.
     assert!(
         toml::from_str::<HostingConfig>(

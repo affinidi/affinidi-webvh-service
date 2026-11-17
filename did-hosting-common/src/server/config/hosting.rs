@@ -3,6 +3,7 @@
 
 use crate::server::error::AppError;
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU64;
 
 use super::default_true;
 use super::env::parse_env_bool;
@@ -110,6 +111,15 @@ pub struct WebsSelfRegistration {
     /// can overshoot it by at most one each.
     #[serde(default = "default_webs_self_register_max")]
     pub max_registrations: u32,
+    /// How many DIDs each self-registered identifier may hold on this domain,
+    /// its own included: the `max_did_count` of the `Owner` entry
+    /// self-registration grants it (default 1, its own slot only). A node
+    /// that publishes the DIDs it creates here — a VTA hosting a community's
+    /// or a persona's DID — needs more. At least 1. Applies to entries granted
+    /// from then on; an entry already granted keeps its limit until an
+    /// administrator changes it.
+    #[serde(default = "default_webs_self_register_dids")]
+    pub max_dids_per_identifier: NonZeroU64,
 }
 
 /// The default [`WebsSelfRegistration::max_registrations`]: enough for a
@@ -120,12 +130,21 @@ fn default_webs_self_register_max() -> u32 {
     DEFAULT_WEBS_SELF_REGISTER_MAX
 }
 
+/// The default [`WebsSelfRegistration::max_dids_per_identifier`]: the
+/// identifier's own slot and nothing more.
+pub const DEFAULT_WEBS_SELF_REGISTER_DIDS: NonZeroU64 = NonZeroU64::MIN;
+
+fn default_webs_self_register_dids() -> NonZeroU64 {
+    DEFAULT_WEBS_SELF_REGISTER_DIDS
+}
+
 impl Default for WebsSelfRegistration {
     fn default() -> Self {
         Self {
             domain: String::new(),
             path_prefixes: Vec::new(),
             max_registrations: DEFAULT_WEBS_SELF_REGISTER_MAX,
+            max_dids_per_identifier: DEFAULT_WEBS_SELF_REGISTER_DIDS,
         }
     }
 }

@@ -110,6 +110,9 @@ pub(crate) struct SelfCertifiedWebs {
     source: String,
     /// The domain's `max_registrations`.
     max_registrations: u32,
+    /// The domain's `max_dids_per_identifier`: the granted entry's
+    /// `max_did_count`.
+    max_dids: u64,
 }
 
 impl SelfCertifiedWebs {
@@ -204,7 +207,8 @@ impl SelfCertifiedWebs {
     }
 
     /// Give the newly registered identifier an `Owner` ACL entry, scoped to
-    /// its domain and to the one slot it holds (`max_did_count = 1`), so that
+    /// its domain and to the domain's `max_dids_per_identifier` slots (default
+    /// 1, the one it holds: `max_did_count`), so that
     /// its later publications take the ordinary owner path. Left alone when
     /// it has an entry already (an administrator's, or one an earlier attempt
     /// granted). Audited either way.
@@ -236,7 +240,7 @@ impl SelfCertifiedWebs {
                     label: Some(SELF_REGISTERED_LABEL.into()),
                     created_at: did_hosting_common::server::auth::session::now_epoch(),
                     max_total_size: None,
-                    max_did_count: Some(1),
+                    max_did_count: Some(self.max_dids),
                     domains: DomainScope::Allowed {
                         domains: vec![record.domain.clone()],
                     },
@@ -272,6 +276,7 @@ pub(crate) struct Candidate {
     path: String,
     source: String,
     max_registrations: u32,
+    max_dids: u64,
     document: affinidi_did_common::Document,
 }
 
@@ -322,6 +327,7 @@ impl Candidate {
             path: self.path,
             source: self.source,
             max_registrations: self.max_registrations,
+            max_dids: self.max_dids,
         })
     }
 }
@@ -491,6 +497,7 @@ pub(crate) async fn admit(
         path,
         source,
         max_registrations: policy.max_registrations,
+        max_dids: policy.max_dids_per_identifier.get(),
         document,
     }))
 }
@@ -744,6 +751,35 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// The granted entry's DID limit is the domain's `max_dids_per_identifier`,
+    /// so a node that publishes the DIDs it creates (a VTA hosting a
+    /// community's DID) is not stopped at its own slot.
+    #[cfg(feature = "method-webs")]
+    #[tokio::test]
+    async fn the_granted_entry_holds_the_domains_max_dids_per_identifier() {
+        let (mut state, _dir) = enabled(&[]).await;
+        let mut config = (*state.config).clone();
+        config.hosting.webs_self_register[0].max_dids_per_identifier =
+            std::num::NonZeroU64::new(25).unwrap();
+        state.config = Arc::new(config);
+
+        let webs = Webs::incept(41);
+        let caller = webs.caller("");
+        let reply = register_as(&state, Via::Https, &caller, webs.payload("")).await;
+        ok(&reply, REGISTER);
+        let entry = get_acl_entry(&state.acl_ks, &caller.did)
+            .await
+            .unwrap()
+            .expect("granted an ACL entry");
+        assert_eq!(entry.max_did_count, Some(25));
+        assert_eq!(
+            entry.domains,
+            DomainScope::Allowed {
+                domains: vec![DOMAIN.into()]
+            }
+        );
     }
 
     /// A self-registration skips the ACL pre-filter but not the replay gate:
