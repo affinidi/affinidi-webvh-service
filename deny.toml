@@ -29,14 +29,6 @@ ignore = [
   # backends, which is why `[graph] all-features` above matters.
   { id = "RUSTSEC-2024-0384", reason = "`instant` unmaintained — transitive only (no direct dependency); upstreams haven't migrated to web-time." },
   { id = "RUSTSEC-2025-0012", reason = "`backoff` unmaintained — transitive only (no direct dependency)." },
-  # chrono was declared unmaintained (chronotope/chrono#1768) with no
-  # successor release. Unlike the three above it IS a direct dependency here
-  # (timestamps throughout every crate), and the whole Affinidi stack
-  # (affinidi-data-integrity, affinidi-tdk, vta-sdk, the mediator) carries it
-  # too, so dropping it is a cross-stack migration, not a lockfile move. Not
-  # a vulnerability. Revisit when the stack moves to `jiff` / `time`.
-  { id = "RUSTSEC-2026-0543", reason = "`chrono` unmaintained — no safe upgrade; direct and stack-wide, migration tracked separately. Not a vulnerability." },
-  { id = "RUSTSEC-2026-0542", reason = "`humantime` unmaintained (follows chrono's status) — transitive only, via the dev-only test mediator (affinidi-messaging-mediator{,-common})." },
   { id = "RUSTSEC-2026-0441", reason = "`pin-utils` unmaintained — transitive only, via aws-smithy-{http,runtime,types}; no safe upgrade exists. Revisit when the AWS SDK moves to `pin-project-lite` / `std::pin::pin!`." },
   # Status-only "unmaintained" advisories (2026-11-17), no fixed release and no
   # reported vulnerability. chrono is used directly here and through the
