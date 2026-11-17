@@ -1,3 +1,5 @@
+//! `GET /api/health`: the unauthenticated liveness probe.
+
 use axum::Json;
 use axum::http::StatusCode;
 use serde::Serialize;

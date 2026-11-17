@@ -30,7 +30,13 @@ include = [
 workspace = true
 
 [features]
-default = ["keyring", "store-fjall", "ui"]
+default = ["keyring", "store-fjall", "ui", "jemalloc"]
+# Use jemalloc as the `did-hosting-control` binary's global allocator (see the
+# dependency comment). On by default: with the system allocator the process
+# holds its RSS high-water mark for its lifetime. Disable
+# (`--no-default-features`) if you need to profile against the system allocator
+# or are building for a target jemalloc doesn't support.
+jemalloc = ["dep:tikv-jemallocator"]
 metrics = ["did-hosting-common/metrics"]
 # DID methods the control plane can accept publications for. The control
 # plane is the write side, so a method must be enabled here for
@@ -99,7 +105,7 @@ did-hosting-common = { version = "0.12", path = "../did-hosting-common", feature
 # declarations (did-hosting-common/-server, webvh-witness) and to
 # the workspace `vta-sdk = "0.38"` — see the lockstep note in
 # did-hosting-common/Cargo.toml.
-vti-common = { version = "0.51", default-features = false }
+vti-common = { version = "0.66", default-features = false }
 async-trait = { workspace = true }
 # Local `.mmdb` GeoIP reader (`crate::geoip`) — never a third-party call.
 maxminddb = { workspace = true }
@@ -139,7 +145,7 @@ affinidi-tdk-common = { workspace = true }
 affinidi-messaging-didcomm = { workspace = true }
 affinidi-secrets-resolver = { workspace = true }
 tokio-util = { workspace = true }
-affinidi-did-resolver-cache-sdk = "0.8.43"
+affinidi-did-resolver-cache-sdk = { workspace = true }
 # Egress address-class guard for the registry URL validation (SSRF default-deny).
 affinidi-net-guard = "0.1"
 axum = { workspace = true }
@@ -193,12 +199,35 @@ azure_identity = { version = "1.0", optional = true }
 # never pulls it in.
 tempfile = { workspace = true, optional = true }
 
+# ── Allocator ────────────────────────────────────────────────────────────
+# jemalloc, used by the `did-hosting-control` binary only (set as the global
+# allocator in main.rs — a library must never impose an allocator on its
+# consumers).
+#
+# The default system allocator (glibc malloc on Linux) does not return the
+# memory of freed allocations to the OS promptly. The control plane's request
+# path is a sawtooth of short-lived allocations (Trust Task envelopes, DID logs
+# being verified, UI and API responses, store batches), and glibc retains those
+# arenas, so RSS ratchets up to its high-water mark and stays there. That reads
+# as a leak in monitoring even though the live heap is flat. jemalloc's
+# decay-based purging returns the pages, so RSS tracks live memory.
+#
+# Not available on MSVC; the cfg gate below falls back to the system allocator
+# there.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+
 [dev-dependencies]
 anyhow.workspace = true
 # The self-registration tests incept real did:webs identifiers, and sign as
 # their keys. Tests only: the service itself never holds KERI keys, and this
-# brings the KERI store (LMDB) into the test graph alone.
-affinidi-keri = "0.4"
+# brings the KERI store (LMDB) into the test graph alone. The version is the
+# one `affinidi-did-webs` incepts with, so a test's AID is the created one's.
+affinidi-keri = "0.8"
+affinidi-keri-core = "0.8"
+# Creates those identifiers whole — inception and the designations naming
+# their DID, which 0.13 requires — as a real controller does (`create`).
+affinidi-did-webs = { workspace = true, features = ["create"] }
 # `validate` is also on in `[dependencies]` above now (the invite/update
 # handler uses it at runtime); kept explicit here too so the table's tests
 # can check any reply against the schema its type names
@@ -221,7 +250,7 @@ openssl = "0.10"
 #
 # 0.48.0 is the line built on affinidi-tdk 0.36 / trust-tasks-rs 0.36, the same
 # the root manifest now pins.
-affinidi-messaging-test-mediator = "0.48.0"
+affinidi-messaging-test-mediator = "0.52.0"
 # Self-dependency with `test-support` on, so this crate's own integration
 # tests compile the `test_support` module (and get `tempfile`) exactly as a
 # downstream consumer would via `features = ["test-support"]`.

@@ -67,7 +67,8 @@
 //! ## Guarantees
 //!
 //! - **At-least-once delivery.** Recipients MUST be idempotent — the
-//!   `handle_domain_*` / `handle_sync_*` handlers are.
+//!   edge's `webvh/sync/*` and `replica/domain/*` handlers are
+//!   (`did-hosting-server`'s `messaging`).
 //! - **Per-target FIFO.** Entries for the same target are processed in
 //!   enqueue order, one in flight at a time; the head blocks the rest
 //!   (head-of-line) until it settles or is dropped. Targets are independent

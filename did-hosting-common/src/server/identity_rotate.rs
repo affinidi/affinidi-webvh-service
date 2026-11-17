@@ -30,12 +30,7 @@
 //! chosen to survive.
 
 use affinidi_tdk::secrets_resolver::secrets::Secret;
-use didwebvh_rs::{
-    DIDWebVHState,
-    log_entry::{LogEntry, LogEntryMethods},
-    log_entry_state::{LogEntryState, LogEntryValidationStatus},
-    parameters::Parameters,
-};
+use didwebvh_rs::{DIDWebVHState, log_entry::LogEntryMethods};
 use serde_json::{Value, json};
 
 use crate::did_ops::content_log_key;
@@ -61,36 +56,12 @@ pub struct RotationReport {
 
 /// Load a `did.jsonl` into a `DIDWebVHState`, validating the chain.
 ///
-/// Mirrors `did_ops::verify_did_log_proofs`'s parse, but keeps the state so we
-/// can append to it. Validation is not optional here: appending to a chain we
-/// have not verified would let a corrupted log silently become a signed one.
+/// The shared [`did_ops::parse_log`](crate::did_ops::parse_log), then the
+/// upstream full-chain validation, keeping the state so we can append to it.
+/// Validation is not optional here: appending to a chain we have not verified
+/// would let a corrupted log silently become a signed one.
 pub(crate) fn load_validated_state(content: &str) -> Result<DIDWebVHState, AppError> {
-    let mut state = DIDWebVHState::default();
-    let mut version = None;
-
-    for (idx, line) in content.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let entry = LogEntry::deserialize_string(line, version)
-            .map_err(|e| AppError::Config(format!("invalid log entry at line {}: {e}", idx + 1)))?;
-        version = Some(entry.get_webvh_version());
-        let version_number = entry
-            .get_version_id_fields()
-            .map_err(|e| AppError::Config(format!("invalid versionId at line {}: {e}", idx + 1)))?
-            .0;
-        state.log_entries_mut().push(LogEntryState {
-            log_entry: entry,
-            version_number,
-            validation_status: LogEntryValidationStatus::NotValidated,
-            validated_parameters: Parameters::default(),
-        });
-    }
-
-    if state.log_entries().is_empty() {
-        return Err(AppError::Config("the DID log is empty".into()));
-    }
+    let mut state = crate::did_ops::parse_log(content).map_err(AppError::Config)?;
 
     // `validate` returns a report rather than erroring on a partial chain, so
     // ignoring it would let a truncated or partially-verified log through — and

@@ -1,8 +1,9 @@
+//! Startup helpers: loading the JWT signing keys and waiting for a shutdown
+//! signal.
+
 use std::sync::Arc;
 
-use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 use affinidi_tdk::secrets_resolver::secrets::Secret;
-use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
 use tracing::{debug, info, warn};
 
 use super::auth::jwt::JwtKeys;
@@ -40,54 +41,6 @@ pub fn init_jwt_keys(secrets: &ServerSecrets) -> Option<Arc<JwtKeys>> {
             None
         }
     }
-}
-
-/// Initialize DIDComm authentication infrastructure (DID resolver + secrets resolver).
-///
-/// Returns `(None, None)` if `server_did` is `None` or if initialization fails.
-pub async fn init_didcomm_auth(
-    server_did: Option<&str>,
-    secrets: &ServerSecrets,
-) -> (Option<DIDCacheClient>, Option<Arc<ThreadedSecretsResolver>>) {
-    let server_did = match server_did {
-        Some(did) => did,
-        None => {
-            warn!("server_did not configured — DIDComm auth endpoints will not work");
-            return (None, None);
-        }
-    };
-
-    let did_resolver = match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("failed to create DID resolver: {e} — DIDComm auth endpoints will not work");
-            return (None, None);
-        }
-    };
-
-    let (secrets_resolver, _handle) = ThreadedSecretsResolver::new(None).await;
-
-    let kid = format!("{server_did}#key-0");
-    match Secret::from_multibase(&secrets.signing_key, Some(&kid)) {
-        Ok(secret) => {
-            secrets_resolver.insert(secret).await;
-            debug!(kid = %kid, "server signing secret loaded");
-        }
-        Err(e) => warn!("failed to decode signing_key: {e}"),
-    }
-
-    let kid = format!("{server_did}#key-1");
-    match Secret::from_multibase(&secrets.key_agreement_key, Some(&kid)) {
-        Ok(secret) => {
-            secrets_resolver.insert(secret).await;
-            debug!(kid = %kid, "server key-agreement secret loaded");
-        }
-        Err(e) => warn!("failed to decode key_agreement_key: {e}"),
-    }
-
-    info!("DIDComm auth initialized for DID {server_did}");
-
-    (Some(did_resolver), Some(Arc::new(secrets_resolver)))
 }
 
 /// Wait for a shutdown signal (Ctrl-C / SIGTERM).

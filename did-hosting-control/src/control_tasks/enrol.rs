@@ -56,8 +56,8 @@ use did_hosting_common::server::passkey::store::{
 use did_hosting_common::server::store::{KS_PASSKEY_STEP_UP, KeyspaceHandle};
 
 use super::{Cx, TaskError, at, typed};
-use crate::error::AppError;
 use crate::server::AppState;
+use did_hosting_common::server::error::AppError;
 
 /// How long an enrolment ceremony stays open (the spec RECOMMENDS 5 minutes).
 const CEREMONY_TTL_SECS: u64 = 300;

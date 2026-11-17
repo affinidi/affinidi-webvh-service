@@ -1,3 +1,5 @@
+//! [`WebVHError`]: the client-side error type of this crate's HTTP client.
+
 #[derive(Debug, thiserror::Error)]
 pub enum WebVHError {
     #[error("HTTP error: {0}")]

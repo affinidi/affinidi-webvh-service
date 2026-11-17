@@ -1,3 +1,6 @@
+//! Ed25519 JWTs for access and refresh tokens: signing, verification and the
+//! claims they carry.
+
 use crate::server::error::AppError;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};

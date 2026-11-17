@@ -1,3 +1,6 @@
+//! Tests for [`super`]: the periodic flush of in-memory counters to the
+//! tiered stats store.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -8,7 +11,7 @@ use did_hosting_common::server::stats_tiers::{
 };
 
 use super::*;
-use crate::store::Store;
+use did_hosting_common::server::store::Store;
 
 async fn keyspaces() -> (tempfile::TempDir, Store, KeyspaceHandle, KeyspaceHandle) {
     let dir = tempfile::tempdir().expect("tempdir");

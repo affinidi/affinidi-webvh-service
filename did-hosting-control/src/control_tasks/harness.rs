@@ -204,13 +204,17 @@ pub(crate) async fn https(state: &AppState, bearer: Option<AuthClaims>, doc: Val
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
 
-    let response = crate::routes::trust_tasks::dispatch_trust_task(
+    // Boxed, as `call` boxes `send`: the dispatch future is deep enough that
+    // a test awaiting several in a row overflows a debug-build test thread's
+    // stack (seen with `method-webs` builds).
+    let headers = axum::http::HeaderMap::new();
+    let response = Box::pin(crate::routes::trust_tasks::dispatch_trust_task(
         bearer,
         axum::extract::State(state.clone()),
         None,
-        &axum::http::HeaderMap::new(),
+        &headers,
         axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
-    )
+    ))
     .await
     .into_response();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();

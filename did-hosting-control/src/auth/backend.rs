@@ -10,8 +10,8 @@
 //!   (`max_pending_challenges_per_did = 0`). did-hosting-control
 //!   keeps its existing O(1) `PendingChallengeTracker` on `AppState`:
 //!   `routes::auth::issue_challenge` reserves a slot around the
-//!   canonical-handler call (for REST and the `auth/challenge/0.1`
-//!   Trust Task alike), and a successful authenticate releases it. The canonical handler's O(N)
+//!   canonical-handler call (for the plain `/api/auth/challenge` route
+//!   and the `auth/challenge` Trust Task alike), and a successful authenticate releases it. The canonical handler's O(N)
 //!   prefix-scan rate-limit would be redundant + slower; preserving
 //!   the tracker is a deliberate choice (the gating mechanism is
 //!   the same, just measured differently).
@@ -27,9 +27,9 @@ use did_hosting_common::server::auth::DidHostingSessionStore;
 use did_hosting_common::server::auth::jwt::JwtKeys;
 use vti_common::auth::backend::{AuthBackend, RoleResolution};
 
-use crate::acl::Role;
-use crate::error::AppError;
 use crate::server::AppState;
+use did_hosting_common::server::acl::Role;
+use did_hosting_common::server::error::AppError;
 
 pub struct DidHostingControlAuthBackend {
     state: Arc<AppState>,
@@ -96,7 +96,7 @@ impl AuthBackend for DidHostingControlAuthBackend {
     }
 
     async fn check_acl(&self, did: &str) -> Result<RoleResolution<Self::Role>, Self::Error> {
-        let role = crate::acl::check_acl(&self.state.acl_ks, did).await?;
+        let role = did_hosting_common::server::acl::check_acl(&self.state.acl_ks, did).await?;
         // A `MetricsReader` is a counters-only sidecar credential and must
         // never obtain an interactive session. The challenge/authenticate
         // (AwsSigV4/WebAuthn) flow mints its token through this backend rather

@@ -423,13 +423,27 @@ mod webs_domain_encoding_tests {
     }
 
     /// A host with no port is untouched — the common case must not grow
-    /// an encoding artefact.
+    /// an encoding artefact. Asked of `slot_did` itself: the reference
+    /// artifacts designate `did-webs-service:7676` only, so they cannot be
+    /// published on any other host (below).
     #[test]
     fn a_plain_host_is_untouched() {
-        let p = verify_publication("hosting.example.com", AID, KERI, None, None).unwrap();
         assert_eq!(
-            p.did_id.as_deref(),
-            Some(format!("did:webs:hosting.example.com:{AID}").as_str()),
+            crate::method::webs::Webs::slot_did("hosting.example.com", AID),
+            format!("did:webs:hosting.example.com:{AID}"),
+        );
+    }
+
+    /// A did:webs is valid only on a domain its own designated aliases name
+    /// (`affinidi-did-webs` 0.13): a log published on another host is
+    /// refused, not served as a DID its controller never designated.
+    #[test]
+    fn a_log_on_a_domain_it_does_not_designate_is_refused() {
+        let err = verify_publication("hosting.example.com", AID, KERI, None, None)
+            .expect_err("the reference artifacts designate did-webs-service:7676 only");
+        assert!(
+            err.to_string().contains("not designated by its AID"),
+            "{err}"
         );
     }
 }

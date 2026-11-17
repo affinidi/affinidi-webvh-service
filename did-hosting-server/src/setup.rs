@@ -1,3 +1,6 @@
+//! `setup`: the interactive wizard and the offline prepare/complete flow
+//! that provision the edge's DID from a VTA and write its `config.toml`.
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

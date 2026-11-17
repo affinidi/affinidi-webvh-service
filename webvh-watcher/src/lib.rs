@@ -8,7 +8,9 @@
 //! Pre-1.0 — the public-module surface is intentionally wide so that
 //! `did-hosting-daemon` can compose this crate as a library. Treat every `pub`
 //! module as **unstable**; breaking changes can land in any minor version.
-//! Pin internal deps with `major.minor` (`= "0.6"`).
+//! Pin internal deps to the release's `major.minor` (a plain
+//! `"<major>.<minor>"` requirement, which for a pre-1.0 crate admits only
+//! that minor's patches).
 
 pub mod config;
 pub mod error;

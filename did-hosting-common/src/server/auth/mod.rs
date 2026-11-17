@@ -1,3 +1,6 @@
+//! Authentication building blocks shared by the services: JWTs, sessions,
+//! the session-store backend and the request extractors.
+
 pub mod backend;
 pub mod extractor;
 pub mod jwt;

@@ -3,7 +3,7 @@
 //!
 //! Every row comes from a list the gate itself reads — [`super::TASKS`], the
 //! ACL family's [`ACL_TASK_URIS`], the auth family's dispatcher and the
-//! infrastructure family's [`crate::trust_tasks_infra::INFRA_TASK_URIS`] —
+//! infrastructure family's [`crate::messaging::infra::INFRA_TASK_URIS`] —
 //! and its proof rule from [`crate::messaging::proof_rule`], the function the
 //! gate calls. Only the *standing* column is written here by hand
 //! ([`STANDING`]), because it lives in each handler's body; the test fails
@@ -185,7 +185,7 @@ const STANDING: &[(&str, &str)] = &[
     ("acl/change-role/0.2", "admin"),
     ("acl/show/0.2", "admin, or the subject looking itself up"),
     ("acl/list/0.3", "admin"),
-    ("trust-task-discovery/0.3", "anyone (unsigned allowed)"),
+    ("trust-task-discovery/0.4", "anyone (unsigned allowed)"),
     // Console sign-in (SIOPv2-style challenge / response).
     ("auth/challenge/0.1", "anyone (unsigned allowed)"),
     (
@@ -298,10 +298,10 @@ fn sections() -> Vec<(&'static str, &'static str, Vec<String>)> {
         (
             "Infrastructure (from edges and watchers)",
             "What an edge or watcher sends the control plane \
-             (`did-hosting-control/src/trust_tasks_infra.rs`): its registration, \
+             (`did-hosting-control/src/messaging/infra/mod.rs`): its registration, \
              health and stats, and the signed acknowledgements that settle the \
              control plane's outbox rows. Operators never send these.",
-            crate::trust_tasks_infra::INFRA_TASK_URIS
+            crate::messaging::infra::INFRA_TASK_URIS
                 .iter()
                 .map(|u| (*u).to_owned())
                 .collect(),

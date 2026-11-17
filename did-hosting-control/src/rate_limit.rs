@@ -145,7 +145,7 @@ pub fn webs_self_register_global_limiter() -> KeyedRateLimiter<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::AppError;
+    use did_hosting_common::server::error::AppError;
     use std::net::IpAddr;
 
     fn ip(s: &str) -> IpAddr {

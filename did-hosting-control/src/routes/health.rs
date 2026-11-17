@@ -1,3 +1,5 @@
+//! `GET /api/health`: liveness and version.
+
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;

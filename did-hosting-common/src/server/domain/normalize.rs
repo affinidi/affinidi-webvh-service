@@ -1,6 +1,6 @@
 //! Domain-name normalisation.
 //!
-//! Per `docs/multi-domain-spec.md` §3 row "Domain name normalization":
+//! Per `docs/archive/multi-domain-spec.md` §3 row "Domain name normalization":
 //! every domain name reaching the system gets lowercase + IDNA-
 //! normalised before storage / comparison. Inputs that aren't already
 //! in canonical form are **rejected with 400**, with the canonical form
@@ -38,7 +38,7 @@ const MAX_LEN: usize = 253;
 ///
 /// IP-literal hosts (`127.0.0.1`, `[::1]`) are rejected — a domain
 /// must be a DNS name. Loopback IPs are honoured at the request-host
-/// level by the trusted-proxy logic in T19, not here.
+/// level by the trusted-proxy logic in [`super::detect`], not here.
 pub fn normalize_domain_name(input: &str) -> Result<String, AppError> {
     if input.is_empty() {
         return Err(AppError::invalid("domain name must not be empty"));

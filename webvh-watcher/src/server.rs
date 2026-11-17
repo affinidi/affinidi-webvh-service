@@ -1,3 +1,6 @@
+//! The watcher's runtime: [`AppState`], startup ([`run`]), its messaging
+//! listener, and the HTTP and storage threads.
+
 use std::sync::{Arc, OnceLock};
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;

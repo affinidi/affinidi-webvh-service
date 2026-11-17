@@ -253,9 +253,11 @@ left; one that keeps losing answers `unavailable` with `retryAfter`.
 
 A document that does not verify — unsigned, signed with the wrong proof
 purpose, not addressed to this witness, stale, or a replay — gets no reply
-(HTTPS answers `403` with an unsigned, detail-free body). A verified document
-from a DID the witness does not authorise is refused with a signed
-`permissionDenied`. Every other reply is signed by the witness.
+(HTTPS answers `403` with an unsigned, detail-free body). A document from a DID the
+witness does not authorise (not in its ACL, or lacking the role the task
+needs) is dropped the same way, before its proof is checked, so a stranger
+costs the witness no DID resolution. Every other reply is signed by the
+witness.
 
 `GET /api/health` stays a plain, unauthenticated liveness probe. It is
 added by the standalone binary; the daemon's embedded witness has no health

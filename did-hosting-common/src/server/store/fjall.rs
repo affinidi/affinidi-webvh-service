@@ -1,3 +1,5 @@
+//! The embedded fjall store backend.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 

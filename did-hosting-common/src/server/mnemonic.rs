@@ -1,3 +1,6 @@
+//! Slot paths (mnemonics): the shared lowercase grammar, reserved first
+//! segments, the did:webs AID exemption and agent-name validation.
+
 use super::error::{AgentNameError, AppError, ValidationKind};
 
 /// Names that conflict with server routes and must not be used as the

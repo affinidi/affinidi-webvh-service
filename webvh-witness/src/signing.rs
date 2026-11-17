@@ -1,3 +1,6 @@
+//! Witness proof signing: the [`WitnessSigner`] extension point and the
+//! in-process [`LocalSigner`].
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

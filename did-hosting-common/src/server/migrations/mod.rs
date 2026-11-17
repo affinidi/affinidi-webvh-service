@@ -1,7 +1,7 @@
 //! Idempotent migration runner for on-disk store-shape changes.
 //!
 //! Why this exists: the multi-domain + multi-method rollout (see
-//! `docs/multi-domain-spec.md` §6.5 and `docs/multi-method-hosting-spec.md`
+//! `docs/archive/multi-domain-spec.md` §6.5 and `docs/archive/multi-method-hosting-spec.md`
 //! §10) introduces breaking shape changes on first boot at the new version.
 //! Existing webvh deployments need their DID records and ACL entries
 //! migrated in place, exactly once, in a known order. A purpose-built
@@ -28,10 +28,11 @@
 //!
 //! ## What this module ships
 //!
-//! This is the **skeleton** (T2): the trait, the runner, the per-id
-//! marker logic, an empty-set test, and a fail-fast test. The first
-//! actual migrations (`M-01` legacy `did_log` → `DidRecord` wrap, `M-02`
-//! domain tagging) land in subsequent tasks and register here.
+//! The trait, the runner and the per-id marker logic, plus the migrations
+//! themselves: [`m01_tag_did_records_with_domain`] (fill
+//! `DidRecord.domain`), [`m02_cache_did_record_services`] (fill
+//! `DidRecord.services`) and [`m03_index_did_records`] (build the usage
+//! counters and slot index).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -274,9 +275,8 @@ pub(crate) fn applied_key(id: &str) -> String {
     format!("{APPLIED_KEY_PREFIX}{id}")
 }
 
-/// Helper: open the `meta` keyspace. The keyspace name will move to the
-/// centralised registry in T3; until then it lives next to its only
-/// consumer.
+/// Helper: open the `meta` keyspace ([`KS_META`]), where the applied
+/// markers live.
 pub(crate) fn meta_keyspace(store: &Store) -> Result<KeyspaceHandle, AppError> {
     store.keyspace(KS_META)
 }

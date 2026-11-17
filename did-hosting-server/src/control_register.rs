@@ -47,10 +47,11 @@ pub fn is_registered() -> bool {
 // DIDComm registration with control plane
 // ---------------------------------------------------------------------------
 
-/// Register this server with the control plane via DIDComm.
+/// Register this server with the control plane.
 ///
-/// Uses the shared `DIDCommService` connection to send a `server/register`
-/// message. Retries with exponential backoff (5s → 60s, max 20 attempts).
+/// Sends a signed `server/register` Trust Task over the transport the control
+/// plane's DID document advertises (`send_trust_task_with_retry`). Retries a
+/// fixed 10 attempts, 5s apart (no backoff).
 ///
 /// The `DIDCommService` must be initialized before calling this.
 pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService) {
@@ -99,10 +100,10 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
     // omitted — they're not handing out DID data publicly.
     //
     // Failures here used to silently send `served_domains: []`. Combined
-    // with the (post-MED-3) handle_domain_ack mirror logic on the
-    // control plane, a transient store error during registration
+    // with the control plane mirroring `served_domains` into its
+    // registry on each registration, a transient store error during registration
     // would swing the registry view from "fully populated" to "empty"
-    // on every re-register, and a subsequent `?purge_servers=true`
+    // on every re-register, and a subsequent domain purge with `purgeServers`
     // fanout would skip this server because the registry briefly
     // lied. Instead, fail the registration attempt so the existing
     // retry loop kicks in — registration with an outdated
@@ -138,10 +139,6 @@ pub async fn register_via_didcomm(state: &AppState, didcomm_svc: &DIDCommService
         "protocolVersion": "1.0",
         "ext": {
             (REGISTER_EXT_NAMESPACE): {
-                // Tells the control plane it may send infrastructure ops
-                // (health ping) as trust tasks, and therefore over whichever
-                // transport this server's DID document advertises.
-                "trust_task_capable": true,
                 // Tells the control plane it may coalesce DID sync updates
                 // into `MSG_SYNC_BATCH` messages instead of one frame per DID.
                 "sync_batch": true,

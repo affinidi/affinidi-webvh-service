@@ -99,7 +99,7 @@ async fn mint_didcomm_peer(
             (PeerKeyRole::Verification, KeyType::Ed25519),
             (PeerKeyRole::Encryption, KeyType::X25519),
         ],
-        Some(vec![didcomm_service()]),
+        Some(vec![didcomm_service(mediator.endpoint().as_str())]),
     )
     .expect("generate did:peer");
     let mut secrets = secrets.into_iter();
@@ -125,28 +125,28 @@ fn mint_https_peer(base_url: &str) -> (String, Secret) {
     (did, signing)
 }
 
-/// A `DIDCommMessaging` service with a short placeholder endpoint — the
-/// named service type `resolve_transport` (tier 1) recognises, deliberately
-/// built ourselves rather than via `TestMediator::add_user` (whose minted
-/// peers tag their service `"dm"`, which `resolve_transport` does not
-/// match). Building it this way exercises document-advertised routing, not
-/// just the config-mediator fallback.
+/// A `DIDCommMessaging` service naming the mediator by its URL — the named
+/// service type `resolve_transport` (tier 1) recognises, deliberately built
+/// ourselves rather than via `TestMediator::add_user` (whose minted peers
+/// tag their service `"dm"`, which `resolve_transport` does not match).
+/// Building it this way exercises document-advertised routing, not just the
+/// config-mediator fallback.
 ///
-/// The endpoint is a placeholder, not `mediator.did()`, on purpose:
-/// `resolve_transport` only reads this service's *type* to pick the
-/// `Didcomm` binding, and `send_over_didcomm` never reads the endpoint value
-/// at all (the real connection target is `identity.mediator_did()` —
-/// `ServiceIdentity::for_didcomm_test`'s own parameter — resolved once at
-/// listener startup, independent of anything in this document). Embedding
-/// the mediator's own `did:peer` here instead would nest one already-long
-/// `did:peer` inside another and push the result past `check_acl`'s
-/// 512-byte cap on the DIDs it looks up — exactly the failure this
-/// placeholder avoids.
-fn didcomm_service() -> PeerService {
+/// The endpoint is the mediator's URL (`mediator_url`), not
+/// `mediator.did()`: embedding the mediator's own `did:peer` would nest one
+/// already-long `did:peer` inside another and push the result past
+/// `check_acl`'s 512-byte cap on the DIDs it looks up. It must still name
+/// *this* mediator: since 0.52 the mediator refuses to store a message for
+/// a recipient whose `DIDCommMessaging` endpoint it cannot classify (once a
+/// `urn:` placeholder here), and a URL whose authority is its own bind
+/// address is its own. On the sending side `resolve_transport` reads only
+/// the service's *type*, and `send_over_didcomm` connects to
+/// `identity.mediator_did()`, whatever this endpoint says.
+fn didcomm_service(mediator_url: &str) -> PeerService {
     PeerService {
         type_: "DIDCommMessaging".into(),
         endpoint: PeerServiceEndpoint::Long(OneOrMany::One(PeerServiceEndpointLong {
-            uri: "urn:mediator:placeholder".into(),
+            uri: mediator_url.into(),
             accept: vec!["didcomm/v2".into()],
             routing_keys: vec![],
         })),

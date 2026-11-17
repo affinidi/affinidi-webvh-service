@@ -4,7 +4,7 @@
 //! ## Why
 //!
 //! The DID list renders a service badge per DID (`WebVHHosting` / `TSP` /
-//! `DIDComm` / `Other`). `list_dids` deliberately never reads log bytes —
+//! `DIDComm` / `Other`). The `did/list` task deliberately never reads log bytes —
 //! see the dual-storage note on [`crate::did_ops::DidRecord`] — so the
 //! badges are served from a cache on the record itself. Every write path
 //! that touches `content_log_key` now keeps that cache fresh, but records

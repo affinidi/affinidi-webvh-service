@@ -30,9 +30,9 @@ use did_hosting_common::server::passkey::store::{self as passkey_store, cred_id_
 use did_hosting_common::server::store::KS_PASSKEY_STEP_UP;
 
 use super::{Cx, TaskError, at, new_id, typed};
-use crate::acl::check_acl;
-use crate::error::AppError;
 use crate::server::AppState;
+use did_hosting_common::server::acl::check_acl;
+use did_hosting_common::server::error::AppError;
 
 /// How long a step-up challenge or a passkey ceremony stays open.
 const CEREMONY_TTL_SECS: u64 = 300;

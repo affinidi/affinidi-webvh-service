@@ -1,3 +1,6 @@
+//! The embedded management UI: serves the exported `ui-dist` bundle, with SPA
+//! fallback to `index.html` and cache headers per asset kind.
+
 use std::borrow::Cow;
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};

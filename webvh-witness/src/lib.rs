@@ -9,12 +9,14 @@
 //! Pre-1.0 — the public-module surface is intentionally wide so that
 //! `did-hosting-daemon` can compose this crate as a library. Treat every `pub`
 //! module as **unstable**; breaking changes can land in any minor version.
-//! Pin internal deps with `major.minor` (`= "0.6"`).
+//! Pin internal deps to the release's `major.minor` (a plain
+//! `"<major>.<minor>"` requirement, which for a pre-1.0 crate admits only
+//! that minor's patches).
 //!
 //! Notably stable: the [`signing::WitnessSigner`] trait is the documented
 //! extension point for plugging in remote-signing backends (HSM, KMS,
 //! VTA-managed keys). Its signature is async (returns a `BoxFuture`) and
-//! intended to remain stable across the 0.6 series.
+//! intended to remain stable within a release series.
 
 pub mod acl;
 pub mod config;

@@ -24,10 +24,15 @@
 //! - A document that does not verify gets **no reply at all** — not even an
 //!   unsigned refusal on the messaging transports (HTTPS answers `403` with a
 //!   detail-free, unsigned body, which settles nothing).
-//! - A verified document whose issuer the witness does not authorise is
-//!   answered with a signed `permissionDenied`, and **nothing is recorded** for
-//!   it — the replay cache only ever holds documents from authorised issuers,
-//!   so a stranger minting DIDs cannot fill it and defer a real request.
+//! - A document whose *claimed* issuer the witness would not authorise (not in
+//!   the ACL, or lacking the role the task needs) is dropped with **no reply**
+//!   before its proof is checked — a local ACL read ahead of any DID
+//!   resolution, the same silence an invalid proof gets.
+//! - Only if the ACL changes between that pre-check and the verified re-check
+//!   is a verified issuer refused, with a signed `permissionDenied`.
+//! - Either way **nothing is recorded** for an unauthorised issuer — the replay
+//!   cache only ever holds documents from authorised issuers, so a stranger
+//!   minting DIDs cannot fill it and defer a real request.
 //! - A replay of a document already acted on gets no reply.
 //!
 //! Every reply to a verified document is signed by the witness.

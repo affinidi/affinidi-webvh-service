@@ -1,8 +1,60 @@
+//! `webvh-witness` binary: setup, the service itself, and local admin
+//! subcommands (ACL, witness identities, VTA and sealed-key operations).
+
 use clap::{Parser, Subcommand};
 use did_hosting_common::server::store::KS_WITNESSES;
 use std::path::PathBuf;
 use webvh_witness::config::AppConfig;
 use webvh_witness::{health, secret_store, server, setup, setup_recipe, store, witness_ops};
+
+// ─── Allocator ──────────────────────────────────────────────────────────────
+//
+// Set on the binary only. A library that installs a #[global_allocator] forces
+// it on every consumer, so this deliberately does not live in lib.rs.
+//
+// Why not the system allocator: the witness churns short-lived buffers (DID
+// logs being verified and signed, DIDComm and TSP messages). glibc malloc
+// keeps those arenas rather than returning them, so RSS ratchets to the
+// high-water mark and never falls back — indistinguishable from a leak on a
+// memory graph.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc tuning, read by jemalloc itself at startup via this well-known symbol.
+///
+/// `background_thread:true` runs the purger off the request path.
+/// `dirty_decay_ms` / `muzzy_decay_ms` are how long freed pages linger before
+/// being returned to the OS; jemalloc's defaults (10s / 10s) are tuned for
+/// throughput on allocation-heavy workloads, and hold RSS well above the live
+/// heap. 5s keeps the memory graph honest at a negligible cost here, because
+/// the service's hot path is I/O-bound, not allocation-bound.
+///
+/// Raise these (or drop the `jemalloc` feature) if you are optimising for
+/// allocation throughput over resident footprint.
+///
+/// The symbol must be `_rjem_malloc_conf`, not the `malloc_conf` jemalloc
+/// documents: tikv-jemalloc-sys (default features) builds jemalloc with
+/// `--with-jemalloc-prefix=_rjem_`, which prefixes every public symbol,
+/// including the one it reads its configuration from. An unprefixed
+/// `malloc_conf` would compile and link fine and be silently ignored.
+///
+/// SAFETY: exporting a symbol is unsafe because it could clash with another
+/// definition of the same name. `_rjem_malloc_conf` is the (prefixed) name
+/// jemalloc reads for exactly this, it is defined once (in the binary, never
+/// the library), and the value is the NUL-terminated static string jemalloc
+/// expects. This is the one `unsafe` outside tests (CONTRIBUTING rule 6),
+/// signed off in the PR that added it.
+///
+/// The type is `&[u8; 63]`, a reference to a fixed-size array: a thin pointer,
+/// which is what jemalloc's `const char *malloc_conf` is. A `&[u8]` slice
+/// reference is a two-word fat pointer (address + length), which matches
+/// `const char *` only by the accident of field order.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[allow(unsafe_code)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static MALLOC_CONF: &[u8; 63] =
+    b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
 
 #[derive(Parser)]
 #[command(name = "webvh-witness", about = "WebVH Witness Node", version)]
@@ -242,6 +294,7 @@ async fn main() {
 
     print_banner();
 
+    let config = cli.config;
     match cli.command {
         Some(Command::Setup {
             setup_key_out,
@@ -251,111 +304,65 @@ async fn main() {
             force_reprovision,
             non_interactive: _,
         }) => {
-            if let Some(path) = setup_key_out {
-                if let Err(e) = setup::run_setup_phase1(&path, &context).await {
-                    eprintln!("Setup error: {e}");
-                    std::process::exit(1);
-                }
-            } else if let Some(recipe_path) = from {
-                match setup_recipe::run_from_recipe(&recipe_path, setup_key_file, force_reprovision)
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(e) => {
-                        eprintln!("Setup error: {e}");
-                        std::process::exit(setup_recipe::map_exit_code(&e));
-                    }
-                }
-            } else if let Err(e) = setup::run_wizard(cli.config, setup_key_file).await {
-                eprintln!("Setup error: {e}");
-                std::process::exit(1);
-            }
+            run_setup_command(
+                config,
+                setup_key_out,
+                setup_key_file,
+                &context,
+                from,
+                force_reprovision,
+            )
+            .await
         }
         Some(Command::Uninstall { yes }) => {
-            let config_path = cli
-                .config
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("config.toml"));
-            if let Err(e) = setup_recipe::run_uninstall(&config_path, yes).await {
-                eprintln!("Uninstall error: {e}");
-                std::process::exit(1);
-            }
+            let config_path = config.unwrap_or_else(|| PathBuf::from("config.toml"));
+            or_exit(
+                "Uninstall error",
+                setup_recipe::run_uninstall(&config_path, yes).await,
+            );
         }
         Some(Command::Health { strict }) => {
             let code = did_hosting_common::server::health::finish(
-                health::run_health(cli.config).await,
+                health::run_health(config).await,
                 strict,
             );
             std::process::exit(code);
         }
         Some(Command::AddAcl { did, role }) => {
-            if let Err(e) = run_add_acl(cli.config, did, role).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+            or_exit("Error", run_add_acl(config, did, role).await);
         }
-        Some(Command::ListAcl) => {
-            if let Err(e) = run_list_acl(cli.config).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::RemoveAcl { did }) => {
-            if let Err(e) = run_remove_acl(cli.config, did).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
+        Some(Command::ListAcl) => or_exit("Error", run_list_acl(config).await),
+        Some(Command::RemoveAcl { did }) => or_exit("Error", run_remove_acl(config, did).await),
         Some(Command::CreateWitness { label }) => {
-            if let Err(e) = run_create_witness(cli.config, label).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+            or_exit("Error", run_create_witness(config, label).await);
         }
-        Some(Command::ListWitnesses) => {
-            if let Err(e) = run_list_witnesses(cli.config).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
+        Some(Command::ListWitnesses) => or_exit("Error", run_list_witnesses(config).await),
         Some(Command::DeleteWitness { id }) => {
-            if let Err(e) = run_delete_witness(cli.config, id).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+            or_exit("Error", run_delete_witness(config, id).await);
         }
         Some(Command::ResetWitnessKekClaim) => {
-            if let Err(e) = run_reset_witness_kek_claim(cli.config).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+            or_exit("Error", run_reset_witness_kek_claim(config).await);
         }
-        Some(Command::SetupOfflinePrepare { request, state }) => {
-            if let Err(e) = setup::run_setup_offline_prepare(cli.config, request, state).await {
-                eprintln!("Setup error: {e}");
-                std::process::exit(1);
-            }
-        }
+        Some(Command::SetupOfflinePrepare { request, state }) => or_exit(
+            "Setup error",
+            setup::run_setup_offline_prepare(config, request, state).await,
+        ),
         Some(Command::SetupOfflineComplete {
             bundle,
             expect_digest,
             state,
-        }) => {
-            if let Err(e) = setup::run_setup_offline_complete(bundle, expect_digest, state).await {
-                eprintln!("Setup error: {e}");
-                std::process::exit(1);
-            }
-        }
+        }) => or_exit(
+            "Setup error",
+            setup::run_setup_offline_complete(bundle, expect_digest, state).await,
+        ),
         Some(Command::ExportSealed {
             request,
             out,
             digest_out,
-        }) => {
-            if let Err(e) = run_export_sealed(cli.config, request, out, digest_out).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
+        }) => or_exit(
+            "Error",
+            run_export_sealed(config, request, out, digest_out).await,
+        ),
         Some(Command::ImportSealed {
             bundle,
             expect_digest,
@@ -363,9 +370,10 @@ async fn main() {
             producer_pubkey,
             jwt_key,
             force,
-        }) => {
-            if let Err(e) = run_import_sealed(
-                cli.config,
+        }) => or_exit(
+            "Error",
+            run_import_sealed(
+                config,
                 bundle,
                 expect_digest,
                 seed,
@@ -373,41 +381,18 @@ async fn main() {
                 jwt_key,
                 force,
             )
-            .await
-            {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
+            .await,
+        ),
         Some(Command::VtaRequest {
             out,
             seed,
             label,
             mediator_did,
             context,
-        }) => {
-            // The witness DID is DIDComm-only (`did-hosting-server` template,
-            // MEDIATOR_DID only — no hosting URL).
-            let shape = did_hosting_common::server::vta_setup::WebvhDidShape::DidcommOnly {
-                mediator_did: mediator_did.as_str(),
-            };
-            let ask = did_hosting_common::server::vta_setup::build_webvh_provision_ask(
-                &context,
-                &shape,
-                Some(&label),
-            );
-            if let Err(e) = did_hosting_common::server::vta_setup::run_offline_request_cli(
-                &out,
-                &seed,
-                "webvh-witness",
-                &ask,
-            )
-            .await
-            {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
+        }) => or_exit(
+            "Error",
+            run_vta_request(&out, &seed, &label, &mediator_did, &context).await,
+        ),
         Some(Command::VtaOpen {
             bundle,
             expect_digest,
@@ -415,8 +400,9 @@ async fn main() {
             did_doc_out,
             did_log_out,
             secrets_out,
-        }) => {
-            if let Err(e) = did_hosting_common::server::vta_setup::run_offline_open_cli(
+        }) => or_exit(
+            "Error",
+            did_hosting_common::server::vta_setup::run_offline_open_cli(
                 &bundle,
                 &expect_digest,
                 &seed,
@@ -426,13 +412,64 @@ async fn main() {
                 did_hosting_common::server::vta_setup::OfflineOpenNextStep::Setup {
                     binary: "webvh-witness",
                 },
-            ) {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        None => run_server(cli.config).await,
+            ),
+        ),
+        None => run_server(config).await,
     }
+}
+
+/// Print `{context}: {error}` and exit non-zero when `result` failed.
+fn or_exit<E: std::fmt::Display>(context: &str, result: Result<(), E>) {
+    if let Err(e) = result {
+        eprintln!("{context}: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// `setup`: headless phase 1 (`--setup-key-out`), a recipe (`--from`, whose
+/// failure picks the exit code), or the interactive wizard.
+async fn run_setup_command(
+    config: Option<PathBuf>,
+    setup_key_out: Option<PathBuf>,
+    setup_key_file: Option<PathBuf>,
+    context: &str,
+    from: Option<PathBuf>,
+    force_reprovision: bool,
+) {
+    if let Some(path) = setup_key_out {
+        or_exit("Setup error", setup::run_setup_phase1(&path, context).await);
+    } else if let Some(recipe_path) = from {
+        if let Err(e) =
+            setup_recipe::run_from_recipe(&recipe_path, setup_key_file, force_reprovision).await
+        {
+            eprintln!("Setup error: {e}");
+            std::process::exit(setup_recipe::map_exit_code(&e));
+        }
+    } else {
+        or_exit(
+            "Setup error",
+            setup::run_wizard(config, setup_key_file).await,
+        );
+    }
+}
+
+/// `vta-request`: the witness DID is DIDComm-only (`did-hosting-server`
+/// template, MEDIATOR_DID only — no hosting URL).
+async fn run_vta_request(
+    out: &std::path::Path,
+    seed: &std::path::Path,
+    label: &str,
+    mediator_did: &str,
+    context: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shape = did_hosting_common::server::vta_setup::WebvhDidShape::DidcommOnly { mediator_did };
+    let ask = did_hosting_common::server::vta_setup::build_webvh_provision_ask(
+        context,
+        &shape,
+        Some(label),
+    );
+    did_hosting_common::server::vta_setup::run_offline_request_cli(out, seed, "webvh-witness", &ask)
+        .await
 }
 
 async fn run_add_acl(

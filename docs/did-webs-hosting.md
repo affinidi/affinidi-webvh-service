@@ -265,6 +265,7 @@ So a host built with `method-webs` accepts a `did/register/0.1` from a
 domain = "did.example.com"
 path_prefixes = ["nodes"]   # optional; empty = any path on the domain
 max_registrations = 100     # optional; the default
+max_dids_per_identifier = 1 # optional; the default (its own slot only)
 ```
 
 Opting a domain in opens it to anyone with a key event log, and an AID costs
@@ -273,6 +274,17 @@ identifiers the domain holds at once (counted from the owner entries
 self-registration grants; deleting one frees its place). A domain at its limit
 refuses with `quotaExceeded`. Like the rate limits it is per process, so N
 replicas can exceed it by at most N−1.
+
+`max_dids_per_identifier` is how many DIDs each self-registered identifier may
+then hold on the domain, its own included. The default, 1, is its own slot
+only. A node that publishes the DIDs it creates on this host needs more: a VTA
+whose own DID registered itself here, and which then hosts a community's,
+a persona's or an integration's DID, is otherwise refused with
+`DID count limit reached (1)`. It applies to entries granted from then on. An
+entry already granted keeps its limit until an administrator changes it
+(`acl/grant` as `owner` with a larger `quota.maxDidCount`, or, with the service
+stopped, `remove-acl` then `add-acl --role owner`, which takes the deployment
+default and every domain).
 
 Off by default: with no entry, an unknown `did:webs` is refused exactly as any
 caller outside the ACL is (`permissionDenied`). A host built without
@@ -306,8 +318,8 @@ The registration then holds the domain's self-registration lock, refuses a
 domain at its `max_registrations`, and is the ordinary `register_did_atomic`,
 as that identifier: it verifies the log again, refuses a slot owned by anyone else
 (only an administrator takes one over), and commits. **After** the commit the
-identifier is given an `Owner` ACL entry, scoped to its domain and to one slot
-(`max_did_count = 1`), so its later publications — key rotations — take the
+identifier is given an `Owner` ACL entry, scoped to its domain and to the
+domain's `max_dids_per_identifier` slots (`max_did_count`, default 1), so its later publications — key rotations — take the
 ordinary owner path, authenticated by resolving the published identifier from
 this host. A crash between the two leaves an owned slot and no entry; a retry
 is again a self-registration of a slot the identifier already owns, and grants

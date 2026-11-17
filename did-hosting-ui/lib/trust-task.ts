@@ -42,10 +42,10 @@ const SERVER_INFO = T.serverInfo;
  * Matched by slug rather than pinned to a version. This was `=== ".../0.1"`,
  * and `trust-tasks-rs` has emitted `trust-task-error/0.3` since its 0.3 release
  * (it carries the §8.2 `inResponseTo` member, which `0.2`'s
- * `additionalProperties: false` payload schema cannot admit) — so the control
- * plane this UI talks to, on 0.4.1, has not sent a document this recognised in
- * some time. SPEC.md §5.2's forward-minor rule says a consumer SHOULD accept a
- * later minor; matching the slug means the next one cannot break it again.
+ * `additionalProperties: false` payload schema cannot admit) — so the version
+ * pin had long stopped matching anything the control plane sends. SPEC.md
+ * §5.2's forward-minor rule says a consumer SHOULD accept a later minor;
+ * matching the slug means the next one cannot break it again.
  * `1.x` is excluded on purpose: a major bump is where the payload shape may
  * change, and `TrustTaskErrorPayload` is read directly off it.
  */

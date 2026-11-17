@@ -16,11 +16,11 @@
 //! Adding a new keyspace = add a `KS_*` const here, document it, done.
 
 // ---------------------------------------------------------------------------
-// Existing keyspaces (pre-rollout)
+// Core keyspaces
 // ---------------------------------------------------------------------------
 
-/// `dids:<mnemonic>` — DID records (`DidRecord` after T12; legacy raw
-/// bytes pre-migration). Backs every DID resolution and management op.
+/// `dids:<mnemonic>` — DID records (`DidRecord`; legacy raw bytes until
+/// migrated). Backs every DID resolution and management op.
 pub const KS_DIDS: &str = "dids";
 
 /// `acl:<did>` — ACL entries (`AclEntry`). Gates which DIDs are allowed
@@ -41,10 +41,14 @@ pub const KS_SESSIONS: &str = "sessions";
 /// credential is never found where a step-up credential is looked for.
 pub const KS_PASSKEY_STEP_UP: &str = "passkey_step_up";
 
-/// `stats:<mnemonic>` — per-DID resolve/update counters and totals.
+/// `stats:<mnemonic>` — per-DID resolve/update counters, totals and coarse
+/// series; `statspin:<mnemonic>` — a DID's tier override. See
+/// [`stats_tiers`](crate::server::stats_tiers).
 pub const KS_STATS: &str = "stats";
 
-/// `ts:<mnemonic>:<epoch>` — time-series buckets for stats / dashboards.
+/// `t5:<mnemonic>:<slot>` — fine time-series ring slots, plus the
+/// server-wide coarse series (`c:_all`). See
+/// [`stats_tiers`](crate::server::stats_tiers).
 pub const KS_TIMESERIES: &str = "timeseries";
 
 /// `registry:<instance_id>` — control plane's registry of remote
@@ -62,27 +66,24 @@ pub const KS_WITNESSES: &str = "witnesses";
 pub const KS_META: &str = "meta";
 
 // ---------------------------------------------------------------------------
-// New keyspaces (added by the multi-domain rollout)
+// Multi-domain keyspaces
 // ---------------------------------------------------------------------------
 //
-// Wired up here for forward-reference. Their producers / consumers land
-// in later tasks (see `tasks/did-hosting-rollout-todo.md`):
-//
-// - KS_DOMAINS         → T14 / T15 (`DomainEntry` CRUD)
-// - KS_ASSIGNMENTS     → T29 (server-local cached assignments)
-// - KS_PENDING_PURGES  → T30 (unassignment grace-period purge sweep)
+// - KS_DOMAINS         → `domain::store` (`DomainEntry` CRUD)
+// - KS_ASSIGNMENTS     → `assignment` (server-local cached assignments)
+// - KS_PENDING_PURGES  → `pending_purge` (unassignment grace-period purges)
 
 /// `domains:<name>` — first-class `DomainEntry` records. Used by the
 /// multi-domain hosting feature.
 pub const KS_DOMAINS: &str = "domains";
 
-/// `assignments:<server_id>:<domain>` — local cache of which domains
+/// `assignments:<domain>` — local cache of which domains
 /// this server is currently authoritative for. Read on cold start
 /// before the control plane is reachable.
 pub const KS_ASSIGNMENTS: &str = "assignments";
 
-/// `pending_purges:<server>:<domain>:<scheduled_at>` — pending grace-
-/// period purges queued after a `domain/unassign/1.0` Trust Task.
+/// `pending_purges:<domain>` — one pending grace-period purge per domain,
+/// queued after a `replica/domain/unassign/0.1` Trust Task.
 pub const KS_PENDING_PURGES: &str = "pending_purges";
 
 /// `identity:current` → the current generation id; `identity:gen:<id>` →

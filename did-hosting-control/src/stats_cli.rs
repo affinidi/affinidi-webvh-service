@@ -16,7 +16,7 @@ use did_hosting_common::server::stats_tiers::{
 use did_hosting_common::server::store::{KS_DIDS, KS_STATS, KS_TIMESERIES};
 
 use crate::config::StatsFlushConfig;
-use crate::store::Store;
+use did_hosting_common::server::store::Store;
 
 type CliResult = Result<(), Box<dyn std::error::Error>>;
 

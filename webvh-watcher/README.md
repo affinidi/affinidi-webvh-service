@@ -98,8 +98,9 @@ Clients ──(GET /{mnemonic}/did.jsonl)──► webvh-watcher
    answers with a signed `#response`, which settles the outbox entry.
 4. Clients resolve DIDs from any watcher.
 
-A document that does not verify gets no reply. A verified one from a DID that
-is not a source is refused `notAuthorized` (signed), and is not recorded.
+A document that does not verify gets no reply. Neither does one whose issuer
+is not a source: it is dropped before its proof is checked, and is not
+recorded.
 
 ### Which source holds a slot
 

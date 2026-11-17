@@ -8,7 +8,7 @@
 //! ## The drift this exists to stop, which already happened
 //!
 //! The HTTPS route used to re-implement the routing: an `acl`-dispatcher
-//! membership check, then a fallthrough to the legacy `dispatch_did_op` bridge.
+//! membership check, then a fallthrough to the legacy `dispatch_did_op` bridge. // retired-name-ok
 //! Its comment claimed "parity with the TSP + DIDComm transports", and it had
 //! parity with one branch of five — the real router checks the typed
 //! `did-hosting/*/1.0` family, the auth family and the infra family *before*
@@ -63,8 +63,8 @@ fn no_transport_asks_which_family_a_document_belongs_to() {
         for (n, line) in production.lines().enumerate() {
             let decides = line.contains("registered_uris()")
                 || line.contains("trust_tasks_auth::owns")
-                || line.contains("trust_tasks_infra::owns")
-                || line.contains("bridge_did_management(");
+                || line.contains("infra::owns")
+                || line.contains("bridge_did_management("); // retired-name-ok
             if decides {
                 offenders.push(format!("{rel}:{}  ({transport})  {}", n + 1, line.trim()));
             }

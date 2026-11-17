@@ -1,10 +1,10 @@
 //! First-class domain objects.
 //!
-//! Per `docs/multi-domain-spec.md` §3. Domains are runtime-managed
+//! Per `docs/archive/multi-domain-spec.md` §3. Domains are runtime-managed
 //! entities (not config-file static): an admin adds / disables /
-//! re-points a domain via the management API or DIDComm and the
-//! daemon picks the change up live. This module is the type surface;
-//! CRUD + normalisation lives in T15.
+//! re-points a domain with the `domain/*` Trust Tasks and the daemon
+//! picks the change up live. `types` is the type surface; CRUD lives in
+//! [`store`] and normalisation in [`normalize`].
 //!
 //! ## Storage layout
 //!

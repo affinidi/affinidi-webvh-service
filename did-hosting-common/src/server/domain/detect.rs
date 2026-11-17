@@ -1,6 +1,6 @@
 //! Request-host extractor with trusted-CIDR gating.
 //!
-//! Per `docs/multi-domain-spec.md` §3 row "Reverse proxy trust":
+//! Per `docs/archive/multi-domain-spec.md` §3 row "Reverse proxy trust":
 //!
 //! - **Inside** the trusted-CIDR set: honour `Forwarded` (RFC 7239)
 //!   `host=` parameter first, then `X-Forwarded-Host` (first value
@@ -12,7 +12,7 @@
 //! This is the read-side of the multi-domain feature: every inbound
 //! request gets its "intended domain" extracted here, normalised via
 //! [`super::normalize::normalize_domain_name`], and then matched
-//! against the active-domain set (T20 / T21 enforcement).
+//! against the active-domain set (the [`super::safety`] checks).
 //!
 //! ## What this module ships
 //!
@@ -29,9 +29,8 @@
 //!   `host=` parameter; full RFC parsing is out of scope (we don't
 //!   consume `for=` / `by=` / `proto=`).
 //!
-//! The Axum middleware wiring lives in `did-hosting-{server,control}`
-//! and lands with T20 — that's the first task that actually consumes
-//! the resolved domain.
+//! The caller is the edge's public resolution path
+//! (`did-hosting-server`'s `routes::resolve_shared`).
 
 use std::net::IpAddr;
 

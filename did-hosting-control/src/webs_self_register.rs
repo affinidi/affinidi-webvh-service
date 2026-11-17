@@ -81,8 +81,8 @@ use did_hosting_common::server::domain::DomainScope;
 use did_hosting_common::tasks::did_management::did::register;
 
 use crate::auth::AuthClaims;
-use crate::error::AppError;
 use crate::server::AppState;
+use did_hosting_common::server::error::AppError;
 
 /// The one Type URI this path serves.
 pub(crate) const SELF_REGISTER_TYPE_URI: &str = register::v0_1::Payload::TYPE_URI;
@@ -110,6 +110,9 @@ pub(crate) struct SelfCertifiedWebs {
     source: String,
     /// The domain's `max_registrations`.
     max_registrations: u32,
+    /// The domain's `max_dids_per_identifier`: the granted entry's
+    /// `max_did_count`.
+    max_dids: u64,
 }
 
 impl SelfCertifiedWebs {
@@ -204,7 +207,8 @@ impl SelfCertifiedWebs {
     }
 
     /// Give the newly registered identifier an `Owner` ACL entry, scoped to
-    /// its domain and to the one slot it holds (`max_did_count = 1`), so that
+    /// its domain and to the domain's `max_dids_per_identifier` slots (default
+    /// 1, the one it holds: `max_did_count`), so that
     /// its later publications take the ordinary owner path. Left alone when
     /// it has an entry already (an administrator's, or one an earlier attempt
     /// granted). Audited either way.
@@ -236,7 +240,7 @@ impl SelfCertifiedWebs {
                     label: Some(SELF_REGISTERED_LABEL.into()),
                     created_at: did_hosting_common::server::auth::session::now_epoch(),
                     max_total_size: None,
-                    max_did_count: Some(1),
+                    max_did_count: Some(self.max_dids),
                     domains: DomainScope::Allowed {
                         domains: vec![record.domain.clone()],
                     },
@@ -272,6 +276,7 @@ pub(crate) struct Candidate {
     path: String,
     source: String,
     max_registrations: u32,
+    max_dids: u64,
     document: affinidi_did_common::Document,
 }
 
@@ -322,6 +327,7 @@ impl Candidate {
             path: self.path,
             source: self.source,
             max_registrations: self.max_registrations,
+            max_dids: self.max_dids,
         })
     }
 }
@@ -491,6 +497,7 @@ pub(crate) async fn admit(
         path,
         source,
         max_registrations: policy.max_registrations,
+        max_dids: policy.max_dids_per_identifier.get(),
         document,
     }))
 }
@@ -503,6 +510,7 @@ mod tests {
 
     use std::sync::Arc;
 
+    use affinidi_did_webs::{CreateConfig, KeyRoles, VerificationKey, create};
     use affinidi_keri::config::InceptionConfig;
     use affinidi_keri::hab::Hab;
     use affinidi_tdk::secrets_resolver::secrets::Secret;
@@ -522,30 +530,115 @@ mod tests {
     /// The hosting domain every test registers under.
     const DOMAIN: &str = "control.test";
 
-    /// A `did:webs` controller: its inception event and current signing key.
+    /// What a role key's seed is varied by, so each differs from the others.
+    const ATTESTATION: u8 = 0xA5;
+    const OPERATIONAL: u8 = 0x5A;
+
+    /// A `did:webs` controller: the salt its identifier is incepted from,
+    /// and the key it signs requests with.
+    ///
+    /// The AID is the digest of the inception event alone, so it is the same
+    /// at every path; the designations are not. Since `affinidi-did-webs`
+    /// 0.13 an identifier is valid only where its own designated aliases name
+    /// it, so the key event stream is built for the slot it is registered at
+    /// ([`Webs::kel_at`]), as a real controller builds it for where it will
+    /// be published.
     struct Webs {
         aid: String,
-        kel: String,
-        /// The key's CESR encoding: its verification method's fragment.
+        salt: u8,
+        /// Separate attestation and operational keys, as a VTA's key-role
+        /// identity has (VTI-KEY-173); `None` signs with the key state's key.
+        key_roles: bool,
+        /// The signing key's CESR encoding: its verification method's
+        /// fragment.
         key_qb64: String,
         seed: Vec<u8>,
+        /// Each slot's stream, built once: designations are salted afresh on
+        /// every build, so a second build is a different log, and a real
+        /// controller resends the one it stored.
+        kels: std::sync::Mutex<std::collections::HashMap<String, String>>,
     }
 
     impl Webs {
-        /// Incept an identifier, deterministically from `salt`.
-        fn incept(salt: u8) -> Self {
-            let config = InceptionConfig {
+        fn inception(salt: u8) -> InceptionConfig {
+            InceptionConfig {
                 salt: Some(vec![salt; 16]),
                 ..InceptionConfig::default()
-            };
-            let (hab, inception) = Hab::incept_event("did:webs", &config).expect("incept");
+            }
+        }
+
+        /// The seed of a role key, distinct from the key state's.
+        fn role_seed(salt: u8, role: u8) -> [u8; 32] {
+            [salt ^ role; 32]
+        }
+
+        fn role_key(salt: u8, role: u8) -> VerificationKey {
+            let seed = Self::role_seed(salt, role);
+            let secret = Secret::generate_ed25519(None, Some(&seed));
+            VerificationKey::Ed25519(secret.get_public_bytes().try_into().expect("Ed25519 key"))
+        }
+
+        /// Incept an identifier, deterministically from `salt`, signing with
+        /// its key state's key.
+        fn incept(salt: u8) -> Self {
+            let (hab, _) = Hab::incept_event("did:webs", &Self::inception(salt)).expect("incept");
             let signer = &hab.signers()[0];
             Webs {
                 aid: hab.prefix().to_string(),
-                kel: String::from_utf8(inception.composed).expect("CESR is text"),
+                salt,
+                key_roles: false,
                 key_qb64: signer.verfer().qb64().expect("key qb64"),
                 seed: signer.raw().to_vec(),
+                kels: Default::default(),
             }
+        }
+
+        /// Incept a key-role identifier, as a VTA's own did:webs is: it signs
+        /// with its designated `operational` key, which the document lists
+        /// under `authentication` in place of the key state's.
+        #[cfg(feature = "method-webs")]
+        fn incept_with_key_roles(salt: u8) -> Self {
+            let (hab, _) = Hab::incept_event("did:webs", &Self::inception(salt)).expect("incept");
+            let operational = Self::role_key(salt, OPERATIONAL);
+            Webs {
+                aid: hab.prefix().to_string(),
+                salt,
+                key_roles: true,
+                key_qb64: operational.to_cesr().expect("key qb64"),
+                seed: Self::role_seed(salt, OPERATIONAL).to_vec(),
+                kels: Default::default(),
+            }
+        }
+
+        /// The key event stream this identifier publishes at `path`.
+        fn kel_at(&self, path: &str) -> String {
+            let mut kels = self.kels.lock().unwrap();
+            kels.entry(path.to_string())
+                .or_insert_with(|| self.build_kel(path))
+                .clone()
+        }
+
+        fn build_kel(&self, path: &str) -> String {
+            let host = if path.is_empty() {
+                DOMAIN.to_string()
+            } else {
+                format!("{DOMAIN}:{}", path.replace('/', ":"))
+            };
+            let mut config = CreateConfig::builder(host).inception(Self::inception(self.salt));
+            if self.key_roles {
+                config = config.key_roles(
+                    KeyRoles::new()
+                        .with_attestation(Self::role_key(self.salt, ATTESTATION))
+                        .with_operational(Self::role_key(self.salt, OPERATIONAL)),
+                );
+            }
+            let created = create(config.build()).expect("create");
+            assert_eq!(
+                created.did(),
+                self.did_at(path),
+                "the slot builds the created DID"
+            );
+            String::from_utf8(created.artifacts().keri_cesr.clone()).expect("CESR is text")
         }
 
         /// The identifier at `path` (`/`-separated, without the AID).
@@ -584,7 +677,7 @@ mod tests {
             json!({
                 "path": self.slot(path),
                 "method": "webs",
-                "didData": self.kel,
+                "didData": self.kel_at(path),
                 "force": false,
                 "domain": DOMAIN,
             })
@@ -658,6 +751,88 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// The granted entry's DID limit is the domain's `max_dids_per_identifier`,
+    /// so a node that publishes the DIDs it creates (a VTA hosting a
+    /// community's DID) is not stopped at its own slot.
+    #[cfg(feature = "method-webs")]
+    #[tokio::test]
+    async fn the_granted_entry_holds_the_domains_max_dids_per_identifier() {
+        let (mut state, _dir) = enabled(&[]).await;
+        let mut config = (*state.config).clone();
+        config.hosting.webs_self_register[0].max_dids_per_identifier =
+            std::num::NonZeroU64::new(25).unwrap();
+        state.config = Arc::new(config);
+
+        let webs = Webs::incept(41);
+        let caller = webs.caller("");
+        let reply = register_as(&state, Via::Https, &caller, webs.payload("")).await;
+        ok(&reply, REGISTER);
+        let entry = get_acl_entry(&state.acl_ks, &caller.did)
+            .await
+            .unwrap()
+            .expect("granted an ACL entry");
+        assert_eq!(entry.max_did_count, Some(25));
+        assert_eq!(
+            entry.domains,
+            DomainScope::Allowed {
+                domains: vec![DOMAIN.into()]
+            }
+        );
+    }
+
+    /// A self-registration skips the ACL pre-filter but not the replay gate:
+    /// its record goes to the cache for other unlisted signers, never the
+    /// shared one or the sign-in one.
+    #[cfg(feature = "method-webs")]
+    #[tokio::test]
+    async fn a_self_registration_is_recorded_apart_from_members() {
+        let (state, _dir) = enabled(&[]).await;
+        let webs = Webs::incept(40);
+        let caller = webs.caller("");
+        let doc = signed(
+            request(REGISTER, &caller.did, webs.payload("")),
+            &caller.key,
+        )
+        .await;
+        ok(&send(&state, Via::Tsp, &caller, doc).await, REGISTER);
+        assert!(state.replay_cache.is_empty());
+        assert!(state.unlisted_signers.sign_in.is_empty());
+        assert_eq!(state.unlisted_signers.other.len(), 1);
+    }
+
+    /// A VTA's own did:webs is a key-role identity (VTI-KEY-173): it signs
+    /// with its designated `operational` key, not the key state's. That key
+    /// is a verification method only of the document the designations
+    /// derive, so the proof must be checked against that document — the
+    /// regression `affinidi-did-webs` 0.7, which read no designation,
+    /// refused as `proofInvalid`.
+    #[cfg(feature = "method-webs")]
+    #[tokio::test]
+    async fn a_key_role_identity_registers_itself_signing_as_its_operational_key() {
+        let (state, _dir) = enabled(&["nodes"]).await;
+        let webs = Webs::incept_with_key_roles(30);
+        let caller = webs.caller("nodes");
+        let reply = register_as(&state, Via::Https, &caller, webs.payload("nodes")).await;
+        conforms(&reply);
+        assert_eq!(
+            ok(&reply, REGISTER)["record"]["owner"],
+            caller.did,
+            "{reply}"
+        );
+
+        // The key state's own key is not the operational key, and does not
+        // stand in for it: the document lists role keys instead.
+        let state_key = Webs::incept(30);
+        let impostor = Caller {
+            key: state_key.key_for(&caller.did),
+            did: caller.did.clone(),
+            role: Role::Owner,
+        };
+        let (state, _dir) = enabled(&["nodes"]).await;
+        let reply = register_as(&state, Via::Https, &impostor, webs.payload("nodes")).await;
+        assert_eq!(code(&reply), "proofInvalid", "{reply}");
     }
 
     #[cfg(feature = "method-webs")]
@@ -854,8 +1029,9 @@ mod tests {
         let webs = Webs::incept(10);
         let caller = webs.caller("");
         let mut payload = webs.payload("");
-        // Flip the last character of the inception event's signature.
-        let kel = webs.kel.trim_end();
+        // Flip the last character of the stream's last signature.
+        let kel = webs.kel_at("");
+        let kel = kel.trim_end();
         let last = kel.chars().last().unwrap();
         let flipped = if last == 'A' { 'B' } else { 'A' };
         payload["didData"] = json!(format!("{}{flipped}", &kel[..kel.len() - 1]));
@@ -919,6 +1095,167 @@ mod tests {
             "not present in the maintainer's ACL",
         );
         assert!(stored(&state, &webs.aid).await.is_none());
+    }
+
+    /// Once self-registration has made a `did:webs` an Owner, its later
+    /// requests take the ordinary sender-bound path, which resolves the
+    /// issuer: the proof is checked against the document the DID cache
+    /// resolves, not against a submitted log. This is a VTA with a did:webs
+    /// identity managing what it registered, end to end — a key-role
+    /// identifier (it signs with its designated `operational` key) that
+    /// designates a service, published over HTTP as this host publishes one
+    /// (`did.json` rendered from the derived document, so the service's
+    /// `type` is an array), resolved by the production verifier
+    /// ([`TransportBoundVerifier::with_did_cache_and_host_policy`]).
+    ///
+    /// Every such request was refused as an unreachable signer
+    /// (`unavailable`) while the DID cache could not resolve a did:webs: when
+    /// it was built without `did-webs`, and, with `affinidi-did-webs` before
+    /// 0.13.9, because resolution failed with `DocumentMismatch` (the
+    /// designated `"X"` against the published `["X"]`). Under
+    /// `trust-tasks-proof` 0.38+ it is also what holds the verifier's decode
+    /// step to the DID cache's host policy: without that, a resolved signer on
+    /// a non-public host is refused as `proofInvalid`.
+    #[cfg(feature = "method-webs")]
+    #[tokio::test]
+    async fn an_acl_member_did_webs_is_verified_by_resolving_it() {
+        use affinidi_did_resolver_cache_sdk::{
+            DIDCacheClient, config::DIDCacheConfigBuilder,
+            network_resolvers::HostPolicy as CacheHostPolicy,
+        };
+        use affinidi_did_webs::DesignatedService;
+        use did_hosting_common::method::webs::Webs as WebsMethod;
+        use did_hosting_common::server::trust_tasks::{HostPolicy, TransportBoundVerifier};
+
+        const INFO: &str = "https://trusttasks.org/spec/did-management/did/info/0.1";
+        let salt = 60;
+
+        // The identifier's host: a loopback listener, port-encoded as a
+        // did:webs host is (`127.0.0.1%3A{port}`).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let domain = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let created = create(
+            CreateConfig::builder(domain.replace(':', "%3A"))
+                .inception(Webs::inception(salt))
+                .key_roles(
+                    KeyRoles::new()
+                        .with_attestation(Webs::role_key(salt, ATTESTATION))
+                        .with_operational(Webs::role_key(salt, OPERATIONAL)),
+                )
+                .designated_service(DesignatedService::new(
+                    "#didcomm",
+                    "DIDCommMessaging",
+                    json!({ "uri": "https://mediator.example/", "accept": ["didcomm/v2"] }),
+                ))
+                .build(),
+        )
+        .expect("create");
+        let did = created.did().to_string();
+        let aid = did.rsplit(':').next().unwrap().to_string();
+        assert_eq!(did, WebsMethod::slot_did(&domain, &aid));
+        let keri_cesr = created.artifacts().keri_cesr.clone();
+
+        // What this host would serve for the slot: the derived document.
+        let did_json = WebsMethod::derive_document(&did, &keri_cesr).expect("derives");
+        let rendered: Value = serde_json::from_slice(&did_json).unwrap();
+        assert!(
+            rendered["service"][0]["type"].is_array(),
+            "the host renders a service's type as an array: {rendered}"
+        );
+        let app = axum::Router::new()
+            .route(
+                &format!("/{aid}/keri.cesr"),
+                axum::routing::get(move || async move { keri_cesr }),
+            )
+            .route(
+                &format!("/{aid}/did.json"),
+                axum::routing::get(move || async move { did_json }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // Its own did:webs, signed as its operational key.
+        let operational = Webs::role_key(salt, OPERATIONAL)
+            .to_cesr()
+            .expect("key qb64");
+        let mut key = Secret::generate_ed25519(None, Some(&Webs::role_seed(salt, OPERATIONAL)));
+        key.id = format!("{did}#{operational}");
+        let caller = Caller {
+            did: did.clone(),
+            key,
+            role: Role::Owner,
+        };
+
+        // An Owner of one slot, as self-registration leaves it. Granted
+        // directly: self-registration needs a hosting domain, and a loopback
+        // `IP:port` is not one (`normalize_domain_name`), so it cannot run
+        // against this host. Its proof is the other path anyway — checked
+        // against the submitted log, never a resolved document (the tests
+        // above) — and what is under test is everything after it.
+        let (mut state, _dir) = state().await;
+        did_hosting_common::server::acl::store_acl_entry(
+            &state.acl_ks,
+            &did_hosting_common::server::acl::AclEntry {
+                did: did.clone(),
+                role: Role::Owner,
+                label: None,
+                created_at: 1_700_000_000,
+                max_total_size: None,
+                max_did_count: Some(1),
+                domains: DomainScope::All,
+            },
+        )
+        .await
+        .unwrap();
+        // A slot it owns; its name is not what is under test.
+        seed_did(&state, &did, "vta-node").await;
+
+        // From here on the production verifier: the DID cache, allowed to
+        // reach the loopback host.
+        let resolver = DIDCacheClient::new(
+            DIDCacheConfigBuilder::default()
+                .with_host_policy(CacheHostPolicy::AllowPrivate)
+                .build(),
+        )
+        .await
+        .expect("DID cache");
+        state.trust_tasks_verifier = Some(Arc::new(
+            TransportBoundVerifier::with_did_cache_and_host_policy(
+                resolver,
+                HostPolicy::AllowPrivate,
+            ),
+        ));
+
+        for via in VIAS {
+            let reply = call(
+                &state,
+                via,
+                &caller,
+                INFO,
+                json!({ "mnemonic": "vta-node" }),
+            )
+            .await;
+            conforms(&reply);
+            let info = ok(&reply, INFO);
+            assert_eq!(info["record"]["owner"], did.as_str(), "{via:?}: {reply}");
+        }
+
+        // And the resolution is what admits it: a key the resolved document
+        // does not list is refused, though it is the key state's own.
+        let state_key = Webs::incept(salt);
+        let impostor = Caller {
+            key: state_key.key_for(&did),
+            did: did.clone(),
+            role: Role::Owner,
+        };
+        let reply = call(
+            &state,
+            Via::Https,
+            &impostor,
+            INFO,
+            json!({ "mnemonic": "vta-node" }),
+        )
+        .await;
+        assert_eq!(code(&reply), "proofInvalid", "{reply}");
     }
 
     /// A self-registration's standing is that one task: the same identifier,

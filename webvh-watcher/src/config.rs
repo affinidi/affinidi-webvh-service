@@ -1,3 +1,6 @@
+//! The watcher's `config.toml` ([`AppConfig`]), including its sync sources
+//! ([`SyncConfig`]), loaded from file with environment overrides.
+
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -59,7 +62,7 @@ pub struct AppConfig {
 pub struct SyncConfig {
     /// The DIDs of the control planes this watcher mirrors. A
     /// `webvh/sync/*` document is applied only when its proof binds it to one
-    /// of them; one from any other signer is refused `notAuthorized`. Empty
+    /// of them; one from any other signer is dropped unanswered. Empty
     /// means the watcher applies nothing.
     #[serde(default)]
     pub source_dids: Vec<String>,

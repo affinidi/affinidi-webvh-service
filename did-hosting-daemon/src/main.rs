@@ -1,3 +1,9 @@
+//! `did-hosting-daemon`: the server, control plane, witness and watcher in
+//! one process, sharing one store (the witness keeps its own), one storage
+//! task and one HTTP listener.
+//! See the "did-hosting-daemon" section of the repository's `CLAUDE.md` for
+//! what it mirrors from the standalone services and what it omits.
+
 mod backup;
 mod config;
 mod setup;
@@ -32,6 +38,55 @@ use did_hosting_server::server::FirstBoot;
 
 use config::DaemonConfig;
 use did_hosting_common::server::store::{KS_DIDS, KS_SESSIONS, KS_STATS, KS_TIMESERIES};
+
+// ─── Allocator ──────────────────────────────────────────────────────────────
+//
+// Set on the binary only. A library that installs a #[global_allocator] forces
+// it on every consumer, so this deliberately does not live in lib.rs.
+//
+// Why not the system allocator: the daemon churns short-lived buffers (Trust
+// Task envelopes, DID logs being verified and served, UI and API responses,
+// store batches). glibc malloc keeps those arenas rather than returning them,
+// so RSS ratchets to the high-water mark and never falls back —
+// indistinguishable from a leak on a memory graph.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc tuning, read by jemalloc itself at startup via this well-known symbol.
+///
+/// `background_thread:true` runs the purger off the request path.
+/// `dirty_decay_ms` / `muzzy_decay_ms` are how long freed pages linger before
+/// being returned to the OS; jemalloc's defaults (10s / 10s) are tuned for
+/// throughput on allocation-heavy workloads, and hold RSS well above the live
+/// heap. 5s keeps the memory graph honest at a negligible cost here, because
+/// the service's hot path is I/O-bound, not allocation-bound.
+///
+/// Raise these (or drop the `jemalloc` feature) if you are optimising for
+/// allocation throughput over resident footprint.
+///
+/// The symbol must be `_rjem_malloc_conf`, not the `malloc_conf` jemalloc
+/// documents: tikv-jemalloc-sys (default features) builds jemalloc with
+/// `--with-jemalloc-prefix=_rjem_`, which prefixes every public symbol,
+/// including the one it reads its configuration from. An unprefixed
+/// `malloc_conf` would compile and link fine and be silently ignored.
+///
+/// SAFETY: exporting a symbol is unsafe because it could clash with another
+/// definition of the same name. `_rjem_malloc_conf` is the (prefixed) name
+/// jemalloc reads for exactly this, it is defined once (in the binary, never
+/// the library), and the value is the NUL-terminated static string jemalloc
+/// expects. This is the one `unsafe` outside tests (CONTRIBUTING rule 6),
+/// signed off in the PR that added it.
+///
+/// The type is `&[u8; 63]`, a reference to a fixed-size array: a thin pointer,
+/// which is what jemalloc's `const char *malloc_conf` is. A `&[u8]` slice
+/// reference is a two-word fat pointer (address + length), which matches
+/// `const char *` only by the accident of field order.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[allow(unsafe_code)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static MALLOC_CONF: &[u8; 63] =
+    b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
 
 #[derive(Parser)]
 #[command(
@@ -859,9 +914,10 @@ type ServiceResult = Result<Router, AppError>;
 
 /// Build the server — returns both the router and the AppState.
 ///
-/// In daemon mode the server only exposes public DID-serving routes
-/// (`.well-known`). All `/api/…` management routes come from the
-/// control plane, which is merged at root.
+/// In daemon mode the server only exposes public DID resolution. There are
+/// no management routes: every management operation is a Trust Task served
+/// by the control plane's listener (`POST /api/trust-tasks`, DIDComm,
+/// TSP), merged at root with `/api/health` and the UI.
 async fn build_server(
     config: &DaemonConfig,
     store: &Store,
@@ -1049,9 +1105,10 @@ async fn build_control(
     // sign-in readiness check — the standalone control plane's boot steps.
     did_hosting_control::server::startup(&state).await?;
 
-    // In daemon mode, no outbound ATM is needed — there are no external
-    // servers to sync with.  The server_push::notify_servers_* functions
-    // gracefully no-op when state.atm is None.
+    // In daemon mode there are no external edges to sync with: the registry
+    // is empty by default, so `server_push::notify_servers_*` finds no
+    // targets. It is not skipped, so a registered remote instance still
+    // gets pushes.
 
     // Build router without UI fallback — daemon adds its own combined fallback
     let router = did_hosting_control::routes::router_without_fallback().with_state(state.clone());

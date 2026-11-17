@@ -17,7 +17,13 @@ build = "build.rs"
 workspace = true
 
 [features]
-default = ["keyring", "store-fjall", "method-webvh", "method-web"]
+default = ["keyring", "store-fjall", "method-webvh", "method-web", "jemalloc"]
+# Use jemalloc as the `did-hosting-server` binary's global allocator (see the
+# dependency comment). On by default: with the system allocator the process
+# holds its RSS high-water mark for its lifetime. Disable
+# (`--no-default-features`) if you need to profile against the system allocator
+# or are building for a target jemalloc doesn't support.
+jemalloc = ["dep:tikv-jemallocator"]
 metrics = ["did-hosting-common/metrics"]
 keyring = ["did-hosting-common/keyring"]
 # DID method routing (T25). Each method's resolve-side routes are
@@ -67,7 +73,7 @@ path = "src/main.rs"
 did-hosting-common = { version = "0.12", path = "../did-hosting-common", features = ["server-core", "setup-wizard"] }
 # OpenAPI spec generation (behind the off-by-default `openapi` feature).
 utoipa = { version = "6", optional = true }
-vti-common = { version = "0.51", default-features = false }
+vti-common = { version = "0.66", default-features = false }
 async-trait = { workspace = true }
 affinidi-tdk = { workspace = true }
 # Trust Tasks: the server consumes infrastructure trust tasks (health ping,
@@ -84,7 +90,7 @@ affinidi-tdk-common = { workspace = true }
 affinidi-messaging-didcomm = { workspace = true }
 affinidi-secrets-resolver = { workspace = true }
 tokio-util = { workspace = true }
-affinidi-did-resolver-cache-sdk = "0.8.43"
+affinidi-did-resolver-cache-sdk = { workspace = true }
 axum = { workspace = true }
 axum-extra = { workspace = true }
 base64 = { workspace = true }
@@ -131,6 +137,24 @@ azure_data_cosmos = { version = "1", features = [
 azure_core = { version = "1.0", optional = true }
 azure_security_keyvault_secrets = { version = "1.0", optional = true }
 azure_identity = { version = "1.0", optional = true }
+
+# ── Allocator ────────────────────────────────────────────────────────────
+# jemalloc, used by the `did-hosting-server` binary only (set as the global
+# allocator in main.rs — a library must never impose an allocator on its
+# consumers).
+#
+# The default system allocator (glibc malloc on Linux) does not return the
+# memory of freed allocations to the OS promptly. The edge's request path is a
+# sawtooth of short-lived allocations (packed/unpacked DIDComm and TSP
+# messages, DID logs read from the store, resolution responses), and glibc
+# retains those arenas, so RSS ratchets up to its high-water mark and stays
+# there. That reads as a leak in monitoring even though the live heap is flat.
+# jemalloc's decay-based purging returns the pages, so RSS tracks live memory.
+#
+# Not available on MSVC; the cfg gate below falls back to the system allocator
+# there.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
