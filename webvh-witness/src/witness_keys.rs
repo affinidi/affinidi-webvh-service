@@ -803,10 +803,22 @@ mod tests {
         let (winner_store, loser_store) = (kek_store(&secrets_dir), kek_store(&secrets_dir));
         // The winner's claim, taken before the loser looks.
         assert_eq!(ks.incr_raw(KEK_CLAIM_KEY).await.unwrap(), 1);
+        let winner_claim = ks.get_raw(KEK_CLAIM_KEY).await.unwrap();
         let loser = tokio::spawn({
             let ks = ks.clone();
             async move { load_or_create(&loser_store, &ks).await }
         });
+        // Wait until the loser has taken its claim, so it is already waiting
+        // when the winner's key lands. Without this the key can land first,
+        // the loser adopts it without claiming, and the count is 2 (#464).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while ks.get_raw(KEK_CLAIM_KEY).await.unwrap() == winner_claim {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the loser never claimed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         // The winner finishes creating its key while the loser waits.
         let keys = WitnessKeys::generate().unwrap();
         winner_store.try_set(&keys.kek).await.ok().unwrap();

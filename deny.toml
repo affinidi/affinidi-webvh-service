@@ -30,6 +30,11 @@ ignore = [
   { id = "RUSTSEC-2024-0384", reason = "`instant` unmaintained — transitive only (no direct dependency); upstreams haven't migrated to web-time." },
   { id = "RUSTSEC-2025-0012", reason = "`backoff` unmaintained — transitive only (no direct dependency)." },
   { id = "RUSTSEC-2026-0441", reason = "`pin-utils` unmaintained — transitive only, via aws-smithy-{http,runtime,types}; no safe upgrade exists. Revisit when the AWS SDK moves to `pin-project-lite` / `std::pin::pin!`." },
+  # Status-only "unmaintained" advisories (2026-11-17), no fixed release and no
+  # reported vulnerability. chrono is used directly here and through the
+  # affinidi-tdk stack, so it cannot leave the graph from this repo alone.
+  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (chronotope/chrono#1768): status only, no vulnerability, no fixed release. Used directly and through the affinidi-tdk stack. Remove when this workspace and affinidi-tdk-rs have migrated to `jiff` or `time`." },
+  { id = "RUSTSEC-2026-0542", reason = "humantime marked unmaintained because chrono is: status only, no vulnerability; humantime 2.4.0 has no dependencies, so chrono's status does not reach it. Remove with RUSTSEC-2026-0543, or when nothing here depends on humantime." },
 ]
 # Removed with the vta-sdk 0.21 / vti-common 0.11.33 bump, which dropped the
 # whole `ssi-*` / `json-ld` subtree and the old `proc-macro-error` generation:

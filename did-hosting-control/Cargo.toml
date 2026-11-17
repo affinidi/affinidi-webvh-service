@@ -30,7 +30,13 @@ include = [
 workspace = true
 
 [features]
-default = ["keyring", "store-fjall", "ui"]
+default = ["keyring", "store-fjall", "ui", "jemalloc"]
+# Use jemalloc as the `did-hosting-control` binary's global allocator (see the
+# dependency comment). On by default: with the system allocator the process
+# holds its RSS high-water mark for its lifetime. Disable
+# (`--no-default-features`) if you need to profile against the system allocator
+# or are building for a target jemalloc doesn't support.
+jemalloc = ["dep:tikv-jemallocator"]
 metrics = ["did-hosting-common/metrics"]
 # DID methods the control plane can accept publications for. The control
 # plane is the write side, so a method must be enabled here for
@@ -192,6 +198,24 @@ azure_identity = { version = "1.0", optional = true }
 # can open a temporary fjall store. Optional + non-default: a production build
 # never pulls it in.
 tempfile = { workspace = true, optional = true }
+
+# ── Allocator ────────────────────────────────────────────────────────────
+# jemalloc, used by the `did-hosting-control` binary only (set as the global
+# allocator in main.rs — a library must never impose an allocator on its
+# consumers).
+#
+# The default system allocator (glibc malloc on Linux) does not return the
+# memory of freed allocations to the OS promptly. The control plane's request
+# path is a sawtooth of short-lived allocations (Trust Task envelopes, DID logs
+# being verified, UI and API responses, store batches), and glibc retains those
+# arenas, so RSS ratchets up to its high-water mark and stays there. That reads
+# as a leak in monitoring even though the live heap is flat. jemalloc's
+# decay-based purging returns the pages, so RSS tracks live memory.
+#
+# Not available on MSVC; the cfg gate below falls back to the system allocator
+# there.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true
