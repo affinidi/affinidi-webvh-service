@@ -17,7 +17,13 @@ build = "build.rs"
 workspace = true
 
 [features]
-default = ["keyring", "store-fjall", "method-webvh", "method-web"]
+default = ["keyring", "store-fjall", "method-webvh", "method-web", "jemalloc"]
+# Use jemalloc as the `did-hosting-server` binary's global allocator (see the
+# dependency comment). On by default: with the system allocator the process
+# holds its RSS high-water mark for its lifetime. Disable
+# (`--no-default-features`) if you need to profile against the system allocator
+# or are building for a target jemalloc doesn't support.
+jemalloc = ["dep:tikv-jemallocator"]
 metrics = ["did-hosting-common/metrics"]
 keyring = ["did-hosting-common/keyring"]
 # DID method routing (T25). Each method's resolve-side routes are
@@ -131,6 +137,24 @@ azure_data_cosmos = { version = "1", features = [
 azure_core = { version = "1.0", optional = true }
 azure_security_keyvault_secrets = { version = "1.0", optional = true }
 azure_identity = { version = "1.0", optional = true }
+
+# ── Allocator ────────────────────────────────────────────────────────────
+# jemalloc, used by the `did-hosting-server` binary only (set as the global
+# allocator in main.rs — a library must never impose an allocator on its
+# consumers).
+#
+# The default system allocator (glibc malloc on Linux) does not return the
+# memory of freed allocations to the OS promptly. The edge's request path is a
+# sawtooth of short-lived allocations (packed/unpacked DIDComm and TSP
+# messages, DID logs read from the store, resolution responses), and glibc
+# retains those arenas, so RSS ratchets up to its high-water mark and stays
+# there. That reads as a leak in monitoring even though the live heap is flat.
+# jemalloc's decay-based purging returns the pages, so RSS tracks live memory.
+#
+# Not available on MSVC; the cfg gate below falls back to the system allocator
+# there.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

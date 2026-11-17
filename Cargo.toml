@@ -672,6 +672,10 @@ affinidi-messaging-sdk = { version = "0.47.2", features = ["tsp"] }
 # signature-only-when-issuer-absent path.
 affinidi-data-integrity = "0.8.7"
 
+# Global allocator of the service binaries (did-hosting-server, -control,
+# -daemon, webvh-witness, webvh-watcher); see any of their Cargo.toml.
+tikv-jemallocator = "0.7"
+
 # Lints every member opts into with `[lints] workspace = true`.
 [workspace.lints.rust]
 # CONTRIBUTING rule 6: no `unsafe` in production code. `deny`, not `forbid`,

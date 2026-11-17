@@ -17,7 +17,13 @@ build = "build.rs"
 workspace = true
 
 [features]
-default = ["keyring", "store-fjall"]
+default = ["keyring", "store-fjall", "jemalloc"]
+# Use jemalloc as the `webvh-watcher` binary's global allocator (see the
+# dependency comment). On by default: with the system allocator the process
+# holds its RSS high-water mark for its lifetime. Disable
+# (`--no-default-features`) if you need to profile against the system allocator
+# or are building for a target jemalloc doesn't support.
+jemalloc = ["dep:tikv-jemallocator"]
 keyring = ["did-hosting-common/keyring"]
 aws-secrets = ["did-hosting-common/aws-secrets"]
 gcp-secrets = ["did-hosting-common/gcp-secrets"]
@@ -65,6 +71,24 @@ tower-http = { workspace = true, features = ["trace"] }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+# ── Allocator ────────────────────────────────────────────────────────────
+# jemalloc, used by the `webvh-watcher` binary only (set as the global
+# allocator in main.rs — a library must never impose an allocator on its
+# consumers).
+#
+# The default system allocator (glibc malloc on Linux) does not return the
+# memory of freed allocations to the OS promptly. The watcher's request path is
+# a sawtooth of short-lived allocations (DID logs mirrored from their sources,
+# resolution responses), and glibc retains those arenas, so RSS ratchets up to
+# its high-water mark and stays there. That reads as a leak in monitoring even
+# though the live heap is flat. jemalloc's decay-based purging returns the
+# pages, so RSS tracks live memory.
+#
+# Not available on MSVC; the cfg gate below falls back to the system allocator
+# there.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
 
 [dev-dependencies]
 affinidi-data-integrity = { workspace = true }
