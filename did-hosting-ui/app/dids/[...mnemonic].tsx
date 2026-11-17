@@ -52,7 +52,9 @@ import {
   requestAgentNameTask,
   requestDidUpdate,
   requestScidAliasUpdate,
+  requestWebsAliasUpdate,
 } from "../../lib/wallet";
+import { WEBS_AGENT_NAMES_UNSUPPORTED, isDidWebs, planWebsEdit } from "../../lib/webs-edit";
 
 /** A stable empty log, so effects keyed on the entries do not re-run on every
  *  render while nothing has loaded. */
@@ -202,6 +204,9 @@ function DidDetailScreen() {
   ): Promise<DelegatedResult> => {
     const didId = didDetail?.didId;
     if (!didId) return noIdentifier(opts?.silent);
+    // did:webs has its own update task, which takes designations, not a
+    // document — sent as a webvh update, the agent cannot find the DID.
+    if (isDidWebs(didId)) return publishWebsAliases(didId, document, opts);
     const expectedVersionId = latestVersionId ?? undefined;
     return task.run(
       () =>
@@ -216,6 +221,24 @@ function DidDetailScreen() {
     );
   };
 
+  const publishWebsAliases = (
+    didId: string,
+    document: Record<string, unknown>,
+    opts?: { silent?: boolean },
+  ): Promise<DelegatedResult> => {
+    const plan = planWebsEdit(didId, currentState, document);
+    if (plan.kind === "refused") {
+      if (!opts?.silent) notify("error", "Can't make this change", plan.reason);
+      return Promise.resolve("error");
+    }
+    return task.run(
+      () => requestWebsAliasUpdate({ did: didId, alsoKnownAs: plan.alsoKnownAs }),
+      (o) => publishWebsAliases(didId, document, o),
+      "Your agent anchored the new aliases and published the update.",
+      opts,
+    );
+  };
+
   // Park (`enable === false`) or resume an agent name. The VTA reads the
   // current document, edits `alsoKnownAs`, signs and calls the host — so we
   // send only the name.
@@ -226,6 +249,11 @@ function DidDetailScreen() {
   ): Promise<DelegatedResult> => {
     const didId = didDetail?.didId;
     if (!didId) return noIdentifier(opts?.silent);
+    if (isDidWebs(didId)) {
+      if (!opts?.silent)
+        notify("error", "Not available for did:webs", WEBS_AGENT_NAMES_UNSUPPORTED);
+      return Promise.resolve("error");
+    }
     return task.run(
       () => requestAgentNameTask({ did: didId, name, enable }),
       (o) => runParkResume(name, enable, o),
