@@ -787,7 +787,7 @@ pub(crate) fn proof_rule(type_uri: &str) -> ProofRule {
     if let Some(rule) = crate::messaging::infra::proof_rule(type_uri) {
         return rule;
     }
-    if type_uri == trust_tasks_rs::specs::trust_task_discovery::v0_3::Payload::TYPE_URI
+    if type_uri == trust_tasks_rs::specs::trust_task_discovery::v0_4::Payload::TYPE_URI
         || crate::trust_tasks_auth::owns(type_uri)
         || type_uri.starts_with(OOB_FAMILY_PREFIX)
     {
@@ -813,7 +813,7 @@ pub(crate) fn replay_partition(
     use trust_tasks_rs::Payload;
     let open_read = type_uri
         == did_hosting_common::tasks::did_management::server::info::v0_1::Payload::TYPE_URI
-        || type_uri == trust_tasks_rs::specs::trust_task_discovery::v0_3::Payload::TYPE_URI
+        || type_uri == trust_tasks_rs::specs::trust_task_discovery::v0_4::Payload::TYPE_URI
         || (rule == ProofRule::Optional && type_uri.starts_with(OOB_FAMILY_PREFIX));
     if !rule.uses_shared_replay_cache() || open_read {
         ReplayPartition::None

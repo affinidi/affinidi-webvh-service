@@ -15,7 +15,3 @@ a domain it does not designate is refused instead of being served there. An
 identifier that designates no key agreement key now resolves with the X25519
 key converted from its signing key in `keyAgreement`, as the reference
 resolver's does. Only builds with `method-webs` are affected.
-
-`affinidi-did-webs` is held at 0.13.3: 0.13.4 and later need `affinidi-crypto`
-0.3, which `didwebvh-rs` 0.8 does not yet build against. 0.13.4 changed only
-that requirement, so 0.13.3 reads every identifier 0.13.4 writes.

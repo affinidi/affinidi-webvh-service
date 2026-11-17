@@ -1041,6 +1041,167 @@ mod tests {
         assert!(stored(&state, &webs.aid).await.is_none());
     }
 
+    /// Once self-registration has made a `did:webs` an Owner, its later
+    /// requests take the ordinary sender-bound path, which resolves the
+    /// issuer: the proof is checked against the document the DID cache
+    /// resolves, not against a submitted log. This is a VTA with a did:webs
+    /// identity managing what it registered, end to end — a key-role
+    /// identifier (it signs with its designated `operational` key) that
+    /// designates a service, published over HTTP as this host publishes one
+    /// (`did.json` rendered from the derived document, so the service's
+    /// `type` is an array), resolved by the production verifier
+    /// ([`TransportBoundVerifier::with_did_cache_and_host_policy`]).
+    ///
+    /// Every such request was refused as an unreachable signer
+    /// (`unavailable`) while the DID cache could not resolve a did:webs: when
+    /// it was built without `did-webs`, and, with `affinidi-did-webs` before
+    /// 0.13.9, because resolution failed with `DocumentMismatch` (the
+    /// designated `"X"` against the published `["X"]`). Under
+    /// `trust-tasks-proof` 0.38+ it is also what holds the verifier's decode
+    /// step to the DID cache's host policy: without that, a resolved signer on
+    /// a non-public host is refused as `proofInvalid`.
+    #[cfg(feature = "method-webs")]
+    #[tokio::test]
+    async fn an_acl_member_did_webs_is_verified_by_resolving_it() {
+        use affinidi_did_resolver_cache_sdk::{
+            DIDCacheClient, config::DIDCacheConfigBuilder,
+            network_resolvers::HostPolicy as CacheHostPolicy,
+        };
+        use affinidi_did_webs::DesignatedService;
+        use did_hosting_common::method::webs::Webs as WebsMethod;
+        use did_hosting_common::server::trust_tasks::{HostPolicy, TransportBoundVerifier};
+
+        const INFO: &str = "https://trusttasks.org/spec/did-management/did/info/0.1";
+        let salt = 60;
+
+        // The identifier's host: a loopback listener, port-encoded as a
+        // did:webs host is (`127.0.0.1%3A{port}`).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let domain = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let created = create(
+            CreateConfig::builder(domain.replace(':', "%3A"))
+                .inception(Webs::inception(salt))
+                .key_roles(
+                    KeyRoles::new()
+                        .with_attestation(Webs::role_key(salt, ATTESTATION))
+                        .with_operational(Webs::role_key(salt, OPERATIONAL)),
+                )
+                .designated_service(DesignatedService::new(
+                    "#didcomm",
+                    "DIDCommMessaging",
+                    json!({ "uri": "https://mediator.example/", "accept": ["didcomm/v2"] }),
+                ))
+                .build(),
+        )
+        .expect("create");
+        let did = created.did().to_string();
+        let aid = did.rsplit(':').next().unwrap().to_string();
+        assert_eq!(did, WebsMethod::slot_did(&domain, &aid));
+        let keri_cesr = created.artifacts().keri_cesr.clone();
+
+        // What this host would serve for the slot: the derived document.
+        let did_json = WebsMethod::derive_document(&did, &keri_cesr).expect("derives");
+        let rendered: Value = serde_json::from_slice(&did_json).unwrap();
+        assert!(
+            rendered["service"][0]["type"].is_array(),
+            "the host renders a service's type as an array: {rendered}"
+        );
+        let app = axum::Router::new()
+            .route(
+                &format!("/{aid}/keri.cesr"),
+                axum::routing::get(move || async move { keri_cesr }),
+            )
+            .route(
+                &format!("/{aid}/did.json"),
+                axum::routing::get(move || async move { did_json }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // Its own did:webs, signed as its operational key.
+        let operational = Webs::role_key(salt, OPERATIONAL)
+            .to_cesr()
+            .expect("key qb64");
+        let mut key = Secret::generate_ed25519(None, Some(&Webs::role_seed(salt, OPERATIONAL)));
+        key.id = format!("{did}#{operational}");
+        let caller = Caller {
+            did: did.clone(),
+            key,
+            role: Role::Owner,
+        };
+
+        // An Owner of one slot, as self-registration leaves it. Granted
+        // directly: self-registration needs a hosting domain, and a loopback
+        // `IP:port` is not one (`normalize_domain_name`), so it cannot run
+        // against this host. Its proof is the other path anyway — checked
+        // against the submitted log, never a resolved document (the tests
+        // above) — and what is under test is everything after it.
+        let (mut state, _dir) = state().await;
+        did_hosting_common::server::acl::store_acl_entry(
+            &state.acl_ks,
+            &did_hosting_common::server::acl::AclEntry {
+                did: did.clone(),
+                role: Role::Owner,
+                label: None,
+                created_at: 1_700_000_000,
+                max_total_size: None,
+                max_did_count: Some(1),
+                domains: DomainScope::All,
+            },
+        )
+        .await
+        .unwrap();
+        // A slot it owns; its name is not what is under test.
+        seed_did(&state, &did, "vta-node").await;
+
+        // From here on the production verifier: the DID cache, allowed to
+        // reach the loopback host.
+        let resolver = DIDCacheClient::new(
+            DIDCacheConfigBuilder::default()
+                .with_host_policy(CacheHostPolicy::AllowPrivate)
+                .build(),
+        )
+        .await
+        .expect("DID cache");
+        state.trust_tasks_verifier = Some(Arc::new(
+            TransportBoundVerifier::with_did_cache_and_host_policy(
+                resolver,
+                HostPolicy::AllowPrivate,
+            ),
+        ));
+
+        for via in VIAS {
+            let reply = call(
+                &state,
+                via,
+                &caller,
+                INFO,
+                json!({ "mnemonic": "vta-node" }),
+            )
+            .await;
+            conforms(&reply);
+            let info = ok(&reply, INFO);
+            assert_eq!(info["record"]["owner"], did.as_str(), "{via:?}: {reply}");
+        }
+
+        // And the resolution is what admits it: a key the resolved document
+        // does not list is refused, though it is the key state's own.
+        let state_key = Webs::incept(salt);
+        let impostor = Caller {
+            key: state_key.key_for(&did),
+            did: did.clone(),
+            role: Role::Owner,
+        };
+        let reply = call(
+            &state,
+            Via::Https,
+            &impostor,
+            INFO,
+            json!({ "mnemonic": "vta-node" }),
+        )
+        .await;
+        assert_eq!(code(&reply), "proofInvalid", "{reply}");
+    }
+
     /// A self-registration's standing is that one task: the same identifier,
     /// verified the same way, gets nothing on any other row.
     #[cfg(feature = "method-webs")]
