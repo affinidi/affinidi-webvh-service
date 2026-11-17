@@ -253,7 +253,7 @@ impl Default for HostingConfig {
 }
 
 /// Apply environment variable overrides to [`HostingConfig`]. `prefix` is the
-/// same namespace [`apply_env_overrides`] takes.
+/// same namespace [`apply_env_overrides`](super::apply_env_overrides) takes.
 pub fn apply_hosting_env_overrides(
     prefix: &str,
     hosting: &mut HostingConfig,

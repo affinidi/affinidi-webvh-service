@@ -63,7 +63,7 @@ fn no_transport_asks_which_family_a_document_belongs_to() {
         for (n, line) in production.lines().enumerate() {
             let decides = line.contains("registered_uris()")
                 || line.contains("trust_tasks_auth::owns")
-                || line.contains("trust_tasks_infra::owns")
+                || line.contains("infra::owns")
                 || line.contains("bridge_did_management("); // retired-name-ok
             if decides {
                 offenders.push(format!("{rel}:{}  ({transport})  {}", n + 1, line.trim()));

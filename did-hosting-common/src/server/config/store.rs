@@ -100,7 +100,7 @@ impl Default for StoreConfig {
 /// Apply the `{prefix}_*` store overrides (`_DATA_DIR`, `_REDIS_URL`,
 /// `_DYNAMODB_TABLE_PREFIX`, …) to one [`StoreConfig`].
 ///
-/// [`apply_env_overrides`] calls it with `{PREFIX}_STORE`; a binary with a
+/// [`apply_env_overrides`](super::apply_env_overrides) calls it with `{PREFIX}_STORE`; a binary with a
 /// second store calls it once more with that store's own prefix (the daemon's
 /// `[witness_store]` reads `DAEMON_WITNESS_STORE_*`).
 pub fn apply_store_env_overrides(prefix: &str, store: &mut StoreConfig) -> Result<(), AppError> {

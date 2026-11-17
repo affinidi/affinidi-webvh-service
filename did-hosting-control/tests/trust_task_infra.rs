@@ -1,5 +1,5 @@
 //! Control-plane infrastructure trust tasks: server registration, health
-//! pong, stats sync and acks, dispatched through `trust_tasks_infra`.
+//! pong, stats sync and acks, dispatched through `messaging::infra`.
 //!
 //! These exercise the transport-*agnostic* half of the wiring: the dispatcher
 //! takes a `TrustTask<Value>` and its proven signer, and knows
@@ -92,8 +92,8 @@ use did_hosting_common::didcomm_types::{
 };
 use did_hosting_common::server::didcomm_profile::ObservedTransport;
 use did_hosting_common::server::trust_tasks::send::build_request;
+use did_hosting_control::messaging::infra;
 use did_hosting_control::registry;
-use did_hosting_control::trust_tasks_infra;
 
 const CONTROL_DID: &str = "did:webvh:test:control.example.com";
 const SERVER_DID: &str = "did:webvh:QmS:webvh.example.com:server1";
@@ -135,7 +135,7 @@ async fn register_trust_task_creates_instance_and_acks() {
         register_body(),
     )
     .expect("build register doc");
-    let resp = trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
+    let resp = infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
         .await
         .expect("register must produce an ack");
 
@@ -161,7 +161,7 @@ async fn register_without_ext_hints_registers() {
     body.as_object_mut().unwrap().remove("ext");
 
     let doc = build_request(MSG_SERVER_REGISTER, SERVER_DID, CONTROL_DID, body).expect("build");
-    trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
+    infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
         .await
         .expect("ack");
 
@@ -191,10 +191,9 @@ async fn register_refuses_a_payload_that_is_not_0_2_for_the_signer() {
     other_id["instanceId"] = json!("someone-else");
     for body in [snake, other_did, other_id] {
         let doc = build_request(MSG_SERVER_REGISTER, SERVER_DID, CONTROL_DID, body).expect("build");
-        let resp =
-            trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
-                .await
-                .expect("a refusal is still a document");
+        let resp = infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
+            .await
+            .expect("a refusal is still a document");
         assert_eq!(resp["payload"]["code"], "malformedRequest", "{resp}");
     }
     assert!(
@@ -220,7 +219,7 @@ async fn register_trust_task_requires_service_role() {
         register_body(),
     )
     .expect("build");
-    let resp = trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
+    let resp = infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
         .await
         .expect("rejection is still a document");
 
@@ -251,7 +250,7 @@ async fn health_pong_trust_task_marks_active_and_is_terminal() {
         register_body(),
     )
     .expect("build");
-    trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), reg).await;
+    infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), reg).await;
 
     let before = registry::get_instance(&h.state.registry_ks, &instance_id_for(SERVER_DID))
         .await
@@ -273,9 +272,7 @@ async fn health_pong_trust_task_marks_active_and_is_terminal() {
     )
     .expect("MSG_HEALTH_PONG must parse as a #response TypeUri");
 
-    let resp =
-        trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Didcomm), pong)
-            .await;
+    let resp = infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Didcomm), pong).await;
     assert!(resp.is_none(), "a pong is an answer, not a question");
 
     let after = registry::get_instance(&h.state.registry_ks, &instance_id_for(SERVER_DID))
@@ -292,14 +289,14 @@ async fn health_pong_trust_task_marks_active_and_is_terminal() {
 fn owns_only_register_health_pong_and_stats_sync() {
     use did_hosting_common::didcomm_types::{MSG_HEALTH_PING, MSG_SYNC_UPDATE};
 
-    assert!(trust_tasks_infra::owns(MSG_SERVER_REGISTER));
-    assert!(trust_tasks_infra::owns(MSG_HEALTH_PONG));
-    assert!(trust_tasks_infra::owns(MSG_STATS_SYNC));
+    assert!(infra::owns(MSG_SERVER_REGISTER));
+    assert!(infra::owns(MSG_HEALTH_PONG));
+    assert!(infra::owns(MSG_STATS_SYNC));
     // The control plane *sends* these; it must never route them to itself.
-    assert!(!trust_tasks_infra::owns(MSG_HEALTH_PING));
-    assert!(!trust_tasks_infra::owns(MSG_SERVER_REGISTER_ACK));
-    assert!(!trust_tasks_infra::owns(MSG_STATS_ACK));
-    assert!(!trust_tasks_infra::owns(MSG_SYNC_UPDATE));
+    assert!(!infra::owns(MSG_HEALTH_PING));
+    assert!(!infra::owns(MSG_SERVER_REGISTER_ACK));
+    assert!(!infra::owns(MSG_STATS_ACK));
+    assert!(!infra::owns(MSG_SYNC_UPDATE));
 }
 
 // Stats sync keys its replay window on a process-wide map, so each test uses
@@ -349,7 +346,7 @@ async fn stats_sync_trust_task_records_deltas_and_acks() {
 
     let doc = build_request(MSG_STATS_SYNC, DID, CONTROL_DID, stats_body(DID, 1, 5))
         .expect("MSG_STATS_SYNC must parse as a TypeUri");
-    let resp = trust_tasks_infra::dispatch(&h.state, DID, Some(ObservedTransport::Tsp), doc)
+    let resp = infra::dispatch(&h.state, DID, Some(ObservedTransport::Tsp), doc)
         .await
         .expect("stats sync must produce an ack");
 
@@ -360,7 +357,7 @@ async fn stats_sync_trust_task_records_deltas_and_acks() {
     // A replay of the same sequence is acked but not double-counted.
     let replay =
         build_request(MSG_STATS_SYNC, DID, CONTROL_DID, stats_body(DID, 1, 5)).expect("build");
-    let resp = trust_tasks_infra::dispatch(&h.state, DID, Some(ObservedTransport::Tsp), replay)
+    let resp = infra::dispatch(&h.state, DID, Some(ObservedTransport::Tsp), replay)
         .await
         .expect("ack");
     assert_eq!(resp["payload"]["accepted"], 0);
@@ -378,7 +375,7 @@ async fn stats_sync_trust_task_records_deltas_and_acks() {
         legacy_stats_body(DID, 2, 3),
     )
     .expect("build");
-    let resp = trust_tasks_infra::dispatch(&h.state, DID, Some(ObservedTransport::Tsp), legacy)
+    let resp = infra::dispatch(&h.state, DID, Some(ObservedTransport::Tsp), legacy)
         .await
         .expect("ack");
     assert_eq!(resp["type"], MSG_STATS_ACK, "got {resp}");
@@ -396,7 +393,7 @@ async fn stats_sync_trust_task_requires_service_role() {
 
     let doc =
         build_request(MSG_STATS_SYNC, DID, CONTROL_DID, stats_body(DID, 1, 5)).expect("build");
-    let resp = trust_tasks_infra::dispatch(&h.state, DID, Some(ObservedTransport::Tsp), doc)
+    let resp = infra::dispatch(&h.state, DID, Some(ObservedTransport::Tsp), doc)
         .await
         .expect("rejection is still a document");
 
@@ -417,7 +414,7 @@ async fn stats_sync_rejects_a_foreign_server_did() {
 
     let doc =
         build_request(MSG_STATS_SYNC, DID, CONTROL_DID, stats_body(VICTIM, 99, 5)).expect("build");
-    let resp = trust_tasks_infra::dispatch(&h.state, DID, Some(ObservedTransport::Tsp), doc)
+    let resp = infra::dispatch(&h.state, DID, Some(ObservedTransport::Tsp), doc)
         .await
         .expect("rejection is still a document");
 
@@ -442,7 +439,7 @@ async fn register_records_the_transport_it_arrived_on() {
         register_body(),
     )
     .expect("build");
-    trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
+    infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), doc)
         .await
         .expect("ack");
 
@@ -468,7 +465,7 @@ async fn pong_updates_observed_inbound_transport() {
         register_body(),
     )
     .expect("build");
-    trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Didcomm), reg).await;
+    infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Didcomm), reg).await;
 
     let pong = build_request(
         MSG_HEALTH_PONG,
@@ -478,7 +475,7 @@ async fn pong_updates_observed_inbound_transport() {
         json!({ "status": "ok" }),
     )
     .expect("build");
-    trust_tasks_infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), pong).await;
+    infra::dispatch(&h.state, SERVER_DID, Some(ObservedTransport::Tsp), pong).await;
 
     let inst = registry::get_instance(&h.state.registry_ks, &instance_id_for(SERVER_DID))
         .await
@@ -500,7 +497,7 @@ async fn unknown_binding_records_no_transport() {
         register_body(),
     )
     .expect("build");
-    trust_tasks_infra::dispatch(&h.state, SERVER_DID, None, doc)
+    infra::dispatch(&h.state, SERVER_DID, None, doc)
         .await
         .expect("ack");
 

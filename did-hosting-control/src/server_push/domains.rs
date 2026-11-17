@@ -287,7 +287,7 @@ pub async fn send_domain_upsert(
 
 /// Replicate every control-side `DomainEntry` to one server, then re-send its
 /// unsettled domain assign/unassign/purge ops ([`resend_domain_intents_for`])
-/// — run on each (re-)registration (by [`resync_server`]) so a server that
+/// — run on each (re-)registration (by [`resync_server`](super::resync_server)) so a server that
 /// missed any of them while unreachable converges on the control plane's
 /// domain records, statuses and assignments. `served` are the domains the
 /// server reported serving, which the control plane assigned it.

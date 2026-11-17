@@ -71,6 +71,15 @@ use did_hosting_common::server::trust_tasks::ProofRule;
 use crate::registry;
 use crate::server::AppState;
 
+// The handler modules below reach the messaging scope through this.
+#[allow(unused_imports)]
+use super::*;
+
+pub(super) mod acks;
+pub(super) mod health;
+pub(super) mod register;
+pub(super) mod stats_sync;
+
 /// Does this Type URI belong to the infrastructure ops handled here?
 ///
 /// Compared on the full string, fragment included: `register/0.1` is a request

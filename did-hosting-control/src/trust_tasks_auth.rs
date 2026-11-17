@@ -18,7 +18,7 @@
 //!
 //! So a wallet connected over TSP could not log in, and a wallet over DIDComm
 //! logged in by a different rule than one over HTTPS. This module gives the
-//! family one identity on every wire, exactly as [`crate::trust_tasks_infra`]
+//! family one identity on every wire, exactly as [`crate::messaging::infra`]
 //! did for server registration and health — see its module doc for the same
 //! argument made about a different family.
 //!

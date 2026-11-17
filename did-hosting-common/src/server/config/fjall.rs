@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// grow with the data set and, left at fjall's defaults, are sized for a
 /// workstation rather than a constrained pod.
 ///
-/// Deliberately **not** a field of [`StoreConfig`]: that type is
+/// Deliberately **not** a field of [`StoreConfig`](super::StoreConfig): that type is
 /// constructed as a bare struct literal (`StoreConfig { data_dir: .. }`)
 /// at hundreds of call sites across the workspace, mostly tests opening
 /// an ad hoc store, and adding a field there would force every one of

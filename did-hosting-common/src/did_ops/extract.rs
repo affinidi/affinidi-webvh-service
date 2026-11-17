@@ -23,7 +23,7 @@ pub fn extract_did_id(jsonl_content: &str) -> Option<String> {
 /// Returns `None` when there is no parseable log entry with a `state` — i.e.
 /// the document is unavailable, so callers must not cache an empty vector and
 /// conclude "advertises nothing". `Some(vec![])` means the document was read
-/// and carries no services. This maps directly onto [`DidRecord::services`].
+/// and carries no services. This maps directly onto [`DidRecord::services`](super::DidRecord::services).
 pub fn extract_service_types(jsonl_content: &str) -> Option<Vec<String>> {
     let last_line = jsonl_content.lines().rfind(|l| !l.trim().is_empty())?;
     let value: serde_json::Value = serde_json::from_str(last_line).ok()?;
