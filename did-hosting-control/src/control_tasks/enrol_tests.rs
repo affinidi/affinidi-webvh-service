@@ -2913,6 +2913,54 @@ async fn an_invite_from_a_former_administrator_enrols_nothing() {
     );
 }
 
+/// The operator's CLI invite is the bootstrap for the first administrator: it
+/// redeems with no administrator in the ACL, and grants the role it carries.
+#[tokio::test]
+async fn an_operator_cli_invite_enrols_the_first_administrator() {
+    let (state, _dir) = state().await;
+    let newcomer = stranger(210);
+    let invitee = stranger(211);
+
+    let made = invite::issue(
+        &state.sessions_ks,
+        invite::InviteRequest {
+            subject: newcomer.did.clone(),
+            purpose: invite::Purpose::Session,
+            role: Some("admin".into()),
+            device_label: None,
+            issued_by: invite::OPERATOR_CLI_ISSUER.into(),
+            ttl_secs: 600,
+        },
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    let issued = Issued {
+        token: made.token.clone(),
+        code: made.claim_code.clone(),
+        body: Value::Null,
+    };
+
+    let mut passkey = SoftPasskey::new();
+    let reply = redeem(&state, Via::Https, &invitee, &issued, &mut passkey, None).await;
+    ok(&reply, &t(REDEEM_FINISH));
+    assert_eq!(
+        get_acl_entry(&state.acl_ks, &newcomer.did)
+            .await
+            .unwrap()
+            .expect("the invite granted no entry")
+            .role,
+        Role::Admin
+    );
+    assert!(
+        pk::get_passkey_user_by_cred(&state.sessions_ks, &hex(&passkey.cred_id))
+            .await
+            .unwrap()
+            .is_some(),
+        "the invite enrolled no passkey"
+    );
+}
+
 /// A redemption of a role-conferring invite racing an `acl/revoke` of its
 /// subject never recreates the entry: the revoke holds the removal lock from
 /// before the entry goes until the invite is withdrawn, and the redemption

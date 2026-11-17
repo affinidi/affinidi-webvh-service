@@ -803,11 +803,17 @@ pub(crate) async fn redeem_finish(
     // An invite carries its issuer's authority, so it is honoured only while
     // the issuer still holds it: an administrator removed or demoted since
     // issuing it no longer enrols anyone. Checked after the take, so the
-    // invite is spent either way.
-    let issuer_standing = match acl::check_acl(&state.acl_ks, &issued_by).await {
-        Ok(role) => role == Role::Admin,
-        Err(e) if acl::is_acl_refusal(&e) => false,
-        Err(e) => return Err(e.into()),
+    // invite is spent either way. The operator's CLI invite (the bootstrap
+    // for the first administrator) rests on store access instead, and has no
+    // ACL entry to lose.
+    let issuer_standing = if issued_by == invite::OPERATOR_CLI_ISSUER {
+        true
+    } else {
+        match acl::check_acl(&state.acl_ks, &issued_by).await {
+            Ok(role) => role == Role::Admin,
+            Err(e) if acl::is_acl_refusal(&e) => false,
+            Err(e) => return Err(e.into()),
+        }
     };
     if !issuer_standing {
         warn!(

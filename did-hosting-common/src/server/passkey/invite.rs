@@ -89,6 +89,13 @@ pub struct ClaimHash {
     digest: String,
 }
 
+/// The issuer recorded on an invite the operator's `invite` subcommand made.
+///
+/// Such an invite rests on store access, not on an administrator's ACL entry,
+/// so a redemption does not look its issuer up in the ACL. It is not a DID, so
+/// no authenticated caller can be recorded under it.
+pub const OPERATOR_CLI_ISSUER: &str = "operator (CLI)";
+
 /// A stored invite. Holds no secret: only hashes of the token and the code.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Invite {
@@ -105,7 +112,7 @@ pub struct Invite {
     pub role: Option<String>,
     /// The inviter's suggested credential label.
     pub device_label: Option<String>,
-    /// Who issued it: the administrator's VID, or `operator (CLI)`.
+    /// Who issued it: the administrator's VID, or [`OPERATOR_CLI_ISSUER`].
     pub issued_by: String,
     pub created_at: u64,
     pub expires_at: u64,

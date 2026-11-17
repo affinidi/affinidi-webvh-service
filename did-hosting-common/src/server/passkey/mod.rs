@@ -64,7 +64,7 @@ pub async fn run_cli_invite(
             purpose: invite::Purpose::Session,
             role: Some(role.to_string()),
             device_label: None,
-            issued_by: "operator (CLI)".into(),
+            issued_by: invite::OPERATOR_CLI_ISSUER.into(),
             ttl_secs,
         },
         hash_wait,
