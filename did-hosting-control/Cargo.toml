@@ -197,8 +197,13 @@ tempfile = { workspace = true, optional = true }
 anyhow.workspace = true
 # The self-registration tests incept real did:webs identifiers, and sign as
 # their keys. Tests only: the service itself never holds KERI keys, and this
-# brings the KERI store (LMDB) into the test graph alone.
-affinidi-keri = "0.4"
+# brings the KERI store (LMDB) into the test graph alone. The version is the
+# one `affinidi-did-webs` incepts with, so a test's AID is the created one's.
+affinidi-keri = "0.8"
+affinidi-keri-core = "0.8"
+# Creates those identifiers whole — inception and the designations naming
+# their DID, which 0.13 requires — as a real controller does (`create`).
+affinidi-did-webs = { workspace = true, features = ["create"] }
 # `validate` is also on in `[dependencies]` above now (the invite/update
 # handler uses it at runtime); kept explicit here too so the table's tests
 # can check any reply against the schema its type names

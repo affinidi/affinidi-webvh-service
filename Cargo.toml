@@ -208,7 +208,7 @@ affinidi-did-common = "0.4.4"
 # needs is the other half — parse the stream, verify the key event log, and
 # derive the document the log implies. That is the default feature set, and
 # it keeps `affinidi-keri` (and its LMDB store) out of the dep graph.
-affinidi-did-webs = "0.7"
+affinidi-did-webs = "0.13"
 
 # VTA SDK — 0.75 on crates.io, bumped in lockstep with vti-common 0.51
 # (which re-pins onto vta-sdk ^0.75), vti-secrets 0.24 (on vti-common ^0.51)

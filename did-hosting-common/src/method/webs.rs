@@ -653,13 +653,19 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&doc).unwrap();
         assert_eq!(v["id"].as_str(), Some(DID));
 
-        // One verification method, carrying the KEL's current signing key.
+        // The KEL's current signing key, and — since the identifier
+        // designates no key agreement key — the X25519 key converted from
+        // it (`affinidi-did-webs` 0.9.2), in `keyAgreement` only.
         let vms = v["verificationMethod"].as_array().expect("vm array");
-        assert_eq!(vms.len(), 1);
+        assert_eq!(vms.len(), 2, "{v}");
+        assert_eq!(vms[0]["publicKeyJwk"]["crv"], "Ed25519");
         assert_eq!(
             vms[0]["publicKeyJwk"]["kid"].as_str(),
             Some("DHr0-I-mMN7h6cLMOTRJkkfPuMd0vgQPrOk4Y3edaHjr"),
         );
+        assert_eq!(vms[1]["publicKeyJwk"]["crv"], "X25519");
+        assert_eq!(v["authentication"], serde_json::json!([vms[0]["id"]]));
+        assert_eq!(v["keyAgreement"], serde_json::json!([vms[1]["id"]]));
     }
 
     #[test]
