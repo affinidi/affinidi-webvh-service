@@ -12,15 +12,17 @@ name: Backport
 #
 # Any other conflict fails the push — the action commits
 # it as `BACKPORT-CONFLICT`, which the commit-message rule rejects — and the
-# action comments on the source PR; backport it by hand on a branch named
-# `backport-<pr>-to-release/<name>`.
+# action comments on the source PR. Backport it by hand: cherry-pick onto a
+# branch of this repository, open the PR against the release branch, and have
+# a maintainer add the `release-direct` label, its description naming the
+# source PR. `branch rules` counts a backport branch only when the release bot
+# opened it, so a hand-made one goes in as `release-direct` (RELEASES.md).
 #
-# pull_request_target, so it runs with this repository's token even for a PR
+# pull_request_target, so it runs with this repository's secrets even for a PR
 # from a fork. It checks out no PR code to run: the action only cherry-picks
-# the commits a maintainer already merged. The PR is opened with RELEASE_TOKEN
-# because one opened with GITHUB_TOKEN triggers no workflows, and the backport
-# needs CI. The secret is required here: the enterprise does not allow
-# GITHUB_TOKEN to open pull requests (RELEASES.md).
+# the commits a maintainer already merged. The PR is opened with the release
+# bot app: `branch rules` accepts a backport only from it, and a PR opened
+# with GITHUB_TOKEN would run no CI.
 on:
   pull_request_target:
     types: [closed, labeled]
@@ -31,18 +33,30 @@ permissions:
 jobs:
   backport:
     name: Backport
+    # Only a merged PR that carries a backport label: the job enters the
+    # `release` environment and mints a bot token, so it must not run for
+    # every merge.
     if: >-
       github.event.pull_request.merged == true &&
-      (github.event.action == 'closed' || startsWith(github.event.label.name, 'backport '))
+      (github.event.action == 'closed'
+        && contains(join(github.event.pull_request.labels.*.name, '|'), 'backport release/')
+       || github.event.action == 'labeled'
+        && startsWith(github.event.label.name, 'backport release/'))
     runs-on: ubuntu-latest
+    # RELEASE_BOT_PRIVATE_KEY is a secret of this environment.
+    environment: release
     timeout-minutes: 15
-    permissions:
-      contents: write
-      pull-requests: write
     steps:
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+          token: ${{ steps.app.outputs.token }}
       # Every backport conflicts on CHANGELOG.md (main's `## Unreleased` is not
       # on a GA'd branch), and the fix is always the same: keep the release
       # branch's copy. Do that in the cherry-pick itself. Left to the action, a
@@ -57,7 +71,7 @@ jobs:
       - uses: korthout/backport-action@8560fb503c275d433c56f05a2f64850093baa9f7 # v4.7.0
         id: backport
         with:
-          github_token: ${{ secrets.RELEASE_TOKEN || github.token }}
+          github_token: ${{ steps.app.outputs.token }}
           label_pattern: '^backport (release/\d+\.\d+)$'
           pull_title: '${pull_title}'
           pull_description: |-
@@ -70,7 +84,7 @@ jobs:
       - name: Drop changelog notes from the backport PRs
         if: steps.backport.outputs.created_pull_numbers != ''
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
           CREATED: ${{ steps.backport.outputs.created_pull_numbers }}
         run: |
           set -euo pipefail

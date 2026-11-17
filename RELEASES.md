@@ -7,7 +7,11 @@ there. Patches (`0.9.1`, `0.9.2`, …) only ever happen on the release branch.
 
 This follows the branching model of verifiable-trust-infrastructure, with one
 difference: a release here is named by its version, not a tree name, and every
-crate in the workspace carries that version.
+crate in the workspace carries that version. Tagging, `nightly` and the
+`branch rules` check run the `release-*` actions of
+[affinidi/pipeline-rust](https://github.com/affinidi/pipeline-rust) (README,
+"Release branches"). The cut, prep, backport and `release guards` stay local
+while only they handle `changelog.d/`.
 
 ## Branches
 
@@ -78,21 +82,29 @@ notes: a patch's changelog is generated from the commit subjects it ships. So
 and `backport.yml` removes the `changelog.d/` fragments the cherry-pick adds in
 a follow-up signed-off commit on the backport PR. Any other conflict currently fails the backport — the action's conflict commit
 (`BACKPORT-CONFLICT`) is rejected by the commit-message rule — so cherry-pick it
-by hand onto a branch named `backport-<pr>-to-release/<major.minor>` and open
-that PR against the release branch.
+by hand onto a branch of this repository, open that PR against the release
+branch, and have a maintainer add the `release-direct` label, with the
+description naming the source PR. Only the release bot's backport branches
+count as backports, so a hand-made one goes in as `release-direct`.
 
 Only fix on the release branch directly when the code there no longer exists on
 `main`: a maintainer adds the `release-direct` label to that PR, and its
 description says why.
 
-The `branch rules` check (`scripts/check-branch-rules.py`) holds all of this: a
-PR into `release/**` is a bot backport, a prep PR or labelled `release-direct`;
-only the release tooling changes versions, `RELEASE` or `CHANGELOG.md`, on any
-branch. The
-tooling's branch names (`backport-…`, `release-prep/…`, `release-cut/…`) count
-only on branches in this repository: a PR from a fork whose branch carries one
-of those names fails the check and is asked to rename it. A hand-made backport
-branch is therefore pushed here, not to a fork.
+The `branch rules` check holds all of this: a PR into `release/**` is a
+backport or prep PR, or labelled `release-direct` by a maintainer; only the
+release tooling changes versions, `RELEASE` or `CHANGELOG.md`, on any branch. A
+cut, prep or backport PR counts as one only when the release-bot app
+(`affinidi-semantic-release[bot]`) opened it from a branch of this repository:
+a branch name alone proves nothing. A cut or prep PR also counts when a person
+with the admin or maintain role opened it, since cuts are run by hand.
+
+The check runs in two steps. pipeline-rust's `release-branch-rules` action
+decides where a PR may go and keeps `RELEASE` off `main`. Then
+`scripts/check-branch-rules.py` holds what that action cannot here: the
+version rules (the action reads only a root `[workspace.package] version`, and
+every crate here carries its own) and the `CHANGELOG.md` rule. Both recognise
+the release tooling the same way, by who opened the PR.
 
 ## Changelog
 
@@ -203,11 +215,19 @@ Settings, not files:
 - **Ruleset on `release/**`:** require a PR, require the CI jobs and
   `branch rules`, block force pushes and deletion.
 - **Ruleset on `main`:** require a PR, and require `branch rules`.
-- **Ruleset on `nightly`:** block force pushes and deletion; only the
-  workflow's identity may update it.
-- **`RELEASE_TOKEN`** (required for backports and preps) — a fine-grained PAT
-  or GitHub App token on this repository with contents and pull-requests
-  write and actions read. The enterprise does not allow `GITHUB_TOKEN` to
-  open pull requests, so without it `backport.yml` and `release-prep.yml`
-  fail at the PR step. (A PR opened with `GITHUB_TOKEN` would trigger no CI
-  anyway.) `nightly.yml` and `release-tag.yml` need no secret.
+- **Ruleset on `nightly`:** block force pushes and deletion; only the release
+  bot (which `nightly.yml` runs as), maintainers and admins may create or
+  update it.
+- **Environment `release`**, with secrets **`RELEASE_BOT_APP_ID`** and
+  **`RELEASE_BOT_PRIVATE_KEY`** — the `affinidi-semantic-release` app.
+  `backport.yml`, `release-prep.yml`, `release-tag.yml` and `nightly.yml` run
+  in it and mint a token scoped to what each needs. It opens the backport and
+  prep PRs: the enterprise does not allow `GITHUB_TOKEN` to open pull
+  requests, and a PR it opened would trigger no CI anyway. Its deployment
+  branches must allow both `main` (`nightly.yml`, and `backport.yml`, which
+  runs on `pull_request_target` from `main`) and `release/**`
+  (`release-tag.yml`, `release-prep.yml`). Restricted to `release/**` alone,
+  `nightly` stops advancing and backports stop. Give it no required reviewers:
+  every labelled backport would then wait on an approval.
+- **pipeline-rust actions are pinned** to a commit in each workflow. Move the
+  pins together, in a reviewed PR, after reading what changed upstream.

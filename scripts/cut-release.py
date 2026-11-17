@@ -7,7 +7,8 @@ Run by the release manager from a clean checkout with push access and `gh`
 authenticated. It:
 
   1. resolves the source commit — `origin/nightly` by default, the newest main
-     commit the full CI suite passed (RELEASES.md);
+     commit the full CI suite passed (RELEASES.md) — and refuses one main
+     doesn't have, since only main is reviewed;
   2. pushes `release/<name>` = source commit + one commit that sets every
      workspace crate to `<name>.0`, its internal pins to `<name>`, and writes
      `RELEASE` = `<name>.0-rc.0`. `release-tag.yml` then tags `v<name>.0-rc.0`;
@@ -79,6 +80,16 @@ def main():
         sys.exit(f"{branch} already exists")
     source = git("rev-parse", "--verify", f"{args.source}^{{commit}}").stdout.strip()
     main_sha = git("rev-parse", "--verify", "origin/main^{commit}").stdout.strip()
+    # 0: on main; 1: not on main; anything else: git could not tell (a missing
+    # object, a shallow clone), which is not the same answer.
+    on_main = git("merge-base", "--is-ancestor", source, main_sha, check=False)
+    if on_main.returncode == 1:
+        sys.exit(f"{args.source} ({source[:12]}) is not on main: a release is cut from a reviewed main commit")
+    if on_main.returncode:
+        sys.exit(
+            f"could not tell whether {args.source} ({source[:12]}) is on main "
+            f"(git merge-base exited {on_main.returncode}): {on_main.stderr.strip()}"
+        )
     print(f"cutting {branch} from {args.source} ({source[:12]}); main is {main_sha[:12]}")
 
     # Prune after the temporary directory is gone: pruned inside it, the
