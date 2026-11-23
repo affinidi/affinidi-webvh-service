@@ -94,24 +94,26 @@ client's address identify it in every per-address limit.
 
 - **Edge (`did-hosting-server`)**: the resolution paths (`/.well-known/*`,
   `/{path}/did.jsonl`, `/did-witness.json`, `/did.json`, `/keri.cesr`,
-  `/@…`) publicly; `/api/health` to your load balancer;
+  `/@…`) publicly; `/api/health`, `/livez` and `/readyz` to your load
+  balancer or orchestrator;
   `POST /api/trust-tasks` only if the edge's DID advertises HTTPS for its
   control plane. Nothing else is served.
 - **Control plane**: the console (any non-API path),
   `POST /api/trust-tasks`, `POST /api/auth/challenge`,
-  `GET /api/sign-in/readiness`, `GET /api/health`. The control plane is the
+  `GET /api/sign-in/readiness`, `GET /api/health`, `GET /livez`,
+  `GET /readyz`. The control plane is the
   single most sensitive endpoint in the system and is deliberately not
   discoverable from the DIDs it manages (see
   [architecture.md](architecture.md#the-control-plane-is-never-advertised)).
   Reach it on its own hostname, and restrict it at the network edge to the
   operators, publishers (VTAs) and wallets that need it where you can.
 - **Witness**: `POST /api/trust-tasks` and `/api/health`, to the parties
-  that request proofs.
+  that request proofs; `/livez` and `/readyz`.
 - **Watcher**: its resolution paths publicly; `POST /api/trust-tasks` to
-  its sources if it advertises HTTPS; `/api/health`.
+  its sources if it advertises HTTPS; `/api/health`, `/livez`, `/readyz`.
 - **Daemon**: all of the control plane's and the edge's paths at the root,
-  `/witness/api/trust-tasks`, `/watcher/…` when the watcher is enabled, and
-  `/health`.
+  `/witness/api/trust-tasks`, `/watcher/…` when the watcher is enabled,
+  `/health`, `/livez` and `/readyz`.
 
 ## Health checks
 
@@ -122,6 +124,29 @@ client's address identify it in every per-address limit.
   the staleness clock, so also alert on restart loops.
 - `GET /api/health` on the control plane, witness and watcher, and `GET
   /health` on the daemon, are liveness probes.
+- `GET /livez` and `GET /readyz` are Kubernetes-style probes on every binary
+  that runs an HTTP listener, at the root (the daemon serves one pair, not one
+  per embedded service). They are unauthenticated and outside the rate
+  limits, like `/api/health`; `/api/health` is unchanged.
+  - `/livez` checks nothing beyond the HTTP server answering: always
+    `200 {"status":"ok"}`. Point `livenessProbe` at it, so storage or
+    control-plane trouble never gets a process restarted (on an edge a
+    restart would also reset the staleness clock and hide the fault).
+  - `/readyz` answers `200 {"status":"ready","storage":"ok"}`, or `503` with
+    `"status":"notReady"` and the failed check marked `"unavailable"`. Point
+    `readinessProbe` at it. `storage` is every store the binary serves from
+    (the daemon's main and witness stores): for fjall, that the data
+    directory still holds the database and fjall has not been poisoned by an
+    I/O error; for the network backends, one point read. It never writes. The
+    edge adds `serving`, the condition its `/api/health` reports (own DID
+    served locally, within the staleness bound); the daemon adds `serving`
+    for its own DID when its server is on. The control plane, witness and
+    watcher check storage only. Mediator connectivity is never part of
+    readiness: messaging reconnects on its own, and draining the instance
+    would turn a degraded transport into an outage.
+  - The checks run at most once a second (concurrent probes share the
+    answer) and give up after 800 ms, which counts as not ready. The body
+    never carries the cause; that is logged at `warn`.
 - `<binary> health [--strict]` is an offline diagnostic for an operator or a
   pre-start hook: it exits non-zero when a check fails (`--strict`: also on
   a warning).
@@ -181,8 +206,23 @@ on `SIGTERM`.
   fjall directory; fjall locks it.
 - A watcher must be the only watcher process on its store. Witness replicas
   may share an external store (their per-DID marks are compare-and-swapped).
-- Probe `/api/health` (or the daemon's `/health`) for readiness and
-  liveness.
+- Probe `/livez` for liveness and `/readyz` for readiness (see
+  [Health checks](#health-checks)):
+
+  ```yaml
+  livenessProbe:
+    httpGet: { path: /livez, port: http }
+    periodSeconds: 10
+    failureThreshold: 3
+  readinessProbe:
+    httpGet: { path: /readyz, port: http }
+    periodSeconds: 5
+    failureThreshold: 2
+  ```
+
+  An edge's `/readyz` also fails past its replication staleness bound, so
+  an outage of the control plane longer than `staleness_bound_secs` drains
+  every edge that depends on it; size the bound with that in mind.
 
 ## Logging
 

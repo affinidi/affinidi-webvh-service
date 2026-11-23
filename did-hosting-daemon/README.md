@@ -144,6 +144,8 @@ the root; the witness and watcher nest under prefixes.
 | --- | --- | --- |
 | `GET /health` | daemon | Daemon liveness: `200` while the daemon's own DID is served from its store, `503` (`"status": "degraded"`) otherwise — the control plane's `/api/health` check |
 | `GET /api/health` | control plane | Service health (checks the service's own DID resolves) |
+| `GET /livez` | daemon | Kubernetes liveness: always `200 {"status":"ok"}`, no checks |
+| `GET /readyz` | daemon | Kubernetes readiness: `503` while the main or witness store is unavailable (`storage`) or, with the server on, the daemon's own DID is not served (`serving`); see [docs/deployment.md](../docs/deployment.md#health-checks) |
 | `POST /api/trust-tasks` | control plane | Every management operation, as a signed Trust Task (the HTTPS binding) |
 | `GET /api/sign-in/readiness` | control plane | Whether the service DID lists the services wallet sign-in needs |
 | `POST /api/auth/challenge` | control plane | Sign-in challenge nonce for a browser with no key yet |
@@ -154,8 +156,9 @@ the root; the witness and watcher nest under prefixes.
 | anything else | control plane | The management UI (`ui` feature) |
 
 The embedded witness and watcher have **no health route of their own**
-(`/witness/api/health` and `/watcher/api/health` are not served); probe
-`/health` or `/api/health`. The embedded watcher serves resolution only: it
+(`/witness/api/health` and `/watcher/api/health` are not served, nor are
+`/witness/readyz` and the like); probe `/livez` and `/readyz` (or `/health`
+or `/api/health`). The embedded watcher serves resolution only: it
 has no DID and runs no listener, so nothing syncs into it. A watcher that
 mirrors control planes is a standalone `webvh-watcher`. A test
 (`documented_daemon_routes_are_served` in `tests/e2e_daemon.rs`) holds this

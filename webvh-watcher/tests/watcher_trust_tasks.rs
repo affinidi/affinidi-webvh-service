@@ -1202,3 +1202,52 @@ async fn resolution_answers_conditional_requests_and_hides_disabled_slots() {
     restarted.prepare_mirror().await.unwrap();
     assert_eq!(get(&restarted, "/hana/did.jsonl", None).await.status(), 404);
 }
+
+// ---------------------------------------------------------------------------
+// `/livez` and `/readyz`
+// ---------------------------------------------------------------------------
+
+/// GET `path` on the probe routes. A fresh router per call builds its own
+/// probe, so no answer comes from an earlier call's one-second cache.
+async fn probe(state: &AppState, path: &str) -> (axum::http::StatusCode, Value) {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let resp = webvh_watcher::routes::health::probe_routes(state)
+        .oneshot(
+            axum::http::Request::get(path)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&body).expect("probe body is JSON"),
+    )
+}
+
+/// `/readyz` is the store: ready over a working one, `503` once its data
+/// directory is gone under the open store. `/livez` stays `200` throughout.
+#[tokio::test]
+async fn readyz_follows_the_store_and_livez_follows_nothing() {
+    use axum::http::StatusCode;
+    let (state, dir) = watcher_state().await;
+    let live = (StatusCode::OK, json!({"status": "ok"}));
+    assert_eq!(probe(&state, "/livez").await, live);
+    assert_eq!(
+        probe(&state, "/readyz").await,
+        (StatusCode::OK, json!({"status": "ready", "storage": "ok"}))
+    );
+
+    std::fs::remove_dir_all(dir.path()).unwrap();
+    assert_eq!(
+        probe(&state, "/readyz").await,
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"status": "notReady", "storage": "unavailable"})
+        )
+    );
+    assert_eq!(probe(&state, "/livez").await, live);
+}

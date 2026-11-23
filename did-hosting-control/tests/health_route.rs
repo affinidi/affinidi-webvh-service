@@ -140,3 +140,57 @@ async fn unhealthy_when_well_known_is_disabled() {
     let (status, _) = call_health(ts.router()).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
+
+// ---------------------------------------------------------------------------
+// `/livez` and `/readyz`
+// ---------------------------------------------------------------------------
+
+/// GET `path` on the control plane's probe routes. A fresh router per call
+/// builds its own probe, so no answer comes from an earlier call's cache.
+async fn call_probe(ts: &TestServer, path: &str) -> (StatusCode, Value) {
+    let response = did_hosting_control::routes::health::probe_routes(&ts.state)
+        .oneshot(Request::get(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&body).expect("probe body is JSON"),
+    )
+}
+
+/// `/readyz` is the store alone on a control plane: a stale own DID degrades
+/// `/api/health` but leaves the control plane ready, because it serves no
+/// resolution. With its data directory gone it is not ready, and `/livez`
+/// stays `200` throughout.
+#[tokio::test]
+async fn readyz_follows_the_store_and_livez_follows_nothing() {
+    let ts = TestServer::start().await;
+    let live = (StatusCode::OK, serde_json::json!({"status": "ok"}));
+    assert_eq!(call_probe(&ts, "/livez").await, live);
+    assert_eq!(
+        call_probe(&ts, "/readyz").await,
+        (
+            StatusCode::OK,
+            serde_json::json!({"status": "ready", "storage": "ok"})
+        )
+    );
+
+    seed_own_did(&ts, "did:webvh:stale:old-host.example").await;
+    assert_eq!(
+        call_health(ts.router()).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(call_probe(&ts, "/readyz").await.0, StatusCode::OK);
+
+    std::fs::remove_dir_all(ts.data_dir()).unwrap();
+    assert_eq!(
+        call_probe(&ts, "/readyz").await,
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"status": "notReady", "storage": "unavailable"})
+        )
+    );
+    assert_eq!(call_probe(&ts, "/livez").await, live);
+}

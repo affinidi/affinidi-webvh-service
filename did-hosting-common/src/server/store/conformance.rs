@@ -4,7 +4,8 @@
 //! callers rely on: round trips, byte-exact prefix scans (odd-length and
 //! glob-looking prefixes included), paging, the keys-only listing and count,
 //! all-or-nothing batches across keyspaces, the atomic `take`, `incr` and
-//! compare-and-swap under contention, and the per-item limit.
+//! compare-and-swap under contention, the per-item limit, and the readiness
+//! probe.
 //!
 //! Every keyspace the suite opens is named `{namespace}_{name}`, so runs
 //! sharing one Redis database or one emulator do not see each other's rows.
@@ -42,6 +43,19 @@ pub async fn run(store: &Store, ns: &str) {
     take_has_exactly_one_winner(store, ns).await;
     incr_never_loses_an_increment(store, ns).await;
     compare_and_swap_has_one_winner(store, ns).await;
+    the_readiness_probe_answers_and_writes_nothing(store, ns).await;
+}
+
+/// The `/readyz` store check answers `Ok` over a working store, and writes
+/// nothing (it runs every second for the life of the process).
+pub async fn the_readiness_probe_answers_and_writes_nothing(store: &Store, ns: &str) {
+    let ks = ks(store, ns, "probe");
+    ks.probe().await.expect("probe a working store");
+    ks.probe().await.expect("probe again");
+    assert!(
+        ks.iter_all().await.unwrap().is_empty(),
+        "the probe wrote to the keyspace it checked"
+    );
 }
 
 fn ks(store: &Store, ns: &str, name: &str) -> KeyspaceHandle {

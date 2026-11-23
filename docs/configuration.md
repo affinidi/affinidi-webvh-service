@@ -62,7 +62,7 @@ Below, `<P>` stands for a binary's env prefix.
 | --- | --- | --- | --- |
 | `didcomm` | `false` | `<P>_FEATURES_DIDCOMM` | Carry DIDComm on the mediator connection (needs `mediator_did`). |
 | `tsp` | `false` | `<P>_FEATURES_TSP` | Carry TSP on the same mediator socket; the DID advertises `TSPTransport`. Preferred over DIDComm when a peer advertises both. |
-| `http_listener` | `false` | `<P>_FEATURES_HTTP_LISTENER` (former `<P>_FEATURES_REST_API` still read; the new name wins) | Run the HTTP listener: the UI, `POST /api/trust-tasks`, `/api/health`, and a witness's or watcher's public routes. Read by control, witness and watcher. A control plane needs at least one of `http_listener`, `didcomm`, `tsp`. The edge and the daemon always serve HTTP and do not read it. Alias: `rest_api`. |
+| `http_listener` | `false` | `<P>_FEATURES_HTTP_LISTENER` (former `<P>_FEATURES_REST_API` still read; the new name wins) | Run the HTTP listener: the UI, `POST /api/trust-tasks`, `/api/health`, `/livez`, `/readyz`, and a witness's or watcher's public routes. Read by control, witness and watcher. A control plane needs at least one of `http_listener`, `didcomm`, `tsp`. The edge and the daemon always serve HTTP and do not read it. Alias: `rest_api`. |
 | `agent_names` | `true` | `<P>_FEATURES_AGENT_NAMES` | Serve the `/@{name}` redirects. Off: every `/@…` path is 404. |
 | `deployment_mode` | `standalone` | — | Set to `daemon` by the daemon itself; changes only UI behaviour. |
 
@@ -279,7 +279,7 @@ service. A self-managed daemon has no `[vta]`.
 | `reconcile_interval_secs` | `60` (must be below the bound) | `DID_HOSTING_REPLICATION_RECONCILE_INTERVAL_SECS` |
 
 The edge reconciles with its control plane every interval; past the bound
-without a clean reconcile, `/api/health` answers `503`.
+without a clean reconcile, `/api/health` and `/readyz` answer `503`.
 
 ### `[limits]` — `LimitsConfig`
 

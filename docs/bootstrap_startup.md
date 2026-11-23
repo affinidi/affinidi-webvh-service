@@ -204,8 +204,8 @@ On startup an edge with a mediator:
    resync request;
 4. reconciles against the control plane every `replication.reconcile_interval_secs`
    (60 s). If it goes longer than `replication.staleness_bound_secs` (300 s)
-   without a clean reconcile, `/api/health` answers `503` so a load balancer
-   drains it.
+   without a clean reconcile, `/api/health` and `/readyz` answer `503` so a
+   load balancer drains it.
 
 The control plane checks the registration's proof and that its signer has the
 `service` role, records the edge in the registry, and queues — in its
@@ -241,6 +241,11 @@ control plane's `[[registry.watchers]]` (`url` + `did`).
 ```bash
 # Liveness + own DID served (+ replication fresh, on an edge). 200 or 503.
 curl -i http://localhost:8530/api/health
+
+# Kubernetes-style probes: /livez is always 200; /readyz is 503 while the
+# store (or, on an edge, the /api/health condition) fails.
+curl -i http://localhost:8530/livez
+curl -i http://localhost:8530/readyz
 
 # Resolution. The root DID's log is served at /.well-known/did.jsonl.
 curl http://localhost:8530/.well-known/did.jsonl

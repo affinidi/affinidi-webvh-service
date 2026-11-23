@@ -966,6 +966,7 @@ fn run_rest_thread(
         // layers), so it closes over its own `AppState` rather than using
         // axum's `State` extractor.
         let health_state = state.clone();
+        let probe_state = state.clone();
         let trusted_proxies = state.config.server.trusted_proxies.clone();
         let app = base_router
             .with_state(state)
@@ -990,7 +991,8 @@ fn run_rest_thread(
                     let health_state = health_state.clone();
                     async move { routes::health::health(health_state).await }
                 }),
-            );
+            )
+            .merge(routes::health::probe_routes(&probe_state));
 
         // Signal that REST is ready to serve
         let _ = ready_tx.send(());

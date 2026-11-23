@@ -1283,6 +1283,9 @@ fn run_rest_thread(
             .expect("failed to convert std TcpListener to tokio TcpListener");
 
         let trusted_proxies = state.config.server.trusted_proxies.clone();
+        // Merged after the layers, like the edge's `/api/health`: outside
+        // request tracing (a probe every few seconds is noise there).
+        let probes = routes::health::probe_routes(&state);
         let app = routes::router()
             .with_state(state)
             .layer(
@@ -1296,7 +1299,8 @@ fn run_rest_thread(
             )
             .layer(axum::middleware::from_fn(
                 did_hosting_common::server::security_headers,
-            ));
+            ))
+            .merge(probes);
 
         let _ = ready_tx.send(());
 

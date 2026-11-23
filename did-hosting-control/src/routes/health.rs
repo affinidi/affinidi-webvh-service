@@ -39,3 +39,17 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
         }),
     )
 }
+
+/// The control plane's `/readyz` check: its store, and nothing else. Its
+/// `/api/health` own-DID check is about whether DID resolution serves the
+/// right identity, and a standalone control plane serves no resolution, so
+/// it is not a reason to stop sending it management traffic.
+pub fn readiness_probe(state: &AppState) -> did_hosting_common::server::probes::ReadinessProbe {
+    did_hosting_common::server::probes::ReadinessProbe::new(state.dids_ks.clone())
+}
+
+/// `GET /livez` and `GET /readyz` (see [`did_hosting_common::server::probes`]),
+/// merged after the router's layers so they sit outside request tracing.
+pub fn probe_routes(state: &AppState) -> axum::Router {
+    did_hosting_common::server::probes::router(readiness_probe(state))
+}

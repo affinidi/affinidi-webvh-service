@@ -260,8 +260,11 @@ costs the witness no DID resolution. Every other reply is signed by the
 witness.
 
 `GET /api/health` stays a plain, unauthenticated liveness probe. It is
-added by the standalone binary; the daemon's embedded witness has no health
-route of its own (probe the daemon's `/health`).
+added by the standalone binary, with `GET /livez` (always `200`, no checks)
+and `GET /readyz` (`503` while the witness store is unavailable; see
+[docs/deployment.md](../docs/deployment.md#health-checks)); the daemon's
+embedded witness has no probe routes of its own (probe the daemon's
+`/livez` and `/readyz`).
 
 ## Library Usage
 

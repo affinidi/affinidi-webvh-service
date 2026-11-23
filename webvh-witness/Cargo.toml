@@ -101,3 +101,5 @@ tempfile = { workspace = true }
 trust-tasks-rs = { workspace = true, features = ["validate"] }
 trust-tasks-proof = { workspace = true }
 http-body-util = { workspace = true }
+# `/livez` and `/readyz` are driven with `oneshot()`.
+tower = { workspace = true, features = ["util"] }
