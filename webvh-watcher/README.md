@@ -190,6 +190,8 @@ webvh-watcher health                           # Diagnostics
 | Method | Path                            | Description         |
 | ------ | ------------------------------- | ------------------- |
 | `GET`  | `/api/health`                   | Health check (standalone only; the daemon's embedded watcher has none) |
+| `GET`  | `/livez`                        | Kubernetes liveness: always `200`, no checks (standalone only) |
+| `GET`  | `/readyz`                       | Kubernetes readiness: `503` while the store is unavailable (standalone only) |
 | `GET`  | `/{mnemonic}/did.jsonl`         | Resolve DID log     |
 | `GET`  | `/{mnemonic}/did-witness.json`  | Resolve witness     |
 | `GET`  | `/.well-known/did.jsonl`        | Root DID log        |

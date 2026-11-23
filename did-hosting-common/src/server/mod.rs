@@ -44,6 +44,7 @@ pub mod operator_messages;
 pub mod passkey;
 pub mod path_locks;
 pub mod pending_purge;
+pub mod probes;
 pub mod problem_report;
 pub mod rate_limit;
 pub mod replay;

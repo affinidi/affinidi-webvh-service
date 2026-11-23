@@ -348,6 +348,7 @@ fn run_rest_thread(
             .trust_tasks_rate_limiter
             .spawn_gc(rate_limit_gc.clone());
         let trusted_proxies = state.config.server.trusted_proxies.clone();
+        let probes = routes::health::probe_routes(&state);
         let app = routes::router_with_resolve_limit(resolve_limit)
             .with_state(state)
             .layer(
@@ -362,7 +363,8 @@ fn run_rest_thread(
             .layer(axum::middleware::from_fn(
                 did_hosting_common::server::security_headers,
             ))
-            .route("/api/health", get(routes::health::health));
+            .route("/api/health", get(routes::health::health))
+            .merge(probes);
         let _ = ready_tx.send(());
         let mut rx = shutdown_rx.clone();
         // Header, idle, connection and per-address limits: see `listener`.

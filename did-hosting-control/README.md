@@ -354,6 +354,8 @@ The control plane has no REST management API. Its HTTP surface is:
 | ------ | ---- | ----------- |
 | `POST` | `/api/trust-tasks` | The HTTPS binding of the Trust Task listener: the same dispatch TSP and DIDComm reach. Every management operation arrives here, authorised on the document's own proof. |
 | `GET` | `/api/health` | Unauthenticated liveness probe |
+| `GET` | `/livez` | Kubernetes liveness: always `200 {"status":"ok"}`, no checks |
+| `GET` | `/readyz` | Kubernetes readiness: `503` while the store is unavailable; see [docs/deployment.md](../docs/deployment.md#health-checks) |
 | `GET` | `/api/sign-in/readiness` | Whether this service's DID lists the services wallet sign-in needs (read by the login page) |
 | `POST` | `/api/auth/challenge` | Mint a sign-in challenge nonce, for a browser that holds no key to sign a Trust Task with yet. The same challenge is the `auth/challenge/0.1` Trust Task. |
 | `GET` | `/*` | The management UI (`ui` feature), for any other path |

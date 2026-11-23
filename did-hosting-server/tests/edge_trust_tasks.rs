@@ -917,6 +917,74 @@ async fn health_degrades_past_the_staleness_bound() {
     assert!(!status.is_fresh(now_epoch(), bound));
 }
 
+async fn probe(state: &AppState, path: &str) -> (axum::http::StatusCode, Value) {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    // A fresh router per call: each builds its own probe, so no answer is
+    // served from an earlier call's one-second cache.
+    let resp = did_hosting_server::routes::health::probe_routes(state)
+        .oneshot(
+            axum::http::Request::get(path)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&body).expect("probe body is JSON"),
+    )
+}
+
+/// `/livez` is the process alone; `/readyz` is the store plus the condition
+/// `/api/health` reports. Past the staleness bound the edge is not ready
+/// (`serving`), with a working store; once its data directory is gone it is
+/// not ready (`storage`); `/livez` stays `200` through both.
+#[tokio::test]
+async fn readyz_follows_the_store_and_the_staleness_bound_and_livez_does_not() {
+    use axum::http::StatusCode;
+    use did_hosting_common::server::auth::session::now_epoch;
+
+    let (state, dir) = edge_state().await;
+    let live = (StatusCode::OK, json!({"status": "ok"}));
+    assert_eq!(probe(&state, "/livez").await, live);
+    assert_eq!(
+        probe(&state, "/readyz").await,
+        (
+            StatusCode::OK,
+            json!({"status": "ready", "storage": "ok", "serving": "ok"})
+        )
+    );
+
+    let bound = state.config.replication.staleness_bound_secs;
+    state
+        .replication
+        .set_last_reconciled_at(now_epoch() - bound - 1);
+    assert_eq!(
+        probe(&state, "/readyz").await,
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"status": "notReady", "storage": "ok", "serving": "unavailable"})
+        )
+    );
+    assert_eq!(probe(&state, "/livez").await, live);
+
+    state.replication.mark_reconciled(now_epoch());
+    assert_eq!(probe(&state, "/readyz").await.0, StatusCode::OK);
+
+    std::fs::remove_dir_all(dir.path()).unwrap();
+    assert_eq!(
+        probe(&state, "/readyz").await,
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"status": "notReady", "storage": "unavailable", "serving": "unavailable"})
+        )
+    );
+    assert_eq!(probe(&state, "/livez").await, live);
+}
+
 /// The bound must be longer than the reconcile interval.
 #[test]
 fn a_bound_the_interval_cannot_keep_is_refused() {

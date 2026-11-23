@@ -69,6 +69,10 @@ pub mod key_prefix {
 // Types
 // ---------------------------------------------------------------------------
 
+/// The key [`StorageBackend::probe`]'s default reads.
+/// Nothing stores it; the read only has to come back.
+const PROBE_KEY: &[u8] = b"readyz:probe";
+
 /// A key-value pair of raw bytes from a prefix scan.
 pub type RawKvPair = (Vec<u8>, Vec<u8>);
 
@@ -292,6 +296,20 @@ pub trait StorageBackend: Send + Sync {
 
     fn batch(&self) -> Box<dyn BatchOps>;
     fn persist(&self) -> BoxFuture<'_, Result<(), AppError>>;
+
+    /// A cheap check that the store can serve requests through `ks` (one
+    /// of this backend's keyspaces) right now, for the `/readyz` probe
+    /// ([`crate::server::probes`]). Never writes and never syncs: it runs
+    /// once a second for as long as the process lives.
+    ///
+    /// The default, for the network backends (Redis, DynamoDB, Firestore,
+    /// Cosmos DB), is one point read in `ks` of a key nothing stores: a
+    /// single round trip that proves the backend answers for a keyspace the
+    /// caller already uses. fjall overrides it, because an open fjall
+    /// database answers reads from memory after its directory is gone.
+    fn probe<'a>(&'a self, ks: &'a dyn KeyspaceOps) -> BoxFuture<'a, Result<(), AppError>> {
+        Box::pin(async move { ks.get_raw(PROBE_KEY.to_vec()).await.map(|_| ()) })
+    }
 
     /// See [`Store::max_item_bytes`]. `None` (the default) when the backend
     /// has no per-item limit a caller would reach.
@@ -525,6 +543,12 @@ impl KeyspaceHandle {
         WriteBatch {
             inner: self.backend.batch(),
         }
+    }
+
+    /// Whether the store can serve requests through this keyspace right
+    /// now: see [`StorageBackend::probe`]. Cheap, and never writes.
+    pub async fn probe(&self) -> Result<(), AppError> {
+        self.backend.probe(&*self.inner).await
     }
 
     pub async fn insert<V: Serialize>(

@@ -35,7 +35,8 @@ did-hosting-daemon --config config.toml health --strict # also fail on warnings
    not served, and anything loaded on an edge directly (`load-did`,
    `bootstrap-did`) is deleted the next time the edge registers (only the edge's
    own DID is exempt). Publish through the control plane.
-2. **Is the edge current?** `GET /api/health` answers `503` (`"degraded"`) when
+2. **Is the edge current?** `GET /api/health` answers `503` (`"degraded"`), and
+   `GET /readyz` answers `503` with `"serving":"unavailable"`, when
    the edge has not reconciled with its control plane within
    `replication.staleness_bound_secs` (300 s). An edge with no mediator logs
    `no messaging service: this edge cannot reconcile with its control plane`

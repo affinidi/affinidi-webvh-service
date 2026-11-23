@@ -624,6 +624,7 @@ async fn run_daemon(config_path: Option<PathBuf>) -> Result<(), AppError> {
     };
 
     // Apply tracing layer, then add health route *after* so it's not traced
+    let probe = daemon_readiness_probe(&config, &main_store, &witness_store, &dids_ks)?;
     let health_ks = dids_ks.clone();
     let health_did = config.server_did.clone();
     let app = combined
@@ -654,7 +655,8 @@ async fn run_daemon(config_path: Option<PathBuf>) -> Result<(), AppError> {
                 let (ks, did) = (health_ks.clone(), health_did.clone());
                 async move { daemon_health(&ks, did.as_deref()).await }
             }),
-        );
+        )
+        .merge(did_hosting_common::server::probes::router(probe));
 
     // Log startup summary
     info!("--- daemon services ---");
@@ -1348,6 +1350,41 @@ async fn daemon_health(
             "version": env!("CARGO_PKG_VERSION"),
         })),
     )
+}
+
+/// The daemon's `/readyz` check: every store it serves from (the main one,
+/// and the witness store when the witness is on) and, when it serves DIDs
+/// (the server is on), the same own-DID check as `/health`, as `serving`. An
+/// instance serving the wrong identity at its root should not receive
+/// resolution traffic. There is no replication bound to check: the embedded
+/// server reads the store its in-process control plane writes.
+fn daemon_readiness_probe(
+    config: &DaemonConfig,
+    main_store: &Store,
+    witness_store: &Store,
+    dids_ks: &KeyspaceHandle,
+) -> Result<did_hosting_common::server::probes::ReadinessProbe, AppError> {
+    use did_hosting_common::server::probes::ReadinessProbe;
+    let mut stores = vec![main_store.keyspace(KS_DIDS)?];
+    if config.enable.witness {
+        stores.push(witness_store.keyspace(did_hosting_common::server::store::KS_WITNESSES)?);
+    }
+    let probe = ReadinessProbe::over(stores);
+    if !config.enable.server {
+        return Ok(probe);
+    }
+    let (ks, did) = (dids_ks.clone(), config.server_did.clone());
+    Ok(probe.with_serving_check(Arc::new(move || {
+        let (ks, did) = (ks.clone(), did.clone());
+        Box::pin(async move {
+            if did_hosting_common::server::health::own_did_served_locally(&ks, did.as_deref()).await
+            {
+                Ok(())
+            } else {
+                Err("the daemon's own DID is not served from its store".into())
+            }
+        })
+    })))
 }
 
 fn print_banner() {

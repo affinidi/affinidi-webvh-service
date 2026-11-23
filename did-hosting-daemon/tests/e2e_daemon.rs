@@ -324,6 +324,12 @@ enable_watcher = {watcher}
             .expect("GET the daemon")
     }
 
+    /// Where setup rooted the daemon's stores: the main store at
+    /// `<data>/store`, the witness store at `<data>/witness`.
+    fn data_dir(&self) -> std::path::PathBuf {
+        self._dir.path().join("data")
+    }
+
     async fn teardown(mut self) {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
@@ -913,6 +919,54 @@ async fn send_trust_task_lists_identity_generations() {
         !unknown.status.success(),
         "an unknown version must be refused"
     );
+
+    daemon.teardown().await;
+}
+
+/// `/livez` and `/readyz` are served at the daemon's root, outside the
+/// resolution rate limit. `/readyz` covers both stores the daemon serves
+/// from and, with the server on, its own DID; with the witness store's
+/// directory gone under the running daemon it answers `503`, naming only the
+/// failed check, while `/livez` stays `200`.
+#[tokio::test]
+async fn livez_and_readyz_are_served_and_readyz_follows_the_stores() {
+    let daemon = Daemon::spawn().await;
+    let http = reqwest::Client::new();
+    let get = |path: &'static str| {
+        let (http, url) = (http.clone(), format!("{}{path}", daemon.base_url));
+        async move {
+            let resp = http.get(url).send().await.expect("GET the daemon");
+            let status = resp.status();
+            (
+                status,
+                resp.json::<serde_json::Value>().await.expect("JSON"),
+            )
+        }
+    };
+    let live = (reqwest::StatusCode::OK, serde_json::json!({"status": "ok"}));
+
+    assert_eq!(get("/livez").await, live);
+    assert_eq!(
+        get("/readyz").await,
+        (
+            reqwest::StatusCode::OK,
+            serde_json::json!({"status": "ready", "storage": "ok", "serving": "ok"})
+        )
+    );
+
+    std::fs::remove_dir_all(daemon.data_dir().join("witness")).expect("remove the witness store");
+    // The previous answer is cached for a second.
+    wait_until(
+        || async { get("/readyz").await.0 == reqwest::StatusCode::SERVICE_UNAVAILABLE },
+        SETTLE_TIMEOUT,
+        "/readyz answers 503 once a store is gone",
+    )
+    .await;
+    assert_eq!(
+        get("/readyz").await.1,
+        serde_json::json!({"status": "notReady", "storage": "unavailable", "serving": "unavailable"})
+    );
+    assert_eq!(get("/livez").await, live);
 
     daemon.teardown().await;
 }

@@ -192,6 +192,12 @@ impl TestServer {
         Self { state, _dir: dir }
     }
 
+    /// The fjall data directory the store was opened in. A test may delete
+    /// it under the open store (the readiness probe's not-ready case).
+    pub fn data_dir(&self) -> &std::path::Path {
+        self._dir.path()
+    }
+
     /// The real control-plane router, ready for `tower::ServiceExt::oneshot`.
     ///
     /// This is the fallback-free router the route tests drive — it 404s an

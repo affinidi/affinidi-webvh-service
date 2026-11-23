@@ -29,7 +29,13 @@ pub struct FjallBackend {
     /// with every keyspace handle, so it runs as long as anything can
     /// still write.
     flusher: Arc<super::flusher::Flusher>,
+    /// The directory the database was opened in, for [`StorageBackend::probe`].
+    data_dir: std::path::PathBuf,
 }
+
+/// fjall's on-disk "this directory is a database root" marker
+/// (`fjall::file::VERSION_MARKER`, which the crate does not re-export).
+const FJALL_VERSION_MARKER: &str = "version";
 
 /// The read-modify-write locks shared by every handle to one keyspace.
 #[derive(Default)]
@@ -133,6 +139,7 @@ impl FjallBackend {
             db,
             locks: StdMutex::new(HashMap::new()),
             flusher: Arc::new(flusher),
+            data_dir: config.data_dir.clone(),
         })
     }
 
@@ -172,6 +179,30 @@ impl StorageBackend for FjallBackend {
                 .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
                 .map_err(|e| AppError::Store(e.to_string()))?;
             Ok(())
+        })
+    }
+
+    /// Two checks, neither a write nor a sync. An open database goes on
+    /// answering from memory after its directory is deleted or its volume
+    /// unmounted, so the version marker must still be there; and once fjall
+    /// has hit an I/O error it is poisoned, which a buffer-only persist (no
+    /// fsync) reports.
+    fn probe<'a>(&'a self, _ks: &'a dyn KeyspaceOps) -> BoxFuture<'a, Result<(), AppError>> {
+        let db = self.db.clone();
+        let marker = self.data_dir.join(FJALL_VERSION_MARKER);
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                if !marker.is_file() {
+                    return Err(AppError::Store(format!(
+                        "store directory no longer holds the database ({} is missing)",
+                        marker.display()
+                    )));
+                }
+                db.persist(PersistMode::Buffer)
+                    .map_err(|e| AppError::Store(e.to_string()))
+            })
+            .await
+            .map_err(|e| AppError::Internal(format!("blocking task panicked: {e}")))?
         })
     }
 }

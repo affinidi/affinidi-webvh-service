@@ -257,6 +257,8 @@ cargo build --locked -p did-hosting-server --release \
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/api/health` | Liveness probe; `503` when the edge's own DID is not served locally or it is past the staleness bound |
+| `GET` | `/livez` | Kubernetes liveness: always `200 {"status":"ok"}`, no checks |
+| `GET` | `/readyz` | Kubernetes readiness: `503` while the store is unavailable (`storage`) or the `/api/health` condition fails (`serving`); see [docs/deployment.md](../docs/deployment.md#health-checks) |
 | `POST` | `/api/trust-tasks` | The HTTPS binding of the edge's Trust Task listener (its control plane only) |
 | `GET` | `/{mnemonic}/did.jsonl`, `/.well-known/did.jsonl` | `did:webvh` log |
 | `GET` | `/{mnemonic}/did-witness.json`, `/.well-known/did-witness.json` | `did:webvh` witness proofs |
