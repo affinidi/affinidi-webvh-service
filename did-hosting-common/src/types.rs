@@ -87,9 +87,9 @@ impl std::fmt::Debug for AuthenticatePayload {
 /// Aligns with OIDC Core §2 / RFC 8176:
 /// - `amr`: authentication method references. did-hosting vocabulary
 ///   uses `"did"` (SIOPv2 id_token), `"passkey"` (WebAuthn assertion),
-///   `"vta"` (VTA approval token), `"cli"` (process-local synthesis).
+///   `"cli"` (process-local synthesis).
 /// - `acr`: authentication context class. `"aal1"` for single-factor
-///   DID, `"aal2"` after a step-up (passkey or VTA approval).
+///   DID, `"aal2"` after a step-up (passkey or wallet-signed approval).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
