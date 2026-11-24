@@ -63,7 +63,7 @@ path = "src/main.rs"
 did-hosting-common = { version = "0.12", path = "../did-hosting-common", features = ["server-core", "setup-wizard"] }
 # OpenAPI spec generation (behind the off-by-default `openapi` feature).
 utoipa = { version = "6", optional = true }
-vti-common = { version = "0.68", default-features = false }
+vti-common = { version = "0.70", default-features = false }
 async-trait = { workspace = true }
 affinidi-tdk = { workspace = true }
 # Trust Tasks: the server consumes infrastructure trust tasks (health ping,
