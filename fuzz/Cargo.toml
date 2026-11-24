@@ -33,7 +33,7 @@ did-hosting-common = { path = "../did-hosting-common" }
 
 # Only for the `server-core` targets: names the `TrustTask<Value>` document
 # type the listeners parse. Same requirement as the workspace's.
-trust-tasks-rs = { version = "0.39.0", default-features = false, optional = true }
+trust-tasks-rs = { version = "0.41.0", default-features = false, optional = true }
 
 [features]
 # The targets for code that exists only in server builds (the Trust Task

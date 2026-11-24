@@ -35,26 +35,16 @@ method-web = ["did-hosting-common/method-web"]
 # did:webs DIDs should not carry. Registers `/{*mnemonic}/keri.cesr` and
 # claims `/{*mnemonic}/did.json` for did:webs records only.
 method-webs = ["did-hosting-common/method-webs"]
-aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "did-hosting-common/aws-secrets"]
-gcp-secrets = [
-  "dep:google-cloud-secretmanager-v1",
-  "dep:google-cloud-auth",
-  "did-hosting-common/gcp-secrets",
-]
-azure-secrets = [
-  "dep:azure_security_keyvault_secrets",
-  "dep:azure_identity",
-  "dep:azure_core",
-  "dep:futures",
-  "did-hosting-common/azure-secrets",
-]
+aws-secrets = ["did-hosting-common/aws-secrets"]
+gcp-secrets = ["did-hosting-common/gcp-secrets"]
+azure-secrets = ["did-hosting-common/azure-secrets"]
 vault-secrets = ["did-hosting-common/vault-secrets"]
 k8s-secrets = ["did-hosting-common/k8s-secrets"]
-store-fjall = ["dep:fjall", "did-hosting-common/store-fjall"]
-store-redis = ["dep:redis", "did-hosting-common/store-redis"]
-store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "did-hosting-common/store-dynamodb"]
-store-firestore = ["dep:firestore", "dep:futures", "did-hosting-common/store-firestore"]
-store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures", "did-hosting-common/store-cosmosdb"]
+store-fjall = ["did-hosting-common/store-fjall"]
+store-redis = ["did-hosting-common/store-redis"]
+store-dynamodb = ["did-hosting-common/store-dynamodb"]
+store-firestore = ["did-hosting-common/store-firestore"]
+store-cosmosdb = ["did-hosting-common/store-cosmosdb"]
 # Generate an OpenAPI 3.1 spec for the HTTP upload/resolve API (issue #47).
 # Off by default — only the `openapi_snapshot` test and a doc-gen build need it.
 # Requires method-webvh and method-web (both methods' resolve paths are
@@ -73,7 +63,7 @@ path = "src/main.rs"
 did-hosting-common = { version = "0.12", path = "../did-hosting-common", features = ["server-core", "setup-wizard"] }
 # OpenAPI spec generation (behind the off-by-default `openapi` feature).
 utoipa = { version = "6", optional = true }
-vti-common = { version = "0.66", default-features = false }
+vti-common = { version = "0.68", default-features = false }
 async-trait = { workspace = true }
 affinidi-tdk = { workspace = true }
 # Trust Tasks: the server consumes infrastructure trust tasks (health ping,
@@ -101,7 +91,6 @@ dialoguer = { workspace = true }
 didwebvh-rs = { workspace = true }
 url = { workspace = true }
 ed25519-dalek = { workspace = true }
-fjall = { workspace = true, optional = true }
 hex = "0.4"
 ipnetwork = "0.21"
 jsonwebtoken = { workspace = true }
@@ -119,24 +108,8 @@ sha2 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
-aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
-aws-config = { version = "1", features = [
-  "behavior-version-latest",
-], optional = true }
 
-google-cloud-secretmanager-v1 = { version = "1", optional = true }
-google-cloud-auth = { version = "1", optional = true }
 bytes = "1"
-redis = { version = "1.0", features = ["tokio-comp", "aio"], optional = true }
-aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
-firestore = { version = "0.61", optional = true }
-futures = { version = "0.3", optional = true }
-azure_data_cosmos = { version = "1", features = [
-  "key_auth",
-], optional = true }
-azure_core = { version = "1.0", optional = true }
-azure_security_keyvault_secrets = { version = "1.0", optional = true }
-azure_identity = { version = "1.0", optional = true }
 
 # ── Allocator ────────────────────────────────────────────────────────────
 # jemalloc, used by the `did-hosting-server` binary only (set as the global

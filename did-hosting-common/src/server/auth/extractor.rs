@@ -69,7 +69,7 @@ pub struct AuthClaims {
     /// JWT.
     pub session_pubkey_b58btc: Option<String>,
     /// Authentication methods on the session (`["did"]` base, plus
-    /// `"webauthn"`/`"vta"` after a step-up). Read from the session row,
+    /// `"passkey"` after a passkey step-up). Read from the session row,
     /// not the JWT — see [`FromRequestParts`] impl below — so a demotion
     /// (e.g. `demote_non_passkey_step_up_sessions`) is reflected on the
     /// very next request rather than waiting for the token to be refreshed.

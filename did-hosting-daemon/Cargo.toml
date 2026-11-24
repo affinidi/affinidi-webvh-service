@@ -187,7 +187,7 @@ didwebvh-rs = { workspace = true }
 # file, this workspace's tests drive genuine TSP traffic through it (the
 # admin RPC client's TSP transport), so — unlike every other consumer of this
 # dependency in the workspace — the `tsp` feature is turned on here.
-affinidi-messaging-test-mediator = { version = "0.52.0", features = ["tsp"] }
+affinidi-messaging-test-mediator = { version = "0.55.0", features = ["tsp"] }
 # A hand-rolled capturing `TspHandler` for the e2e admin RPC client (there is
 # no library-provided one — every other TSP-driving test in this workspace
 # dispatches in-process instead of over a real socket).
@@ -199,4 +199,4 @@ http-body-util = { workspace = true }
 # has to resolve a real did:webvh whose host is `localhost`, which the
 # resolver's default `PublicOnly` policy refuses (SSRF hardening that a
 # same-machine test has no use for).
-affinidi-did-web = "0.1"
+affinidi-did-web = "0.2"
