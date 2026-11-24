@@ -8,12 +8,14 @@ Every crate moves to the Affinidi TDK generation built on
 `affinidi-tsp` 0.5, `vta-sdk` 0.92, `vti-common` 0.68, `vti-secrets` 0.41,
 the `trust-tasks-*` crates 0.41 and `agent-names` 0.2 (#486).
 
-- `didwebvh-rs` is required as `0.8.3` instead of exactly `=0.8.2`. The exact
-  pin was a stopgap: 0.8.3 accepts the newer generation, so an unlocked build
-  (`cargo install` without `--locked`) of 0.12 gave it different
-  `affinidi-data-integrity` and `affinidi-secrets-resolver` copies from the
-  rest of the service and did not compile. Now the whole workspace is on
-  that generation.
+- `didwebvh-rs` is required as `0.8.3`. Since didwebvh-rs 0.8.3, which
+  accepts the newer generation, an unlocked build (`cargo install` without
+  `--locked`) gave it different `affinidi-data-integrity` and
+  `affinidi-secrets-resolver` copies from the rest of the service, and the
+  binaries failed to compile. An exact `=0.8.2` pin worked around that while
+  `vta-sdk` and `vti-common` were still on the old generation. With the whole
+  workspace on the new one, the pin is gone and unlocked builds compile
+  again. Locked builds were never affected.
 - `jsonwebtoken` moves from 10 to 12, the version `trust-tasks-https` and
   `vti-common` now use, so the service ships one copy instead of two. It is
   built with the `aws_lc_rs` backend, as they build it, instead of
