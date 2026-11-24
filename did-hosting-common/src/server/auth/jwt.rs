@@ -10,13 +10,13 @@ use tracing::debug;
 
 /// Idempotently install the process-level `jsonwebtoken::CryptoProvider`.
 ///
-/// `jsonwebtoken` 10.x supports two providers (`rust_crypto` + `aws_lc_rs`)
-/// and refuses to auto-pick when both features are compiled in. That state
-/// is reachable when this crate is built alongside another that pulls in
-/// `aws_lc_rs` — feature unification turns on both — for example
-/// `affinidi-messaging-test-mediator` in dev-deps. We always pick
-/// `rust_crypto` (matches our workspace dep declaration), and the
-/// `OnceLock` makes the install a no-op on subsequent calls.
+/// `jsonwebtoken` supports two providers (`aws_lc_rs` + `rust_crypto`) and
+/// refuses to auto-pick when both features are compiled in. We declare
+/// `aws_lc_rs`, as `trust-tasks-https` and `vti-common` do, so a normal build
+/// has exactly one; but feature unification can turn `rust_crypto` on too if
+/// any crate in a build asks for it. Installing `aws_lc_rs` explicitly keeps
+/// JWT operations working in that case, and the `OnceLock` makes the install
+/// a no-op on subsequent calls.
 ///
 /// Safe to call from any thread, any number of times. Always called
 /// before encode/decode so JWT operations work regardless of which
@@ -24,18 +24,15 @@ use tracing::debug;
 fn ensure_jwt_crypto_provider() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
-        // When both providers are unified by cargo (e.g. when our build
-        // also pulls in `aws_lc_rs` via test-mediator dev-deps), install
-        // `rust_crypto` explicitly to match the workspace dep declaration.
         // When only one provider is active the call is redundant —
         // `install_default` returns `Err(already installed)` and we ignore.
-        let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
+        let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
     });
 }
 
 /// Default authentication methods (`amr`) for a base login: a single
 /// `did` factor (did:key over REST SIOP / DIDComm authcrypt). Step-up
-/// adds factors (`webauthn`, `vta`) and bumps `acr` to `aal2`.
+/// adds a factor (`passkey`) and bumps `acr` to `aal2`.
 fn default_amr() -> Vec<String> {
     vec!["did".to_string()]
 }
@@ -61,7 +58,7 @@ pub struct Claims {
     #[serde(default)]
     pub jti: String,
     /// Authentication methods references (RFC 8176-style). Base login is
-    /// `["did"]`; step-up appends `"webauthn"` or `"vta"`.
+    /// `["did"]`; a passkey step-up appends `"passkey"`.
     #[serde(default = "default_amr")]
     pub amr: Vec<String>,
     /// Authentication context class / assurance level. `"aal1"` for a base

@@ -13,15 +13,6 @@ version = 2
 # its ignore in the same PR.
 unused-ignored-advisory = "deny"
 ignore = [
-  { id = "RUSTSEC-2023-0071", reason = "Marvin Attack on the `rsa` crate. Pulled in transitively by jsonwebtoken, but webvh JWTs use Ed25519 (EdDSA), so the RSA timing sidechannel is not on any code path we exercise." },
-  # crypto-bigint 0.5.5 reaches us only through jsonwebtoken's `rust_crypto`
-  # backend (elliptic-curve 0.13 -> p256/p384, for ES256/ES384). We sign and
-  # verify EdDSA only (`server/auth/jwt.rs`), so no secret ever reaches that
-  # arithmetic. The fix exists only in 0.7.6+; there is no patched 0.5.x, and
-  # the 0.7 copy we resolve is 0.7.10. The ignore is by ID and also covers the
-  # 0.7 line, so a downgrade below 0.7.6 there would be silenced.
-  # Re-evaluate when jsonwebtoken moves to the elliptic-curve 0.14 line.
-  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 — transitive via jsonwebtoken's p256/p384 only; our JWTs are EdDSA. No patched 0.5.x; our 0.7 copy is on 0.7.10." },
   # Unmaintained-status advisories on transitive crates. These are not
   # exploitable vulnerabilities — the upstreams that pull them haven't migrated
   # yet, and we don't depend on any of them directly. Revisit as the relevant
@@ -30,12 +21,15 @@ ignore = [
   { id = "RUSTSEC-2024-0384", reason = "`instant` unmaintained — transitive only (no direct dependency); upstreams haven't migrated to web-time." },
   { id = "RUSTSEC-2025-0012", reason = "`backoff` unmaintained — transitive only (no direct dependency)." },
   { id = "RUSTSEC-2026-0441", reason = "`pin-utils` unmaintained — transitive only, via aws-smithy-{http,runtime,types}; no safe upgrade exists. Revisit when the AWS SDK moves to `pin-project-lite` / `std::pin::pin!`." },
-  # Status-only "unmaintained" advisories (2026-11-17), no fixed release and no
+  # Status-only "unmaintained" advisory (2026-11-17), no fixed release and no
   # reported vulnerability. chrono is used directly here and through the
   # affinidi-tdk stack, so it cannot leave the graph from this repo alone.
   { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (chronotope/chrono#1768): status only, no vulnerability, no fixed release. Used directly and through the affinidi-tdk stack. Remove when this workspace and affinidi-tdk-rs have migrated to `jiff` or `time`." },
-  { id = "RUSTSEC-2026-0542", reason = "humantime marked unmaintained because chrono is: status only, no vulnerability; humantime 2.4.0 has no dependencies, so chrono's status does not reach it. Remove with RUSTSEC-2026-0543, or when nothing here depends on humantime." },
 ]
+# Removed with the affinidi-tdk 0.49 / jsonwebtoken 12 move (#486), whose
+# crates are no longer in the lock: RUSTSEC-2023-0071 (rsa) and
+# RUSTSEC-2026-0387 (crypto-bigint 0.5), both reached only through
+# jsonwebtoken 10's `rust_crypto` backend, and RUSTSEC-2026-0542 (humantime).
 # Removed with the vta-sdk 0.21 / vti-common 0.11.33 bump, which dropped the
 # whole `ssi-*` / `json-ld` subtree and the old `proc-macro-error` generation:
 #   RUSTSEC-2024-0370 (proc-macro-error), RUSTSEC-2026-0173 (proc-macro-error2),
@@ -64,50 +58,29 @@ multiple-versions = "warn"
 skip = [
   # RustCrypto's 2024-25 release generation (digest 0.10 -> 0.11, signature 2
   # -> 3, elliptic-curve 0.13 -> 0.14, ed25519-dalek 2 -> 3, ...). We and the
-  # Affinidi stack are on the new generation; jsonwebtoken (both majors),
-  # webauthn-rs, the KERI stack (argon2 0.5) and the cloud SDKs
+  # Affinidi stack are on the new generation; webauthn-rs, the KERI stack (argon2 0.5) and the cloud SDKs
   # are still on the old one.
   "aead@0.5.2",
   "aes@0.8.4",
   "argon2@0.5.3",
-  "base16ct@0.2.0",
   "blake2@0.10.6",
   "block-buffer@0.10.4",
   "block-padding@0.3.3",
   "cbc@0.1.2",
   "cipher@0.4.4",
-  "const-oid@0.9.6",
   "cpufeatures@0.2.17",
-  "crypto-bigint@0.5.5",
   "crypto-common@0.1.7",
-  "curve25519-dalek@4.1.3",
-  "der@0.7.10",
   "digest@0.10.7",
-  "ecdsa@0.16.9",
-  "ed25519@2.2.3",
-  "ed25519-dalek@2.2.0",
-  "elliptic-curve@0.13.8",
-  "ff@0.13.1",
-  "fiat-crypto@0.2.9",
-  "group@0.13.0",
   "hkdf@0.12.4",
   "hmac@0.12.1",
   "inout@0.1.4",
   "num-bigint@0.4.8",
-  "p256@0.13.2",
-  "p384@0.13.1",
   "password-hash@0.5.0",
-  "pem-rfc7468@0.7.0",
-  "pkcs8@0.10.2",
   "poly1305@0.8.0",
-  "primeorder@0.13.6",
-  "rfc6979@0.4.0",
   "salsa20@0.10.2",
-  "sec1@0.7.3",
   "sha1@0.10.7",
   "sha2@0.10.9",
   "signature@2.2.0",
-  "spki@0.7.3",
   "universal-hash@0.5.1",
   # rand 0.8 / 0.9 / 0.10 and their cores: the same generational split.
   "getrandom@0.2.17",
@@ -122,17 +95,25 @@ skip = [
   # the note on `base64` in Cargo.toml).
   "base64@0.21.7",
   "base64@0.22.1",
-  # jsonwebtoken 10 is ours, 11 arrives with vti-common / the mediator /
-  # google-cloud-auth (see the note on `jsonwebtoken` in Cargo.toml).
-  "jsonwebtoken@10.4.0",
+  # jsonwebtoken 12 is ours (and trust-tasks-https's and vti-common's); 11
+  # arrives only with the test mediator (dev graph) and google-cloud-auth (the
+  # `gcp-secrets` / `store-firestore` backends). pem 3 comes with it.
+  "jsonwebtoken@11.1.0",
+  "pem@3.0.6",
   # tower-http 0.6 via reqwest 0.13 and kube-client; we are on 0.7.
   "tower-http@0.6.11",
   # tokio-tungstenite / tungstenite 0.29 via axum 0.8's `ws`; the messaging
   # SDK is on 0.30.
   "tokio-tungstenite@0.29.0",
   "tungstenite@0.29.0",
-  # serde_json_canonicalizer 0.3 via affinidi-data-integrity 0.8.
-  "serde_json_canonicalizer@0.3.2",
+  # trust-tasks 0.40 via affinidi-messaging-sdk 0.50 / the mediator 0.55,
+  # which have not yet moved to the 0.41 line vta-sdk 0.92 and we are on (see
+  # the Trust Tasks note in Cargo.toml). trust-tasks-build 0.1 is the build
+  # dependency of vti-specs-*; regress 0.11 comes with its typify.
+  "trust-tasks-rs@0.40.5",
+  "trust-tasks-proof@0.40.5",
+  "trust-tasks-build@0.1.4",
+  "regress@0.11.1",
   # thiserror 1 via asn1-rs / x509-parser (webauthn-rs) and vaultrs.
   "thiserror@1.0.69",
   "thiserror-impl@1.0.69",
