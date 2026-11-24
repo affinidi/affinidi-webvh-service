@@ -97,22 +97,15 @@ skip = [
   "base64@0.22.1",
   # jsonwebtoken 12 is ours (and trust-tasks-https's and vti-common's); 11
   # arrives only with the test mediator (dev graph) and google-cloud-auth (the
-  # `gcp-secrets` / `store-firestore` backends). pem 3 comes with it.
+  # `gcp-secrets` / `store-firestore` backends).
   "jsonwebtoken@11.1.0",
-  "pem@3.0.6",
   # tower-http 0.6 via reqwest 0.13 and kube-client; we are on 0.7.
   "tower-http@0.6.11",
   # tokio-tungstenite / tungstenite 0.29 via axum 0.8's `ws`; the messaging
   # SDK is on 0.30.
   "tokio-tungstenite@0.29.0",
   "tungstenite@0.29.0",
-  # trust-tasks 0.40 via affinidi-messaging-sdk 0.50 / the mediator 0.55,
-  # which have not yet moved to the 0.41 line vta-sdk 0.92 and we are on (see
-  # the Trust Tasks note in Cargo.toml). trust-tasks-build 0.1 is the build
-  # dependency of vti-specs-*; regress 0.11 comes with its typify.
-  "trust-tasks-rs@0.40.5",
-  "trust-tasks-proof@0.40.5",
-  "trust-tasks-build@0.1.4",
+  # regress 0.11 comes with the typify that trust-tasks-build uses.
   "regress@0.11.1",
   # thiserror 1 via asn1-rs / x509-parser (webauthn-rs) and vaultrs.
   "thiserror@1.0.69",
