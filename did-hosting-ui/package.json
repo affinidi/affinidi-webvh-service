@@ -17,7 +17,7 @@
   "dependencies": {
     "@expo-google-fonts/figtree": "^0.4.1",
     "@expo/metro-runtime": "~58.0.14",
-    "expo": "^58.0.14",
+    "expo": "^58.0.23",
     "expo-clipboard": "~58.0.3",
     "expo-constants": "~58.0.12",
     "expo-font": "~58.0.8",
