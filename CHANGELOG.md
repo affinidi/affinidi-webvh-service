@@ -1,8 +1,2527 @@
 # Changelog
 
-## Unreleased
+## 0.12.0 (2026-11-25)
 
-Entries for the next release are kept in [`changelog.d/`](changelog.d/README.md) until it is released.
+### Breaking — `did-hosting-common` lock-guard and invite signatures
+
+Rust callers of `did-hosting-common` must update for the two changes below:
+
+- `PathLocks::guard` returns `did_hosting_common::server::path_locks::PathGuard`
+  instead of `tokio::sync::OwnedMutexGuard<()>`. Code that only holds the
+  guard and drops it needs no change; code that names the type does.
+- `passkey::invite::issue`, `passkey::invite::redeem` and
+  `passkey::run_cli_invite` take a final `std::time::Duration` argument, the
+  longest wait for a claim-code hashing slot. Pass
+  `config.auth.claim_code_hash_wait()`.
+
+This change is for the next release and will not be backported.
+
+### Breaking — `did-hosting-common` `ServerConfig` has a `client_ipv6_prefix` field
+
+Rust callers that build `did_hosting_common::server::config::ServerConfig`
+with a struct literal must set `client_ipv6_prefix`; use
+`did_hosting_common::server::config::default_client_ipv6_prefix()` or
+`..ServerConfig::default()`. Build a service's `ClientIps` with
+`ClientIps::from_server_config(&config.server)` so the setting applies;
+`ClientIps::new` still works and counts an IPv6 client by its /64.
+Configuration files need no change.
+
+### Breaking — the daemon refuses a witness store that reaches the control plane's data
+
+With the witness enabled, `did-hosting-daemon` now refuses to start when
+`[witness_store]` reaches the same data as `[store]`. The embedded witness keeps
+its ACL in its store, so it would otherwise share the control plane's ACL, and
+with `service` entries now allowed to request witness signatures, every
+control-plane `service` entry (each registered edge) could have it sign. The
+check is made by trying it: at startup the daemon writes a random value under
+a reserved key (`store-probe:…`, outside the `acl:` entries) in `[store]`'s ACL
+keyspace, looks for it through `[witness_store]`, and removes it. Any spelling
+of the same Redis server and database, DynamoDB table prefix and region,
+Firestore database or Cosmos DB database is therefore caught. On DynamoDB both
+prefixes default to `webvh`, so a `[witness_store]` without its own
+`dynamodb_table_prefix` is refused. The default layout (separate fjall
+directories) is unaffected.
+
+To move a deployment that shares one store, keeping its witness identities
+(and, with sealed witness keys, the recorded key-encryption key and the sealed
+keys, which live in the same keyspace):
+
+1. Stop the daemon and run `did-hosting-daemon backup -o witness.json`. The
+   backup includes the `witnesses` keyspace; it does not include the ACL.
+2. Give `[witness_store]` its own location (for example
+   `dynamodb_table_prefix = "webvh-witness"`).
+3. Restore into it: run `did-hosting-daemon restore -i witness.json` with a
+   copy of the config whose `[store]` section is the new `[witness_store]`.
+   This also writes the backup's other keyspaces there; the witness does not
+   read them.
+4. Re-create the witness's ACL with `did-hosting-daemon add-acl --witness
+   --did <DID> --role admin|service`, giving `service` to callers that only
+   request signatures.
+
+If that is not possible, the fallback is to create new witness identities in
+the new store and have DIDs that list the old identities move to them.
+
+### Breaking — proof-verification failures carry their kind as a value
+
+Whether a refused proof was a signer that could not be resolved (retryable),
+a deactivated signer or a bad proof was decided by searching the error message
+for fixed phrases. That message includes the signer's DID, which the sender
+chooses. The verifier now reports the kind as a value, taken from where it was
+decided, and nothing decides it from text.
+
+Rust callers of `did-hosting-common`:
+
+- `trust_tasks::is_unreachable` and `trust_tasks::unreachable_error` are
+  removed. Use `TransportBoundVerifier::check_operational` /
+  `check_approval`, which return a `VerifyFailure { kind, error }`
+  (`VerifyFailureKind::{Unreachable, Deactivated, Invalid}`), and
+  `BoundError::unreachable(detail)` to report a signer you gave up waiting on.
+- `BoundError` has a new `Unreachable(VerificationError)` variant, which is
+  what `is_transient` now reports. An unreachable signer is no longer a
+  `BoundError::Proof`, and its message reads "proof could not be checked: …".
+- `verify_operational`, `verify_approval` and `ProofVerifier::verify` keep
+  their signatures.
+- A caller-supplied resolver (`TransportBoundVerifier::with_resolver`)
+  cannot report a kind, so its failures count as bad proofs, whatever their
+  message says.
+
+No wire shapes change. Which failures are retryable is unchanged for the
+service's own verifier.
+
+### Breaking — unused items removed from `did-hosting-common` and `did-hosting-control`
+
+Rust callers:
+
+- `ServerSecrets`, `RetiredKeys` and `StoredSecrets` implement `Drop`
+  (`ZeroizeOnDrop`), so a field can no longer be moved out of one; use
+  `clone()` or `std::mem::take`.
+- `did-hosting-control`'s `AppState::signing_key_bytes` is removed. It was a
+  second, unused copy of the signing seed; sign with
+  `signing::control_signing_secret`.
+- `didcomm_unpack::{unpack_signed, require_addressed_to, REPLAY_WINDOW_SECS}`
+  are removed. Nothing called them since the REST sign-in path was retired.
+- `server::acl::{CreateAclRequest, UpdateAclRequest, AclEntryResponse,
+  AclListResponse}` are removed, left over from the retired ACL REST routes.
+- `SpecAclEntry::into_local` takes the creation time to record, and ignores
+  an inbound `createdAt`, as it already did for the other provenance members.
+- New: `ServiceIdentity::secret(kid)`,
+  `auth::session::{refresh_token_digest, refresh_hash_of_stored}`.
+
+### Breaking — `did_hosting_server::routes::trust_tasks::receive` takes the body unread
+
+Rust callers that invoke the handler directly: it now takes
+`Extension<trust_tasks::BodyLimit>` (after `ConnectInfo`) and an
+`axum::body::Body` instead of `Bytes`, and reads the body itself after its
+rate limit. Mounted through `routes::router*`, nothing changes.
+
+### Breaking — `did-hosting-common` storage backends implement `compare_and_swap_raw`
+
+`KeyspaceOps` has a new required method, `compare_and_swap_raw(key,
+expected, new)`, exposed as `KeyspaceHandle::compare_and_swap_raw`: it
+writes only if the key holds `expected` (`None`: is absent), atomically
+across processes on Redis (a Lua script), DynamoDB (a conditional
+`PutItem`), Cosmos DB (create, or `If-Match` replace) and Firestore (a
+transaction). An out-of-tree `KeyspaceOps` implementation must add it.
+`webvh_witness::witness_ops::sign_witness_proof` no longer takes the mark to
+record; call `read_witnessed_mark` and `advance_witnessed_mark` first.
+
+### Breaking — a wallet step-up in the console no longer hands the wallet the session's tokens
+
+The console used to step a wallet session up by giving the wallet browser
+extension the session's access token and refresh token
+(`window.vtaWallet.stepUpVta`); the wallet then opened the step-up, sent its
+decision and renewed the session itself. Now the console keeps both tokens:
+
+1. The console opens the step-up itself: `auth/step-up/start/0.2`, signed by
+   the session key bound at login. The control plane answers with its signed
+   `auth/step-up/approve-request/0.5`, a single-use challenge bound to this
+   session and its subject that lapses on its own (300 seconds).
+2. The wallet is handed that approve-request and the service DID, nothing
+   else (`window.vtaWallet.approveSessionStepUp({ rpDid, approveRequest })`).
+   It verifies the request, asks the user, and returns its
+   `auth/step-up/approve-response/0.7`, signed as the subject
+   (`assertionMethod`); a session key may never sign an approval.
+3. The console checks that the decision answers this challenge for this
+   session, and sends it as signed.
+4. The console renews the session with `auth/refresh/0.2`, signed by the
+   session key with the refresh token it holds, so the new tokens carry
+   `aal2`.
+
+The control plane is unchanged: it already accepted a session-key-signed
+`auth/step-up/start` for the session's own subject, and an approval only by
+the subject's own key.
+
+Behaviour change (R3.6): a wallet that offers only `stepUpVta` can no longer
+step a console session up. The console says the action needs a stepped-up
+session, and never falls back to handing the tokens over. A passkey session is
+unaffected (it is `aal2` from login).
+
+### Breaking — Cosmos DB keeps every keyspace in one container, so a batch is atomic
+
+The `store-cosmosdb` backend kept one container per keyspace and applied a
+batch one write at a time, so a failure part-way through left half a change
+(a DID record without its log or its name index, a domain re-enabled with its
+purge still queued). Every keyspace now lives in one container,
+`store.cosmosdb_container` (`<PREFIX>_STORE_COSMOSDB_CONTAINER`, default `kv`,
+partitioned on `/pk`), created with its database if missing, and a batch is
+one Cosmos DB transactional batch: it lands whole or not at all. A batch over
+the transactional batch's bound (100 writes, 2 MB) is refused as a size quota,
+writing nothing, as on DynamoDB and Firestore.
+
+On first start, each keyspace still in a container of its own is copied into
+the shared container, once. Start one upgraded replica alone so the copy
+finishes before others write; the old containers are left for you to delete.
+Everything now shares one logical partition, which Cosmos DB caps at 20 GB.
+
+### Breaking — config files refuse unknown keys, and boolean environment variables refuse values they do not recognise
+
+Every binary's config file is now parsed strictly: a key a section does not
+define is a startup error that names it, instead of being dropped while the
+default applies. This covers the top level of each binary's config and the
+`[server]`, `[store]`, `[fjall]`, `[auth]`, `[secrets]`, `[hosting]`,
+`[features]`, `[log]`, `[identity]` and `[vta]` sections, the server's
+`[limits]`, `[stats]` and `[replication]`, the control plane's `[registry]`
+(and `[[registry.instances]]` / `[[registry.watchers]]`) and `[trust_tasks]`,
+the watcher's `[sync]` and the daemon's `[enable]`. A misspelling such as
+`[store] redis_ur = …` or `[auth] acess_token_expiry = 300` used to be
+ignored; it now stops the service. Before upgrading, run `<binary> health`
+against each config: it reports the offending key. One config file shared by
+two different binaries no longer loads; give each its own.
+
+Boolean environment overrides (`<PREFIX>_FEATURES_DIDCOMM`, `_TSP`,
+`_AGENT_NAMES`, `_HTTP_LISTENER`, `_SECRETS_VAULT_SKIP_VERIFY`,
+`_HOSTING_SCID_ALSO_KNOWN_AS`, `_STORE_DYNAMODB_AUTO_CREATE`) accept `1`/`true`/`yes`/`on` and
+`0`/`false`/`no`/`off` in any case. Anything else is a startup error naming
+the variable; before, `=yes` or `=on` turned the feature off.
+
+`[features] deployment_mode` accepts only `"standalone"` or `"daemon"` (the
+values it always had), and `[[registry.instances]] service_type` only
+`"server"`, `"witness"` or `"watcher"`; an unknown service type was skipped
+at seed time with a warning and is now a startup error.
+
+### Breaking — `[hosting]` grace periods are checked when the config loads
+
+`[hosting] unassigned_purge_grace` and `disable_purge_grace` are parsed when
+the config is loaded, by every binary. A value that is not a duration (an
+integer with an optional unit `s`, `m`, `h` or `d`) stops the service at
+startup with a message naming the key and the accepted units. Before, an edge
+silently fell back to 2 hours at unassign time (so `"1w"` purged a domain's
+DIDs two hours after an unassign), and the control plane failed "disable
+domain" with an internal error weeks later.
+
+### Breaking — CLI defaults renamed: the backup file and the VTA context
+
+`backup` writes `did-hosting-backup.json` by default (was
+`webvh-backup.json`), and the default VTA context id for `setup
+--setup-key-out --context`, `vta-request --context` and the setup wizards'
+context prompt is `did-hosting` (was `webvh`). Pass `--output` / `--context`
+(or answer the prompt) to keep the old names; an existing context keeps
+working when named explicitly.
+
+### Breaking — `did-hosting-daemon backup` / `restore` cover the whole daemon, in a format of their own
+
+The daemon used the edge's backup, which loaded the daemon's config file as
+an edge config (so with `[store]` omitted it backed up an empty
+`data/did-hosting-server` directory), carried only the edge's keyspaces, and
+never opened `[witness_store]`. A restore therefore brought DIDs back without
+the ACL, login and step-up passkeys, identity generations, did:scid floors or
+outbound queue, lost the witness's ACL and keys, and rewrote `config.toml`
+through the edge's config type, dropping `[enable]`, `[witness_store]`,
+`[registry]`, `[stats_flush]`, `[geoip]` and `did_hosting_url`.
+
+A daemon backup is now a `did-hosting-daemon` document: both stores, with an
+explicit keyspace list for each (every keyspace except the TSP relationship
+state, which the next handshake re-establishes), and the configuration file
+carried and restored byte for byte. DID logs are still checked against their
+own history and the target store's before anything is written. A backup an
+earlier daemon wrote is in the edge's format and is refused by
+`did-hosting-daemon restore`; take a fresh backup after upgrading.
+
+A backup never carries live sign-in sessions or refresh tokens (users sign in
+again after a restore), and both binaries now write the backup file readable
+by its owner only (`0600`). It still holds the ACL, passkey credentials and
+the configuration unencrypted, so keep it as you keep the service's secrets.
+
+### Breaking — stats sync and health pings follow their pinned Trust Task specifications
+
+`server/stats-sync/0.1` and `server/health/0.1` now carry the payloads their
+pinned specifications define, on both ends (#449). An edge sends `instanceId`
+and `perMnemonic`, with its sequence number and each entry's latest-event times
+under `ext."vnd.affinidi.webvh"`. The control plane answers with `instanceId`
+and `accepted` (how many entries it counted). A health ping names the
+`instanceId` it probes. The pong answers `instanceId`, `ok` and `observedAt`,
+with the edge's version and DID count under the same namespace. A control
+plane refuses a sync that sends `buckets` rather than dropping them.
+
+**Upgrade the control plane before its edges.** For this release only, a
+control plane still reads the old sync and pong shapes, and an edge still
+answers the old empty ping. A control plane from before this release refuses
+the new shapes: an upgraded edge's stats would not be counted, and its
+instance would age to `Unreachable`. The old shapes stop being read in 0.13.
+`did_hosting_common::{StatsSyncAck, StatsSyncStatus}` are removed. Build and
+read these payloads with `did_hosting_common::server::trust_tasks::infra`.
+
+### Breaking — a malformed `server.trusted_proxy_cidrs` entry stops the service at startup
+
+An entry that is neither an address nor a CIDR range was logged and dropped,
+so a typo silently stopped `Forwarded` / `X-Forwarded-Host` being honoured
+from that proxy. The list is now parsed when the config is loaded, like
+`trusted_proxies`: a bad entry, or a range covering every address
+(`0.0.0.0/0`, `::/0`), is refused, naming the key and the entry. Bare
+addresses (`10.0.0.1`) are accepted as one-address ranges.
+
+### Breaking — an invalid `identity.rotation_grace_period` stops the service at startup
+
+A value that was not a duration was logged and treated as `1h`, so a typo in
+the compromised-key setting (`"0"`) kept the old key honoured for an hour. It
+is now parsed when the config is loaded, like the `[hosting]` grace periods,
+and a bad value is refused, naming the key.
+
+### Breaking — `trust-task-discovery` is answered in 0.4 only
+
+The service speaks the latest version of each task it serves, and
+`trust-tasks-rs` 0.39 supersedes `trust-task-discovery/0.3` with 0.4. A
+discoverer asking in 0.3 is now refused `unsupportedType` and may retry in
+0.4. The 0.4 answer lists the same Type URIs; it states no acceptance
+window.
+
+### Breaking — `did-hosting-common` invite issuer type
+
+Rust callers of `did-hosting-common` must update for the changes below:
+
+- `passkey::invite::Invite::issued_by`, `passkey::invite::InviteRequest::issued_by`
+  and `passkey::store::CeremonyOrigin::Invite::issued_by` are now
+  `passkey::invite::Issuer` instead of `String`. Build one with
+  `Issuer::administrator(did)`, which refuses anything that is not a DID, or
+  `Issuer::operator()`. The stored form is unchanged, so invites and ceremonies
+  already on disk still read.
+- `passkey::invite::Invite` has a new public field, `amended_by: Vec<String>`.
+- `passkey::issue_cli_invite` is new. It is the validating half of
+  `run_cli_invite` and returns the issued invite instead of printing it.
+
+### Changed — a passkey login start discloses no subject and leaves no rows behind
+
+`auth/passkey/login/start/0.2` is answered to anyone, unsigned. With no
+`subject` it read every login passkey enrolled here, returned all their
+credential ids as `allowCredentials`, and stored a snapshot of them under the
+new `authId`. Those rows were never removed unless the login finished, and
+the start answered `subjectNotRecognized` and `noCredentials` differently, so
+it also said which DIDs had a passkey.
+
+- **No subject named:** the start opens a discoverable-credential ceremony
+  with no `allowCredentials`; the browser offers the passkeys it holds for
+  this service. Finish looks the credential up by id, requires the returned
+  user handle to be that credential's user (an assertion without one is
+  `assertionInvalid`), and verifies against that one subject's credentials.
+  The ceremony row holds only its challenge, whatever the number of passkeys.
+- **A subject named:** the start lists that subject's credentials, as
+  before, so a passkey enrolled as non-discoverable keeps signing in. For a
+  subject with no login passkey it lists decoy credential ids instead of
+  answering `subjectNotRecognized` / `noCredentials`: one or two ids derived
+  from a service key (made on first use, kept as `pk_login_decoy_key`) and
+  the subject, the same on every start for that subject and shaped as the
+  console's own enrolments are. Nothing answers them.
+- A login that named its subject fails in exactly one way at finish
+  (`assertionInvalid`, "the assertion did not verify"), whether the
+  credential is unknown, not listed, another subject's, or a decoy list's,
+  or the assertion does not verify, so its outcome does not say whether the
+  subject is enrolled. An unnamed login still says `credentialUnknown`.
+- The counter update after a successful login is made under the subject's
+  credentials guard on a fresh read, so a login racing a revocation or an
+  enrolment neither restores the revoked credential nor drops the new one.
+- Only a request carrying the named subject's own bearer session is told
+  `subjectNotRecognized` or `noCredentials`.
+- Each source may open 30 login ceremonies a minute: the client address on
+  HTTPS (refused as `unavailable` with `retryAfter`), the authenticated
+  sender on DIDComm and TSP (refused as `rateLimited`). A DIDComm or TSP
+  start with no authenticated sender is refused (`permissionDenied`). A
+  messaging sender can mint a fresh `did:key` per request, so there the limit
+  is per identity rather than per party; what each start leaves is one small,
+  swept row.
+- The session sweep now removes expired login ceremonies (`pk_task_meta:`
+  and any `pk_auth:` state row an older build wrote), passkey revocation
+  ceremonies (`pk_revoke:`), step-up challenges (`stepup-task:`) and DID
+  ownership offers (`did_xfer:`). A login ceremony opened by the previous
+  build can still be finished.
+- New login passkeys are requested with `residentKey: preferred`, so an
+  authenticator that can store a discoverable credential does. Step-up
+  passkeys are unchanged.
+- The console's passkey sign-in takes an optional DID; naming it lists that
+  DID's credentials, for a security key the browser does not offer by itself.
+- `webauthn-rs` gains its `conditional-ui` feature (no new dependency).
+- Behaviour changes (R3.6):
+  - An anonymous login start never answers `noCredentials` or
+    `subjectNotRecognized`. Unnamed, it opens a ceremony with no list;
+    naming an unknown subject, it lists decoys.
+  - A passkey enrolled as non-discoverable (some hardware security keys,
+    registered under the earlier `residentKey: discouraged`) signs in only
+    when the start names its subject — in the console, by entering the DID
+    beside "Login with Passkey".
+  - A discoverable-flow assertion with no user handle is refused.
+  - A named login's failures are all `assertionInvalid` (a named login with
+    an unknown credential used to be `credentialUnknown`).
+  - Residual signal: decoys are always one or two ids of 16, 20 or 32 bytes.
+    A named subject whose real list has three or more credentials, ids of
+    other lengths, or `transports` (recorded when a browser reports them at
+    enrolment) is distinguishable from an unknown one. Real lists cannot be
+    trimmed without breaking those credentials' sign-in, so this is left as
+    is; a subject's count and id lengths are what they disclose.
+  - The 31st login start a minute from one source is refused, and a
+    DIDComm/TSP start with no sender is refused.
+  - Checked consumers: the console's `passkeyLoginStart` (updated here to
+    pass an optional subject) handles options with or without
+    `allowCredentials`. No client in verifiable-trust-infrastructure calls
+    this service's passkey login (its own `vta-service` and `vtc-service`
+    have their own).
+
+### Changed — enrolling a passkey that grants `aal2` needs a stepped-up session or the caller's own key
+
+A passkey login is minted at `aal2`. `auth/passkey/enroll/{start,finish}/0.2`
+let any authenticated subject add a login passkey, and asked for user
+verification only when one was already held, so a session at `aal1` (signed
+by its browser session key) could enrol a first passkey and sign in again at
+`aal2`. An administrator's session at `aal1` could do the same through an
+invite (`auth/passkey/enroll/invite/0.3`) naming itself. And enrolment
+accepted a credential id already bound to another subject, repointing that
+credential's index so its holder could no longer sign in with it.
+
+- Enrolling a subject's first login passkey needs a session already at
+  `aal2`, or a request signed by the subject's own DID key (the factor a
+  `didSigned` step-up rests on). The check runs at start and again at finish,
+  against the credentials held then.
+- Issuing any enrolment invite needs the same of the administrator: an `aal2`
+  session or its own DID key's signature, whoever the invite names.
+- Both refusals are `permissionDenied` with message `step_up_required`. The
+  console treats that, like a declared `stepUpRequired`, as a request to step
+  up and retry, for invites and for domain purges.
+- Every enrolment finish (redeem, self-enrolment, either purpose) refuses a
+  credential id already bound to any subject in either credential store
+  (`attestationInvalid`), as WebAuthn §7.1 requires; enrolments of the same id
+  are serialised.
+- Adding a further passkey is unchanged (user verification over an existing
+  one).
+- Behaviour changes (R3.6):
+  - A session at `aal1` signed by its session key can no longer start or
+    finish a first login passkey enrolment, or issue an invite. A passkey
+    session is `aal2` already; a wallet session steps up first.
+  - Re-enrolling a credential already bound anywhere is refused.
+  - Checked consumers: the console enrols through invites (it steps up when
+    asked); no client in verifiable-trust-infrastructure calls this service's
+    `enroll/*` tasks.
+
+### Changed — `did/change-owner` moves a slot only when its recipient accepts
+
+`did/change-owner/0.1` moved a slot to any DID with an ACL entry, at the
+owner's word alone. The recipient never agreed, its quota and domain scope
+were not applied, and the "not in the ACL" error told the owner whether a
+DID had an entry.
+
+- An administrator's request moves the slot at once, as before.
+- An owner's request now only offers it. The record is returned unchanged,
+  with `ext["vnd.affinidi.webvh"].ownerTransfer = { status: "offered",
+  newOwner, expiresAt }`. The offer lasts 72 hours. A new offer replaces the
+  last; naming the current owner withdraws it; deleting the slot removes it.
+  Nothing about the recipient is looked up when an offer is made, so an offer
+  answers the same for any DID.
+- The recipient accepts by sending the same request naming itself as
+  `newOwner`. It needs the live offer from the slot's current owner, made
+  since the slot was registered; anyone else still gets `notOwner`.
+- Before a slot moves (an administrator's transfer or an acceptance), the
+  recipient must have an ACL entry with a role that owns DIDs (`owner` or
+  `admin`), a domain scope that covers the slot, and room for it in its DID
+  count and total size quotas. Otherwise the request is refused as
+  `targetNotAuthorized`, naming the check that failed (only an administrator,
+  or the recipient about itself, can reach it).
+- The recipient's quota check and the move are one critical section per
+  owner, and so are the quota checks and commits of `did/register`, create,
+  publish and the agent-name verbs (the publish paths re-check the size quota
+  under the owner's lock and hold it through their commit), so two writes for
+  the same owner cannot both take its last slot or byte. Lock order: slot,
+  then owner, then agent names.
+- `did_ops::change_did_owner` takes the request's `domain` and returns
+  `OwnerChange { record, offer }`, or `OwnerChangeError`.
+- The console's ownership card offers a DID (owners) or transfers it
+  (administrators), and the DID list has "Accept a DID".
+- Behaviour changes (R3.6):
+  - A non-administrator's `did/change-owner` no longer moves the slot. A
+    caller that read `record.owner` from the reply to confirm a move now sees
+    the old owner and an `ownerTransfer` offer.
+  - A transfer to a DID outside the ACL is no longer refused at once when an
+    owner sends it. It is recorded as an offer that can never be accepted.
+    An administrator's transfer to one is refused as `targetNotAuthorized`
+    (it was `malformedRequest`).
+  - A transfer to a `service` or `metrics-reader` entry, or to a recipient
+    over its quota or outside its domain scope, is refused, administrators
+    included.
+  - Checked consumers: the console (updated here). verifiable-trust-
+    infrastructure defines the Type URI constant in `vta-sdk` but sends no
+    `did/change-owner`.
+
+### Changed — tiered, bounded statistics; charts read by key
+
+Every DID now keeps a coarse series (hourly for 7 days, daily for 30) inside
+its `stats:` row, and only busy DIDs keep a 5-minute series, in a ring of 288
+rows (`t5:{mnemonic}:{slot}`) that is overwritten in place. Nothing grows
+without bound and nothing needs a sweep. Charts read rows by key instead of
+scanning the time-series keyspace, which on DynamoDB was a full-table Scan
+per chart (one per DID for a domain chart). A DID's row is written at most
+once per 5 minutes, when its bucket closes, rather than every 10 seconds.
+
+- **`[stats]`** (env `CONTROL_STATS_*`, `DAEMON_STATS_*`): `mode` (`auto`,
+  `fine`, `coarse`), `promote_per_hour` (60), `demote_per_hour` (20),
+  `max_fine_dids` (1,000).
+- **A per-DID override**, `auto`, `fine`, `coarse` or `off`. Only an admin
+  may set `fine`; an owner may set the others for their own DID. Set it with
+  the new `did-management/stats/set-resolution/0.1` Trust Task, which also
+  reports the tier that applies and why, or offline with the new `stats-set`
+  command. `stats-show` reports a DID's tier.
+- **The chart's `bucketSeconds` now varies**: a DID without 5-minute detail
+  is charted hourly (daily over 30 days). The UI uses the value it is sent.
+- **Migration is automatic.** At startup the legacy `ts:` rows are folded into
+  the new rows, a flush's worth at a time. Only the last 31 days are
+  migrated, as no chart shows older, so memory is bounded by a month of
+  history rather than the deployment's age. fjall and DynamoDB read them a
+  page of 1,000 keys at a time (DynamoDB as a paged `Scan`), and a failed
+  read is retried from where it stopped. Redis, Firestore and Cosmos DB read
+  them whole, and after a failed read wait 5 minutes before reading again.
+  Charts read the legacy rows until it completes. It can run again safely,
+  and picks up rows an older version wrote after a rollback. Legacy rows are
+  kept for 30 days, then deleted; `stats-purge-legacy` deletes them at once.
+- Removing a DID deletes its statistics rows: an explicit delete, and on the
+  daemon also the empty-slot cleanup and the domain purge sweep.
+- Displayed totals include counts not yet written.
+- A flush tick (the paced flush, then the migration step) starts no writes
+  after its 10-second interval; under a slow store, what is left waits for
+  the next tick instead of delaying it.
+
+See `docs/stats-tiers.md`.
+
+### Changed — a peer's advertised Trust Task HTTPS endpoint must be public `https`
+
+When a peer's DID document advertises `TrustTaskHTTPS` (and no TSP or DIDComm
+service), the control plane's pushes and health pings, and an edge's
+registration, stats and replication sends, `POST` to that endpoint. The URL is
+the peer's to name, so it is now held to an outbound policy (via
+`affinidi-net-guard`): `https` to a public host only. An endpoint on loopback,
+a private, link-local or carrier-grade NAT range, or a special-use name
+(`localhost`, `*.internal`, single-label names) is treated as not advertised:
+the send falls back to the configured mediator, or fails as unroutable. What
+the name resolves to is checked again when the request connects. Redirects
+are not followed, timeouts are finite and the reply is capped at 1 MiB, as
+before. A non-2xx reply body is sanitised and truncated before it reaches a
+log line or an outbox error.
+
+- **Behaviour change:** a peer that advertises `TrustTaskHTTPS` at
+  `http://localhost:…`, `http://127.0.0.1:…` or a private address is no
+  longer sent to. Advertise a public `https` endpoint, or a TSP / DIDComm
+  service.
+- URLs an operator configures (`WebVHClient`'s server URL, `WitnessClient`'s
+  witness URL) are unaffected.
+- Setup (interactive and recipe) and the control plane's sign-in self-check
+  now note when this node's own advertised `TrustTaskHTTPS` endpoint is one
+  other nodes will not send to.
+- There is no setting yet to admit private address ranges; a deployment whose
+  nodes reach each other only over a private network uses TSP/DIDComm through
+  a mediator.
+- A peer whose endpoint is refused is warned about once per process; repeats
+  are logged at debug.
+
+### Changed — outbound HTTPS Trust Tasks share one client and one verifier
+
+An HTTPS send built a new HTTP client, and a new reply verifier, for every
+request. Each service now verifies HTTPS replies with the verifier it checks
+inbound documents with, so DID-status verdicts are reused and forced
+re-resolutions of a peer's DID are rate-limited across calls (at most one per
+DID per 30 s) on these paths too. Replies get a forced-refresh allowance of
+their own (`TransportBoundVerifier::for_replies`), so inbound documents cannot
+use up the re-resolution a just-rotated peer's reply needs. `WitnessClient` and `WebVHClient` build
+their verifier once per client. HTTP clients are built once per process, so
+connections are reused.
+
+- **API:** `send_trust_task` and `send_trust_task_with_retry` take a
+  `send::Peers` (DID cache and verifier) in place of `Option<&DIDCacheClient>`.
+  `post_trust_task_https` still builds a verifier per call and is meant for
+  one-off callers; long-lived callers use `post_trust_task_https_verified`.
+
+### Changed — rate limits run on `affinidi-rate-limit`
+
+Every per-address and per-source rate limit (resolution, each Trust Task
+listener, the challenge, invite redemption, wallet sign-in, and the
+per-address and service-wide large-document budgets), and the rule for which
+address a request comes from, now use the `affinidi-rate-limit` crate the mediator and the DID resolver cache use. Each limit is still stated
+as requests per window, with the same numbers, but is now a token bucket: a
+client may spend its allowance at once and regains one request every
+`window / max`, so `Retry-After` is the time to its next request rather than
+to the end of the window, and there is no double burst across a window
+boundary. Refusals are logged once per client per window. Idle clients are
+swept every minute, and at most 250,000 are tracked per limit (previously
+10,000, with the map cleared when full). The `429` keeps its shape. Its `message`
+changes: the resolution limit sends the crate's generic text, and the other
+limits share one template naming their numbers, replacing the challenge's and
+redemption's own wording. The large-document budget keeps its own penalty (an
+address whose claimed issuer did not verify pays double for its next large
+document) on top of the crate's buckets, and tracks at most 10,000 addresses.
+
+Four refusals change. A chain from a trusted proxy that cannot be read (a
+malformed entry, more than 64 entries, or a header that is not visible ASCII)
+is refused with `400` instead of being charged to the proxy's address, which
+handed its sender a second budget and hid a misbehaving proxy; the first such
+chain from a proxy each minute is logged as a warning naming it. The `400`
+carries the same body everywhere a request is charged to an address — `{
+"error": "invalid_forwarded_for", "limiter": "<limiter>", "message": "..." }`
+with `x-rate-limit-source: did-host` — except `POST /api/trust-tasks` on the
+control plane, which refuses it, like everything else it refuses, with a
+`trust-task-error` document (`malformedRequest`).
+`server.trusted_proxies` refuses a range covering every address (`0.0.0.0/0`,
+`::/0`) at startup. A resolution request with no peer address, a wiring
+fault, is refused with `403` instead of `500`. And when a limit already
+tracks 250,000 clients that are still within their budget, a new client is
+refused with `429` and `Retry-After: 60` until room frees up, rather than the
+limit forgetting everyone.
+
+### Changed — `auth/step-up/approve-response` moves to 0.7
+
+The VTA and the VTC moved every step-up answer to
+`auth/step-up/approve-response/0.7` and stopped serving 0.6
+(OpenVTC/verifiable-trust-infrastructure#2346), and the browser wallet
+cuts over with them (OpenVTC/vta-browser-plugin#412). Its lock holds one
+version per slug, so after that change the wallet sends only 0.7, and a
+control plane still on 0.6 refuses every `stepUpVta` approval. The control
+plane now serves 0.7 only; 0.6 is no longer accepted. Merge together with
+the wallet's change.
+
+The payload is unchanged. 0.7 relaxes the specification's proof
+requirement and spells the `assertionInvalid` `details.reason` values in
+lowerCamelCase. The control plane still requires an `assertionMethod`
+proof (a relying party may be stricter than the specification) and emits
+no `details.reason`, so neither change alters what it does. The UI's
+generated types follow the lock.
+
+### Changed — a claim-code check waits a bounded time for a hashing slot
+
+Passkey invite claim codes are checked with Argon2 in a small fixed number of
+concurrent slots. A check that found every slot busy used to wait for as long
+as it took. It now waits at most `auth.claim_code_hash_wait_ms` (default
+5000 ms, at most 60000; env `*_AUTH_CLAIM_CODE_HASH_WAIT_MS`) and is then
+answered `unavailable` with a retry time (`RateLimited`, limiter
+`claim-code-hashing`). The same bound applies to a redemption waiting behind
+another attempt on the same invite. A refused check counts no wrong code
+against the invite. A slot is now held until its hash finishes, even if the
+caller has gone away; before this, a cancelled request freed its slot while
+its hash was still running. Issuing an invite has its own two slots, so
+redemption attempts cannot hold up an administrator issuing one. A config
+file with a wait above 60000 ms is refused at load.
+
+### Changed — per-address limits count an IPv6 client by its /64, and proven callers keep a share of the large-document budget
+
+Every per-address limit counted an IPv6 client by its full address, so one
+host could draw a fresh allowance from each address in its block. Only the
+resolution limit counted a /64. Now every one does: the Trust Task listener
+limit on the edge, witness and watcher, `POST /api/auth/challenge`, passkey
+invite redemption and login start over HTTPS, wallet sign-in (`auth/oob/*`)
+and its open-poll cap, the sign-in replay quota per source, and the
+large-document budget per address.
+
+- New `[server] client_ipv6_prefix` (default `64`, `1` to `128`) sets the
+  network an IPv6 client is counted by, for those limits and for
+  `[server.resolve_rate_limit]`. A value outside the range stops the service
+  at startup. IPv4 clients are counted by their address, as before.
+- The large-document budget across all addresses (60 a minute) is split. An
+  address whose large `did/register` verified as the issuer it claimed in the
+  last hour draws on 40 of those that no other address can spend. Every other
+  address shares the remaining 20, and a proven address falls back to them
+  once its own 40 are spent. A claim that does not verify ends the address's
+  proven standing.
+- The forced re-resolution of a signer's DID is limited per DID with any
+  path, query and fragment removed. Before, only a `did:scid`'s lone `?src=`
+  was removed, so a `src` with further parameters, or another query, counted
+  as a different DID.
+
+Behaviour change (R3.6): no wire shapes change. Clients in one IPv6 /64
+now share one allowance on each of the limits above, so several hosts behind
+one /64 (or a deployment that hands out addresses from one) can be refused
+sooner; set `client_ipv6_prefix = 128` to count each address alone. A
+caller's first large document, before it has verified once, and every large
+document from a new address, competes for the 20-a-minute share. Log lines
+for a limited IPv6 client name its network, not its address.
+
+### Changed — a witness caller can be allowed to request signatures and nothing else
+
+On a witness, `webvh/witness/sign` required an `admin` ACL entry, and an
+`admin` can also create and delete witness identities and administer the
+witness's ACL. So a control plane, VTA or edge that only needs proofs had to
+hold a credential that could delete every witness identity and grant access
+to others. `webvh/witness/sign` now also accepts a `service` entry, and
+nothing else on the witness does: `key/create`, `key/list` and `key/delete`
+still require `admin`, and the ACL tasks still require `admin` (any member
+may show or revoke its own entry, as before). An `owner` or `metricsReader`
+entry still can do nothing on a witness.
+
+Existing entries and how they move:
+
+- An `admin` entry keeps every permission it had; nothing stops working.
+  To narrow a caller that only requests signatures, change its role to
+  `service`: `acl/change-role` (`fromRole: admin`, `toRole: service`) from
+  another admin, or `webvh-witness remove-acl --did <DID>` then
+  `webvh-witness add-acl --did <DID> --role service`. The last `admin`
+  cannot be demoted.
+- An existing `service` entry on a witness, which could do nothing there
+  before, can now request signatures.
+- On a witness, a `service` entry now states `keys: {"scope": "all"}` in
+  `acl/show` and `acl/list`, since it may have the witness sign with any of
+  its identities. An `acl/grant` of a `service` entry to a witness must say
+  `keys: {"scope": "all"}`; one saying `none` is refused (`taskFailed`,
+  `details.reason: notSupportedByMaintainer`).
+  Other services are unchanged: they sign nothing for their members.
+- `webvh-witness add-acl` now requires `--role`, and accepts only `admin`
+  or `service`. It defaulted to `owner`, which can do nothing on a witness.
+- `did-hosting-daemon add-acl --witness` and `list-acl --witness` write and
+  read the embedded witness's ACL, which had no CLI before.
+
+### Changed — refresh tokens are stored as SHA-256 digests
+
+The session row and the refresh index key held each refresh token as issued.
+They now hold `sha256:` and the token's SHA-256, so reading the sessions
+keyspace (a Redis, DynamoDB or Cosmos backend, or a backup) does not yield a
+token that redeems. The settlement marker a refresh checks is keyed the same
+way.
+
+Sessions written by an earlier release keep working: a token of the shape
+those releases issued is also looked up under its old key, and a stored digest
+is never accepted in place of a token. The session sweep now also removes
+refresh index entries no session issues any more (the session has gone, or a
+later sign-in replaced the token without retiring it).
+
+### Changed — service keys are wiped from memory when dropped
+
+`ServerSecrets`, `RetiredKeys` and `StoredSecrets` are zeroized on drop, as is
+the serialised envelope, the JWT key's DER encoding and a key a rotation
+replaces. Signing a Trust Task copies only the signing key rather than every
+live key.
+
+### Changed — the edge and the daemon serve HTTP under connection and time limits
+
+The public listener of `did-hosting-server` and `did-hosting-daemon` now runs
+on the shared bounded listener the witness and watcher already use. It
+limits connections to 256 at once and 32 per address (IPv4 address or IPv6
+/64; `server.trusted_proxies` exempt), allows 20 s for request headers, and
+closes a connection after 60 s idle. The edge's `POST /api/trust-tasks` reads
+its body after the per-address limit rather than before, bounded in size as
+before and now in time (30 s; `408` past it, `413` over the size).
+
+Behaviour change (R3.6): a client past these limits is disconnected or refused
+where it was served before.
+
+### Changed — a registration acknowledgement is logged only when it verifies
+
+An edge logged "registration acknowledged by control plane" at `info`, with
+the `instanceId` from the document, for any `server/register` response that
+reached it, including one posted to its HTTPS listener by anyone. The
+acknowledgement is now checked as the control plane's, as every control-plane
+document is. An unverified one is logged at `debug` without its contents.
+
+### Changed — `server.trusted_proxies` and `server.trusted_proxy_cidrs` are documented together
+
+The two lists answer different questions: which client sent a request
+(`trusted_proxies`) and which host it addresses (`trusted_proxy_cidrs`).
+Behind a reverse proxy, list the proxy in both. The edge and the daemon now
+warn at startup when only one of them is set.
+
+### Changed — the console signs out in every tab, and takes the invite token out of the address bar
+
+- Signing out (or a session ending on a `401`) in one tab now signs out every
+  other tab of the console that holds the same session, through a
+  `BroadcastChannel`. Before, another tab kept its in-memory token and session
+  key until its next request was refused.
+- The enrolment page reads the invite token once, then removes it from the
+  address bar and the current history entry (`history.replaceState`), so it
+  is not left on screen, in history or in a bookmark. The page also asks the
+  browser to send no `Referer` (`<meta name="referrer">`), in addition to the
+  `Referrer-Policy: no-referrer` the control plane and daemon already send.
+- The comment on where the console keeps its tokens now says what protects
+  them. IndexedDB is not a boundary against a script on the origin; the
+  non-extractable session key is, together with the control plane requiring a
+  proof on every task that acts.
+- The UI's npm `overrides` use caret ranges at the locked majors (`minimatch
+  ^11.0.4`, `postcss ^8.5.10`, `@xmldom/xmldom ^0.9.12`, `uuid ^11.1.1`, `ws
+  ^8.20.1`, `shell-quote ^1.8.4`, `glob ^14.0.2`) instead of open-ended `>=`
+  ranges, so a lockfile regeneration cannot jump a major. The lockfile is
+  unchanged.
+
+### Changed — enrolment invite links carry the token in the fragment
+
+Invite links (`auth/passkey/enroll/invite` responses and the operator CLI)
+are now `{base}/enroll#token=…` instead of `{base}/enroll?token=…`. A browser
+never sends the fragment, so the token no longer reaches the web host's
+request line, its access logs or a `Referer`. The claim code is still sent
+separately, as before.
+
+Behaviour change (R3.6): the link format changes. The enrolment page reads
+the fragment first and still accepts `?token=`, so links issued before this
+release keep working until they expire. A client that parses the invite
+`url` itself should read the token from the fragment, or use the response's
+`invite.token` member.
+
+### Changed — the control plane's HTTPS listener is bounded like the edge's
+
+The control plane served `axum::serve` with no header or idle timeout and no
+connection cap. It now uses the shared listener limits the edge, witness and
+daemon use (256 connections, 32 per address or IPv6 /64, 20 s for request
+headers, 60 s idle; `server.trusted_proxies` exempt from the per-address
+cap). `POST /api/trust-tasks` reads its body within 30 s (`408` otherwise),
+on the control plane and in the daemon.
+
+### Changed — infrastructure messages from edges are typed and checked against the registry
+
+- `server/stats-sync` is parsed as a closed type; an unknown member refuses
+  the sync (`e.p.stats.malformed`). A delta whose resolve or update count is
+  over 1,000,000,000 is skipped, and the stats totals saturate instead of
+  wrapping.
+- `replica/domain/*` acknowledgements that are not their task's response
+  type are ignored.
+- Two server DIDs can map to one registry id (`did:web:h:a_b`,
+  `did:web:h:a:b`). A registration under an id another DID registered is
+  refused (`e.p.registration.conflict`), and a health pong, domain
+  acknowledgement or replication record from the other DID no longer
+  updates that instance.
+- A server's `servedDomains` claim at registration is kept only for a domain
+  the control plane assigned to that server (its latest recorded domain
+  operation is an assign). A server with no recorded domain operation keeps
+  only domains the registry already listed for it.
+
+### Changed — refusal texts no longer carry internal detail
+
+A proof that does not verify is refused `proofInvalid` with the kind of
+failure (malformed, unsupported cryptosuite, key not the issuer's, bad
+signature), not the verifier's own message; the message is logged. A
+registration the store cannot write is refused with a fixed text, and asks
+for a retry when the store is throttled.
+
+### Changed — deleting a DID, retiring an identity generation, purging a domain on an edge and granting an administrator need a stepped-up session
+
+A request that presents a console session (a bearer token on
+`POST /api/trust-tasks`) now needs that session at `aal2` for:
+
+- `did-management/did/delete/0.1`;
+- `did-management/identity/retire/0.1`;
+- `did-management/registry/purge-domain/0.1`;
+- `acl/grant/0.2` of an `admin` or `service` entry, and `acl/change-role/0.2`
+  to either role. Grants and role changes to `owner` or `metricsReader` are
+  unchanged.
+
+Below `aal2` the request is refused before anything is written, with the
+same refusal `domain/purge` already gave: `permissionDenied` with the message
+`step_up_required`. The ACL tasks ask it of an administrator only; anyone else
+gets the task's own refusal.
+
+The console routes each of these calls through its step-up path: on that
+refusal it steps a wallet session up through the wallet and sends the request
+once more. A passkey session is `aal2` from login and sees no change.
+
+Behaviour change (R3.6): a console wallet session now prompts for a step-up
+the first time it deletes a DID, retires a generation, purges a domain on one
+edge, or makes someone an administrator or service account. A client that
+sends these tasks with an `aal1` bearer session must step it up first. A
+request with no bearer session — a VTA sending signed Trust Tasks over
+DIDComm, TSP or HTTPS — is authorised by its own proof as before.
+
+### Changed — edge-facing refusals are typed
+
+- A refused `server/stats-sync` or `server/register` now reaches the edge with
+  a distinct standard code: `permissionDenied` (not authorised),
+  `identityMismatch` (the payload names another server), `taskFailed` with
+  `details.limit` (too many deltas), `malformedRequest`, or `internalError` /
+  `unavailable` for a failure of the control plane's own (a registration that
+  could not be stored was reported as `permissionDenied`).
+- The health pong a control plane reads is closed: a pong carrying a member it
+  does not read marks nothing active.
+- An edge picks `historyRewrite`, `deactivated` or `invalidLog` for a refused
+  sync from the kind the check carried rather than its wording, so a
+  `did:webs` fork is now `historyRewrite` (was `invalidLog`). An edge also
+  refuses to sync a log of a method whose history it does not check (a
+  `did:web` document) instead of storing it unchecked.
+- An unrouted bare DIDComm message is answered with the standard DIDComm
+  `report-problem/2.0` message instead of the unpinned
+  `did-management/did/problem-report/0.1`.
+
+### Changed — the console is keyboard- and screen-reader-usable, and meets WCAG AA contrast
+
+Buttons, pickers, inputs and dialogs are shared primitives with roles, names,
+state (`checked`, `expanded`, `busy`, `disabled`), a visible focus ring, and
+Enter/Space activation; inputs are labelled, page and card titles are
+headings, forms submit on Enter, and status is spelled out rather than shown by
+colour alone. Tertiary text and filled buttons now meet the 4.5:1 contrast
+ratio.
+
+### Changed — the console caches and shares its reads
+
+Screens read through one small cache that deduplicates requests, shows held
+data while it refreshes, polls only while the page is visible, ignores a late
+answer for a view the operator has moved off (a quick usage-chart range switch
+no longer shows the previous range), and refreshes what a change touched.
+Editing an ACL entry sends only what changed. The settings page no longer
+re-renders every second for every viewer.
+
+### Changed — the console confirms destructive actions in its own dialog, and removing an owner says what happens to their DIDs
+
+Every destructive action in the management console — deleting a DID, rolling
+back its last entry, purging or deleting a domain, purging a domain on one
+server, retiring an identity generation, revoking a passkey or an invite —
+now asks in an in-app dialog with a title, an explicitly labelled action and
+focus on Cancel, instead of the browser's `confirm()` (which a browser can
+silently suppress). Deleting a DID and purging or deleting a domain also need
+the name typed first.
+
+Removing an access entry is one dialog with three choices: remove access only,
+remove access and delete the DIDs the account owns (listed, and confirmed by
+typing), or cancel. Deleting shows each DID's progress; if any fails, the
+access entry is kept and the failures are listed with a retry. Success and
+failure notices appear as in-app messages rather than `alert()`.
+
+### Changed — the console keeps your place and your work when you sign in or your session ends
+
+One route guard now covers every page: a reload shows a splash while the
+saved session is restored (no more flash of "Please log in"), a signed-out
+visitor is sent to the sign-in page and brought back to the page they asked
+for (`/login?next=…`, honoured only for a path on the console's own origin),
+and a session that expires mid-task shows a "Session expired — sign in again"
+banner over the page, with sign-in in a dialog, so whatever was typed on the
+page is still there afterwards.
+
+### Changed — console forms validate inline and the console explains itself
+
+- Creating a DID checks the path against the control plane's own rules as you
+  type and keeps Create disabled while the path is invalid, taken or still
+  being checked; success says what to do next. "Create root DID" reserves the
+  root of the selected domain and explains what it is.
+- The access form checks the DID or agent name and the quota numbers inline,
+  and each role has a one-line description. Creating a domain checks the host
+  name the way the control plane will.
+- A small "?" explains protocol terms (witness, watcher, portable,
+  pre-rotation, TTL, alsoKnownAs, step-up passkeys, domain scope).
+- Copy says "control plane" rather than "the daemon", names
+  `did-hosting-server` correctly, and uses one verb, "Sign in", throughout.
+  The older wallet sign-ins are described in plain language with a
+  "What is this?" disclosure.
+- When a session needs a step-up the browser cannot provide, the message says
+  exactly what to do.
+
+### Changed — the DID page offers document editing only when it can be published, and shows parameters read-only
+
+Without a wallet that can relay to the DID's agent, the document editor is not
+offered (it could not sign anything) and the page says how updates are made
+instead; the "Copy to Upload" button, which discarded the edit, is gone. The
+parameters card is read-only, with a "Copy parameters JSON" action.
+
+### Changed — the Access page and the dashboard fit an owner's account
+
+The Access nav item and page are administrator-only, as the control plane
+already enforced. An owner's dashboard shows their DIDs per domain.
+
+### Changed — `health` exits non-zero on a failed check
+
+`did-hosting-server`, `did-hosting-control`, `did-hosting-daemon`,
+`webvh-witness` and `webvh-watcher` `health` now exit 1 when any check fails,
+or when the config cannot be loaded (before, it always exited 0), so
+`health && deploy` and container probes can act on it. `--strict` also fails
+on warnings (a store held by the running service, plaintext secrets, a
+non-2xx reachability probe). The run ends with a summary line. Colour is used
+only when stderr is a terminal and `NO_COLOR` is unset. The store check names
+the backend's own location (the data directory for fjall; the server without
+credentials for Redis; table prefix and region for DynamoDB; project and
+database for Firestore; database and region for Cosmos DB).
+
+### Changed — CLI listings go to stdout; `add-acl` persists before it reports
+
+`list-acl`, `tsp-relationship-list` and `identity-list` print their listings on
+stdout (diagnostics stay on stderr), so `list-acl | grep did:` works.
+`add-acl` flushes the store before reporting success, as `remove-acl` already
+did.
+
+### Changed — `features.rest_api` is now `features.http_listener`
+
+The flag runs the HTTP listener (the UI, `POST /api/trust-tasks`,
+`/api/health`), not a REST API, so it is renamed `http_listener` (env
+`<PREFIX>_FEATURES_HTTP_LISTENER`). `rest_api` and `<PREFIX>_FEATURES_REST_API`
+are still accepted; when both env names are set, `_HTTP_LISTENER` wins. Read by
+the control plane, witness and watcher; the edge always serves HTTP.
+
+### Changed — setup wizards check URLs, DIDs and the listen host as they are entered
+
+URL prompts require an `http://` or `https://` URL with a host, DID prompts
+(VTA, mediator, control plane, admin, watcher sources) require the
+`did:<method>:<id>` shape, and the listen host must be an IP address; a bad
+answer is re-asked with the reason instead of failing later at provisioning or
+first boot. When the VTA DID cannot be resolved, the wizard says so instead of
+silently offering no mediator.
+
+### Changed — `--path` and `--mnemonic` both name a DID slot
+
+`stats-show`, `stats-set`, `bootstrap-did`, `load-did`, `dump-did`,
+`recreate-did`, `recover-did` and `remove-did` accept either `--path` or
+`--mnemonic`. Messages that suggest a command now name the binary that is
+running (`did-hosting-daemon remove-did …` from the daemon).
+
+### Changed — the control plane queues replication with the change that causes it, as references
+
+A DID publish, register, delete, rollback, suspension, witness upload or
+agent-name change now writes its sync rows for every server and watcher in the
+**same store transaction** as the change. A crash between the two can no longer
+lose the push, and a slot's rows reach each server in commit order (a publish
+quickly followed by a delete no longer risks the delete arriving first).
+
+Outbox rows no longer carry the `did.jsonl`: a row names the slot (or the
+domain), and the worker reads it when it sends. Rows are a few hundred bytes
+whatever the log's size, so a resync batch can no longer exceed DynamoDB's
+400 KB item limit; a resend carries the newest state, and a slot deleted before
+its row is sent goes out as a delete. A slot or domain already queued for a
+server is not queued again — an edge that registers while its queue is still
+draining no longer has the same delta appended each time — and an
+acknowledgement of a state a later change superseded re-arms the row rather
+than settling it.
+
+Delivery is cheaper and fairer: the worker reads only the head of each queue,
+finds the row an acknowledgement answers through an index, services targets
+concurrently, and locks per target rather than globally. The replication
+gauges read a count and the head rather than the whole queue. A registration
+queues domain rows before DID rows, and pages through the DID records.
+
+Rows queued by an earlier version are re-keyed when the worker starts and drain
+as before.
+
+### Changed — unacknowledged sends back off, and are counted apart from failures
+
+A send the mediator accepted but the target never acknowledged was re-sent every
+minute, so an offline edge exhausted its budget in about 50 minutes and
+collected a copy a minute. The wait now doubles from one minute to an hour,
+with jitter, for up to 24 sends (about 19 hours); hard delivery failures keep
+their own budget (50, about 3.5 hours). An acknowledgement of any of the last
+16 copies sent settles the row. New counters on `server/metrics`:
+`webvh_outbox_enqueue_failures_total`, `webvh_outbox_delivery_failures_total`,
+`webvh_outbox_unacked_resends_total`, `webvh_outbox_dropped_total` and
+`webvh_outbox_record_failures_total`.
+
+An assign a server acknowledged is no longer re-sent on every registration
+while the server still reports serving the domain; it is re-sent to one that
+registers without it.
+
+### Changed — `did/list` pages from the store, and quota checks stop scanning
+
+`did/list` no longer reads, parses and sorts every record for each page. On
+fjall and Redis a page starts at its cursor in the owner index, a new
+per-domain index (`domain:{domain}:{mnemonic}`) or the records, and stops
+when it is full. On DynamoDB, Cosmos DB and Firestore, whose pages are not in
+key order, a page is still one walk of the records, but holds only the page
+in memory; the order and the cursor are the same on every backend. Pages stay
+in mnemonic order.
+
+The `vnd.affinidi.webvh` request extension of `did/list` takes `search`
+(1–200 characters, matched without case against the mnemonic, the DID and its
+agent names) and `agentName` (with `domain`: the slot holding that name, from
+the name index). A searched page reads at most 5,000 rows and may come back
+short, or empty, with a `nextCursor`; keep paging while one is present. An
+unknown member of the extension is refused. The same extension's `domain` on
+`stats/get` (without `mnemonic`) answers the per-domain aggregate: every slot
+on the domain for an administrator, the caller's own slots otherwise.
+
+Each owner's slot count and stored bytes are kept in a `usage:{owner}` row
+written in the same batch as the record, so the count and size quotas read one
+row instead of every slot the owner holds. Both new kinds of row are built for
+an existing store by the `m03_index_did_records` migration, which the control
+plane and the daemon run at their first boot after upgrade; a control plane
+that cannot run it does not start. Control-plane replicas sharing one store
+should be upgraded together: a replica on the previous version writes records
+without updating these rows.
+
+### Changed — boot and periodic work no longer hold whole keyspaces in memory
+
+The boot-time integrity check, the session cleanup, the domain purge and the
+storage migrations walk the store a page at a time, and the DID counts (the
+stats seed and the hourly recount) count keys without reading values. The
+stats seed retries a failed store read with backoff and logs it, rather than
+silently starting the totals at zero, and the statistics collector no longer
+fails every later resolve after a panic while it held its lock.
+
+### Changed — a hosting server answers resolution from memory, with ETags, `304` and compression
+
+- A standalone edge now keeps the resolution gate cache (each DID's record and
+  the domains) the daemon already kept: every change an edge serves arrives as
+  a control-plane directive it applies in-process, and each one — sync update
+  and delete, domain upsert, assign, unassign and purge, the reconcile repair,
+  the empty-slot cleanup — clears what it changed through one helper. A warm
+  resolve reads nothing from the store. The record is read once per request
+  however many method dispatchers look at it.
+- Resolved content is held as shared bytes (a hit no longer copies the
+  document) with a strong `ETag` computed when it is cached; a matching
+  `If-None-Match` is answered `304 Not Modified`. Responses are gzip- or
+  brotli-compressed for clients that accept it; the compressed form carries
+  the tag weakened (`W/`), which still revalidates.
+- The content cache is bounded: `limits.content_cache_bytes` (default 256 MiB),
+  dropping the oldest entries past it.
+- The HTTP runtime's worker threads default to one per available core instead
+  of four; `limits.http_worker_threads` sets them.
+- A cold resolve verifies the log on a blocking thread, and a `did:webs`
+  `did.json` is derived once per key event log (memoised in memory on the
+  stream's SHA-256, so it can never serve a document from before a rotation).
+
+### Changed — an edge applies syncs per slot, verifies before locking, and keeps compact high-water marks
+
+- Sync updates verify the log's chain on a blocking thread before any lock is
+  taken, then lock only the slot (and the DID's identity) for the
+  read-check-write, so syncs of different slots run in parallel. Re-sending
+  exactly what the edge holds is answered `unchanged` without re-verifying it.
+- The high-water mark kept for each DID (the tombstone that stops a deleted
+  DID's history being rolled back) is now its entries' version ids rather than
+  a second copy of the whole log; a `did:webs` mark still keeps its key event
+  log. Rows in the old format are read as before and rewritten at boot.
+- Registration, the reconcile loop, the empty-slot cleanup and the boot count
+  page through the store instead of reading every DID record at once, and the
+  health ping reports the in-memory DID count; the per-DID boot log line is
+  now `debug`.
+
+### Changed — the console pages and searches the DID list on the server
+
+The DID list no longer reads every DID before it shows any. It asks
+`did/list` for 50 at a time, filtered to the pinned domain and to the search
+box by the control plane (name, DID or agent name), with **Load more** for
+the next page; sorting applies to the DIDs loaded. The dashboard's
+pinned-domain cards read that domain's totals with one `stats/get` instead of
+listing every DID (the update count is now the real number of updates), and
+granting access by agent name looks the one name up instead of listing every
+DID. A DID's page reads its log once per load rather than twice, and the
+usage chart (with its charting library, most of the console's script) loads
+only on the pages that show it.
+
+### Changed — the watcher verifies syncs in parallel and stores a compact high-water mark
+
+A watcher verifies a synced log's chain on a blocking thread before it takes
+any lock, and serialises only the read-check-write, per slot and per DID,
+instead of every sync behind one process-wide lock. A re-send of exactly the
+log it already mirrors is not re-verified. The high-water mark it keeps per DID
+is now its entry count, last `versionId`, a SHA-256 over its entries and
+whether it deactivated the DID, not a second copy of the log; rows an earlier
+release stored as full logs are rewritten at startup. The mark still survives a
+delete, as the DID's anti-rollback tombstone.
+
+### Changed — watcher resolution answers conditional requests
+
+Watcher resolution reads the store once per request (disabled slots are
+tracked in memory) and sends a strong `ETag`, answering a matching
+`If-None-Match` with `304 Not Modified`.
+
+### Changed — the witness signs without a process-wide lock
+
+`webvh/witness/sign` verifies the log off the async workers, and serialises
+only requests for the same witness identity and DID while the witnessed mark
+moves; signing happens after the lock is released. The mark's
+compare-and-swap is unchanged.
+
+### Changed — the management console's assets are cacheable and compressed
+
+The control plane and the daemon send content-hashed console bundles
+(`_expo/static/…`, hashed `assets/…`) with `Cache-Control: public,
+max-age=31536000, immutable`, other files with `no-cache`, and every non-HTML
+file with a strong `ETag` (answering `If-None-Match` with `304`); the console's
+HTML stays `no-store`. Console responses are gzip- or brotli-compressed when
+the client accepts it. In the daemon, files of the console's bundle are no
+longer charged to the public resolution rate limit.
+
+### Changed — `did-hosting-control` refuses to build with no storage backend, or with more than one
+
+Its build script used to print a warning and carry on, leaving a binary that
+could not open a store (none selected) or picked one by accident of cfg
+ordering (several). It now fails the build with the same message as
+`did-hosting-server`, `webvh-witness` and `webvh-watcher`: enable exactly one
+of `store-fjall`, `store-redis`, `store-dynamodb`, `store-firestore` or
+`store-cosmosdb`.
+
+### Changed — release builds use one codegen unit and strip symbols
+
+`[profile.release]` adds `codegen-units = 1` and `strip = "symbols"`
+alongside the existing `opt-level = "s"` and `lto = true`. Release binaries
+are smaller and a little faster to run, slower to build, and a panic
+backtrace from one shows addresses rather than function names; build with
+`CARGO_PROFILE_RELEASE_STRIP=none` when you need them. `opt-level` stays at
+`"s"`: `3` measured no faster on webvh log verification and made the binary
+about 27% larger.
+
+### Changed — building the management UI requires the Node.js version in `did-hosting-ui/package.json`
+
+The `ui` feature's build script (`did-hosting-control/build.rs`, used by the
+control plane and the daemon) now reads its Node.js floor from `engines.node`
+in `did-hosting-ui/package.json` (currently `>=24.3.0`) instead of its own
+`20`, so the two can no longer disagree. A build that rebuilds the UI on an
+older Node now stops with a message naming the required version; build with
+`--no-default-features` (see the crate READMEs) to skip the UI.
+
+### Changed — shipped setup recipes run as documented
+
+`examples/did-hosting-server-build.toml` sets a placeholder
+`[identity].control_did` (replace it with your control plane's DID), so it is
+no longer refused as shipped, and the new
+`examples/did-hosting-daemon-self-managed.toml` sets up a VTA-less daemon on
+`localhost` with no edits. CI loads and validates every recipe in `examples/`.
+
+### Changed — documentation reorganised
+
+`docs/README.md` indexes the documentation; every page carries a status line,
+superseded designs and plans moved to `docs/archive/`, and new pages cover
+configuration, deployment, backup and upgrade, metrics, troubleshooting, the
+architecture and trust model, and a glossary. A `docs` CI job checks status
+lines, relative links (lychee, offline) and retired names.
+
+### Changed — a fjall store flushes its writes in the background, holding at most 8 MiB in memory by default
+
+Every service that opens a local fjall store (control, server, witness,
+watcher, and the daemon's two stores) now runs a background flusher. fjall
+3.1 records `max_write_buffer_size` but does not enforce it, so before this
+change buffered writes stayed in memory, and in the journal replayed at
+startup, until fjall flushed on its own schedule. The flusher seals the
+memtables once the unflushed bytes across all keyspaces reach
+`[fjall].write_buffer` (env `STORAGE_FJALL_WRITE_BUFFER`; default **8 MiB**,
+previously effectively unbounded), and flushes anything older than five
+minutes however small, which also keeps the journal short. Memory use and
+flush behaviour change for every fjall deployment; raise
+`[fjall].write_buffer` if a write-heavy service now flushes more often than
+you want. (#340)
+
+### Changed — background work is supervised, and shutdown is ordered and bounded
+
+`did-hosting-server`, `did-hosting-control` and `did-hosting-daemon` now run
+their background work under a supervisor. A task that stops on its own while
+the service is running is logged at `error`: the restartable ones (the
+outbox, the purge and identity sweeps, the registry health check, the edge's
+registration, reconcile and stats-sync loops) are restarted with backoff
+(1 s, doubling to 60 s); the critical ones (the HTTP listener and the storage
+thread or task, which persists the store) shut the service down with a
+non-zero exit so the orchestrator restarts it. Before this a dead worker was
+noticed only at shutdown, and the service kept answering `/api/health` while
+replication, identity expiry or the statistics flush had stopped.
+
+Shutdown runs in stages, each given at most 30 seconds: the workers, then the
+messaging service (awaited — "DIDComm service stopped" is now logged only
+once it has), then HTTP, then work requests handed off (an edge's resync),
+then the storage thread's last flush and the store's persist — which
+therefore runs after the outbox worker has stopped. The daemon's HTTP server
+had no deadline, so one stalled connection could hold up `SIGTERM`
+indefinitely; it now has the edge's 30 s.
+
+An edge (and the control plane, and the daemon) now retries starting its
+messaging service with backoff instead of giving up after one warning, so an
+edge whose mediator is briefly unreachable at boot still comes to reconcile
+with its control plane.
+
+### Changed — the daemon's `/health` reports the real check
+
+`GET /health` on `did-hosting-daemon` answered `ok` unconditionally. It now
+answers `200` only while the daemon's own DID is served from its store, and
+`503` with `"status": "degraded"` otherwise — the check the standalone
+services' `/api/health` makes. Its body gains a `version` field.
+
+### Changed — `did_hosting_control::server::AppState` is built by `AppState::build`
+
+For crates embedding the control plane: `AppState` drops the unused
+`http_client` field and gains `background` (the tracker of work handed off by
+a request, awaited at shutdown). Build one with `AppState::build(config,
+store, secrets, identity, AppStateOverrides { .. })` — the recipe the
+standalone control plane, the daemon and `test_support` all use — and run
+its boot steps with `server::startup`, rather than writing the literal.
+
+### Changed — the control plane no longer records `trust_task_capable` for a server
+
+Every health ping has been a signed trust task for some time, so the registry flag
+that once chose between a trust-task ping and the legacy `MSG_HEALTH_PING` was stored
+but never read. It is gone from the registry record, and edges no longer send the
+`trust_task_capable` registration hint (a control plane that receives it from an older
+edge ignores it, as it does any unknown hint).
+
+### Changed — one did.jsonl parser for every did:webvh path
+
+Validation, the publish and serve verifiers, witnessing and identity rotation now
+share a single parse of a `did.jsonl` instead of five copies, and a publish no longer
+parses every entry twice before checking signatures. Each line is read under the
+method version of the entry before it, and a malformed `versionId` is refused by plain
+validation too, as every verifier already did.
+
+### Changed — the management UI package is named `did-hosting-ui`
+
+The UI's `package.json` name and Expo slug were still `webvh-ui`.
+
+### Changed — dependency generation: TDK 0.45, trust-tasks 0.39, vta-sdk 0.90
+
+`affinidi-tdk` 0.45, `affinidi-messaging-sdk` 0.47 (`-didcomm-service`
+0.32), `trust-tasks-*` 0.39, `vta-sdk` 0.90, `vti-common` 0.66, `vti-secrets`
+0.39 and `affinidi-crypto` 0.3, the generation `vta-sdk` 0.90 is built
+against, so the shipped graph holds one copy of each. The test mediator moves
+to 0.52 with them.
+
+### Changed — the service binaries return freed memory to the OS
+
+`did-hosting-server`, `did-hosting-control`, `did-hosting-daemon`,
+`webvh-witness` and `webvh-watcher` now use jemalloc as their global
+allocator. With glibc malloc, memory freed after a burst of requests stayed
+resident, so RSS ratcheted up to its high-water mark and never came down —
+which looks like a leak on a memory graph. jemalloc (with
+`background_thread:true`, `dirty_decay_ms:5000`, `muzzy_decay_ms:5000`,
+exported as `_rjem_malloc_conf` because tikv-jemalloc-sys prefixes jemalloc's
+symbols) returns freed pages to the OS, so RSS tracks the live heap.
+
+It is behind a new default-on `jemalloc` feature on each of those crates and
+installed only by the binaries (`main.rs`), never the libraries, so a program
+embedding them keeps its own allocator. Build with `--no-default-features` (and
+the features you need) to use the system allocator; MSVC targets always do.
+
+### Changed — an invite that would be refused is refused before the passkey is made
+
+`auth/passkey/enroll/redeem/start` now refuses an invite whose issuer or
+amending administrator has lost administrator standing, and one that would pair
+a passkey with a metrics reader, with `permissionDenied`. Before, these were
+refused only at `redeem/finish`, after the invitee had created a passkey on
+their authenticator, and the invite was spent. A start refused this way leaves
+the invite in place. The finish still checks both. It now reads the role to
+grant from the invite as it stands at the finish, not as it was when the
+ceremony opened.
+
+### Changed — the workspace moves to the affinidi-tdk 0.49 generation, and `didwebvh-rs` is no longer pinned exactly
+
+Every crate moves to the Affinidi TDK generation built on
+`affinidi-data-integrity` 0.9 and `affinidi-secrets-resolver` 0.6, together:
+`affinidi-tdk` 0.49, `affinidi-did-common` 0.5,
+`affinidi-did-resolver-cache-sdk` 0.9, `affinidi-did-webs` 0.14,
+`affinidi-messaging-sdk` 0.50, `affinidi-messaging-didcomm-service` 0.38,
+`affinidi-tsp` 0.5, `vta-sdk` 0.92, `vti-common` 0.68, `vti-secrets` 0.41,
+the `trust-tasks-*` crates 0.41 and `agent-names` 0.2 (#486).
+
+- `didwebvh-rs` is required as `0.8.3`. Since didwebvh-rs 0.8.3, which
+  accepts the newer generation, an unlocked build (`cargo install` without
+  `--locked`) gave it different `affinidi-data-integrity` and
+  `affinidi-secrets-resolver` copies from the rest of the service, and the
+  binaries failed to compile. An exact `=0.8.2` pin worked around that while
+  `vta-sdk` and `vti-common` were still on the old generation. With the whole
+  workspace on the new one, the pin is gone and unlocked builds compile
+  again. Locked builds were never affected.
+- `jsonwebtoken` moves from 10 to 12, the version `trust-tasks-https` and
+  `vti-common` now use, so the service ships one copy instead of two. It is
+  built with the `aws_lc_rs` backend, as they build it, instead of
+  `rust_crypto`. Session tokens are still EdDSA, signed and verified only by
+  this service. The `rsa` and `crypto-bigint` 0.5 advisories that
+  jsonwebtoken 10 brought in no longer apply, and their `deny.toml` ignores
+  are gone.
+- `did-hosting-control` and `did-hosting-server` no longer declare the storage
+  and cloud-secret backend crates themselves. Their `store-*` and `*-secrets`
+  features turn on the same `did-hosting-common` features as before, which
+  bring those crates in. No feature was renamed or removed.
+
+The `acl/*` Trust Task versions do not change: `acl/{grant,show,change-role,revoke}`
+stay at 0.2 and `acl/list` at 0.3. The next versions make a per-entry
+`purposes` scope required, which this service does not implement yet.
+
+No configuration, stored data or wire format changes.
+
+### Changed — the workspace moves to the affinidi-tdk 0.50 generation, and the graph holds one trust-tasks copy
+
+Every Affinidi / VTI crate moves together: `affinidi-tdk` 0.50,
+`affinidi-messaging-sdk` 0.51, `affinidi-messaging-didcomm-service` 0.39,
+`vta-sdk` 0.94, `vti-common` 0.70, `vti-secrets` 0.43, the `trust-tasks-*`
+crates 0.41.2, `trust-tasks-build` 0.2.2 and the test mediator 0.56 (dev).
+No source change was needed.
+
+- The messaging stack is now on trust-tasks 0.41, so `trust-tasks-rs` and
+  `trust-tasks-proof` 0.40 leave the dependency graph. `cargo tree -d` lists
+  no duplicate `affinidi-*`, `trust-tasks-*`, `vta-*` or `vti-*` crate, and
+  the `deny.toml` skips for the 0.40 copies, `trust-tasks-build` 0.1 and
+  `pem` are gone.
+- `fuzz/Cargo.lock` is refreshed the same way.
+
+No configuration, stored data or wire format changes.
+
+### Fixed — a DID an administrator suspended stays suspended until an administrator resumes it
+
+`did/set-state` stored only whether a slot was suspended, not who
+suspended it, and a re-register wrote every slot back as active. So a slot
+an administrator suspended was resumed by its owner sending
+`did/set-state active`, by the owner re-registering it, or by the owner
+force re-creating the path. The record now notes an administrator's
+suspension (`disabled_by_admin`, absent on older records, which read as
+not suspended by an administrator). While it is set, the owner's `active`
+is refused with `permissionDenied`, and a re-register or forced re-create
+keeps the slot suspended. An administrator's `active` clears it.
+
+Behaviour change: a re-register (`did/register` of an existing slot) and a
+forced re-create no longer resume a suspended slot, whoever suspended it;
+the slot is resumed with `did/set-state active`. An owner can still
+suspend and resume a slot it suspended itself. An owner can no longer
+delete a slot an administrator suspended (`permissionDenied`): the delete
+is final, so a later re-register would start the slot afresh. An
+administrator can still delete it.
+
+Upgrade note: a binary from before this change does not know the marker
+and drops it when it rewrites a record. After a downgrade, or while
+replicas of mixed versions share a store, re-apply administrator
+suspensions once every replica runs this version.
+
+### Fixed — the large-document cost of an address decays, and a `did:scid` issuer's `?src=` is not a mismatch
+
+A large `did/register` (over 64 KiB) whose claimed issuer does not verify
+doubles its address's cost for the next one. That raised cost never went down
+until the process restarted, so after three such documents an address could
+send no large document at all: a shared egress address, or a load balancer
+missing from `trusted_proxies`, stayed shut out after one sender's failures.
+The raised cost now halves every 15 minutes and on each large document from
+the address that does verify, and is forgotten once back to 1. The penalty
+table keeps its 10,000-address bound and, when full, makes room by dropping
+the penalties that have decayed.
+
+The claimed issuer was also compared with the verified one as raw strings, but
+the verifier reports a `did:scid` issuer without its `?src=` locator. An owner
+signing as `did:scid:vh:1:…?src=…` was charged a penalty on every large
+document it sent, although it verified. The two are now compared as
+identities, without the locator.
+
+Behaviour change (R3.6): no wire shape changes; an address is refused large
+documents for less time than before, and a `did:scid` issuer with `?src=` that
+verifies is no longer held to a raised cost.
+
+### Fixed — a `did:webs` slot can be read, suspended, transferred and deleted
+
+A `did:webs` slot's path ends in its AID, which is mixed case. Only
+`did/register` accepted that path; `did/info`, `did/log`, `did/set-state`,
+`did/change-owner`, `did/delete`, `did/rollback`, `agent-name/list` and
+`webvh/witness/publish` checked it against the lowercase-only grammar and
+refused it as an invalid path, so a registered `did:webs` could not be
+inspected, suspended, transferred or removed. Each of these now takes the
+path's grammar from the stored record, as a publish already did: the AID
+grammar applies only to a slot recorded as `did:webs`, never because of
+anything in the request.
+
+What each does with a `did:webs` slot:
+
+- `did/info` returns the record and no `logSummary`: that summary is read from
+  a `did:webvh` log line.
+- `did/log` returns one entry, the document the key event log implies now
+  (re-verified, as on resolution), and with `raw` the stored `keri.cesr`.
+  Earlier establishment events are not listed. Without `method-webs` it
+  returns no entries.
+- `did/set-state`, `did/change-owner` and `did/delete` work as for any slot.
+- `did/rollback` is refused: it truncates a `did:webvh` log by line, and a
+  `did:webs` key event log is only ever extended by its controller.
+- `webvh/witness/publish` is refused with `invalidWitness`: a `did:webs`
+  slot's witness receipts are part of its key event log.
+
+`did/rollback` now applies to `did:webvh` slots only. On a `did:web` slot it
+split the stored `did.json` by line: a pretty-printed document was left as
+invalid JSON with no `did_id`, and pushed to every edge. It is refused for
+every method but `did:webvh`, and the slot is left as it was.
+
+`did/log` answers a path that is not a valid slot path with `notFound`, as it
+answers a slot the caller may not read, so the answer does not depend on
+whether a `did:webs` slot is recorded at an AID-shaped path.
+
+Behaviour change (R3.6): no wire shape changes. Requests naming a `did:webs`
+slot that were refused as an invalid path now succeed, or (rollback, witness
+publish) are refused for the method instead. `did/rollback` on a `did:web` (or
+any other non-`did:webvh`) slot is refused. `did/log` with a malformed path
+returns `did-management/did/log:notFound` instead of a validation error.
+
+### Fixed — outbound HTTP clients keep their timeouts and redirect policy
+
+The client `did-hosting-common` uses to resolve a DID log from a hosting URL
+and to send a Trust Task over HTTPS has a 30-second total timeout, a
+10-second connect timeout, and refuses redirects. If that client could not be
+built (the TLS backend or the platform certificate verifier failed to
+initialise), it was silently replaced by a default client with no timeouts
+that follows redirects. The failure is now returned to the caller as an error
+instead: `WebVHClient::resolve_did` returns `WebVHError::Http`, and a Trust
+Task HTTPS send fails like any other transport error. The client is now
+public as `did_hosting_common::outbound_client`.
+
+Two other clients now follow the same policy:
+
+- `did-hosting-daemon setup` authenticates to a VTA's REST URL, taken from
+  the VTA's DID document, with this client. Before, it used a default client
+  with no timeouts that followed redirects.
+- The health check's reachability probe (`check_url_reachable`) adds a
+  5-second connect timeout to its 5-second total timeout and no longer
+  follows redirects, so a 3xx is reported as that status. If its client
+  cannot be built, the check fails with the reason instead of panicking.
+
+Behaviour change: on a host whose TLS setup cannot initialise, these calls now
+fail instead of running without timeouts or redirect refusal. The health
+check reports a redirecting URL as reachable with its 3xx status, as it
+already does for other non-success statuses, instead of following it.
+
+### Fixed — a watcher slot stays with the source that first synced it
+
+On a watcher with more than one source, a second source could change or
+delete a slot another source held for the same DID. A slot now belongs to the
+source that first synced it until that source deletes it. An update from
+another source is refused `webvh/sync/update:notAuthorized` (in a batch, that
+entry is refused with the same code). A delete from another source leaves the
+slot in place and is answered `absent`, as before. Both are logged as
+warnings.
+
+The first sync wins, so two settings bound it:
+
+- `[[sync.sources]]` lists a source with the `domains` it may sync DIDs for.
+  A DID on any other host is refused `notAuthorized`. A source with no
+  `domains`, and every source in `source_dids`, may sync any host, as before.
+- A slot whose holder is no longer a configured source is released. The next
+  configured source to sync it holds it, still held to the DID's high-water
+  log, and the release is logged with the old holder. Removing a source is
+  how an operator moves its slots to another.
+
+Behaviour change: before, a second source could extend a DID held by another
+source; now only the holding source can. A slot stored by an earlier release
+belongs to the source its record names, which is the source that last wrote
+it; no migration is needed. Operators with more than one source should check
+which source holds each DID. A watcher with a single source is unaffected.
+
+The holder check and the write are serialised per process only, and the store
+has no conditional write: run one watcher process per store.
+
+### Fixed — the daemon sends the standard response headers
+
+`did-hosting-daemon` now sets the same response headers as the standalone
+control plane, server, witness and watcher: `Content-Security-Policy`
+(`default-src 'self'`, …), `X-Content-Type-Options: nosniff`,
+`X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
+`Strict-Transport-Security`, and `Cache-Control: no-store` on any response whose
+handler sets no `Cache-Control` of its own. They cover the management console and
+its assets, `POST /api/trust-tasks`, the embedded witness and watcher, and DID
+resolution, which keeps its configured `[server.resolve_cache]` value.
+`/health` is unchanged. Before this the daemon sent only the console's own HTML
+headers, so Trust Task replies and error responses could be cached. Operators
+whose reverse proxy already adds these headers will now see them twice and may
+want to drop one copy.
+
+### Fixed — dashboard polling no longer keeps an idle console signed in
+
+The console's dashboard refreshed itself every five seconds, and each refresh
+counted as activity, so a console left open on the dashboard never reached
+`auth.admin_idle_timeout`. Requests the console sends on a timer now carry
+`X-Background-Request: 1`. The control plane authenticates and answers them
+as before, but does not record them as session activity. The dashboard refresh
+and the pending-approval log check on a DID's page are marked this way, as are
+the agent-name and DID reloads they trigger, and both polls pause while the
+browser tab is hidden. A request without the header counts as
+activity, as before.
+
+### Fixed — signers outside the ACL get their own replay cache and bounded DID resolution
+
+The control plane recorded every signed Trust Task document in one shared
+replay cache, including those on the tasks that take a proof from a signer the
+ACL does not list (`server/info`, discovery, the `auth/*` family, passkey login
+and invite redemption). Such a signer (a fresh `did:key`, say) costs nothing to
+create, so that traffic could fill the cache, which then refused every signed
+request as `unavailable` until its records aged out. Verifying those proofs,
+and a proxied login's delegation evidence, could also resolve any DID the
+document named, twice.
+
+- Replay records are now partitioned. Open reads (`server/info`, capability
+  discovery, an `auth/oob/*` version this service does not serve) are not
+  recorded at all. The shared cache holds only ACL members' and configured
+  watchers' records. Sign-in rows from any other signer go to a separate cache
+  (100,000 records, 1,000 per signer), and each source (client address on
+  HTTPS, sender on DIDComm and TSP) may add at most 120 records a minute. A
+  `did:webs` self-registration goes to a third, small cache. A document
+  recorded in any of them is refused as a replay in all of them.
+- Verifying a proof from a signer the ACL does not list runs the key-free
+  checks (recipient, freshness, issuer/sender) first. If the DID must be
+  resolved over the network (anything but a `did:key`), at most 16 resolutions
+  run at once and 300 per minute across all such signers, each within 10 s,
+  with no forced re-resolution retry. Past those limits the document is refused
+  as `unavailable` with a `retryAfter`; a timeout is reported as an unreachable
+  signer (retryable). The delegate of a proxied login whose principal is an ACL
+  member, and whose delegation evidence that principal signed verifies, is
+  verified as a member is.
+- A proxied `auth/authenticate/0.3` is refused (`permissionDenied`) when its
+  principal has no ACL entry, before its delegation evidence is checked. A
+  `siopIdToken` must claim the principal as `iss` before it is resolved. Both
+  evidence checks are bounded at 10 s.
+- For every signer: a proof whose signer DID could not be resolved at all is no
+  longer resolved a second time. The forced-refresh limiter is keyed on the
+  DID's identity, so a `did:scid`'s `?src=` variants share one allowance, and
+  tracks at most 4,096 DIDs.
+- Behaviour changes (R3.6):
+  - Signers outside the ACL, members' own sign-in keys included (a passkey
+    login's browser key, a session key on `auth/refresh`, a proxied login's
+    delegate, invite redemption), share the sign-in cache and per-source
+    quota. When they are spent, those requests get `unavailable` (retryable)
+    even though the shared cache has room. Members' own signed operational
+    requests are not affected.
+  - A non-`did:key` delegate whose mandate does not verify, and any other
+    non-`did:key` signer outside the ACL, competes for the shared resolution
+    slots and rate.
+  - A signed open read can be resent; it is answered again rather than refused
+    as `idConflict`.
+  - A proxied login for a principal outside the ACL is now refused before its
+    evidence is checked (it was refused later, at the ACL check, before).
+  - A signer DID whose resolution fails, including a `did:webvh` whose log
+    cannot be read to establish deactivation, used to get a forced fresh
+    resolution within the same request. It now gets a retryable `unavailable`,
+    and the retry resolves it afresh.
+  - The new bounds are constants, not configuration.
+
+### Fixed — `did:webs` registers over `did/register/0.1`
+
+The `did/register/0.1` Trust Task refused every method but webvh ("this host
+registers webvh only over this task"), and the REST `POST /api/dids/register`
+that took `method: "webs"` has since been removed, so a host built with
+`method-webs` had no way left to accept a `did:webs` publication. The task now
+takes `method: "webs"` with the `keri.cesr` stream as `didData` and a `domain`,
+on a host built with `method-webs`, through the same `register_did_atomic`
+that verifies the log and builds the identifier from the slot. A host built
+without it refuses `webs` by name, naming the feature. This is how a VTA
+publishes the `did:webs` DIDs it creates.
+
+### Fixed — agent names are reserved per name, and released when their DID is deleted
+
+The check that an agent name is free and the write that binds it were held
+under the claiming DID's own lock only, so two DIDs claiming the same free name
+at once (`agent-name/update`, a plain publish, or `did/register`) could both
+succeed, leaving both records listing the name and the index pointing at
+whichever wrote last. Each name now has its own lock, taken after the DID's lock
+and held from the check to the commit, so exactly one claim wins and the other
+is refused as taken.
+
+- `agent-name/remove` retires the name's index entry only while it points at
+  the DID removing it; it no longer deletes another DID's entry.
+- `did/delete` releases the deleted DID's agent names (active and parked),
+  again only entries that point at that DID. Previously they stayed indexed
+  against a DID that no longer existed. The names are removed in a second
+  write right after the record, so a DID with many names stays deletable on
+  stores that cap one transactional write (DynamoDB: 100 items).
+- A domain purge likewise removes only the index entries that still point at
+  each purged DID, after the record; in the daemon it now takes the control
+  plane's DID and name locks while it deletes.
+- The DID and name locks are released as soon as a publish or agent-name
+  change commits, before the check for a rotation of the service's own DID.
+- **Behaviour change:** an index entry that points at a DID which no longer
+  exists, or whose record no longer lists the name, no longer holds the name.
+  `agent-name/check` reports such a name available and it can be claimed.
+- **Upgrading:** agent names left indexed by DIDs deleted before this release
+  become claimable again by any DID on their domain.
+
+### Fixed — error text with multi-byte characters is truncated safely
+
+The control plane's outbox cut a failed delivery's error text at a fixed byte
+offset; text with a multi-byte character across that offset (an edge's own
+error message, or one of this service's messages containing `—`) stopped the
+outbox worker. User-facing error messages capped in `did-hosting-common` had the
+same problem. Both now cut on a character boundary.
+
+### Fixed — the Redis store URL is logged without credentials
+
+Opening the Redis store logged `redis_url` as configured, including any
+username, password or query parameters. The log line now shows the scheme,
+host, port and database only.
+
+### Fixed — no warning per DID change when no edge is registered
+
+"DID sync: no active servers in registry" (and its delete counterpart) was
+logged at warn on every DID change whenever no edge was active, which for a
+daemon is always. With no edge registered it is now logged at debug. With
+edges registered but none active, so the change reaches none of them, it is
+a warning at most once every 5 minutes.
+
+### Fixed — per-key write locks are released when no longer in use
+
+`PathLocks` (the per-slot, per-name and ACL write locks) kept one entry for
+every key ever locked, for the life of the process, including keys that named
+no stored record. An entry is now removed as soon as no task holds or waits
+for its key, so the lock table stays as small as the set of keys in use.
+Same-key callers still serialise exactly as before.
+
+### Fixed — the HTTPS listener classifies a passkey ceremony without a full parse
+
+`POST /api/trust-tasks` decides whether a request opens an invite redemption
+or a passkey login (to apply its per-address limit) before the per-type size
+limit runs. It used to parse every body, up to the route's largest limit, as
+a whole Trust Task document to decide. It now looks only at the body's length
+first (a body over those ceremonies' 64 KiB limit cannot be one and is refused
+later by the size limit, before any parse), and otherwise reads only the
+top-level `type`. A body over 64 KiB that is refused before dispatch is
+answered with an unrouted error document instead of one addressed to it. A
+redemption or login body that names the ceremony's `type` but is otherwise
+malformed now counts against the per-address limit.
+
+### Fixed — sessions and invites end with the passkey or ACL entry they rest on
+
+Revoking a passkey left the sessions it had signed in, and the elevation
+it had granted, in place until they expired. Removing a subject's ACL
+entry (`acl/revoke` with `revocation.kind: entry`) left its sessions, and
+the enrolment invites issued for it, in place, and redeeming such an
+invite recreated the entry. Now:
+
+- `auth/passkey/revoke/finish` ends the subject's sessions a login passkey
+  signed in (when the revoked passkey is a login passkey) and returns
+  sessions a passkey elevated to `aal1`. A session does not record which
+  passkey established it, so this covers every such session of the
+  subject, except that a passkey session the revocation was made from is
+  kept (an elevation on it is still dropped).
+- Removing an ACL entry, by `acl/revoke` or by the operator's
+  `acl remove`, ends every session of its subject and withdraws the
+  invites issued for it or by it. Narrowing an entry's act scope does
+  neither. An invite redemption waits for a removal in progress, so it
+  cannot recreate the entry in between. The subject's passkeys are kept:
+  login checks the ACL, so they work again only if the subject is granted
+  an entry again, and then they do. `acl remove` from the command line
+  does not take the running control plane's removal lock, so on a store a
+  running control plane shares (DynamoDB, Redis and the other networked
+  backends) prefer `acl/revoke`.
+- A refresh in flight while its session is ended or demoted does not undo
+  that: the refresh re-applies it to the rotated session (an ended
+  session's refresh is refused).
+- `auth/passkey/enroll/redeem/finish` refuses (`permissionDenied`) an
+  invite whose issuer no longer holds administrator standing, checked
+  under the ACL write lock; the invite is spent.
+
+Behaviour change: a subject signed in with a passkey is signed out when
+one of its login passkeys is revoked from another session, and a removed
+member is signed out at once rather than when its session expires.
+
+### Fixed — a `mandateCredential` is checked as a decision and must name its own end
+
+A proxied `auth/authenticate/0.3` backed by `delegationEvidence` of kind
+`mandateCredential` verified the mandate's proof with the general proof
+check, which does not refuse a principal whose `did:webvh` is
+deactivated, and accepted a mandate with no `expiresAt`, which then let the
+delegate sign in as the principal with no end. The mandate is now verified
+as every other decision is (`TransportBoundVerifier::verify_approval`: an
+`assertionMethod` proof by a key under the principal's own
+`assertionMethod`, never a session delegate, from a principal that has not
+deactivated its DID). It must carry `issuedAt` (not in the future) and
+`expiresAt` (after it, and not past), at most 30 days apart, and the
+session it backs, and that session's refresh token, end no later than the
+mandate's `expiresAt`. So does its first access token, and the session
+row's `not_after` is set to the mandate's end, which `auth/refresh` clamps
+to and the bearer check now refuses past.
+
+Behaviour change: a mandate without `issuedAt` or `expiresAt`, or valid for
+more than 30 days, is refused (`delegationNotRecognized`). A session whose
+mandate ends before its refresh token would is not refreshed; the delegate
+signs in again with its mandate. A bearer session past its `not_after`
+is refused (`unauthorized`); only these mandate-backed sessions set it.
+`siopIdToken` evidence is unchanged.
+
+### Fixed — the witness and watcher listeners bound slow connections and read a body only after admission
+
+The witness's and the watcher's HTTP listeners had no header, body or idle
+timeout and accepted connections without bound, and `POST /api/trust-tasks`
+read the whole body (up to 1 MiB) before its per-address rate limit ran. A
+client that sent a request slowly, or not at all, kept its connection, and
+the limiter never saw a request whose body did not finish.
+
+Both now serve through a shared listener (`did_hosting_common::server::listener`):
+
+- at most 256 connections are served at once; more wait in the backlog for a
+  free slot;
+- at most 32 of them come from one IPv4 address or one IPv6 /64; more are
+  closed as soon as they are accepted. Addresses in `server.trusted_proxies`
+  are exempt, since every client behind a proxy shares its address;
+- a request's headers must arrive within 20 seconds of its first byte, and a
+  new connection must send its first request within the same time; sending a
+  byte at a time does not extend it;
+- a connection waiting for its next request, or not reading its response, is
+  closed after 60 seconds;
+- a connection that opens with the HTTP/2 preface is held to the 20-second
+  header deadline, renewed only when the service writes to it, never by the
+  peer's bytes alone.
+
+`POST /api/trust-tasks` now checks the sender's address before it reads the
+body, so a refused address gets its `429` without its body being read. An
+admitted body is read up to 1 MiB, as before, and within 30 seconds: one
+declared or sent over the limit is answered `413`, one that stops arriving
+`408`, both with `Connection: close`. An over-size body was already refused
+with `413`; a body that stopped arriving was waited for without limit.
+
+The daemon's embedded witness gets the same order (rate limit, then body)
+and the same body bound and timeout; the daemon's own listener is unchanged.
+Both READMEs now say a reverse proxy is still expected in front.
+
+For library users: `webvh_witness::routes::trust_tasks::receive` and
+`webvh_watcher::routes::trust_tasks::receive` now take the request body as
+`axum::body::Body` rather than `Bytes`, and each crate's `AppState` has a
+`body_read_timeout`.
+
+### Fixed — witness signing keys are sealed, with the key in the secret store
+
+A witness identity's Ed25519 private key was serialised in clear into its
+record in the data store (`witness:{id}` in the `witnesses` keyspace), so
+anyone able to read that store, a backup of it, or a disk snapshot could sign
+witness proofs as that identity. The record now holds the key only sealed
+(HPKE, the envelope already used for VTA bootstrap bundles) to a witness
+key-encryption key, and the additional authenticated data names the
+identity, so a sealed key moved onto another record does not open. The
+key-encryption key is held in the configured secret store in an entry of its
+own (`<name>-witness-kek`, or the keyring account
+`witness_key_encryption_key`; see `webvh-witness/README.md`). It is written
+once, when the witness first starts, and never rewritten, so no release that
+writes the service's own entry can drop it, and nothing reads, modifies and
+writes back a shared secret. Its creation is claimed through the data
+store's atomic counter, so two witnesses starting together on one store make
+one key. The data store records its public half; a witness whose secret store
+holds no key or another key, while its identities are sealed to the recorded
+one, refuses to start and names the entry to restore.
+
+The key-encryption key is read when the witness starts (bounded at 15 s) and
+held in memory, so signing reads nothing from the secret store. The signer
+checks that the key it opens is the one the identity's id names.
+
+On the first start after upgrading, the witness (standalone, or embedded in
+the daemon) seals every key still held in clear in a record, re-reading each
+record just before rewriting it, 50 at a time. It logs the witness ids
+sealed, never key material. Startup is refused, naming the identity and
+changing nothing, if a record's key does not belong to it. Keys are not
+changed, so no DID's witness list needs updating. Identities whose key
+cannot be opened are named in a startup warning.
+
+The service's own secret-store entry also now keeps any member this release
+does not know when it rewrites the entry, instead of dropping it.
+
+Behaviour changes:
+
+- The witness needs permission to create and read a second secret-store
+  entry on the cloud, Vault and Kubernetes backends.
+- A backup of the data store (including the server's `backup` command)
+  holds no usable witness key; back up the key-encryption key's entry too.
+  `setup` re-run with another backend, and `export-sealed` /
+  `import-sealed`, do not carry it.
+- New CLI commands `webvh-witness reset-witness-kek-claim` and
+  `did-hosting-daemon reset-witness-kek-claim`, for a first start that
+  stopped part-way. A first write the secret store refuses releases the
+  claim itself.
+- In a rolling upgrade, replicas still on an earlier release cannot sign for
+  identities the upgraded ones have sealed until they are upgraded too.
+- Moving back to an earlier release after the upgrade does not work: it
+  cannot read a sealed record. Nothing is lost; upgrading again works.
+
+Records written before this change remain in earlier backups, snapshots,
+and any history the storage backend keeps (point-in-time recovery, for
+example), with the keys in clear, and restoring one brings them back until
+the witness next starts. Where those copies may have been readable by
+others, consider creating new witness identities and having DID controllers
+move their witness lists to them; that cannot be done by the service alone.
+
+### Fixed — a `did:webs` update must extend the hosted key event log
+
+An update to a hosted `did:webs` slot, whether a control-plane publish or a
+sync an edge applies, was checked only for the same AID and a sequence number
+no lower than the hosted one. A log with a different event at the hosted
+sequence number, or a longer log that diverged before it, was accepted and
+replaced the hosted one. Both verify on their own, so the service could serve
+a document from a history that contradicts the one it had already served.
+
+The update's key events for the AID must now begin with every event the hosted
+log holds, at the same sequence number with the same SAID, with one exception:
+KERI's superseding recovery, where a rotation replaces the interaction events
+after the last establishment event. Any other divergence is refused, including
+a rotation superseding a rotation, and a shorter log is refused as a rewind.
+Events are compared by SAID, so republishing the same events, re-serialized or
+with witness receipts added, is still accepted. An edge applies the same check
+against the high-water log it keeps after a delete.
+
+A stored log that cannot be parsed still does not block an update, so a
+corrupt slot can be repaired; the skipped check is now logged. One that parses
+but no longer verifies is compared by its events. Only the AID's own key event
+log is held to its history: a delegator's log in the same stream is verified
+but not compared with the hosted one.
+
+Behaviour change (R3.6): no wire changes. A `did:webs` publish or sync that
+diverges from the hosted log other than by superseding recovery is refused
+(`did/publish` and `sync/update` refuse it as they refuse a rewind) instead of
+being accepted. Only builds with `method-webs` are affected.
+
+### Fixed — a server's own CLI holds a DID log to the history it has served
+
+A synced log must verify and strictly extend every history the server has
+served for that DID: the log it holds, and the high-water mark it keeps after
+a delete. The server's own subcommands that write a log skipped those checks.
+`load-did` and `bootstrap-did --did-log` checked only the log's structure, so
+`remove-did` followed by `load-did` could put an older version of a DID back.
+`restore` wrote a backup's logs and high-water marks over the store's
+unchecked, so restoring an older backup rolled both back.
+
+Every path that writes a log now goes through the same history check and
+records the high-water marks: `load-did`, `bootstrap-did` (with or without
+`--did-log`), `recreate-did`, and setup's import of the server's own DID, on
+both `did-hosting-server` and `did-hosting-daemon`. `load-did` and
+`bootstrap-did --did-log` also verify the log's chain and, for a witnessed
+DID, its witness proofs. A new DID in a slot is still allowed, as `sync/update`
+allows it.
+
+`restore` checks the whole backup before writing anything, `config.toml`
+included. It works through the backup's logs, so none is restored unchecked.
+Each restored `did:webvh` log, or `did:webs` log in a build with
+`method-webs`, must have a record naming the DID the log establishes, must
+verify, must extend the backup's own high-water mark, and must extend what the
+store holds for that DID and slot. A backup's high-water mark is kept only if
+it extends the store's, and a mark the store holds further is left in place.
+If any check fails, the restore is refused and nothing is written. The data
+goes into the store the backup's config names, after the usual environment
+overrides. An interrupted restore can be run again.
+
+`setup`'s replacement of the server's own DID (`--force-reprovision`) now
+verifies the new DID before removing the old one, and swaps them in one batch.
+
+Records these commands create are now tagged with the host their identifier
+names, as a synced record is, so a purge of that domain selects them. Before,
+the domain was empty and a purge skipped them.
+
+Behaviour change (R3.6): no wire changes. `load-did` and `bootstrap-did
+--did-log` refuse a log that does not verify, one that lacks the witness
+proofs its parameters require, and an older version of a DID the store has
+served. `restore` refuses a backup that would roll a DID back, so restore
+into an empty data directory to start from a backup's state. It also refuses
+an inconsistent backup (a log with no record, a record naming another DID, a
+log that does not verify, or a log behind the backup's own high-water mark)
+into any store, and no longer writes `config.toml` before that check.
+
+### Fixed — an edge's HTTPS binding sends no document for a directive it did not verify, and says when to retry
+
+On DIDComm and TSP an edge sends nothing back for a document that does not
+verify as its control plane's. Its HTTPS binding (`POST /api/trust-tasks`)
+answered such a document `403` with an unsigned `permissionDenied` error
+document. It also did so for a document it could not check just now (the
+control plane's DID could not be resolved, or the replay cache was full), so a
+sender saw a refusal that looked final for a condition the edge expects to
+clear.
+
+The HTTPS binding now answers:
+
+- a document that does not verify, or takes no reply: `403` with an empty
+  body, no error document;
+- a document that could not be checked just now: `503` with `Retry-After`
+  (the replay cache's own hint, otherwise 30 seconds) and an empty body.
+
+A health ping that could not be checked is treated the same way. On DIDComm
+and TSP nothing changes: neither case is answered, and the control plane
+re-sends what it is not answered. Nothing about a deferred document is
+recorded, so the same document is applied once it can be checked.
+
+Behaviour change (R3.6): the edge's HTTPS binding no longer returns a body
+with `403`, and returns `503` with `Retry-After` where it returned `403`. The
+control plane's outbox already treated both as unsettled and kept the
+directive queued; only a signed refusal settles one. `docs/openapi.json` is
+regenerated.
+
+### Fixed — secrets envelope writes in one process no longer overwrite each other
+
+Writing the service keys (`set`, as a rotation does), writing the offline
+bootstrap seed and clearing it each read the whole secrets envelope, changed
+one member and wrote it back, with nothing ordering them. Two of them at
+once could write back an envelope read before the other's change. A rotation
+could then be undone by a seed write that started earlier, leaving the
+service unable to sign as its published DID.
+
+Updates of one envelope entry in a process now take turns, wherever the
+store was built. Each backend read and write an update makes is bounded at
+20 s. An update that waits more than 60 s for its turn fails rather than
+queueing indefinitely. Nothing is written after a failed or timed-out read.
+
+Behaviour change (R3.6): a secrets write against a backend that does not
+answer now fails after 20 s (a wait for a turn after 60 s) instead of waiting
+on it indefinitely. The backends offer no compare-and-swap, so writers in
+separate processes (the setup CLI and a running service on one entry) are
+still not ordered against each other.
+
+### Fixed — a rollback keeps the agent-name registry in step with the document it restores
+
+`did/rollback` rewrote the log, the DID, its services and version count but
+left the agent-name registry as it was, so the registry could list names the
+restored document no longer claims, or miss names it does. A rollback now
+reconciles the registry exactly as a publish does: names the restored entry
+claims are registered, names it no longer claims are released, parked names
+stay parked.
+
+Behaviour change (R3.6): a rollback to an entry that claims a name another DID
+now holds, or a reserved name, is refused (`agent-name` taken / reserved) and
+changes nothing. A name changes holder only through an explicit `remove` by
+its holder.
+
+### Fixed — DID resolution answers only `GET` and `HEAD`
+
+A `POST`, `PUT`, `DELETE` or other method to a DID path (`/{path}/did.jsonl`,
+`did.json`, `did-witness.json`, `keri.cesr`) returned the document and counted
+as a resolution. It is now `405 Method Not Allowed` with `Allow: GET, HEAD`, on
+the edge, the daemon and the watcher.
+
+### Fixed — an agent name on a disabled domain no longer redirects
+
+`GET /@{name}` skipped the domain check the DID's own documents pass, so a
+name on a disabled domain still redirected to a DID that answered `503`. It
+now answers as the DID's documents do.
+
+### Fixed — per-request warnings are rate-limited
+
+The warnings for a `Forwarded` / `X-Forwarded-Host` header from a peer outside
+`server.trusted_proxy_cidrs`, for resolution with no domain configured, and
+for a request with no resolvable host are now written at most once a minute,
+with a count of those held back. The rest go to `debug`. Any client could
+trigger them on every request.
+
+### Fixed — witness replicas sharing a store keep to one history of each DID
+
+`webvh/witness/sign` checked that a log extends the furthest entry the
+identity had already witnessed for the DID, then recorded the new entry,
+under a lock held only within one process. Two witness replicas sharing a
+Redis, DynamoDB, Firestore or Cosmos DB store could each pass the check
+against the same mark for two different histories of one DID and both sign.
+
+The mark is now moved by an atomic compare-and-swap in the store, from
+exactly the value the check read, before the proof is signed. A replica
+whose swap loses re-reads the mark and checks again, so it refuses a log
+that does not extend what the other replica witnessed. A request that keeps
+losing the swap is answered `unavailable` with `retryAfter`. The
+`proofsSigned` counter is updated the same way, so a concurrent change to
+the identity's record is no longer overwritten.
+
+### Fixed — a republish of the same did:webvh must extend the stored log
+
+`did/register` and `did/publish` used the stored log only to count its
+entries. A log for the same DID (same SCID) that was shorter than the stored
+one, or diverged from it, was stored, while every edge refused it
+(`verify_history`) and kept serving the previous log. The control plane now
+refuses it with the same rule: the stored entries, unchanged, then any new
+ones. A different DID in the slot is still a replacement, not compared.
+
+### Fixed — an admin takeover releases the previous holder's parked agent names
+
+A forced takeover (`did/register` with `force`) carried every agent name of
+the previous record to the new owner, parked names included. Parked names
+the new document does not claim are now released with their index entries;
+names the new document claims are registered as before.
+
+### Fixed — a witness publishing again replaces its proof
+
+`webvh/witness/publish` appended each proof to the version's entry in
+`did-witness.json`, so a witness that published twice was stored twice. A
+proof from a witness that already has one for the version now replaces it.
+
+### Fixed — a control plane or daemon picks up a rotation of its own DID as soon as it is registered
+
+Publishing a new version of the control plane's (or daemon's) own DID through
+`did/register` did not reload the service identity; the change was only noticed
+by the 5-minute backstop reload, so for up to 5 minutes the served document
+advertised keys the listener had not loaded. `did/register` now triggers the
+reload as soon as the new version is committed.
+
+### Fixed — a daemon restarted mid-rotation keeps draining its old mediator
+
+After a mediator change, a daemon restarted inside the grace window did not
+reconnect to the old mediator, so messages peers still delivered there were
+lost. The daemon now resumes those drains at startup, through the same
+post-listener step the standalone control plane uses.
+
+### Fixed — a node keeps TSP and its TSP relationships when its identity changes
+
+When a witness's identity changed (a key rotation, a transport or mediator
+change, or its first resolution at boot), its listener was rebuilt without TSP,
+so TSP frames sent to it were dropped and acknowledged until a restart. On every
+node the rebuilt listener also lost the transports reconciled from its own DID
+document and its persistent TSP relationship store. Each node now builds its
+listener through one function at boot and on every rebuild. A witness with only
+TSP enabled now also starts its listener.
+
+### Fixed — a watcher notices its own DID rotating
+
+The watcher loaded its identity once and never re-read it, so after its keys
+rotated it kept signing replies with a key its document no longer carried and
+every sync looked unacknowledged until a restart. Like the witness, it now
+re-resolves its own DID every 5 minutes, rotates onto the new keys, expires
+superseded generations, and drains an old mediator after a mediator change.
+
+### Fixed — health pongs and acknowledgements no longer log an ERROR on the control plane
+
+Over DIDComm, every health pong, sync or domain acknowledgement and inbound
+`trust-task-error` was logged at ERROR as a "should not happen" suppressed
+reply. A document that is itself an answer now ends the exchange quietly; only
+the SPEC §8.1 suppression, which no transport here can reach, is still logged
+as an invariant break. The request log's quiet list (health and stats) now
+matches the type of the document inside a trust-task envelope, so those
+exchanges no longer add an INFO line each.
+
+### Fixed — an ACL entry granted over `acl/grant` is one that can authorise
+
+The `acl/grant` Trust Task now validates its subject as every other ACL write
+does (trimmed, no control characters, at most 2048 bytes), and the ACL check
+and the auth challenge accept DIDs up to the same 2048 bytes instead of 512,
+so an administrator can no longer create an entry the witness or control plane
+then refuses to authorise. The control plane no longer verifies an ACL task's
+proof a second time after its proof gate has.
+
+### Fixed — the console checks session renewal and proxied wallet sign-in replies, and reads JWT claims as base64url
+
+Renewing a session (`auth/refresh`) and the VTA-proxied wallet sign-in
+(`auth/authenticate/0.3`) were sent with a raw `fetch` and their replies used
+unchecked; both now go through the console's Trust Task client, so a reply must
+be the control plane's signed answer to that request before its tokens are
+kept. The access token's claims are decoded in one place, as base64url with
+padding restored, so a claim whose encoding contains `-` or `_` no longer hides
+the admin navigation or stops renewal.
+
+### Fixed — copying in the console says when it failed
+
+Every copy button (invite link and claim code, DIDs, agent names) now reports
+"Copy failed — select and copy manually" when the browser refuses the
+clipboard — on a plain-HTTP deployment, or with the permission denied — and
+shows the value as selectable text, instead of failing silently.
+
+### Fixed — `did/register` enforces the caller's `domain` for did:webvh
+
+A `did/register` request naming a `domain` that is not the host of the
+did:webvh it publishes is now refused as `did-management:unknown_domain`
+before anything is written, as `did/publish` already did. The parameter was
+previously accepted and ignored. An omitted domain behaves as before.
+
+### Fixed — `did/register` no longer wipes a did:webvh slot's domain
+
+Registering or re-registering a did:webvh through `did/register` recorded an
+empty domain, erasing the one a reserved slot or an earlier publish had set
+and hiding the DID from per-domain listings. The record now carries the DID's
+host, as every other write path does.
+
+### Fixed — a node picks up TSP on an identity rotation without a restart
+
+The control plane, hosting server, witness and watcher now always start their
+messaging service with a TSP handler. Before, a node that booted without TSP
+could not dispatch inbound TSP even after a rotation rebuilt its listener for a
+DID document that began advertising `TSPTransport`; it needed a restart.
+
+### Fixed — Cosmos DB prefix scans find every key
+
+A prefix scan matched the base64 of the prefix against the base64 of each
+key, which only works for prefixes a multiple of 3 bytes long. `did:`,
+`acl:` and `session:` scans returned nothing or only part of their rows, so
+DID listing, the DID count, domain purges and ACL listing were empty or short
+on Cosmos DB.
+
+### Fixed — DynamoDB creates a missing table only when it is missing, and waits for it
+
+A table was created on any `DescribeTable` failure (throttling, `AccessDenied`,
+the network), used before it was `ACTIVE`, and never ensured for a keyspace
+whose first write was a batch. Now only a missing table is created, a table
+someone else is creating counts as created, every table waits until it is
+`ACTIVE`, and a batch ensures each table it writes. New tables are on-demand
+(`PAY_PER_REQUEST`) instead of 5 provisioned read and write units; set
+`store.dynamodb_billing_mode` (`<PREFIX>_STORE_DYNAMODB_BILLING_MODE`) to
+`provisioned:<read>:<write>` for provisioned tables, and
+`store.dynamodb_auto_create = false`
+(`<PREFIX>_STORE_DYNAMODB_AUTO_CREATE=false`) to refuse a missing table
+instead of creating it.
+
+### Fixed — Redis prefix scans read only their keyspace, once each
+
+A prefix scan walked every key in the database with `SCAN MATCH`, treated
+`*`, `?` and `[` in a prefix as wildcards, could return a row twice, and read
+every value in one `MGET`. Each keyspace now keeps a sorted-set index
+(`__index__:<keyspace>`), written in the same transaction as its rows, and a
+scan, a page or a count reads only that range of it, in chunks. A database
+written by an earlier release is indexed once when the store opens. Upgrade
+every replica sharing the database together: one still on the old release
+writes rows the index does not list.
+
+### Fixed — failed loads in the console no longer look like empty data
+
+The DID list, dashboard, access control, invites, settings, servers and
+domains pages show a failed read as an error with a Retry button instead of
+"no DIDs", "no invites" or nothing at all. A DID path that does not exist (or
+is not yours) shows "DID not found" with no delete or rollback buttons. Panels
+that refresh on a timer say when they were last updated and that refreshing is
+failing. Rejection codes (`permissionDenied`, `notFound`, `unavailable`,
+`stepUpRequired`, …), cancelled passkey prompts and unverifiable replies are
+described in plain words, in one place.
+
+### Fixed — the witness's default port is 8531 everywhere
+
+The witness setup wizard offered 8102 and the setup recipe 8534; both now use
+8531, the port the witness's config defaults to.
+
+### Fixed — configured registry instances no longer duplicate on every restart
+
+Each `[[registry.instances]]` entry is now kept under a stable id derived from
+its type and URL and updated in place, so restarts no longer add a dead record
+per configured instance; the duplicates earlier versions left are removed on
+start. Every change to an instance record (registration, health status, pong,
+acknowledgement, transport and badge observations, `served_domains`) now goes
+through one locked read-modify-write, so concurrent writers no longer drop each
+other's changes.
+
+### Fixed — a standalone edge runs the purge it acknowledged
+
+An edge answered `replica/domain/unassign` (and a domain disable) with a
+scheduled purge time, but only the daemon ran the sweep that carries it out,
+so an unassigned domain's DIDs stayed on the edge and kept resolving. The
+edge's storage thread now runs the sweep every minute and drops its
+resolution cache when it purges anything.
+
+### Fixed — an edge's own DID stays out of the control plane's reach
+
+A self-hosted `did:webvh` edge imports its own DID at setup. It reported that
+slot at registration, so the control plane queued a `sync/delete` for it, and
+the reconcile counted it as extra for ever, holding `/api/health` at 503. The
+edge's own DID is no longer reported, never counts as extra, and a
+`sync/delete` of it is refused.
+
+### Fixed — an edge no longer drops an agent name another DID has taken over
+
+When a name moved from one DID to another and the edge applied the new
+holder's update first, the old holder's later update (or deletion) removed the
+name's index entry anyway, and `/@name` 404'd with nothing to repair it. An
+index entry is now removed only while it still names the slot being updated
+or deleted, and a re-sync of an unchanged log writes back any of its own
+entries that went missing.
+
+### Fixed — migrations that defer records stay pending, and never overwrite a concurrent write
+
+The migration runner marked a migration applied even when it had deferred
+records (M-01 without a default domain, M-02 with an unreadable log), so they
+were never retried. `Migration::run` now reports `Complete` or
+`Deferred(n)`, and only a complete run is marked. M-01 and M-02 also walk the
+records in pages and write each one with a compare-and-swap on a fresh read
+that changes their one field alone, so a publish another replica commits
+during a rolling upgrade is not overwritten with a stale record.
+
+### Fixed — `DAEMON_STORE_*`, `DAEMON_SECRETS_*`, `DAEMON_AUTH_*` and `DAEMON_FEATURES_*` are honoured
+
+The daemon read only a fixed handful of variables, so the store, secret
+backend, auth and feature overrides documented for every prefix were ignored
+under `DAEMON_`. It now applies the shared overrides, and
+`DAEMON_WITNESS_STORE_*` configures `[witness_store]`.
+
+### Fixed — a degraded instance no longer reads as healthy again without a pong
+
+The registry health sweep stamped `last_health_check` whenever it changed an
+instance's status, and so did `registry/check`. The next sweep then read a
+degraded instance as freshly checked and marked it `Active` again, though it
+had not answered. Now only a health pong that reports the edge healthy records
+a check. The sweep and `registry/check` re-derive the status from that check,
+so they can degrade an instance but never revive it.
+
+### Fixed — `did/rollback` reports `invalidTargetVersion` from a typed error
+
+The `invalidTargetVersion` code was chosen by matching the start of the error
+message. It now comes from a `ValidationKind::InvalidTargetVersion` error kind,
+so rewording the message can no longer change the code.
+
+### Fixed — a Redis store opens when a scan batch has no rows to index
+
+The one-time index build at open sent an empty pipeline for a `SCAN` batch
+that held no row of a known keyspace, which Redis refuses, so the store
+failed to open on a database holding only other keys (#470). Such a batch is
+now skipped.
+
+### Fixed — `did-hosting-daemon` builds without the `ui` feature
+
+`cargo build -p did-hosting-daemon --no-default-features --features
+<store>,did-methods` failed to compile (a missing `IntoResponse` import on the
+no-UI fallback route). CI now builds the daemon once per storage backend
+without default features, so a broken feature passthrough is caught.
+
+### Fixed — the daemon's embedded watcher serves the DIDs in the daemon's store
+
+`GET /watcher/.well-known/did.jsonl` (and every other hosted DID under
+`/watcher`) answered `500`: the watcher read the daemon's slot records as its
+own record type, which they are not. It now reads only whether a slot is
+disabled or deleted, so a hosted DID is served and an unknown, disabled or
+deleted one is `404`.
+
+### Fixed — `did-hosting-control setup` tells operators to grant edges the `service` role
+
+The wizard's ACL step said to add each edge with `--role admin`, which
+`server/register` refuses. It now says `--role service`, and its admin entry
+is offered for operator DIDs only.
+
+### Fixed — a key-role `did:webs`, such as a VTA's own identity, can register itself
+
+`affinidi-did-webs` moves from 0.7 to 0.13. 0.7 read no key-role designation
+and no KERI 2.0 designation, so the document the control plane derives from a
+submitted `keri.cesr` lacked the keys such an identifier signs with. A VTA's
+own `did:webs` (VTI-KEY-173: distinct attestation, operational and messaging
+keys) signs its self-registration with its designated `operational` key,
+which that document did not list under `authentication`, so its first-boot
+`did/register` was refused as `proofInvalid`. It is now accepted, and the key
+state's own key does not stand in for the operational one.
+
+Behaviour change (R3.6): no wire changes. Under 0.13 a `did:webs` is valid
+only on a domain its own designated aliases name: a key event log published on
+a domain it does not designate is refused instead of being served there. An
+identifier that designates no key agreement key now resolves with the X25519
+key converted from its signing key in `keyAgreement`, as the reference
+resolver's does. Only builds with `method-webs` are affected.
+
+### Fixed — a `did:webs` in the ACL is verified by resolving it
+
+A `did:webs` that self-registration made an Owner (a VTA whose own identity
+is a `did:webs`, publishing here) was refused on every request after the
+first. Its later requests take the ordinary sender-bound path, which
+resolves the issuer, and the DID resolver every service builds was compiled
+without `did:webs` support, so the signer was reported unreachable. The
+resolver now resolves `did:webs` (`affinidi-did-resolver-cache-sdk` with
+`did-webs`) on every binary, whether or not it is built with `method-webs`:
+that feature decides what this host serves, not whom it accepts requests
+from.
+
+`affinidi-did-webs` moves to 0.13.9, which fixes the resolver's comparison of
+a service's `type`: a `did.json` carrying `["X"]` where the key event log
+designates `"X"` (as every `did.json` this host serves does) failed
+resolution with `DocumentMismatch`, so no `did:webs` designating a service
+could be resolved, here or by any other client of the same resolver.
+
+Behaviour change (R3.6): resolving a `did:webs` signer fetches its
+`keri.cesr` and `did.json` from the identifier's host, under the same host
+policy as `did:web` (public hosts only by default). No configuration
+changes.
+
+### Fixed — the console stops renewing a session the control plane has ended
+
+When `auth/refresh` was refused for good (the session reached its absolute
+lifetime, idled out, or was revoked or unknown), the console swallowed the
+refusal and sent the same refresh token again on every request, background
+polls included, until the access token ran out. It now ends the session on the
+first such refusal: the tokens and session key are cleared, the other tabs
+holding the session are told, and the "Session expired — sign in again" prompt
+shows. Network errors, 5xx responses and `unavailable` are still retried, with
+a backoff that doubles up to a minute.
+
+The control plane now answers a store failure during the refresh pre-checks as
+retryable `unavailable`, not `permissionDenied`, so a non-retryable refusal
+always means the session is over. The idle-timeout refusal is still
+`permissionDenied`; nothing else changes on the wire.
+
+### Fixed — normal session expiry is no longer logged as a warning
+
+A refresh refused because the session reached its absolute lifetime or idled
+out, and a bearer request refused because its session reached its end, are
+now logged at `info`, and an idle refusal is logged once, not twice. WARN is
+kept for refusals worth an operator's attention, such as a wrong or missing
+session-key proof or an unknown, replayed or superseded refresh token.
+
+### Fixed — an operator's CLI invite enrolls the first administrator again
+
+Since invites began to be honored only while their issuer is still an
+administrator, an invite made with the operator's `invite` subcommand was
+refused at the last step of enrollment with "the administrator who issued this
+invite no longer holds that standing": its recorded issuer is the operator, not
+an ACL entry, so the lookup never found one. A fresh deployment could not enroll
+its first administrator's passkey. A CLI invite carries the operator's
+authority, which is store access rather than an ACL entry, so its redemption no
+longer looks the operator up in the ACL. This applies to every CLI invite,
+whatever its role, not only the first administrator's. Invites issued by an
+administrator are checked as before. A refused invite is spent; issue a new one
+after upgrading.
+
+### Fixed — an administrator who changes an invite is answerable for it
+
+An administrator who changes an outstanding invite's role or expiry
+(`auth/passkey/enroll/invite/update`) is now recorded on the invite. From then
+on the invite is honored only while that administrator, as well as its issuer,
+is still an administrator, and it is withdrawn when their ACL entry is removed.
+Before, a change left no record, so an administrator could raise an operator's
+CLI invite to `admin` and the invite stayed redeemable after they were removed.
+It also stayed redeemable if they changed an invite another administrator issued.
+
+### Fixed — the CLI no longer issues an invite that cannot be redeemed
+
+The `invite` subcommand refuses `--role metricsReader`, as
+`auth/passkey/enroll/invite` already did. Before, it printed an invite that was
+always refused at the finish. `remove-acl --did <did>` now also withdraws the
+invites issued for a DID that has no ACL entry, so an operator can take back a
+CLI invite.
+
+### Fixed — Editing a did:webs DID from the UI no longer fails with "SCID … not found"
+
+The DID detail page sent every delegated edit as `vta/webvh/dids/update`. A VTA keeps its did:webs DIDs in a separate store, so it answered `not found`, and the page then suggested the DID had been orphaned. Edits to a did:webs DID now go through `vta/webs/dids/update/0.1`. That task can change only the DID aliases in `alsoKnownAs`, so the page explains and stops any other document change, as well as agent-name bind, park and resume, before asking the agent.
+
+### Added — a `did:webs` can register itself, proved by its own key event log
+
+A `did:webs` does not exist until a host publishes it, so a node whose own
+identity is a `did:webs` had no DID to authenticate to this host with before
+its first publication. With `method-webs`, a `did/register/0.1` from a
+`did:webs` outside the ACL is now accepted on a domain whose operator enables
+it, when the request is signed by a current signing key of the identifier as
+the submitted `keri.cesr` establishes it (not by resolving it: it does not
+exist yet), and `issuer` is the `did:webs:{domain}:{path}:{AID}` the slot
+builds. The new slot is owned by the identifier, which is then given an
+`Owner` ACL entry scoped to that domain and one slot, so later publications
+take the ordinary owner path.
+
+- **`[[hosting.webs_self_register]]`**: `domain`, and optional
+  `path_prefixes` and `max_registrations` (default 100, the most
+  self-registered identifiers the domain holds at once). Off by default;
+  ignored without `method-webs`.
+- Webs only: a self-registration of any other method, with `force`, at a slot
+  someone else owns, outside the prefixes, or signed by any key but the log's
+  is refused. Rate-limited per source (10 a minute) and across all sources (30
+  a minute) before the log is verified, and audited with its source
+  (`did.webs.self_registered`).
+
+See `docs/did-webs-hosting.md` ("Self-registration").
+
+### Added — a budget for the statistics flush
+
+The control plane and the daemon flush per-DID statistics every 10 seconds:
+at most 200 rows, each a read and a write, all at once. On a small DynamoDB
+table that burst could take most of the capacity.
+`[stats_flush] max_rows_per_second` (env
+`CONTROL_STATS_FLUSH_MAX_ROWS_PER_SECOND`, `DAEMON_STATS_FLUSH_MAX_ROWS_PER_SECOND`)
+now sets the rate, from 1 to 10,000, and the flush is paced at it across the
+interval instead of written in one burst. The default, 20, keeps today's
+volume. Rows past the budget wait for the next flush; as before, time-series
+buckets older than an hour and rows past the collector's caps are dropped
+with a warning, so a budget below the rows produced loses series data.
+Shutdown stops the pacing, and the final flush writes the rest.
+
+### Added — store conformance suite, run against every backend
+
+The `KeyspaceOps` contract (round trips, byte-exact prefix scans, paging,
+atomic batches across keyspaces, `take`, `incr` and compare-and-swap under
+contention, the per-item limit) is one suite every backend runs: fjall in its
+unit tests, Redis, DynamoDB Local and Cosmos DB (its SDK's in-memory
+emulator) on every PR, and the Firestore emulator nightly. Every backend now
+pages prefix scans, lists keys without their values (`prefix_keys_raw`),
+counts them (`prefix_count`), and reports its per-item limit
+(`Store::max_item_bytes`).
+
+### Added — suspend and resume a DID, set its statistics detail, and edit a domain's label from the console
+
+The DID page gains Suspend / Resume (`did/set-state`) and a statistics-detail
+picker (`stats/set-resolution`); the domains page can add or change a domain's
+label (`domain/update`).
+
+### Added — `docs/cli-reference.md` and `did-hosting-daemon dump-did`
+
+A complete CLI reference for every binary, generated from the CLI definitions
+and kept current by a test. The daemon gains `dump-did`, which the server
+already had.
+
+### Added — `send-trust-task`: send any signed Trust Task from the command line
+
+`did-hosting-control send-trust-task` and `did-hosting-daemon send-trust-task`
+sign one Trust Task with a `did:key` file (the format `setup --setup-key-out`
+writes), `POST` it to the running service's `/api/trust-tasks`, verify that the
+reply is signed by the service's own DID, and print the response payload as
+JSON. `--type` takes a full Type URI or its `<slug>/<version>` short form
+(`identity/list/0.1`); `--payload` / `--payload-file` give the request payload.
+The signer is authorised like any other client, by its proof and its ACL entry.
+Runbooks that used to `curl` removed REST routes (`identity/retire`,
+`domain/assign`, `registry/purge-domain`, …) now use it; see
+`docs/sending-trust-tasks.md`. `fetch-metrics` is now this command with a fixed
+type.
+
+### Added — a generated Trust Task catalogue
+
+`docs/trust-tasks.md` lists every Trust Task the control plane serves, with its
+version, the proof rule the gate enforces and the standing its handler
+requires. It is generated from the routing tables and checked by a drift test
+(`UPDATE_TRUST_TASKS=1 cargo test -p did-hosting-control --lib
+trust_task_catalogue` regenerates it).
+
+### Added — the daemon has every subcommand the standalone binaries have
+
+`did-hosting-daemon` gains `export-sealed`, `import-sealed`, `vta-request` and
+`vta-open`. The subcommands the binaries share are now defined once and
+shared by all three, so they behave the same everywhere:
+
+- `import-secrets` and `import-sealed` take an optional `--jwt-key` on every
+  binary, and `import-sealed` on `did-hosting-control` now keeps the retired
+  key material of superseded identity generations, as the other binaries
+  already did.
+- `vta-request` takes `--public-url` (`--did-hosting-url` remains an alias),
+  an optional `--mediator-did` and `--transport` on every binary; on
+  `did-hosting-control` `--mediator-did` is no longer required (without it
+  the request is for an HTTP-only DID). `--label` defaults to the binary's
+  name.
+- `vta-open`'s output files default to `<service>-did.json`,
+  `<service>-did.jsonl` and `<service>-secrets.json`, where `<service>` is
+  `server`, `control` or `daemon`.
+- `remove-did` and `recreate-did` on `did-hosting-server` now remove the
+  slot's domain index row and usage counter with it, and `recreate-did`
+  removes the owner index entry of the record's actual owner, as the daemon's
+  did.
+
+### Added — a self-registered `did:webs` may hold more than its own DID
+
+`[[hosting.webs_self_register]]` takes `max_dids_per_identifier` (default 1,
+at least 1): how many DIDs each identifier that registers itself on the domain
+may hold, its own included — the `max_did_count` of the `Owner` entry
+self-registration grants. With the old fixed limit of one, a VTA whose own
+`did:webs` registered itself could publish nothing else on the host: a
+community's DID it provisions was refused with `DID count limit reached (1)`.
+It applies to entries granted from then on; an entry already granted keeps its
+limit until an administrator changes it. See `docs/did-webs-hosting.md`
+("Self-registration").
+
+### Added — `/livez` and `/readyz` probes on every HTTP listener
+
+Every binary that runs an HTTP listener (edge, control plane, witness,
+watcher, daemon) now serves Kubernetes-style probes at the root,
+unauthenticated and outside the rate limits like `/api/health`, which is
+unchanged.
+
+- **`GET /livez`** checks nothing beyond the HTTP server answering: always
+  `200 {"status":"ok"}`, so storage or control-plane trouble never gets a
+  process restarted.
+- **`GET /readyz`** answers `200 {"status":"ready","storage":"ok"}`, or `503`
+  with `"status":"notReady"` and the failed check `"unavailable"`.
+  `storage` covers every store the binary serves from (the daemon's main and
+  witness stores): on fjall, that the data directory still holds the database
+  (an open database goes on answering from memory after its volume is gone)
+  and that fjall has not been poisoned by an I/O error; on the network
+  backends, one point read. It never writes. The edge adds `serving`, the
+  condition its `/api/health` reports (its own DID served locally, within the
+  replication staleness bound); the daemon adds `serving` for its own DID
+  when its server is on. Mediator connectivity is not part of readiness.
+- The checks run at most once a second, shared by concurrent probes, and
+  give up after 800 ms (not ready). The body never carries the cause, which
+  is logged at `warn`.
+
+See `docs/deployment.md` ("Health checks", and "Containers and Kubernetes"
+for a probe example).
+
+### Removed — the "Show flow visualization (demo)" option on the login page
+
+The VTA-proxied sign-in under "Using an older wallet?" no longer offers a
+flow visualization. The checkbox, its stored preference
+(`didhosting:proxyLoginViz` in `localStorage`, no longer read), the modal
+that showed the decoded sign-in token and the code that decoded it for
+display are gone. The proxied sign-in itself is unchanged and goes straight to
+the dashboard.
+
+### Removed — the console's native (iOS / Android) targets
+
+The management console is web-only: the `android` / `ios` scripts, the native
+blocks in `app.json` and the unused `App.tsx` are gone, and the app declares
+its dark appearance. Under 700px wide the navigation folds into a menu and the
+DID list shows cards instead of a sideways-scrolling table.
+
+### Removed — `did-hosting-daemon migrate-from-webvh-config`
+
+The subcommand was a stub: it printed instructions, ignored `--force` and
+wrote nothing. There is no configuration file content to migrate (the rename
+from `webvh-*` changed binary names and environment variable prefixes, not
+config keys), so it is removed rather than finished.
+
+### Deprecated — edge settings nothing reads
+
+`did-hosting-server` accepts several settings it never reads: `features.http_listener`
+(an edge always binds its HTTP listener), `[limits] default_max_total_size` and
+`default_max_did_count` (per-account quotas are the control plane's, never an edge's,
+along with their `DID_HOSTING_LIMITS_DEFAULT_MAX_*` environment overrides), and every
+`[auth]` key except `cleanup_ttl_minutes`. They still load, but the server now logs a
+warning naming each one set to a non-default value, and the two `[limits]` keys are no
+longer written back. Remove them from edge configs; a later release will refuse them.
+
+### Security — `url` 2.5.9 for RUSTSEC-2026-0592
+
+The lockfiles now take `url` 2.5.9 (and `form_urlencoded` 1.2.3), which fixes
+a stack overflow in `Url::origin()` on nested `blob:` URLs.
+
+### Security — `url` 2.5.9 (RUSTSEC-2026-0592)
+
+- The lockfiles move `url` from 2.5.8 to 2.5.9. In 2.5.8 `Url::origin()`
+  recursed once per nested `blob:` prefix, so a crafted URL could overflow
+  the stack and abort the process (GHSA-hrj5-67jp-wqp9).
 
 ## 0.11.0 (release/0.11)
 
