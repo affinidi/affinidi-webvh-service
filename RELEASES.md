@@ -191,7 +191,14 @@ update the schedule table above.
 
 **From** (`-f from=<rev>`; `--from <rev>` locally) cuts from something other
 than `origin/nightly` — the first cut, before `nightly` exists, is
-`origin/main`.
+`origin/main`. It must be an ancestor of `origin/main`: the script refuses
+anything else, since a release is only cut from reviewed `main`.
+
+The workflow checks the inputs and the admin role first, in a job with no
+secrets; only then does a second job enter the `release` environment and mint
+the app token. `cut-release.py` takes that token out of its environment before
+running anything, so `cargo update` and the other tools that read the source
+commit never see it: only its `git fetch` / `push` and `gh` calls get it.
 
 ### Release candidate, GA, patch
 
