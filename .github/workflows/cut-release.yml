@@ -1,0 +1,128 @@
+name: Cut a release
+
+# Creates `release/<major.minor>` from `nightly` and opens the `release-cut/…`
+# PR that moves main to the next minor (RELEASES.md, "Cut"). Run it from the
+# Actions tab on main. The push to the release branch triggers release-tag.yml,
+# which tags `v<major.minor>.0-rc.0` straight away; only the release-cut PR
+# waits for a merge.
+#
+# It runs scripts/cut-release.py as the release-bot app (affinidi-semantic-
+# release). The `release/*` ruleset restricts branch creation and requires
+# signatures, and lets admins bypass it only through a PR, which a new branch
+# cannot come from, so an admin can no longer push a cut from a laptop; the
+# app bypasses it. Because the app can, a first job checks that whoever
+# started the run is an admin, keeping "only admins cut a release"; only then
+# does the `cut` job enter the `release` environment and mint the app token.
+#
+# The source is `origin/nightly` unless `from` says otherwise, and
+# cut-release.py refuses any source that is not an ancestor of origin/main: a
+# release is only ever cut from reviewed main. The token never reaches cargo
+# or anything else that reads the source commit: cut-release.py takes it out
+# of its environment first and hands it only to git fetch/push and gh.
+on:
+  workflow_dispatch:
+    # Free text from the dispatcher, so never interpolated into a `run:`
+    # script: every step reads them through `env:`, and `authorize` checks
+    # `release` is major.minor and `from` a plain ref name or commit id before
+    # anything uses them.
+    inputs:
+      release:
+        description: "major.minor to cut, e.g. 0.12"
+        required: true
+        type: string
+      from:
+        description: "Source revision, an ancestor of origin/main (default: the newest green main, origin/nightly)"
+        required: false
+        default: origin/nightly
+        type: string
+      dry_run:
+        description: "Build both commits and show them; push nothing"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cut-release
+  cancel-in-progress: false
+
+jobs:
+  # Before any secret: outside the `release` environment, with GITHUB_TOKEN.
+  authorize:
+    name: Check the inputs and who started it
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check the inputs
+        env:
+          RELEASE: ${{ inputs.release }}
+          FROM: ${{ inputs.from }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE" =~ ^[0-9]+\.[0-9]+$ ]] || { echo "::error::release must be major.minor, not '$RELEASE'"; exit 1; }
+          # A ref name or a full commit id; never something git could read as an option.
+          [[ "$FROM" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && "$FROM" != *..* ]] \
+            || { echo "::error::from must be a ref name or commit id, not '$FROM'"; exit 1; }
+      - name: Only an admin may cut
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -euo pipefail
+          role=$(gh api "repos/${REPO}/collaborators/${ACTOR}/permission" --jq .permission)
+          [[ "$role" == "admin" ]] || { echo "::error::${ACTOR} is '${role}' on ${REPO}; only an admin may cut a release"; exit 1; }
+
+  cut:
+    name: Cut release/${{ inputs.release }}${{ inputs.dry_run && ' (dry run)' || '' }}
+    needs: authorize
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # RELEASE_BOT_PRIVATE_KEY is a secret of this environment.
+    environment: release
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # The worktrees need the source commit, and the changelog orders
+          # entries by when each fragment was added: the whole history.
+          fetch-depth: 0
+          persist-credentials: false
+      # `cargo update` refreshes both lockfiles after the versions move.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      # The release-bot app is on the release-branch and tag bypass lists and
+      # may open PRs; GITHUB_TOKEN is neither. Minted only now: after the
+      # admin check, and after the steps that need no token.
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Cut
+        env:
+          # Read and removed from the environment by cut-release.py before it
+          # runs anything; only its git fetch/push and gh calls get it.
+          CUT_RELEASE_TOKEN: ${{ steps.app.outputs.token }}
+          # A public profile lookup: GITHUB_TOKEN is enough.
+          GH_TOKEN: ${{ github.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          RELEASE: ${{ inputs.release }}
+          FROM: ${{ inputs.from }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # Commit and sign off as the app that pushes.
+          bot="${APP_SLUG}[bot]"
+          bot_id=$(gh api "users/${bot}" --jq .id)
+          git config user.name "$bot"
+          git config user.email "${bot_id}+${bot}@users.noreply.github.com"
+          args=("$RELEASE" --from "$FROM")
+          [[ "$DRY_RUN" == "true" ]] && args+=(--dry-run)
+          # GH_TOKEN (GITHUB_TOKEN) is not passed on either: the script's gh
+          # calls use the app token it was given.
+          env -u GH_TOKEN python3 scripts/cut-release.py "${args[@]}"

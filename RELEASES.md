@@ -162,21 +162,43 @@ cut), never through a normal PR.
 
 ### Cut
 
+Actions → **Cut a release** → run it on `main` with the release name (`0.9`).
+It runs with **dry run** ticked by default: that builds both commits and shows
+them in the log, pushing nothing. Check the log, then run it again with dry run
+unticked. From the command line:
+
 ```sh
-python3 scripts/cut-release.py 0.9 --dry-run   # builds both commits, pushes nothing
-python3 scripts/cut-release.py 0.9
+gh workflow run cut-release.yml --ref main -f release=0.9                  # dry run
+gh workflow run cut-release.yml --ref main -f release=0.9 -f dry_run=false # the cut
 ```
 
-From a clean checkout with push access and `gh` authenticated. It pushes
-`release/0.9` (every crate at `0.9.0`, `RELEASE` = `0.9.0-rc.0`, which
+Only an admin may start it; it runs `scripts/cut-release.py` as the release-bot
+app, because the `release/**` ruleset restricts branch creation and lets admins
+bypass it only through a PR, which a new branch cannot come from. Pushing the
+cut from a checkout is refused ("creations being restricted"). The same dry run
+works locally:
+
+```sh
+python3 scripts/cut-release.py 0.9 --dry-run   # builds both commits, pushes nothing
+```
+
+It pushes `release/0.9` (every crate at `0.9.0`, `RELEASE` = `0.9.0-rc.0`, which
 `release-tag.yml` tags), creates the `backport release/0.9` label, and opens
 the `release-cut/0.9` PR that moves `main` to `0.10.0` and assembles the
 `changelog.d/` fragments that shipped into `## 0.9.0 (release/0.9)` (the
 release branch's copy is assembled, with its date, at GA). Merge it, then
 update the schedule table above.
 
-`--from <rev>` cuts from something other than `origin/nightly` — the first cut,
-before `nightly` exists, is `--from origin/main`.
+**From** (`-f from=<rev>`; `--from <rev>` locally) cuts from something other
+than `origin/nightly` — the first cut, before `nightly` exists, is
+`origin/main`. It must be an ancestor of `origin/main`: the script refuses
+anything else, since a release is only cut from reviewed `main`.
+
+The workflow checks the inputs and the admin role first, in a job with no
+secrets; only then does a second job enter the `release` environment and mint
+the app token. `cut-release.py` takes that token out of its environment before
+running anything, so `cargo update` and the other tools that read the source
+commit never see it: only its `git fetch` / `push` and `gh` calls get it.
 
 ### Release candidate, GA, patch
 
@@ -213,18 +235,22 @@ crates stay.
 Settings, not files:
 
 - **Ruleset on `release/**`:** require a PR, require the CI jobs and
-  `branch rules`, block force pushes and deletion.
+  `branch rules`, signatures, block force pushes and deletion, restrict
+  creation. Only the release bot creates a release branch or pushes to one
+  directly; admins and maintainers bypass only through a PR. So
+  `cut-release.yml` cuts as the bot, after checking that whoever started it is
+  an admin.
 - **Ruleset on `main`:** require a PR, and require `branch rules`.
 - **Ruleset on `nightly`:** block force pushes and deletion; only the release
   bot (which `nightly.yml` runs as), maintainers and admins may create or
   update it.
 - **Environment `release`**, with secrets **`RELEASE_BOT_APP_ID`** and
   **`RELEASE_BOT_PRIVATE_KEY`** — the `affinidi-semantic-release` app.
-  `backport.yml`, `release-prep.yml`, `release-tag.yml` and `nightly.yml` run
-  in it and mint a token scoped to what each needs. It opens the backport and
+  `backport.yml`, `cut-release.yml`, `release-prep.yml`, `release-tag.yml`
+  and `nightly.yml` run in it and mint a token scoped to what each needs. It opens the backport, cut and
   prep PRs: the enterprise does not allow `GITHUB_TOKEN` to open pull
   requests, and a PR it opened would trigger no CI anyway. Its deployment
-  branches must allow both `main` (`nightly.yml`, and `backport.yml`, which
+  branches must allow both `main` (`nightly.yml`, `cut-release.yml`, and `backport.yml`, which
   runs on `pull_request_target` from `main`) and `release/**`
   (`release-tag.yml`, `release-prep.yml`). Restricted to `release/**` alone,
   `nightly` stops advancing and backports stop. Give it no required reviewers:

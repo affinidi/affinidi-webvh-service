@@ -3,8 +3,16 @@
 
     python3 scripts/cut-release.py 0.9 [--from origin/nightly] [--dry-run]
 
-Run by the release manager from a clean checkout with push access and `gh`
-authenticated. It:
+Run by the `Cut a release` workflow (`.github/workflows/cut-release.yml`) as
+the release-bot app: the `release/*` rulesets no longer let an admin push a new
+release branch. `--dry-run` works anywhere.
+
+The workflow hands it the app token as CUT_RELEASE_TOKEN. The script takes it
+out of its environment before running anything, so cargo and the other tools
+that read the source commit never see it, and gives it only to the commands
+that talk to GitHub: `git fetch` / `ls-remote` / `push` (as an HTTP header,
+never written to .git/config) and `gh`. Without it, git and gh use whatever
+credentials they already have. It:
 
   1. resolves the source commit — `origin/nightly` by default, the newest main
      commit the full CI suite passed (RELEASES.md) — and refuses one main
@@ -30,18 +38,54 @@ in the release under its heading by hand, in the PR.
 """
 
 import argparse
+import base64
+import os
 import pathlib
 import sys
 import tempfile
+import time
 
 from changelog_fragments import FRAGMENT_DIR, README, assemble, strip_pointer
 from release_lib import RELEASE_NAME, git, run, set_version, unreleased_split
+
+# Taken out of os.environ here, before any subprocess starts: see the docstring.
+TOKEN = os.environ.pop("CUT_RELEASE_TOKEN", "")
+
+
+def remote_env():
+    """Credentials for one git command that talks to GitHub, or None."""
+    if not TOKEN:
+        return None
+    auth = base64.b64encode(f"x-access-token:{TOKEN}".encode()).decode()
+    return {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+        "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {auth}",
+    }
+
+
+def gh_env():
+    return {"GH_TOKEN": TOKEN} if TOKEN else None
 
 
 def worktree(rev, tmp, name):
     path = pathlib.Path(tmp) / name
     git("worktree", "add", "--detach", str(path), rev)
     return path
+
+
+def push(ref, cwd, attempts=3):
+    """Push HEAD to `ref`, retrying: GitHub now and then refuses a push with a
+    transient `fatal error in commit_refs_rules`. Pushing the same commit again
+    is harmless, and a refusal that is not transient fails every attempt."""
+    for attempt in range(1, attempts + 1):
+        out = git("push", "origin", f"HEAD:{ref}", cwd=cwd, check=False, env=remote_env())
+        if not out.returncode:
+            return
+        if attempt == attempts:
+            sys.exit(f"`git push origin HEAD:{ref}` failed {attempts} times:\n{out.stderr.strip()}")
+        print(f"WARNING: push to {ref} failed (attempt {attempt}), retrying:\n{out.stderr.strip()}", file=sys.stderr)
+        time.sleep(10 * attempt)
 
 
 def shipped_fragments(source, mn):
@@ -61,10 +105,10 @@ def shipped_fragments(source, mn):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("name", help="major.minor, e.g. 0.9")
     ap.add_argument("--from", dest="source", default="origin/nightly")
-    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--dry-run", action="store_true", help="build both commits, push nothing")
     args = ap.parse_args()
 
     m = RELEASE_NAME.fullmatch(args.name)
@@ -75,8 +119,8 @@ def main():
     version = f"{args.name}.0"
     next_version = f"{major}.{minor + 1}.0"
 
-    git("fetch", "origin", "--tags", "--prune")
-    if git("ls-remote", "--exit-code", "--heads", "origin", branch, check=False).returncode == 0:
+    git("fetch", "origin", "--tags", "--prune", env=remote_env())
+    if git("ls-remote", "--exit-code", "--heads", "origin", branch, check=False, env=remote_env()).returncode == 0:
         sys.exit(f"{branch} already exists")
     source = git("rev-parse", "--verify", f"{args.source}^{{commit}}").stdout.strip()
     main_sha = git("rev-parse", "--verify", "origin/main^{commit}").stdout.strip()
@@ -137,13 +181,23 @@ def main():
                 print("dry run: nothing pushed")
                 return 0
 
-            git("push", "origin", f"HEAD:refs/heads/{branch}", cwd=rel)
+            push(f"refs/heads/{branch}", rel)
             cut_head = f"release-cut/{args.name}"
-            git("push", "origin", f"HEAD:refs/heads/{cut_head}", cwd=mn)
-            run(
+            push(f"refs/heads/{cut_head}", mn)
+            # The branch is already pushed: a missing label is not worth
+            # stopping for before the PR is open, so warn instead.
+            label = run(
                 "gh", "label", "create", f"backport {branch}", "--force",
                 "--color", "5319e7", "--description", f"Cherry-pick onto {branch} once merged",
+                check=False,
+                env=gh_env(),
             )
+            if label.returncode:
+                print(
+                    f"WARNING: could not create the `backport {branch}` label; create it by hand:\n"
+                    f"{label.stderr.strip()}",
+                    file=sys.stderr,
+                )
             run(
                 "gh", "pr", "create", "--base", "main", "--head", cut_head,
                 "--title", f"chore(release): cut {branch}; main moves to {next_version}",
@@ -151,6 +205,7 @@ def main():
                 f"Cuts `{branch}` from `{source[:12]}` ({args.source}). "
                 f"`main` moves to `{next_version}`."
                 + ("" if split else "\n\n**CHANGELOG.md needs splitting by hand** — see the cut output."),
+                env=gh_env(),
             )
             print(f"pushed {branch}; opened the {cut_head} PR. Update the table in RELEASES.md.")
     finally:

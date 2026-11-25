@@ -9,6 +9,7 @@ The release branch's current version is the `RELEASE` file at its root:
 `0.9.0-rc.0`, `0.9.0-rc.1`, `0.9.0`, `0.9.1`, … The tag is `v` + that.
 """
 
+import os
 import pathlib
 import re
 import subprocess
@@ -19,15 +20,16 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 RELEASE_NAME = re.compile(r"(\d+)\.(\d+)")
 RELEASE_VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?")
 
-def run(*args, cwd=ROOT, check=True):
-    out = subprocess.run(args, capture_output=True, text=True, cwd=cwd)
+def run(*args, cwd=ROOT, check=True, env=None):
+    """`env`: extra variables for this one command, on top of os.environ."""
+    out = subprocess.run(args, capture_output=True, text=True, cwd=cwd, env=None if env is None else {**os.environ, **env})
     if check and out.returncode:
         raise SystemExit(f"`{' '.join(args)}` failed in {cwd}:\n{out.stderr.strip()}")
     return out
 
 
-def git(*args, cwd=ROOT, check=True):
-    return run("git", *args, cwd=cwd, check=check)
+def git(*args, cwd=ROOT, check=True, env=None):
+    return run("git", *args, cwd=cwd, check=check, env=env)
 
 
 def members(root):
