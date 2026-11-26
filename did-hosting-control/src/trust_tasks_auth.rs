@@ -868,8 +868,8 @@ async fn authenticate_v3_arm(
         value["session"]["actor"] = Value::String(actor);
     }
     // A session a mandate backs ends when the mandate does, tokens included.
-    // One whose mandate ends before its refresh token would is not refreshed:
-    // its delegate logs in again with its mandate.
+    // Its refreshes are capped at the same ceiling (`refresh_v2_arm`), and
+    // once the mandate has ended its delegate logs in again with a new one.
     if let Some(mandate_end) = evidence_ends_at {
         bound_session_to_mandate(state, &resp.session.id, mandate_end, &mut value)
             .await
@@ -946,6 +946,33 @@ fn proof_probe<P: serde::Serialize>(doc: &TrustTask<P>) -> TrustTask<Value> {
     serde_json::from_value(value).expect("TrustTask<Value> re-parses from its own serialisation")
 }
 
+/// Cap the access token in a token response at `ceiling`: re-encoded with the
+/// same claims (so its `jti` still matches the session's pin) and an `exp` no
+/// later than the ceiling, with `expiresIn` and `session.expiresAt` to match.
+/// A token already inside the ceiling is left as it is.
+fn cap_access_token(
+    state: &AppState,
+    value: &mut Value,
+    ceiling: u64,
+) -> Result<(), did_hosting_common::server::error::AppError> {
+    use did_hosting_common::server::error::AppError;
+    let Some(token) = value["tokens"]["accessToken"].as_str() else {
+        return Ok(());
+    };
+    let jwt_keys = state
+        .jwt_keys
+        .as_deref()
+        .ok_or_else(|| AppError::Config("auth not configured".into()))?;
+    let mut claims = jwt_keys.decode(token)?;
+    if claims.exp > ceiling {
+        claims.exp = ceiling;
+        value["tokens"]["accessToken"] = Value::String(jwt_keys.encode(&claims)?);
+        value["tokens"]["expiresIn"] = serde_json::json!(ceiling.saturating_sub(now_epoch()));
+        value["session"]["expiresAt"] = Value::String(epoch_to_rfc3339(ceiling));
+    }
+    Ok(())
+}
+
 #[allow(clippy::result_large_err)]
 async fn refresh_v2_arm(
     state: &AppState,
@@ -1013,12 +1040,17 @@ async fn refresh_v2_arm(
             })?;
         bound_key_verified = session.session_pubkey_b58btc.is_some();
 
+        // Reached means the clock has reached the ceiling — not that the
+        // session's refresh deadline sits *at* it. A deadline at the ceiling
+        // is the normal state of a session whose grant (a trigger-link
+        // sign-in's `sessionEndsAt`, a mandate's `expiresAt`) is shorter than
+        // the refresh-token expiry, and of any session a refresh has already
+        // clamped: refusing on it ended those sessions at their first renewal
+        // (or one access-token lifetime after the clamp), not at the ceiling.
         if let Some(meta) = get_auth_proxy_meta(state, &session_id)
             .await
             .map_err(|e| unavailable(&doc, "refresh/meta", e))?
-            && session
-                .refresh_expires_at
-                .is_some_and(|expires| expires >= meta.absolute_expires_at)
+            && now_epoch() >= meta.absolute_expires_at
         {
             // The session lived its full span: expected, so `info`.
             info!(session_id = %session_id, "refresh refused: absolute session lifetime reached");
@@ -1105,9 +1137,9 @@ async fn refresh_v2_arm(
         // Cap the rotated session's own refresh deadline at the ceiling —
         // conformance item 4 ("MUST NOT set the resulting Session.expiresAt
         // later than Session.absoluteExpiresAt"). The pre-check above has
-        // already refused outright once the *current* deadline reached the
-        // ceiling, so what remains here is only ever a downward clamp, never
-        // a silent zero-or-negative window.
+        // already refused outright once the clock reached the ceiling, so
+        // what remains here is only ever a downward clamp, never a silent
+        // zero-or-negative window.
         if let Some(mut session) = get_session(&state.sessions_ks, &new_session_id)
             .await
             .map_err(|e| denied(&doc, "refresh/meta", e))?
@@ -1122,6 +1154,11 @@ async fn refresh_v2_arm(
             value["tokens"]["refreshExpiresIn"] =
                 serde_json::json!(meta.absolute_expires_at.saturating_sub(now));
         }
+        // The access token is capped too: a refresh near the ceiling must not
+        // mint one that outlives it. Same `jti`, so the session's token pin
+        // (written by `settle_after_refresh` above) still matches.
+        cap_access_token(state, &mut value, meta.absolute_expires_at)
+            .map_err(|e| denied(&doc, "refresh/meta", e))?;
         value["session"]["absoluteExpiresAt"] =
             Value::String(epoch_to_rfc3339(meta.absolute_expires_at));
         // Preserved unchanged across the refresh — conformance item 6.

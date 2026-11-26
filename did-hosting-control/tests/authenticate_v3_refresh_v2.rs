@@ -805,28 +805,21 @@ async fn refresh_past_the_absolute_lifetime_is_refused() {
     let h = harness().await;
     let (principal, delegate, session_key) = (key(24), key(25), key(26));
 
-    let (refresh_token, body, session_id) =
+    let (refresh_token, _body, session_id) =
         proxied_login_binding_session_key(&h, &principal, &delegate, &session_key).await;
-    let absolute_expires_at = chrono::DateTime::parse_from_rfc3339(
-        body["payload"]["session"]["absoluteExpiresAt"]
-            .as_str()
-            .expect("absoluteExpiresAt"),
-    )
-    .expect("valid rfc3339")
-    .timestamp() as u64;
 
-    // Push the session's own refresh deadline out to the absolute ceiling —
-    // simulating a session that has been refreshed right up against it —
-    // without needing to wait out the real 30-day default.
-    let mut session =
-        did_hosting_common::server::auth::session::get_session(&h.state.sessions_ks, &session_id)
-            .await
-            .expect("read session")
-            .expect("session exists");
-    session.refresh_expires_at = Some(absolute_expires_at);
-    did_hosting_common::server::auth::session::store_session(&h.state.sessions_ks, &session)
+    // Move the ceiling into the past — the clock has reached it — without
+    // waiting out the real 30-day default. The row's shape is
+    // `AuthProxyMeta`'s (no `actor`: this test does not read it back).
+    let past = chrono::Utc::now().timestamp() as u64 - 1;
+    h.state
+        .sessions_ks
+        .insert(
+            format!("auth-proxy-meta:{session_id}"),
+            &json!({ "absolute_expires_at": past }),
+        )
         .await
-        .expect("store session");
+        .expect("store meta");
 
     let d = sign(
         refresh_doc(&refresh_token, &session_key.did),
@@ -841,6 +834,88 @@ async fn refresh_past_the_absolute_lifetime_is_refused() {
         "auth/refresh:sessionLifetimeExceeded",
         "{body}"
     );
+}
+
+/// A session whose refresh deadline sits *at* its ceiling — the shape of a
+/// trigger-link sign-in whose grant is shorter than the refresh-token expiry,
+/// of a mandate-backed session, and of any session a refresh has clamped —
+/// still refreshes until the ceiling itself. Refusing it ended a trigger-link
+/// session at its first renewal (the step-up that needed one failed with
+/// "absolute session lifetime reached" seconds after sign-in). Nothing the
+/// refresh mints outlives the ceiling.
+#[tokio::test]
+async fn refresh_with_its_deadline_at_the_ceiling_succeeds_capped() {
+    let h = harness().await;
+    let (principal, delegate, session_key) = (key(27), key(28), key(29));
+
+    let (refresh_token, body, session_id) =
+        proxied_login_binding_session_key(&h, &principal, &delegate, &session_key).await;
+    let absolute_expires_at = chrono::DateTime::parse_from_rfc3339(
+        body["payload"]["session"]["absoluteExpiresAt"]
+            .as_str()
+            .expect("absoluteExpiresAt"),
+    )
+    .expect("valid rfc3339")
+    .timestamp() as u64;
+
+    // A ceiling closer than an access-token lifetime, with the refresh
+    // deadline exactly on it.
+    let ceiling = chrono::Utc::now().timestamp() as u64 + 60;
+    assert!(ceiling < absolute_expires_at);
+    h.state
+        .sessions_ks
+        .insert(
+            format!("auth-proxy-meta:{session_id}"),
+            &json!({ "absolute_expires_at": ceiling }),
+        )
+        .await
+        .expect("store meta");
+    let mut session =
+        did_hosting_common::server::auth::session::get_session(&h.state.sessions_ks, &session_id)
+            .await
+            .expect("read session")
+            .expect("session exists");
+    session.refresh_expires_at = Some(ceiling);
+    did_hosting_common::server::auth::session::store_session(&h.state.sessions_ks, &session)
+        .await
+        .expect("store session");
+
+    let d = sign(
+        refresh_doc(&refresh_token, &session_key.did),
+        &session_key,
+        "authentication",
+    )
+    .await;
+    let (status, body) = post(&h, &d).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let tokens = &body["payload"]["tokens"];
+    let access = tokens["accessToken"].as_str().expect("accessToken");
+    let claims = h
+        .state
+        .jwt_keys
+        .as_deref()
+        .expect("jwt keys")
+        .decode(access)
+        .expect("the capped access token still verifies");
+    assert!(
+        claims.exp <= ceiling,
+        "access token outlives the ceiling: {} > {ceiling}",
+        claims.exp
+    );
+    assert!(tokens["expiresIn"].as_u64().expect("expiresIn") <= 60);
+    assert!(
+        tokens["refreshExpiresIn"]
+            .as_u64()
+            .expect("refreshExpiresIn")
+            <= 60
+    );
+    let rotated =
+        did_hosting_common::server::auth::session::get_session(&h.state.sessions_ks, &session_id)
+            .await
+            .expect("read session")
+            .expect("session exists");
+    assert!(rotated.refresh_expires_at.is_some_and(|e| e <= ceiling));
 }
 
 /// A session idle past `auth.admin_idle_timeout` refuses refresh with a
