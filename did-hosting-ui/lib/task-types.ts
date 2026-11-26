@@ -46,6 +46,8 @@ import type * as LoginFinish from "./trust-tasks/auth/passkey/login/finish/0.2/p
 import type * as Invite from "./trust-tasks/auth/passkey/enroll/invite/0.3/payload";
 import type * as RedeemStart from "./trust-tasks/auth/passkey/enroll/redeem/start/0.1/payload";
 import type * as RedeemFinish from "./trust-tasks/auth/passkey/enroll/redeem/finish/0.1/payload";
+import type * as EnrollStart from "./trust-tasks/auth/passkey/enroll/start/0.2/payload";
+import type * as EnrollFinish from "./trust-tasks/auth/passkey/enroll/finish/0.2/payload";
 import type * as InviteList from "./trust-tasks/auth/passkey/enroll/invite/list/0.1/payload";
 import type * as InviteUpdate from "./trust-tasks/auth/passkey/enroll/invite/update/0.1/payload";
 import type * as InviteRevoke from "./trust-tasks/auth/passkey/enroll/invite/revoke/0.1/payload";
@@ -114,6 +116,9 @@ export const T = {
     `${TT}auth/passkey/enroll/redeem/start/0.1` as const satisfies typeof RedeemStart.TYPE_URI,
   redeemFinish:
     `${TT}auth/passkey/enroll/redeem/finish/0.1` as const satisfies typeof RedeemFinish.TYPE_URI,
+  enrollStart: `${TT}auth/passkey/enroll/start/0.2` as const satisfies typeof EnrollStart.TYPE_URI,
+  enrollFinish:
+    `${TT}auth/passkey/enroll/finish/0.2` as const satisfies typeof EnrollFinish.TYPE_URI,
   inviteList:
     `${TT}auth/passkey/enroll/invite/list/0.1` as const satisfies typeof InviteList.TYPE_URI,
   inviteUpdate:
