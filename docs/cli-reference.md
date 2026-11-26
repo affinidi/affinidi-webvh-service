@@ -980,6 +980,9 @@ Options:
       --did <DID>
           DID to remove from the ACL
 
+      --force
+          Remove the entry even when it is the last admin. Without an admin, no one can administer the service until an operator runs `invite --role admin`
+
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -1776,6 +1779,9 @@ Options:
 
       --did <DID>
           DID to remove from the ACL
+
+      --force
+          Remove the entry even when it is the last admin. Without an admin, no one can administer the service until an operator runs `invite --role admin`
 
   -h, --help
           Print help (see a summary with '-h')
@@ -2596,6 +2602,9 @@ Options:
 
       --did <DID>
           DID to remove from the ACL
+
+      --force
+          Remove the entry even when it is the last admin
 
   -h, --help
           Print help

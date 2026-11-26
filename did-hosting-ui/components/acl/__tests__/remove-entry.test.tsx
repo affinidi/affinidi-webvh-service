@@ -8,14 +8,15 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { DidRecord } from "../../../lib/api";
+import type { AclEntry, DidRecord } from "../../../lib/api";
 import { getFeedbackState, resetFeedbackForTests } from "../../../lib/feedback";
 
 const listDids = vi.fn<(owner?: string) => Promise<DidRecord[]>>();
 const deleteDid = vi.fn<(m: string) => Promise<void>>();
 const deleteAcl = vi.fn<(did: string) => Promise<void>>();
+const listAcl = vi.fn<() => Promise<{ entries: AclEntry[] }>>();
 // One object, as the real provider gives: the dialog reads on `api` changing.
-const api = { listDids, deleteDid, deleteAcl };
+const api = { listDids, deleteDid, deleteAcl, listAcl };
 vi.mock("../../ApiProvider", () => ({
   useApi: () => api,
 }));
@@ -23,6 +24,18 @@ vi.mock("../../ApiProvider", () => ({
 import { RemoveEntryDialog, deletePhrase } from "../RemoveEntryDialog";
 
 const OWNER = "did:web:bob.example";
+const ADMIN = "did:web:admin.example";
+
+function entry(did: string, role: AclEntry["role"]): AclEntry {
+  return {
+    did,
+    role,
+    label: null,
+    created_at: 1,
+    max_total_size: null,
+    max_did_count: null,
+  };
+}
 
 function rec(mnemonic: string): DidRecord {
   return {
@@ -42,6 +55,7 @@ function rec(mnemonic: string): DidRecord {
 beforeEach(() => {
   deleteAcl.mockResolvedValue(undefined);
   deleteDid.mockResolvedValue(undefined);
+  listAcl.mockResolvedValue({ entries: [entry(ADMIN, "admin"), entry(OWNER, "owner")] });
 });
 afterEach(() => {
   act(() => resetFeedbackForTests());
@@ -49,9 +63,9 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-async function renderDialog(onClose = vi.fn()) {
+async function renderDialog(onClose = vi.fn(), did = OWNER, lastAdmin = false) {
   await act(async () => {
-    render(<RemoveEntryDialog did={OWNER} onClose={onClose} />);
+    render(<RemoveEntryDialog did={did} lastAdmin={lastAdmin} onClose={onClose} />);
   });
   return { onClose };
 }
@@ -146,5 +160,48 @@ describe("RemoveEntryDialog", () => {
     await renderDialog();
     expect(screen.getByRole("alert").textContent).toMatch(/they will be kept/);
     expect(screen.getByRole("button", { name: "Remove access only" })).toBeTruthy();
+  });
+
+  it("offers nothing for the last administrator", async () => {
+    const { onClose } = await renderDialog(vi.fn(), ADMIN, true);
+    expect(screen.getByRole("alert").textContent).toMatch(/last administrator/);
+    expect(screen.queryByRole("button", { name: /Remove access/ })).toBeNull();
+    expect(listDids).not.toHaveBeenCalled();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    });
+    expect(onClose).toHaveBeenCalled();
+    expect(deleteAcl).not.toHaveBeenCalled();
+  });
+
+  it("deletes no DID when a fresh check shows the account is now the last administrator", async () => {
+    // The page's list was stale: another administrator has gone since.
+    listDids.mockResolvedValue([rec("alice")]);
+    listAcl.mockResolvedValue({ entries: [entry(ADMIN, "admin")] });
+    const { onClose } = await renderDialog(vi.fn(), ADMIN, false);
+    fireEvent.change(screen.getByLabelText(/To delete the DIDs too/), {
+      target: { value: "delete 1" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Remove access and delete 1 DID" }));
+    });
+    expect(deleteDid).not.toHaveBeenCalled();
+    expect(deleteAcl).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert").textContent).toMatch(/last administrator/);
+  });
+
+  it("deletes no DID when the access list cannot be checked", async () => {
+    listDids.mockResolvedValue([rec("alice")]);
+    listAcl.mockRejectedValue(new Error("timeout"));
+    await renderDialog();
+    fireEvent.change(screen.getByLabelText(/To delete the DIDs too/), {
+      target: { value: "delete 1" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Remove access and delete 1 DID" }));
+    });
+    expect(deleteDid).not.toHaveBeenCalled();
+    expect(deleteAcl).not.toHaveBeenCalled();
   });
 });

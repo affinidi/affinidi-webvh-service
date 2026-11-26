@@ -341,6 +341,7 @@ mod agent_name;
 mod did;
 mod did_list;
 mod gate;
+mod last_admin;
 mod platform;
 mod step_up_gated;
 mod unlisted;
