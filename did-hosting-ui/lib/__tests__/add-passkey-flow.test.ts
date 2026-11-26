@@ -5,7 +5,13 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { AddPasskeyError, completeAddPasskey, startAddPasskey } from "../add-passkey-flow";
+import {
+  AddPasskeyError,
+  MAX_DEVICE_LABEL,
+  completeAddPasskey,
+  displayLabel,
+  startAddPasskey,
+} from "../add-passkey-flow";
 import { resetServiceInfo, type EnrollStartResponse } from "../api";
 import { generateSessionKeypair } from "../session-key";
 import {
@@ -85,6 +91,14 @@ describe("starting to add a passkey", () => {
     expect(tasks(sent)[0]!.doc.payload).toEqual({});
   });
 
+  it("refuses an over-long label before sending anything", async () => {
+    const sent = installControlPlane((req) => seal(req, start()));
+    await expect(startAddPasskey("x".repeat(MAX_DEVICE_LABEL + 1))).rejects.toThrow(
+      AddPasskeyError,
+    );
+    expect(tasks(sent)).toHaveLength(0);
+  });
+
   it("explains the declared refusals plainly", async () => {
     installControlPlane(() => rejection("auth/passkey/enroll/start:maxCredentialsReached"));
     await expect(startAddPasskey()).rejects.toThrow(AddPasskeyError);
@@ -146,5 +160,12 @@ describe("completing it", () => {
 
     installControlPlane(() => rejection("permissionDenied"));
     await expect(completeAddPasskey(start(), ceremonies)).rejects.toThrow(/did not confirm/);
+  });
+});
+
+describe("showing a label", () => {
+  it("flattens it to one line and clips it", () => {
+    expect(displayLabel("  Work\n  laptop ")).toBe("Work laptop");
+    expect(displayLabel("y".repeat(300))).toBe(`${"y".repeat(MAX_DEVICE_LABEL)}…`);
   });
 });

@@ -21,10 +21,31 @@ import { isRejection } from "./trust-task";
 /** A refusal worded for the person adding the passkey. */
 export class AddPasskeyError extends Error {}
 
+/** The longest label the console sends. The spec allows 256; the control
+ *  plane's schema check is what holds a direct caller to that. */
+export const MAX_DEVICE_LABEL = 64;
+
+/** A label as sent: trimmed, absent when blank, refused when too long. */
+function normaliseLabel(label: string | undefined): string | undefined {
+  const trimmed = label?.trim();
+  if (!trimmed) return undefined;
+  if ([...trimmed].length > MAX_DEVICE_LABEL) {
+    throw new AddPasskeyError(`Keep the label to ${MAX_DEVICE_LABEL} characters or fewer.`);
+  }
+  return trimmed;
+}
+
+/** A label for display: one line, clipped. */
+export function displayLabel(label: string): string {
+  const flat = label.replace(/\s+/g, " ").trim();
+  const chars = [...flat];
+  return chars.length > MAX_DEVICE_LABEL ? `${chars.slice(0, MAX_DEVICE_LABEL).join("")}…` : flat;
+}
+
 /** Open a registration for another login passkey of the caller's own. */
 export async function startAddPasskey(deviceLabel?: string): Promise<EnrollStartResponse> {
   try {
-    return await api.enrollStart(deviceLabel?.trim() || undefined);
+    return await api.enrollStart(normaliseLabel(deviceLabel));
   } catch (e) {
     if (isRejection(e, "maxCredentialsReached")) {
       throw new AddPasskeyError(
@@ -49,17 +70,13 @@ export async function completeAddPasskey(
   webauthn: WebAuthnCeremonies,
   deviceLabel?: string,
 ): Promise<EnrollFinishResponse> {
+  const label = normaliseLabel(deviceLabel);
   const uvCredential = start.uvOptions
     ? await webauthn.get({ publicKey: structuredClone(start.uvOptions) })
     : undefined;
   const credential = await webauthn.create({ publicKey: structuredClone(start.options) });
   try {
-    return await api.enrollFinish(
-      start.enrollmentId,
-      credential,
-      uvCredential,
-      deviceLabel?.trim() || undefined,
-    );
+    return await api.enrollFinish(start.enrollmentId, credential, uvCredential, label);
   } catch (e) {
     if (isRejection(e, "enrollmentExpired") || isRejection(e, "enrollmentNotFound")) {
       throw new AddPasskeyError("This registration timed out or was replaced. Start again.");

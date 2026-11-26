@@ -25,7 +25,12 @@ import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
 import type { InvitePurpose, PasskeyCredential } from "../lib/api";
 import { confirm, notify } from "../lib/feedback";
 import { errorMessage } from "../lib/errors";
-import { completeAddPasskey, startAddPasskey } from "../lib/add-passkey-flow";
+import {
+  MAX_DEVICE_LABEL,
+  completeAddPasskey,
+  displayLabel,
+  startAddPasskey,
+} from "../lib/add-passkey-flow";
 import { createPasskeyCredential, getPasskeyCredential } from "../lib/passkey";
 import { invalidateQueries, useTrustTaskQuery } from "../lib/query";
 import { completeRevocation, startRevocation } from "../lib/revoke-flow";
@@ -103,7 +108,11 @@ export function PasskeysCard({ subject, purpose, title }: PasskeysCardProps) {
       );
       setNewLabel("");
       await invalidateQueries(PASSKEYS_KEY);
-      notify("success", "Passkey added", done.deviceLabel ?? "You can now sign in with it.");
+      notify(
+        "success",
+        "Passkey added",
+        done.deviceLabel ? displayLabel(done.deviceLabel) : "You can now sign in with it.",
+      );
     } catch (e: unknown) {
       notify("error", "Could not add the passkey", errorMessage(e, "Failed to add passkey."));
     } finally {
@@ -153,7 +162,7 @@ export function PasskeysCard({ subject, purpose, title }: PasskeysCardProps) {
             value={newLabel}
             onChangeText={setNewLabel}
             onSubmit={() => void add()}
-            maxLength={64}
+            maxLength={MAX_DEVICE_LABEL}
             editable={!adding}
             style={styles.addField}
           />
