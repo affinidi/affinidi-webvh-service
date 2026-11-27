@@ -12,6 +12,11 @@
  * Revoking is a re-authentication ceremony, not a bare delete
  * (`lib/revoke-flow.ts`): the browser runs one WebAuthn assertion, from the
  * *caller's own* passkey, before anything is unbound.
+ *
+ * In own mode the card also adds a passkey (`lib/add-passkey-flow.ts`) — a
+ * backup authenticator for a signed-in subject, confirmed with one they
+ * already hold. Administrators never add a passkey for someone else; that is
+ * what an invite is for.
  */
 
 import { useState } from "react";
@@ -20,7 +25,13 @@ import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
 import type { InvitePurpose, PasskeyCredential } from "../lib/api";
 import { confirm, notify } from "../lib/feedback";
 import { errorMessage } from "../lib/errors";
-import { getPasskeyCredential } from "../lib/passkey";
+import {
+  MAX_DEVICE_LABEL,
+  completeAddPasskey,
+  displayLabel,
+  startAddPasskey,
+} from "../lib/add-passkey-flow";
+import { createPasskeyCredential, getPasskeyCredential } from "../lib/passkey";
 import { invalidateQueries, useTrustTaskQuery } from "../lib/query";
 import { completeRevocation, startRevocation } from "../lib/revoke-flow";
 import { colors, fonts, spacing } from "../lib/theme";
@@ -28,6 +39,7 @@ import { formatDate } from "../lib/time";
 import { useApi } from "./ApiProvider";
 import { Button } from "./Button";
 import { Card } from "./Card";
+import { Field } from "./Field";
 import { ErrorWithRetry } from "./QueryState";
 
 /** Every passkey inventory is read under this prefix, so a revocation
@@ -51,6 +63,8 @@ export interface PasskeysCardProps {
 export function PasskeysCard({ subject, purpose, title }: PasskeysCardProps) {
   const api = useApi();
   const [revoking, setRevoking] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
+  const [newLabel, setNewLabel] = useState("");
   const listPurpose = purpose ?? "session";
   const passkeys = useTrustTaskQuery<PasskeyCredential[]>(
     subject ? [...PASSKEYS_KEY, "admin", subject, listPurpose] : [...PASSKEYS_KEY, "own"],
@@ -79,6 +93,30 @@ export function PasskeysCard({ subject, purpose, title }: PasskeysCardProps) {
       notify("error", "Could not revoke the passkey", errorMessage(e, "Failed to revoke passkey."));
     } finally {
       setRevoking(null);
+    }
+  };
+
+  const add = async () => {
+    setAdding(true);
+    try {
+      const label = newLabel.trim() || undefined;
+      const start = await startAddPasskey(label);
+      const done = await completeAddPasskey(
+        start,
+        { create: createPasskeyCredential, get: getPasskeyCredential },
+        label,
+      );
+      setNewLabel("");
+      await invalidateQueries(PASSKEYS_KEY);
+      notify(
+        "success",
+        "Passkey added",
+        done.deviceLabel ? displayLabel(done.deviceLabel) : "You can now sign in with it.",
+      );
+    } catch (e: unknown) {
+      notify("error", "Could not add the passkey", errorMessage(e, "Failed to add passkey."));
+    } finally {
+      setAdding(false);
     }
   };
 
@@ -116,6 +154,27 @@ export function PasskeysCard({ subject, purpose, title }: PasskeysCardProps) {
           </View>
         ))
       )}
+      {subject ? null : (
+        <View style={styles.addRow}>
+          <Field
+            label="New passkey label"
+            hint="Optional — e.g. “Work laptop” or “Backup security key”."
+            value={newLabel}
+            onChangeText={setNewLabel}
+            onSubmit={() => void add()}
+            maxLength={MAX_DEVICE_LABEL}
+            editable={!adding}
+            style={styles.addField}
+          />
+          <Button
+            label="Add passkey"
+            busyLabel="Adding…"
+            size="sm"
+            busy={adding}
+            onPress={() => void add()}
+          />
+        </View>
+      )}
     </Card>
   );
 }
@@ -146,6 +205,17 @@ const styles = StyleSheet.create({
     fontFamily: fonts.regular,
     color: colors.textSecondary,
     marginTop: 2,
+  },
+  addRow: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    flexWrap: "wrap",
+    gap: spacing.md,
+    marginTop: spacing.md,
+  },
+  addField: {
+    flexGrow: 1,
+    flexBasis: 220,
   },
   hint: {
     fontSize: 13,

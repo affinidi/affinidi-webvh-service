@@ -8,6 +8,8 @@ import type * as LoginFinish from "../trust-tasks/auth/passkey/login/finish/0.2/
 import type * as Invite from "../trust-tasks/auth/passkey/enroll/invite/0.3/payload";
 import type * as RedeemStart from "../trust-tasks/auth/passkey/enroll/redeem/start/0.1/payload";
 import type * as RedeemFinish from "../trust-tasks/auth/passkey/enroll/redeem/finish/0.1/payload";
+import type * as EnrollStart from "../trust-tasks/auth/passkey/enroll/start/0.2/payload";
+import type * as EnrollFinish from "../trust-tasks/auth/passkey/enroll/finish/0.2/payload";
 import type * as InviteList from "../trust-tasks/auth/passkey/enroll/invite/list/0.1/payload";
 import type * as InviteUpdate from "../trust-tasks/auth/passkey/enroll/invite/update/0.1/payload";
 import type * as InviteRevoke from "../trust-tasks/auth/passkey/enroll/invite/revoke/0.1/payload";
@@ -41,6 +43,8 @@ import { inviteFromWire, passkeyCredentialFromWire } from "../wire";
 import { T } from "./tasks";
 import type {
   CreateInviteResponse,
+  EnrollFinishResponse,
+  EnrollStartResponse,
   InviteListItem,
   InviteListResponse,
   InvitePurpose,
@@ -300,6 +304,38 @@ export const authApi = {
       },
       { signer: "none", anonymous: true },
     ),
+
+  // ---- Adding a passkey to yourself (Trust Tasks) ----
+
+  /**
+   * Open a registration for another login passkey of the caller's own.
+   * When the caller already holds one, the response carries `uvOptions` and
+   * the finish must answer them with an existing passkey. A *first* login
+   * passkey needs a stepped-up session instead, so a wallet session at
+   * `aal1` is stepped up and the start sent again.
+   */
+  enrollStart: async (deviceLabel?: string): Promise<EnrollStartResponse> =>
+    withStepUp(() =>
+      trustTask<EnrollStart.Payload, EnrollStart.Response>(
+        T.enrollStart,
+        deviceLabel ? { deviceLabel } : {},
+      ),
+    ),
+
+  /** Bind the new passkey (and, where asked, prove an existing one). */
+  enrollFinish: async (
+    enrollmentId: string,
+    credential: EnrollFinish.Payload["credential"],
+    uvCredential?: EnrollFinish.Payload["uvCredential"],
+    deviceLabel?: string,
+  ): Promise<EnrollFinishResponse> =>
+    trustTask<EnrollFinish.Payload, EnrollFinish.Response>(T.enrollFinish, {
+      enrollmentId,
+      credential,
+      // Only the members given: an `undefined` member cannot be canonicalised.
+      ...(uvCredential ? { uvCredential } : {}),
+      ...(deviceLabel ? { deviceLabel } : {}),
+    }),
 
   // ---- Enrolment invites (Trust Tasks) ----
 

@@ -6,6 +6,8 @@
 import type * as LoginStart from "../trust-tasks/auth/passkey/login/start/0.2/payload";
 import type * as RedeemStart from "../trust-tasks/auth/passkey/enroll/redeem/start/0.1/payload";
 import type * as RedeemFinish from "../trust-tasks/auth/passkey/enroll/redeem/finish/0.1/payload";
+import type * as EnrollStart from "../trust-tasks/auth/passkey/enroll/start/0.2/payload";
+import type * as EnrollFinish from "../trust-tasks/auth/passkey/enroll/finish/0.2/payload";
 import type * as PasskeyRevokeStart from "../trust-tasks/auth/passkey/revoke/start/0.2/payload";
 import { type ScidAliasState } from "../scid-alias";
 
@@ -341,6 +343,13 @@ export type RedeemStartResponse = RedeemStart.Response;
 
 /** The credential an invite bound. */
 export type RedeemFinishResponse = RedeemFinish.Response;
+
+/** The registration a signed-in subject opened for another passkey of their
+ *  own — with `uvOptions` over the passkeys they already hold, if any. */
+export type EnrollStartResponse = EnrollStart.Response;
+
+/** The credential a signed-in subject added to themselves. */
+export type EnrollFinishResponse = EnrollFinish.Response;
 
 /** A pending invite as an administrator sees it later: addressed by
  *  `inviteId`. The token is shown once, when the invite is created, and is
