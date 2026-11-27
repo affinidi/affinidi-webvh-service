@@ -135,6 +135,9 @@ enum Command {
         /// DID to remove from the ACL
         #[arg(long)]
         did: String,
+        /// Remove the entry even when it is the last admin
+        #[arg(long)]
+        force: bool,
     },
     /// Create a new witness identity
     CreateWitness {
@@ -332,7 +335,9 @@ async fn main() {
             or_exit("Error", run_add_acl(config, did, role).await);
         }
         Some(Command::ListAcl) => or_exit("Error", run_list_acl(config).await),
-        Some(Command::RemoveAcl { did }) => or_exit("Error", run_remove_acl(config, did).await),
+        Some(Command::RemoveAcl { did, force }) => {
+            or_exit("Error", run_remove_acl(config, did, force).await)
+        }
         Some(Command::CreateWitness { label }) => {
             or_exit("Error", run_create_witness(config, label).await);
         }
@@ -490,9 +495,10 @@ async fn run_list_acl(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::e
 async fn run_remove_acl(
     config_path: Option<PathBuf>,
     did: String,
+    force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load(config_path)?;
-    did_hosting_common::server::cli_acl::run_remove_acl(&config.store, did).await
+    did_hosting_common::server::cli_acl::run_remove_acl(&config.store, did, force).await
 }
 
 async fn run_create_witness(

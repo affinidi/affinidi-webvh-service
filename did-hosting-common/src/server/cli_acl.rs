@@ -112,10 +112,26 @@ pub async fn run_list_acl(store_config: &StoreConfig) -> Result<(), Box<dyn std:
     Ok(())
 }
 
+/// Whether removing `did` would leave `entries` with no `Admin` — the same
+/// rule `acl/revoke` enforces as `lastAuthorityProtected`.
+fn removes_last_admin(entries: &[AclEntry], did: &str) -> bool {
+    entries
+        .iter()
+        .any(|e| e.did == did && e.role == Role::Admin)
+        && !entries
+            .iter()
+            .any(|e| e.did != did && e.role == Role::Admin)
+}
+
 /// Remove an ACL entry from the store.
+///
+/// Refuses to remove the last `Admin` unless `force` is set, as `acl/revoke`
+/// refuses it outright. The operator can always recover with `invite --role
+/// admin`, so this is a guard against a slip, not a lock.
 pub async fn run_remove_acl(
     store_config: &StoreConfig,
     did: String,
+    force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open(store_config).await?;
     let acl_ks = store.keyspace(KS_ACL)?;
@@ -138,6 +154,22 @@ pub async fn run_remove_acl(
     }
 
     let entry = existing.unwrap();
+    if removes_last_admin(&list_acl_entries(&acl_ks).await?, &did) {
+        if !force {
+            eprintln!();
+            eprintln!("  {did} is the last admin in this ACL.");
+            eprintln!("  Removing it leaves no one who can administer the service until an");
+            eprintln!("  operator creates a new admin (`invite --did <DID> --role admin`).");
+            eprintln!();
+            return Err(
+                "refusing to remove the last admin — add another admin first, \
+                        or pass --force"
+                    .into(),
+            );
+        }
+        eprintln!();
+        eprintln!("  Warning: removing the last admin (--force).");
+    }
     delete_acl_entry(&acl_ks, &did).await?;
     store.persist().await?;
     // What the entry authorised goes with it, as on `acl/revoke`: the
@@ -173,4 +205,40 @@ pub async fn run_remove_acl(
     eprintln!();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::domain::DomainScope;
+
+    fn entry(did: &str, role: Role) -> AclEntry {
+        AclEntry {
+            did: did.into(),
+            role,
+            label: None,
+            created_at: 0,
+            max_total_size: None,
+            max_did_count: None,
+            domains: DomainScope::All,
+        }
+    }
+
+    #[test]
+    fn the_last_admin_is_protected_and_no_other_removal_is() {
+        let sole = [
+            entry("did:example:a", Role::Admin),
+            entry("did:example:o", Role::Owner),
+        ];
+        assert!(removes_last_admin(&sole, "did:example:a"));
+        assert!(!removes_last_admin(&sole, "did:example:o"));
+        assert!(!removes_last_admin(&sole, "did:example:absent"));
+
+        let two = [
+            entry("did:example:a", Role::Admin),
+            entry("did:example:b", Role::Admin),
+        ];
+        assert!(!removes_last_admin(&two, "did:example:a"));
+        assert!(!removes_last_admin(&two, "did:example:b"));
+    }
 }

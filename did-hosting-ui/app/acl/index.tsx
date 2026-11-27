@@ -8,6 +8,7 @@ import { RequireAuth } from "../../components/RequireAuth";
 import { AclEntryRow, type EditState } from "../../components/acl/AclEntryRow";
 import { AddEntryForm } from "../../components/acl/AddEntryForm";
 import { RemoveEntryDialog } from "../../components/acl/RemoveEntryDialog";
+import { isLastAdmin } from "../../lib/last-admin";
 import { ErrorWithRetry, StaleMarker } from "../../components/QueryState";
 import { useAuth } from "../../components/AuthProvider";
 import { InviteCard } from "../../components/acl/InviteCard";
@@ -242,7 +243,13 @@ function AclAdmin() {
         }
         ItemSeparatorComponent={EntrySeparator}
       />
-      {removing && <RemoveEntryDialog did={removing} onClose={() => setRemoving(null)} />}
+      {removing && (
+        <RemoveEntryDialog
+          did={removing}
+          lastAdmin={isLastAdmin(entries, removing)}
+          onClose={() => setRemoving(null)}
+        />
+      )}
     </>
   );
 }

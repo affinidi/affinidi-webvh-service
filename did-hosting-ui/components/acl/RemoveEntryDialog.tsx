@@ -3,6 +3,7 @@ import { ActivityIndicator, ScrollView, StyleSheet, Text, View } from "react-nat
 
 import type { DidRecord } from "../../lib/api";
 import { errorMessage } from "../../lib/errors";
+import { isLastAdmin } from "../../lib/last-admin";
 import { notify } from "../../lib/feedback";
 import { plural } from "../../lib/plural";
 import { invalidateQueries } from "../../lib/query";
@@ -17,6 +18,7 @@ type DidStatus = "pending" | "deleting" | "deleted" | "failed";
 
 type Phase =
   | { kind: "loading" }
+  | { kind: "lastAdmin" }
   | { kind: "choose"; dids: DidRecord[]; listError: string | null }
   | { kind: "running"; dids: DidRecord[]; status: Record<string, DidStatus>; step: string }
   | {
@@ -41,14 +43,31 @@ export function deletePhrase(count: number): string {
  * time with each one's progress shown; if any fails, the access entry is
  * kept and the failures are listed with a retry, so a half-finished removal is
  * never reported as done.
+ *
+ * The last administrator cannot be removed (the control plane refuses it), so
+ * the dialog says so instead of offering anything — and checks again, against
+ * a fresh ACL, before deleting any DID, so a stale list can never cost an
+ * administrator's DIDs for a removal that is then refused.
  */
-export function RemoveEntryDialog({ did, onClose }: { did: string; onClose: () => void }) {
+export function RemoveEntryDialog({
+  did,
+  lastAdmin = false,
+  onClose,
+}: {
+  did: string;
+  /** Whether the page's ACL shows `did` as the only administrator. */
+  lastAdmin?: boolean;
+  onClose: () => void;
+}) {
   const api = useApi();
-  const [phase, setPhase] = useState<Phase>({ kind: "loading" });
+  const [phase, setPhase] = useState<Phase>({ kind: lastAdmin ? "lastAdmin" : "loading" });
   const [typed, setTyped] = useState("");
   // Focus starts on Cancel, so a stray Enter never removes anything.
   const cancelRef = useRef<ButtonHandle>(null);
-  const focusKey = phase.kind === "choose" || phase.kind === "loading" ? phase.kind : null;
+  const focusKey =
+    phase.kind === "choose" || phase.kind === "loading" || phase.kind === "lastAdmin"
+      ? phase.kind
+      : null;
   useEffect(() => {
     if (!focusKey) return;
     const focus = () => (cancelRef.current as unknown as HTMLElement | null)?.focus?.();
@@ -58,6 +77,7 @@ export function RemoveEntryDialog({ did, onClose }: { did: string; onClose: () =
   }, [focusKey]);
 
   useEffect(() => {
+    if (lastAdmin) return;
     let cancelled = false;
     api
       .listDids(did)
@@ -74,7 +94,7 @@ export function RemoveEntryDialog({ did, onClose }: { did: string; onClose: () =
     return () => {
       cancelled = true;
     };
-  }, [api, did]);
+  }, [api, did, lastAdmin]);
 
   const removeAccess = async (): Promise<string | null> => {
     try {
@@ -116,6 +136,25 @@ export function RemoveEntryDialog({ did, onClose }: { did: string; onClose: () =
     for (const d of dids) if (status[d.mnemonic] !== "deleted") status[d.mnemonic] = "pending";
     const errors: Record<string, string> = {};
     const show = (step: string) => setPhase({ kind: "running", dids, status: { ...status }, step });
+    // Deleting comes before the removal, so ask first whether the removal
+    // can happen at all: an administrator added or removed since the page
+    // loaded changes the answer.
+    show("Checking access…");
+    try {
+      if (isLastAdmin((await api.listAcl()).entries, did)) {
+        setPhase({ kind: "lastAdmin" });
+        return;
+      }
+    } catch (e: unknown) {
+      setPhase({
+        kind: "partial",
+        dids,
+        status,
+        errors: {},
+        aclError: errorMessage(e, "Could not check the access list, so nothing was deleted."),
+      });
+      return;
+    }
     for (const d of dids) {
       if (status[d.mnemonic] === "deleted") continue;
       status[d.mnemonic] = "deleting";
@@ -154,7 +193,15 @@ export function RemoveEntryDialog({ did, onClose }: { did: string; onClose: () =
   let body: ReactNode = null;
   let actions: ReactNode = null;
 
-  if (phase.kind === "loading") {
+  if (phase.kind === "lastAdmin") {
+    body = (
+      <Text role="alert" style={styles.warning}>
+        {did} is the last administrator. Add another administrator before removing this one —
+        otherwise no one could manage this service from the console.
+      </Text>
+    );
+    actions = <Button buttonRef={cancelRef} label="Cancel" variant="secondary" onPress={onClose} />;
+  } else if (phase.kind === "loading") {
     body = <ActivityIndicator color={colors.accent} aria-label="Checking owned DIDs" />;
     actions = <Button buttonRef={cancelRef} label="Cancel" variant="secondary" onPress={onClose} />;
   } else if (phase.kind === "choose") {

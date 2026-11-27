@@ -47,6 +47,8 @@ const CODE_MESSAGES: Record<string, string> = {
   conflict: "Someone else changed this at the same time. Reload and try again.",
   quotaExceeded: "This would exceed the account's quota.",
   stepUpRequired: STEP_UP_GUIDANCE,
+  lastAuthorityProtected:
+    "This is the last administrator. Add another administrator before removing this one.",
 };
 
 /** Wrap a human sentence around the server's detail, when it adds anything. */

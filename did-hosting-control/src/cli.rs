@@ -217,6 +217,11 @@ pub enum AdminCommand {
         /// DID to remove from the ACL
         #[arg(long)]
         did: String,
+        /// Remove the entry even when it is the last admin. Without an admin,
+        /// no one can administer the service until an operator runs
+        /// `invite --role admin`.
+        #[arg(long)]
+        force: bool,
     },
     /// Create a passkey enrollment invite
     Invite {
@@ -322,7 +327,9 @@ impl AdminCommand {
                 };
                 cli_acl::run_list_acl(store).await
             }
-            Self::RemoveAcl { did } => cli_acl::run_remove_acl(config.store(), did).await,
+            Self::RemoveAcl { did, force } => {
+                cli_acl::run_remove_acl(config.store(), did, force).await
+            }
             Self::Invite {
                 did,
                 role,
