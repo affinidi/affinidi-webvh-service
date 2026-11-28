@@ -1,10 +1,11 @@
 # Self-registration — design
 
-Status: **implemented** on `feat/guest-self-registration` (2026-11-27), against the
-`did-management/account/*` specs of trustoverip/dtgwg-trust-tasks-tf#1405.
+> **Status:** current
 
-Task names below are short for the `did-management/account/*` family, drafted
-in dtgwg-trust-tasks-tf on branch `feat/did-management-account` (with
+Implemented against the `did-management/account/*` specs of
+trustoverip/dtgwg-trust-tasks-tf#1405.
+
+Task names below are short for the `did-management/account/*` family (with
 `did-management/server/info/0.2` and `did-management/_shared/0.4`). The specs
 are the authority on wire shapes; this document is the authority on how this
 service implements them.
