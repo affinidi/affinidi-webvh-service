@@ -1168,3 +1168,67 @@ async fn an_administrator_exempts_an_account_from_its_terms_and_back() {
     .await;
     assert_eq!(code(&reply), exempt::v0_1::error_codes::NO_ACCOUNT.code);
 }
+
+/// A disabled account's DID does not resolve (it answers 404), so its
+/// holder's `renew` and `status` are verified against the host's stored log
+/// for it, not by resolution. Here the registrant is never made resolvable at
+/// all: only the stored log can authenticate it, before and after it is
+/// disabled.
+#[tokio::test]
+async fn a_disabled_account_renews_from_its_stored_log() {
+    let (vtc, _) = crate::signing::test_util::did_key_signer(&[9; 32]);
+    let (state, _dir, admin) = guest_state(&vtc).await;
+    for (path, as_scid) in [("agents/stored-webvh", false), ("agents/stored-scid", true)] {
+        let r = registrant(path).await;
+        let caller = if as_scid { r.scid_caller() } else { r.caller() };
+        let subject = caller.did.clone();
+        let (_, token, claim) = invite(&state, &admin).await;
+        let reply = call(
+            &state,
+            Via::Https,
+            &caller,
+            REGISTER,
+            register_payload(&r, invite_admission(&token, &claim)),
+        )
+        .await;
+        ok(&reply, REGISTER);
+
+        // Disabled for inactivity: its slot no longer serves.
+        age(&state, &subject, 91).await;
+        Box::pin(crate::account_lifecycle::sweep_once(&state)).await;
+        let slot: DidRecord = state.dids_ks.get(did_key(path)).await.unwrap().unwrap();
+        assert!(slot.disabled, "{subject}");
+
+        // Status still answers, and says so.
+        let reply = call(
+            &state,
+            Via::Tsp,
+            &caller,
+            status::v0_1::Payload::TYPE_URI,
+            json!({}),
+        )
+        .await;
+        conforms(&reply);
+        assert_eq!(
+            ok(&reply, status::v0_1::Payload::TYPE_URI)["account"]["state"],
+            "disabled",
+            "{subject}"
+        );
+
+        // And renew restores it.
+        let reply = call(
+            &state,
+            Via::Https,
+            &caller,
+            renew::v0_1::Payload::TYPE_URI,
+            json!({}),
+        )
+        .await;
+        conforms(&reply);
+        let p = ok(&reply, renew::v0_1::Payload::TYPE_URI);
+        assert_eq!(p["changed"], true, "{subject}");
+        assert_eq!(p["account"]["state"], "active", "{subject}");
+        let slot: DidRecord = state.dids_ks.get(did_key(path)).await.unwrap().unwrap();
+        assert!(!slot.disabled, "{subject}");
+    }
+}

@@ -555,6 +555,10 @@ state (`account::policy`, `did-management/account/policy/{list,set}`);
   disabled itself. `account/status` is not a liveness signal; renewal and any
   other signed task are. Closing a domain stops new registrations, never the
   lifecycle of the accounts it holds.
+- **A self-registered account's own `account/renew` and `account/status` are
+  verified against the host's stored log for its DID** (`held_signer` in the
+  gate), never by resolution: a disabled account's DID answers 404, and renew
+  is how it is restored. A deactivated log authenticates no one.
 - **An administrator can exempt an account** (`account/exempt`): the terms and
   the lifecycle stop applying (`is_held_to_terms`), and DIDs the lifecycle
   disabled are restored. Check `is_held_to_terms`, not mere existence of the

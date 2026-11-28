@@ -270,6 +270,15 @@ Active ──(idle_days − warn days)──▶ Warned ──(idle_days)──�
   `did:webvh` names its SCID, so whoever takes the path next mints a different
   DID; the old one cannot be impersonated.
 
+### Verifying a disabled holder
+
+A disabled account's DID does not resolve, yet `account/renew` must restore it
+and `account/status` must tell an offline holder its state. So both tasks, from
+a self-registered account, are verified against the host's own stored log for
+the account's DID (the gate's `held_signer`), as the registration was verified
+against the submitted log — never by resolution. A deactivated log
+authenticates no one.
+
 ### Decommission warnings
 
 New task `account/expiry-notice/0.1`, **sent by the control plane to the
