@@ -4,6 +4,9 @@
 //! stats and the CLI subcommands the binaries share. Only compiled with the
 //! `server-core` feature; unstable, public so the binaries can compose it.
 
+// Guest accounts reuse the passkey invites' token and claim-code hashing.
+#[cfg(feature = "passkey")]
+pub mod account;
 pub mod acl;
 pub mod acl_removal;
 pub mod agent_name_index;

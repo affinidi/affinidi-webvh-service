@@ -104,10 +104,10 @@ impl WebVHClient {
     // Public API
     // -------------------------------------------------------------------
 
-    /// `server/info/0.1`: what the service publishes about itself (its DID,
+    /// `server/info/0.2`: what the service publishes about itself (its DID,
     /// whether `/@name` redirects are served, …), signed by that DID.
     pub async fn server_info(&self) -> Result<Value> {
-        self.call(server_info::v0_1::Payload::TYPE_URI, json!({}))
+        self.call(server_info::v0_2::Payload::TYPE_URI, json!({}))
             .await
     }
 

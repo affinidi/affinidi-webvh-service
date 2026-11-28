@@ -328,7 +328,7 @@ async fn an_unreadable_forwarded_chain_is_refused_in_each_routes_own_shape() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "id": "urn:uuid:5b3c5e2a-1b81-4d3e-9b51-7a3c89e3d1f2",
-                "type": "https://trusttasks.org/spec/server/info/0.1",
+                "type": "https://trusttasks.org/spec/server/info/0.2",
                 "payload": {},
             }))
             .unwrap(),

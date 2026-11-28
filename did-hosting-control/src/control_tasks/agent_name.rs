@@ -27,7 +27,7 @@ pub(crate) async fn update(
     cx: &Cx<'_>,
     p: update::v0_1::Payload,
 ) -> Result<update::v0_1::Response, TaskError> {
-    let auth = cx.auth().await?;
+    let auth = cx.auth_unrestricted("hold agent names").await?;
     let state = cx.state;
     let log = did_log(&serde_json::to_value(&p.did_data)?)?;
     let desired = match p.state {
@@ -61,7 +61,7 @@ pub(crate) async fn remove(
     cx: &Cx<'_>,
     p: remove::v0_1::Payload,
 ) -> Result<remove::v0_1::Response, TaskError> {
-    let auth = cx.auth().await?;
+    let auth = cx.auth_unrestricted("hold agent names").await?;
     let state = cx.state;
     let log = did_log(&serde_json::to_value(&p.did_data)?)?;
     let record = did_ops::remove_agent_name(

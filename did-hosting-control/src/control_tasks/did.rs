@@ -70,6 +70,19 @@ pub(crate) async fn check_name(
         Err(_) => None,
     };
 
+    if let Some(path) = path {
+        super::account::ensure_account_path(state, &auth, path).await?;
+    } else if did_hosting_common::server::account::is_held_to_terms(&state.acl_ks, &auth.did)
+        .await?
+    {
+        // An auto-assigned path is not one the domain's prefixes can be
+        // checked against before it is chosen.
+        return Err(TaskError::Standard(
+            StandardCode::PermissionDenied,
+            "a self-registered account names the path it reserves".into(),
+        ));
+    }
+
     // A named path that is already taken is not an error: the spec answers
     // `available: false, reserved: false` and changes nothing.
     match did_ops::create_did(&auth, state, path, false, resolved_domain.as_deref()).await {
@@ -104,6 +117,7 @@ pub(crate) async fn register(
         None => cx.auth().await?,
     };
     let state = cx.state;
+    super::account::ensure_account_path(state, &auth, p.path.as_str()).await?;
     let (method, payload) = register_method_and_data(&p)?;
     // webvh, and did:webs where this host is built to verify it: a `keri.cesr`
     // stream, from which the identifier is built with the slot and domain
@@ -634,7 +648,9 @@ pub(crate) async fn change_owner(
 ) -> Result<change_owner::v0_1::Response, TaskError> {
     use change_owner::v0_1::error_codes;
 
-    let auth = cx.auth().await?;
+    let auth = cx
+        .auth_unrestricted("transfer a DID to another owner")
+        .await?;
     let state = cx.state;
     let change = match did_ops::change_did_owner(
         &auth,

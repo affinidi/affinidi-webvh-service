@@ -73,6 +73,42 @@ fn existing_rows_keep_their_proof_rules() {
             ProofRule::Authentication,
         ),
         (
+            "https://trusttasks.org/spec/did-management/account/register/0.1",
+            ProofRule::Authentication,
+        ),
+        (
+            "https://trusttasks.org/spec/did-management/account/renew/0.1",
+            ProofRule::Authentication,
+        ),
+        (
+            "https://trusttasks.org/spec/did-management/account/status/0.1",
+            ProofRule::Authentication,
+        ),
+        (
+            "https://trusttasks.org/spec/did-management/account/invite/issue/0.1",
+            ProofRule::Authentication,
+        ),
+        (
+            "https://trusttasks.org/spec/did-management/account/invite/list/0.1",
+            ProofRule::Authentication,
+        ),
+        (
+            "https://trusttasks.org/spec/did-management/account/invite/revoke/0.1",
+            ProofRule::Authentication,
+        ),
+        (
+            "https://trusttasks.org/spec/did-management/account/policy/list/0.1",
+            ProofRule::Authentication,
+        ),
+        (
+            "https://trusttasks.org/spec/did-management/account/policy/set/0.1",
+            ProofRule::Authentication,
+        ),
+        (
+            "https://trusttasks.org/spec/did-management/account/exempt/0.1",
+            ProofRule::Authentication,
+        ),
+        (
             "https://trusttasks.org/spec/did-management/me/domains/0.1",
             ProofRule::Authentication,
         ),
@@ -133,7 +169,7 @@ fn existing_rows_keep_their_proof_rules() {
             ProofRule::Authentication,
         ),
         (
-            "https://trusttasks.org/spec/did-management/server/info/0.1",
+            "https://trusttasks.org/spec/did-management/server/info/0.2",
             ProofRule::Optional,
         ),
         (

@@ -24,7 +24,7 @@ import {
 } from "../session";
 
 export const SERVICE_DID = "did:webvh:QmTest:control.example.com";
-export const SERVER_INFO = "https://trusttasks.org/spec/did-management/server/info/0.1";
+export const SERVER_INFO = "https://trusttasks.org/spec/did-management/server/info/0.2";
 export const TT_ERROR = "https://trusttasks.org/spec/trust-task-error/0.3";
 
 export type Doc = Record<string, any>;

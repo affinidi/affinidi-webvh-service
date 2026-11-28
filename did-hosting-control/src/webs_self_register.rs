@@ -28,9 +28,10 @@
 //!    caller outside the ACL is;
 //! 2. the payload registers `did:webs` — `method: "webs"`, a named `domain`,
 //!    and no `force` (only an administrator takes over a slot). A `did:webvh`
-//!    is never registered this way: its log is verified by its own update
-//!    keys, but nothing ties a `did:webvh` that does not resolve yet to the
-//!    caller in the way an AID ties a `did:webs` to its inception keys;
+//!    is self-certifying too (its SCID commits to the genesis entry and so to
+//!    its keys), but it registers itself through
+//!    `did-management/account/register` (`crate::account_register`), which
+//!    also asks for admission evidence, never through this path;
 //! 3. the `issuer` is exactly the identifier the slot builds
 //!    ([`Webs::slot_did`]) — the same function the write path builds it with;
 //! 4. a per-source rate limit
@@ -62,9 +63,6 @@
 //! grant_owner_entry`]), so that its later publications — key rotations — take
 //! the ordinary owner path, authenticated by resolving the published
 //! identifier from this host.
-
-#[cfg(feature = "method-webs")]
-use std::sync::Arc;
 
 #[cfg(feature = "method-webs")]
 use serde_json::Value;
@@ -291,35 +289,21 @@ impl Candidate {
         sender: &str,
         my_vid: &str,
     ) -> Result<SelfCertifiedWebs, did_hosting_common::server::trust_tasks::BoundError> {
-        use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
-        use did_hosting_common::server::trust_tasks::{
-            BoundError, TransportBoundVerifier, verify_sender_bound,
-        };
-        use trust_tasks_rs::VerificationError;
-
-        // A cache holding this one document, so the library's own
-        // relationship check (listed under `authentication`, controlled by
-        // the DID that names it) and key decoding decide the key — the same
-        // code every other proof here goes through.
-        let mut client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
-            .await
-            .map_err(|e| {
-                BoundError::Proof(VerificationError::Other(format!(
-                    "could not hold the derived did:webs document: {e}"
-                )))
-            })?;
-        client.add_did_document(&self.did, self.document).await;
-        let verifier = TransportBoundVerifier::with_resolver(Arc::new(OneDocument {
-            did: self.did.clone(),
-            decode: trust_tasks_proof::affinidi::CachedDidResolver::new(Arc::new(client)),
-        }));
-        let proven =
-            verify_sender_bound(doc, Some(&self.did), Some(sender), my_vid, &verifier).await?;
+        let proven = crate::self_certify::verify_against_document(
+            doc,
+            &self.did,
+            self.document,
+            sender,
+            my_vid,
+        )
+        .await?;
         if proven != self.did {
-            return Err(BoundError::UnexpectedIssuer {
-                issuer: proven,
-                expected: self.did,
-            });
+            return Err(
+                did_hosting_common::server::trust_tasks::BoundError::UnexpectedIssuer {
+                    issuer: proven,
+                    expected: self.did,
+                },
+            );
         }
         Ok(SelfCertifiedWebs {
             did: self.did,
@@ -329,34 +313,6 @@ impl Candidate {
             max_registrations: self.max_registrations,
             max_dids: self.max_dids,
         })
-    }
-}
-
-/// Resolves verification methods of exactly one identifier, from the document
-/// its verified key event log implies. Any other DID is refused here, before
-/// the cache could treat it as a miss and resolve it over the network.
-#[cfg(feature = "method-webs")]
-struct OneDocument {
-    did: String,
-    decode: trust_tasks_proof::affinidi::CachedDidResolver,
-}
-
-#[cfg(feature = "method-webs")]
-#[async_trait::async_trait]
-impl trust_tasks_proof::affinidi::ProofPurposeResolver for OneDocument {
-    async fn resolve_vm_for_purpose(
-        &self,
-        vm: &str,
-        purpose: trust_tasks_proof::affinidi::ProofPurpose,
-    ) -> Result<affinidi_data_integrity::ResolvedKey, affinidi_data_integrity::DataIntegrityError>
-    {
-        if did_hosting_common::server::trust_tasks::verifier::controller_did(vm) != self.did {
-            return Err(affinidi_data_integrity::DataIntegrityError::Resolver(
-                "the proof's verificationMethod is not a key of the did:webs being registered"
-                    .into(),
-            ));
-        }
-        self.decode.resolve_vm_for_purpose(vm, purpose).await
     }
 }
 

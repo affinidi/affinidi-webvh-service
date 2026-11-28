@@ -451,6 +451,9 @@ pub mod tasks {
     pub const REGISTRY_HEALTH_CHECK: &str = "registry-health-check";
     /// The GeoIP database is reloaded when its file changes.
     pub const GEOIP_RELOAD: &str = "geoip-reload";
+    /// Self-registered accounts are warned, disabled when unused, and purged
+    /// (`crate::account_lifecycle`).
+    pub const ACCOUNT_LIFECYCLE: &str = "account-lifecycle";
     /// The durable outbound queue is delivered (a worker, not a tick).
     pub const OUTBOX: &str = "outbox";
     /// The periodic tasks of [`super::background_tasks`], run together.
@@ -459,12 +462,13 @@ pub mod tasks {
     /// Every storage tick ([`super::storage_tasks`]).
     pub const STORAGE: [&str; 3] = [SESSION_CLEANUP, STATS_FLUSH, DID_COUNT_RECONCILE];
     /// Every background tick ([`super::background_tasks`]).
-    pub const PERIODIC: [&str; 5] = [
+    pub const PERIODIC: [&str; 6] = [
         DOMAIN_PURGE_SWEEP,
         IDENTITY_EXPIRY,
         IDENTITY_RELOAD,
         REGISTRY_HEALTH_CHECK,
         GEOIP_RELOAD,
+        ACCOUNT_LIFECYCLE,
     ];
 }
 
@@ -477,6 +481,8 @@ pub mod tasks {
 ///   marker-gated, so a no-op once applied — the daemon has already run them
 ///   with the rest of its migrations).
 /// - Seed the registry from `[[registry.instances]]`.
+/// - Seed self-registration terms from `[[hosting.guest_register]]`, for
+///   domains with none stored.
 /// - Check, in the background, that the service's DID lists the services
 ///   wallet sign-in needs; warn once with the fix if not. Never blocks.
 pub async fn startup(state: &AppState) -> Result<(), AppError> {
@@ -487,6 +493,14 @@ pub async fn startup(state: &AppState) -> Result<(), AppError> {
     backfill_service_badges(&state.store).await;
     index_did_records(&state.store).await?;
     seed_registry(state).await;
+    // Self-registration terms the configuration names, for domains that have
+    // none stored yet; an administrator's later changes are left alone.
+    did_hosting_common::server::account::policy::seed_from_config(
+        &state.acl_ks,
+        &state.config.hosting.guest_register,
+        crate::auth::session::now_epoch(),
+    )
+    .await?;
     crate::sign_in_readiness::spawn(state);
     Ok(())
 }
@@ -719,12 +733,33 @@ pub fn background_tasks(state: &AppState) -> Vec<PeriodicTask> {
         )
     };
 
+    // Self-registered accounts' inactivity lifecycle. Local work, except the
+    // expiry notices it sends; always on, since terms are set at runtime (a
+    // tick with no accounts reads one prefix and stops).
+    let accounts = {
+        let state = state.clone();
+        PeriodicTask::new(
+            tasks::ACCOUNT_LIFECYCLE,
+            crate::account_lifecycle::SWEEP_INTERVAL,
+            move |_| {
+                let state = state.clone();
+                async move {
+                    let changed = crate::account_lifecycle::sweep_once(&state).await;
+                    if changed > 0 {
+                        info!(count = changed, "account lifecycle tick completed");
+                    }
+                }
+            },
+        )
+    };
+
     vec![
         purge,
         expiry,
         reload,
         health,
         state.oob.geoip().reload_task(),
+        accounts,
     ]
 }
 

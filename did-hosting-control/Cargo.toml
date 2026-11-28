@@ -50,7 +50,7 @@ metrics = ["did-hosting-common/metrics"]
 # It also lets a `did:webs` outside the ACL register itself on a domain whose
 # operator enables it (`[[hosting.webs_self_register]]`), authenticated by its
 # own key event log — see `src/webs_self_register.rs`.
-method-webs = ["did-hosting-common/method-webs", "dep:affinidi-did-common"]
+method-webs = ["did-hosting-common/method-webs"]
 ui = ["dep:rust-embed", "dep:mime_guess", "dep:tower"]
 keyring = ["did-hosting-common/keyring"]
 aws-secrets = ["did-hosting-common/aws-secrets"]
@@ -118,9 +118,9 @@ trust-tasks-https = { workspace = true }
 trust-tasks-didcomm = { workspace = true }
 trust-tasks-proof = { workspace = true }
 chrono = { workspace = true }
-# `method-webs` only: the document a self-registering did:webs's key event log
-# implies, which its registration's proof is checked against.
-affinidi-did-common = { workspace = true, optional = true }
+# The document a self-registration is checked against: the one a did:webs's
+# key event log, or a did:webvh's log, implies (`crate::self_certify`).
+affinidi-did-common = { workspace = true }
 # Direct dep for signing the request leg of outbound approval Trust Tasks
 # (task-consent/request, auth/step-up/approve-request) with the control DID's
 # operational (`authentication`) key — see src/signing.rs and issue #147.

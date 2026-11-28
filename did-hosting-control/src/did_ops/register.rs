@@ -357,6 +357,17 @@ pub async fn register_did_atomic(
     // submitted document may claim.
     let reg_domain =
         did_hosting_common::server::domain::extract_did_host(&did_id).unwrap_or_default();
+    // A self-registered account holds no agent names
+    // (`did_hosting_common::server::account`): a document that claims one here
+    // is refused, never published with the claim left unserved.
+    if !publication.agent_names(&reg_domain).is_empty()
+        && did_hosting_common::server::account::is_held_to_terms(&state.acl_ks, &auth.did).await?
+    {
+        return Err(AppError::Forbidden(
+            "a self-registered account may not hold agent names: remove this domain's names from alsoKnownAs"
+                .into(),
+        ));
+    }
     let (claimed, released, name_locks) = reconcile_agent_names(
         state,
         &mut new_record,
@@ -477,17 +488,7 @@ async fn verify_registration(
     )
     .map_err(publication_error)?;
 
-    let server_base_url = state
-        .config
-        .did_hosting_url
-        .as_deref()
-        .or(state.config.public_url.as_deref())
-        .ok_or_else(|| {
-            AppError::Internal(
-                "server has neither did_hosting_url nor public_url configured; cannot validate DID host"
-                    .into(),
-            )
-        })?;
+    let server_base_url = hosting_base_url(state)?;
 
     let did_id = publication.did_id.clone().ok_or_else(|| {
         AppError::invalid("did_log's latest entry has no resolvable did:webvh state.id")
@@ -522,6 +523,37 @@ async fn verify_registration(
         ensure_requested_domain_matches_did(domain, &did_id)?;
     }
     Ok((publication, did_id))
+}
+
+/// The URL DIDs are published under: `did_hosting_url`, else `public_url`.
+fn hosting_base_url(state: &AppState) -> Result<&str, AppError> {
+    state
+        .config
+        .did_hosting_url
+        .as_deref()
+        .or(state.config.public_url.as_deref())
+        .ok_or_else(|| {
+            AppError::Internal(
+                "server has neither did_hosting_url nor public_url configured; cannot validate DID host"
+                    .into(),
+            )
+        })
+}
+
+/// Whether the did:webvh `did_id` a log establishes is the DID the slot
+/// (`path`, on `domain`) holds: the same two checks a registration makes once
+/// it has verified the log. For a caller that must decide this before
+/// registering — a guest's self-registration, whose proof is checked against
+/// that log's document before anything is written.
+pub(crate) fn check_webvh_slot_identifier(
+    state: &AppState,
+    path: &str,
+    domain: &str,
+    did_id: &str,
+) -> Result<(), AppError> {
+    did_ops::validate_did_id_matches_request(did_id, path, hosting_base_url(state)?)
+        .map_err(AppError::invalid)?;
+    ensure_requested_domain_matches_did(Some(domain), did_id)
 }
 
 /// Whether `auth` may write the slot `existing` holds, and whether doing so

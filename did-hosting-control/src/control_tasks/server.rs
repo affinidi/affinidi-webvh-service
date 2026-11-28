@@ -14,15 +14,62 @@ use crate::did_ops;
 use crate::server::AppState;
 use did_hosting_common::server::error::AppError;
 
-/// `server/info/0.1`: the one public read. Accepted with no proof; answers
+/// `server/info/0.2`: the one public read. Accepted with no proof; answers
 /// only what the service already publishes, and the reply — signed by the DID
 /// it names as `serviceDid` — is what lets a client check it is talking to
-/// the service that DID belongs to.
+/// the service that DID belongs to. Besides 0.1's facts, it gives the terms on
+/// which each open domain admits a party with no account (`selfRegistration`)
+/// — public, because a registrant reads its path rules before it mints the DID
+/// they are fixed into. (0.2 extends 0.1; only 0.2 is served.)
 pub(crate) async fn info(
     cx: &Cx<'_>,
-    _p: info::v0_1::Payload,
-) -> Result<info::v0_1::Response, TaskError> {
+    _p: info::v0_2::Payload,
+) -> Result<info::v0_2::Response, TaskError> {
     let state = cx.state;
+    let mut body = info_body(state).await?;
+    // Open domains only, and never the operator's labels for the parties
+    // they trust.
+    let open: Vec<Value> = did_hosting_common::server::account::policy::list(&state.acl_ks)
+        .await?
+        .into_iter()
+        .filter(|t| t.enabled)
+        .map(|t| {
+            let mut entry = serde_json::Map::new();
+            entry.insert("domain".into(), json!(t.domain));
+            entry.insert(
+                "admissions".into(),
+                json!(t.admissions.iter().map(|a| a.as_str()).collect::<Vec<_>>()),
+            );
+            if !t.trusted_issuers.is_empty() {
+                entry.insert(
+                    "trustedVoucherIssuers".into(),
+                    json!(t.trusted_issuers.iter().map(|i| &i.did).collect::<Vec<_>>()),
+                );
+            }
+            if !t.path_prefixes.is_empty() {
+                entry.insert("pathPrefixes".into(), json!(t.path_prefixes));
+            }
+            if let Some(n) = t.max_did_count {
+                entry.insert("maxDidCount".into(), json!(n));
+            }
+            if let Some(n) = t.max_total_size {
+                entry.insert("maxTotalSizeBytes".into(), json!(n));
+            }
+            if t.inactivity_days > 0 {
+                entry.insert("inactivityDays".into(), json!(t.inactivity_days));
+                entry.insert("graceDays".into(), json!(t.grace_days));
+            }
+            Value::Object(entry)
+        })
+        .collect();
+    if !open.is_empty() {
+        body.insert("selfRegistration".into(), Value::Array(open));
+    }
+    typed(Value::Object(body), "server/info response")
+}
+
+/// `server/info`'s members other than `selfRegistration`.
+async fn info_body(state: &AppState) -> Result<serde_json::Map<String, Value>, TaskError> {
     let service_did = state
         .config
         .server_did
@@ -42,7 +89,7 @@ pub(crate) async fn info(
         "domainPurgeGraceSeconds".into(),
         json!(state.config.hosting.disable_purge_grace.as_secs()),
     );
-    typed(Value::Object(body), "server/info response")
+    Ok(body)
 }
 
 /// `server/config/0.1`: the effective configuration, never a secret. Admin.

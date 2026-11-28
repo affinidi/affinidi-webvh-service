@@ -12,7 +12,7 @@ use trust_tasks_proof::affinidi::{ProofPurpose, ProofPurposeResolver};
 
 use crate::unlisted_signers::{SIGN_IN_PER_SOURCE, UnlistedSigners};
 
-const SERVER_INFO: &str = "did-management/server/info/0.1";
+const SERVER_INFO: &str = "did-management/server/info/0.2";
 const CHALLENGE: &str = "auth/challenge/0.1";
 
 /// Decodes a `did:key` locally; counts every other DID it is asked to

@@ -64,7 +64,7 @@ import type * as RevokeSession from "./trust-tasks/auth/revoke-session/0.2/paylo
 import type * as StepUpStart from "./trust-tasks/auth/step-up/start/0.2/payload";
 import type * as StepUpApprove from "./trust-tasks/auth/step-up/approve-response/0.7/payload";
 import type * as StepUpApproveRequest from "./trust-tasks/auth/step-up/approve-request/0.5/payload";
-import type * as ServerInfo from "./trust-tasks/did-management/server/info/0.1/payload";
+import type * as ServerInfo from "./trust-tasks/did-management/server/info/0.2/payload";
 import type * as Refresh from "./trust-tasks/auth/refresh/0.2/payload";
 import type * as Authenticate from "./trust-tasks/auth/authenticate/0.3/payload";
 
@@ -72,7 +72,7 @@ const TT = "https://trusttasks.org/spec/";
 const DM = `${TT}did-management/` as const;
 
 export const T = {
-  serverInfo: `${DM}server/info/0.1` as const satisfies typeof ServerInfo.TYPE_URI,
+  serverInfo: `${DM}server/info/0.2` as const satisfies typeof ServerInfo.TYPE_URI,
   authenticate: `${TT}auth/authenticate/0.3` as const satisfies typeof Authenticate.TYPE_URI,
   refresh: `${TT}auth/refresh/0.2` as const satisfies typeof Refresh.TYPE_URI,
   didList: `${DM}did/list/0.2` as const satisfies typeof DidList.TYPE_URI,
