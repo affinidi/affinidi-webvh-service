@@ -330,6 +330,13 @@ is `did_hosting_common::server::trust_tasks::bound::verify_sender_bound`
 - **`TransportBoundVerifier` requires an in-band `issuer`.** Don't reintroduce
   an issuer-absent path; the passkey session delegate is per-request, HTTPS-only
   (`with_session_delegate`).
+- **A signer whose DID this host holds is verified against the host's own
+  stored log** (`crate::local_signer`, `Authentication`-rule rows), not by
+  resolving it back to this host: only the servable (witnessed) part of the
+  log, a deactivated log authenticates no one, and a disabled slot does not
+  lock its holder out (authority is the ACL entry's). Approvals
+  (`AssertionMethod`) keep the resolving path. A slot that is gone or does not
+  hold exactly the signer's DID falls back to resolution.
 - **A proof failing against a cached DID document is re-resolved once**
   (rate-limited per DID with its path, query and fragment removed, bounded
   map) before refusal, so a rotation
@@ -555,6 +562,10 @@ state (`account::policy`, `did-management/account/policy/{list,set}`);
   disabled itself. `account/status` is not a liveness signal; renewal and any
   other signed task are. Closing a domain stops new registrations, never the
   lifecycle of the accounts it holds.
+- **A self-registered account's `account/renew` and `account/status` never
+  depend on its DID resolving**: a disabled account's DID answers 404, and
+  renew is how it is restored. They, like every operational request signed by
+  a DID this host holds, go through `local_signer` (below).
 - **An administrator can exempt an account** (`account/exempt`): the terms and
   the lifecycle stop applying (`is_held_to_terms`), and DIDs the lifecycle
   disabled are restored. Check `is_held_to_terms`, not mere existence of the

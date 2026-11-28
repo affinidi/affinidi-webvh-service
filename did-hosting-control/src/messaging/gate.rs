@@ -335,6 +335,10 @@ struct Admission {
     webs_candidate: Option<crate::webs_self_register::Candidate>,
     /// The guest registration whose proof [`Gate::verify`] checks.
     account_candidate: Option<crate::account_register::Candidate>,
+    /// A signer whose DID this host holds, whose proof [`Gate::verify`]
+    /// checks against the host's stored log for it rather than by resolving
+    /// it back to this host ([`crate::local_signer`]).
+    local_signer: Option<crate::local_signer::LocalSigner>,
 }
 
 /// What [`Gate::verify`] proved.
@@ -417,6 +421,17 @@ impl Gate<'_, '_> {
             }
         };
         let self_registering = webs_registering || account_candidate.is_some();
+        // An operational request signed by a DID this host holds. Approvals
+        // (`AssertionMethod`) keep their own path, with its purpose and
+        // relationship checks; a self-registration has its candidate already.
+        let local_signer = if rule == ProofRule::Authentication && !self_registering {
+            match Box::pin(crate::local_signer::local_signer(self.state, doc)).await {
+                Ok(local) => local,
+                Err(refusal) => return Err(rejected(doc, refusal)),
+            }
+        } else {
+            None
+        };
 
         let signed = rule != ProofRule::Optional || doc.proof.is_some();
         let needs_acl = matches!(rule, ProofRule::Authentication | ProofRule::AssertionMethod)
@@ -444,6 +459,7 @@ impl Gate<'_, '_> {
             #[cfg(feature = "method-webs")]
             webs_candidate,
             account_candidate,
+            local_signer,
         })
     }
 
@@ -571,7 +587,11 @@ impl Gate<'_, '_> {
             },
             None => (None, None),
         };
-        let self_bound = self_bound.or(account_bound);
+        let local_bound = match admitted.local_signer {
+            Some(local) => Some(Box::pin(local.verify(doc, sender, my_vid)).await),
+            None => None,
+        };
+        let self_bound = self_bound.or(account_bound).or(local_bound);
 
         if !admitted.signed {
             return Ok(Verified {

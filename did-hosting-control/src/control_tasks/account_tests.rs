@@ -1168,3 +1168,157 @@ async fn an_administrator_exempts_an_account_from_its_terms_and_back() {
     .await;
     assert_eq!(code(&reply), exempt::v0_1::error_codes::NO_ACCOUNT.code);
 }
+
+/// A disabled account's DID does not resolve (it answers 404), so its
+/// holder's `renew` and `status` are verified against the host's stored log
+/// for it, not by resolution. Here the registrant is never made resolvable at
+/// all: only the stored log can authenticate it, before and after it is
+/// disabled.
+#[tokio::test]
+async fn a_disabled_account_renews_from_its_stored_log() {
+    let (vtc, _) = crate::signing::test_util::did_key_signer(&[9; 32]);
+    let (state, _dir, admin) = guest_state(&vtc).await;
+    for (path, as_scid) in [("agents/stored-webvh", false), ("agents/stored-scid", true)] {
+        let r = registrant(path).await;
+        let caller = if as_scid { r.scid_caller() } else { r.caller() };
+        let subject = caller.did.clone();
+        let (_, token, claim) = invite(&state, &admin).await;
+        let reply = call(
+            &state,
+            Via::Https,
+            &caller,
+            REGISTER,
+            register_payload(&r, invite_admission(&token, &claim)),
+        )
+        .await;
+        ok(&reply, REGISTER);
+
+        // Disabled for inactivity: its slot no longer serves.
+        age(&state, &subject, 91).await;
+        Box::pin(crate::account_lifecycle::sweep_once(&state)).await;
+        let slot: DidRecord = state.dids_ks.get(did_key(path)).await.unwrap().unwrap();
+        assert!(slot.disabled, "{subject}");
+
+        // Status still answers, and says so.
+        let reply = call(
+            &state,
+            Via::Tsp,
+            &caller,
+            status::v0_1::Payload::TYPE_URI,
+            json!({}),
+        )
+        .await;
+        conforms(&reply);
+        assert_eq!(
+            ok(&reply, status::v0_1::Payload::TYPE_URI)["account"]["state"],
+            "disabled",
+            "{subject}"
+        );
+
+        // And renew restores it.
+        let reply = call(
+            &state,
+            Via::Https,
+            &caller,
+            renew::v0_1::Payload::TYPE_URI,
+            json!({}),
+        )
+        .await;
+        conforms(&reply);
+        let p = ok(&reply, renew::v0_1::Payload::TYPE_URI);
+        assert_eq!(p["changed"], true, "{subject}");
+        assert_eq!(p["account"]["state"], "active", "{subject}");
+        let slot: DidRecord = state.dids_ks.get(did_key(path)).await.unwrap().unwrap();
+        assert!(!slot.disabled, "{subject}");
+    }
+}
+
+/// Any signer whose DID this host holds — not only a self-registered one — is
+/// verified against the stored log, so a host that cannot fetch its own public
+/// URL (behind NAT, or on loopback here) still authenticates it, and its slot
+/// being disabled does not lock it out: its authority is its ACL entry's.
+#[tokio::test]
+async fn an_owner_whose_did_is_hosted_here_is_verified_from_the_stored_log() {
+    use did_hosting_common::tasks::did_management::did::{
+        list as did_list, register as did_register, set_state,
+    };
+    let (vtc, _) = crate::signing::test_util::did_key_signer(&[9; 32]);
+    let (state, _dir, admin) = guest_state(&vtc).await;
+
+    // An owner whose own identity DID an administrator publishes here. It is
+    // never made resolvable.
+    let r = registrant("owners/hosted").await;
+    let reply = call(
+        &state,
+        Via::Https,
+        &admin,
+        did_register::v0_1::Payload::TYPE_URI,
+        json!({ "path": r.path, "method": "webvh", "didData": r.log, "domain": DOMAIN }),
+    )
+    .await;
+    ok(&reply, did_register::v0_1::Payload::TYPE_URI);
+    let owner = r.caller();
+    did_hosting_common::server::acl::store_acl_entry(
+        &state.acl_ks,
+        &did_hosting_common::server::acl::AclEntry {
+            did: owner.did.clone(),
+            role: Role::Owner,
+            label: None,
+            created_at: 1,
+            max_total_size: None,
+            max_did_count: None,
+            domains: did_hosting_common::server::domain::DomainScope::All,
+        },
+    )
+    .await
+    .unwrap();
+
+    for via in VIAS {
+        let reply = call(
+            &state,
+            via,
+            &owner,
+            did_list::v0_2::Payload::TYPE_URI,
+            json!({}),
+        )
+        .await;
+        conforms(&reply);
+    }
+
+    // Its slot disabled by an administrator: it no longer serves, and the
+    // owner still authenticates.
+    let reply = call(
+        &state,
+        Via::Https,
+        &admin,
+        set_state::v0_1::Payload::TYPE_URI,
+        json!({ "mnemonic": r.path, "state": "suspended" }),
+    )
+    .await;
+    ok(&reply, set_state::v0_1::Payload::TYPE_URI);
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        did_list::v0_2::Payload::TYPE_URI,
+        json!({}),
+    )
+    .await;
+    conforms(&reply);
+
+    // A key the stored log does not name is still refused.
+    let forged = Caller {
+        did: owner.did.clone(),
+        key: Secret::generate_ed25519(Some(&format!("{}#key-0", owner.did)), Some(&[4; 32])),
+        role: Role::Owner,
+    };
+    let reply = call(
+        &state,
+        Via::Https,
+        &forged,
+        did_list::v0_2::Payload::TYPE_URI,
+        json!({}),
+    )
+    .await;
+    assert_eq!(code(&reply), "proofInvalid");
+}
