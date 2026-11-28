@@ -21,6 +21,7 @@ pub mod frontend;
 pub mod geoip;
 pub mod health;
 pub mod identity_rotation;
+pub(crate) mod local_signer;
 pub mod messaging;
 pub mod oob;
 pub mod outbox;

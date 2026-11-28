@@ -1232,3 +1232,93 @@ async fn a_disabled_account_renews_from_its_stored_log() {
         assert!(!slot.disabled, "{subject}");
     }
 }
+
+/// Any signer whose DID this host holds — not only a self-registered one — is
+/// verified against the stored log, so a host that cannot fetch its own public
+/// URL (behind NAT, or on loopback here) still authenticates it, and its slot
+/// being disabled does not lock it out: its authority is its ACL entry's.
+#[tokio::test]
+async fn an_owner_whose_did_is_hosted_here_is_verified_from_the_stored_log() {
+    use did_hosting_common::tasks::did_management::did::{
+        list as did_list, register as did_register, set_state,
+    };
+    let (vtc, _) = crate::signing::test_util::did_key_signer(&[9; 32]);
+    let (state, _dir, admin) = guest_state(&vtc).await;
+
+    // An owner whose own identity DID an administrator publishes here. It is
+    // never made resolvable.
+    let r = registrant("owners/hosted").await;
+    let reply = call(
+        &state,
+        Via::Https,
+        &admin,
+        did_register::v0_1::Payload::TYPE_URI,
+        json!({ "path": r.path, "method": "webvh", "didData": r.log, "domain": DOMAIN }),
+    )
+    .await;
+    ok(&reply, did_register::v0_1::Payload::TYPE_URI);
+    let owner = r.caller();
+    did_hosting_common::server::acl::store_acl_entry(
+        &state.acl_ks,
+        &did_hosting_common::server::acl::AclEntry {
+            did: owner.did.clone(),
+            role: Role::Owner,
+            label: None,
+            created_at: 1,
+            max_total_size: None,
+            max_did_count: None,
+            domains: did_hosting_common::server::domain::DomainScope::All,
+        },
+    )
+    .await
+    .unwrap();
+
+    for via in VIAS {
+        let reply = call(
+            &state,
+            via,
+            &owner,
+            did_list::v0_2::Payload::TYPE_URI,
+            json!({}),
+        )
+        .await;
+        conforms(&reply);
+    }
+
+    // Its slot disabled by an administrator: it no longer serves, and the
+    // owner still authenticates.
+    let reply = call(
+        &state,
+        Via::Https,
+        &admin,
+        set_state::v0_1::Payload::TYPE_URI,
+        json!({ "mnemonic": r.path, "state": "suspended" }),
+    )
+    .await;
+    ok(&reply, set_state::v0_1::Payload::TYPE_URI);
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        did_list::v0_2::Payload::TYPE_URI,
+        json!({}),
+    )
+    .await;
+    conforms(&reply);
+
+    // A key the stored log does not name is still refused.
+    let forged = Caller {
+        did: owner.did.clone(),
+        key: Secret::generate_ed25519(Some(&format!("{}#key-0", owner.did)), Some(&[4; 32])),
+        role: Role::Owner,
+    };
+    let reply = call(
+        &state,
+        Via::Https,
+        &forged,
+        did_list::v0_2::Payload::TYPE_URI,
+        json!({}),
+    )
+    .await;
+    assert_eq!(code(&reply), "proofInvalid");
+}

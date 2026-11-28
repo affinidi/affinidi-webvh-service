@@ -335,10 +335,10 @@ struct Admission {
     webs_candidate: Option<crate::webs_self_register::Candidate>,
     /// The guest registration whose proof [`Gate::verify`] checks.
     account_candidate: Option<crate::account_register::Candidate>,
-    /// A self-registered account's own `account/renew` or `account/status`,
-    /// whose proof [`Gate::verify`] checks against the host's stored log for
-    /// its DID — which does not resolve while the account is disabled.
-    held_signer: Option<crate::account_register::HeldSigner>,
+    /// A signer whose DID this host holds, whose proof [`Gate::verify`]
+    /// checks against the host's stored log for it rather than by resolving
+    /// it back to this host ([`crate::local_signer`]).
+    local_signer: Option<crate::local_signer::LocalSigner>,
 }
 
 /// What [`Gate::verify`] proved.
@@ -421,13 +421,16 @@ impl Gate<'_, '_> {
             }
         };
         let self_registering = webs_registering || account_candidate.is_some();
-        let held_signer = match Box::pin(crate::account_register::held_signer(
-            self.state, type_uri, doc,
-        ))
-        .await
-        {
-            Ok(held) => held,
-            Err(refusal) => return Err(rejected(doc, refusal)),
+        // An operational request signed by a DID this host holds. Approvals
+        // (`AssertionMethod`) keep their own path, with its purpose and
+        // relationship checks; a self-registration has its candidate already.
+        let local_signer = if rule == ProofRule::Authentication && !self_registering {
+            match Box::pin(crate::local_signer::local_signer(self.state, doc)).await {
+                Ok(local) => local,
+                Err(refusal) => return Err(rejected(doc, refusal)),
+            }
+        } else {
+            None
         };
 
         let signed = rule != ProofRule::Optional || doc.proof.is_some();
@@ -456,7 +459,7 @@ impl Gate<'_, '_> {
             #[cfg(feature = "method-webs")]
             webs_candidate,
             account_candidate,
-            held_signer,
+            local_signer,
         })
     }
 
@@ -584,11 +587,11 @@ impl Gate<'_, '_> {
             },
             None => (None, None),
         };
-        let held_bound = match admitted.held_signer {
-            Some(held) => Some(Box::pin(held.verify(doc, sender, my_vid)).await),
+        let local_bound = match admitted.local_signer {
+            Some(local) => Some(Box::pin(local.verify(doc, sender, my_vid)).await),
             None => None,
         };
-        let self_bound = self_bound.or(account_bound).or(held_bound);
+        let self_bound = self_bound.or(account_bound).or(local_bound);
 
         if !admitted.signed {
             return Ok(Verified {
