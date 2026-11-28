@@ -516,6 +516,52 @@ Also worth knowing before you go looking for them:
   keys and publishes the stream here, exactly as a VTA publishes a
   signed `did.jsonl`.
 
+## Self-registration: a stranger registers its own `did:webvh`
+
+`did-management/account/register/0.1` admits a party with **no** ACL entry —
+typically a VTA embedded in openvtc that minted its DID before it had anywhere
+to publish it. Whether a domain admits anyone, and on what terms, is runtime
+state (`account::policy`, `did-management/account/policy/{list,set}`);
+`[[hosting.guest_register]]` only seeds it at first start. Read
+`docs/guest-registration-design.md` before touching it. What must hold:
+
+- **Two separate proofs, and neither is the other.** The submitted log is
+  self-certifying, so the request's proof is checked against the document that
+  log implies (`crate::self_certify`, shared with `did:webs`) — never a resolved
+  one; that says *who*. The invite or voucher says *may*. Never admit on the
+  log alone: a self-certifying DID costs nothing to mint.
+- **Cheap checks first** (`account_register::admit`, in the gate): an ACL entry
+  (`alreadyRegistered`), the domain's stored terms, the rate limits, the
+  evidence, and only then the log and the proof. A stranger without evidence
+  must cost a key lookup and a claim-code hash, nothing more.
+- **The registration never takes the ACL path**, and the gate refuses it rather
+  than falling through. Evidence is re-checked under its lock in the row and
+  consumed, and the owner's entry granted, only after the slot commits.
+- **The signer is the DID or its listed `did:scid` alias** (VTI-KEY-164: a
+  distinct identity, verified by the same log). The proof's key is under the
+  document's `authentication`, never an update key. The account is keyed on the
+  form that signed, without `src`.
+- **The account is an ordinary owner; its terms set it apart.** While its
+  `AccountRecord` (`account:{subject}`) exists: every DID it holds sits under
+  the domain's path prefixes (`ensure_account_path`), it holds no agent names
+  (a publish whose document claims one is refused, not stripped), no
+  `did/change-owner` (`Cx::auth_unrestricted`), and the terms' quotas — or the
+  service's ordinary limits where they state none. Don't key any of this on a
+  role.
+- **Self-registered accounts expire** (`account_lifecycle`, the
+  `account-lifecycle` periodic task, which the daemon runs too). It acts on the
+  account's DIDs with the holder's own claims, so a renewal can lift what it
+  did — never an administrator's suspension — and it restores only the slots it
+  disabled itself. `account/status` is not a liveness signal; renewal and any
+  other signed task are. Closing a domain stops new registrations, never the
+  lifecycle of the accounts it holds.
+- **An administrator can exempt an account** (`account/exempt`): the terms and
+  the lifecycle stop applying (`is_held_to_terms`), and DIDs the lifecycle
+  disabled are restored. Check `is_held_to_terms`, not mere existence of the
+  record, wherever a term is enforced.
+- **A referral is attribution, never authority.** Verified only when the
+  admitting voucher (issuer = `via`) or invite (operator-set) supports it.
+
 ## Gotchas worth knowing
 
 - **Wire enums are camelCase.** Vault `secretKind` values are `didSelfIssued`,

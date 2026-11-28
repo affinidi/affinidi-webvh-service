@@ -1504,7 +1504,7 @@ mod https {
     async fn other_documents_pass_through() {
         let (state, _dir) = harness::state().await;
         let body =
-            serde_json::to_vec(&json!({"type": "https://trusttasks.org/spec/server/info/0.1"}))
+            serde_json::to_vec(&json!({"type": "https://trusttasks.org/spec/server/info/0.2"}))
                 .unwrap();
         assert!(
             crate::oob::http::maybe_handle(

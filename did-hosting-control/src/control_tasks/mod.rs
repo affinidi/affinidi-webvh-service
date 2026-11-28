@@ -50,6 +50,9 @@ use crate::server::AppState;
 use did_hosting_common::server::acl::check_acl;
 use did_hosting_common::server::error::AppError;
 
+pub(crate) mod account;
+#[cfg(test)]
+mod account_tests;
 pub(crate) mod agent_name;
 pub(crate) mod auth;
 #[cfg(test)]
@@ -80,8 +83,9 @@ use did_hosting_common::tasks::{
         revoke_session as tt_revoke_session, step_up as tt_step_up,
     },
     did_management::{
-        agent_name as tt_agent_name, did as tt_did, domain as tt_domain, identity as tt_identity,
-        me as tt_me, registry as tt_registry, server as tt_server, stats as tt_stats,
+        account as tt_account, agent_name as tt_agent_name, did as tt_did, domain as tt_domain,
+        identity as tt_identity, me as tt_me, registry as tt_registry, server as tt_server,
+        stats as tt_stats,
     },
     webvh::witness as tt_witness,
 };
@@ -116,10 +120,14 @@ macro_rules! control_tasks {
         /// A bound-key row is reached only through the gate's
         /// [`ProofRule::BoundKey`] arm, which has admitted it and verified its
         /// proof; `https` is then always present.
+        // One argument per thing a row may be handed; a struct would only
+        // rename them.
+        #[allow(clippy::too_many_arguments)]
         pub(crate) async fn route<V>(
             state: &AppState,
             bearer: Option<&AuthClaims>,
             self_certified: Option<&crate::webs_self_register::SelfCertifiedWebs>,
+            self_registered: Option<&crate::account_register::SelfRegisteredAccount>,
             https: Option<&crate::messaging::HttpsFacts<'_>>,
             transport: &(impl TransportHandler + Sync),
             policy: ProofPolicy<'_, V>,
@@ -131,17 +139,21 @@ macro_rules! control_tasks {
             let type_uri = doc.type_uri.to_string();
             $(
                 if type_uri == <$($seg)::+::Payload as trust_tasks_rs::Payload>::TYPE_URI {
+                    // Boxed, each row: inline, `route`'s future is as large as
+                    // its largest row, and every request — whatever its type —
+                    // would pay for it on the stack.
                     return Ok(crate::messaging::RoutedReply::Framework(Box::new(
-                        serve::<$($seg)::+::Payload, _>(
+                        Box::pin(serve::<$($seg)::+::Payload, _>(
                             state,
                             bearer,
                             self_certified,
+                            self_registered,
                             transport,
                             policy,
                             doc,
                             $($seg)::+::ERROR_CODES,
                             $handler,
-                        )
+                        ))
                         .await,
                     )));
                 }
@@ -222,6 +234,20 @@ control_tasks! {
     tt_agent_name::list::v0_1 => Authentication, agent_name::list;
     tt_agent_name::check::v0_1 => Authentication, agent_name::check;
     tt_agent_name::resolve::v0_1 => Authentication, agent_name::resolve;
+    // Self-registered accounts: a party with no account registers its own
+    // DID, admitted by an invite or a voucher and authenticated by the log it
+    // submits (the gate's `account_register::admit`, never the ACL); the
+    // holder renews and reads its account; an administrator issues and
+    // withdraws invites and sets each domain's terms at runtime.
+    tt_account::register::v0_1 => Authentication, account::register;
+    tt_account::renew::v0_1 => Authentication, account::renew;
+    tt_account::status::v0_1 => Authentication, account::status;
+    tt_account::invite::issue::v0_1 => Authentication, account::invite_issue;
+    tt_account::invite::list::v0_1 => Authentication, account::invite_list;
+    tt_account::invite::revoke::v0_1 => Authentication, account::invite_revoke;
+    tt_account::policy::list::v0_1 => Authentication, account::policy_list_task;
+    tt_account::policy::set::v0_1 => Authentication, account::policy_set_task;
+    tt_account::exempt::v0_1 => Authentication, account::exempt_task;
     // Hosting domains.
     tt_me::domains::v0_1 => Authentication, domain::me_domains;
     tt_domain::list::v0_1 => Authentication, domain::list;
@@ -240,7 +266,7 @@ control_tasks! {
     tt_registry::deregister::v0_1 => Authentication, registry::deregister;
     tt_registry::purge_domain::v0_1 => Authentication, registry::purge_domain;
     // The service itself.
-    tt_server::info::v0_1 => Optional, server::info;
+    tt_server::info::v0_2 => Optional, server::info;
     tt_server::config::v0_1 => Authentication, server::config;
     tt_server::metrics::v0_1 => Authentication, server::metrics;
     tt_stats::get::v0_1 => Authentication, server::stats_get;
@@ -337,6 +363,7 @@ async fn serve<P, V>(
     state: &AppState,
     bearer: Option<&AuthClaims>,
     self_certified: Option<&crate::webs_self_register::SelfCertifiedWebs>,
+    self_registered: Option<&crate::account_register::SelfRegisteredAccount>,
     transport: &(impl TransportHandler + Sync),
     policy: ProofPolicy<'_, V>,
     doc: TrustTask<Value>,
@@ -384,6 +411,11 @@ where
                     <P as trust_tasks_rs::Payload>::TYPE_URI
                         == crate::webs_self_register::SELF_REGISTER_TYPE_URI
                 }),
+                // Likewise a guest registration, on `account/register` alone.
+                self_registered: self_registered.filter(|_| {
+                    <P as trust_tasks_rs::Payload>::TYPE_URI
+                        == crate::account_register::REGISTER_TYPE_URI
+                }),
                 proof_vm: doc.proof.as_ref().map(|p| p.verification_method.clone()),
                 via: did_hosting_common::server::didcomm_profile::ObservedTransport::from_binding_uri(
                     transport.binding_uri(),
@@ -413,6 +445,10 @@ pub(crate) struct Cx<'a> {
     /// ([`crate::webs_self_register`]). Set on that row alone; `None` on every
     /// other request, which is authorised on the ACL through [`Cx::auth`].
     pub self_certified: Option<&'a crate::webs_self_register::SelfCertifiedWebs>,
+    /// A party with no account that the gate admitted on its evidence and
+    /// verified against the `did:webvh` log its own `account/register/0.1`
+    /// submits ([`crate::account_register`]). Set on that row alone.
+    pub self_registered: Option<&'a crate::account_register::SelfRegisteredAccount>,
     /// The request proof's `verificationMethod`, when it carried a proof.
     pub proof_vm: Option<String>,
     /// The transport the request arrived on, when it is one this service knows.
@@ -510,6 +546,31 @@ impl Cx<'_> {
                 "a metrics-reader credential is not valid for this task".into(),
             ));
         }
+        // A self-registered account's signed task keeps it alive
+        // (`crate::account_lifecycle`; a no-op for any other). `account/status`
+        // does not come this way, so asking when the account lapses does not
+        // postpone it.
+        crate::account_lifecycle::touch(self.state, &auth.did).await;
+        Ok(auth)
+    }
+
+    /// [`Cx::auth`], refused with `permissionDenied` for a self-registered
+    /// account.
+    ///
+    /// A self-registered account is an owner held to its domain's terms
+    /// (`did_hosting_common::server::account`): it may not take agent names
+    /// or hand a DID to someone else. `what` completes "a self-registered
+    /// account may not …".
+    pub async fn auth_unrestricted(&self, what: &str) -> Result<AuthClaims, TaskError> {
+        let auth = self.auth().await?;
+        if did_hosting_common::server::account::is_held_to_terms(&self.state.acl_ks, &auth.did)
+            .await?
+        {
+            return Err(TaskError::Standard(
+                StandardCode::PermissionDenied,
+                format!("a self-registered account may not {what}"),
+            ));
+        }
         Ok(auth)
     }
 
@@ -581,6 +642,9 @@ pub(crate) enum TaskError {
     Declared(DeclaredErrorCode, String),
     /// A framework standard code.
     Standard(StandardCode, String),
+    /// A complete error payload — a declared code with its `details`. Boxed:
+    /// every handler returns this type, and it is rare.
+    Payload(Box<ErrorPayload>),
 }
 
 impl From<AppError> for TaskError {
@@ -596,6 +660,25 @@ impl From<serde_json::Error> for TaskError {
 }
 
 impl TaskError {
+    /// This error with `details`, as its code's `detailsSchema` describes
+    /// them. Only a declared or standard code carries details; a shared-engine
+    /// failure is returned unchanged.
+    pub(crate) fn with_details(self, details: Value) -> Self {
+        match self {
+            TaskError::Declared(code, message) => TaskError::Payload(Box::new(
+                ErrorPayload::from(code)
+                    .with_message(message)
+                    .with_details(details),
+            )),
+            TaskError::Standard(code, message) => TaskError::Payload(Box::new(
+                ErrorPayload::new(code)
+                    .with_message(message)
+                    .with_details(details),
+            )),
+            other => other,
+        }
+    }
+
     /// A declared code by its local part, when `codes` has it.
     fn declared(codes: &'static [DeclaredErrorCode], locals: &[&str]) -> Option<DeclaredErrorCode> {
         locals
@@ -614,6 +697,7 @@ impl TaskError {
             TaskError::Standard(code, message) => {
                 return ErrorPayload::new(code).with_message(message);
             }
+            TaskError::Payload(payload) => return *payload,
             TaskError::App(e) => (map_app_error(&e, codes), e),
         };
         match code {

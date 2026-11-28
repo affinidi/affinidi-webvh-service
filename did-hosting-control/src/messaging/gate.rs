@@ -333,6 +333,8 @@ struct Admission {
     /// The self-registration whose proof [`Gate::verify`] checks.
     #[cfg(feature = "method-webs")]
     webs_candidate: Option<crate::webs_self_register::Candidate>,
+    /// The guest registration whose proof [`Gate::verify`] checks.
+    account_candidate: Option<crate::account_register::Candidate>,
 }
 
 /// What [`Gate::verify`] proved.
@@ -341,6 +343,8 @@ struct Verified {
     principal: String,
     /// A self-registration's identifier, which the register row runs as.
     self_certified: Option<crate::webs_self_register::SelfCertifiedWebs>,
+    /// A guest registration, which `account/register` runs as.
+    self_registered: Option<crate::account_register::SelfRegisteredAccount>,
 }
 
 impl Gate<'_, '_> {
@@ -387,9 +391,32 @@ impl Gate<'_, '_> {
                 Err(reason) => return Err(rejected(doc, reason)),
             };
         #[cfg(feature = "method-webs")]
-        let self_registering = webs_candidate.is_some();
+        let webs_registering = webs_candidate.is_some();
         #[cfg(not(feature = "method-webs"))]
-        let self_registering = false;
+        let webs_registering = false;
+        // A guest registration (`account/register`) is always one: it is
+        // admitted by its evidence and its own log, or refused here; it never
+        // takes the ACL path.
+        // Boxed: its checks (a claim-code hash, a voucher's proof, a log
+        // verification) are deep enough that inline they push every gate
+        // future past a debug-build thread's stack.
+        let account_candidate = match Box::pin(crate::account_register::admit(
+            self.state,
+            sender,
+            self.https,
+            self.my_vid,
+            type_uri,
+            doc,
+        ))
+        .await
+        {
+            Ok(candidate) => candidate,
+            Err(refusal) => {
+                warn!(sender, %type_uri, code = ?refusal.code, "guest registration refused");
+                return Err(rejected(doc, refusal));
+            }
+        };
+        let self_registering = webs_registering || account_candidate.is_some();
 
         let signed = rule != ProofRule::Optional || doc.proof.is_some();
         let needs_acl = matches!(rule, ProofRule::Authentication | ProofRule::AssertionMethod)
@@ -416,6 +443,7 @@ impl Gate<'_, '_> {
             self_registering,
             #[cfg(feature = "method-webs")]
             webs_candidate,
+            account_candidate,
         })
     }
 
@@ -533,10 +561,23 @@ impl Gate<'_, '_> {
             Option<Result<String, did_hosting_common::server::trust_tasks::BoundError>>,
         ) = (None, None);
 
+        let (self_registered, account_bound) = match admitted.account_candidate {
+            Some(candidate) => match Box::pin(candidate.verify(doc, sender, my_vid)).await {
+                Ok(account) => {
+                    let subject = account.subject.clone();
+                    (Some(account), Some(Ok(subject)))
+                }
+                Err(e) => (None, Some(Err(e))),
+            },
+            None => (None, None),
+        };
+        let self_bound = self_bound.or(account_bound);
+
         if !admitted.signed {
             return Ok(Verified {
                 principal: sender.to_string(),
                 self_certified,
+                self_registered,
             });
         }
         let bound = match self.rule {
@@ -598,6 +639,7 @@ impl Gate<'_, '_> {
             Ok(principal) => Ok(Verified {
                 principal,
                 self_certified,
+                self_registered,
             }),
             Err(e) => {
                 warn!(sender, %type_uri, error = %e, "trust task refused: not bound to its sender");
@@ -733,6 +775,7 @@ impl Gate<'_, '_> {
             state,
             bearer,
             verified.self_certified.as_ref(),
+            verified.self_registered.as_ref(),
             self.https,
             transport,
             trust_tasks_rs::ProofPolicy::<TransportBoundVerifier>::AcceptUnverified,
@@ -1027,7 +1070,7 @@ pub(crate) fn replay_partition(
     use crate::unlisted_signers::ReplayPartition;
     use trust_tasks_rs::Payload;
     let open_read = type_uri
-        == did_hosting_common::tasks::did_management::server::info::v0_1::Payload::TYPE_URI
+        == did_hosting_common::tasks::did_management::server::info::v0_2::Payload::TYPE_URI
         || type_uri == trust_tasks_rs::specs::trust_task_discovery::v0_4::Payload::TYPE_URI
         || (rule == ProofRule::Optional && type_uri.starts_with(OOB_FAMILY_PREFIX));
     if !rule.uses_shared_replay_cache() || open_read {

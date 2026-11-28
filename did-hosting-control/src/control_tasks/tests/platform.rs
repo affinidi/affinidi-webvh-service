@@ -211,7 +211,7 @@ pub(super) fn request_doc(type_uri: &str, issuer: &str, payload: Value) -> Value
 #[tokio::test]
 async fn server_info_answers_an_anonymous_request_signed_by_the_service() {
     let (state, _dir) = state().await;
-    let uri = t("did-management/server/info/0.1");
+    let uri = t("did-management/server/info/0.2");
     let mut doc = request(&uri, "unused", json!({}));
     doc.as_object_mut().unwrap().remove("issuer");
     let reply = https(&state, None, doc).await;
@@ -1014,7 +1014,7 @@ pub(super) async fn seed_named(
 
 /// `server/info` asked anonymously over HTTPS, as the login page asks it.
 pub(super) async fn anonymous_server_info(state: &AppState) -> Value {
-    let uri = t("did-management/server/info/0.1");
+    let uri = t("did-management/server/info/0.2");
     let mut doc = request(&uri, "unused", json!({}));
     doc.as_object_mut().unwrap().remove("issuer");
     ok(&https(state, None, doc).await, &uri)

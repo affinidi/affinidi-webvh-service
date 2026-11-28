@@ -213,6 +213,66 @@ type_uri = "https://trusttasks.org/spec/auth/whoami/0.1"
 digest = "sha256:ad4f4385fe1abad5a8aaddc626e6ed001b86567f9510fdf95dd33371a1fd9866"
 
 [[task]]
+slug = "did-management/account/exempt"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/account/exempt/0.1"
+digest = "sha256:4b886603a4d439a26234868168e7d140df31177abe8e36cf18874587d441813f"
+
+[[task]]
+slug = "did-management/account/expiry-notice"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/account/expiry-notice/0.1"
+digest = "sha256:d10a28e13cc0f10ec703447cf6c72fb9958c77394704c96fd89205412e959060"
+
+[[task]]
+slug = "did-management/account/invite/issue"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/account/invite/issue/0.1"
+digest = "sha256:dbe2abeda031a5386370fa58fd49067998adc38fc326f613ee48e8ff38bcb463"
+
+[[task]]
+slug = "did-management/account/invite/list"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/account/invite/list/0.1"
+digest = "sha256:128117520268cea72a0ee8b93805da82bb61f72cecc5a168fd7dc9a01b811ea0"
+
+[[task]]
+slug = "did-management/account/invite/revoke"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/account/invite/revoke/0.1"
+digest = "sha256:7f605aa4729f65a50d0ed34de08ca4bc00f1fd3fb59344da5eefb9278b8e4b16"
+
+[[task]]
+slug = "did-management/account/policy/list"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/account/policy/list/0.1"
+digest = "sha256:6de39ee0cb2ddaf79dcbb2f1f3c8c14dfdfdc2e5b15010d8d961fc9b2dcf6dad"
+
+[[task]]
+slug = "did-management/account/policy/set"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/account/policy/set/0.1"
+digest = "sha256:ae4380a5141b2860a411d0f171fd2b5b8ce00d2a305e663dd8d48f0dd828f1d8"
+
+[[task]]
+slug = "did-management/account/register"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/account/register/0.1"
+digest = "sha256:3492aa8239bb04e70bd264d94e1b82e2e33ad730653805b1468ec5e26e2653f7"
+
+[[task]]
+slug = "did-management/account/renew"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/account/renew/0.1"
+digest = "sha256:f50f9dcd36e5e284711381c1d118c821170cc71ba663fa951b269745cbe415c6"
+
+[[task]]
+slug = "did-management/account/status"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/did-management/account/status/0.1"
+digest = "sha256:7c83fee62b2d84bac45c148f3fb50106a913cdc17456dfc23d2bec652f11f031"
+
+[[task]]
 slug = "did-management/agent-name/check"
 version = "0.1"
 type_uri = "https://trusttasks.org/spec/did-management/agent-name/check/0.1"
@@ -436,9 +496,9 @@ digest = "sha256:e395b918740726ac137da10c70980c4902f9203e24d99e6445a9158d874f8cd
 
 [[task]]
 slug = "did-management/server/info"
-version = "0.1"
-type_uri = "https://trusttasks.org/spec/did-management/server/info/0.1"
-digest = "sha256:441c845ec34d586b9495cb9e8cdd65011cbaa7d0aa98daf454dc296d4bb58f99"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/did-management/server/info/0.2"
+digest = "sha256:140332c925d619ec79d1551d4411e7e92317dc564bdf734546c1425e8c008115"
 
 [[task]]
 slug = "did-management/server/metrics"

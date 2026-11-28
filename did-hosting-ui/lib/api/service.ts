@@ -13,7 +13,7 @@ import type * as StatsTimeseries from "../trust-tasks/did-management/stats/times
 import type * as ServerConfig from "../trust-tasks/did-management/server/config/0.1/payload";
 import type * as IdentityList from "../trust-tasks/did-management/identity/list/0.1/payload";
 import type * as IdentityRetire from "../trust-tasks/did-management/identity/retire/0.1/payload";
-import type { Response as ServerInfo } from "../trust-tasks/did-management/server/info/0.1/payload";
+import type { Response as ServerInfo } from "../trust-tasks/did-management/server/info/0.2/payload";
 import { request } from "../http";
 import { getServiceInfo, trustTask } from "../trust-task";
 import {

@@ -26,7 +26,7 @@ import {
   restoreSessionKeypair,
   signEnvelope,
 } from "./session-key";
-import type { Response as ServerInfoResponse } from "./trust-tasks/did-management/server/info/0.1/payload";
+import type { Response as ServerInfoResponse } from "./trust-tasks/did-management/server/info/0.2/payload";
 import { T } from "./task-types";
 
 /** The Trust Task endpoint on the control plane. */
@@ -336,7 +336,7 @@ export function checkReply(
 let cachedServiceInfo: Promise<ServerInfoResponse> | null = null;
 
 /**
- * `did-management/server/info/0.1`: the service DID every other document is
+ * `did-management/server/info/0.2`: the service DID every other document is
  * addressed to, plus the public facts the console renders before login.
  *
  * Sent anonymously (no bearer, no proof — the one public read). The reply must

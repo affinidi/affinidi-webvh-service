@@ -67,6 +67,31 @@ const STANDING: &[(&str, &str)] = &[
     ("did-management/agent-name/list/0.1", "member"),
     ("did-management/agent-name/check/0.1", "member"),
     ("did-management/agent-name/resolve/0.1", "member"),
+    // Self-registered accounts.
+    (
+        "did-management/account/register/0.1",
+        "a party with no ACL entry, on a domain whose stored terms are open, admitted by an invite or a trusted voucher and verified against the `did:webvh` log it submits; becomes an owner held to the domain's terms",
+    ),
+    (
+        "did-management/account/renew/0.1",
+        "any account holder (its own account)",
+    ),
+    (
+        "did-management/account/status/0.1",
+        "any account holder (its own account); not a liveness signal",
+    ),
+    ("did-management/account/invite/issue/0.1", "admin"),
+    ("did-management/account/invite/list/0.1", "admin"),
+    ("did-management/account/invite/revoke/0.1", "admin"),
+    ("did-management/account/policy/list/0.1", "admin"),
+    (
+        "did-management/account/policy/set/0.1",
+        "admin (takes effect at once)",
+    ),
+    (
+        "did-management/account/exempt/0.1",
+        "admin (lifts, or restores, a self-registered account's terms)",
+    ),
     // Domains.
     (
         "did-management/me/domains/0.1",
@@ -92,7 +117,7 @@ const STANDING: &[(&str, &str)] = &[
     ),
     // The service.
     (
-        "did-management/server/info/0.1",
+        "did-management/server/info/0.2",
         "anyone (unsigned allowed)",
     ),
     ("did-management/server/config/0.1", "admin"),

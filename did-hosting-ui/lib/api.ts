@@ -33,7 +33,7 @@ export {
   resetServiceInfo,
   retryDelayMs,
 } from "./trust-task";
-export type { Response as ServerInfo } from "./trust-tasks/did-management/server/info/0.1/payload";
+export type { Response as ServerInfo } from "./trust-tasks/did-management/server/info/0.2/payload";
 export * from "./api/types";
 export { T } from "./task-types";
 export type { ReadOptions } from "./api/tasks";

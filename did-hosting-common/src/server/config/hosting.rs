@@ -1,5 +1,5 @@
 //! `[hosting]`: multi-domain bootstrap, the unassignment lifecycle, grace
-//! periods and `did:webs` self-registration.
+//! periods, `did:webs` self-registration and guest accounts.
 
 use crate::server::error::AppError;
 use serde::{Deserialize, Serialize};
@@ -85,6 +85,213 @@ pub struct HostingConfig {
     /// ```
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub webs_self_register: Vec<WebsSelfRegistration>,
+
+    /// The self-registration terms to **seed** on domains that have none:
+    /// where a party with no account may register one with
+    /// `did-management/account/register/0.1`, submitting its own
+    /// self-certifying `did:webvh` log and an operator invite or a trusted
+    /// authorising party's voucher. Seeded at startup into the runtime store
+    /// (`account::policy`), which an administrator then manages with
+    /// `did-management/account/policy/{list,set}`; a domain that already has
+    /// stored terms keeps them. Empty (default): nothing is seeded.
+    ///
+    /// ```toml
+    /// [[hosting.guest_register]]
+    /// domain = "did.example.com"
+    /// path_prefixes = ["g"]                       # optional; empty = any path
+    /// admissions = ["invite", "voucher"]          # default ["invite"]
+    /// trusted_voucher_issuers = ["did:webvh:…"]   # required with "voucher"
+    /// ```
+    ///
+    /// See `docs/guest-registration-design.md`.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_guest_register"
+    )]
+    pub guest_register: Vec<GuestRegistration>,
+}
+
+/// What admits a guest account (`did-management/account/register/0.1`'s
+/// `admission`).
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum GuestAdmission {
+    /// Both halves of an invite an administrator issued
+    /// (`did-management/account/invite/issue/0.1`).
+    Invite,
+    /// A `DidHostingVoucher` signed by one of the domain's
+    /// `trusted_voucher_issuers`.
+    Voucher,
+}
+
+impl GuestAdmission {
+    /// The wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GuestAdmission::Invite => "invite",
+            GuestAdmission::Voucher => "voucher",
+        }
+    }
+}
+
+/// One hosting domain's self-registration terms, as the configuration seeds
+/// them ([`HostingConfig::guest_register`]); see
+/// `crate::server::account::policy`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GuestRegistration {
+    /// The hosting domain, as it is configured in the domain registry
+    /// (compared after normalisation).
+    pub domain: String,
+    /// Leading path segments a guest's slot must sit under, matched on whole
+    /// `/`-separated segments, as [`WebsSelfRegistration::path_prefixes`].
+    /// Empty: any path the domain's grammar admits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_prefixes: Vec<String>,
+    /// The admission evidence the domain accepts. Default: `["invite"]`.
+    #[serde(default = "default_guest_admissions")]
+    pub admissions: Vec<GuestAdmission>,
+    /// The DIDs of the trust communities whose vouchers admit a guest here.
+    /// Required, and only allowed, when `admissions` includes `voucher`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_voucher_issuers: Vec<String>,
+    /// The most guest accounts the domain holds at once (default
+    /// [`DEFAULT_GUEST_MAX_REGISTRATIONS`]). Per-process like the rate limits:
+    /// replicas behind one store can overshoot it by at most one each.
+    #[serde(default = "default_guest_max_registrations")]
+    pub max_registrations: u32,
+    /// How many DIDs a self-registered account may hold, its own included.
+    /// Unset (default): the service's ordinary per-account limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_did_count: Option<NonZeroU64>,
+    /// The most bytes of DID content a self-registered account may hold.
+    /// Unset (default): the service's ordinary per-account limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_size: Option<u64>,
+    /// Days a guest account may go without a liveness signal before its DIDs
+    /// are disabled (default [`DEFAULT_GUEST_INACTIVITY_DAYS`]). `0`: guest
+    /// accounts on this domain never expire.
+    #[serde(default = "default_guest_inactivity_days")]
+    pub inactivity_days: u32,
+    /// Days a disabled guest account is kept, and can be restored by its
+    /// holder's renewal, before it is purged (default
+    /// [`DEFAULT_GUEST_GRACE_DAYS`]).
+    #[serde(default = "default_guest_grace_days")]
+    pub grace_days: u32,
+    /// The most invites that may be pending for the domain at once (default
+    /// [`DEFAULT_GUEST_MAX_PENDING_INVITES`]).
+    #[serde(default = "default_guest_max_pending_invites")]
+    pub max_pending_invites: u32,
+}
+
+/// The default [`GuestRegistration::max_registrations`].
+pub const DEFAULT_GUEST_MAX_REGISTRATIONS: u32 = 1000;
+/// The default [`GuestRegistration::inactivity_days`].
+pub const DEFAULT_GUEST_INACTIVITY_DAYS: u32 = 90;
+/// The default [`GuestRegistration::grace_days`].
+pub const DEFAULT_GUEST_GRACE_DAYS: u32 = 30;
+/// The default [`GuestRegistration::max_pending_invites`].
+pub const DEFAULT_GUEST_MAX_PENDING_INVITES: u32 = 1000;
+
+fn default_guest_admissions() -> Vec<GuestAdmission> {
+    vec![GuestAdmission::Invite]
+}
+fn default_guest_max_registrations() -> u32 {
+    DEFAULT_GUEST_MAX_REGISTRATIONS
+}
+fn default_guest_inactivity_days() -> u32 {
+    DEFAULT_GUEST_INACTIVITY_DAYS
+}
+fn default_guest_grace_days() -> u32 {
+    DEFAULT_GUEST_GRACE_DAYS
+}
+fn default_guest_max_pending_invites() -> u32 {
+    DEFAULT_GUEST_MAX_PENDING_INVITES
+}
+
+impl Default for GuestRegistration {
+    fn default() -> Self {
+        Self {
+            domain: String::new(),
+            path_prefixes: Vec::new(),
+            admissions: default_guest_admissions(),
+            trusted_voucher_issuers: Vec::new(),
+            max_registrations: DEFAULT_GUEST_MAX_REGISTRATIONS,
+            max_did_count: None,
+            max_total_size: None,
+            inactivity_days: DEFAULT_GUEST_INACTIVITY_DAYS,
+            grace_days: DEFAULT_GUEST_GRACE_DAYS,
+            max_pending_invites: DEFAULT_GUEST_MAX_PENDING_INVITES,
+        }
+    }
+}
+
+impl GuestRegistration {
+    /// The terms, checked as a whole: a domain, at least one admission, and
+    /// trusted issuers exactly when vouchers are accepted.
+    fn validate(&self) -> Result<(), String> {
+        if self.domain.trim().is_empty() {
+            return Err("a [[hosting.guest_register]] entry needs a `domain`".into());
+        }
+        if self.admissions.is_empty() {
+            return Err(format!(
+                "[[hosting.guest_register]] `{}`: `admissions` is empty, so nothing could admit a \
+                 guest; remove the entry to close the domain",
+                self.domain
+            ));
+        }
+        let vouchers = self.admissions.contains(&GuestAdmission::Voucher);
+        if vouchers && self.trusted_voucher_issuers.is_empty() {
+            return Err(format!(
+                "[[hosting.guest_register]] `{}`: `admissions` includes \"voucher\" but \
+                 `trusted_voucher_issuers` names no issuer",
+                self.domain
+            ));
+        }
+        if !vouchers && !self.trusted_voucher_issuers.is_empty() {
+            return Err(format!(
+                "[[hosting.guest_register]] `{}`: `trusted_voucher_issuers` is set but \
+                 `admissions` does not include \"voucher\"",
+                self.domain
+            ));
+        }
+        if let Some(bad) = self
+            .trusted_voucher_issuers
+            .iter()
+            .find(|d| !d.starts_with("did:"))
+        {
+            return Err(format!(
+                "[[hosting.guest_register]] `{}`: trusted voucher issuer `{bad}` is not a DID",
+                self.domain
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn deserialize_guest_register<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<GuestRegistration>, D::Error> {
+    let entries = Vec::<GuestRegistration>::deserialize(d)?;
+    for entry in &entries {
+        entry.validate().map_err(serde::de::Error::custom)?;
+    }
+    Ok(entries)
+}
+
+/// Whether `path` sits under one of `prefixes` on whole `/`-separated
+/// segments, with at least one segment of its own after the prefix. Empty
+/// `prefixes` admit any path.
+fn path_under_prefixes(prefixes: &[String], path: &str) -> bool {
+    prefixes.is_empty()
+        || prefixes.iter().any(|prefix| {
+            let prefix = prefix.trim_matches('/');
+            !prefix.is_empty()
+                && path
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('/') && rest.len() > 1)
+        })
 }
 
 /// One hosting domain's opt-in to `did:webs` self-registration
@@ -153,14 +360,7 @@ impl WebsSelfRegistration {
     /// Whether a slot at `path` (`/`-separated, ending in the AID) is
     /// under one of this domain's prefixes.
     pub fn admits_path(&self, path: &str) -> bool {
-        self.path_prefixes.is_empty()
-            || self.path_prefixes.iter().any(|prefix| {
-                let prefix = prefix.trim_matches('/');
-                !prefix.is_empty()
-                    && path
-                        .strip_prefix(prefix)
-                        .is_some_and(|rest| rest.starts_with('/') && rest.len() > 1)
-            })
+        path_under_prefixes(&self.path_prefixes, path)
     }
 }
 
@@ -267,6 +467,7 @@ impl Default for HostingConfig {
             disable_purge_grace: default_disable_purge_grace(),
             scid_also_known_as: true,
             webs_self_register: Vec::new(),
+            guest_register: Vec::new(),
         }
     }
 }

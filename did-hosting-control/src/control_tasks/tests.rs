@@ -99,6 +99,27 @@ async fn sample(state: &AppState, admin: &Caller, n: usize, type_uri: &str) -> V
         "did-management/did/check-name/0.1" => {
             json!({ "path": format!("free-{n}"), "reserve": false })
         }
+        "did-management/account/register/0.1" => json!({
+            "domain": "control.test",
+            "path": format!("agents/reg-{n}"),
+            "method": "webvh",
+            "didData": "not a log",
+            "admission": { "invite": { "token": "inv_aaaaaaaaaaaaaaaa", "claimCode": "AAAA-AAAA-AAAA" } },
+        }),
+        "did-management/account/renew/0.1"
+        | "did-management/account/status/0.1"
+        | "did-management/account/invite/list/0.1"
+        | "did-management/account/policy/list/0.1" => json!({}),
+        "did-management/account/invite/issue/0.1" => {
+            json!({ "domain": "control.test", "ttlSeconds": 3600 })
+        }
+        "did-management/account/invite/revoke/0.1" => json!({ "inviteId": "no-such-invite" }),
+        "did-management/account/policy/set/0.1" => json!({ "policy": {
+            "domain": "control.test", "enabled": false, "admissions": [], "trustedIssuers": [],
+            "pathPrefixes": [], "maxRegistrations": 0, "inactivityDays": 0, "graceDays": 0,
+            "maxPendingInvites": 0,
+        } }),
+        "did-management/account/exempt/0.1" => json!({ "subject": admin.did, "exempt": true }),
         "did-management/did/register/0.1" => {
             json!({ "path": format!("reg-{n}"), "method": "webvh", "didData": "not a log", "force": false })
         }
@@ -116,7 +137,7 @@ async fn sample(state: &AppState, admin: &Caller, n: usize, type_uri: &str) -> V
         | "did-management/me/domains/0.1"
         | "did-management/domain/list/0.1"
         | "did-management/registry/list/0.2"
-        | "did-management/server/info/0.1"
+        | "did-management/server/info/0.2"
         | "did-management/server/config/0.1"
         | "did-management/server/metrics/0.1"
         | "did-management/stats/get/0.1"
@@ -279,6 +300,12 @@ async fn a_proof_under_the_wrong_key_relationship_is_refused() {
         for via in VIAS {
             n += 1;
             let payload = sample(&state, &admin, n, type_uri).await;
+            // A self-registration is refused `alreadyRegistered` for an ACL
+            // member before its proof is looked at; `account_tests` checks
+            // its proof (a forged one is `proofInvalid`).
+            if *type_uri == crate::account_register::REGISTER_TYPE_URI {
+                continue;
+            }
             let doc = request(type_uri, &admin.did, payload);
             let doc = match rule {
                 ProofRule::AssertionMethod => signed(doc, &admin.key).await,
@@ -297,7 +324,11 @@ async fn a_signer_outside_the_acl_is_refused_on_every_transport() {
     let outsider = stranger(5);
     let mut n = 3000;
     for (type_uri, rule) in did_signed_rows() {
-        if matches!(rule, ProofRule::Optional | ProofRule::SessionKey) {
+        // A self-registration exists to admit a party outside the ACL, on
+        // its evidence; `account_tests` covers who it refuses.
+        if matches!(rule, ProofRule::Optional | ProofRule::SessionKey)
+            || *type_uri == crate::account_register::REGISTER_TYPE_URI
+        {
             continue;
         }
         for via in VIAS {

@@ -9,6 +9,8 @@
 //! shapes consumers should rely on (request/response types, DID shapes,
 //! auth primitives) live in `did-hosting-common`.
 
+pub(crate) mod account_lifecycle;
+pub(crate) mod account_register;
 pub mod auth;
 pub mod cli;
 pub mod config;
@@ -30,6 +32,7 @@ pub mod registry;
 mod replication_e2e;
 pub mod routes;
 pub mod secret_store;
+pub(crate) mod self_certify;
 pub mod server;
 pub mod server_push;
 pub mod setup;

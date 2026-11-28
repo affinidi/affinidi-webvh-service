@@ -58,6 +58,7 @@ pub use list::{ListFilter, ListPage, list_dids_page, owner_mnemonics_on_domain};
 pub use owner::{
     OWNER_TRANSFER_OFFER_TTL_SECS, OwnerChange, OwnerChangeError, TransferOffer, change_did_owner,
 };
+pub(crate) use register::check_webvh_slot_identifier;
 pub use register::{check_name, create_did, register_did_atomic};
 pub use resolve::{
     MAX_RESOLVE_DIDS, resolve_agent_name_to_did, resolve_agent_names, resolve_did_or_agent_name,
@@ -143,7 +144,7 @@ async fn check_did_host_safety(
 /// never accepted and ignored). An absent or empty domain means "no explicit
 /// claim" and passes. Compared in the decoded form `extract_did_host`
 /// returns, case-insensitively, as a hostname is.
-fn ensure_requested_domain_matches_did(
+pub(crate) fn ensure_requested_domain_matches_did(
     request_domain: Option<&str>,
     did_id: &str,
 ) -> Result<(), AppError> {

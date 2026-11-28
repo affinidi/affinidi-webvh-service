@@ -399,7 +399,7 @@ pub fn verify_claim_code(hash: &ClaimHash, code: &str) -> bool {
 
 /// A claim hash for a code nobody holds, so a refusal for an unknown token
 /// costs what a refusal for a wrong code does.
-static DECOY: LazyLock<ClaimHash> = LazyLock::new(|| ClaimHash {
+pub(crate) static DECOY: LazyLock<ClaimHash> = LazyLock::new(|| ClaimHash {
     salt: hex::encode([0u8; SALT_BYTES]),
     m_kib: ARGON2_M_KIB,
     t: ARGON2_T,
@@ -431,7 +431,7 @@ static ATTEMPT_LOCKS: LazyLock<PathLocks> = LazyLock::new(PathLocks::new);
 /// configured `auth.claim_code_hash_wait_ms`.
 const MAX_CONCURRENT_HASHES: usize = 8;
 
-static HASH_PERMITS: tokio::sync::Semaphore =
+pub(crate) static HASH_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(MAX_CONCURRENT_HASHES);
 
 /// Claim-code hashes for [`issue`], kept apart from [`HASH_PERMITS`] so that
@@ -439,7 +439,7 @@ static HASH_PERMITS: tokio::sync::Semaphore =
 /// invite.
 const MAX_CONCURRENT_ISSUE_HASHES: usize = 2;
 
-static ISSUE_HASH_PERMITS: tokio::sync::Semaphore =
+pub(crate) static ISSUE_HASH_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(MAX_CONCURRENT_ISSUE_HASHES);
 
 /// [`AppError::RateLimited::limiter`] for a claim-code hash that found no
@@ -468,7 +468,7 @@ fn hashing_busy() -> AppError {
 /// The permit moves into the blocking task, so it is held for as long as the
 /// hash runs, even if the caller stops waiting (a client that goes away, a
 /// dropped handler): a hash that keeps running keeps counting.
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     permits: &'static tokio::sync::Semaphore,
     wait: std::time::Duration,
     f: impl FnOnce() -> T + Send + 'static,

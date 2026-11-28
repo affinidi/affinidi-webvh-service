@@ -38,6 +38,16 @@ export * as AuthStepUpApproveRequest_v0_5 from "./auth/step-up/approve-request/0
 export * as AuthStepUpApproveResponse_v0_7 from "./auth/step-up/approve-response/0.7/payload.js";
 export * as AuthStepUpStart_v0_2 from "./auth/step-up/start/0.2/payload.js";
 export * as AuthWhoami_v0_1 from "./auth/whoami/0.1/payload.js";
+export * as DidManagementAccountExempt_v0_1 from "./did-management/account/exempt/0.1/payload.js";
+export * as DidManagementAccountExpiryNotice_v0_1 from "./did-management/account/expiry-notice/0.1/payload.js";
+export * as DidManagementAccountInviteIssue_v0_1 from "./did-management/account/invite/issue/0.1/payload.js";
+export * as DidManagementAccountInviteList_v0_1 from "./did-management/account/invite/list/0.1/payload.js";
+export * as DidManagementAccountInviteRevoke_v0_1 from "./did-management/account/invite/revoke/0.1/payload.js";
+export * as DidManagementAccountPolicyList_v0_1 from "./did-management/account/policy/list/0.1/payload.js";
+export * as DidManagementAccountPolicySet_v0_1 from "./did-management/account/policy/set/0.1/payload.js";
+export * as DidManagementAccountRegister_v0_1 from "./did-management/account/register/0.1/payload.js";
+export * as DidManagementAccountRenew_v0_1 from "./did-management/account/renew/0.1/payload.js";
+export * as DidManagementAccountStatus_v0_1 from "./did-management/account/status/0.1/payload.js";
 export * as DidManagementAgentNameCheck_v0_1 from "./did-management/agent-name/check/0.1/payload.js";
 export * as DidManagementAgentNameList_v0_1 from "./did-management/agent-name/list/0.1/payload.js";
 export * as DidManagementAgentNameRemove_v0_1 from "./did-management/agent-name/remove/0.1/payload.js";
@@ -75,7 +85,7 @@ export * as DidManagementReplicaDomainUnassign_v0_1 from "./did-management/repli
 export * as DidManagementReplicaDomainUpsert_v0_1 from "./did-management/replica/domain/upsert/0.1/payload.js";
 export * as DidManagementServerConfig_v0_1 from "./did-management/server/config/0.1/payload.js";
 export * as DidManagementServerHealth_v0_1 from "./did-management/server/health/0.1/payload.js";
-export * as DidManagementServerInfo_v0_1 from "./did-management/server/info/0.1/payload.js";
+export * as DidManagementServerInfo_v0_2 from "./did-management/server/info/0.2/payload.js";
 export * as DidManagementServerMetrics_v0_1 from "./did-management/server/metrics/0.1/payload.js";
 export * as DidManagementServerRegister_v0_2 from "./did-management/server/register/0.2/payload.js";
 export * as DidManagementServerStatsSync_v0_1 from "./did-management/server/stats-sync/0.1/payload.js";

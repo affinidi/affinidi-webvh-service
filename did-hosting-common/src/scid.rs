@@ -26,6 +26,14 @@ pub fn scid_alias(webvh_did: &str) -> String {
     DIDWebVHState::convert_webvh_id_to_scid_id(webvh_did)
 }
 
+/// The `did:scid:vh:1` form of a did:webvh document: its `id` and every
+/// reference to itself rewritten under the did:scid DID, as a resolver of that
+/// did:scid would return it — so a proof whose key is the alias's `#key-0` can
+/// be checked against it.
+pub fn scid_document(webvh_document: &Value) -> Result<Value, String> {
+    didwebvh_rs::did_web::to_scid_did_document(webvh_document).map_err(|e| e.to_string())
+}
+
 /// Whether a did:webvh document lists its own did:scid alias, and for where.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]

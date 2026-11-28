@@ -41,6 +41,15 @@ The rows of the control plane's Trust Task table (`did-hosting-control/src/contr
 | `did-management/agent-name/list` | 0.1 | `Authentication` | member |
 | `did-management/agent-name/check` | 0.1 | `Authentication` | member |
 | `did-management/agent-name/resolve` | 0.1 | `Authentication` | member |
+| `did-management/account/register` | 0.1 | `Authentication` | a party with no ACL entry, on a domain whose stored terms are open, admitted by an invite or a trusted voucher and verified against the `did:webvh` log it submits; becomes an owner held to the domain's terms |
+| `did-management/account/renew` | 0.1 | `Authentication` | any account holder (its own account) |
+| `did-management/account/status` | 0.1 | `Authentication` | any account holder (its own account); not a liveness signal |
+| `did-management/account/invite/issue` | 0.1 | `Authentication` | admin |
+| `did-management/account/invite/list` | 0.1 | `Authentication` | admin |
+| `did-management/account/invite/revoke` | 0.1 | `Authentication` | admin |
+| `did-management/account/policy/list` | 0.1 | `Authentication` | admin |
+| `did-management/account/policy/set` | 0.1 | `Authentication` | admin (takes effect at once) |
+| `did-management/account/exempt` | 0.1 | `Authentication` | admin (lifts, or restores, a self-registered account's terms) |
 | `did-management/me/domains` | 0.1 | `Authentication` | member (the caller's own domains) |
 | `did-management/domain/list` | 0.1 | `Authentication` | admin |
 | `did-management/domain/create` | 0.1 | `Authentication` | admin |
@@ -56,7 +65,7 @@ The rows of the control plane's Trust Task table (`did-hosting-control/src/contr
 | `did-management/registry/admin-register` | 0.2 | `Authentication` | admin |
 | `did-management/registry/deregister` | 0.1 | `Authentication` | admin |
 | `did-management/registry/purge-domain` | 0.1 | `Authentication` | admin; an `aal2` session over HTTPS when one is presented |
-| `did-management/server/info` | 0.1 | `Optional` | anyone (unsigned allowed) |
+| `did-management/server/info` | 0.2 | `Optional` | anyone (unsigned allowed) |
 | `did-management/server/config` | 0.1 | `Authentication` | admin |
 | `did-management/server/metrics` | 0.1 | `Authentication` | admin or `metricsReader` (gauges: admin only) |
 | `did-management/stats/get` | 0.1 | `Authentication` | slot owner or admin (whole-service totals: admin) |
